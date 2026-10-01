@@ -340,3 +340,40 @@ func TestWMP_HTTP_ModernEmptyTAC_Refused(t *testing.T) {
 	a.HandleWMPEvents(sw, req)
 	assert.Equal(t, http.StatusForbidden, sw.Code)
 }
+
+// A session created by a legacy token has effective permissions defined by
+// what the legacy RPC path allows. A modern token with an empty TAC (no
+// permissions) must not stream it; a modern token covering those
+// permissions, and a legacy token, may.
+func TestWMP_SSE_LegacySessionRequiresEffectivePermissionsFromModernToken(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	sid, _, _ := createSessionFull(t, a, "u", "t", nil) // legacy HMAC token
+	a.mu.RLock()
+	sess := a.peers[sid].session
+	a.mu.RUnlock()
+	require.False(t, sess.TACEnforced)
+	require.Empty(t, sess.TAC)
+
+	require.Equal(t, claims.TAC("ir"), legacySessionEffectiveTAC())
+
+	assert.False(t, a.tokenCoversSession(sid, "", true), "modern empty TAC must not cover a legacy session")
+	assert.False(t, a.tokenCoversSession(sid, "r", true), "partial modern TAC must not cover")
+	assert.True(t, a.tokenCoversSession(sid, "ir", true))
+	assert.True(t, a.tokenCoversSession(sid, "irw", true))
+	assert.True(t, a.tokenCoversSession(sid, "", false), "legacy token streams its own legacy session")
+
+	v, key, issuer := setupEngineTokenValidatorTest(t)
+	m.SetTokenValidator(v)
+	modern := signEngineToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   gojosejwt.Claims{Audience: gojosejwt.Audience{"wallet-registry"}, Subject: "u"},
+		TenantID: "t", ACR: "urn:siros:acr:passkey",
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/wallet/events?session_id="+sid, nil).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+modern)
+	w := httptest.NewRecorder()
+	a.HandleWMPEvents(w, req)
+	assert.Equal(t, http.StatusForbidden, w.Code)
+}

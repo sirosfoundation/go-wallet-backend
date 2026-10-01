@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -194,7 +195,7 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	// notifications of a session that may have been created with broader
 	// privileges than this token holds. The presented token must grant every
 	// capability the session was created with.
-	if !a.tokenCoversSession(sessionID, id.TAC) {
+	if !a.tokenCoversSession(sessionID, id.TAC, id.EnforceTAC) {
 		a.logger.Warn("WMP SSE rejected - token lacks the session's capabilities",
 			zap.String("request_tac", string(id.TAC)))
 		http.Error(w, "token lacks the session's capabilities", http.StatusForbidden)
@@ -326,19 +327,46 @@ func (a *WMPAdapter) SetExternalURL(raw string) error {
 	return nil
 }
 
-// tokenCoversSession reports whether a token with the given TAC may observe the
-// session: every capability the session was created with must be granted by
-// the token. A session created without a TAC (legacy auth) has nothing to
-// cover. A token with no TAC (including a modern token with an empty TAC)
-// cannot read a session that has one.
-func (a *WMPAdapter) tokenCoversSession(sessionID string, tac claims.TAC) bool {
+// legacySessionEffectiveTAC is the permission set a session created by a
+// legacy token (no TAC concept) is treated as holding: every permission
+// authorizeProtocol gates on, since the legacy RPC path allows all of them.
+// A modern token must cover this to stream such a session, so a modern token
+// with an empty TAC (no permissions) cannot read it.
+func legacySessionEffectiveTAC() claims.TAC {
+	var b []byte
+	for _, perm := range requiredTACForProtocol {
+		for i := 0; i < len(perm); i++ {
+			if !strings.Contains(string(b), perm[i:i+1]) {
+				b = append(b, perm[i])
+			}
+		}
+	}
+	sort.Slice(b, func(i, j int) bool { return b[i] < b[j] })
+	return claims.TAC(b)
+}
+
+// tokenCoversSession reports whether a token with the given TAC (and
+// provenance) may observe the session: every capability the session holds
+// must be granted by the token. A session created by a modern token holds its
+// TAC (possibly empty). A session created by a legacy token holds
+// legacySessionEffectiveTAC, which a legacy token trivially covers (it has no
+// TAC concept) but a modern token must grant explicitly.
+func (a *WMPAdapter) tokenCoversSession(sessionID string, tac claims.TAC, enforce bool) bool {
 	a.mu.RLock()
 	ws, ok := a.peers[sessionID]
 	a.mu.RUnlock()
 	if !ok {
 		return false
 	}
-	return ws.session.TAC.IsSubsetOf(tac)
+	sess := ws.session
+	if sess.TACEnforced || sess.TAC != "" {
+		return sess.TAC.IsSubsetOf(tac)
+	}
+	// Legacy-created session.
+	if !enforce && tac == "" {
+		return true
+	}
+	return legacySessionEffectiveTAC().IsSubsetOf(tac)
 }
 
 // HandleWMPConfiguration serves the /.well-known/wmp-configuration discovery endpoint.
