@@ -31,7 +31,10 @@ type failStore struct {
 	// failNth makes an operation fail on its nth call only (1-based), to hit
 	// the step after one that already succeeded.
 	failNth map[string]int
-	calls   map[string]int
+	// failThrough extends failNth into a run: the operation fails on every
+	// call from failNth[op] up to and including failThrough[op].
+	failThrough map[string]int
+	calls       map[string]int
 }
 
 func newFailStore(ops ...string) *failStore {
@@ -51,7 +54,7 @@ func (f *failStore) err(op string) error {
 			f.calls = map[string]int{}
 		}
 		f.calls[op]++
-		if f.calls[op] == n {
+		if f.calls[op] == n || (f.calls[op] > n && f.calls[op] <= f.failThrough[op]) {
 			return errBoom
 		}
 	}
@@ -64,6 +67,16 @@ func (f *failStore) failOnCall(op string, n int) *failStore {
 		f.failNth = map[string]int{}
 	}
 	f.failNth[op] = n
+	return f
+}
+
+// failOnCalls arranges for op to fail on calls from..to inclusive.
+func (f *failStore) failOnCalls(op string, from, to int) *failStore {
+	f.failOnCall(op, from)
+	if f.failThrough == nil {
+		f.failThrough = map[string]int{}
+	}
+	f.failThrough[op] = to
 	return f
 }
 

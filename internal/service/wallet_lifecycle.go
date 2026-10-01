@@ -515,8 +515,13 @@ func (s *WalletLifecycleService) cascadeLocked(ctx context.Context, tenantID dom
 	// whose cut-off never landed. Establish the cut-off when the user has
 	// none, without advancing one that is already set (that would need-
 	// lessly invalidate tokens issued since).
-	if err := s.ensureCutoff(ctx, userID); err != nil {
-		errs = append(errs, err)
+	//
+	// Without an established cut-off at least as new as the revocation, an
+	// already-issued token could write wallet data back after the erasure, so
+	// a failure here aborts the cascade before anything is dropped or erased.
+	// It is reported as ErrErasureIncomplete, so the request stays retryable.
+	if err := s.ensureCutoff(ctx, userID, inst); err != nil {
+		return s.incomplete(userID, []error{err})
 	}
 	if s.sessionCleaner != nil {
 		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
@@ -551,9 +556,13 @@ func (s *WalletLifecycleService) CascadeForRevoked(ctx context.Context, tenantID
 	return s.cascade(ctx, tenantID, inst, actor)
 }
 
-// ensureCutoff records a token cut-off for a user that has none. Used by
-// cascade for statuses persisted outside ChangeStatus/RevokeAllForUser.
-func (s *WalletLifecycleService) ensureCutoff(ctx context.Context, userID domain.UserID) error {
+// ensureCutoff makes sure the user's token cut-off exists and is not older
+// than the instance's revocation. Used by cascade for statuses persisted
+// outside ChangeStatus/RevokeAllForUser. A cut-off that is already at or past
+// the revocation is left alone (advancing it would needlessly invalidate
+// tokens issued since); a missing one, or one that predates inst.DeactivatedAt
+// (the second advance of an earlier attempt never landed), is set to now.
+func (s *WalletLifecycleService) ensureCutoff(ctx context.Context, userID domain.UserID, inst *domain.WalletInstance) error {
 	cutoff, err := s.store.Users().GetAuthCutoff(ctx, userID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
@@ -561,7 +570,7 @@ func (s *WalletLifecycleService) ensureCutoff(ctx context.Context, userID domain
 		}
 		return fmt.Errorf("read token cut-off: %w", err)
 	}
-	if !cutoff.IsZero() {
+	if !cutoff.IsZero() && (inst == nil || inst.DeactivatedAt == nil || !cutoff.Before(*inst.DeactivatedAt)) {
 		return nil
 	}
 	if err := s.store.Users().InvalidateAuthBefore(ctx, userID, time.Now()); err != nil && !errors.Is(err, storage.ErrNotFound) {

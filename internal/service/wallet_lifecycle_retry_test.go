@@ -21,9 +21,10 @@ var providerActor = LifecycleActor{Kind: "provider"}
 // forever.
 func TestChangeStatus_RetryAdvancesACutoffThatPredatesTheRevocation(t *testing.T) {
 	ctx := context.Background()
-	fs := newFailStore().failOnCall("users.InvalidateAuthBefore", 2)
+	fs := newFailStore().failOnCalls("users.InvalidateAuthBefore", 2, 3)
 	svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
 	uid := seedWalletUser(t, fs.Store)
+	// Calls 2 and 3 fail: the second cut-off, and the cascade's own repair of it.
 	// A second live instance keeps the wallet alive, so no erasure advances
 	// the cut-off behind the test's back.
 	require.NoError(t, fs.Store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
@@ -57,7 +58,7 @@ func TestChangeStatus_RetryAdvancesACutoffThatPredatesTheRevocation(t *testing.T
 func TestChangeStatus_RetryReportsAFailingCutoff(t *testing.T) {
 	ctx := context.Background()
 	newFixture := func(t *testing.T) (*WalletLifecycleService, *failStore, string) {
-		fs := newFailStore().failOnCall("users.InvalidateAuthBefore", 2)
+		fs := newFailStore().failOnCalls("users.InvalidateAuthBefore", 2, 3)
 		svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
 		uid := seedWalletUser(t, fs.Store)
 		require.NoError(t, fs.Store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
