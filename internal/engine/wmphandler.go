@@ -44,6 +44,7 @@ type WMPAdapter struct {
 	peers             map[string]*wmpSession      // keyed by WMP session ID
 	resumptionTokens  map[string]*resumptionEntry // token -> entry with session ID and expiry
 	eventBufs         map[string]*wmpEventBuffer  // keyed by WMP session ID; survives resume unlike peers
+	outbound          map[string]outboundRequest  // server->client request IDs awaiting a response (see trackOutbound)
 	externalURL       string                      // public base URL for discovery (SetExternalURL)
 	draining          bool                        // set by Drain/Close; new sessions and requests are refused
 	beforeCreateToken func(sessionID string)      // test hook: runs between publishing a new peer and issuing its token
@@ -296,18 +297,26 @@ func (b *wmpEventBuffer) missedSince(lastReceivedID string) int {
 // session's event buffer as they are emitted. It exits when ctx (the
 // wmpSession's context) is cancelled, after draining whatever is still
 // queued, and then closes done.
-func pumpEvents(ctx context.Context, ct *wmp.ChannelTransport, buf *wmpEventBuffer, done chan<- struct{}) {
+func pumpEvents(ctx context.Context, ct *wmp.ChannelTransport, buf *wmpEventBuffer, done chan<- struct{}, onOut func([]byte)) {
 	defer close(done)
 	out := ct.Out()
+	emit := func(data []byte) {
+		// Track before the event becomes visible to the client, so a
+		// response can never arrive ahead of its registration.
+		if onOut != nil {
+			onOut(data)
+		}
+		buf.append(data)
+	}
 	for {
 		select {
 		case data := <-out:
-			buf.append(data)
+			emit(data)
 		case <-ctx.Done():
 			for {
 				select {
 				case data := <-out:
-					buf.append(data)
+					emit(data)
 				default:
 					return
 				}
@@ -442,6 +451,7 @@ func NewWMPAdapter(manager *Manager, logger *zap.Logger, bearerToken func(*http.
 		peers:            make(map[string]*wmpSession),
 		resumptionTokens: make(map[string]*resumptionEntry),
 		eventBufs:        make(map[string]*wmpEventBuffer),
+		outbound:         make(map[string]outboundRequest),
 		stopCh:           make(chan struct{}),
 		loopDone:         make(chan struct{}),
 	}
@@ -517,6 +527,12 @@ func (a *WMPAdapter) cleanupExpired() {
 	for token, entry := range a.resumptionTokens {
 		if now.After(entry.expiresAt) {
 			delete(a.resumptionTokens, token)
+		}
+	}
+	// Remove outbound requests whose Call() has long since timed out.
+	for id, o := range a.outbound {
+		if now.After(o.expiresAt) {
+			delete(a.outbound, id)
 		}
 	}
 
@@ -618,6 +634,14 @@ func (a *WMPAdapter) HandleRPCAs(ctx context.Context, sessionID string, caller w
 		return a.handleSessionResume(ctx, caller, msg)
 	}
 
+	// A response carries no session identity of its own: go-wmp's HTTPS+SSE
+	// client sets only the headers it was configured with at construction
+	// (before session.create), and a response has no params.wmp.session_id.
+	// Route it by the server-initiated request ID it answers.
+	if msg.IsResponse() {
+		return a.routeResponse(ctx, sessionID, caller, msg, body)
+	}
+
 	// All other methods require an existing session.
 	if sessionID == "" {
 		return wmpErrorBytes(nil, wmp.ErrNotAuthorized, map[string]string{
@@ -715,6 +739,11 @@ func (a *WMPAdapter) dropSessionStateLocked(sessionID string) {
 	for token, entry := range a.resumptionTokens {
 		if entry.sessionID == sessionID {
 			delete(a.resumptionTokens, token)
+		}
+	}
+	for id, o := range a.outbound {
+		if o.sessionID == sessionID {
+			delete(a.outbound, id)
 		}
 	}
 }
@@ -935,7 +964,7 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 	a.mu.Unlock()
 
 	// Buffer notifications as they are emitted (see pumpEvents).
-	go pumpEvents(sessionCtx, ct, buf, ws.pumpDone)
+	go pumpEvents(sessionCtx, ct, buf, ws.pumpDone, func(data []byte) { a.trackOutbound(sessionID, data) })
 
 	// Start the peer's read loop in a goroutine (for processing responses
 	// to outbound Call() requests, if any).
@@ -1214,7 +1243,7 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 		})
 	}
 
-	go pumpEvents(sessionCtx, ct, buf, ws.pumpDone)
+	go pumpEvents(sessionCtx, ct, buf, ws.pumpDone, func(data []byte) { a.trackOutbound(params.SessionID, data) })
 	go func() {
 		_ = peer.Serve(sessionCtx)
 		a.closeSessionIfCurrent(params.SessionID, ws)
@@ -2209,4 +2238,79 @@ func wmpResponseBytes(id json.RawMessage, result interface{}) ([]byte, error) {
 		return wmpErrorBytes(id, wmp.ErrInternalError, nil)
 	}
 	return json.Marshal(resp)
+}
+
+// wmpOutboundRequestTTL bounds how long a tracked server-initiated request ID
+// stays routable: the Call() timeout plus slack. Entries are also removed when
+// answered and when their session closes.
+const wmpOutboundRequestTTL = childFlowStartTimeout + 30*time.Second
+
+// outboundRequest is a server->client JSON-RPC request awaiting its response.
+type outboundRequest struct {
+	sessionID string
+	expiresAt time.Time
+}
+
+// trackOutbound records the ID of a server-initiated request (a message with
+// both an id and a method) emitted on the session's transport, so the client's
+// response envelope can be routed back to the session without a session header.
+func (a *WMPAdapter) trackOutbound(sessionID string, data []byte) {
+	var env struct {
+		ID     json.RawMessage `json:"id"`
+		Method string          `json:"method"`
+	}
+	if json.Unmarshal(data, &env) != nil || env.Method == "" || len(env.ID) == 0 || string(env.ID) == "null" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.outbound == nil {
+		a.outbound = make(map[string]outboundRequest)
+	}
+	a.outbound[string(env.ID)] = outboundRequest{sessionID: sessionID, expiresAt: time.Now().Add(wmpOutboundRequestTTL)}
+}
+
+// routeResponse delivers a client response to the session that has the
+// matching outstanding server-initiated request. With a session ID (header or
+// metadata) the session is the one named, already ownership-checked by the
+// HTTP layer; the matching tracked ID, if any, is consumed. Without one the
+// session is found via the request ID, and the caller must own it. IDs are
+// one-shot; unknown, expired, already-answered, or foreign IDs are rejected
+// identically so nothing is revealed about other users' requests.
+func (a *WMPAdapter) routeResponse(ctx context.Context, sessionID string, caller wmpCaller, msg *wmp.Message, body []byte) ([]byte, error) {
+	key := string(msg.ID)
+	var ws *wmpSession
+
+	a.mu.Lock()
+	o, tracked := a.outbound[key]
+	if tracked && time.Now().After(o.expiresAt) {
+		delete(a.outbound, key)
+		tracked = false
+	}
+	if sessionID != "" {
+		if tracked && o.sessionID == sessionID {
+			delete(a.outbound, key)
+		}
+		ws = a.peers[sessionID]
+	} else if tracked {
+		if cand, ok := a.peers[o.sessionID]; ok && ownsSession(cand, caller) {
+			// Consume only for the owner: a foreign token must not be able to
+			// burn another user's pending ID.
+			delete(a.outbound, key)
+			ws = cand
+			sessionID = o.sessionID
+		}
+	}
+	a.mu.Unlock()
+
+	if ws == nil {
+		if sessionID != "" {
+			return wmpErrorBytes(nil, wmp.ErrSessionNotFound, nil)
+		}
+		return wmpErrorBytes(nil, wmp.ErrNotAuthorized, map[string]string{
+			"reason": "unknown or unauthorized response ID",
+		})
+	}
+	a.touchSession(sessionID)
+	return ws.peer.HandleRequestSync(ctx, body)
 }
