@@ -127,6 +127,7 @@ func ValidateAnyAudience(secret string, issuers []string, rawToken string) (*cla
 		jwt.WithValidMethods([]string{"HS256", "HS384", "HS512"}),
 		jwt.WithLeeway(legacyLeeway),
 		jwt.WithExpirationRequired(),
+		jwt.WithIssuedAt(),
 	)
 	lc := &legacyClaims{}
 	token, err := parser.ParseWithClaims(rawToken, lc, func(t *jwt.Token) (interface{}, error) {

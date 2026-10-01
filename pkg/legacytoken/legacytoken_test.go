@@ -170,12 +170,18 @@ func TestValidateAnyAudience(t *testing.T) {
 		}
 	}
 
+	// Positive control for iat: a past iat is accepted.
+	if _, err := ValidateAnyAudience(secret, issuers, good(func(c jwt.MapClaims) { c["iat"] = time.Now().Add(-time.Minute).Unix() })); err != nil {
+		t.Fatalf("token with past iat rejected: %v", err)
+	}
+
 	// Negative cases (non-vacuous: each differs from the control in one thing).
 	expired := good(func(c jwt.MapClaims) { c["exp"] = time.Now().Add(-time.Hour).Unix() })
 	noExp := good(func(c jwt.MapClaims) { delete(c, "exp") })
 	badIss := good(func(c jwt.MapClaims) { c["iss"] = "someone-else" })
 	noIss := good(func(c jwt.MapClaims) { delete(c, "iss") })
 	notYet := good(func(c jwt.MapClaims) { c["nbf"] = time.Now().Add(time.Hour).Unix() })
+	futureIat := good(func(c jwt.MapClaims) { c["iat"] = time.Now().Add(time.Hour).Unix() })
 	wrongSecret := hsToken(t, jwt.SigningMethodHS256, "another-secret-another-secret-00000", jwt.MapClaims{
 		"iss": "wallet-backend", "exp": time.Now().Add(time.Hour).Unix()})
 	none, err := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{"iss": "wallet-backend", "exp": time.Now().Add(time.Hour).Unix()}).
@@ -184,7 +190,7 @@ func TestValidateAnyAudience(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, tok := range map[string]string{"expired": expired, "no exp": noExp, "bad issuer": badIss, "no issuer": noIss,
-		"nbf in future": notYet, "wrong secret": wrongSecret, "alg none": none, "garbage": "x.y.z"} {
+		"nbf in future": notYet, "iat in future": futureIat, "wrong secret": wrongSecret, "alg none": none, "garbage": "x.y.z"} {
 		if _, err := ValidateAnyAudience(secret, issuers, tok); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
