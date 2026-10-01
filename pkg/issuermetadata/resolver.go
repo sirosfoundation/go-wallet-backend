@@ -429,7 +429,7 @@ func validateCredentialIssuerClaim(claims map[string]interface{}, issuerURL stri
 	if credentialIssuer == "" {
 		return fmt.Errorf("metadata missing required 'credential_issuer' claim")
 	}
-	if credentialIssuer != issuerURL {
+	if !oidc.SameIssuerIdentifier(credentialIssuer, issuerURL) {
 		return fmt.Errorf("metadata 'credential_issuer' claim %q does not match issuer URL %q", credentialIssuer, issuerURL)
 	}
 	return nil
@@ -601,9 +601,7 @@ func validateJWTClaims(claims map[string]interface{}, issuerURL string) error {
 	if sub == "" {
 		return fmt.Errorf("JWT payload missing required 'sub' claim")
 	}
-	normalizedSub := strings.TrimSuffix(sub, "/")
-	normalizedIssuer := strings.TrimSuffix(issuerURL, "/")
-	if normalizedSub != normalizedIssuer {
+	if !oidc.SameIssuerIdentifier(sub, issuerURL) {
 		return fmt.Errorf("JWT 'sub' claim %q does not match issuer URL %q", sub, issuerURL)
 	}
 

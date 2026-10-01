@@ -1078,3 +1078,74 @@ func TestResolve_TrustEvaluatorError(t *testing.T) {
 		t.Errorf("expected propagated error, got: %v", err)
 	}
 }
+
+// The credential_issuer claim is compared as an identifier: a root slash on
+// either the requested or the declared side must not cause a rejection, while
+// a path difference (including a trailing slash on a path) still does.
+func TestResolve_CredentialIssuerRootSlashSymmetric(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		reqSlash  bool
+		declSlash bool
+	}{
+		{"neither", false, false},
+		{"requested only", true, false},
+		{"declared only", false, true},
+		{"both", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var server *httptest.Server
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				id := server.URL
+				if tc.declSlash {
+					id += "/"
+				}
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]string{"credential_issuer": id}) //nolint:errcheck
+			}))
+			defer server.Close()
+			req := server.URL
+			if tc.reqSlash {
+				req += "/"
+			}
+			if _, err := newTestResolver(t).Resolve(context.Background(), req); err != nil {
+				t.Fatalf("Resolve(%q) error: %v", req, err)
+			}
+		})
+	}
+}
+
+func TestResolve_CredentialIssuerPathSlashStillExact(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL + "/tenant"}) //nolint:errcheck
+	}))
+	defer server.Close()
+	_, err := newTestResolver(t).Resolve(context.Background(), server.URL+"/tenant/")
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("expected mismatch for differing path slash, got %v", err)
+	}
+}
+
+func TestValidateIssuerClaims_RootSlashAndQuery(t *testing.T) {
+	cases := []struct {
+		claim, issuer string
+		ok            bool
+	}{
+		{"https://i.example.com/", "https://i.example.com", true},
+		{"https://i.example.com", "https://i.example.com/", true},
+		{"https://i.example.com/t", "https://i.example.com/t/", false},
+		{"https://i.example.com/t/", "https://i.example.com/t", false},
+		{"https://i.example.com?r=https://c/", "https://i.example.com?r=https://c/", true},
+		{"https://i.example.com?r=https://c", "https://i.example.com?r=https://c/", false},
+	}
+	for _, c := range cases {
+		if got := validateCredentialIssuerClaim(map[string]interface{}{"credential_issuer": c.claim}, c.issuer) == nil; got != c.ok {
+			t.Errorf("credential_issuer %q vs %q: ok=%v want %v", c.claim, c.issuer, got, c.ok)
+		}
+		if got := validateJWTClaims(map[string]interface{}{"sub": c.claim, "iat": 1}, c.issuer) == nil; got != c.ok {
+			t.Errorf("sub %q vs %q: ok=%v want %v", c.claim, c.issuer, got, c.ok)
+		}
+	}
+}

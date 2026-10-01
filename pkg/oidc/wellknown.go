@@ -53,3 +53,20 @@ func NormalizeIssuerURL(rawURL string) string {
 	}
 	return rawURL
 }
+
+// SameIssuerIdentifier reports whether two issuer identifiers denote the same
+// issuer. The comparison is exact except for the one equivalence RFC 3986
+// §6.2.3 defines for http(s) URLs: an empty path and "/" are the same
+// (so "https://issuer.example.com" == "https://issuer.example.com/"). The
+// normalisation is applied identically to BOTH sides, so a document that
+// declares its identifier with or without the root slash matches a configured
+// identifier written either way. Paths, queries and fragments are otherwise
+// compared byte for byte; in particular "/tenant" and "/tenant/" differ.
+//
+// Use this for comparing identifiers (metadata issuer / credential_issuer,
+// JWT iss / sub). NormalizeIssuerURL alone is only for building well-known
+// URLs and cache keys and must never be applied to just one side of a
+// comparison.
+func SameIssuerIdentifier(a, b string) bool {
+	return a == b || NormalizeIssuerURL(a) == NormalizeIssuerURL(b)
+}

@@ -100,3 +100,35 @@ func TestNormalizeIssuerURL(t *testing.T) {
 		})
 	}
 }
+
+func TestSameIssuerIdentifier(t *testing.T) {
+	tests := []struct {
+		name string
+		a, b string
+		want bool
+	}{
+		{"identical", "https://i.example.com", "https://i.example.com", true},
+		{"root slash on left", "https://i.example.com/", "https://i.example.com", true},
+		{"root slash on right", "https://i.example.com", "https://i.example.com/", true},
+		{"root slash both", "https://i.example.com/", "https://i.example.com/", true},
+		{"path identical", "https://i.example.com/t", "https://i.example.com/t", true},
+		{"path slash left only differs", "https://i.example.com/t/", "https://i.example.com/t", false},
+		{"path slash right only differs", "https://i.example.com/t", "https://i.example.com/t/", false},
+		{"different path", "https://i.example.com/a", "https://i.example.com/b", false},
+		{"different host", "https://i.example.com", "https://j.example.com", false},
+		{"query identical", "https://i.example.com/?x=1", "https://i.example.com/?x=1", true},
+		{"query slash value kept", "https://i.example.com?r=https://c/", "https://i.example.com?r=https://c", false},
+		{"query vs none", "https://i.example.com?x=1", "https://i.example.com", false},
+		{"root slash then query equal", "https://i.example.com/?x=1", "https://i.example.com?x=1", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := SameIssuerIdentifier(tt.a, tt.b); got != tt.want {
+				t.Errorf("SameIssuerIdentifier(%q,%q)=%v want %v", tt.a, tt.b, got, tt.want)
+			}
+			if got := SameIssuerIdentifier(tt.b, tt.a); got != tt.want {
+				t.Errorf("not symmetric for (%q,%q)", tt.b, tt.a)
+			}
+		})
+	}
+}
