@@ -36,6 +36,9 @@ const (
 	// maxCacheTTL caps a publisher-chosen ttl so a revocation is never hidden
 	// for longer than this, whatever the list claims.
 	maxCacheTTL = time.Hour
+	// maxTTLSeconds bounds a ttl claim before it is converted to a Duration
+	// (about 68 years; far above maxCacheTTL, far below overflow).
+	maxTTLSeconds = 1 << 31
 	// maxCacheEntries and maxCacheBytes bound the cache (the latter counts
 	// inflated list bytes, which can be large); on overflow it is reset.
 	maxCacheEntries = 256
@@ -626,8 +629,22 @@ func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial,
 	// (not from when this wallet fetched it). Without ttl, a default window
 	// from now applies. exp and maxCacheTTL cap it.
 	expires := now.Add(defaultCacheTTL)
-	if lc.ttl != nil && *lc.ttl > 0 {
-		expires = time.Unix(*lc.iat, 0).Add(time.Duration(*lc.ttl) * time.Second)
+	if lc.ttl != nil {
+		// draft-ietf-oauth-status-list: ttl is a positive integer. A present
+		// ttl of zero or below is a malformed claim (like any other present
+		// but invalid claim), never silently read as absent.
+		if *lc.ttl <= 0 {
+			return parsedList{}, fmt.Errorf("status list ttl %d is not a positive integer", *lc.ttl)
+		}
+		// Clamp before converting to a Duration: seconds * 1e9 overflows
+		// int64 above ~292 years and would wrap to a negative or tiny
+		// lifetime. maxCacheTTL below is the effective cap; this bound only
+		// has to be far above it and safely inside time.Time's range.
+		secs := *lc.ttl
+		if secs > maxTTLSeconds {
+			secs = maxTTLSeconds
+		}
+		expires = time.Unix(*lc.iat, 0).Add(time.Duration(secs) * time.Second)
 	}
 	if lc.nbf != nil && now.Before(time.Unix(*lc.nbf, 0)) {
 		return parsedList{}, errors.New("status list token is not yet valid (nbf)")

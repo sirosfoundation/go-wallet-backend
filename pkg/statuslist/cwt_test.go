@@ -12,6 +12,8 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
+	"fmt"
+	"math"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -748,4 +750,59 @@ func TestCWT_NullStandardStatusListIsNotAbsent(t *testing.T) {
 			t.Fatalf("want ErrRevoked, got %v", err)
 		}
 	})
+}
+
+// ttl must be a positive integer in the CWT form too (standard and legacy
+// labels); an oversized one is capped, not overflowed.
+func TestCWT_TTLValues(t *testing.T) {
+	ctx := context.Background()
+	for _, legacy := range []bool{false, true} {
+		label := int64(cwtClaimTTL)
+		if legacy {
+			label = cwtClaimLegacyTTL
+		}
+		for _, tc := range []struct {
+			name    string
+			ttl     any
+			wantErr bool
+		}{
+			{"valid", 900, false},
+			{"huge (largest the CWT reader accepts, 2^62)", int64(1) << 62, false},
+			{"beyond int64 is not an integer", uint64(1) << 63, true},
+			{"zero", 0, true},
+			{"negative", -1, true},
+			{"min int64", int64(math.MinInt64), true},
+		} {
+			t.Run(fmt.Sprintf("legacy=%v/%s", legacy, tc.name), func(t *testing.T) {
+				called := false
+				c, uri, _ := serveCWT(t, func(u string) []byte {
+					return makeCWT(t, cwtOpts{sub: u, legacy: legacy, claims: map[int64]any{label: tc.ttl}})
+				}, mediaTypeCWT, func(context.Context, string, *trust.KeyMaterial) (bool, error) {
+					called = true
+					return true, nil
+				})
+				err := c.Check(ctx, &Reference{Idx: 1, URI: uri})
+				if tc.wantErr {
+					if err == nil || errors.Is(err, ErrRevoked) || !strings.Contains(err.Error(), "ttl") {
+						t.Fatalf("got %v, want a ttl error", err)
+					}
+					if called {
+						t.Fatal("trust consulted for a malformed token")
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, e := range c.cache {
+					if rem := e.expires.Sub(time.Now()); rem <= 0 || rem > maxCacheTTL {
+						t.Fatalf("cached lifetime %v out of (0, %v]", rem, maxCacheTTL)
+					}
+				}
+				if len(c.cache) != 1 {
+					t.Fatalf("cache entries = %d, want 1", len(c.cache))
+				}
+			})
+		}
+	}
 }
