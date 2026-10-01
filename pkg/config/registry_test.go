@@ -729,7 +729,7 @@ func TestLoadRegistryOnly_IgnoresBackendOnlySecretFiles(t *testing.T) {
 	_, err = LoadRegistryOnly(p)
 	assert.ErrorContains(t, err, "jwt.secret_path")
 	sp := writeFile(t, dir, "secret", "0123456789abcdef0123456789abcdef\n")
-	p = writeFile(t, dir, "c3.yaml", "jwt:\n  secret_path: "+sp+"\nserver:\n  admin_token_path: "+missing+"\n")
+	p = writeFile(t, dir, "c3.yaml", "jwt:\n  secret_path: "+sp+"\nserver:\n  rp_id: wallet.example.org\n  admin_token_path: "+missing+"\n")
 	cfg, err = LoadRegistryOnly(p)
 	require.NoError(t, err)
 	assert.Equal(t, "0123456789abcdef0123456789abcdef", cfg.JWT.Secret)
@@ -743,4 +743,29 @@ func TestApplyLegacyRegistryConfig_CombinedDoesNotReadOldSecretFile(t *testing.T
 	require.NoError(t, err, "combined mode uses the backend jwt settings")
 	_, err = defaultConfig().ApplyLegacyRegistryConfig(old, true)
 	assert.ErrorContains(t, err, "jwt.secret_path", "standalone still needs it")
+}
+
+func TestConfig_ValidateRegistryStandalone_LegacyRPID(t *testing.T) {
+	c := defaultConfig()
+	c.AS.Legacy.Enabled = true
+	c.JWT.Secret = strings.Repeat("s", 32)
+	err := c.ValidateRegistryStandalone()
+	require.Error(t, err, "default rp_id would reject every legacy token")
+	assert.Contains(t, err.Error(), "server.rp_id")
+
+	c.Server.RPID = ""
+	require.Error(t, c.ValidateRegistryStandalone())
+
+	c.Server.RPID = "wallet.example.org"
+	require.NoError(t, c.ValidateRegistryStandalone())
+
+	c = defaultConfig()
+	c.AS.Legacy.Enabled = false
+	c.JWT.Secret = strings.Repeat("s", 32)
+	require.NoError(t, c.ValidateRegistryStandalone(), "legacy disabled")
+
+	c = defaultConfig()
+	c.AS.Legacy.Enabled = true
+	c.JWT.Secret = ""
+	require.NoError(t, c.ValidateRegistryStandalone(), "no secret, legacy unusable")
 }

@@ -334,7 +334,12 @@ docker run -p 8097:8097 -v $PWD/registry.yaml:/etc/wallet/config.yaml \
 
 A registry-only process listens on `server.registry_host`/`server.registry_port`
 (default `0.0.0.0:8097`); `WALLET_SERVER_REGISTRY_PORT` overrides it. Backend-only
-settings (storage, `jwt.secret` when not needed, `rp_id`, ...) are not required.
+settings (storage, `jwt.secret` when not needed, ...) are not required. The one
+exception is `server.rp_id`: while `as.legacy.enabled` is true and a `jwt.secret`
+is configured, it must be set to the RP ID of the backend that issues the legacy
+HMAC tokens (their `aud` claim; go-tokenauth applies its audience list to them
+too). Startup fails with a clear error if it is left at the default `localhost`;
+alternatively set `as.legacy.enabled: false`.
 
 When `registry.require_auth` is `true` the process needs the settings to build
 the shared token validator (the AS itself is *not* run, keep `as.enabled` false):

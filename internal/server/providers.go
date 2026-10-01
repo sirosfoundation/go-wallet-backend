@@ -890,7 +890,9 @@ type RegistryProvider struct {
 // registryTokenAudiences is the "aud" list the registry's token validator
 // accepts: the registry audience for AS-issued tokens and, when legacy HMAC
 // tokens are enabled, the RP ID (their audience, see UserService/
-// WebAuthnService).
+// WebAuthnService). go-tokenauth cannot exempt legacy tokens from its audience
+// list, so a registry-only process must have server.rp_id set to the issuing
+// backend's RP ID (config.ValidateRegistryStandalone enforces it).
 func registryTokenAudiences(cfg *config.Config) []string {
 	auds := []string{config.RegistryAudience}
 	if cfg.AS.Legacy.Enabled && cfg.Server.RPID != "" {

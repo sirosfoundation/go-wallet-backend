@@ -414,6 +414,25 @@ func (c *Config) ValidateRegistryStandalone() error {
 	if err := c.Server.validateTrustedProxies(); err != nil {
 		return err
 	}
+	return c.validateStandaloneLegacyAudience()
+}
+
+// validateStandaloneLegacyAudience fails startup when a registry-only process
+// would validate legacy HMAC tokens but server.rp_id is still at its default.
+// go-tokenauth applies its audience list to legacy tokens as well, and legacy
+// tokens carry the issuing backend's RP ID as "aud" (the validator has no way
+// to exempt them), so with the default RP ID every token minted by a real
+// backend would be silently rejected.
+func (c *Config) validateStandaloneLegacyAudience() error {
+	if !c.AS.Legacy.Enabled || c.JWT.Secret == "" {
+		return nil
+	}
+	if c.Server.RPID == "" || c.Server.RPID == "localhost" {
+		return fmt.Errorf("server.rp_id must be set to the RP ID of the backend that issues the legacy tokens " +
+			"(their \"aud\" claim) when a registry-only process validates legacy HMAC tokens " +
+			"(as.legacy.enabled with jwt.secret); it is unset or the default \"localhost\", which would reject every such token. " +
+			"Set server.rp_id (WALLET_SERVER_RP_ID) or set as.legacy.enabled=false")
+	}
 	return nil
 }
 

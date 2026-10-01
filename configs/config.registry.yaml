@@ -9,6 +9,11 @@
 #   WALLET_SERVER_REGISTRY_PORT, WALLET_AS_EXTERNAL_URL, WALLET_JWT_SECRET.
 
 server:
+  # Required while as.legacy.enabled is true and jwt.secret is set: the RP ID
+  # of the backend that issues the legacy HMAC tokens (their "aud" claim).
+  # Startup fails if it is left at the default "localhost". Not needed with
+  # as.legacy.enabled=false.
+  # rp_id: "wallet.example.org"
   host: "0.0.0.0"
   # Registry-only processes listen on registry_port (default 8097).
   registry_port: 8097

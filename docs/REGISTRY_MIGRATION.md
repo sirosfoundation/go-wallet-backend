@@ -55,6 +55,11 @@ roles, also when the process does not run the authorization server:
 - legacy HMAC tokens are accepted while `as.legacy.enabled` is true, are checked
   against `jwt.secret` (>= 32 bytes) and are never rejected because of the
   audience list;
+- legacy validation also needs `server.rp_id` set to the RP ID of the backend
+  that issued the tokens (their `aud` claim; go-tokenauth applies the audience
+  list to legacy tokens too, so the registry cannot exempt them). A registry-only
+  process refuses to start with the default `localhost` while legacy HMAC
+  validation is enabled;
 - `as.external_url`, `as.issuer` (or `jwt.issuer`) and, while legacy is enabled,
   `jwt.secret`/`jwt.secret_path` must be set; startup names the missing ones.
 
