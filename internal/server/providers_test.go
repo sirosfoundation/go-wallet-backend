@@ -1682,6 +1682,10 @@ func TestConfigureWMPExternalURL(t *testing.T) {
 			logger := zap.NewNop()
 			manager := wsengine.NewManager(cfg, logger)
 			adapter := wsengine.NewWMPAdapter(manager, logger, func(*http.Request) string { return "" })
+			t.Cleanup(func() {
+				adapter.Close()
+				manager.Close()
+			})
 			configureWMPExternalURL(adapter, cfg, logger)
 
 			w := httptest.NewRecorder()

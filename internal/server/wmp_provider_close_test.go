@@ -37,8 +37,8 @@ func TestEngineProvider_Close_StopsWMPAdapter(t *testing.T) {
 	cfg := &config.Config{}
 	manager := wsengine.NewManager(cfg, logger)
 
-	// Other tests in this package may leave their own adapters running, so
-	// compare against the baseline rather than expecting zero.
+	// Tests running concurrently in this package may hold live adapters of
+	// their own, so compare against the baseline rather than expecting zero.
 	before := cleanupLoops()
 	adapter := wsengine.NewWMPAdapter(manager, logger, middleware.ExtractBearerToken)
 	if cleanupLoops() != before+1 {

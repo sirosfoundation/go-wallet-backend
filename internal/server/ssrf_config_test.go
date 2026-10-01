@@ -216,6 +216,7 @@ func TestNewEngineProvider_AllowHTTPWiring(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewEngineProvider failed: %v", err)
 			}
+			t.Cleanup(provider.Close)
 
 			if provider.metadataResolver == nil {
 				t.Fatal("the provider registered its flow handlers without a metadata resolver")
