@@ -142,6 +142,14 @@ func (s *ProxyService) Execute(ctx context.Context, req *ProxyRequest) (*ProxyRe
 	// Set a generic user-agent to avoid fingerprinting
 	httpReq.Header.Set("User-Agent", "SIROS-Wallet/1.0")
 
+	// Final recheck immediately before dispatch. The early check above is a
+	// fast fail; marshaling, request construction and header processing run
+	// between it and the send, and a cut-off landing in that window must
+	// still stop the request, since it acts on a third party as the wallet.
+	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
+		return nil, nil, err
+	}
+
 	// Execute the request
 	resp, err := s.client.Do(httpReq)
 	if err != nil {

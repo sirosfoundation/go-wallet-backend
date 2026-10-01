@@ -105,3 +105,30 @@ func TestProxyService_Execute_CutoffAfterAdmissionIsRefused(t *testing.T) {
 	assert.ErrorIs(t, err, tokengate.ErrRevoked)
 	assert.Zero(t, hits.Load(), "the outbound request must not be made")
 }
+
+// The early check passes, then the cut-off lands during marshaling, request
+// construction or header processing: the final recheck immediately before
+// dispatch must still stop the outbound request.
+func TestProxyService_Execute_CutoffBetweenEarlyCheckAndDispatchIsRefused(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+	}))
+	defer server.Close()
+
+	base := context.Background()
+	store := memory.NewStore()
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(base, &domain.User{UUID: uid}))
+	cutoff := time.Now().Truncate(time.Second)
+	svc := NewProxyService(&config.Config{HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true}}, zap.NewNop())
+	users := &cutoffAdvancingUsers{UserStore: store.Users(), after: 1, cutoff: cutoff}
+	svc.SetUsers(users)
+
+	ctx := tokengate.WithSubject(base, uid.String(), cutoff.Add(-time.Minute))
+	resp, _, err := svc.Execute(ctx, &ProxyRequest{URL: server.URL, Method: "POST", Data: map[string]string{"a": "b"}})
+	assert.ErrorIs(t, err, tokengate.ErrRevoked)
+	assert.Nil(t, resp)
+	assert.Zero(t, hits.Load(), "the outbound request must not be made")
+	assert.Equal(t, 2, users.reads, "the early and the pre-dispatch check must both read the cut-off")
+}
