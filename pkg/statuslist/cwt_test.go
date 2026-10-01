@@ -47,6 +47,40 @@ type cwtOpts struct {
 	legacy    bool                // vc#703 layout: status_list=65534, ttl=65535
 	badSig    bool
 	rawLst    []byte
+	// badLabel is a raw CBOR map key (not an integer or text string) added
+	// to the map named by badLabelIn: "prot", "unprot" or "claims".
+	badLabel   cbor.RawMessage
+	badLabelIn string
+}
+
+// marshalMapWith encodes m as a definite-length CBOR map and, when extra is
+// set, appends one more entry whose key is the given raw CBOR item.
+func marshalMapWith(t *testing.T, m map[int64]any, extra cbor.RawMessage) []byte {
+	t.Helper()
+	if extra == nil {
+		b, err := cbor.Marshal(m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	n := len(m) + 1
+	if n > 23 {
+		t.Fatal("map too large for the test encoder")
+	}
+	out := []byte{0xa0 | byte(n)}
+	for k, v := range m {
+		kb, err := cbor.Marshal(k)
+		if err != nil {
+			t.Fatal(err)
+		}
+		vb, err := cbor.Marshal(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(append(out, kb...), vb...)
+	}
+	return append(append(out, extra...), 0x00)
 }
 
 func selfSigned(t *testing.T, key *ecdsa.PrivateKey) []byte {
@@ -124,10 +158,16 @@ func makeCWT(t *testing.T, o cwtOpts) []byte {
 	for k, v := range o.claims {
 		claims[k] = v
 	}
-	payload, err := cbor.Marshal(claims)
-	if err != nil {
-		t.Fatal(err)
+	var claimsExtra, protExtra, unprotExtra cbor.RawMessage
+	switch o.badLabelIn {
+	case "claims":
+		claimsExtra = o.badLabel
+	case "prot":
+		protExtra = o.badLabel
+	case "unprot":
+		unprotExtra = o.badLabel
 	}
+	payload := marshalMapWith(t, claims, claimsExtra)
 
 	prot := map[int64]any{coseHdrAlg: o.alg}
 	unprot := map[int64]any{4: []byte("prototype-1")} // kid
@@ -149,7 +189,7 @@ func makeCWT(t *testing.T, o cwtOpts) []byte {
 			prot[coseHdrX5Chain] = chain
 		}
 	}
-	protBytes, _ := cbor.Marshal(prot)
+	protBytes := marshalMapWith(t, prot, protExtra)
 	tbs, _ := cbor.Marshal([]any{"Signature1", protBytes, []byte{}, payload})
 	var h crypto.Hash
 	size := (curve.Params().BitSize + 7) / 8
@@ -173,7 +213,11 @@ func makeCWT(t *testing.T, o cwtOpts) []byte {
 	if o.badSig {
 		sig[0] ^= 0xff
 	}
-	arr := []any{protBytes, unprot, payload, sig}
+	var unprotItem any = unprot
+	if unprotExtra != nil {
+		unprotItem = cbor.RawMessage(marshalMapWith(t, unprot, unprotExtra))
+	}
+	arr := []any{protBytes, unprotItem, payload, sig}
 	var out []byte
 	if o.wrap != nil {
 		out, err = cbor.Marshal(o.wrap(arr))
@@ -807,6 +851,63 @@ func TestCWT_TTLValues(t *testing.T) {
 					t.Fatalf("cache entries = %d, want 1", len(c.cache))
 				}
 			})
+		}
+	}
+}
+
+// A COSE label is an integer or a text string. A map in the headers or the
+// claims that carries any other key type is malformed, never skipped, even
+// when the signature is valid.
+func TestParseCWT_NonIntegerNonTextLabelsMalformed(t *testing.T) {
+	ctx := context.Background()
+	labels := map[string]cbor.RawMessage{
+		"boolean":     {0xf5},
+		"byte string": {0x41, 0x01},
+		"float":       {0xfb, 0x3f, 0xf8, 0, 0, 0, 0, 0, 0},
+		"array":       {0x81, 0x01},
+		"map":         {0xa1, 0x01, 0x01},
+	}
+	for name, label := range labels {
+		for _, in := range []string{"prot", "unprot", "claims"} {
+			t.Run(name+" in "+in, func(t *testing.T) {
+				c, uri, _ := serveCWT(t, func(u string) []byte {
+					return makeCWT(t, cwtOpts{sub: u, badLabel: label, badLabelIn: in})
+				}, mediaTypeCWT, trustAll)
+				err := c.Check(ctx, &Reference{Idx: 1, URI: uri})
+				if err == nil || errors.Is(err, ErrRevoked) {
+					t.Fatalf("got %v, want a malformed-token error", err)
+				}
+			})
+		}
+	}
+}
+
+func TestDecodeHeaderLabels_KeyTypes(t *testing.T) {
+	// Valid integer and text labels are kept; a repeated label is refused.
+	ints, texts, err := decodeHeaderLabels(marshalMapWith(t, map[int64]any{1: -7, 4: "k"}, nil))
+	if err != nil || len(ints) != 2 || len(texts) != 0 {
+		t.Fatalf("int labels: %v %v %v", ints, texts, err)
+	}
+	ints, texts, err = decodeHeaderLabels([]byte{0xa2, 0x01, 0x01, 0x63, 'e', 'x', 't', 0x02})
+	if err != nil || len(ints) != 1 || !texts["ext"] {
+		t.Fatalf("mixed labels: %v %v %v", ints, texts, err)
+	}
+	if _, _, err = decodeHeaderLabels([]byte{0xa2, 0x01, 0x01, 0x01, 0x02}); err == nil {
+		t.Fatal("repeated integer label accepted")
+	}
+	if _, _, err = decodeHeaderLabels([]byte{0xa2, 0x63, 'e', 'x', 't', 0x01, 0x63, 'e', 'x', 't', 0x02}); err == nil {
+		t.Fatal("repeated text label accepted")
+	}
+	for name, m := range map[string][]byte{
+		"boolean":     {0xa1, 0xf5, 0x00},
+		"byte string": {0xa1, 0x41, 0x01, 0x00},
+		"float":       {0xa1, 0xfb, 0x3f, 0xf8, 0, 0, 0, 0, 0, 0, 0x00},
+		"array":       {0xa1, 0x81, 0x01, 0x00},
+		"map":         {0xa1, 0xa1, 0x01, 0x01, 0x00},
+		"mixed":       {0xa2, 0x01, 0x01, 0xf5, 0x00},
+	} {
+		if _, _, err := decodeHeaderLabels(m); err == nil {
+			t.Errorf("%s label accepted", name)
 		}
 	}
 }

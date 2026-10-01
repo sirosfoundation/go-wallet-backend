@@ -325,7 +325,8 @@ func decodeHeaderBucket(b []byte) (map[int64]any, error) {
 // decodeHeaderLabels decodes a COSE header map with mixed keys. Integer
 // labels are returned with their values; text labels are returned only as a
 // set so that cross-bucket duplicates can be rejected (RFC 9052 section 3).
-// A repeated label within the map is an error.
+// A repeated label within the map, or a label that is neither an integer
+// nor a text string, is an error.
 func decodeHeaderLabels(b []byte) (map[int64]any, map[string]bool, error) {
 	var raw map[any]any
 	if err := claimsDecMode.Unmarshal(b, &raw); err != nil {
@@ -338,6 +339,11 @@ func decodeHeaderLabels(b []byte) (map[int64]any, map[string]bool, error) {
 			ints[label] = v
 		} else if t, ok := k.(string); ok {
 			texts[t] = true
+		} else {
+			// COSE labels are integers or text strings (RFC 9052 section
+			// 1.4); any other key type makes the map malformed rather than
+			// being skipped.
+			return nil, nil, fmt.Errorf("label of type %T is neither an integer nor a text string", k)
 		}
 	}
 	return ints, texts, nil
