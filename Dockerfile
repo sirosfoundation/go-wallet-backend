@@ -9,6 +9,7 @@ RUN apk add --no-cache git ca-certificates
 # Build arguments for versioning and source control
 ARG VERSION=dev
 ARG COMMIT=unknown
+ARG BUILD_TIME=unknown
 ARG GIT_REF=
 
 # If GIT_REF is provided, clone from that ref instead of using local context
@@ -30,7 +31,7 @@ COPY . .
 
 # Build with version information
 RUN CGO_ENABLED=0 GOOS=linux go build \
-    -ldflags="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT}" \
+    -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildTime=${BUILD_TIME}" \
     -o server cmd/server/main.go
 
 # Runtime stage

@@ -28,6 +28,7 @@ var (
 	registryConfigFile = flag.String("registry-config", "configs/registry.yaml", "DEPRECATED: path to the old standalone registry configuration file; use the registry: section of --config")
 	modeFlag           = flag.String("mode", "backend", "Operating roles: backend, registry, engine, admin, auth, wallet-provider (comma-separated or 'all')")
 	version            = "dev"
+	commit             = "unknown"
 	buildTime          = "unknown"
 )
 
@@ -106,6 +107,7 @@ func main() {
 
 	logger.Info("Starting Wallet Backend",
 		zap.String("version", version),
+		zap.String("commit", commit),
 		zap.String("build_time", buildTime),
 		zap.Strings("roles", roleStrings),
 	)
