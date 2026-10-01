@@ -347,7 +347,10 @@ const evalFailedReasonPrefix = "Trust evaluation failed"
 //
 // TrustInfo.Action names the action that produced a positive result, so
 // callers can tell a status-list-signer decision from a fallback one. A
-// negative and an error remain distinguishable through TrustInfo.Reason.
+// negative and an error remain distinguishable through
+// TrustInfo.EvaluationFailed (true for an error); the no-PDP case is
+// identified by Framework == FrameworkNone. Callers must never classify an
+// outcome from the human-readable Reason text.
 //
 // The endpoint is resolved like EvaluateIssuer's (session override, then the
 // per-flow issuer PDP URL, then the global PDP URL): a status list signer is an
