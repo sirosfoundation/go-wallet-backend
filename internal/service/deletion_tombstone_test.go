@@ -3,6 +3,9 @@ package service
 import (
 	"context"
 	"errors"
+	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -237,4 +240,142 @@ func TestDeletedAccount_PreDeletionTokenCannotCreateAnInstanceOrWIA(t *testing.T
 		assert.ErrorIs(t, gerr, storage.ErrNotFound)
 	}
 	assert.Empty(t, instances, "no instance may be created for a deleted account")
+}
+
+// gatedTombstoneStore counts concurrent and total sweeps and lets a test hold
+// the first sweep open.
+type gatedTombstoneStore struct {
+	storage.Store
+	users *gatedTombstoneUsers
+}
+
+type gatedTombstoneUsers struct {
+	storage.UserStore
+	mu      sync.Mutex
+	live    int
+	maxLive int
+	total   int
+	entered chan struct{} // closed when the first sweep starts
+	gate    chan struct{} // the first sweep returns when this is closed; nil: never held
+	first   sync.Once
+}
+
+func (g *gatedTombstoneStore) Users() storage.UserStore { return g.users }
+
+func (u *gatedTombstoneUsers) DeleteExpiredDeletionTombstones(ctx context.Context, now time.Time) (int, error) {
+	u.mu.Lock()
+	u.live++
+	u.total++
+	if u.live > u.maxLive {
+		u.maxLive = u.live
+	}
+	u.mu.Unlock()
+	defer func() { u.mu.Lock(); u.live--; u.mu.Unlock() }()
+	u.first.Do(func() {
+		if u.entered != nil {
+			close(u.entered)
+		}
+		if u.gate != nil {
+			<-u.gate
+		}
+	})
+	return 0, nil
+}
+
+func (u *gatedTombstoneUsers) stats() (maxLive, total int) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.maxLive, u.total
+}
+
+func newGatedTombstoneStore() *gatedTombstoneStore {
+	return &gatedTombstoneStore{
+		Store: memory.NewStore(),
+		users: &gatedTombstoneUsers{entered: make(chan struct{}), gate: make(chan struct{})},
+	}
+}
+
+func waitReturns(t *testing.T, what string, d time.Duration, f func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { f(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatalf("%s did not return within %s", what, d)
+	}
+}
+
+// A Start that races a Stop still draining a sweep must not launch a second
+// run next to it: it waits for the Stop, then runs, and the final Stop ends
+// that run.
+func TestDeletionTombstoneSweeper_StartDuringStopWaitsForIt(t *testing.T) {
+	store := newGatedTombstoneStore()
+	sw := NewDeletionTombstoneSweeper(config.DeletionTombstoneConfig{CleanupIntervalSeconds: 3600}, store, zap.NewNop())
+
+	sw.Start()
+	<-store.users.entered // first sweep is in flight and held open
+
+	stopped := make(chan struct{})
+	go func() { sw.Stop(); close(stopped) }()
+	time.Sleep(50 * time.Millisecond) // let Stop take the lock and cancel
+
+	started := make(chan struct{})
+	go func() { sw.Start(); close(started) }()
+	time.Sleep(100 * time.Millisecond)
+
+	maxLive, total := store.users.stats()
+	assert.Equal(t, 1, maxLive, "no second run may sweep while Stop drains the first")
+	assert.Equal(t, 1, total)
+	select {
+	case <-started:
+		t.Fatal("Start returned while Stop was still waiting for the sweep")
+	default:
+	}
+
+	close(store.users.gate)
+	waitReturns(t, "Stop", 5*time.Second, func() { <-stopped })
+	waitReturns(t, "Start", 5*time.Second, func() { <-started })
+
+	waitReturns(t, "final Stop", 5*time.Second, sw.Stop)
+	_, total = store.users.stats()
+	time.Sleep(50 * time.Millisecond)
+	_, after := store.users.stats()
+	assert.Equal(t, total, after, "no sweep may run after the final Stop")
+}
+
+// Concurrent Start/Stop callers never wedge, never run two sweeps at once, and
+// leave nothing running after the last Stop.
+func TestDeletionTombstoneSweeper_ConcurrentStartStop(t *testing.T) {
+	store := newGatedTombstoneStore()
+	close(store.users.gate)
+	sw := NewDeletionTombstoneSweeper(config.DeletionTombstoneConfig{CleanupIntervalSeconds: 3600}, store, zap.NewNop())
+
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				if (i+g)%2 == 0 {
+					sw.Start()
+				} else {
+					sw.Stop()
+				}
+			}
+		}(g)
+	}
+	waitReturns(t, "concurrent Start/Stop callers", 20*time.Second, wg.Wait)
+	waitReturns(t, "final Stop", 5*time.Second, sw.Stop)
+
+	maxLive, _ := store.users.stats()
+	assert.Equal(t, 1, maxLive, "two runs swept at once")
+	assert.Eventually(t, func() bool { return sweeperRunGoroutines() == 0 }, 2*time.Second, 10*time.Millisecond, "run goroutines leaked")
+}
+
+// sweeperRunGoroutines counts the live goroutines executing the sweeper loop.
+func sweeperRunGoroutines() int {
+	buf := make([]byte, 1<<20)
+	buf = buf[:runtime.Stack(buf, true)]
+	return strings.Count(string(buf), "(*DeletionTombstoneSweeper).run(")
 }

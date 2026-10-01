@@ -39,7 +39,8 @@ func NewDeletionTombstoneSweeper(cfg config.DeletionTombstoneConfig, store stora
 }
 
 // Start begins sweeping in the background: once immediately, then every
-// interval. Calling Start on a running sweeper does nothing.
+// interval. Calling Start on a running sweeper does nothing. A Start that
+// races a Stop waits for that Stop to finish and then starts a fresh run.
 func (w *DeletionTombstoneSweeper) Start() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -54,14 +55,19 @@ func (w *DeletionTombstoneSweeper) Start() {
 }
 
 // Stop stops the sweeper and waits for a sweep in progress to end.
+//
+// The lifecycle lock is held through the cancellation and the wait, so a
+// concurrent Start cannot launch a second run (or add to the wait group) while
+// this one is still draining; it runs after Stop returns. The run loop never
+// takes the lock, so holding it across wg.Wait cannot deadlock.
 func (w *DeletionTombstoneSweeper) Stop() {
 	w.mu.Lock()
-	cancel := w.cancel
-	w.cancel = nil
-	w.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	defer w.mu.Unlock()
+	if w.cancel == nil {
+		return
 	}
+	w.cancel()
+	w.cancel = nil
 	w.wg.Wait()
 }
 
