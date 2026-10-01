@@ -12,6 +12,8 @@ import (
 	"errors"
 	"io"
 	"math/big"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -254,4 +256,35 @@ func TestNewConfiguredKeyManager(t *testing.T) {
 	assert.NoError(t, (&ASModule{KeyManager: km}).Close())
 	var nilm *ASModule
 	assert.NoError(t, nilm.Close())
+}
+
+func TestNewConfiguredKeyManager_PINFile(t *testing.T) {
+	orig := newPKCS11Signer
+	defer func() { newPKCS11Signer = orig }()
+	called := false
+	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	var got *signing.PKCS11Config
+	newPKCS11Signer = func(c *signing.PKCS11Config) (crypto.Signer, error) {
+		called = true
+		got = c
+		return &fakeHSM{inner: k}, nil
+	}
+
+	// Missing PIN file: clear error, HSM never opened, path not leaked.
+	dir := t.TempDir()
+	_, err := newConfiguredKeyManager(&config.ASConfig{SigningKeyPKCS11: &config.PKCS11SigningConfig{
+		ModulePath: "m", KeyLabel: "l", PINPath: filepath.Join(dir, "no-such-pin-file")}})
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "pin_path")
+	assert.NotContains(t, err.Error(), "no-such-pin-file")
+	assert.False(t, called)
+
+	// Present PIN file is read lazily and passed to the signer.
+	pinFile := filepath.Join(dir, "pin")
+	require.NoError(t, os.WriteFile(pinFile, []byte("4321\n"), 0o600))
+	km, err := newConfiguredKeyManager(&config.ASConfig{SigningKeyPKCS11: &config.PKCS11SigningConfig{
+		ModulePath: "m", KeyLabel: "l", PINPath: pinFile}})
+	require.NoError(t, err)
+	assert.Equal(t, "4321", got.PIN)
+	assert.NoError(t, (&ASModule{KeyManager: km}).Close())
 }

@@ -2936,3 +2936,45 @@ func TestASConfig_ExternalBaseURL(t *testing.T) {
 		})
 	}
 }
+
+func TestLoad_ASPKCS11PINFileNotReadAtLoad(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "absent-pin")
+	configPath := filepath.Join(dir, "config.yaml")
+	yml := "jwt:\n  secret: 0123456789abcdef0123456789abcdef\nas:\n  external_url: https://as.example.com\n  signing_key_pkcs11:\n    module_path: /m.so\n    key_label: k\n    pin_path: " + missing + "\n"
+	if err := os.WriteFile(configPath, []byte(yml), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load must not read the AS HSM PIN file: %v", err)
+	}
+	p := cfg.AS.SigningKeyPKCS11
+	if p == nil || p.PINPath != missing || p.PIN != "" {
+		t.Fatalf("PINPath must be kept and PIN left unresolved, got %+v", p)
+	}
+}
+
+func TestPKCS11SigningConfig_ResolvePIN(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pin")
+	if err := os.WriteFile(path, []byte("1234\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// File wins over inline PIN.
+	pin, err := (&PKCS11SigningConfig{PIN: "inline", PINPath: path}).ResolvePIN()
+	if err != nil || pin != "1234" {
+		t.Fatalf("got %q, %v", pin, err)
+	}
+	// Inline PIN when no path.
+	pin, err = (&PKCS11SigningConfig{PIN: "inline"}).ResolvePIN()
+	if err != nil || pin != "inline" {
+		t.Fatalf("got %q, %v", pin, err)
+	}
+	// Missing file: clear error that does not name the path.
+	missing := filepath.Join(dir, "secret-location-xyz")
+	_, err = (&PKCS11SigningConfig{PINPath: missing}).ResolvePIN()
+	if err == nil || !strings.Contains(err.Error(), "pin_path") || strings.Contains(err.Error(), "secret-location-xyz") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

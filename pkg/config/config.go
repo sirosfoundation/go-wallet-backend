@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -1038,9 +1039,33 @@ type PKCS11SigningConfig struct {
 	ModulePath string `yaml:"module_path" envconfig:"MODULE_PATH"`
 	SlotID     uint   `yaml:"slot_id" envconfig:"SLOT_ID"`
 	PIN        string `yaml:"pin" envconfig:"PIN"`
-	PINPath    string `yaml:"pin_path" envconfig:"PIN_PATH"` // Path to file containing PIN (preferred over inline PIN)
+	PINPath    string `yaml:"pin_path" envconfig:"PIN_PATH"` // Path to file containing PIN (preferred over inline PIN). For the AS signer it is read only when the signer is constructed, not by Load.
 	KeyLabel   string `yaml:"key_label" envconfig:"KEY_LABEL"`
 	PoolSize   int    `yaml:"pool_size" envconfig:"POOL_SIZE"` // Session pool size (default 4)
+}
+
+// ResolvePIN returns the PKCS#11 PIN, reading PINPath when set (the file
+// takes precedence over the inline PIN). It is called lazily by the code that
+// opens the HSM, not by Load, so processes that never touch the HSM do not
+// need the file. Errors do not name the file (see readSecretFile).
+func (p *PKCS11SigningConfig) ResolvePIN() (string, error) {
+	if p.PINPath == "" {
+		return p.PIN, nil
+	}
+	data, err := os.ReadFile(p.PINPath)
+	if err != nil {
+		// os.ReadFile errors carry the path; unwrap to the bare cause.
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) {
+			err = pathErr.Err
+		}
+		return "", fmt.Errorf("pin_path: failed to read PIN file: %w", err)
+	}
+	pin := strings.TrimSpace(string(data))
+	if pin == "" {
+		return "", errors.New("pin_path: PIN file is empty")
+	}
+	return pin, nil
 }
 
 // AttestationConfig controls attestation lifecycle behavior.
@@ -1824,12 +1849,10 @@ func (c *Config) loadSecretsFromFiles() error {
 		}
 	}
 
-	if c.AS.SigningKeyPKCS11 != nil && c.AS.SigningKeyPKCS11.PINPath != "" {
-		c.AS.SigningKeyPKCS11.PIN, err = readSecretFile(c.AS.SigningKeyPKCS11.PINPath)
-		if err != nil {
-			return fmt.Errorf("as.signing_key_pkcs11.pin_path: %w", err)
-		}
-	}
+	// as.signing_key_pkcs11.pin_path is deliberately NOT read here: only the
+	// process that builds the AS signer needs the PIN, and a standalone
+	// engine/validator (as.external_url) may share this configuration without
+	// having the file. The AS reads it via PKCS11SigningConfig.ResolvePIN.
 
 	// Load Play Integrity decryption/verification keys from file
 	natCfg := &c.WalletProvider.Attestation.NativeAttestation

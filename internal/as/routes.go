@@ -289,10 +289,16 @@ func newConfiguredKeyManager(cfg *config.ASConfig) (*KeyManager, error) {
 		return nil, fmt.Errorf("as: signing_key_path and signing_key_pkcs11 are mutually exclusive")
 	case cfg.SigningKeyPKCS11 != nil:
 		p := cfg.SigningKeyPKCS11
+		// The PIN file is read here, not in config.Load, so standalone
+		// engines/validators sharing this config need not have it.
+		pin, err := p.ResolvePIN()
+		if err != nil {
+			return nil, fmt.Errorf("as: signing_key_pkcs11: %w", err)
+		}
 		signer, err := newPKCS11Signer(&signing.PKCS11Config{
 			ModulePath: p.ModulePath,
 			SlotID:     p.SlotID,
-			PIN:        p.PIN,
+			PIN:        pin,
 			KeyLabel:   p.KeyLabel,
 			PoolSize:   p.PoolSize,
 		})
