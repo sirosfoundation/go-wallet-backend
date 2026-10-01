@@ -1176,7 +1176,7 @@ func newAuditEmitter(cfg *config.Config, logger *zap.Logger) *audit.Emitter {
 
 // configureWMPExternalURL sets the public base URL for the WMP discovery
 // document from server.external_urls.engine_url (normally a ws:// or wss://
-// URL, mapped to http(s) by SetExternalURL). The WMP routes are mounted on
+// URL, mapped to https by SetExternalURL; plaintext only for loopback). The WMP routes are mounted on
 // the engine router/port only, so as.external_url (the AS origin) is
 // deliberately NOT used as a fallback: it can point at a host that does not
 // serve them. Unset/invalid leaves /.well-known/wmp-configuration failing

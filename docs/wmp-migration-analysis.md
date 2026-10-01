@@ -51,10 +51,10 @@ single absolute `https` base URL, POSTs JSON-RPC to it and opens the stream at
 `endpoints.rpc = <external-url>/api/v2/wallet/rpc` and
 `endpoints.events = <external-url>/api/v2/wallet/rpc/events`, and the server
 serves the stream at both `/api/v2/wallet/events` and `/api/v2/wallet/rpc/events`.
-The external URL comes from `server.external_urls.engine_url` (a `wss://`/`ws://` URL is mapped to `https://`/`http://`),
+The external URL comes from `server.external_urls.engine_url` (a `wss://` URL is mapped to `https://`). Because discovery advertises security mode `tls`, only `https://`/`wss://` URLs are accepted; plaintext `http://`/`ws://` is rejected unless the host is loopback (`localhost`, `127.0.0.0/8`, `::1`), a development-only exception (there is no separate dev setting),
 there is deliberately no fallback to `as.external_url`, because the WMP routes
 are served only on the engine router/port and the AS origin may not route them.
-If `engine_url` is unset or invalid, the discovery endpoint returns 503 (and a
+If `engine_url` is unset, invalid or a non-loopback plaintext URL, the discovery endpoint returns 503 (and a
 warning is logged) rather than advertising unreachable or relative URLs. JSON-RPC notifications are
 answered `202 Accepted` with an empty body (the client accepts only 200/202).
 

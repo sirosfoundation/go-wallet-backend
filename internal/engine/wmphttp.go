@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"sort"
@@ -304,10 +305,13 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 
 // SetExternalURL sets the public base URL (scheme://host[:port][/prefix])
 // under which the WMP endpoints are reachable; the discovery document
-// advertises absolute URLs built from it. Only http(s) URLs with a host and
-// no query or fragment are accepted. A WebSocket URL - which is what
-// server.external_urls.engine_url holds - is mapped to the HTTP URL of the
-// same host: wss:// to https://, ws:// to http://.
+// advertises absolute URLs built from it. Only https URLs with a host and no
+// query or fragment are accepted: discovery advertises security mode "tls",
+// so a plaintext public endpoint would make clients send bearer tokens and
+// WMP payloads unencrypted. As a development exception plain http is accepted
+// for loopback hosts only (localhost, 127.0.0.0/8, ::1). A WebSocket URL -
+// which is what server.external_urls.engine_url holds - is mapped to the HTTP
+// URL of the same host: wss:// to https://, ws:// to http:// (loopback only).
 func (a *WMPAdapter) SetExternalURL(raw string) error {
 	u, err := url.Parse(strings.TrimRight(raw, "/"))
 	if err == nil {
@@ -321,10 +325,23 @@ func (a *WMPAdapter) SetExternalURL(raw string) error {
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
 		return fmt.Errorf("invalid WMP external URL %q", raw)
 	}
+	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
+		return fmt.Errorf("WMP external URL %q must use https (or wss): plaintext http/ws is only allowed for loopback hosts", raw)
+	}
 	a.mu.Lock()
 	a.externalURL = u.String()
 	a.mu.Unlock()
 	return nil
+}
+
+// isLoopbackHost reports whether host is localhost or a loopback IP literal
+// (127.0.0.0/8, ::1).
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // legacySessionEffectiveTAC is the permission set a session created by a

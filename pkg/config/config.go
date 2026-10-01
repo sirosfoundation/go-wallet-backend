@@ -873,7 +873,7 @@ type ExternalURLsConfig struct {
 	// BackendURL is the external URL for the backend service (for engine → backend calls)
 	BackendURL string `yaml:"backend_url" envconfig:"BACKEND_URL"`
 
-	// EngineURL is the external URL for the engine service (for WebSocket connections)
+	// EngineURL is the external URL for the engine service (for WebSocket connections). WMP discovery requires wss:// (or https://); ws:// and http:// are accepted only for loopback hosts
 	EngineURL string `yaml:"engine_url" envconfig:"ENGINE_URL"`
 
 	// RegistryURL is the external URL for the registry service (for VCTM lookups)

@@ -2900,6 +2900,8 @@ func TestWMPAdapter_SetExternalURL_WebSocketSchemes(t *testing.T) {
 		"wss://ws.wallet.example.com/":     "https://ws.wallet.example.com",
 		"wss://ws.example.com:8443/prefix": "https://ws.example.com:8443/prefix",
 		"ws://localhost:8082":              "http://localhost:8082",
+		"ws://127.0.0.1:8082":              "http://127.0.0.1:8082",
+		"http://[::1]:8080":                "http://[::1]:8080",
 		"https://wallet.example.com":       "https://wallet.example.com",
 		"http://localhost:8080":            "http://localhost:8080",
 	} {
@@ -2914,4 +2916,31 @@ func TestWMPAdapter_SetExternalURL_WebSocketSchemes(t *testing.T) {
 		assert.Error(t, a.SetExternalURL(bad), bad)
 	}
 	assert.False(t, a.HasExternalURL())
+}
+
+// Discovery advertises security mode "tls", so plaintext endpoints are only
+// acceptable for loopback development.
+func TestWMPAdapter_SetExternalURL_RejectsPlaintextNonLoopback(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	for _, bad := range []string{
+		"http://wallet.example.com",
+		"ws://wallet.example.com",
+		"ws://wallet.example.com:8080/prefix",
+		"http://10.0.0.5:8080",
+		"http://192.168.1.1",
+		"http://localhost.example.com",
+		"http://127.0.0.1.example.com",
+		"http://[2001:db8::1]:8080",
+		"http://0.0.0.0:8080",
+	} {
+		err := a.SetExternalURL(bad)
+		if assert.Error(t, err, bad) {
+			assert.Contains(t, err.Error(), "https", bad)
+		}
+	}
+	assert.False(t, a.HasExternalURL())
+	for _, ok := range []string{"http://localhost:8080", "http://LOCALHOST", "ws://127.0.0.2:8080", "http://[::1]"} {
+		assert.NoError(t, a.SetExternalURL(ok), ok)
+	}
 }
