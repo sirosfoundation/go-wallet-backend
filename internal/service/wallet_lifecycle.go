@@ -263,6 +263,12 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 	} else {
 		inst.Status = target
 		inst.UpdatedAt = time.Now().UTC()
+		if target == domain.InstanceStatusRevoked {
+			// Same as in RevokeAllForUser: the cascade's cut-off check
+			// needs the revocation time, which this local copy lacks.
+			revokedAt := inst.UpdatedAt
+			inst.DeactivatedAt = &revokedAt
+		}
 	}
 	s.emitAudit(inst.ID, target, reason, actor)
 	if target != domain.InstanceStatusActive {
@@ -390,6 +396,16 @@ func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor Lif
 				return changed, err
 			}
 			inst.Status = domain.InstanceStatusRevoked
+			// Carry the revocation time on the local copy: the early
+			// cascade returns below hand it to ensureCutoff, which compares
+			// the user's cut-off with DeactivatedAt. Without it an older
+			// non-zero cut-off (a logout-everywhere) would pass as
+			// sufficient and the erasure would run without a cut-off past
+			// this revocation. Taken after the write, so it is never
+			// earlier than the stored time.
+			revokedAt := time.Now().UTC()
+			inst.DeactivatedAt = &revokedAt
+			inst.UpdatedAt = revokedAt
 			s.emitAudit(inst.ID, domain.InstanceStatusRevoked, reason, actor)
 			changed++
 			revokedThisPass++
@@ -558,7 +574,9 @@ func (s *WalletLifecycleService) ensureCutoff(ctx context.Context, userID domain
 		}
 		return fmt.Errorf("read token cut-off: %w", err)
 	}
-	if !cutoff.IsZero() && (inst == nil || inst.DeactivatedAt == nil || !cutoff.Before(*inst.DeactivatedAt)) {
+	// A revoked instance without a recorded time cannot prove the cut-off is
+	// new enough, so it is advanced (fail closed) rather than trusted.
+	if !cutoff.IsZero() && inst.DeactivatedAt != nil && !cutoff.Before(*inst.DeactivatedAt) {
 		return nil
 	}
 	if err := s.store.Users().InvalidateAuthBefore(ctx, userID, time.Now()); err != nil && !errors.Is(err, storage.ErrNotFound) {
