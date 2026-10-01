@@ -144,6 +144,21 @@ func (rc *RegistryClient) FetchTypeMetadata(ctx context.Context, vct string) (*V
 	return &metadata, nil
 }
 
+// GetVCTM issues GET <registry>/vctm/<vct> and returns the raw response; the
+// caller closes the body. It uses this client's transport (in-process handler
+// or HTTP), so every registry lookup goes the same way.
+func (rc *RegistryClient) GetVCTM(ctx context.Context, vct string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", rc.registryURL()+"/vctm/"+url.PathEscape(vct), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	if tenantID := TenantFromContext(ctx); tenantID != "" {
+		req.Header.Set("X-Tenant-ID", tenantID)
+	}
+	return rc.httpClient.Do(req)
+}
+
 // FetchTypeMetadataJSON fetches VCTM and returns it as JSON raw message.
 // Returns nil if not found or on error (to not fail the flow).
 func (rc *RegistryClient) FetchTypeMetadataJSON(ctx context.Context, vct string) json.RawMessage {
