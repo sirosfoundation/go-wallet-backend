@@ -154,6 +154,7 @@ type Checker struct {
 	// flights are the loads in progress, by cache key (guarded by mu);
 	// loadSem bounds how many run at once.
 	flights map[string]*flight
+	nextGen uint64 // last flight generation handed out (guarded by mu)
 	loadSem chan struct{}
 }
 
@@ -163,19 +164,29 @@ type flight struct {
 	done    chan struct{}
 	cancel  context.CancelFunc
 	waiters int // guarded by Checker.mu
-	bits    int
-	list    []byte
-	err     error
+	// gen orders flights: it is assigned from Checker.nextGen when the flight
+	// starts, so a later flight for the same key always has a larger gen.
+	gen uint64
+	// abandoned is set (under Checker.mu) when the last waiter gave up and
+	// the flight was withdrawn; its result has no consumer and must not be
+	// cached.
+	abandoned bool
+	bits      int
+	list      []byte
+	err       error
 }
 
 // parsedList is a verified, trust-evaluated status list. iat orders versions
 // of the same list: a cache entry is never replaced by a list with an older
-// iat.
+// iat. iat has one-second granularity and is not a unique version, so gen
+// (the generation of the flight that fetched the list) breaks ties: a list
+// from an older flight never replaces one from a newer flight.
 type parsedList struct {
 	bits    int
 	list    []byte
 	expires time.Time
 	iat     int64
+	gen     uint64
 }
 
 type cachedList = parsedList
@@ -273,7 +284,8 @@ func (c *Checker) load(ctx context.Context, uri string) (int, []byte, error) {
 		// The flight outlives any single caller, so it takes ctx's values
 		// (the tenant) but neither its cancellation nor its deadline.
 		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), flightTimeout)
-		f = &flight{done: make(chan struct{}), cancel: cancel}
+		c.nextGen++
+		f = &flight{done: make(chan struct{}), cancel: cancel, gen: c.nextGen}
 		c.flights[key] = f
 		go c.runFlight(fctx, key, uri, f)
 	}
@@ -292,6 +304,7 @@ func (c *Checker) load(ctx context.Context, uri string) (int, []byte, error) {
 			if c.flights[key] == f {
 				delete(c.flights, key)
 			}
+			f.abandoned = true
 			f.cancel()
 		}
 		c.mu.Unlock()
@@ -302,7 +315,7 @@ func (c *Checker) load(ctx context.Context, uri string) (int, []byte, error) {
 // runFlight performs one load and publishes the outcome to its waiters.
 func (c *Checker) runFlight(ctx context.Context, key, uri string, f *flight) {
 	defer f.cancel()
-	f.bits, f.list, f.err = c.loadOnce(ctx, key, uri)
+	f.bits, f.list, f.err = c.loadOnce(ctx, key, uri, f)
 	c.mu.Lock()
 	if c.flights[key] == f {
 		delete(c.flights, key)
@@ -313,7 +326,7 @@ func (c *Checker) runFlight(ctx context.Context, key, uri string, f *flight) {
 
 // loadOnce fetches, verifies and caches one list, holding a load slot for
 // the duration.
-func (c *Checker) loadOnce(ctx context.Context, key, uri string) (int, []byte, error) {
+func (c *Checker) loadOnce(ctx context.Context, key, uri string, f *flight) (int, []byte, error) {
 	select {
 	case c.loadSem <- struct{}{}:
 		defer func() { <-c.loadSem }()
@@ -338,7 +351,7 @@ func (c *Checker) loadOnce(ctx context.Context, key, uri string) (int, []byte, e
 	if err != nil {
 		return 0, nil, err
 	}
-	return c.store(key, pl)
+	return c.store(key, pl, f)
 }
 
 // store caches pl and returns the list to act on. expires is an absolute
@@ -349,12 +362,24 @@ func (c *Checker) loadOnce(ctx context.Context, key, uri string) (int, []byte, e
 // that fetched an earlier token but finished after a newer one (say, a slow
 // signer evaluation) must not restore the status the newer token superseded.
 // When the newer entry is still fresh the caller gets that entry's list too.
-func (c *Checker) store(key string, pl parsedList) (int, []byte, error) {
+//
+// iat is second-granular, so two revisions issued in the same second tie on
+// it. Flights are therefore also ordered by generation: a flight that was
+// abandoned, or whose generation is lower than the cached entry's or than the
+// key's current flight, never stores. f is the loading flight (nil outside
+// flights, e.g. in tests, which then carry their own gen in pl).
+func (c *Checker) store(key string, pl parsedList, f *flight) (int, []byte, error) {
 	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if f != nil {
+		pl.gen = f.gen
+		if cur := c.flights[key]; f.abandoned || (cur != nil && cur.gen > f.gen) {
+			return pl.bits, pl.list, nil
+		}
+	}
 	old, had := c.cache[key]
-	if had && old.iat > pl.iat {
+	if had && (old.iat > pl.iat || (old.iat == pl.iat && old.gen > pl.gen)) {
 		if now.Before(old.expires) {
 			return old.bits, old.list, nil
 		}

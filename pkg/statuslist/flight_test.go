@@ -266,6 +266,75 @@ func TestLoad_OutOfOrderCompletionKeepsNewerStatus(t *testing.T) {
 	}
 }
 
+// Two revisions issued in the same second tie on iat. An abandoned older
+// flight that finishes after the newer one must still not restore the status
+// the newer revision superseded.
+func TestLoad_OutOfOrderCompletionSameSecondKeepsNewerStatus(t *testing.T) {
+	key := newKey(t)
+	iat := time.Now().Add(-5 * time.Second).Truncate(time.Second) // shared by both revisions
+	var fetch atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sub := "https://" + r.Host + r.URL.Path
+		var tok string
+		if fetch.Add(1) == 1 { // older revision: everything VALID
+			tok = makeToken(t, tokenOpts{sub: sub, key: key, iat: iat})
+		} else { // newer revision: index 1 revoked
+			tok = makeToken(t, tokenOpts{sub: sub, key: key, iat: iat, values: map[int]int{1: 1}})
+		}
+		w.Header().Set("Content-Type", mediaTypeJWT)
+		_, _ = w.Write([]byte(tok))
+	}))
+	t.Cleanup(srv.Close)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	slowThenFast := func(context.Context, string, *trust.KeyMaterial) (bool, error) {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release // deliberately ignores the context: a slow signer evaluation
+		}
+		return true, nil
+	}
+	c := NewChecker(srv.Client(), false, slowThenFast)
+	ref := &Reference{Idx: 1, URI: srv.URL + "/statuslists/1"}
+
+	ctxA, cancelA := context.WithCancel(context.Background())
+	aDone := make(chan error, 1)
+	go func() { aDone <- c.Check(ctxA, ref) }()
+	<-entered
+	cancelA()
+	<-aDone
+
+	// B starts a fresh flight (A's was abandoned), sees the newer token.
+	if err := c.Check(context.Background(), ref); !errors.Is(err, ErrRevoked) {
+		t.Fatalf("newer token check = %v, want ErrRevoked", err)
+	}
+	// Let the older load complete, and wait until it has released its slot.
+	close(release)
+	waitFor(t, "older load finished", func() bool { return len(c.loadSem) == 0 })
+
+	if err := c.Check(context.Background(), ref); !errors.Is(err, ErrRevoked) {
+		t.Fatalf("older load restored stale status: %v", err)
+	}
+	if got := fetch.Load(); got != 2 {
+		t.Fatalf("%d fetches, want 2 (the newer entry must still be cached)", got)
+	}
+}
+
+func TestStore_SameIatOlderGenerationNeverReplaces(t *testing.T) {
+	now := time.Now()
+	c := NewChecker(http.DefaultClient, false, trustAll)
+	c.now = func() time.Time { return now }
+	newer := parsedList{bits: 1, list: []byte{0x02}, expires: now.Add(time.Minute), iat: 100, gen: 2}
+	older := parsedList{bits: 1, list: []byte{0x00}, expires: now.Add(time.Hour), iat: 100, gen: 1}
+	_, _, _ = c.store("k", newer, nil)
+	_, list, _ := c.store("k", older, nil)
+	if list[0] != 0x02 || c.cache["k"].gen != 2 {
+		t.Fatalf("same-iat older generation replaced the newer: list=%v gen=%d", list, c.cache["k"].gen)
+	}
+}
+
 func TestStore_NeverReplacesNewerVersion(t *testing.T) {
 	now := time.Now()
 	c := NewChecker(http.DefaultClient, false, trustAll)
@@ -273,11 +342,11 @@ func TestStore_NeverReplacesNewerVersion(t *testing.T) {
 	newer := parsedList{bits: 1, list: []byte{0x02}, expires: now.Add(time.Minute), iat: 200}
 	older := parsedList{bits: 1, list: []byte{0x00}, expires: now.Add(time.Hour), iat: 100}
 
-	if _, _, err := c.store("k", newer); err != nil {
+	if _, _, err := c.store("k", newer, nil); err != nil {
 		t.Fatal(err)
 	}
 	// The older load is answered from the newer entry, which stays cached.
-	_, list, _ := c.store("k", older)
+	_, list, _ := c.store("k", older, nil)
 	if len(list) != 1 || list[0] != 0x02 {
 		t.Fatalf("older load answered with %v, want the newer list", list)
 	}
@@ -286,13 +355,13 @@ func TestStore_NeverReplacesNewerVersion(t *testing.T) {
 	}
 	// Same or newer iat does replace.
 	newest := parsedList{bits: 1, list: []byte{0x06}, expires: now.Add(time.Minute), iat: 300}
-	_, _, _ = c.store("k", newest)
+	_, _, _ = c.store("k", newest, nil)
 	if c.cache["k"].iat != 300 {
 		t.Fatal("newer version did not replace the cache entry")
 	}
 	// An expired newer entry is not served to the older load, but is not replaced either.
 	now = now.Add(2 * time.Minute)
-	_, list, _ = c.store("k", older)
+	_, list, _ = c.store("k", older, nil)
 	if list[0] != 0x00 || c.cache["k"].iat != 300 {
 		t.Fatalf("older load after expiry: list=%v cached iat=%d", list, c.cache["k"].iat)
 	}
