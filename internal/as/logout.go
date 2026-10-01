@@ -27,10 +27,19 @@ import (
 // all: without that check, any caller with a valid session of their own
 // could submit a stranger's token in the Authorization header and get it
 // revoked as a denial-of-service (#391 review, round 2). issuer/
+// sidParser is a signature-only legacy HMAC parser used solely to read the
+// presented bearer's sid and user_id for the pre-#402 family fallback. It is
+// independent of legacyIssuer (which exists only when as.legacy.enabled), because
+// /user/session/refresh stays mounted whenever jwt.refresh_days > 0 and can
+// rotate a pre-#402 session's refresh token even with legacy authentication
+// disabled; it never authenticates anything. nil falls back to legacyIssuer.
 // legacyIssuer/blacklist may be nil (steps they'd perform are then
 // skipped); a missing, mismatched, expired, or unparseable bearer token is
 // never an error - the session is still revoked either way.
-func LogoutHandler(store SessionStore, issuer *TokenIssuer, legacyIssuer *LegacyTokenIssuer, blacklist TokenBlacklistChecker, familyRetention time.Duration, insecureCookies bool, logger *zap.Logger) gin.HandlerFunc {
+func LogoutHandler(store SessionStore, issuer *TokenIssuer, legacyIssuer, sidParser *LegacyTokenIssuer, blacklist TokenBlacklistChecker, familyRetention time.Duration, insecureCookies bool, logger *zap.Logger) gin.HandlerFunc {
+	if sidParser == nil {
+		sidParser = legacyIssuer
+	}
 	opts := CookieOptions{Insecure: insecureCookies}
 	return func(c *gin.Context) {
 		sessionID := GetSessionCookie(c, opts)
@@ -70,9 +79,9 @@ func LogoutHandler(store SessionStore, issuer *TokenIssuer, legacyIssuer *Legacy
 		// token is rotated the replacement pair carries a freshly generated
 		// sid that only the replacement JWTs know about.
 		var bearerSID string
-		if blacklist != nil && sessErr == nil && session != nil && legacyIssuer != nil {
+		if blacklist != nil && sessErr == nil && session != nil && sidParser != nil {
 			if bearerToken := extractBearerToken(c); bearerToken != "" {
-				if uid, sid, ok := legacyIssuer.ParseSIDUnverifiedClaims(bearerToken); ok && uid == session.UserID {
+				if uid, sid, ok := sidParser.ParseSIDUnverifiedClaims(bearerToken); ok && uid == session.UserID {
 					bearerSID = sid
 				}
 			}

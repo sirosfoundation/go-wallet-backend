@@ -29,7 +29,7 @@ func TestLogoutHandler_Success(t *testing.T) {
 	_ = store.Create(context.Background(), sess)
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, nil, time.Hour, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, nil, nil, time.Hour, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -68,7 +68,7 @@ func TestLogoutHandler_NoSession(t *testing.T) {
 	logger := zap.NewNop()
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, nil, time.Hour, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, nil, nil, time.Hour, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -113,7 +113,7 @@ func TestLogoutHandler_BlacklistsPresentedBearerToken(t *testing.T) {
 	blacklist := &fakeBlacklist{}
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, issuer, nil, blacklist, time.Hour, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, issuer, nil, nil, blacklist, time.Hour, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -164,7 +164,7 @@ func TestLogoutHandler_RefusesToBlacklistOtherUsersToken(t *testing.T) {
 	blacklist := &fakeBlacklist{}
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, issuer, nil, blacklist, time.Hour, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, issuer, nil, nil, blacklist, time.Hour, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -214,7 +214,7 @@ func TestLogoutHandler_BlacklistsLegacyBearerToken(t *testing.T) {
 	// issuer (the asymmetric one) is nil here to simulate its
 	// ParseAndVerify failing on a legacy-shaped token and falling through
 	// to the legacy issuer, without needing a real mismatched key.
-	router.DELETE("/auth/session", LogoutHandler(store, nil, legacyIssuer, blacklist, time.Hour, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, nil, legacyIssuer, nil, blacklist, time.Hour, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -259,7 +259,7 @@ func TestLogoutHandler_RefusesToBlacklistOtherUsersLegacyToken(t *testing.T) {
 	blacklist := &fakeBlacklist{}
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, nil, legacyIssuer, blacklist, time.Hour, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, nil, legacyIssuer, nil, blacklist, time.Hour, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -311,7 +311,7 @@ func TestLogoutHandler_BlacklistAddErrorDoesNotFailLogout(t *testing.T) {
 	}
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, issuer, nil, &erroringBlacklist{}, time.Hour, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, issuer, nil, nil, &erroringBlacklist{}, time.Hour, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -347,7 +347,7 @@ func TestLogoutHandler_LegacyBlacklistAddErrorDoesNotFailLogout(t *testing.T) {
 	}
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, nil, legacyIssuer, &erroringBlacklist{}, time.Hour, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, nil, legacyIssuer, nil, &erroringBlacklist{}, time.Hour, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -366,7 +366,7 @@ func TestLogoutHandler_NonexistentSession(t *testing.T) {
 	logger := zap.NewNop()
 
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, nil, time.Hour, true, logger))
+	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, nil, nil, time.Hour, true, logger))
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -391,7 +391,7 @@ func logoutWithFamily(t *testing.T, store SessionStore, blacklist TokenBlacklist
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, blacklist, 48*time.Hour, true, zap.NewNop()))
+	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, nil, blacklist, 48*time.Hour, true, zap.NewNop()))
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
 	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: cookie})
@@ -480,7 +480,7 @@ func TestLogoutHandler_RetryAfterFailedFamilyRevocation(t *testing.T) {
 	})
 	bl := &fakeBlacklist{familyErr: errors.New("boom")}
 	router := gin.New()
-	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, bl, time.Hour, true, zap.NewNop()))
+	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, nil, bl, time.Hour, true, zap.NewNop()))
 	do := func() *httptest.ResponseRecorder {
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
@@ -525,7 +525,7 @@ func TestLogoutHandler_RevokesSIDFromLegacyBearerForPreSIDSession(t *testing.T) 
 		})
 		bl := &fakeBlacklist{}
 		router := gin.New()
-		router.DELETE("/auth/session", LogoutHandler(store, nil, legacyIssuer, bl, time.Hour, true, zap.NewNop()))
+		router.DELETE("/auth/session", LogoutHandler(store, nil, legacyIssuer, nil, bl, time.Hour, true, zap.NewNop()))
 		w := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
 		req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-pre"})
@@ -544,6 +544,50 @@ func TestLogoutHandler_RevokesSIDFromLegacyBearerForPreSIDSession(t *testing.T) 
 		t.Error("sid from an expired legacy bearer must still be revoked")
 	}
 	if bl := run(mint("someone-else", time.Now().Add(time.Hour))); len(bl.families) != 0 {
+		t.Errorf("a stranger's bearer must not revoke any family, got %v", bl.families)
+	}
+}
+
+// TestLogoutHandler_SIDParserWorksWithLegacyAuthDisabled proves the pre-#402
+// fallback uses the independent sid parser: legacyIssuer is nil (legacy
+// authentication disabled) yet the bearer's sid is still revoked, and a
+// stranger's bearer revokes nothing.
+func TestLogoutHandler_SIDParserWorksWithLegacyAuthDisabled(t *testing.T) {
+	secret := []byte("test-legacy-secret-32-bytes-long!")
+	parser := NewLegacyTokenIssuer(secret, "test-issuer", 0)
+	mint := func(user string) string {
+		tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"jti": "j1", "sub": user, "user_id": user, "sid": "sid-rotated",
+			"exp": time.Now().Add(time.Hour).Unix(),
+		}).SignedString(secret)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return tok
+	}
+	run := func(bearer string) *fakeBlacklist {
+		gin.SetMode(gin.TestMode)
+		store := NewMemorySessionStore()
+		_ = store.Create(context.Background(), &Session{
+			JTI: "sess-pre", UserID: "user-1", CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+		})
+		bl := &fakeBlacklist{}
+		router := gin.New()
+		router.DELETE("/auth/session", LogoutHandler(store, nil, nil, parser, bl, time.Hour, true, zap.NewNop()))
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
+		req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-pre"})
+		req.Header.Set("Authorization", "Bearer "+bearer)
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("expected 204, got %d", w.Code)
+		}
+		return bl
+	}
+	if bl := run(mint("user-1")); bl.families["sid-rotated"].IsZero() {
+		t.Error("sid must be revoked with legacy authentication disabled")
+	}
+	if bl := run(mint("someone-else")); len(bl.families) != 0 {
 		t.Errorf("a stranger's bearer must not revoke any family, got %v", bl.families)
 	}
 }
