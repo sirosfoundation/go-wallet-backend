@@ -501,7 +501,20 @@ func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
 }
 
 // Close shuts down the WMP adapter and the engine manager
+// Drain is the first shutdown step: the WMP adapter and the WebSocket
+// manager stop accepting new requests, sessions and upgrades (503) while the
+// listeners are still up. Idempotent; Close implies it.
+func (p *EngineProvider) Drain() {
+	if p.wmpAdapter != nil {
+		p.wmpAdapter.Drain()
+	}
+	if p.manager != nil {
+		p.manager.Drain()
+	}
+}
+
 func (p *EngineProvider) Close() {
+	p.Drain()
 	// Stop the WMP adapter first: it starts draining (new RPC/SSE requests
 	// get 503 and session.create is refused) before its live sessions are
 	// closed and its cleanup goroutine stopped, so nothing can register a

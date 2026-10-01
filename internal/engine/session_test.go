@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1520,4 +1521,124 @@ func TestMemorySessionStore_DeleteByUser_AllTenants(t *testing.T) {
 	assert.ErrorIs(t, err, ErrSessionNotFound)
 	_, err = store.Get(ctx, "c")
 	assert.NoError(t, err)
+}
+
+// dialRaw performs the handshake for userID without waiting for registration.
+func handshakeNoWait(t *testing.T, m *Manager, wsURL, userID string) *websocket.Conn {
+	t.Helper()
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": userID,
+		"exp":     time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString([]byte(m.cfg.JWT.Secret))
+	require.NoError(t, err)
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	require.NoError(t, ws.WriteJSON(HandshakeMessage{
+		Message:  Message{Type: TypeHandshake},
+		AppToken: tokenString,
+	}))
+	return ws
+}
+
+// A connection accepted and authenticated before Close, but not yet
+// registered when Close runs, must not survive: it is refused at
+// registration instead of landing in the freshly cleared maps.
+func TestManager_Close_ConnectionBetweenCloseAndRegisterDoesNotSurvive(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	m.beforeRegisterHook = func() {
+		close(reached)
+		<-release
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	ws := handshakeNoWait(t, m, wsURL, "late-user")
+	defer ws.Close()
+
+	<-reached // accepted, authenticated, not yet registered
+	m.Close()
+	close(release)
+
+	_ = ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		var msg Message
+		if err := ws.ReadJSON(&msg); err != nil {
+			break // closed by the server, as required
+		}
+		require.NotEqual(t, TypeHandshakeComplete, msg.Type, "handshake must not complete after Close")
+	}
+
+	m.sessionsMu.RLock()
+	defer m.sessionsMu.RUnlock()
+	assert.Empty(t, m.sessions)
+	assert.Empty(t, m.userIndex)
+}
+
+type nopTransport struct{ closed atomic.Bool }
+
+func (n *nopTransport) SendJSON(interface{}) error { return nil }
+func (n *nopTransport) ReadMessage(context.Context) ([]byte, error) {
+	return nil, errors.New("nop")
+}
+func (n *nopTransport) Close() error { n.closed.Store(true); return nil }
+
+func newBareSession(id, user string) *Session {
+	return &Session{
+		ID:        id,
+		UserID:    user,
+		transport: &nopTransport{},
+		flows:     make(map[string]*Flow),
+		logger:    zap.NewNop(),
+		stopPing:  make(chan struct{}),
+	}
+}
+
+func TestManager_HandleConnection_RejectedWith503WhenDraining(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	m.Drain()
+	m.Drain() // idempotent
+
+	rec := httptest.NewRecorder()
+	m.HandleConnection(rec, httptest.NewRequest(http.MethodGet, "/ws", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+}
+
+// Stress: registrations racing Close never leave a session behind.
+func TestManager_RegisterSession_RacingClose_NoLeak(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	for round := 0; round < 20; round++ {
+		m := NewManager(cfg, zap.NewNop())
+		const n = 32
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				m.registerSession(newBareSession(fmt.Sprintf("s%d", i), fmt.Sprintf("u%d", i)))
+			}(i)
+		}
+		wg.Add(1)
+		go func() { defer wg.Done(); <-start; m.Close() }()
+		close(start)
+		wg.Wait()
+
+		// Anything that registered before Close was swept; after Close
+		// returned nothing may remain, and nothing may register later.
+		m.sessionsMu.Lock()
+		leftover := len(m.sessions)
+		m.sessionsMu.Unlock()
+		// Sessions registered before Close are cleared by it; those after are refused.
+		assert.Zero(t, leftover, "round %d leaked sessions", round)
+		assert.False(t, m.registerSession(newBareSession("late", "late-user")))
+	}
 }

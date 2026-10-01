@@ -201,6 +201,14 @@ type Manager struct {
 	sessionsMu sync.RWMutex
 	sessions   map[string]*Session  // sessionID -> session (active connections only)
 	userIndex  map[userKey]*Session // (tenant, user) -> session (last connection wins)
+	// draining is set (under sessionsMu) by Drain/Close and never cleared:
+	// no connection may register once it is set, so a WebSocket accepted
+	// just before shutdown cannot slip in after Close has cleared the maps.
+	draining bool
+	// beforeRegisterHook, if set, runs in handleNewConnection immediately
+	// before registerSession. Tests use it to hold a connection in the
+	// accepted-but-unregistered window while shutdown begins.
+	beforeRegisterHook func()
 
 	flowHandlers map[Protocol]FlowHandlerFactory
 	handlersMu   sync.RWMutex
@@ -320,6 +328,13 @@ func (m *Manager) RegisterFlowHandler(protocol Protocol, factory FlowHandlerFact
 
 // HandleConnection handles a new WebSocket connection
 func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
+	// Refuse upgrades once shutdown has begun. registerSession re-checks
+	// under the lock for connections accepted before this point.
+	if m.isDraining() {
+		http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
+		return
+	}
+
 	// Reserve a slot atomically before checking the limit. Checking
 	// Load() >= maxConnections and only then incrementing is racy: multiple
 	// concurrent requests can all pass the check before any of them
@@ -435,8 +450,11 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	// narrow window between validateToken's own check above and this call -
 	// registerSession has already closed the connection itself in that
 	// case, so there is nothing left to unregister.
+	if m.beforeRegisterHook != nil {
+		m.beforeRegisterHook()
+	}
 	if !m.registerSession(session) {
-		session.logger.Warn("Handshake rejected: user revoked between token validation and session registration")
+		session.logger.Warn("Handshake rejected: user revoked or server draining between token validation and session registration")
 		return
 	}
 	defer m.unregisterSession(session)
@@ -796,6 +814,15 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 func (m *Manager) registerSession(session *Session) bool {
 	m.sessionsMu.Lock()
 
+	// Drain gate: Close/Drain flip draining under this same lock, so a
+	// registration is either ordered before it (and closed by Close's
+	// sweep) or sees the flag here and is refused. It can never land after
+	// Close has cleared the maps.
+	if m.draining {
+		m.sessionsMu.Unlock()
+		session.closeWithReason("server shutting down")
+		return false
+	}
 	if session.UserID != "" {
 		if m.userRevoked(session.UserID) {
 			m.sessionsMu.Unlock()
@@ -1215,10 +1242,28 @@ func (s *Session) closeWithReason(reason string) {
 	_ = t.Close()
 }
 
-// Close closes all sessions
+// Drain stops the manager accepting new connections and sessions: further
+// WebSocket upgrades get 503 and any in-flight handshake is refused at
+// registration. Existing sessions are left running; Close ends them. It is
+// idempotent.
+func (m *Manager) Drain() {
+	m.sessionsMu.Lock()
+	m.draining = true
+	m.sessionsMu.Unlock()
+}
+
+func (m *Manager) isDraining() bool {
+	m.sessionsMu.RLock()
+	defer m.sessionsMu.RUnlock()
+	return m.draining
+}
+
+// Close drains the manager, then closes all sessions.
 func (m *Manager) Close() {
 	m.sessionsMu.Lock()
 	defer m.sessionsMu.Unlock()
+
+	m.draining = true
 
 	for _, session := range m.sessions {
 		_ = session.currentTransport().Close()

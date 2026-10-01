@@ -325,12 +325,18 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
-	// Close the engine provider first: it puts the WMP adapter into draining
-	// mode (new RPC/SSE requests are rejected with 503 while the listener is
-	// still up), stops it and ends the live sessions, which terminates their long-lived SSE handlers. Doing it
-	// after mgr.Shutdown would leave http.Server.Shutdown waiting on those
-	// streams for the whole shutdown timeout.
+	// Shutdown order matters:
+	//  1. Drain the engine: the WMP adapter and the WebSocket manager refuse
+	//     new RPC/SSE requests, sessions and upgrades (503). A WebSocket
+	//     accepted just before this is refused at session registration, so
+	//     nothing can register after step 2 clears the session maps.
+	//  2. Close the engine: ends live sessions (terminating their long-lived
+	//     SSE handlers and closing hijacked WebSocket connections, which
+	//     http.Server.Shutdown does not do).
+	//  3. Shut the HTTP/WebSocket listeners down within the timeout; with the
+	//     streams already ended it no longer waits on them.
 	if engineProvider != nil {
+		engineProvider.Drain()
 		engineProvider.Close()
 	}
 
