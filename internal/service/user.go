@@ -408,6 +408,17 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		}
 	} else if !errors.Is(err, storage.ErrNotFound) {
 		return fmt.Errorf("%w: load user: %w", ErrDeletionIncomplete, err)
+	} else if _, terr := s.store.Users().GetDeletionTombstone(ctx, userID.String()); errors.Is(terr, storage.ErrNotFound) {
+		// No record and no tombstone: nothing was ever deleted here. A token
+		// for an identity this wallet does not know passes the gate as an
+		// external identity, and writing a tombstone for it would let any
+		// authenticated caller poison user_deletion_tombstones so that later
+		// tokens for that subject are refused as ErrAccountDeleted. A
+		// tombstone with no record is a deletion that already got past its
+		// first step, and a retry of it carries on below.
+		return ErrUserNotFound
+	} else if terr != nil {
+		return fmt.Errorf("%w: look up deletion tombstone: %w", ErrDeletionIncomplete, terr)
 	}
 	// Get all tenants the user belongs to
 	// A failed membership lookup is fatal to the request rather than a
@@ -730,7 +741,9 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	}
 
 	// Delete the user
-	if err := s.store.Users().Delete(ctx, userID); err != nil {
+	// A record that is already gone (a retry of a deletion that got that far)
+	// is the outcome wanted, not a failure.
+	if err := s.store.Users().Delete(ctx, userID); err != nil && !errors.Is(err, storage.ErrNotFound) {
 		return fmt.Errorf("failed to delete user: %w", err)
 	}
 

@@ -1088,6 +1088,10 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		if abortIfTokenRevoked(c, err) {
 			return
 		}
+		if errors.Is(err, service.ErrUserNotFound) {
+			c.JSON(404, gin.H{"error": "User not found"})
+			return
+		}
 		if errors.Is(err, service.ErrDeletionIncomplete) {
 			// The account still exists on purpose, so the caller can repeat
 			// the request rather than be left with a stranded wallet

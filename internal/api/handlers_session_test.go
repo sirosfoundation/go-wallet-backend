@@ -925,3 +925,17 @@ func TestHandlers_DeleteUser_TokenCutOffAfterAdmission(t *testing.T) {
 	_, err = handlers.services.User.GetUserByID(context.Background(), user.UUID)
 	assert.Error(t, err, "a fresh token deletes the account")
 }
+
+// An unknown subject (a token the gate let through as an external identity)
+// gets 404 from DELETE, not a 400 or a tombstone.
+func TestHandlers_DeleteUser_UnknownSubjectIs404(t *testing.T) {
+	handlers, router, _ := setupTestHandlersWithUser(t)
+	ghost := &domain.User{UUID: domain.NewUserID(), DID: "did:example:ghost"}
+	router.DELETE("/", authMiddlewareForUser(ghost), handlers.DeleteUser)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/", nil))
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+}
