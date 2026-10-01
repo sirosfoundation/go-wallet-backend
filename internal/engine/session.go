@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -314,6 +315,13 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	defer m.activeConnections.Add(-1)
 	defer func() { _ = conn.Close() }()
 
+	// Handshake-scoped context: the upgrade request's own context is
+	// cancelled as soon as ServeHTTP returns (this runs in a goroutine after
+	// the connection was hijacked), so bound the handshake explicitly with
+	// the same 30s budget as the read deadline below.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	// Wait for handshake message
 	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	_, message, err := conn.ReadMessage()
@@ -341,7 +349,7 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	}
 
 	// Validate token and extract claims
-	userID, tenantID, tac, err := m.validateToken(handshake.AppToken)
+	userID, tenantID, tac, err := m.validateToken(ctx, handshake.AppToken)
 	if err != nil {
 		m.logger.Warn("Authentication failed",
 			zap.Error(err),
@@ -792,10 +800,18 @@ func (m *Manager) unregisterSession(session *Session) {
 // path (below) has no TAC concept at all, so callers must treat an empty
 // tac as "not applicable here", not "no permissions", exactly like
 // requireTACIfEnforced does for HTTP routes (see internal/server/providers.go).
-func (m *Manager) validateToken(tokenString string) (userID, tenantID string, tac claims.TAC, err error) {
+//
+// ctx is the handshake-scoped context and is passed to every validator and
+// revocation lookup. If it is already done, validation fails closed (a
+// revocation check that could not be run to completion must never read as
+// "not revoked").
+func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID, tenantID string, tac claims.TAC, err error) {
+	if err := ctx.Err(); err != nil {
+		return "", "", "", fmt.Errorf("token validation aborted: %w", err)
+	}
 	// Use go-tokenauth validator when available (supports both new-style and legacy tokens)
 	if m.tokenValidator != nil {
-		result, err := m.tokenValidator.Validate(context.Background(), tokenString)
+		result, err := m.tokenValidator.Validate(ctx, tokenString)
 		if err != nil {
 			return "", "", "", err
 		}
@@ -820,7 +836,7 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 		// TokenBlacklist feature and the engine's own always-on
 		// revokedUsers (#403) - either one saying revoked is enough to
 		// reject.
-		if (m.blacklist != nil && m.blacklist.IsUserRevoked(context.Background(), result.UserID)) || m.isUserRevoked(result.UserID) {
+		if (m.blacklist != nil && m.blacklist.IsUserRevoked(ctx, result.UserID)) || m.isUserRevoked(result.UserID) {
 			return "", "", "", errors.New("token has been revoked")
 		}
 		// Refresh-token family revocation (#402/#414), legacy-mode tokens
@@ -840,7 +856,12 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 			if sidErr != nil {
 				return "", "", "", errors.New("cannot determine token family")
 			}
-			if sid != "" && m.blacklist.IsFamilyRevoked(context.Background(), sid) {
+			// Re-check ctx right before the lookup: fail closed rather than
+			// treat an abandoned handshake's lookup as "not revoked".
+			if err := ctx.Err(); err != nil {
+				return "", "", "", fmt.Errorf("family revocation check aborted: %w", err)
+			}
+			if sid != "" && m.blacklist.IsFamilyRevoked(ctx, sid) {
 				return "", "", "", errors.New("token has been revoked")
 			}
 		}
@@ -874,7 +895,6 @@ func (m *Manager) validateToken(tokenString string) (userID, tenantID string, ta
 			return "", "", "", errors.New("invalid token claims: missing user_id or uuid")
 		}
 		if m.blacklist != nil {
-			ctx := context.Background()
 			if jti, _ := mapClaims["jti"].(string); jti != "" && m.blacklist.IsBlacklisted(ctx, jti) {
 				return "", "", "", errors.New("token has been revoked")
 			}
