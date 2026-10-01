@@ -113,13 +113,13 @@ same WMP protocol semantics. go-wmp already has an `httpsse` transport package.
 │  ──────                                ──────                           │
 │                                                                         │
 │  POST /api/v2/wallet/rpc ─────────────►  Handle JSON-RPC request        │
-│    {method: "wmp.session.create"}        Return JSON-RPC response        │
+│    {method: "wmp.session.create"}        Return JSON-RPC response       │
 │  ◄─────────────────────────────────────  {result: {session_id: "..."}}  │
 │                                                                         │
 │  GET /api/v2/wallet/events ───────────►  Open SSE stream                │
-│  ◄─ event: wmp ───────────────────   Server pushes notifications    │
-│     data: {method: "wmp.flow.progress",  (progress, sub-flow starts,     │
-│            params: {step: "..."}}         complete, etc.)                 │
+│  ◄─ event: wmp ────────────────────────  Server pushes notifications    │
+│     data: {method: "wmp.flow.progress",  (progress, sub-flow starts,    │
+│            params: {step: "..."}}         complete, etc.)               │
 │                                                                         │
 │  POST /api/v2/wallet/rpc ─────────────►  Handle action                  │
 │    {method: "wmp.flow.action",           Return acknowledgment          │
@@ -158,6 +158,13 @@ native `EventSource` cannot be used at all. Clients use fetch-based SSE; we use 
 ```typescript
 import { fetchEventSource } from '@microsoft/fetch-event-source';
 
+class RetriableError extends Error {}
+class FatalError extends Error {}
+
+declare const sessionId: string;
+declare const token: string;
+declare function handleNotification(msg: unknown): void;
+
 const ctrl = new AbortController();
 await fetchEventSource(`/api/v2/wallet/events?session_id=${sessionId}`, {
   headers: {
@@ -174,6 +181,7 @@ await fetchEventSource(`/api/v2/wallet/events?session_id=${sessionId}`, {
   onerror(err) {
     if (err instanceof FatalError) throw err; // stop retrying
     // Return retry interval in ms, or undefined for default
+    return undefined;
   },
 });
 ```
@@ -208,40 +216,72 @@ exposes two endpoints:
 ```go
 // POST /api/v2/wallet/rpc — handles JSON-RPC requests
 func handleRPC(w http.ResponseWriter, r *http.Request) {
-    // Wmp-Session-Id header, else params.wmp.session_id from the body (what
-    // go-wmp's HTTPS+SSE client sends); empty for session.create.
-    sessionID := r.Header.Get("Wmp-Session-Id")
-    // User and tenant come from the validated bearer token, never from a header.
-    userID, tenantID, tac, tokenID, err := validateToken(bearerToken(r))
-    
-    var req wmp.Request
-    json.NewDecoder(r.Body).Decode(&req)
-    
-    // Dispatch to WMP peer/handler
-    result, err := peer.HandleRequest(ctx, &req)
-    
-    // Return the JSON-RPC response; a notification (no "id") gets an empty
-    // 202 Accepted, which is what go-wmp's client expects (200 or 202 only).
-    json.NewEncoder(w).Encode(result)
+	// Wmp-Session-Id header, else params.wmp.session_id from the body (what
+	// go-wmp's HTTPS+SSE client sends); empty for session.create.
+	sessionID := r.Header.Get("Wmp-Session-Id")
+	_ = sessionID
+
+	// User and tenant come from the validated bearer token, never from a header.
+	userID, tenantID, tac, tokenID, err := validateToken(bearerToken(r))
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	_, _, _, _ = userID, tenantID, tac, tokenID
+
+	var req wmp.Request
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	// Dispatch to WMP peer/handler
+	result, err := peer.HandleRequest(r.Context(), &req)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// Return the JSON-RPC response; a notification (no "id") gets an empty
+	// 202 Accepted, which is what go-wmp's client expects (200 or 202 only).
+	if result == nil {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
 }
 
 // GET /api/v2/wallet/events — SSE stream for server→client notifications
 func handleEvents(w http.ResponseWriter, r *http.Request) {
-    sessionID := r.URL.Query().Get("session_id")
-    lastEventID := r.Header.Get("Last-Event-ID")
-    
-    flusher := w.(http.Flusher)
-    w.Header().Set("Content-Type", "text/event-stream")
-    w.Header().Set("Cache-Control", "no-cache")
-    
-    // Replay missed events if Last-Event-ID is set
-    replayFrom(w, sessionID, lastEventID)
-    
-    // Stream new events
-    for event := range session.Events() {
-        fmt.Fprintf(w, "id: %d\nevent: wmp\ndata: %s\n\n", event.ID, event.Data)
-        flusher.Flush()
-    }
+	sessionID := r.URL.Query().Get("session_id")
+	lastEventID := r.Header.Get("Last-Event-ID")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	// Replay missed events if Last-Event-ID is set
+	replayFrom(w, sessionID, lastEventID)
+	flusher.Flush()
+
+	// Stream new events until the client goes away
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case event, ok := <-session.Events():
+			if !ok {
+				return
+			}
+			fmt.Fprintf(w, "id: %d\nevent: wmp\ndata: %s\n\n", event.ID, event.Data)
+			flusher.Flush()
+		}
+	}
 }
 ```
 
@@ -250,10 +290,28 @@ func handleEvents(w http.ResponseWriter, r *http.Request) {
 The frontend transport becomes dramatically simpler:
 
 ```typescript
+import { fetchEventSource } from '@microsoft/fetch-event-source';
+
+// Provided by the wallet frontend; shown here only so the example type-checks.
+interface IOIDFlowTransport {
+  connect(token: string): Promise<void>;
+  startFlow(protocol: string, params: unknown): Promise<unknown>;
+  sendAction(flowId: string, action: string, params: unknown): Promise<unknown>;
+}
+
+class RetriableError extends Error {}
+
+class WMPError extends Error {
+  constructor(public readonly error: { code: number; message: string }) {
+    super(error.message);
+  }
+}
+
 class OIDFlowHTTPSSETransport implements IOIDFlowTransport {
-  private abort: AbortController | null = null; // fetch-based SSE, not native EventSource
+  private ctrl: AbortController | null = null; // fetch-based SSE, not native EventSource
   private sessionId: string | null = null;
-  
+  private token = '';
+
   async connect(token: string): Promise<void> {
     this.token = token;
     // Create the session via POST. Authentication is inline: params.auth is
@@ -263,13 +321,13 @@ class OIDFlowHTTPSSETransport implements IOIDFlowTransport {
     const result = await this.rpc('wmp.session.create', {
       wmp: { version: '0.1' },
       security: { mode: 'tls' },
-      auth: { type: 'bearer', token }
+      auth: { type: 'bearer', token },
     });
     this.sessionId = result.wmp.session_id;
-    
+
     // Open SSE stream for notifications (with auth headers)
     this.ctrl = new AbortController();
-    fetchEventSource(`/api/v2/wallet/events?session_id=${this.sessionId}`, {
+    void fetchEventSource(`/api/v2/wallet/events?session_id=${this.sessionId}`, {
       headers: {
         'Authorization': `Bearer ${token}`,
       },
@@ -278,8 +336,8 @@ class OIDFlowHTTPSSETransport implements IOIDFlowTransport {
       onclose: () => { throw new RetriableError(); },
     });
   }
-  
-  async startFlow(protocol: string, params: any): Promise<any> {
+
+  async startFlow(protocol: string, params: unknown): Promise<any> {
     return this.rpc('wmp.flow.start', {
       wmp: { version: '0.1', session_id: this.sessionId },
       flow_type: protocol,
@@ -287,8 +345,8 @@ class OIDFlowHTTPSSETransport implements IOIDFlowTransport {
       params,
     });
   }
-  
-  async sendAction(flowId: string, action: string, params: any): Promise<any> {
+
+  async sendAction(flowId: string, action: string, params: unknown): Promise<any> {
     return this.rpc('wmp.flow.action', {
       wmp: { version: '0.1', session_id: this.sessionId },
       flow_id: flowId,
@@ -296,8 +354,8 @@ class OIDFlowHTTPSSETransport implements IOIDFlowTransport {
       params,
     });
   }
-  
-  private async rpc(method: string, params: any): Promise<any> {
+
+  private async rpc(method: string, params: unknown): Promise<any> {
     const resp = await fetch('/api/v2/wallet/rpc', {
       method: 'POST',
       headers: {
@@ -317,8 +375,8 @@ class OIDFlowHTTPSSETransport implements IOIDFlowTransport {
     if (result.error) throw new WMPError(result.error);
     return result.result;
   }
-  
-  private handleNotification(msg: any) {
+
+  private handleNotification(msg: { method: string; params: unknown }): void {
     // Route to flow handlers based on msg.method
     switch (msg.method) {
       case 'wmp.flow.progress':
@@ -332,6 +390,11 @@ class OIDFlowHTTPSSETransport implements IOIDFlowTransport {
         break;
     }
   }
+
+  // Callbacks wired up by the flow runner.
+  onProgress: (params: unknown) => void = () => {};
+  onComplete: (params: unknown) => void = () => {};
+  onError: (params: unknown) => void = () => {};
 }
 ```
 
@@ -503,46 +566,48 @@ allowing the engine's coroutine-style handlers to run unchanged:
 
 ```go
 type FlowBridge struct {
-    peer     wmp.PeerContext
-    actionCh chan *wmp.FlowActionParams
-    signCh   chan *wmp.FlowActionParams
-    matchCh  chan *wmp.FlowActionParams
+	peer     wmp.PeerContext
+	flowID   string
+	handler  *FlowHandler
+	actionCh chan *wmp.FlowActionParams
+	signCh   chan *wmp.FlowActionParams
+	matchCh  chan *wmp.FlowActionParams
 }
 
 // StartFlow launches the coroutine
 func (b *FlowBridge) StartFlow(ctx context.Context, params *wmp.FlowStartParams) (*wmp.FlowStartResult, error) {
-    go b.handler.Execute(ctx, toEngineMsg(params))
-    return &wmp.FlowStartResult{...}, nil
+	go b.handler.Execute(ctx, toEngineMsg(params))
+	return &wmp.FlowStartResult{}, nil
 }
 
 // HandleAction routes to the appropriate channel
 func (b *FlowBridge) HandleAction(ctx context.Context, params *wmp.FlowActionParams) (*wmp.FlowActionResult, error) {
-    switch classifyAction(params.Action) {
-    case "sign_response":
-        b.signCh <- params
-    case "match_response":
-        b.matchCh <- params
-    default:
-        b.actionCh <- params
-    }
-    return &wmp.FlowActionResult{Status: "accepted"}, nil
+	switch classifyAction(params.Action) {
+	case "sign_response":
+		b.signCh <- params
+	case "match_response":
+		b.matchCh <- params
+	default:
+		b.actionCh <- params
+	}
+	return &wmp.FlowActionResult{Status: "accepted"}, nil
 }
 
 // RequestSign sends a progress notification and blocks on signCh
-func (b *FlowBridge) RequestSign(ctx context.Context, action string, signParams interface{}) (json.RawMessage, error) {
-    peer.Notify(ctx, wmp.MethodFlowProgress, &wmp.FlowProgressParams{
-        FlowID: b.flowID,
-        Step:   "sign_request",
-        Payload: marshalSignRequest(action, signParams),
-    })
-    select {
-    case resp := <-b.signCh:
-        return resp.Params, nil
-    case <-time.After(30 * time.Second):
-        return nil, ErrSignTimeout
-    case <-ctx.Done():
-        return nil, ctx.Err()
-    }
+func (b *FlowBridge) RequestSign(ctx context.Context, action string, signParams any) (json.RawMessage, error) {
+	_ = b.peer.Notify(ctx, wmp.MethodFlowProgress, &wmp.FlowProgressParams{
+		FlowID:  b.flowID,
+		Step:    "sign_request",
+		Payload: marshalSignRequest(action, signParams),
+	})
+	select {
+	case resp := <-b.signCh:
+		return resp.Params, nil
+	case <-time.After(30 * time.Second):
+		return nil, ErrSignTimeout
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 ```
 
@@ -771,11 +836,16 @@ Sketch of the enforcement (see `HandleWMPRPC` / `HandleWMPEvents` in
 
 ```go
 userID, tenantID, tac, tokenID, err := validateToken(bearerToken(r))
-if err != nil { /* 401 */ }
+if err != nil {
+	http.Error(w, "unauthorized", http.StatusUnauthorized)
+	return
+}
 tenantID = normalizeTenant(tenantID) // "" -> "default"
 if !ownsSession(session, caller{userID, tenantID, tokenID}) {
-    http.Error(w, "session not found", http.StatusNotFound)
+	http.Error(w, "session not found", http.StatusNotFound)
+	return
 }
+_ = tac
 ```
 
 ### 2. Signing Timeout Semantics
@@ -814,10 +884,10 @@ The new `OIDFlowHTTPTransport` implements this same interface, making the
 migration transparent to the rest of the frontend:
 
 ```typescript
-class OIDFlowHTTPTransport implements IOIDFlowTransport {
-  // fetch() for requests, fetch-based SSE for notifications (native EventSource cannot send Authorization)
-  // Same IOIDFlowTransport callbacks as WebSocket version
-}
+// Builds on OIDFlowHTTPSSETransport above: fetch() for requests, fetch-based SSE
+// for notifications (native EventSource cannot send Authorization). Same
+// IOIDFlowTransport callbacks as the WebSocket version.
+class OIDFlowHTTPTransport extends OIDFlowHTTPSSETransport {}
 ```
 
 ### 6. SSE Connection Limits
