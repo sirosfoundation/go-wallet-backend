@@ -441,6 +441,10 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 		return nil, err
 	}
 
+	// codeql[go/request-forgery]: h.httpClient is constructed via
+	// cfg.HTTPClient.NewHTTPClient(), whose DialContext blocks private/
+	// loopback/link-local IPs by default (SSRF protection). Fetching an
+	// attacker-supplied request_uri is inherent to OID4VP §5.10.
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		return nil, &requestFetchError{fmt.Errorf("failed to fetch request: %w", err)}
@@ -1487,6 +1491,10 @@ func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*C
 		return nil, err
 	}
 
+	// codeql[go/request-forgery]: h.httpClient is constructed via
+	// cfg.HTTPClient.NewHTTPClient(), whose DialContext blocks private/
+	// loopback/link-local IPs by default (SSRF protection). Fetching an
+	// attacker-supplied client_metadata_uri is inherent to OID4VP §5.7.
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -1859,6 +1867,11 @@ func (h *OID4VPHandler) submitDirectPost(ctx context.Context, endpoint string, a
 	}
 	req.Header.Set(hdrContentType, mimeFormURLEncoded)
 
+	// codeql[go/request-forgery]: endpoint was rebuilt by sanitizeEndpointURL()
+	// (scheme validated, taint broken) above, and h.httpClient additionally
+	// blocks private/loopback/link-local IPs via its DialContext by default
+	// (SSRF protection). Posting to an attacker-supplied response_uri is
+	// inherent to OID4VP §6.2.
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to submit response: %w", err)
@@ -2428,6 +2441,11 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 	}
 	req.Header.Set(hdrContentType, mimeFormURLEncoded)
 
+	// codeql[go/request-forgery]: endpoint was rebuilt by sanitizeEndpointURL()
+	// (scheme validated, taint broken) above, and h.httpClient additionally
+	// blocks private/loopback/link-local IPs via its DialContext by default
+	// (SSRF protection). Posting to an attacker-supplied response_uri is
+	// inherent to OID4VP §6.2.
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to submit JARM response: %w", err)

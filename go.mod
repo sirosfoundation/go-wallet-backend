@@ -3,6 +3,7 @@ module github.com/sirosfoundation/go-wallet-backend
 go 1.27
 
 require (
+	github.com/alicebob/miniredis/v2 v2.39.0
 	github.com/descope/virtualwebauthn v1.0.3
 	github.com/fxamacker/cbor/v2 v2.9.4
 	github.com/getkin/kin-openapi v0.149.0
@@ -23,6 +24,7 @@ require (
 	github.com/sirosfoundation/go-tokenauth v0.5.0
 	github.com/sirosfoundation/go-trust v0.21.1
 	github.com/sirosfoundation/go-ts11client v0.0.0-20260820233304-8809951d6f67
+	github.com/sirosfoundation/go-wmp v0.5.0
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.1
 	go.mongodb.org/mongo-driver v1.17.10
@@ -86,6 +88,7 @@ require (
 	github.com/xdg-go/scram v1.2.0 // indirect
 	github.com/xdg-go/stringprep v1.0.4 // indirect
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
+	github.com/yuin/gopher-lua v1.1.1 // indirect
 	go.mongodb.org/mongo-driver/v2 v2.9.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect

@@ -1675,6 +1675,56 @@ func TestNewBackendProvider_WiresASModuleWhenEnabled(t *testing.T) {
 	}
 }
 
+func TestConfigureWMPExternalURL(t *testing.T) {
+	cases := []struct {
+		name   string
+		engine string
+		as     string
+		want   string // expected advertised rpc endpoint prefix; "" means 503
+	}{
+		{"wss engine url", "wss://ws.wallet.example.com", "", "https://ws.wallet.example.com"},
+		{"ws engine url", "ws://localhost:8082", "", "http://localhost:8082"},
+		{"https engine url", "https://engine.example.com", "", "https://engine.example.com"},
+		{"http engine url", "http://localhost:8082", "", "http://localhost:8082"},
+		{"invalid engine url does not fall back to AS", "wss://", "https://as.example.com", ""},
+		{"query engine url does not fall back to AS", "wss://x.example/?q=1", "https://as.example.com", ""},
+		{"empty engine url does not fall back to AS", "", "https://as.example.com", ""},
+		{"engine url wins over AS", "https://engine.example.com", "https://as.example.com", "https://engine.example.com"},
+		{"nothing usable", "ftp://x", "::", ""},
+		{"nothing configured", "", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{}
+			cfg.Server.ExternalURLs.EngineURL = tc.engine
+			cfg.AS.ExternalURL = tc.as
+			logger := zap.NewNop()
+			manager := wsengine.NewManager(cfg, logger)
+			adapter := wsengine.NewWMPAdapter(manager, logger, func(*http.Request) string { return "" })
+			t.Cleanup(func() {
+				adapter.Close()
+				manager.Close()
+			})
+			configureWMPExternalURL(adapter, cfg, logger)
+
+			w := httptest.NewRecorder()
+			adapter.HandleWMPConfiguration(w, httptest.NewRequest(http.MethodGet, "/.well-known/wmp-configuration", nil))
+			if tc.want == "" {
+				if w.Code != http.StatusServiceUnavailable {
+					t.Fatalf("status = %d, want 503", w.Code)
+				}
+				return
+			}
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200", w.Code)
+			}
+			if !strings.Contains(w.Body.String(), tc.want+"/api/v2/wallet/rpc") {
+				t.Fatalf("body %s lacks %s", w.Body.String(), tc.want)
+			}
+		})
+	}
+}
+
 // A deployment may configure AS.Issuer differently from JWT.Issuer. Legacy
 // tokens are minted with iss=JWT.Issuer, so the validator must be told that
 // explicitly rather than falling back to the AS issuer.

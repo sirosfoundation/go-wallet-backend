@@ -544,6 +544,10 @@ type SignResponseMessage struct {
 	// given.
 	DPoPKeyID string `json:"dpop_key_id,omitempty"`
 	DPoPProof string `json:"dpop_proof,omitempty"`
+	// Error is set when the client failed the sign request (for WMP, a
+	// wmp.flow.error for the child sign flow); RequestSign returns it as an
+	// error instead of waiting for a timeout.
+	Error string `json:"error,omitempty"`
 }
 
 // MatchRequestMessage requests client-side credential matching.

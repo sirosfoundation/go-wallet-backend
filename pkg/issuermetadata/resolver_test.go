@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,8 +25,9 @@ import (
 func newTestResolver(t *testing.T) *Resolver {
 	t.Helper()
 	r, err := New(Config{
-		CacheTTL:  5 * time.Minute,
-		AllowHTTP: true,
+		CacheTTL:                              5 * time.Minute,
+		AllowHTTP:                             true,
+		UnsafeAllowPrivateAddressesForTesting: true,
 	})
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
@@ -541,8 +543,9 @@ func TestResolve_CacheTTLExpiry(t *testing.T) {
 	defer server.Close()
 
 	r, _ := New(Config{
-		CacheTTL:  1 * time.Millisecond, // very short TTL
-		AllowHTTP: true,
+		CacheTTL:                              1 * time.Millisecond, // very short TTL
+		AllowHTTP:                             true,
+		UnsafeAllowPrivateAddressesForTesting: true,
 	})
 
 	if _, err := r.Resolve(context.Background(), server.URL); err != nil {
@@ -661,8 +664,9 @@ func TestResolveWithInfo_Validated_SignedMetadata(t *testing.T) {
 
 	evaluator := &mockTrustEvaluator{decision: true}
 	resolver, _ := New(Config{
-		AllowHTTP:      true,
-		TrustEvaluator: evaluator,
+		AllowHTTP:                             true,
+		UnsafeAllowPrivateAddressesForTesting: true,
+		TrustEvaluator:                        evaluator,
 	})
 	result, err := resolver.ResolveWithInfo(context.Background(), server.URL)
 	if err != nil {
@@ -748,9 +752,10 @@ func TestResolve_ApplicationJWT_WithX5C(t *testing.T) {
 	token = signClaimsWithX5C(t, priv, []*x509.Certificate{cert}, "openidvci-issuer-metadata+jwt", claims)
 
 	resolver, err := New(Config{
-		CacheTTL:       5 * time.Minute,
-		AllowHTTP:      true,
-		TrustEvaluator: evaluator,
+		CacheTTL:                              5 * time.Minute,
+		AllowHTTP:                             true,
+		UnsafeAllowPrivateAddressesForTesting: true,
+		TrustEvaluator:                        evaluator,
 	})
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
@@ -803,9 +808,10 @@ func TestResolve_ApplicationJWT_TrustEvaluatorRejects(t *testing.T) {
 	token = signClaimsWithX5C(t, priv, []*x509.Certificate{cert}, "openidvci-issuer-metadata+jwt", claims)
 
 	resolver, _ := New(Config{
-		CacheTTL:       5 * time.Minute,
-		AllowHTTP:      true,
-		TrustEvaluator: evaluator,
+		CacheTTL:                              5 * time.Minute,
+		AllowHTTP:                             true,
+		UnsafeAllowPrivateAddressesForTesting: true,
+		TrustEvaluator:                        evaluator,
 	})
 
 	_, err := resolver.Resolve(context.Background(), server.URL)
@@ -838,7 +844,8 @@ func TestResolve_ApplicationJWT_WrongTyp(t *testing.T) {
 	defer server.Close()
 
 	resolver, _ := New(Config{
-		AllowHTTP: true,
+		AllowHTTP:                             true,
+		UnsafeAllowPrivateAddressesForTesting: true,
 	})
 
 	_, err := resolver.Resolve(context.Background(), server.URL)
@@ -868,7 +875,7 @@ func TestResolve_ApplicationJWT_MissingSub(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{AllowHTTP: true})
+	resolver, _ := New(Config{AllowHTTP: true, UnsafeAllowPrivateAddressesForTesting: true})
 	_, err := resolver.Resolve(context.Background(), server.URL)
 	if err == nil {
 		t.Error("expected error for missing sub claim")
@@ -893,7 +900,7 @@ func TestResolve_ApplicationJWT_SubMismatch(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{AllowHTTP: true})
+	resolver, _ := New(Config{AllowHTTP: true, UnsafeAllowPrivateAddressesForTesting: true})
 	_, err := resolver.Resolve(context.Background(), server.URL)
 	if err == nil {
 		t.Error("expected error for sub mismatch")
@@ -921,7 +928,7 @@ func TestResolve_ApplicationJWT_MissingIat(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{AllowHTTP: true})
+	resolver, _ := New(Config{AllowHTTP: true, UnsafeAllowPrivateAddressesForTesting: true})
 	_, err := resolver.Resolve(context.Background(), server.URL)
 	if err == nil {
 		t.Error("expected error for missing iat claim")
@@ -952,8 +959,9 @@ func TestResolve_SignedMetadata_TrustEvaluatorCalled(t *testing.T) {
 	defer server.Close()
 
 	resolver, _ := New(Config{
-		AllowHTTP:      true,
-		TrustEvaluator: evaluator,
+		AllowHTTP:                             true,
+		UnsafeAllowPrivateAddressesForTesting: true,
+		TrustEvaluator:                        evaluator,
 	})
 
 	_, err := resolver.Resolve(context.Background(), server.URL)
@@ -995,8 +1003,9 @@ func TestResolve_SignedMetadata_TrustEvaluatorRejects(t *testing.T) {
 	defer server.Close()
 
 	resolver, _ := New(Config{
-		AllowHTTP:      true,
-		TrustEvaluator: evaluator,
+		AllowHTTP:                             true,
+		UnsafeAllowPrivateAddressesForTesting: true,
+		TrustEvaluator:                        evaluator,
 	})
 
 	_, err := resolver.Resolve(context.Background(), server.URL)
@@ -1015,7 +1024,7 @@ func TestResolve_AcceptHeader(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{AllowHTTP: true})
+	resolver, _ := New(Config{AllowHTTP: true, UnsafeAllowPrivateAddressesForTesting: true})
 	resolver.Resolve(context.Background(), server.URL) //nolint:errcheck
 
 	if !strings.Contains(acceptHeader, "application/jwt") {
@@ -1034,7 +1043,7 @@ func TestResolve_UnsupportedContentType(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{AllowHTTP: true})
+	resolver, _ := New(Config{AllowHTTP: true, UnsafeAllowPrivateAddressesForTesting: true})
 	_, err := resolver.Resolve(context.Background(), server.URL)
 	if err == nil {
 		t.Error("expected error for unsupported Content-Type")
@@ -1066,8 +1075,9 @@ func TestResolve_TrustEvaluatorError(t *testing.T) {
 	defer server.Close()
 
 	resolver, _ := New(Config{
-		AllowHTTP:      true,
-		TrustEvaluator: evaluator,
+		AllowHTTP:                             true,
+		UnsafeAllowPrivateAddressesForTesting: true,
+		TrustEvaluator:                        evaluator,
 	})
 
 	_, err := resolver.Resolve(context.Background(), server.URL)
@@ -1076,5 +1086,124 @@ func TestResolve_TrustEvaluatorError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "trust engine unavailable") {
 		t.Errorf("expected propagated error, got: %v", err)
+	}
+}
+
+// The credential_issuer claim is compared as an identifier: a root slash on
+// either the requested or the declared side must not cause a rejection, while
+// a path difference (including a trailing slash on a path) still does.
+func TestResolve_CredentialIssuerRootSlashSymmetric(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		reqSlash  bool
+		declSlash bool
+	}{
+		{"neither", false, false},
+		{"requested only", true, false},
+		{"declared only", false, true},
+		{"both", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var server *httptest.Server
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				id := server.URL
+				if tc.declSlash {
+					id += "/"
+				}
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]string{"credential_issuer": id}) //nolint:errcheck
+			}))
+			defer server.Close()
+			req := server.URL
+			if tc.reqSlash {
+				req += "/"
+			}
+			if _, err := newTestResolver(t).Resolve(context.Background(), req); err != nil {
+				t.Fatalf("Resolve(%q) error: %v", req, err)
+			}
+		})
+	}
+}
+
+func TestResolve_CredentialIssuerPathSlashStillExact(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL + "/tenant"}) //nolint:errcheck
+	}))
+	defer server.Close()
+	_, err := newTestResolver(t).Resolve(context.Background(), server.URL+"/tenant/")
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("expected mismatch for differing path slash, got %v", err)
+	}
+}
+
+func TestValidateIssuerClaims_RootSlashAndQuery(t *testing.T) {
+	cases := []struct {
+		claim, issuer string
+		ok            bool
+	}{
+		{"https://i.example.com/", "https://i.example.com", true},
+		{"https://i.example.com", "https://i.example.com/", true},
+		{"https://i.example.com/t", "https://i.example.com/t/", false},
+		{"https://i.example.com/t/", "https://i.example.com/t", false},
+		{"https://i.example.com?r=https://c/", "https://i.example.com?r=https://c/", true},
+		{"https://i.example.com?r=https://c", "https://i.example.com?r=https://c/", false},
+	}
+	for _, c := range cases {
+		if got := validateCredentialIssuerClaim(map[string]interface{}{"credential_issuer": c.claim}, c.issuer) == nil; got != c.ok {
+			t.Errorf("credential_issuer %q vs %q: ok=%v want %v", c.claim, c.issuer, got, c.ok)
+		}
+		if got := validateJWTClaims(map[string]interface{}{"sub": c.claim, "iat": 1}, c.issuer) == nil; got != c.ok {
+			t.Errorf("sub %q vs %q: ok=%v want %v", c.claim, c.issuer, got, c.ok)
+		}
+	}
+}
+
+// TestNew_DefaultClientIsSSRFGuarded verifies that a nil Config.HTTPClient
+// yields a guarded client rather than http.DefaultClient: a loopback issuer
+// must be refused unless the test-only option is set.
+func TestNew_DefaultClientIsSSRFGuarded(t *testing.T) {
+	var hits atomic.Int32
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		// Valid metadata: if the server is reached, Resolve succeeds, so a
+		// refusal can only come from the guard, not from a later parse or
+		// validation failure.
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"credential_issuer": srv.URL})
+	}))
+	defer srv.Close()
+
+	r, err := New(Config{AllowHTTP: true})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	if r.httpClient == http.DefaultClient {
+		t.Fatal("resolver must not use http.DefaultClient")
+	}
+	_, err = r.Resolve(context.Background(), srv.URL)
+	if err == nil {
+		t.Fatal("expected loopback issuer to be refused by the default guarded client")
+	}
+	if got := hits.Load(); got != 0 {
+		t.Fatalf("loopback server was reached %d time(s); guard did not block the request (err: %v)", got, err)
+	}
+	if !strings.Contains(err.Error(), "private/loopback address") {
+		t.Fatalf("error is not the SSRF refusal: %v", err)
+	}
+
+	// Positive control: the same server is reachable, and Resolve succeeds,
+	// when the test-only opt-out is set.
+	open, err := New(Config{AllowHTTP: true, UnsafeAllowPrivateAddressesForTesting: true})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	if _, err := open.Resolve(context.Background(), srv.URL); err != nil {
+		t.Fatalf("control: Resolve with opt-out failed: %v", err)
+	}
+	if hits.Load() == 0 {
+		t.Fatal("control: server was not reached with the opt-out set")
 	}
 }
