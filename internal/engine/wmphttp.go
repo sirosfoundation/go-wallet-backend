@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,6 +42,10 @@ const maxWMPRPCBodyBytes = 256 * 1024
 // socket write indefinitely - closing the event buffer cannot interrupt one.
 // It is a variable so tests can shorten it.
 var wmpSSEWriteTimeout = 15 * time.Second
+
+// wmpSSEHeartbeatInterval is how often an idle SSE stream emits a comment
+// frame so dead connections are detected by a failing (bounded) write.
+var wmpSSEHeartbeatInterval = 20 * time.Second
 
 // HandleWMPRPC handles POST /api/v2/wallet/rpc — a single JSON-RPC request/response.
 func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
@@ -210,16 +215,16 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Reject a second concurrent connection for this session rather than
-	// letting it interleave with the first on the same event stream. Must
-	// run before any header is written — an implicit 200 from
-	// flusher.Flush() below can't be undone afterward.
-	ctx := r.Context()
-	if !buf.tryAcquire(ctx) {
-		http.Error(w, "another connection is already streaming events for this session", http.StatusConflict)
-		return
-	}
-	defer buf.release(ctx)
+	// A new connection supersedes any previous one for this session: the
+	// old stream's context is cancelled so its handler exits. A stale
+	// connection (unclean mobile/network drop that the server has not yet
+	// noticed) must never lock the client out. Ownership and capability
+	// checks above have already passed, so only an authorized caller can
+	// supersede. Replay is cursor-driven, so nothing is lost.
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	stream := buf.acquire(cancel)
+	defer buf.release(stream)
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -256,6 +261,8 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	done := buf.doneCh()
+	heartbeat := time.NewTicker(wmpSSEHeartbeatInterval)
+	defer heartbeat.Stop()
 
 	for {
 		events, wake := buf.after(cursor)
@@ -279,6 +286,17 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 		case <-done:
 			return // session closed (client close, expiry, revocation, shutdown)
 		case <-wake:
+		case <-heartbeat.C:
+			// Comment frame: ignored by SSE clients, but forces a write so
+			// a dead socket is detected within the bounded write deadline.
+			armWrite()
+			if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
+				return
+			}
+			if err := rc.Flush(); err != nil {
+				return
+			}
+			clearWrite()
 		}
 	}
 }

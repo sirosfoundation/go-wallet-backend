@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1316,20 +1317,44 @@ func TestWMP_HTTPEndpoint_Events_MissingSessionID(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, w.Code)
 }
 
-// TestWMP_HTTPEndpoint_Events_RejectsConcurrentConnection is a regression
-// test: a second GET /wmp/events for the same session while a first is
-// still connected must not race it to read from the same events channel
-// (which would silently split the notification stream between them).
-func TestWMP_HTTPEndpoint_Events_RejectsConcurrentConnection(t *testing.T) {
+// readSSELine reads lines until one contains want, or fails on timeout.
+func readSSEUntil(t *testing.T, br *bufio.Reader, want string) {
+	t.Helper()
+	got := make(chan bool, 1)
+	go func() {
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				got <- false
+				return
+			}
+			if strings.Contains(line, want) {
+				got <- true
+				return
+			}
+		}
+	}()
+	select {
+	case ok := <-got:
+		require.True(t, ok, "stream ended before %q", want)
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timeout waiting for %q", want)
+	}
+}
+
+// TestWMP_HTTPEndpoint_Events_NewConnectionSupersedesStale: a second GET
+// while a first (never-closing, stale) stream is open succeeds, the first
+// stream ends, and the second replays from its own cursor without loss.
+func TestWMP_HTTPEndpoint_Events_NewConnectionSupersedesStale(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
 
 	sessionID := createWMPSession(t, a)
 	token := testToken("user-1", "tenant-a")
+	buf := a.getOrCreateEventBuffer(sessionID)
+	buf.append([]byte(`{"n":1}`))
 
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		a.HandleWMPEvents(w, r)
-	}))
+	ts := httptest.NewServer(http.HandlerFunc(a.HandleWMPEvents))
 	defer ts.Close()
 
 	req1, _ := http.NewRequest(http.MethodGet, ts.URL+"?session_id="+sessionID, nil)
@@ -1338,18 +1363,55 @@ func TestWMP_HTTPEndpoint_Events_RejectsConcurrentConnection(t *testing.T) {
 	require.NoError(t, err)
 	defer resp1.Body.Close()
 	require.Equal(t, http.StatusOK, resp1.StatusCode)
+	br1 := bufio.NewReader(resp1.Body)
+	readSSEUntil(t, br1, `"n":1`)
 
-	require.Eventually(t, func() bool {
-		buf := a.getOrCreateEventBuffer(sessionID)
-		return !buf.tryAcquire(context.Background()) // still held by req1 => can't acquire
-	}, time.Second, 5*time.Millisecond)
+	// Event emitted while the (stale) first stream is still attached.
+	buf.append([]byte(`{"n":2}`))
+	readSSEUntil(t, br1, `"n":2`)
 
 	req2, _ := http.NewRequest(http.MethodGet, ts.URL+"?session_id="+sessionID, nil)
 	req2.Header.Set("Authorization", "Bearer "+token)
+	req2.Header.Set("Last-Event-ID", "1")
 	resp2, err := http.DefaultClient.Do(req2)
 	require.NoError(t, err)
 	defer resp2.Body.Close()
-	assert.Equal(t, http.StatusConflict, resp2.StatusCode)
+	require.Equal(t, http.StatusOK, resp2.StatusCode)
+	br2 := bufio.NewReader(resp2.Body)
+	readSSEUntil(t, br2, `"n":2`) // replayed after the cursor, not lost
+
+	// The first stream is terminated by the supersede.
+	done := make(chan struct{})
+	go func() { _, _ = io.Copy(io.Discard, br1); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("superseded stream did not end")
+	}
+
+	// The new stream keeps receiving.
+	buf.append([]byte(`{"n":3}`))
+	readSSEUntil(t, br2, `"n":3`)
+}
+
+func TestWMP_HTTPEndpoint_Events_Heartbeat(t *testing.T) {
+	old := wmpSSEHeartbeatInterval
+	wmpSSEHeartbeatInterval = 20 * time.Millisecond
+	defer func() { wmpSSEHeartbeatInterval = old }()
+
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	sessionID := createWMPSession(t, a)
+
+	ts := httptest.NewServer(http.HandlerFunc(a.HandleWMPEvents))
+	defer ts.Close()
+	req, _ := http.NewRequest(http.MethodGet, ts.URL+"?session_id="+sessionID, nil)
+	req.Header.Set("Authorization", "Bearer "+testToken("user-1", "tenant-a"))
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	readSSEUntil(t, bufio.NewReader(resp.Body), ": keepalive")
 }
 
 // TestWMPEventBuffer_AppendReplayAndAcquire covers the wmpEventBuffer
@@ -1374,12 +1436,16 @@ func TestWMPEventBuffer_AppendReplayAndAcquire(t *testing.T) {
 	assert.Nil(t, buf.replaySince("not-a-number"))
 
 	ctx1, cancel1 := context.WithCancel(context.Background())
-	require.True(t, buf.tryAcquire(ctx1), "first connection should acquire")
-	assert.False(t, buf.tryAcquire(context.Background()), "second connection should be rejected while first is active")
+	s1 := buf.acquire(cancel1)
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	s2 := buf.acquire(cancel2)
+	assert.Error(t, ctx1.Err(), "second connection must supersede the first")
+	assert.NoError(t, ctx2.Err())
 
-	cancel1()
-	buf.release(ctx1)
-	assert.True(t, buf.tryAcquire(context.Background()), "should be acquirable again after release")
+	buf.release(s1) // stale release must not clear the newer registration
+	buf.acquire(func() {})
+	assert.Error(t, ctx2.Err(), "newer registration must still have been active")
+	buf.release(s2)
 }
 
 // --- Message translation tests ---

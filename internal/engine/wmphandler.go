@@ -154,10 +154,14 @@ type wmpEventBuffer struct {
 	done     chan struct{}
 	doneOnce sync.Once
 
-	// activeCtx is the Context of the currently-connected SSE request, if
-	// any. A second concurrent GET /events for the same session would
-	// otherwise interleave writes with the first on the same event stream.
-	activeCtx context.Context
+	// active is the cancel function of the currently-streaming SSE
+	// connection, if any. A new connection supersedes it (see acquire).
+	active *wmpStream
+}
+
+// wmpStream identifies one SSE connection registered on a buffer.
+type wmpStream struct {
+	cancel context.CancelFunc
 }
 
 // ensure lazily initialises the signalling channels (so the zero value is
@@ -171,28 +175,31 @@ func (b *wmpEventBuffer) ensure() {
 	}
 }
 
-// tryAcquire claims this buffer for a new SSE connection with the given
-// request context, returning false if another connection is already active
-// (and not yet done). Callers must call release with the same ctx when the
-// connection ends.
-func (b *wmpEventBuffer) tryAcquire(ctx context.Context) bool {
+// acquire registers a new SSE connection and supersedes any previous one by
+// cancelling its context so its handler exits. A stale connection (e.g. an
+// unclean mobile disconnect whose context is not yet cancelled) therefore can
+// never block a reconnect. The buffer is replay-only and cursor-driven, so
+// the superseded handler losing its stream drops nothing: the new connection
+// replays from its own Last-Event-ID. Callers must call release with the
+// returned stream when the connection ends.
+func (b *wmpEventBuffer) acquire(cancel context.CancelFunc) *wmpStream {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.activeCtx != nil && b.activeCtx.Err() == nil {
-		return false
+	if b.active != nil {
+		b.active.cancel()
 	}
-	b.activeCtx = ctx
-	return true
+	s := &wmpStream{cancel: cancel}
+	b.active = s
+	return s
 }
 
-// release clears the active connection if ctx is still the one registered
-// (a stale release from an already-superseded connection must not clear a
-// newer one's registration).
-func (b *wmpEventBuffer) release(ctx context.Context) {
+// release clears the active connection if s is still the registered one (a
+// release from an already-superseded connection must not clear a newer one).
+func (b *wmpEventBuffer) release(s *wmpStream) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.activeCtx == ctx {
-		b.activeCtx = nil
+	if b.active == s {
+		b.active = nil
 	}
 }
 
