@@ -251,7 +251,7 @@ func TestManager_validateToken_UUID(t *testing.T) {
 	userID, tenantID, _, err := m.validateToken(tokenString)
 	require.NoError(t, err)
 	assert.Equal(t, "uuid-user-456", userID)
-	assert.Empty(t, tenantID) // wallet-backend-server tokens don't have tenant_id
+	assert.Equal(t, "default", tenantID) // no tenant_id claim: normalised to the default tenant
 }
 
 func TestManager_validateToken_UserIDTakesPrecedence(t *testing.T) {

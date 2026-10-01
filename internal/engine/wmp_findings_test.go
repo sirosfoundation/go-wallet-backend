@@ -2,10 +2,14 @@ package engine
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/gorilla/websocket"
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -149,4 +153,67 @@ func TestWMP_SessionSlot_ReleasedOnEveryTeardownPath(t *testing.T) {
 	a.tokenSlotsMu.Lock()
 	defer a.tokenSlotsMu.Unlock()
 	assert.Empty(t, a.tokenSlots, "per-token counters must be released too")
+}
+
+// A token without a tenant_id claim belongs to the default tenant on every
+// transport. The WebSocket and WMP sessions of such a user therefore share
+// one (tenant, user) index key and supersede each other.
+func TestTokenlessTenant_WebSocketAndWMPShareDefaultTenantIndex(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+
+	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	dialWS := func() *websocket.Conn {
+		ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		require.NoError(t, err)
+		require.NoError(t, ws.WriteJSON(HandshakeMessage{
+			Message:  Message{Type: TypeHandshake},
+			AppToken: testToken("user-nt", ""),
+		}))
+		var complete HandshakeCompleteMessage
+		require.NoError(t, ws.ReadJSON(&complete))
+		require.Equal(t, TypeHandshakeComplete, complete.Type)
+		return ws
+	}
+	waitClosed := func(ws *websocket.Conn) {
+		_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
+		for {
+			if _, _, err := ws.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}
+
+	// 1. WebSocket session lands under the default tenant.
+	ws1 := dialWS()
+	defer func() { _ = ws1.Close() }()
+	wsSess, err := m.GetSessionByUser("default", "user-nt")
+	require.NoError(t, err, "WebSocket session must be indexed under the default tenant")
+	assert.Equal(t, "default", wsSess.TenantID)
+	_, err = m.GetSessionByUser("", "user-nt")
+	assert.NoError(t, err, "an empty tenant resolves to default on lookup too")
+
+	// 2. A WMP session of the same user supersedes the WebSocket session.
+	wmpID, _ := createWMPSessionWithToken(t, a, "user-nt", "")
+	waitClosed(ws1)
+	cur, err := m.GetSessionByUser("default", "user-nt")
+	require.NoError(t, err)
+	assert.Equal(t, wmpID, cur.ID)
+	assert.False(t, m.isCurrentSession(wsSess))
+
+	// 3. A new WebSocket session supersedes the WMP session.
+	ws2 := dialWS()
+	defer func() { _ = ws2.Close() }()
+	cur2, err := m.GetSessionByUser("default", "user-nt")
+	require.NoError(t, err)
+	assert.NotEqual(t, wmpID, cur2.ID)
+	assert.Eventually(t, func() bool {
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		_, ok := a.peers[wmpID]
+		return !ok
+	}, 5*time.Second, 20*time.Millisecond, "WMP session must be superseded by the WebSocket one")
 }

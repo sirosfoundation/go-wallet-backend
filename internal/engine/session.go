@@ -172,9 +172,24 @@ type userKey struct {
 	UserID   string
 }
 
+// defaultTenant is the tenant a token without a tenant_id claim belongs to
+// (matches pkg/middleware/tokenauth.go).
+const defaultTenant = "default"
+
+// normalizeTenant maps a missing tenant claim to the default tenant. It is
+// the single normalisation shared by WebSocket and WMP session creation, the
+// (tenant, user) index, session ownership checks and the persisted store, so
+// the same tokenless-tenant user always resolves to the same tenant.
+func normalizeTenant(t string) string {
+	if t == "" {
+		return defaultTenant
+	}
+	return t
+}
+
 // userKey returns the session's (tenant, user) index key.
 func (s *Session) userKey() userKey {
-	return userKey{TenantID: s.TenantID, UserID: s.UserID}
+	return userKey{TenantID: normalizeTenant(s.TenantID), UserID: s.UserID}
 }
 
 // Manager manages WebSocket sessions and flows
@@ -826,7 +841,7 @@ func (m *Manager) registerSession(session *Session) bool {
 		sessionData := &SessionData{
 			ID:        session.ID,
 			UserID:    session.UserID,
-			TenantID:  session.TenantID,
+			TenantID:  normalizeTenant(session.TenantID),
 			CreatedAt: time.Now(),
 			ExpiresAt: time.Now().Add(24 * time.Hour), // TODO: configurable
 		}
@@ -915,7 +930,7 @@ type tokenIdentity struct {
 // (see tokenIdentity.EnforceTAC).
 func (m *Manager) validateTokenAuth(tokenString string) (tokenIdentity, error) {
 	userID, tenantID, tac, jti, enforce, err := m.validateTokenFull(tokenString)
-	return tokenIdentity{UserID: userID, TenantID: tenantID, TAC: tac, JTI: jti, EnforceTAC: enforce}, err
+	return tokenIdentity{UserID: userID, TenantID: normalizeTenant(tenantID), TAC: tac, JTI: jti, EnforceTAC: enforce}, err
 }
 
 func (m *Manager) validateTokenFull(tokenString string) (userID, tenantID string, tac claims.TAC, jti string, enforceTAC bool, err error) {
@@ -1037,7 +1052,7 @@ func (m *Manager) GetSession(sessionID string) (*Session, error) {
 func (m *Manager) GetSessionByUser(tenantID, userID string) (*Session, error) {
 	m.sessionsMu.RLock()
 	defer m.sessionsMu.RUnlock()
-	session, ok := m.userIndex[userKey{TenantID: tenantID, UserID: userID}]
+	session, ok := m.userIndex[userKey{TenantID: normalizeTenant(tenantID), UserID: userID}]
 	if !ok {
 		return nil, ErrSessionNotFound
 	}
@@ -1049,7 +1064,7 @@ func (m *Manager) ListSessions(ctx context.Context, tenantID string) ([]*Session
 	if m.sessionStore == nil {
 		return nil, nil
 	}
-	return m.sessionStore.List(ctx, tenantID)
+	return m.sessionStore.List(ctx, normalizeTenant(tenantID))
 }
 
 // CleanupSessions removes expired sessions from the persistent store

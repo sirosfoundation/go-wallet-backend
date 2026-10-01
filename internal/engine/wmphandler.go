@@ -583,17 +583,6 @@ func (a *WMPAdapter) verifySessionOwnership(sessionID string, caller wmpCaller) 
 	return ownsSession(ws, caller)
 }
 
-// defaultWMPTenant is the tenant a token without a tenant_id claim belongs to
-// (matches pkg/middleware/tokenauth.go).
-const defaultWMPTenant = "default"
-
-func normalizeWMPTenant(t string) string {
-	if t == "" {
-		return defaultWMPTenant
-	}
-	return t
-}
-
 func ownsSession(ws *wmpSession, caller wmpCaller) bool {
 	if ws.session.UserID != caller.UserID {
 		return false
@@ -601,7 +590,7 @@ func ownsSession(ws *wmpSession, caller wmpCaller) bool {
 	// Exact tenant equality after normalisation. An empty tenant claim must
 	// not act as a wildcard: the HTTP middleware maps a missing tenant_id to
 	// the default tenant, so both sides are compared in that form.
-	if normalizeWMPTenant(ws.session.TenantID) != normalizeWMPTenant(caller.TenantID) {
+	if normalizeTenant(ws.session.TenantID) != normalizeTenant(caller.TenantID) {
 		return false
 	}
 	if ws.session.UserID == "" {
@@ -866,7 +855,7 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 				"reason": "invalid or expired token",
 			})
 		}
-		tenantID = normalizeWMPTenant(tenantID)
+		tenantID = normalizeTenant(tenantID)
 	} else {
 		return wmpErrorBytes(req.ID, wmp.ErrNotAuthorized, map[string]string{
 			"reason": "auth required",
