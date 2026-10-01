@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -158,6 +159,15 @@ type Manager struct {
 	// serveErrs receives fatal errors returned by a serving goroutine after
 	// Start succeeded (anything other than http.ErrServerClosed).
 	serveErrs chan error
+
+	// listeners holds every listener bound by listenAndServe so Shutdown can
+	// close them explicitly: http.Server.Shutdown only closes listeners that
+	// Serve has already registered, so a listener whose Serve goroutine has not
+	// yet run would otherwise stay bound after a failed Start.
+	listenersMu sync.Mutex
+	listeners   []net.Listener
+	// serveWG tracks the serving goroutines so Shutdown can wait for them.
+	serveWG sync.WaitGroup
 }
 
 // ServeErrors returns a channel that receives the first fatal error of a
@@ -214,7 +224,8 @@ func (c *providerChecker) CheckReady(ctx context.Context) error {
 // Start builds routers and starts http servers. Listeners are bound
 // synchronously, so an occupied port or invalid address is returned as an
 // error instead of being logged from a serving goroutine. If startup fails
-// after some listeners were bound, they are shut down again.
+// after some listeners were bound, they are closed again and their serving
+// goroutines have exited before Start returns.
 func (m *Manager) Start(ctx context.Context) error {
 	if err := m.start(ctx); err != nil {
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -236,8 +247,13 @@ func (m *Manager) listenAndServe(srv *http.Server, tlsCfg *config.TLSConfig, lis
 	if err != nil {
 		return fmt.Errorf("%s: cannot listen on %s: %w", errMsg, srv.Addr, err)
 	}
+	m.listenersMu.Lock()
+	m.listeners = append(m.listeners, ln)
+	m.listenersMu.Unlock()
 	m.logger.Info(listeningMsg, fields...)
+	m.serveWG.Add(1)
 	go func() {
+		defer m.serveWG.Done()
 		if err := tlsCfg.Serve(srv, ln); err != nil && err != http.ErrServerClosed {
 			m.logger.Error(errMsg, zap.Error(err))
 			select {
@@ -412,6 +428,20 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("admin server shutdown: %w", err))
 		}
 	}
+
+	// Release every bound listener, including ones whose Serve goroutine had
+	// not registered them with its http.Server yet. Already-closed listeners
+	// (closed by Server.Shutdown) report an error that is expected here.
+	m.listenersMu.Lock()
+	for _, ln := range m.listeners {
+		_ = ln.Close()
+	}
+	m.listeners = nil
+	m.listenersMu.Unlock()
+
+	// Serve returns once its listener is closed; waiting guarantees nothing is
+	// still bound or serving when Shutdown (and so a failed Start) returns.
+	m.serveWG.Wait()
 
 	if len(errs) > 0 {
 		return fmt.Errorf("shutdown errors: %v", errs)

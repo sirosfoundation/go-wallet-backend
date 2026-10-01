@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -541,4 +543,35 @@ func TestManagerStartAdminBindFailureReleasesHTTPListener(t *testing.T) {
 		t.Errorf("error = %v, want it to mention the admin server", err)
 	}
 	_ = m
+}
+
+// failingStartProvider fails Start, simulating a provider/background failure
+// after the HTTP listener is already bound.
+type failingStartProvider struct{}
+
+func (failingStartProvider) Name() string                 { return "failing" }
+func (failingStartProvider) Transport() Transport         { return TransportHTTP }
+func (failingStartProvider) RegisterRoutes(_ *gin.Engine) {}
+func (failingStartProvider) Start(_ context.Context) error {
+	return errors.New("injected start failure")
+}
+
+// A failure right after the first bind must release that listener before
+// Start returns, even when its Serve goroutine had not yet been scheduled.
+func TestManagerStartFailureReleasesListenerImmediately(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		port := freePort(t)
+		cfg := &ServerConfig{HTTPAddress: "127.0.0.1", HTTPPort: port}
+		cfg.CORS.SetDefaults()
+		m := NewManager(cfg, zap.NewNop())
+		m.AddProvider(failingStartProvider{})
+		if err := m.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "injected") {
+			t.Fatalf("Start() error = %v, want injected failure", err)
+		}
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			t.Fatalf("iteration %d: port still bound right after failed Start: %v", i, err)
+		}
+		_ = ln.Close()
+	}
 }
