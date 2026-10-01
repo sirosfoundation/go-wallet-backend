@@ -478,9 +478,12 @@ func (p *EngineProvider) SetTokenBlacklist(b wsengine.TokenBlacklistChecker) {
 
 // wmpAffinityWarning is the message logged when the WMP routes are mounted.
 const wmpAffinityWarning = "WMP session state is process-local: with more than one engine replica, " +
-	"the load balancer must pin each WMP session to one replica by the WMP session ID " +
-	"(Wmp-Session-Id header or params.wmp.session_id) for both RPC POSTs and the SSE stream; " +
-	"without affinity a request reaching another replica fails with session not found (404). " +
+	"the load balancer must keep each client on one replica. The only identifier present on every WMP request " +
+	"(session.create, RPC POSTs, SSE GET and responses to server-initiated requests) is the Authorization bearer token, " +
+	"so key affinity on a hash of the Authorization header; Wmp-Session-Id, params.wmp.session_id and the SSE " +
+	"session_id query parameter are secondary hints that not every request carries. " +
+	"Limits: a refreshed token may be routed to another replica, where the session must then be resumed or recreated. " +
+	"Without affinity a request reaching another replica fails with session not found (404). " +
 	"The Redis session store does not share this state. Shared WMP session state is tracked in " +
 	"https://github.com/sirosfoundation/go-wallet-backend/issues/432"
 
@@ -494,7 +497,7 @@ func (p *EngineProvider) warnWMPSessionAffinity() {
 		p.logger.Warn(wmpAffinityWarning,
 			zap.String("rpc_path", wsengine.WMPRPCPath),
 			zap.String("events_path", wsengine.WMPEventsPath),
-			zap.String("affinity_key", "Wmp-Session-Id"),
+			zap.String("affinity_key", "Authorization"),
 			zap.String("issue", "#432"))
 	})
 }

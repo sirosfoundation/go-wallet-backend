@@ -447,16 +447,28 @@ goroutines, and the per-session SSE event buffer all live in the memory of the
 engine process that handled `wmp.session.create`. The Redis session store does
 not share any of it. A request for that session that reaches a different
 replica fails with `session not found` (HTTP 404), so a deployment with more
-than one engine replica must configure load-balancer affinity keyed on the WMP
-session ID:
+than one engine replica must configure load-balancer affinity. The WMP session ID
+is **not** a sufficient key, because not every request carries it:
 
-- RPC POSTs and the SSE GET must carry the session ID in the `Wmp-Session-Id`
-  header (RPC bodies also carry `params.wmp.session_id`); hash or pin on that
-  header (NGINX `hash $http_wmp_session_id consistent;`, an Envoy header hash
-  policy, or Traefik header-based sticky routing).
-- `wmp.session.create` has no session ID yet and may go to any replica; the
-  replica that handles it owns the session, and affinity applies from the
-  response onward.
+| Request | Authorization bearer | `Wmp-Session-Id` header | `params.wmp.session_id` | `params.session_id` | `session_id` query |
+|---|---|---|---|---|---|
+| `wmp.session.create` | yes | no | no | no | no |
+| RPC POST | yes | optional (stock client does not set it) | yes | no | no |
+| `wmp.session.resume` | yes | optional | no | yes (top level) | no |
+| SSE GET | yes | optional | no | no | yes |
+| Response to a server-initiated request | yes | optional | no | no | no |
+
+- Key affinity on a hash of the `Authorization` header (NGINX
+  `hash $http_authorization consistent;`, an Envoy header hash policy on
+  `authorization`). It is the only identifier present on every request, so
+  `session.create`, RPCs, the SSE stream and responses all reach the owning
+  replica. Several sessions of one token share a replica.
+- Limits: tokens rotate on refresh, so a refreshed token may be routed to
+  another replica; the client must then resume or recreate the session.
+  `Wmp-Session-Id` and `session_id` are secondary hints usable only for the
+  requests that carry them.
+- No affinity cookie is issued: the stock go-wmp HTTPS+SSE client uses
+  `http.DefaultClient` (no cookie jar), so it would not return one.
 
 The engine logs a warning when the WMP routes are mounted. Making the state
 shareable, which would remove the requirement, is tracked in

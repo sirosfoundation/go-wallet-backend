@@ -42,7 +42,7 @@ func TestEngineProvider_RegisterRoutes_WarnsAboutWMPSessionAffinity(t *testing.T
 	if found[0].Level != zapcore.WarnLevel {
 		t.Errorf("expected Warn level, got %s", found[0].Level)
 	}
-	for _, want := range []string{"Wmp-Session-Id", "params.wmp.session_id", "issues/432"} {
+	for _, want := range []string{"Authorization", "Wmp-Session-Id", "params.wmp.session_id", "session_id query", "refreshed token", "issues/432"} {
 		if !strings.Contains(found[0].Message, want) {
 			t.Errorf("warning does not mention %q: %s", want, found[0].Message)
 		}

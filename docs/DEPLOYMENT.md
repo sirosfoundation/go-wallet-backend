@@ -564,21 +564,37 @@ which did not create the session fails with `session not found` (HTTP 404), and
 a flow in progress cannot continue.
 
 With more than one engine replica you must therefore configure the load
-balancer to route every request of a WMP session to the same replica, keyed on
-the WMP session ID:
+balancer to route every request of a WMP session to the same replica. The
+only key present on every request is the Authorization bearer token:
 
-- Every RPC POST and the SSE GET carry it in the `Wmp-Session-Id` header (the
-  RPC body also carries it as `params.wmp.session_id`). Hash or pin on that
-  header, for example `hash $http_wmp_session_id consistent;` in an NGINX
-  `upstream`, a header-hash `lb_policy` (`ring_hash`/`maglev` with a header hash
-  policy on `wmp-session-id`) in Envoy, or header-based sticky routing in
-  Traefik.
-- `wmp.session.create` has no session ID yet, so it may go to any replica. The
-  replica that handles it owns the session, and the client sends the returned
-  session ID on every later request, so affinity applies from the response
-  onward. Requests without the header (the create call, other endpoints) can be
-  balanced freely.
-- Make sure the proxy forwards `Wmp-Session-Id` and does not buffer the SSE
+- Which routing identifiers each request carries (stock go-wmp HTTPS+SSE
+  client, which is constructed before `session.create` and sends only the
+  headers it was configured with):
+
+  | Request | Authorization bearer | `Wmp-Session-Id` header | `params.wmp.session_id` | `params.session_id` | `session_id` query |
+  |---|---|---|---|---|---|
+  | `wmp.session.create` POST | yes | no | no | no | no |
+  | RPC POST | yes | optional (not set by the stock client) | yes | no | no |
+  | `wmp.session.resume` POST | yes | optional | no | yes (top level) | no |
+  | SSE GET | yes | optional | no | no | yes |
+  | Response to a server-initiated request | yes | optional | no | no | no |
+
+- Key affinity on a hash of the `Authorization` header value. It is the only
+  key present on every request, including `session.create` and the responses
+  to server-initiated requests, so the whole lifetime of a session lands on the
+  replica that created it. For example `hash $http_authorization consistent;`
+  in an NGINX `upstream`, or a header hash policy on `authorization` in Envoy.
+  Several sessions of one token share a replica, which is fine.
+- Limits: access tokens rotate on refresh. A request carrying a refreshed token
+  may hash to a different replica, where the session is not found (404); the
+  client must then resume (`wmp.session.resume`) or recreate the session. Do not
+  rely on `Wmp-Session-Id` or the `session_id` query parameter alone: they are
+  secondary hints usable only for requests that carry them, and the stock client
+  does not send the header at all.
+- The server does not set an affinity cookie: the stock go-wmp HTTPS+SSE client
+  uses `http.DefaultClient`, which has no cookie jar, so a cookie would not be
+  returned on later requests.
+- Make sure the proxy forwards `Authorization` and does not buffer the SSE
   stream.
 
 The engine logs a warning at startup, when the WMP routes are mounted, as a
