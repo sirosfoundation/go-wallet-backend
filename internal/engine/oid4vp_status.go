@@ -102,10 +102,16 @@ func (h *OID4VPHandler) checkPresentationStatus(ctx context.Context, vpToken str
 		return nil
 	}
 	b := h.newStatusBudget()
-	for _, tok := range presentedTokens(vpToken) {
+	ts := presentedTokens(vpToken)
+	// Every readable member is checked before a strict refusal for the
+	// malformed ones, so a revoked credential is reported as revoked.
+	for _, tok := range ts.tokens {
 		if err := h.checkTokenStatus(ctx, tok, b); err != nil {
 			return err
 		}
+	}
+	if err := h.malformedOutcome(ts.malformed); err != nil {
+		return err
 	}
 	if b.skipped > 0 {
 		h.Logger.Warn("status check budget exhausted; remaining status checks skipped",
@@ -222,24 +228,49 @@ func (h *OID4VPHandler) checkTokenStatus(ctx context.Context, token string, b *s
 const maxVPNesting = 1
 
 // embeddedCredentials returns the credential JWTs a JWT VP carries in
-// vp.verifiableCredential (a string or an array; non-string entries, such as
-// Data Integrity credential objects, are not JWTs and are skipped).
-func embeddedCredentials(claims map[string]any) []string {
+// vp.verifiableCredential (a string or an array). Every array member is
+// examined individually; objects (Data Integrity credentials) are skipped and
+// members of any other type are counted as malformed.
+func embeddedCredentials(claims map[string]any) tokenSet {
+	var ts tokenSet
 	vp, ok := claims["vp"].(map[string]any)
 	if !ok {
-		return nil
+		return ts
 	}
 	switch vc := vp["verifiableCredential"].(type) {
+	case nil:
 	case string:
-		return []string{vc}
+		ts.tokens = append(ts.tokens, vc)
+	case map[string]any:
 	case []any:
-		var out []string
 		for _, e := range vc {
-			if s, ok := e.(string); ok {
-				out = append(out, s)
+			switch v := e.(type) {
+			case string:
+				ts.tokens = append(ts.tokens, v)
+			case map[string]any:
+			default:
+				ts.malformed++
 			}
 		}
-		return out
+	default:
+		ts.malformed++
+	}
+	return ts
+}
+
+// malformedOutcome applies the mode to token-container members that could not
+// be read: strict refuses; the other modes log a redacted warning and carry on
+// with every other member.
+func (h *OID4VPHandler) malformedOutcome(n int) error {
+	if n == 0 {
+		return nil
+	}
+	mode := h.statusMode.Effective()
+	h.Logger.Warn("presented token collection has malformed members; they were skipped",
+		zap.Int("malformed", n),
+		zap.String("status_check", string(mode)))
+	if mode == config.StatusCheckStrict {
+		return fmt.Errorf("credential status could not be determined (malformed presentation): %w", errStatusUndetermined)
 	}
 	return nil
 }
@@ -262,10 +293,14 @@ func (h *OID4VPHandler) checkTokenStatusDepth(ctx context.Context, token string,
 	// in the credential JWTs it embeds, not in its own payload. Every embedded
 	// credential is checked, under the same shared budget.
 	if depth < maxVPNesting {
-		for _, vc := range embeddedCredentials(claims) {
+		emb := embeddedCredentials(claims)
+		for _, vc := range emb.tokens {
 			if err := h.checkTokenStatusDepth(ctx, vc, b, depth+1); err != nil {
 				return err
 			}
+		}
+		if err := h.malformedOutcome(emb.malformed); err != nil {
+			return err
 		}
 	}
 	ref, present, err := statuslist.ReferenceFromCredentialClaims(claims)
@@ -295,42 +330,124 @@ func (h *OID4VPHandler) checkTokenStatusDepth(ctx context.Context, token string,
 	return h.statusOutcome(err, ref.URI)
 }
 
-// presentedTokens flattens a vp_token into the individual presentations: a
-// DCQL JSON object (query id -> string or array of strings), a JSON array, or
-// one/newline-separated raw tokens.
-func presentedTokens(vpToken string) []string {
-	vpToken = strings.TrimSpace(vpToken)
-	if vpToken == "" {
-		return nil
-	}
-	if strings.HasPrefix(vpToken, "{") {
-		var obj map[string]json.RawMessage
-		if json.Unmarshal([]byte(vpToken), &obj) == nil {
-			var out []string
-			for _, raw := range obj {
-				out = append(out, stringsOrOne(raw)...)
-			}
-			return out
-		}
-	}
-	if strings.HasPrefix(vpToken, "[") {
-		if out := stringsOrOne(json.RawMessage(vpToken)); out != nil {
-			return out
-		}
-	}
-	return strings.Split(vpToken, "\n")
+// tokenSet is the result of flattening client-supplied token containers.
+// Collections are decoded element by element so one odd member can never hide
+// the others: tokens holds every string member, malformed counts members that
+// are neither strings nor objects (objects, e.g. Data Integrity credentials,
+// are legitimately not JWTs and are skipped silently).
+type tokenSet struct {
+	tokens    []string
+	malformed int
 }
 
-func stringsOrOne(raw json.RawMessage) []string {
-	var one string
-	if json.Unmarshal(raw, &one) == nil {
-		return []string{one}
+// addValue classifies one JSON value into the set.
+func (t *tokenSet) addValue(raw json.RawMessage) {
+	raw = json.RawMessage(strings.TrimSpace(string(raw)))
+	switch {
+	case len(raw) == 0:
+		t.malformed++
+	case raw[0] == '"':
+		var s string
+		if json.Unmarshal(raw, &s) != nil {
+			t.malformed++
+			return
+		}
+		t.tokens = append(t.tokens, s)
+	case raw[0] == '{':
+		// Not a JWT; nothing to check.
+	default:
+		t.malformed++
 	}
-	var many []string
-	if json.Unmarshal(raw, &many) == nil {
-		return many
+}
+
+// addStringsOrOne adds a string, or every member of an array.
+func (t *tokenSet) addStringsOrOne(raw json.RawMessage) {
+	raw = json.RawMessage(strings.TrimSpace(string(raw)))
+	if len(raw) > 0 && raw[0] == '[' {
+		elems, ok := jsonArrayElements(raw)
+		if !ok {
+			t.malformed++
+			return
+		}
+		for _, e := range elems {
+			t.addValue(e)
+		}
+		return
 	}
-	return nil
+	t.addValue(raw)
+}
+
+// jsonArrayElements splits a JSON array into its raw elements.
+func jsonArrayElements(raw json.RawMessage) ([]json.RawMessage, bool) {
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('[') {
+		return nil, false
+	}
+	var out []json.RawMessage
+	for dec.More() {
+		var e json.RawMessage
+		if dec.Decode(&e) != nil {
+			return nil, false
+		}
+		out = append(out, e)
+	}
+	if tok, err := dec.Token(); err != nil || tok != json.Delim(']') {
+		return nil, false
+	}
+	return out, true
+}
+
+// jsonObjectValues returns every member value of a JSON object in document
+// order, keeping duplicate keys (a map would keep only the last one and let
+// a repeated key hide a revoked credential).
+func jsonObjectValues(raw string) ([]json.RawMessage, bool) {
+	dec := json.NewDecoder(strings.NewReader(raw))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return nil, false
+	}
+	var out []json.RawMessage
+	for dec.More() {
+		if _, err := dec.Token(); err != nil { // key
+			return nil, false
+		}
+		var v json.RawMessage
+		if dec.Decode(&v) != nil {
+			return nil, false
+		}
+		out = append(out, v)
+	}
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return nil, false
+	}
+	return out, true
+}
+
+// presentedTokens flattens a vp_token into the individual presentations: a
+// DCQL JSON object (query id -> string or array of strings), a JSON array, or
+// one/newline-separated raw tokens. Containers are walked member by member.
+func presentedTokens(vpToken string) tokenSet {
+	var ts tokenSet
+	vpToken = strings.TrimSpace(vpToken)
+	if vpToken == "" {
+		return ts
+	}
+	switch vpToken[0] {
+	case '{':
+		vals, ok := jsonObjectValues(vpToken)
+		if !ok {
+			ts.malformed++
+			return ts
+		}
+		for _, raw := range vals {
+			ts.addStringsOrOne(raw)
+		}
+		return ts
+	case '[':
+		ts.addStringsOrOne(json.RawMessage(vpToken))
+		return ts
+	}
+	ts.tokens = strings.Split(vpToken, "\n")
+	return ts
 }
 
 func decodeJWTSegment(seg string, v any) error {

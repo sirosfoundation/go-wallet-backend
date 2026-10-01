@@ -299,13 +299,83 @@ func TestCheckPresentationStatus_Disabled(t *testing.T) {
 }
 
 func TestPresentedTokens_Shapes(t *testing.T) {
-	assert.Nil(t, presentedTokens("  "))
-	assert.ElementsMatch(t, []string{"a", "b", "c"}, presentedTokens(`{"q1":"a","q2":["b","c"]}`))
-	assert.ElementsMatch(t, []string{"a", "b"}, presentedTokens(`["a","b"]`))
-	assert.Equal(t, []string{"a", "b"}, presentedTokens("a\nb"))
-	// Malformed JSON-looking input falls back to being treated as raw tokens.
-	assert.Equal(t, []string{`{"q":`}, presentedTokens(`{"q":`))
-	assert.Equal(t, []string{`[1,2]`}, presentedTokens(`[1,2]`))
+	assert.Empty(t, presentedTokens("  ").tokens)
+	assert.ElementsMatch(t, []string{"a", "b", "c"}, presentedTokens(`{"q1":"a","q2":["b","c"]}`).tokens)
+	assert.ElementsMatch(t, []string{"a", "b"}, presentedTokens(`["a","b"]`).tokens)
+	assert.Equal(t, []string{"a", "b"}, presentedTokens("a\nb").tokens)
+	// Malformed JSON is counted, never silently treated as raw tokens.
+	assert.Equal(t, 1, presentedTokens(`{"q":`).malformed)
+	assert.Equal(t, 1, presentedTokens(`[1,`).malformed)
+	// Mixed arrays keep every string member and count the rest.
+	for in, want := range map[string]int{`[1,2]`: 2, `["x",1]`: 1, `[1,"x"]`: 1, `[null,"x"]`: 1, `["x",{"a":1}]`: 0, `["x",[ "y" ]]`: 1, `["x",true]`: 1} {
+		ts := presentedTokens(in)
+		assert.Equal(t, want, ts.malformed, in)
+	}
+	assert.Equal(t, []string{"x"}, presentedTokens(`["x",1]`).tokens)
+	assert.Equal(t, []string{"x"}, presentedTokens(`{"q":["x",null]}`).tokens)
+	// A repeated object key must not hide the first value.
+	assert.ElementsMatch(t, []string{"a", "b"}, presentedTokens(`{"q":"a","q":"b"}`).tokens)
+}
+
+func TestEmbeddedCredentials_ElementWise(t *testing.T) {
+	mk := func(v any) map[string]any { return map[string]any{"vp": map[string]any{"verifiableCredential": v}} }
+	ts := embeddedCredentials(mk([]any{"a", 1.0, nil, map[string]any{"x": 1}, "b"}))
+	assert.Equal(t, []string{"a", "b"}, ts.tokens)
+	assert.Equal(t, 2, ts.malformed)
+	assert.Equal(t, 1, embeddedCredentials(mk(5.0)).malformed)
+	assert.Equal(t, []string{"a"}, embeddedCredentials(mk("a")).tokens)
+}
+
+// A client-controlled collection with an odd member must not hide a revoked
+// credential, in any mode.
+func TestCheckPresentationStatus_MixedCollections(t *testing.T) {
+	ctx := context.Background()
+	h, mint := statusFixture(t, false)
+	rev := strings.TrimSuffix(mint(1, true), "")
+	q := func(v ...any) string { b, _ := json.Marshal(v); return string(b) }
+	o := func(v ...any) string { b, _ := json.Marshal(map[string]any{"q": v}); return string(b) }
+	nested := func(v ...any) string {
+		b, _ := json.Marshal(map[string]any{"q": v, "r": []any{map[string]any{"a": []any{1}}}})
+		return string(b)
+	}
+	for name, tok := range map[string]string{
+		"array [revoked,1]":     q(rev, 1),
+		"array [1,revoked]":     q(1, rev),
+		"array [null,revoked]":  q(nil, rev),
+		"dcql [revoked,1]":      o(rev, 1),
+		"dcql [1,revoked]":      o(1, rev),
+		"dcql [null,revoked]":   o(nil, rev),
+		"dcql nested object":    nested(map[string]any{"k": []any{1}}, rev),
+		"dcql dup keys":         `{"q":"` + rev + `","q":1}`,
+		"dcql dup keys reverse": `{"q":1,"q":"` + rev + `"}`,
+	} {
+		for _, mode := range []config.StatusCheckMode{config.StatusCheckEnforceRevoked, config.StatusCheckStrict} {
+			hh := *h
+			hh.statusMode = mode
+			err := hh.checkPresentationStatus(ctx, tok)
+			require.Error(t, err, "%s/%s", name, mode)
+		}
+		hh := *h
+		hh.statusMode = config.StatusCheckWarn
+		core, logs := observer.New(zap.WarnLevel)
+		hh.Logger = zap.New(core)
+		require.NoError(t, hh.checkPresentationStatus(ctx, tok), name)
+		assert.Equal(t, 1, logs.FilterMessage("credential status revoked").Len(), "warn must still inspect the revoked credential: %s", name)
+	}
+	// Malformed members alone: strict refuses, the others proceed.
+	ok := mint(0, true)
+	for _, tok := range []string{q(ok, 1), q(1, ok), o(nil, ok)} {
+		hh := *h
+		hh.statusMode = config.StatusCheckStrict
+		require.Error(t, hh.checkPresentationStatus(ctx, tok), tok)
+		for _, mode := range []config.StatusCheckMode{config.StatusCheckEnforceRevoked, config.StatusCheckWarn} {
+			hh.statusMode = mode
+			core, logs := observer.New(zap.WarnLevel)
+			hh.Logger = zap.New(core)
+			require.NoError(t, hh.checkPresentationStatus(ctx, tok), tok)
+			assert.Equal(t, 1, logs.FilterMessage("presented token collection has malformed members; they were skipped").Len())
+		}
+	}
 }
 
 func TestDecodeJWTSegment_Errors(t *testing.T) {
