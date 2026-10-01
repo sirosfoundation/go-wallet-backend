@@ -181,7 +181,10 @@ func TestWMP_Resume_RejectedCallerDoesNotConsumeToken(t *testing.T) {
 	require.Nil(t, rpcErr, "owner must still be able to use the token after a rejected attempt")
 	assert.True(t, res.Resumed)
 
-	// One-time use: replaying the consumed token fails.
+	// A consumed token stays redeemable once (lost-response recovery, see
+	// wmp_resume_lost_response_test.go); after that it is spent.
+	_, rpcErr = doResume(t, a, "owner", "t", resumeBody(sid, token, ""))
+	require.Nil(t, rpcErr)
 	_, rpcErr = doResume(t, a, "owner", "t", resumeBody(sid, token, ""))
 	require.NotNil(t, rpcErr)
 	assert.Equal(t, wmp.ErrSessionNotFound, rpcErr.Code)
@@ -747,7 +750,10 @@ func TestWMP_Resume_LosingConcurrentResumeKeepsChildFlows(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	assert.Equal(t, int32(1), okCount.Load(), "exactly one concurrent resume may win the one-time token")
+	// One resume wins; a duplicate arriving after the winner issued its
+	// successor is the single permitted lost-response retry. Never more.
+	assert.GreaterOrEqual(t, okCount.Load(), int32(1))
+	assert.LessOrEqual(t, okCount.Load(), int32(2), "a token yields at most one resume plus one lost-response retry")
 
 	a.mu.RLock()
 	cur := a.peers[sid]

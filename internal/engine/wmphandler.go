@@ -329,10 +329,28 @@ func pumpEvents(ctx context.Context, ct *wmp.ChannelTransport, buf *wmpEventBuff
 }
 
 // resumptionEntry holds a resumption token's session binding and expiry.
+//
+// A resume rotates the token. If the response carrying the new token is lost,
+// the client still holds the old one, so a consumed token is kept for a short
+// grace window (resumptionGraceWindow) linked to its successor and may be
+// presented exactly once more, but only while the successor has not itself
+// been used. Using either token of a pair retires both, so at most one
+// resume ever succeeds per rotation and a used chain cannot be replayed.
 type resumptionEntry struct {
 	sessionID string
 	expiresAt time.Time
+
+	// used marks a token that a resume already consumed. A used token is
+	// only redeemable while its successor is still outstanding and the
+	// grace window (expiresAt) has not elapsed.
+	used        bool
+	successor   string // token issued by the resume that consumed this one
+	predecessor string // token whose resume issued this one
 }
+
+// resumptionGraceWindow bounds how long a consumed token stays redeemable
+// after a resume, to recover from a lost resume response.
+const resumptionGraceWindow = 2 * time.Minute
 
 // wmpSessionIdleTimeout is the maximum time a WMP session can be idle
 // (no RPC activity) before being automatically closed.
@@ -1046,12 +1064,67 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 // still the installed peer, atomically with respect to CloseSession and
 // closeSessionIfCurrent (which remove the peer and its tokens under a.mu).
 func (a *WMPAdapter) issueResumptionTokenIfCurrent(sessionID string, ws *wmpSession) (string, bool) {
-	return a.issueResumptionToken(sessionID, ws)
+	return a.issueResumptionToken(sessionID, ws, "")
+}
+
+// issueRotatedResumptionToken is issueResumptionTokenIfCurrent for a resume:
+// the new token is linked to the token the resume consumed (prev) so that the
+// pair retire together (see resumptionEntry).
+func (a *WMPAdapter) issueRotatedResumptionToken(sessionID string, ws *wmpSession, prev string) (string, bool) {
+	return a.issueResumptionToken(sessionID, ws, prev)
+}
+
+// usableResumptionTokenLocked returns the entry for token if it can be
+// redeemed now: it exists and is unexpired, and if it was already consumed by
+// a resume, its successor is still outstanding (the client never used it, so
+// the resume response was presumably lost). Expired entries are dropped.
+// Caller holds a.mu.
+func (a *WMPAdapter) usableResumptionTokenLocked(token string) (*resumptionEntry, bool) {
+	entry, ok := a.resumptionTokens[token]
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(entry.expiresAt) {
+		delete(a.resumptionTokens, token)
+		return nil, false
+	}
+	if entry.used {
+		succ, ok := a.resumptionTokens[entry.successor]
+		if entry.successor == "" || !ok || succ.used {
+			return nil, false
+		}
+	}
+	return entry, true
+}
+
+// consumeResumptionTokenLocked redeems token. A fresh token is kept for the
+// grace window, marked used, so a lost response can be retried once; a token
+// that was already used is deleted outright. In both cases the other token of
+// its rotation pair is retired, so the pair yields exactly one resume.
+// Caller holds a.mu and has just seen usableResumptionTokenLocked succeed.
+func (a *WMPAdapter) consumeResumptionTokenLocked(token string) {
+	entry, ok := a.resumptionTokens[token]
+	if !ok {
+		return
+	}
+	if entry.predecessor != "" {
+		delete(a.resumptionTokens, entry.predecessor)
+		entry.predecessor = ""
+	}
+	if entry.used {
+		delete(a.resumptionTokens, entry.successor)
+		delete(a.resumptionTokens, token)
+		return
+	}
+	entry.used = true
+	if grace := time.Now().Add(resumptionGraceWindow); grace.Before(entry.expiresAt) {
+		entry.expiresAt = grace
+	}
 }
 
 // issueResumptionToken creates and stores a token. With a non-nil ws the peer
 // check and the insertion happen under one a.mu critical section.
-func (a *WMPAdapter) issueResumptionToken(sessionID string, ws *wmpSession) (string, bool) {
+func (a *WMPAdapter) issueResumptionToken(sessionID string, ws *wmpSession, prev string) (string, bool) {
 	b := make([]byte, 32) // 256 bits
 	if _, err := rand.Read(b); err != nil {
 		// Should never happen with crypto/rand
@@ -1066,8 +1139,12 @@ func (a *WMPAdapter) issueResumptionToken(sessionID string, ws *wmpSession) (str
 		return "", false
 	}
 	a.resumptionTokens[token] = &resumptionEntry{
-		sessionID: sessionID,
-		expiresAt: time.Now().Add(resumptionTokenTTL),
+		sessionID:   sessionID,
+		expiresAt:   time.Now().Add(resumptionTokenTTL),
+		predecessor: prev,
+	}
+	if p, ok := a.resumptionTokens[prev]; ok && prev != "" && p.used && p.sessionID == sessionID {
+		p.successor = token
 	}
 	return token, true
 }
@@ -1162,11 +1239,7 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 	// Look the token up without consuming it: it must exist, be unexpired
 	// and be bound to the session named in the request.
 	a.mu.Lock()
-	entry, validToken := a.resumptionTokens[params.ResumptionToken]
-	if validToken && time.Now().After(entry.expiresAt) {
-		delete(a.resumptionTokens, params.ResumptionToken)
-		validToken = false
-	}
+	entry, validToken := a.usableResumptionTokenLocked(params.ResumptionToken)
 	var oldWS *wmpSession
 	if validToken && entry.sessionID == params.SessionID {
 		oldWS = a.peers[params.SessionID]
@@ -1228,7 +1301,7 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 		a.beforeResumePublish(params.SessionID)
 	}
 	a.mu.Lock()
-	_, tokenStillValid := a.resumptionTokens[params.ResumptionToken]
+	_, tokenStillValid := a.usableResumptionTokenLocked(params.ResumptionToken)
 	// A create for the same user may have superseded the session being
 	// resumed after the lookup above; publishing then would leave it active
 	// here but absent from the manager next to its replacement.
@@ -1244,7 +1317,7 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 		}
 		return invalidToken()
 	}
-	delete(a.resumptionTokens, params.ResumptionToken)
+	a.consumeResumptionTokenLocked(params.ResumptionToken)
 	a.peers[params.SessionID] = ws
 	buf := a.eventBufs[params.SessionID]
 	a.mu.Unlock()
@@ -1306,7 +1379,7 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 	// so checking and issuing under the same lock gives close and resume a
 	// single linearization point (no token for a session that no longer
 	// exists, and no "resumed: true" for it either).
-	newToken, stillCurrent := a.issueResumptionTokenIfCurrent(params.SessionID, ws)
+	newToken, stillCurrent := a.issueRotatedResumptionToken(params.SessionID, ws, params.ResumptionToken)
 	if !stillCurrent {
 		a.logger.Warn("WMP session.resume: session closed or superseded during resume", zap.String("session_id", params.SessionID))
 		a.closeSessionIfCurrent(params.SessionID, ws)
