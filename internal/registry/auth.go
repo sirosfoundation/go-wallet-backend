@@ -13,6 +13,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audience"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/legacytoken"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
@@ -107,12 +108,30 @@ func AuthMiddlewares(cfg AuthConfig) []gin.HandlerFunc {
 
 // acceptedInOptionalMode applies the same tenant and revocation checks as the
 // strict chain; a failure downgrades the request to unauthenticated.
-func acceptedInOptionalMode(c *gin.Context, cfg AuthConfig, res *claims.Result, logger *zap.Logger) bool {
+func acceptedInOptionalMode(c *gin.Context, cfg AuthConfig, res *claims.Result, rawToken string, logger *zap.Logger) bool {
 	ctx := c.Request.Context()
 	if cfg.Blacklist != nil {
 		if (res.JTI != "" && cfg.Blacklist.IsBlacklisted(ctx, res.JTI)) || cfg.Blacklist.IsUserRevoked(ctx, res.UserID) {
 			logger.Debug("registry token revoked, continuing unauthenticated")
 			return false
+		}
+		// Refresh-token family revocation, legacy tokens only (as in
+		// TokenAuthMiddleware). Fail closed: if the family cannot be
+		// determined the token is not treated as authenticated.
+		if res.Mode == claims.ModeLegacy {
+			secret := ""
+			if cfg.Config != nil {
+				secret = cfg.Config.JWT.Secret
+			}
+			sid, err := legacytoken.ParseSID(secret, rawToken)
+			if err != nil {
+				logger.Debug("cannot determine refresh-token family of legacy registry token, continuing unauthenticated", zap.Error(err))
+				return false
+			}
+			if sid != "" && cfg.Blacklist.IsFamilyRevoked(ctx, sid) {
+				logger.Debug("registry token family revoked, continuing unauthenticated")
+				return false
+			}
 		}
 	}
 	if cfg.Tenants != nil {
@@ -171,7 +190,8 @@ func optionalAuth(cfg AuthConfig, logger *zap.Logger) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		res, err := v.Validate(c.Request.Context(), strings.TrimSpace(parts[1]))
+		rawToken := strings.TrimSpace(parts[1])
+		res, err := v.Validate(c.Request.Context(), rawToken)
 		if err != nil {
 			logger.Debug("registry token validation failed, continuing unauthenticated", zap.Error(err))
 			c.Next()
@@ -183,7 +203,7 @@ func optionalAuth(cfg AuthConfig, logger *zap.Logger) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		if !acceptedInOptionalMode(c, cfg, res, logger) {
+		if !acceptedInOptionalMode(c, cfg, res, rawToken, logger) {
 			c.Next()
 			return
 		}

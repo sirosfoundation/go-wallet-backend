@@ -23,6 +23,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
 const (
@@ -347,4 +348,49 @@ func TestAuthMiddlewares_Optional(t *testing.T) {
 		assert.Equal(t, http.StatusOK, r.status)
 		assert.False(t, r.auth)
 	})
+}
+
+type familyBlacklist struct {
+	fakeBlacklist
+	revokedSID string
+}
+
+func (f familyBlacklist) IsFamilyRevoked(_ context.Context, sid string) bool {
+	return f.revokedSID != "" && sid == f.revokedSID
+}
+
+func TestAuthMiddlewares_OptionalFamilyRevocation(t *testing.T) {
+	env := newAuthEnv(t)
+	hs := func(secret, sid string) string {
+		c := gojwt.MapClaims{"iss": "wallet-backend", "user_id": "u1", "aud": testRPID,
+			"exp": time.Now().Add(time.Hour).Unix()}
+		if sid != "" {
+			c["sid"] = sid
+		}
+		s, err := gojwt.NewWithClaims(gojwt.SigningMethodHS256, c).SignedString([]byte(secret))
+		require.NoError(t, err)
+		return "Bearer " + s
+	}
+	cfg := AuthConfig{
+		Validator: env.validator(t, true), Logger: zap.NewNop(),
+		Config:    &config.Config{JWT: config.JWTConfig{Secret: testSecret}},
+		Blacklist: familyBlacklist{revokedSID: "dead"},
+	}
+
+	assert.False(t, probe(t, cfg, hs(testSecret, "dead")).auth, "revoked family is downgraded")
+	assert.True(t, probe(t, cfg, hs(testSecret, "live")).auth, "live family stays authenticated")
+	assert.True(t, probe(t, cfg, hs(testSecret, "")).auth, "token without sid stays authenticated")
+	assert.Equal(t, http.StatusOK, probe(t, cfg, hs(testSecret, "dead")).status, "never rejected")
+
+	// The SID cannot be determined without jwt.secret: fail closed.
+	noSecret := cfg
+	noSecret.Config = nil
+	assert.False(t, probe(t, noSecret, hs(testSecret, "live")).auth, "undeterminable sid is downgraded")
+	wrong := cfg
+	wrong.Config = &config.Config{JWT: config.JWTConfig{Secret: "another-secret-another-secret-0000"}}
+	assert.False(t, probe(t, wrong, hs(testSecret, "live")).auth, "unverifiable sid is downgraded")
+
+	// Without a blacklist there is nothing to check.
+	cfg.Blacklist = nil
+	assert.True(t, probe(t, cfg, hs(testSecret, "dead")).auth)
 }
