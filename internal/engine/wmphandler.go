@@ -56,9 +56,10 @@ type WMPAdapter struct {
 	tokenSlotsMu sync.Mutex
 	tokenSlots   map[string]int
 
-	stopCh   chan struct{}
-	stopOnce sync.Once
-	loopDone chan struct{} // closed when cleanupLoop has exited
+	stopCh      chan struct{}
+	stopOnce    sync.Once
+	loopStarted chan struct{} // closed when cleanupLoop begins running
+	loopDone    chan struct{} // closed when cleanupLoop has exited
 }
 
 // maxWMPSessionsPerToken bounds how many live WMP sessions one bearer token
@@ -455,11 +456,20 @@ func NewWMPAdapter(manager *Manager, logger *zap.Logger, bearerToken func(*http.
 		eventBufs:        make(map[string]*wmpEventBuffer),
 		outbound:         make(map[string]outboundRequest),
 		stopCh:           make(chan struct{}),
+		loopStarted:      make(chan struct{}),
 		loopDone:         make(chan struct{}),
 	}
 	go a.cleanupLoop()
 	return a
 }
+
+// CleanupStarted returns a channel that is closed once this adapter's cleanup
+// goroutine is running.
+func (a *WMPAdapter) CleanupStarted() <-chan struct{} { return a.loopStarted }
+
+// CleanupStopped returns a channel that is closed once this adapter's cleanup
+// goroutine has exited.
+func (a *WMPAdapter) CleanupStopped() <-chan struct{} { return a.loopDone }
 
 // Drain marks the adapter as draining: from now on the HTTP handlers answer
 // 503 and session.create / session.resume are refused. It is idempotent and
@@ -505,6 +515,9 @@ func (a *WMPAdapter) Close() {
 
 // cleanupLoop periodically removes expired resumption tokens and idle sessions.
 func (a *WMPAdapter) cleanupLoop() {
+	if a.loopStarted != nil {
+		close(a.loopStarted)
+	}
 	if a.loopDone != nil {
 		defer close(a.loopDone)
 	}

@@ -3,8 +3,6 @@ package server
 import (
 	"net/http"
 	"net/http/httptest"
-	"runtime"
-	"strings"
 	"testing"
 	"time"
 
@@ -16,43 +14,27 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
-// cleanupLoops counts live WMP adapter cleanup goroutines, by looking for them
-// in a full goroutine dump. Counting goroutines with
-// runtime.NumGoroutine is racy: unrelated goroutines from earlier tests exit
-// concurrently and skew the count in either direction.
-func cleanupLoops() int {
-	buf := make([]byte, 1<<20)
-	for {
-		n := runtime.Stack(buf, true)
-		if n < len(buf) {
-			return strings.Count(string(buf[:n]), "(*WMPAdapter).cleanupLoop")
-		}
-		buf = make([]byte, 2*len(buf))
-	}
-}
-
-// EngineProvider.Close must stop the WMP adapter's cleanup goroutine.
+// EngineProvider.Close must stop the WMP adapter's cleanup goroutine. The test
+// observes this adapter's own lifecycle signals, so it is independent of any
+// other goroutines in the process.
 func TestEngineProvider_Close_StopsWMPAdapter(t *testing.T) {
 	logger := zap.NewNop()
 	cfg := &config.Config{}
 	manager := wsengine.NewManager(cfg, logger)
 
-	// Tests running concurrently in this package may hold live adapters of
-	// their own, so compare against the baseline rather than expecting zero.
-	before := cleanupLoops()
 	adapter := wsengine.NewWMPAdapter(manager, logger, middleware.ExtractBearerToken)
-	if cleanupLoops() != before+1 {
+	select {
+	case <-adapter.CleanupStarted():
+	case <-time.After(5 * time.Second):
 		t.Fatal("expected the adapter to start its cleanup goroutine")
 	}
 
 	provider := &EngineProvider{cfg: cfg, logger: logger, manager: manager, wmpAdapter: adapter}
 	provider.Close()
 
-	deadline := time.Now().Add(2 * time.Second)
-	for cleanupLoops() > before && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if cleanupLoops() > before {
+	select {
+	case <-adapter.CleanupStopped():
+	case <-time.After(5 * time.Second):
 		t.Fatal("WMP cleanup goroutine still running after Close")
 	}
 }
