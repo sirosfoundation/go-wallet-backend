@@ -813,3 +813,61 @@ func TestApplyLegacyRegistryConfig_OldSecretFileOnlyReadWhenUsable(t *testing.T)
 		assert.NotContains(t, err.Error(), gone)
 	})
 }
+
+func TestApplyLegacyRegistryConfig_IssuerPrecedence(t *testing.T) {
+	legacy := "jwt:\n  secret: \"0123456789abcdef0123456789abcdef\"\n  issuer: legacy-issuer\n"
+	backend := func(t *testing.T, yamlBody string) *Config {
+		t.Helper()
+		p := writeFile(t, t.TempDir(), "config.yaml", yamlBody)
+		c, err := LoadRegistryOnly(p)
+		require.NoError(t, err)
+		return c
+	}
+	apply := func(t *testing.T, c *Config) {
+		t.Helper()
+		p := writeFile(t, t.TempDir(), "registry.yaml", legacy)
+		_, err := c.ApplyLegacyRegistryConfig(p, true)
+		require.NoError(t, err)
+	}
+	base := "as:\n  external_url: https://wallet.example.org\n"
+
+	t.Run("only deprecated issuer set is applied", func(t *testing.T) {
+		unsetJWTIssuerEnv(t)
+		c := backend(t, base)
+		apply(t, c)
+		assert.Equal(t, "legacy-issuer", c.JWT.Issuer)
+	})
+	t.Run("explicit file jwt.issuer wins", func(t *testing.T) {
+		unsetJWTIssuerEnv(t)
+		c := backend(t, base+"jwt:\n  issuer: new-issuer\n")
+		apply(t, c)
+		assert.Equal(t, "new-issuer", c.JWT.Issuer)
+	})
+	t.Run("explicit file jwt.issuer equal to default wins", func(t *testing.T) {
+		unsetJWTIssuerEnv(t)
+		c := backend(t, base+"jwt:\n  issuer: wallet-backend\n")
+		apply(t, c)
+		assert.Equal(t, "wallet-backend", c.JWT.Issuer)
+	})
+	t.Run("WALLET_JWT_ISSUER wins", func(t *testing.T) {
+		t.Setenv("WALLET_JWT_ISSUER", "env-issuer")
+		c := backend(t, base)
+		apply(t, c)
+		assert.Equal(t, "env-issuer", c.JWT.Issuer)
+	})
+	t.Run("neither set keeps the default when legacy has none", func(t *testing.T) {
+		unsetJWTIssuerEnv(t)
+		c := backend(t, base)
+		p := writeFile(t, t.TempDir(), "registry.yaml", "jwt:\n  secret: \"0123456789abcdef0123456789abcdef\"\n")
+		_, err := c.ApplyLegacyRegistryConfig(p, true)
+		require.NoError(t, err)
+		assert.Equal(t, "wallet-backend", c.JWT.Issuer)
+	})
+}
+
+// unsetJWTIssuerEnv removes WALLET_JWT_ISSUER for the test (restored on cleanup).
+func unsetJWTIssuerEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("WALLET_JWT_ISSUER", "")
+	require.NoError(t, os.Unsetenv("WALLET_JWT_ISSUER"))
+}

@@ -53,6 +53,12 @@ type Config struct {
 	// RegistryExplicit and ApplyLegacyRegistryConfig.
 	registryExplicit bool
 
+	// jwtIssuerExplicit records whether jwt.issuer was set by the config file
+	// or WALLET_JWT_ISSUER (as opposed to the built-in default). The deprecated
+	// registry jwt.issuer only applies when it is false, so the shared JWT
+	// config stays a consistent (secret, issuer) pair.
+	jwtIssuerExplicit bool
+
 	// registryYAML is the decoded `registry:` mapping of the config file, used
 	// to tell keys the operator set explicitly from defaults.
 	registryYAML map[string]any
@@ -1858,6 +1864,7 @@ func load(configFile string, loadSecrets, validate func(*Config) error) (*Config
 			cfg.asEnabledExplicit = yamlHasASEnabledKey(data)
 			cfg.registryExplicit = yamlHasTopLevelKey(data, "registry")
 			cfg.registryYAML = yamlRegistrySection(data)
+			cfg.jwtIssuerExplicit = yamlHasNestedKey(data, "jwt", "issuer")
 			if w := retiredRegistryLayoutWarning(data); w != "" {
 				cfg.loadWarnings = append(cfg.loadWarnings, w)
 			}
@@ -1868,6 +1875,9 @@ func load(configFile string, loadSecrets, validate func(*Config) error) (*Config
 	// Since we removed `default:` tags, this only applies actual env vars
 	if _, ok := os.LookupEnv("WALLET_AS_ENABLED"); ok {
 		cfg.asEnabledExplicit = true
+	}
+	if _, ok := os.LookupEnv("WALLET_JWT_ISSUER"); ok {
+		cfg.jwtIssuerExplicit = true
 	}
 	if envHasPrefix("WALLET_REGISTRY_") {
 		cfg.registryExplicit = true
@@ -1908,6 +1918,20 @@ func yamlHasTopLevelKey(data []byte, key string) bool {
 		return false
 	}
 	_, ok := raw[key]
+	return ok
+}
+
+// yamlHasNestedKey reports whether the raw YAML has section.key.
+func yamlHasNestedKey(data []byte, section, key string) bool {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return false
+	}
+	m, ok := raw[section].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, ok = m[key]
 	return ok
 }
 

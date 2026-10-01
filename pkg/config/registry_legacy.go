@@ -144,7 +144,11 @@ func (c *Config) ApplyLegacyRegistryConfig(path string, standalone bool) ([]stri
 			if secret != "" && c.JWT.Secret == "" {
 				c.JWT.Secret = secret
 			}
-			if f.JWT.Issuer != "" && f.JWT.Issuer != "wallet-backend" {
+			// Like the secret, an explicitly configured shared jwt.issuer
+			// (file or WALLET_JWT_ISSUER) wins; otherwise the new secret
+			// would be paired with the old issuer and the shared config's
+			// HMAC tokens would be rejected.
+			if f.JWT.Issuer != "" && f.JWT.Issuer != "wallet-backend" && !c.jwtIssuerExplicit {
 				c.JWT.Issuer = f.JWT.Issuer
 			}
 			warnings = append(warnings, "deprecated registry `jwt` block: secret and issuer are mapped to the backend jwt.secret / jwt.issuer "+
