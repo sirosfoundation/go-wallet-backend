@@ -3,6 +3,8 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -338,4 +340,119 @@ func TestRedisSessionStore_LegacyBackfillDoesNotOverwriteNewerPointer(t *testing
 	members, err := mr.ZMembers(store.userSetKey("u1"))
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{"old", "new"}, members)
+}
+
+func TestRedisSessionStore_DeleteByUserRemovesEverythingInBatches(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	n := deleteBatchSize*2 + 7 // several batches
+	for i := 0; i < n; i++ {
+		require.NoError(t, store.Put(ctx, redisSess(fmt.Sprintf("s%d", i), fmt.Sprintf("t%d", i%3), "u1", time.Hour)))
+	}
+	require.NoError(t, store.Put(ctx, redisSess("keep", "t0", "u2", time.Hour)))
+
+	require.NoError(t, store.DeleteByUser(ctx, "u1"))
+
+	for i := 0; i < n; i++ {
+		assert.False(t, mr.Exists(store.sessionKey(fmt.Sprintf("s%d", i))))
+	}
+	assert.False(t, mr.Exists(store.userSetKey("u1")))
+	for i := 0; i < 3; i++ {
+		assert.False(t, mr.Exists(store.userKey(fmt.Sprintf("t%d", i), "u1")))
+	}
+	assert.True(t, mr.Exists(store.sessionKey("keep")))
+	assert.True(t, mr.Exists(store.userKey("t0", "u2")))
+}
+
+// A session Put between two DeleteByUser rounds is either removed by a later
+// round of the same call, or (if it lands after the final empty check) stays
+// indexed so a later DeleteByUser finds it.
+func TestRedisSessionStore_PutDuringDeleteByUserStaysDiscoverable(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	for i := 0; i < deleteBatchSize+5; i++ {
+		require.NoError(t, store.Put(ctx, redisSess(fmt.Sprintf("s%d", i), "t1", "u1", time.Hour)))
+	}
+
+	// Round 1: a Put lands between batches; the same call must pick it up.
+	puts := 0
+	store.betweenDeleteBatches = func() {
+		if puts == 0 {
+			puts++
+			require.NoError(t, store.Put(ctx, redisSess("mid", "t2", "u1", time.Hour)))
+		}
+	}
+	require.NoError(t, store.DeleteByUser(ctx, "u1"))
+	assert.False(t, mr.Exists(store.sessionKey("mid")), "mid-call Put seen by a later round")
+	assert.False(t, mr.Exists(store.userSetKey("u1")))
+
+	// A Put after the final empty check creates a fresh set that indexes it.
+	store.betweenDeleteBatches = nil
+	require.NoError(t, store.Put(ctx, redisSess("late", "t2", "u1", time.Hour)))
+	members, err := mr.ZMembers(store.userSetKey("u1"))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"late"}, members)
+	require.NoError(t, store.DeleteByUser(ctx, "u1"))
+	assert.False(t, mr.Exists(store.sessionKey("late")))
+	assert.False(t, mr.Exists(store.userKey("t2", "u1")))
+}
+
+// The set must not be deleted while a member exists.
+func TestRedisSessionStore_DeleteUserSetIfEmptyKeepsNonEmptySet(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	require.NoError(t, store.Put(ctx, redisSess("s1", "t1", "u1", time.Hour)))
+	done, err := deleteUserSetIfEmptyScript.Run(ctx, store.client, []string{store.userSetKey("u1")}).Int()
+	require.NoError(t, err)
+	assert.Equal(t, 0, done)
+	assert.True(t, mr.Exists(store.userSetKey("u1")))
+}
+
+// Stress: Puts race DeleteByUser. Whatever interleaving happens, no session
+// key may exist that is not a member of its user's set (every live session
+// stays discoverable), and a final DeleteByUser leaves nothing.
+func TestRedisSessionStore_ConcurrentPutDeleteByUserNoOrphans(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+
+	var wg sync.WaitGroup
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < 60; i++ {
+				_ = store.Put(ctx, redisSess(fmt.Sprintf("s-%d-%d", g, i), fmt.Sprintf("t%d", i%2), "u1", time.Hour))
+			}
+		}(g)
+	}
+	for g := 0; g < 2; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 15; i++ {
+				assert.NoError(t, store.DeleteByUser(ctx, "u1"))
+			}
+		}()
+	}
+	wg.Wait()
+
+	members := map[string]bool{}
+	if mr.Exists(store.userSetKey("u1")) {
+		ms, err := mr.ZMembers(store.userSetKey("u1"))
+		require.NoError(t, err)
+		for _, m := range ms {
+			members[m] = true
+		}
+	}
+	for _, k := range mr.Keys() {
+		if strings.HasPrefix(k, "t:s-") {
+			assert.True(t, members[strings.TrimPrefix(k, "t:")], "session %s exists but is not indexed", k)
+		}
+	}
+
+	require.NoError(t, store.DeleteByUser(ctx, "u1"))
+	for _, k := range mr.Keys() {
+		assert.False(t, strings.HasPrefix(k, "t:s-"), "leftover %s", k)
+	}
+	assert.False(t, mr.Exists(store.userSetKey("u1")))
 }
