@@ -581,6 +581,28 @@ func TestCWTHelpers(t *testing.T) {
 	if m, _, err := decodeHeaderMap(nil); err != nil || len(m) != 0 {
 		t.Error("empty protected header")
 	}
+	if m, _, err := decodeHeaderMap([]byte{}); err != nil || m == nil || len(m) != 0 {
+		t.Error("empty protected bstr must be an empty map")
+	}
+	if m, _, err := decodeHeaderMap([]byte{0xa0}); err != nil || len(m) != 0 {
+		t.Error("empty-map protected header must be accepted")
+	}
+	for _, b := range [][]byte{{0xf6}, {0xf7}} {
+		if _, _, err := decodeHeaderMap(b); err == nil {
+			t.Errorf("protected header %x accepted", b)
+		}
+		if _, err := decodeClaims(b); err == nil {
+			t.Errorf("claims payload %x accepted", b)
+		}
+	}
+	if _, err := decodeClaims([]byte{0xa0}); err != nil {
+		t.Errorf("empty claims map rejected: %v", err)
+	}
+	for _, v := range []any{map[any]any(nil), map[int64]any(nil), map[string]any(nil)} {
+		if _, ok := anyMap(v); ok {
+			t.Errorf("anyMap accepted nil %T", v)
+		}
+	}
 }
 
 func TestCWT_MinEntries(t *testing.T) {
@@ -754,6 +776,10 @@ func TestCWT_HeaderLabels(t *testing.T) {
 		{"same text label in both buckets", [][2]any{{"x-ext", "a"}}, cborMap([2]any{"x-ext", "b"}), false},
 		{"text label only in unprotected, other text only in protected", [][2]any{{"x-a", 1}}, cborMap([2]any{"x-b", 1}), true},
 		{"same integer label in both buckets", [][2]any{{int64(99), 1}}, cborMap([2]any{int64(99), 2}), false},
+		{"null unprotected header", nil, []byte{0xf6}, false},
+		{"undefined unprotected header", nil, []byte{0xf7}, false},
+		{"non-map unprotected header", nil, []byte{0x01}, false},
+		{"empty-map unprotected header", nil, []byte{0xa0}, true},
 		{"crit in unprotected header", nil, cborMap([2]any{int64(coseHdrCrit), []any{int64(coseHdrTyp)}}), false},
 	}
 	for _, tc := range cases {

@@ -332,6 +332,12 @@ func decodeHeaderLabels(b []byte) (map[int64]any, map[string]bool, error) {
 	if err := claimsDecMode.Unmarshal(b, &raw); err != nil {
 		return nil, nil, err
 	}
+	// CBOR null and undefined decode into a nil map without an error; a map
+	// is required here (an empty map is fine), so they are malformed rather
+	// than an empty header or claims set.
+	if raw == nil {
+		return nil, nil, errors.New("not a CBOR map (null or undefined)")
+	}
 	ints := make(map[int64]any, len(raw))
 	texts := make(map[string]bool)
 	for k, v := range raw {
@@ -419,14 +425,20 @@ func verifyCOSE(alg int64, pub crypto.PublicKey, s *sign1) error {
 func anyMap(raw any) (map[any]any, bool) {
 	switch m := raw.(type) {
 	case map[any]any:
-		return m, true
+		return m, m != nil
 	case map[int64]any:
+		if m == nil {
+			return nil, false
+		}
 		out := make(map[any]any, len(m))
 		for k, v := range m {
 			out[k] = v
 		}
 		return out, true
 	case map[string]any:
+		if m == nil {
+			return nil, false
+		}
 		out := make(map[any]any, len(m))
 		for k, v := range m {
 			out[k] = v
