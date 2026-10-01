@@ -3,6 +3,7 @@ package trust
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -1171,5 +1172,51 @@ func TestService_EvaluateStatusListSigner_ReasonTextIsNotASignal(t *testing.T) {
 	info, _ = svc.EvaluateStatusListSigner(context.Background(), "s", "", &KeyMaterial{Type: "x5c", X5C: []string{"AA"}}, false)
 	if !info.EvaluationFailed {
 		t.Fatal("an evaluation error must set EvaluationFailed")
+	}
+}
+
+// failingEvaluator answers every call with a PDP error or an in-band failure
+// whose text embeds the token-controlled marker.
+type failingEvaluator struct {
+	testMockEvaluator
+	inBand bool
+	marker string
+}
+
+func (f *failingEvaluator) Evaluate(context.Context, *EvaluationRequest) (*EvaluationResponse, error) {
+	if f.inBand {
+		return &EvaluationResponse{Failed: true, Reason: "pdp broke on " + f.marker}, nil
+	}
+	return nil, errors.New("transport broke on " + f.marker)
+}
+
+func TestService_EvaluateStatusListSigner_LogsAreRedacted(t *testing.T) {
+	const marker = "ATTACKER-CONTROLLED-ISS"
+	for _, tc := range []struct {
+		name string
+		ev   TrustEvaluator
+	}{
+		{"transport error", &failingEvaluator{marker: marker}},
+		{"in-band failure", &failingEvaluator{marker: marker, inBand: true}},
+		{"denied", &actionEvaluator{answers: map[string]any{"status-list-signer": false}}},
+		{"fallback trusted", &actionEvaluator{answers: map[string]any{"status-list-signer": errors.New("down " + marker), "credential-issuer": true}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &config.Config{Trust: config.TrustConfig{Timeout: 10, PDPURL: "https://pdp"}}
+			core, logs := observer.New(zap.DebugLevel)
+			svc := NewService(cfg, zap.New(core), func(string, time.Duration) (TrustEvaluator, error) { return tc.ev, nil })
+			km := &KeyMaterial{Type: "x5c", X5C: []string{"MIIBxxx"}}
+			if _, err := svc.EvaluateStatusListSigner(context.Background(), marker, "", km, true); err != nil {
+				t.Fatal(err)
+			}
+			if logs.Len() == 0 {
+				t.Fatal("expected log output")
+			}
+			for _, e := range logs.All() {
+				if s := fmt.Sprint(e.Message, e.ContextMap()); strings.Contains(s, marker) {
+					t.Errorf("log line carries token-controlled content: %s", s)
+				}
+			}
+		})
 	}
 }

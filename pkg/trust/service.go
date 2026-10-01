@@ -326,6 +326,11 @@ const StatusListSignerFallbackAction = string(RoleCredentialIssuer)
 // the evaluation itself failed; TrustInfo.EvaluationFailed is the signal.
 const evalFailedReasonPrefix = "Trust evaluation failed"
 
+// statusEvalFailedClass is the only description of a failed status-list
+// signer evaluation that is logged: the raw error and PDP reason may carry
+// token-controlled text.
+const statusEvalFailedClass = "evaluation_failed"
+
 // EvaluateStatusListSigner asks the trust endpoint whether keyMaterial (the
 // x5c chain or jwk from a status list's header) may sign status lists for
 // subject (the list's iss claim, else the origin of the list URI).
@@ -361,6 +366,7 @@ func (s *Service) EvaluateStatusListSigner(ctx context.Context, subject string, 
 		action:      StatusListSignerAction,
 		keyMaterial: keyMaterial,
 		logLabel:    "status_list_signer",
+		redact:      true,
 	})
 	if err != nil {
 		return nil, err
@@ -377,15 +383,18 @@ func (s *Service) EvaluateStatusListSigner(ctx context.Context, subject string, 
 	if !first.EvaluationFailed {
 		s.logger.Warn("status list signer denied",
 			zap.String("reason", "signer_untrusted_denied"),
-			zap.String("signer_trust_action", StatusListSignerAction),
-			zap.String("status_list_signer_reason", first.Reason))
+			zap.String("signer_trust_action", StatusListSignerAction))
 		return first, nil
 	}
 	if !fallbackOnError {
 		return first, nil
 	}
 
-	second, err := s.EvaluateIssuer(ctx, subject, trustEndpoint, keyMaterial)
+	second, err := s.evaluate(ctx, subject, endpoint, RoleCredentialIssuer, evaluateOptions{
+		keyMaterial: keyMaterial,
+		logLabel:    "issuer",
+		redact:      true,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -393,7 +402,7 @@ func (s *Service) EvaluateStatusListSigner(ctx context.Context, subject string, 
 		second.Action = StatusListSignerFallbackAction
 		s.logger.Warn("status list signer trusted via credential-issuer fallback; the status-list-signer evaluation failed",
 			zap.String("signer_trust_action", StatusListSignerFallbackAction),
-			zap.String("status_list_signer_error", first.Reason))
+			zap.String("status_list_signer_error", statusEvalFailedClass))
 		return second, nil
 	}
 	if !second.EvaluationFailed {
@@ -424,6 +433,10 @@ type evaluateOptions struct {
 	// EvaluationRequest.Context (see EvaluateVerifierWithContext's doc
 	// comment for why this exists).
 	evalContext map[string]interface{}
+	// redact keeps the subject, evaluator errors and PDP reasons out of this
+	// call's log lines (they are token-controlled); only an error class is
+	// logged.
+	redact bool
 }
 
 // evaluate is the shared implementation for issuer, verifier, and FIDO2
@@ -433,6 +446,12 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 	keyMaterial := opts.keyMaterial
 	logLabel := opts.logLabel
 	evalContext := opts.evalContext
+	subjectField := func() []zap.Field {
+		if opts.redact {
+			return nil
+		}
+		return []zap.Field{zap.String(logLabel, subjectID)}
+	}
 
 	eval, err := s.GetEvaluator(endpoint)
 	if err != nil {
@@ -481,8 +500,7 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 			}
 			req.Key = keyMaterial.X5C
 			s.logger.Debug("Trust evaluation with x5c",
-				zap.String(logLabel, subjectID),
-				zap.Int("cert_count", len(keyMaterial.X5C)))
+				append(subjectField(), zap.Int("cert_count", len(keyMaterial.X5C)))...)
 		case "jwk":
 			// Normalize JWKS/JWK into a flat slice of individual JWK objects
 			normalized := NormalizeJWKS(keyMaterial.JWK)
@@ -494,8 +512,7 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 			}
 			req.Key = normalized
 			s.logger.Debug("Trust evaluation with JWK",
-				zap.String(logLabel, subjectID),
-				zap.Int("key_count", len(normalized)))
+				append(subjectField(), zap.Int("key_count", len(normalized)))...)
 		case "":
 			// Type not set but key material provided; try to infer
 			if len(keyMaterial.X5C) > 0 {
@@ -510,16 +527,19 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 			}
 		}
 	} else {
-		s.logger.Debug("Trust evaluation resolution-only",
-			zap.String(logLabel, subjectID))
+		s.logger.Debug("Trust evaluation resolution-only", subjectField()...)
 	}
 
 	// Delegate evaluation to the trust endpoint
 	resp, err := eval.Evaluate(ctx, req)
 	if err != nil {
-		s.logger.Warn("Trust evaluation error",
-			zap.String(logLabel, subjectID),
-			zap.Error(err))
+		if opts.redact {
+			s.logger.Warn("Trust evaluation error", zap.String("error_class", statusEvalFailedClass))
+		} else {
+			s.logger.Warn("Trust evaluation error",
+				zap.String(logLabel, subjectID),
+				zap.Error(err))
+		}
 		return &TrustInfo{
 			Trusted:          false,
 			Framework:        "authzen",
@@ -531,9 +551,13 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 	if resp.Failed {
 		// The evaluator reports a PDP/build failure in-band (no Go error):
 		// that is a failed evaluation, not a denial.
-		s.logger.Warn("Trust evaluation failed",
-			zap.String(logLabel, subjectID),
-			zap.String("reason", resp.Reason))
+		if opts.redact {
+			s.logger.Warn("Trust evaluation failed", zap.String("error_class", statusEvalFailedClass))
+		} else {
+			s.logger.Warn("Trust evaluation failed",
+				zap.String(logLabel, subjectID),
+				zap.String("reason", resp.Reason))
+		}
 		return &TrustInfo{
 			Trusted:          false,
 			Framework:        "authzen",
