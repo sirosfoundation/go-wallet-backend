@@ -99,11 +99,17 @@ type Session struct {
 	// authoritative even when empty (no permissions). False only for legacy
 	// tokens, which have no TAC concept.
 	TACEnforced bool
-	transport   SessionTransport
-	transportMu sync.RWMutex // guards transport reassignment during session resume
-	flows       map[string]*Flow
-	flowsMu     sync.RWMutex
-	logger      *zap.Logger
+
+	// onSuperseded, when set before registration, is called (without any
+	// manager lock held) after a later registerSession for the same user
+	// replaces this session. The WMP adapter uses it to invalidate the
+	// session's resume state (token, peer) so it cannot be resumed.
+	onSuperseded func()
+	transport    SessionTransport
+	transportMu  sync.RWMutex // guards transport reassignment during session resume
+	flows        map[string]*Flow
+	flowsMu      sync.RWMutex
+	logger       *zap.Logger
 
 	// Channels for flow coordination
 	actionCh chan *FlowActionMessage
@@ -745,11 +751,21 @@ func (m *Manager) registerSession(session *Session) bool {
 			return false
 		}
 	}
-	defer m.sessionsMu.Unlock()
+	// A superseded session's onSuperseded hook runs after sessionsMu is
+	// released: it takes the owning adapter's lock, and adapters take their
+	// lock before consulting the manager (isCurrentSession).
+	var superseded *Session
+	defer func() {
+		m.sessionsMu.Unlock()
+		if superseded != nil && superseded.onSuperseded != nil {
+			superseded.onSuperseded()
+		}
+	}()
 
 	// Close existing session for this user (skip for anonymous sessions)
 	if session.UserID != "" {
 		if existing, ok := m.userIndex[session.UserID]; ok {
+			superseded = existing
 			m.logger.Debug("Closing existing session", zap.String("user_id", session.UserID))
 			_ = existing.currentTransport().Close()
 			delete(m.sessions, existing.ID)

@@ -40,15 +40,16 @@ type WMPAdapter struct {
 	// bearerToken extracts the bearer credential from an HTTP request.
 	bearerToken func(*http.Request) string
 
-	mu                sync.RWMutex
-	peers             map[string]*wmpSession      // keyed by WMP session ID
-	resumptionTokens  map[string]*resumptionEntry // token -> entry with session ID and expiry
-	eventBufs         map[string]*wmpEventBuffer  // keyed by WMP session ID; survives resume unlike peers
-	outbound          map[string]outboundRequest  // server->client request IDs awaiting a response (see trackOutbound)
-	externalURL       string                      // public base URL for discovery (SetExternalURL)
-	draining          bool                        // set by Drain/Close; new sessions and requests are refused
-	afterRegister     func(sessionID string)      // test hook: runs between manager registration and peer publication
-	beforeCreateToken func(sessionID string)      // test hook: runs between publishing a new peer and issuing its token
+	mu                  sync.RWMutex
+	peers               map[string]*wmpSession      // keyed by WMP session ID
+	resumptionTokens    map[string]*resumptionEntry // token -> entry with session ID and expiry
+	eventBufs           map[string]*wmpEventBuffer  // keyed by WMP session ID; survives resume unlike peers
+	outbound            map[string]outboundRequest  // server->client request IDs awaiting a response (see trackOutbound)
+	externalURL         string                      // public base URL for discovery (SetExternalURL)
+	draining            bool                        // set by Drain/Close; new sessions and requests are refused
+	beforeResumePublish func(sessionID string)      // test hook: runs between a resume's validation and its publication
+	afterRegister       func(sessionID string)      // test hook: runs between manager registration and peer publication
+	beforeCreateToken   func(sessionID string)      // test hook: runs between publishing a new peer and issuing its token
 
 	// tokenSlotsMu guards tokenSlots, the number of live WMP sessions per
 	// bearer token (see reserveSlot).
@@ -783,6 +784,25 @@ func (a *WMPAdapter) closeSessionIfCurrent(sessionID string, ws *wmpSession) {
 	a.teardown(ws)
 }
 
+// supersedeSession invalidates the adapter state of a session that the
+// manager replaced with a newer one for the same user: the peer entry,
+// resumption tokens and event buffer are removed atomically so the old
+// session can no longer be resumed, then it is torn down. A no-op when the
+// session was never published (create handles that itself) or the entry now
+// belongs to a different engine session.
+func (a *WMPAdapter) supersedeSession(sessionID string, session *Session) {
+	a.mu.Lock()
+	ws, ok := a.peers[sessionID]
+	if !ok || ws.session != session {
+		a.mu.Unlock()
+		return
+	}
+	delete(a.peers, sessionID)
+	a.dropSessionStateLocked(sessionID)
+	a.mu.Unlock()
+	a.teardown(ws)
+}
+
 // handleSessionCreate creates a new engine session and wmp.Peer.
 func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([]byte, error) {
 	req := msg.AsRequest()
@@ -905,6 +925,7 @@ func (a *WMPAdapter) handleSessionCreate(_ context.Context, msg *wmp.Message) ([
 
 	// Store handler's session reference (needed for FlowStart/FlowAction).
 	handler.session = session
+	session.onSuperseded = func() { a.supersedeSession(sessionID, session) }
 
 	// Register with engine manager. A false result means the user was
 	// revoked between token validation and now (registerSession has already
@@ -1201,12 +1222,24 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 	// published BEFORE the old peer is cancelled below, so the old peer's
 	// Serve goroutine (whose cleanup only acts if it is still current) can
 	// never tear down the resumed session.
+	if a.beforeResumePublish != nil {
+		a.beforeResumePublish(params.SessionID)
+	}
 	a.mu.Lock()
 	_, tokenStillValid := a.resumptionTokens[params.ResumptionToken]
-	if !tokenStillValid || a.peers[params.SessionID] != oldWS || a.draining {
+	// A create for the same user may have superseded the session being
+	// resumed after the lookup above; publishing then would leave it active
+	// here but absent from the manager next to its replacement.
+	superseded := !a.manager.isCurrentSession(oldWS.session)
+	if !tokenStillValid || a.peers[params.SessionID] != oldWS || a.draining || superseded {
 		a.mu.Unlock()
 		cancel()
 		_ = ct.Close()
+		if superseded {
+			// The session is gone from the manager: end the adapter side
+			// too (peer, tokens, buffer) rather than leave it resumable.
+			a.closeSessionIfCurrent(params.SessionID, oldWS)
+		}
 		return invalidToken()
 	}
 	delete(a.resumptionTokens, params.ResumptionToken)
@@ -1273,7 +1306,8 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 	// exists, and no "resumed: true" for it either).
 	newToken, stillCurrent := a.issueResumptionTokenIfCurrent(params.SessionID, ws)
 	if !stillCurrent {
-		a.logger.Warn("WMP session.resume: session closed during resume", zap.String("session_id", params.SessionID))
+		a.logger.Warn("WMP session.resume: session closed or superseded during resume", zap.String("session_id", params.SessionID))
+		a.closeSessionIfCurrent(params.SessionID, ws)
 		return invalidToken()
 	}
 
