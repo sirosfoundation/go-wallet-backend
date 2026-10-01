@@ -157,8 +157,8 @@ type ASLegacyConfig struct {
 	// are sent on legacy token responses.
 	DeprecationHeader bool `yaml:"deprecation_header" envconfig:"DEPRECATION_HEADER"`
 
-	// SunsetDate is the date after which legacy tokens will no longer be supported.
-	// Informational only: used in the Sunset HTTP header. It does not disable
+	// SunsetDate is the date advertised in the Sunset HTTP header on legacy token
+	// responses. Informational only. It does not disable
 	// anything; use enabled=false for that. Format: RFC 3339 date (e.g. "2027-10-01T00:00:00Z").
 	SunsetDate string `yaml:"sunset_date" envconfig:"SUNSET_DATE"`
 }
