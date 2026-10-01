@@ -913,16 +913,39 @@ func (t *TLSConfig) ListenAndServe(srv *http.Server) error {
 	return srv.ListenAndServe()
 }
 
+// PrepareTLS loads and validates the certificate/key pair and applies the
+// MinVersion setting to srv.TLSConfig. It is a no-op when TLS is disabled.
+// Calling it before binding a listener lets a missing, unreadable, malformed
+// or mismatched certificate fail startup instead of surfacing from a serving
+// goroutine. Serve then needs no files.
+func (t *TLSConfig) PrepareTLS(srv *http.Server) error {
+	if !t.Enabled {
+		return nil
+	}
+	cert, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
+	if err != nil {
+		return fmt.Errorf("failed to load TLS certificate (cert_file=%q, key_file=%q): %w", t.CertFile, t.KeyFile, err)
+	}
+	if srv.TLSConfig == nil {
+		srv.TLSConfig = &tls.Config{}
+	}
+	srv.TLSConfig.MinVersion = t.TLSMinVersion()
+	srv.TLSConfig.Certificates = []tls.Certificate{cert}
+	return nil
+}
+
 // Serve serves srv on an already-bound listener, using TLS if t is enabled and
 // plain HTTP otherwise. Binding the listener separately (net.Listen) lets the
-// caller report bind failures synchronously instead of from a goroutine.
+// caller report bind failures synchronously instead of from a goroutine. The
+// certificate is loaded here only if PrepareTLS has not already done so.
 func (t *TLSConfig) Serve(srv *http.Server, ln net.Listener) error {
 	if t.Enabled {
-		if srv.TLSConfig == nil {
-			srv.TLSConfig = &tls.Config{}
+		if srv.TLSConfig == nil || len(srv.TLSConfig.Certificates) == 0 {
+			if err := t.PrepareTLS(srv); err != nil {
+				return err
+			}
 		}
-		srv.TLSConfig.MinVersion = t.TLSMinVersion()
-		return srv.ServeTLS(ln, t.CertFile, t.KeyFile)
+		return srv.ServeTLS(ln, "", "")
 	}
 	return srv.Serve(ln)
 }

@@ -154,7 +154,16 @@ type Manager struct {
 
 	// Readiness management for /readyz endpoint
 	readiness *health.ReadinessManager
+
+	// serveErrs receives fatal errors returned by a serving goroutine after
+	// Start succeeded (anything other than http.ErrServerClosed).
+	serveErrs chan error
 }
+
+// ServeErrors returns a channel that receives the first fatal error of a
+// listener that stopped serving after Start succeeded. The caller should shut
+// down and exit non-zero instead of running without that listener.
+func (m *Manager) ServeErrors() <-chan error { return m.serveErrs }
 
 // NewManager creates a new server manager
 func NewManager(cfg *ServerConfig, logger *zap.Logger) *Manager {
@@ -162,6 +171,7 @@ func NewManager(cfg *ServerConfig, logger *zap.Logger) *Manager {
 		cfg:       cfg,
 		logger:    logger,
 		providers: make([]RouteProvider, 0),
+		serveErrs: make(chan error, 8),
 		readiness: health.NewReadinessManager(
 			health.WithCacheTTL(2*time.Second),
 			health.WithCheckTimeout(2*time.Second),
@@ -217,6 +227,11 @@ func (m *Manager) Start(ctx context.Context) error {
 
 // listenAndServe binds srv.Addr synchronously and serves it in a goroutine.
 func (m *Manager) listenAndServe(srv *http.Server, tlsCfg *config.TLSConfig, listeningMsg, errMsg string, fields []zap.Field) error {
+	// Validate the certificate before binding so a bad TLS setup aborts
+	// startup (and nothing extra needs releasing).
+	if err := tlsCfg.PrepareTLS(srv); err != nil {
+		return fmt.Errorf("%s: %w", errMsg, err)
+	}
 	ln, err := net.Listen("tcp", srv.Addr)
 	if err != nil {
 		return fmt.Errorf("%s: cannot listen on %s: %w", errMsg, srv.Addr, err)
@@ -225,6 +240,10 @@ func (m *Manager) listenAndServe(srv *http.Server, tlsCfg *config.TLSConfig, lis
 	go func() {
 		if err := tlsCfg.Serve(srv, ln); err != nil && err != http.ErrServerClosed {
 			m.logger.Error(errMsg, zap.Error(err))
+			select {
+			case m.serveErrs <- fmt.Errorf("%s: %w", errMsg, err):
+			default:
+			}
 		}
 	}()
 	return nil

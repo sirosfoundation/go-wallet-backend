@@ -349,8 +349,13 @@ func main() {
 	}
 
 	// Wait for shutdown signal
-	<-quit
-	logger.Info("Received shutdown signal")
+	var serveErr error
+	select {
+	case <-quit:
+		logger.Info("Received shutdown signal")
+	case serveErr = <-mgr.ServeErrors():
+		logger.Error("Listener stopped serving, shutting down", zap.Error(serveErr))
+	}
 	cancel()
 
 	// Graceful shutdown
@@ -370,6 +375,10 @@ func main() {
 	}
 
 	logger.Info("Server exited")
+	if serveErr != nil {
+		_ = logger.Sync()
+		os.Exit(1) //nolint:gocritic // cleanup above is complete; deferred cancel is irrelevant
+	}
 }
 
 // setupRegistryConfig applies the deprecated standalone registry
