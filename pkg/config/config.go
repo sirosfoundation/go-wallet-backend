@@ -298,7 +298,9 @@ type PresentationConfig struct {
 	// remaining checks are skipped, each treated as "status could not be
 	// determined": warn and enforce-revoked log a warning and proceed, strict
 	// refuses (fails closed) with CREDENTIAL_STATUS_UNDETERMINED. Seconds;
-	// 0 (default) means 30. Keep it well below the flow timeout.
+	// 0 (default) means 30. Keep it well below the flow timeout. Must be
+	// between 0 and MaxTrustCacheTTLSeconds (the largest seconds value a
+	// time.Duration holds); a larger value would wrap negative.
 	// Env: WALLET_PRESENTATION_STATUS_CHECK_BUDGET_SECONDS
 	StatusCheckBudgetSeconds int `yaml:"status_check_budget_seconds" envconfig:"STATUS_CHECK_BUDGET_SECONDS"`
 
@@ -2308,6 +2310,11 @@ func (c *Config) Validate() error {
 	}
 	if c.Presentation.StatusCheckBudgetSeconds < 0 {
 		return fmt.Errorf("invalid presentation.status_check_budget_seconds %d: must not be negative", c.Presentation.StatusCheckBudgetSeconds)
+	}
+	// It is multiplied by time.Second; past the int64 nanosecond range that
+	// wraps negative and the budget would silently fall back to the default.
+	if c.Presentation.StatusCheckBudgetSeconds > MaxTrustCacheTTLSeconds {
+		return fmt.Errorf("invalid presentation.status_check_budget_seconds %d: must not exceed %d (a larger value overflows time.Duration)", c.Presentation.StatusCheckBudgetSeconds, MaxTrustCacheTTLSeconds)
 	}
 	if c.Presentation.StatusListMinEntries < 0 {
 		return fmt.Errorf("invalid presentation.status_list_min_entries %d: must not be negative", c.Presentation.StatusListMinEntries)

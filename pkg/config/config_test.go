@@ -2663,6 +2663,17 @@ func TestConfig_Validate_PresentationStatusCheck(t *testing.T) {
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "status_check_budget_seconds") {
 		t.Errorf("Validate must reject a negative status_check_budget_seconds, got %v", err)
 	}
+	cfg.Presentation.StatusCheckBudgetSeconds = MaxTrustCacheTTLSeconds + 1
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "status_check_budget_seconds") {
+		t.Errorf("Validate must reject an overflowing status_check_budget_seconds, got %v", err)
+	}
+	cfg.Presentation.StatusCheckBudgetSeconds = MaxTrustCacheTTLSeconds
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("the maximum status_check_budget_seconds rejected: %v", err)
+	}
+	if d := time.Duration(cfg.Presentation.StatusCheckBudgetSeconds) * time.Second; d <= 0 {
+		t.Errorf("maximum budget wraps negative: %v", d)
+	}
 	cfg.Presentation.StatusCheckBudgetSeconds = 0
 	cfg.Presentation.StatusListMinEntries = -1
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "status_list_min_entries") {
