@@ -561,6 +561,54 @@ func TestContentTypeMalformedVsMissing(t *testing.T) {
 	}
 }
 
+// TestCWT_AmbiguousAliasesRejected: a signed map must not carry two
+// spellings of one member or claim, since a reader of the other spelling
+// would derive a different verdict from the same token.
+func TestCWT_AmbiguousAliasesRejected(t *testing.T) {
+	ctx := context.Background()
+	lst := zlibBytes(t, 2, map[int]int{3: 1})
+	other := zlibBytes(t, 2, nil)
+	base := func(u string, sl map[any]any, extra ...[2]any) []byte {
+		items := [][2]any{
+			{int64(cwtClaimSub), u}, {int64(cwtClaimIat), testEpoch.Unix()},
+			{int64(cwtClaimTTL), 900}, {int64(cwtClaimStatusList), sl},
+		}
+		return signedCWTWithPayload(t, cborMap(append(items, extra...)...))
+	}
+	cases := map[string]func(u string) []byte{
+		"bits text and int": func(u string) []byte {
+			return base(u, map[any]any{"bits": 2, int64(statusListKeyBits): 1, "lst": lst})
+		},
+		"bits text and int, equal": func(u string) []byte {
+			return base(u, map[any]any{"bits": 2, int64(statusListKeyBits): 2, "lst": lst})
+		},
+		"lst text and int": func(u string) []byte {
+			return base(u, map[any]any{"bits": 2, "lst": lst, int64(statusListKeyLst): other})
+		},
+		"standard and legacy status_list": func(u string) []byte {
+			// Label 65534 is the standard ttl, so the legacy status_list
+			// can only appear here with no standard ttl beside it.
+			return signedCWTWithPayload(t, cborMap(
+				[2]any{int64(cwtClaimSub), u}, [2]any{int64(cwtClaimIat), testEpoch.Unix()},
+				[2]any{int64(cwtClaimStatusList), map[any]any{"bits": 2, "lst": lst}},
+				[2]any{int64(cwtClaimLegacyStatusList), map[any]any{"bits": 2, "lst": other}}))
+		},
+		"standard and legacy ttl": func(u string) []byte {
+			return base(u, map[any]any{"bits": 2, "lst": lst}, [2]any{int64(cwtClaimLegacyTTL), 60})
+		},
+	}
+	for name, mk := range cases {
+		t.Run(name, func(t *testing.T) {
+			c, uri, _ := serveCWT(t, mk, mediaTypeCWT, trustAll)
+			err := c.Check(ctx, &Reference{Idx: 3, URI: uri})
+			if err == nil || errors.Is(err, ErrRevoked) {
+				t.Fatalf("ambiguous token must be unverifiable, got %v", err)
+
+			}
+		})
+	}
+}
+
 func TestCWTHelpers(t *testing.T) {
 	if _, ok := toInt64(uint64(1) << 63); ok {
 		t.Error("huge uint64 must not narrow")
@@ -576,9 +624,19 @@ func TestCWTHelpers(t *testing.T) {
 			t.Errorf("anyMap(%T)", m)
 		}
 	}
-	if member(map[any]any{"bits": 2}, "bits", 1) != 2 || member(map[any]any{uint64(1): 3}, "bits", 1) != 3 ||
-		member(map[any]any{int64(1): 4}, "bits", 1) != 4 || member(map[any]any{"x": 1}, "bits", 1) != nil {
-		t.Error("member lookup")
+	for _, tc := range []struct {
+		m    map[any]any
+		want any
+		err  bool
+	}{
+		{map[any]any{"bits": 2}, 2, false}, {map[any]any{uint64(1): 3}, 3, false},
+		{map[any]any{int64(1): 4}, 4, false}, {map[any]any{"x": 1}, nil, false},
+		{map[any]any{"bits": 2, int64(1): 2}, nil, true}, {map[any]any{"bits": 2, uint64(1): 3}, nil, true},
+	} {
+		got, err := member(tc.m, "bits", 1)
+		if (err != nil) != tc.err || got != tc.want {
+			t.Errorf("member(%v) = %v, %v", tc.m, got, err)
+		}
 	}
 	if _, err := x5chain(7); err == nil {
 		t.Error("bad x5chain type accepted")

@@ -118,6 +118,18 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 		if _, isMap := anyMap(claims[cwtClaimLegacyStatusList]); isMap {
 			slRaw, ttlLabel = claims[cwtClaimLegacyStatusList], cwtClaimLegacyTTL
 		}
+	} else {
+		// Both layouts at once are ambiguous: the standard and legacy
+		// spellings could carry different verdicts. Label 65534 is the
+		// standard ttl and the legacy status_list, so a map there next to
+		// the standard status_list (or both ttl spellings) is rejected.
+		if _, isMap := anyMap(claims[cwtClaimLegacyStatusList]); isMap {
+			return parsedList{}, fmt.Errorf("%w has both the standard and the legacy status_list claim", errCWT)
+		}
+		_, std := claims[cwtClaimTTL]
+		if _, legacy := claims[cwtClaimLegacyTTL]; std && legacy {
+			return parsedList{}, fmt.Errorf("%w has both the standard and the legacy ttl claim", errCWT)
+		}
 	}
 	sl, ok := anyMap(slRaw)
 	if !ok {
@@ -125,11 +137,19 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 	}
 	// The draft's CDDL uses the text keys "bits" and "lst"; the integer
 	// labels 1 and 2 are also read (vc#703 writes those).
-	bits, ok := toInt64(member(sl, "bits", statusListKeyBits))
+	bitsRaw, err := member(sl, "bits", statusListKeyBits)
+	if err != nil {
+		return parsedList{}, fmt.Errorf("%w status_list: %v", errCWT, err)
+	}
+	lstRaw, err := member(sl, "lst", statusListKeyLst)
+	if err != nil {
+		return parsedList{}, fmt.Errorf("%w status_list: %v", errCWT, err)
+	}
+	bits, ok := toInt64(bitsRaw)
 	if !ok {
 		return parsedList{}, fmt.Errorf("%w status_list has no bits", errCWT)
 	}
-	lst, ok := member(sl, "lst", statusListKeyLst).([]byte)
+	lst, ok := lstRaw.([]byte)
 	if !ok || len(lst) == 0 {
 		return parsedList{}, fmt.Errorf("%w status_list has no lst", errCWT)
 	}
@@ -513,18 +533,27 @@ func anyMap(raw any) (map[any]any, bool) {
 	return nil, false
 }
 
-// member looks a status_list member up by its text key, then by any integer
-// encoding (int64 or uint64) of its numeric label.
-func member(m map[any]any, text string, label int64) any {
-	if v, ok := m[text]; ok {
-		return v
-	}
+// member looks a status_list member up by its text key or by any integer
+// encoding (int64 or uint64) of its numeric label. A map carrying both
+// spellings is rejected, even when the values agree: an implementation that
+// reads only the other spelling could otherwise derive a different verdict
+// from the same signed token.
+func member(m map[any]any, text string, label int64) (any, error) {
+	tv, hasText := m[text]
+	var iv any
+	hasInt := false
 	for k, v := range m {
 		if n, ok := toInt64(k); ok && n == label {
-			return v
+			iv, hasInt = v, true
 		}
 	}
-	return nil
+	if hasText && hasInt {
+		return nil, fmt.Errorf("member %q is present as both %q and %d", text, text, label)
+	}
+	if hasText {
+		return tv, nil
+	}
+	return iv, nil
 }
 
 func toInt64(v any) (int64, bool) {
