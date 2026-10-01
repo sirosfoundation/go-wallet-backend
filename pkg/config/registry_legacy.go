@@ -127,10 +127,12 @@ func (c *Config) ApplyLegacyRegistryConfig(path string, standalone bool) ([]stri
 				"(new-style tokens are validated against <as.external_url>/auth/.well-known/jwks.json)")
 		}
 	}
-	// The old secret (file) is only read when it is going to be used, i.e.
-	// standalone; a combined process authenticates with the backend's jwt.*.
+	// The old secret file is only read when it is going to be used: the
+	// registry runs alone, legacy HMAC validation is enabled and no shared
+	// secret has been loaded already (the new jwt.secret / jwt.secret_path
+	// wins). Otherwise a missing file must not fail startup.
 	secret := f.JWT.Secret
-	if standalone && f.JWT.SecretPath != "" {
+	if standalone && f.JWT.SecretPath != "" && c.AS.Legacy.Enabled && c.JWT.Secret == "" {
 		s, err := readSecretFile(f.JWT.SecretPath)
 		if err != nil {
 			return warnings, fmt.Errorf("registry jwt.secret_path: %w", err)

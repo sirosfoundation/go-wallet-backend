@@ -769,3 +769,47 @@ func TestConfig_ValidateRegistryStandalone_LegacyRPID(t *testing.T) {
 	c.JWT.Secret = ""
 	require.NoError(t, c.ValidateRegistryStandalone(), "no secret, legacy unusable")
 }
+
+func TestApplyLegacyRegistryConfig_OldSecretFileOnlyReadWhenUsable(t *testing.T) {
+	dir := t.TempDir()
+	gone := filepath.Join(dir, "gone-secret-file")
+	old := writeFile(t, dir, "registry.yaml", "jwt:\n  secret_path: "+gone+"\n")
+
+	t.Run("legacy disabled: unreadable file does not fail startup", func(t *testing.T) {
+		c := defaultConfig()
+		c.AS.Legacy.Enabled = false
+		_, err := c.ApplyLegacyRegistryConfig(old, true)
+		require.NoError(t, err)
+		assert.Empty(t, c.JWT.Secret)
+	})
+
+	t.Run("shared secret already loaded: file is not read", func(t *testing.T) {
+		c := defaultConfig()
+		c.AS.Legacy.Enabled = true
+		c.JWT.Secret = strings.Repeat("n", 32)
+		_, err := c.ApplyLegacyRegistryConfig(old, true)
+		require.NoError(t, err)
+		assert.Equal(t, strings.Repeat("n", 32), c.JWT.Secret)
+	})
+
+	t.Run("legacy enabled without a secret: file is read", func(t *testing.T) {
+		sp := writeFile(t, dir, "secret", strings.Repeat("o", 32)+"\n")
+		ok := writeFile(t, dir, "ok.yaml", "jwt:\n  secret_path: "+sp+"\n")
+		c := defaultConfig()
+		c.AS.Legacy.Enabled = true
+		c.JWT.Secret = ""
+		_, err := c.ApplyLegacyRegistryConfig(ok, true)
+		require.NoError(t, err)
+		assert.Equal(t, strings.Repeat("o", 32), c.JWT.Secret)
+	})
+
+	t.Run("legacy enabled, unreadable: clear error without the path", func(t *testing.T) {
+		c := defaultConfig()
+		c.AS.Legacy.Enabled = true
+		c.JWT.Secret = ""
+		_, err := c.ApplyLegacyRegistryConfig(old, true)
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "jwt.secret_path")
+		assert.NotContains(t, err.Error(), gone)
+	})
+}
