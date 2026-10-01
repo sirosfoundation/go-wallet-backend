@@ -881,13 +881,13 @@ func TestWIAGenerateDuplicateChallenge(t *testing.T) {
 	}
 
 	// First consume should succeed (via internal consume)
-	ok, _ := svc.challenges.Consume(ctx, challenge)
+	ok, _ := svc.challenges.Consume(ctx, domain.DefaultTenantID, challenge)
 	if !ok {
 		t.Fatal("first consume should succeed")
 	}
 
 	// Second consume should fail
-	ok, _ = svc.challenges.Consume(ctx, challenge)
+	ok, _ = svc.challenges.Consume(ctx, domain.DefaultTenantID, challenge)
 	if ok {
 		t.Fatal("expected failure on second consume")
 	}
@@ -1345,5 +1345,26 @@ func TestCreateChallenge_DefaultTTL(t *testing.T) {
 	diff := expiresAt.Sub(expected)
 	if diff < -2*time.Second || diff > 2*time.Second {
 		t.Errorf("default TTL should be ~5min, got expiry diff %v", diff)
+	}
+}
+
+// A challenge minted for one tenant cannot be redeemed by a caller of another,
+// and the failed attempt does not burn it for its own tenant.
+func TestWIAService_GenerateWIA_ChallengeIsTenantBound(t *testing.T) {
+	svc, _ := newTestWIAServiceWithInstances(t)
+	ctx := context.Background()
+
+	challenge, _, err := svc.CreateChallenge(ctx, domain.TenantID("tenant-a"))
+	if err != nil {
+		t.Fatalf("CreateChallenge: %v", err)
+	}
+	pop, _ := createTestPop(t, challenge)
+
+	_, err = svc.GenerateWIA(ctx, domain.TenantID("tenant-b"), nil, &WIARequest{Pop: pop, Challenge: challenge})
+	if !errors.Is(err, ErrWIAChallengeExpired) {
+		t.Fatalf("cross-tenant GenerateWIA = %v, want ErrWIAChallengeExpired", err)
+	}
+	if _, err := svc.GenerateWIA(ctx, domain.TenantID("tenant-a"), nil, &WIARequest{Pop: pop, Challenge: challenge}); err != nil {
+		t.Fatalf("own-tenant GenerateWIA after a refused cross-tenant attempt: %v", err)
 	}
 }

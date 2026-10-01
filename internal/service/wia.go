@@ -114,13 +114,14 @@ func (cs *challengeStore) put(c *WIAChallenge) bool {
 	return true
 }
 
-// consume removes and returns a challenge if it exists and is not expired.
-func (cs *challengeStore) consume(challenge string) (*WIAChallenge, bool) {
+// consume removes and returns a challenge if it exists, is not expired and
+// was minted for tenantID. A challenge of another tenant is left untouched.
+func (cs *challengeStore) consume(tenantID domain.TenantID, challenge string) (*WIAChallenge, bool) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
 	c, ok := cs.items[challenge]
-	if !ok {
+	if !ok || c.TenantID != tenantID {
 		return nil, false
 	}
 	cs.removeLocked(c)
@@ -286,8 +287,8 @@ func (s *WIAService) CreateChallenge(ctx context.Context, tenantID domain.Tenant
 }
 
 // consumeChallenge validates and removes a challenge (single-use).
-func (s *WIAService) consumeChallenge(ctx context.Context, challenge string) error {
-	ok, err := s.challenges.Consume(ctx, challenge)
+func (s *WIAService) consumeChallenge(ctx context.Context, tenantID domain.TenantID, challenge string) error {
+	ok, err := s.challenges.Consume(ctx, tenantID, challenge)
 	if err != nil {
 		return fmt.Errorf("consume challenge: %w", err)
 	}
@@ -339,7 +340,10 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	// Must happen before PoP validation to prevent concurrent crypto amplification
 	// attacks on the same challenge (TOCTOU). The trade-off is that a malformed PoP
 	// burns the nonce, but this is acceptable — the nonce is single-use anyway.
-	if err := s.consumeChallenge(ctx, req.Challenge); err != nil {
+	//
+	// A challenge is only good for the tenant it was minted for, so the
+	// caller's tenant is part of the consume.
+	if err := s.consumeChallenge(ctx, tenantID, req.Challenge); err != nil {
 		s.emitAuditFailure("challenge_invalid", err)
 		return "", err
 	}
