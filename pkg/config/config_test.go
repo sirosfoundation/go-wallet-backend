@@ -2873,3 +2873,88 @@ func TestConfig_EnableForRole_DefaultsAudiencesAndValidates(t *testing.T) {
 		t.Errorf("explicit audiences must be preserved: %v", ex.AS.Audiences)
 	}
 }
+
+// chartShapedConfig mirrors what siros-id-stack's templates/04-wallet-backend.yaml
+// renders for backend.yaml: as.enabled true, NO as.audiences, no jwt.issuer,
+// legacy off. config.Load must keep accepting it (documented defaults apply
+// before Validate), otherwise chart-based deployments crash-loop on upgrade.
+const chartShapedConfig = `
+server:
+  port: 8080
+  engine_port: 8082
+  rp_name: Test Wallet
+  rp_id: wallet.example.org
+  rp_origins:
+    - https://wallet.example.org
+  base_url: https://backend.example.org
+as:
+  enabled: true
+  legacy:
+    enabled: %t
+  signing_key_path: /as-cert/tls.key
+  rules_dir: /as-rules
+  default_max_tac: rwlid
+  external_url: https://backend.example.org
+  issuer: https://backend.example.org
+storage:
+  type: memory
+jwt:
+  secret: "test-secret-that-is-at-least-32-bytes!"
+`
+
+func TestLoad_ChartShapedConfig_AppliesASDefaults(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy=%t", legacy), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "backend.yaml")
+			if err := os.WriteFile(path, []byte(fmt.Sprintf(chartShapedConfig, legacy)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("chart-shaped config must load: %v", err)
+			}
+			for _, a := range defaultASAudiences {
+				if !containsString(cfg.AS.Audiences, a) {
+					t.Errorf("default audience %q missing from %v", a, cfg.AS.Audiences)
+				}
+			}
+			if got := containsString(cfg.AS.Audiences, "wallet.example.org"); got != legacy {
+				t.Errorf("rp_id in audiences = %t, want %t (%v)", got, legacy, cfg.AS.Audiences)
+			}
+			if cfg.JWT.Issuer != "wallet-backend" {
+				t.Errorf("jwt.issuer = %q", cfg.JWT.Issuer)
+			}
+		})
+	}
+}
+
+// An empty jwt.issuer (e.g. blanked by the environment) with legacy on gets
+// the documented default instead of failing; Load and EnableForRole agree.
+func TestApplyASSecurityDefaults_JWTIssuerAndParity(t *testing.T) {
+	mk := func() *Config {
+		c := validBaseConfig()
+		c.Server.RPID = "wallet.example.org"
+		c.AS = ASConfig{Enabled: true, SigningKeyPath: "/k", RulesDir: "/r", Issuer: "https://x"}
+		c.AS.Legacy.Enabled = true
+		return c
+	}
+	a := mk()
+	a.applyASSecurityDefaults()
+	if a.JWT.Issuer != "wallet-backend" {
+		t.Fatalf("jwt.issuer = %q", a.JWT.Issuer)
+	}
+	if err := a.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	b := mk()
+	b.EnableForRole()
+	if fmt.Sprint(a.AS.Audiences) != fmt.Sprint(b.AS.Audiences) || a.JWT.Issuer != b.JWT.Issuer {
+		t.Errorf("Load and EnableForRole defaults differ: %v/%q vs %v/%q", a.AS.Audiences, a.JWT.Issuer, b.AS.Audiences, b.JWT.Issuer)
+	}
+	// AS disabled: untouched.
+	d := validBaseConfig()
+	d.applyASSecurityDefaults()
+	if len(d.AS.Audiences) != 0 {
+		t.Errorf("AS disabled must not get audiences: %v", d.AS.Audiences)
+	}
+}

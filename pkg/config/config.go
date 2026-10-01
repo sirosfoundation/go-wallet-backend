@@ -70,7 +70,11 @@ type ASConfig struct {
 
 	// Audiences lists the accepted audience values for token validation.
 	// Tokens must contain at least one of these in their "aud" claim.
-	// Required when AS is enabled - Validate() rejects an empty list.
+	// Required when AS is enabled, but an empty list is filled with the
+	// documented defaults ("wallet-backend", "wallet-engine",
+	// "wallet-registry", plus server.rp_id while as.legacy.enabled is true)
+	// before validation, so configs that never set it keep working.
+	// Validate() rejects an empty list only if that defaulting was skipped.
 	// go-tokenauth v0.5.0 made this mandatory at the validator level too
 	// (both its validation paths now refuse to validate at all when their
 	// own configured Audiences is empty, closing a fail-open
@@ -78,9 +82,9 @@ type ASConfig struct {
 	// with no audiences configured would otherwise reject every request
 	// silently at runtime instead of failing to start).
 	// Documented values: "wallet-backend", "wallet-engine", "wallet-registry".
-	// When as.legacy.enabled is true this must ALSO include server.rp_id:
-	// legacy (HMAC) tokens carry the RP ID as their audience, and Validate()
-	// rejects a configuration that omits it.
+	// When as.legacy.enabled is true an explicitly configured list must ALSO
+	// include server.rp_id: legacy (HMAC) tokens carry the RP ID as their
+	// audience, and Validate() rejects a configuration that omits it.
 	Audiences []string `yaml:"audiences" envconfig:"AUDIENCES"`
 
 	// RulesDir is the path to a directory containing SPOCP policy rule files.
@@ -207,15 +211,39 @@ func (c *Config) EnableForRole() {
 	if c.AS.Issuer == "" {
 		c.AS.Issuer = c.JWT.Issuer
 	}
-	// Validate() requires a non-empty audience list when AS is enabled, so
-	// a role flag alone must supply the documented default set. Legacy
-	// (HMAC) tokens carry Server.RPID as their audience, so it is added
-	// while legacy mode is on. An explicitly configured list is left alone.
+	c.applyASSecurityDefaults()
+}
+
+// defaultASAudiences is the documented default for as.audiences.
+var defaultASAudiences = []string{"wallet-backend", "wallet-engine", "wallet-registry"}
+
+// defaultJWTIssuer is the documented default for jwt.issuer (see defaultConfig).
+const defaultJWTIssuer = "wallet-backend"
+
+// applyASSecurityDefaults fills in the documented defaults for the settings
+// Validate() makes mandatory whenever the AS is enabled, so that existing
+// deployments that never set them (e.g. the siros-id-stack chart renders
+// `as.enabled: true` with no `audiences`) keep starting. It is a no-op when
+// the AS is disabled, and never overrides an explicitly configured value.
+//
+// Shared by Load() (which must run it BEFORE Validate()) and EnableForRole()
+// so both paths produce an identical result.
+//
+//   - as.audiences empty: the documented default set, plus server.rp_id while
+//     legacy (HMAC) tokens are enabled (they carry the RP ID as "aud").
+//   - jwt.issuer empty while legacy tokens are enabled: "wallet-backend".
+func (c *Config) applyASSecurityDefaults() {
+	if !c.AS.Enabled {
+		return
+	}
 	if len(c.AS.Audiences) == 0 {
-		c.AS.Audiences = []string{"wallet-backend", "wallet-engine", "wallet-registry"}
+		c.AS.Audiences = append([]string(nil), defaultASAudiences...)
 		if c.AS.Legacy.Enabled && c.Server.RPID != "" && !containsString(c.AS.Audiences, c.Server.RPID) {
 			c.AS.Audiences = append(c.AS.Audiences, c.Server.RPID)
 		}
+	}
+	if c.AS.Legacy.Enabled && c.JWT.Issuer == "" {
+		c.JWT.Issuer = defaultJWTIssuer
 	}
 }
 
@@ -970,7 +998,7 @@ type JWTConfig struct {
 	SecretPath  string `yaml:"secret_path" envconfig:"SECRET_PATH"` // Path to file containing JWT secret
 	ExpiryHours int    `yaml:"expiry_hours" envconfig:"EXPIRY_HOURS"`
 	RefreshDays int    `yaml:"refresh_days" envconfig:"REFRESH_DAYS"`
-	// Issuer is the "iss" claim of legacy (HMAC) tokens. Required (non-empty) when as.legacy.enabled is true: legacy tokens are issued and validated with it, and Validate() rejects an empty value in that mode.
+	// Issuer is the "iss" claim of legacy (HMAC) tokens. Required (non-empty) when as.legacy.enabled is true: legacy tokens are issued and validated with it. Defaults to "wallet-backend"; if it is blanked while as.legacy.enabled is true, that default is re-applied before validation.
 	Issuer string `yaml:"issuer" envconfig:"ISSUER"`
 }
 
@@ -1758,6 +1786,10 @@ func Load(configFile string) (*Config, error) {
 		return nil, fmt.Errorf("failed to load secrets from files: %w", err)
 	}
 
+	// Apply the documented AS defaults before validating: Validate() makes
+	// them mandatory, and configs written before that must keep loading.
+	cfg.applyASSecurityDefaults()
+
 	// Validate configuration
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
@@ -1903,7 +1935,7 @@ func defaultConfig() *Config {
 		JWT: JWTConfig{
 			ExpiryHours: 24,
 			RefreshDays: 7,
-			Issuer:      "wallet-backend",
+			Issuer:      defaultJWTIssuer,
 		},
 		Trust: TrustConfig{
 			Timeout: 30, // seconds

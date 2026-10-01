@@ -367,6 +367,18 @@ az container create \
     WALLET_JWT_SECRET='your-secret'
 ```
 
+### Authorization Server defaults (upgrade note)
+
+When `as.enabled` is true and `as.audiences` is empty or omitted, the backend
+applies the documented default audiences (`wallet-backend`, `wallet-engine`,
+`wallet-registry`, plus `server.rp_id` while `as.legacy.enabled` is true)
+before validating the configuration. Likewise, an empty `jwt.issuer` with
+`as.legacy.enabled: true` falls back to `wallet-backend`. Configurations that
+never set these (for example the siros-id-stack chart, which renders
+`as.enabled: true` with legacy off and no `audiences`) therefore keep starting
+unchanged. An explicitly configured `as.audiences` is never altered; with
+legacy enabled it must include `server.rp_id`.
+
 ## Production Checklist
 
 - [ ] Use MongoDB or other scalable database
