@@ -225,6 +225,25 @@ end
 return 0
 `)
 
+// userSessionsAddScript records a session in a user's sorted set of session
+// IDs, scored by the session's expiry (unix ms). It then drops members whose
+// expiry has passed and expires the whole set when its longest-lived member
+// does, so a set can never outlive the sessions it indexes (a crashed
+// process cannot leave members behind forever).
+// Time is taken from the Redis server so replicas with skewed clocks agree.
+// KEYS[1] = set, ARGV[1] = session TTL (ms), ARGV[2] = session ID.
+var userSessionsAddScript = redis.NewScript(`
+local t = redis.call("TIME")
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+redis.call("ZADD", KEYS[1], string.format("%.0f", now + tonumber(ARGV[1])), ARGV[2])
+redis.call("ZREMRANGEBYSCORE", KEYS[1], "-inf", string.format("%.0f", now))
+local top = redis.call("ZRANGE", KEYS[1], -1, -1, "WITHSCORES")
+if top[2] then
+	redis.call("PEXPIREAT", KEYS[1], string.format("%.0f", tonumber(top[2])))
+end
+return 1
+`)
+
 // RedisSessionStore stores sessions in Redis for horizontal scaling.
 type RedisSessionStore struct {
 	client     *redis.Client
@@ -285,8 +304,9 @@ func (r *RedisSessionStore) userKey(tenantID, userID string) string {
 	return r.keyPrefix + "user:" + url.PathEscape(tenantID) + ":" + url.PathEscape(userID)
 }
 
-// userSetKey holds the IDs of all of a user's sessions across tenants, so a
-// user-wide DeleteByUser can find them.
+// userSetKey is the sorted set of the IDs of all of a user's sessions across
+// tenants (scored by expiry), so a user-wide DeleteByUser can find them. It
+// carries a TTL and is pruned on every add; see userSessionsAddScript.
 func (r *RedisSessionStore) userSetKey(userID string) string {
 	return r.keyPrefix + "userall:" + url.PathEscape(userID)
 }
@@ -344,10 +364,16 @@ func (r *RedisSessionStore) Put(ctx context.Context, session *SessionData) error
 	pipe.SetNX(ctx, r.sessionKey(session.ID), data, ttl)
 	pipe.Set(ctx, r.userKey(session.TenantID, session.UserID), session.ID, ttl)
 	pipe.SAdd(ctx, r.tenantKey(session.TenantID), session.ID)
-	pipe.SAdd(ctx, r.userSetKey(session.UserID), session.ID)
+	r.indexUserSession(ctx, pipe, session, ttl)
 
 	_, err = pipe.Exec(ctx)
 	return err
+}
+
+// indexUserSession queues the expiry-scored user-set update on pipe.
+func (r *RedisSessionStore) indexUserSession(ctx context.Context, pipe redis.Pipeliner, session *SessionData, ttl time.Duration) {
+	userSessionsAddScript.Eval(ctx, pipe, []string{r.userSetKey(session.UserID)},
+		ttl.Milliseconds(), session.ID)
 }
 
 func (r *RedisSessionStore) Update(ctx context.Context, session *SessionData) error {
@@ -373,6 +399,7 @@ func (r *RedisSessionStore) Update(ctx context.Context, session *SessionData) er
 	pipe := r.client.TxPipeline()
 	pipe.Set(ctx, r.sessionKey(session.ID), data, ttl)
 	pipe.Set(ctx, r.userKey(session.TenantID, session.UserID), session.ID, ttl)
+	r.indexUserSession(ctx, pipe, session, ttl)
 
 	_, err = pipe.Exec(ctx)
 	return err
@@ -391,7 +418,7 @@ func (r *RedisSessionStore) Delete(ctx context.Context, sessionID string) error 
 	pipe := r.client.TxPipeline()
 	pipe.Del(ctx, r.sessionKey(sessionID))
 	pipe.SRem(ctx, r.tenantKey(session.TenantID), sessionID)
-	pipe.SRem(ctx, r.userSetKey(session.UserID), sessionID)
+	pipe.ZRem(ctx, r.userSetKey(session.UserID), sessionID)
 
 	_, err = pipe.Exec(ctx)
 	if err != nil {
@@ -407,7 +434,9 @@ func (r *RedisSessionStore) Delete(ctx context.Context, sessionID string) error 
 }
 
 func (r *RedisSessionStore) DeleteByUser(ctx context.Context, userID string) error {
-	ids, err := r.client.SMembers(ctx, r.userSetKey(userID)).Result()
+	// Every member, expired or not: Delete is idempotent for IDs whose
+	// session key already expired, and the set is dropped at the end.
+	ids, err := r.client.ZRange(ctx, r.userSetKey(userID), 0, -1).Result()
 	if err != nil {
 		return err
 	}
@@ -443,9 +472,10 @@ func (r *RedisSessionStore) List(ctx context.Context, tenantID string) ([]*Sessi
 }
 
 func (r *RedisSessionStore) Cleanup(ctx context.Context) (int64, error) {
-	// Redis handles TTL-based expiration automatically.
-	// This method is mainly for cleaning up tenant set references.
-	// In production, run this periodically.
+	// Redis handles TTL-based expiration of session keys automatically.
+	// The per-user session sets are expiry-scored, TTL'd and pruned on every
+	// add (userSessionsAddScript); tenant set members are pruned lazily by
+	// List. Nothing to do here.
 	r.logger.Debug("Redis cleanup - TTL handles session expiration")
 	return 0, nil
 }

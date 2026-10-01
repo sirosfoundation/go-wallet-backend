@@ -26,6 +26,13 @@ func newTestRedisStore(t *testing.T) (*RedisSessionStore, *miniredis.Miniredis) 
 	return store, mr
 }
 
+// advanceRedis moves both key TTLs and the server clock (Redis TIME, used by
+// the user-set script) forward.
+func advanceRedis(mr *miniredis.Miniredis, d time.Duration) {
+	mr.SetTime(time.Now().Add(d))
+	mr.FastForward(d)
+}
+
 func redisSess(id, tenant, user string, ttl time.Duration) *SessionData {
 	return &SessionData{ID: id, TenantID: tenant, UserID: user, ExpiresAt: time.Now().Add(ttl)}
 }
@@ -121,4 +128,83 @@ func TestRedisSessionStore_DeleteRemovesOwnPointer(t *testing.T) {
 	require.NoError(t, store.Put(ctx, redisSess("s1", "t1", "u1", time.Hour)))
 	require.NoError(t, store.Delete(ctx, "s1"))
 	assert.False(t, mr.Exists(store.userKey("t1", "u1")))
+}
+
+func TestRedisSessionStore_UserSetHasTTLMatchingLongestSession(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	uset := store.userSetKey("u1")
+
+	require.NoError(t, store.Put(ctx, redisSess("s1", "t1", "u1", 10*time.Minute)))
+	require.NoError(t, store.Put(ctx, redisSess("s2", "t2", "u1", 30*time.Minute)))
+	ttl := mr.TTL(uset)
+	assert.InDelta(t, (30 * time.Minute).Seconds(), ttl.Seconds(), 5, "set TTL tracks longest-lived member")
+
+	// A shorter session added later must not shorten the set's life.
+	require.NoError(t, store.Put(ctx, redisSess("s3", "t3", "u1", time.Minute)))
+	assert.InDelta(t, (30 * time.Minute).Seconds(), mr.TTL(uset).Seconds(), 5)
+
+	// Once every session has expired the set disappears by itself.
+	advanceRedis(mr, 31*time.Minute)
+	assert.False(t, mr.Exists(uset))
+}
+
+func TestRedisSessionStore_PutPrunesExpiredMembers(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	uset := store.userSetKey("u1")
+
+	require.NoError(t, store.Put(ctx, redisSess("short", "t1", "u1", time.Minute)))
+	require.NoError(t, store.Put(ctx, redisSess("long", "t2", "u1", time.Hour)))
+	// Simulate a process that died without Delete: the session key expires
+	// by TTL, the set member remains.
+	advanceRedis(mr, 2*time.Minute)
+	members, err := mr.ZMembers(uset)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"short", "long"}, members)
+
+	require.NoError(t, store.Put(ctx, redisSess("fresh", "t3", "u1", time.Hour)))
+	members, err = mr.ZMembers(uset)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"long", "fresh"}, members, "expired member pruned on add")
+}
+
+func TestRedisSessionStore_DeleteByUserHandlesStaleMembers(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, store.Put(ctx, redisSess("gone", "t1", "u1", time.Minute)))
+	require.NoError(t, store.Put(ctx, redisSess("live", "t2", "u1", time.Hour)))
+	require.NoError(t, store.Put(ctx, redisSess("other", "t1", "u2", time.Hour)))
+	advanceRedis(mr, 2*time.Minute)
+
+	require.NoError(t, store.DeleteByUser(ctx, "u1"))
+	_, err := store.Get(ctx, "live")
+	assert.ErrorIs(t, err, ErrSessionNotFound)
+	assert.False(t, mr.Exists(store.userSetKey("u1")))
+	assert.False(t, mr.Exists(store.userKey("t2", "u1")))
+	// Another user is untouched.
+	_, err = store.Get(ctx, "other")
+	assert.NoError(t, err)
+}
+
+func TestRedisSessionStore_DeleteRemovesUserSetMember(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	require.NoError(t, store.Put(ctx, redisSess("s1", "t1", "u1", time.Hour)))
+	require.NoError(t, store.Put(ctx, redisSess("s2", "t2", "u1", time.Hour)))
+	require.NoError(t, store.Delete(ctx, "s1"))
+	members, err := mr.ZMembers(store.userSetKey("u1"))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"s2"}, members)
+}
+
+func TestRedisSessionStore_UpdateExtendsUserSetExpiry(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	s := redisSess("s1", "t1", "u1", 10*time.Minute)
+	require.NoError(t, store.Put(ctx, s))
+	s.ExpiresAt = time.Now().Add(2 * time.Hour)
+	require.NoError(t, store.Update(ctx, s))
+	assert.InDelta(t, (2 * time.Hour).Seconds(), mr.TTL(store.userSetKey("u1")).Seconds(), 5)
 }
