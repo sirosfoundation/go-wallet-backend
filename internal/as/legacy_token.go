@@ -127,6 +127,30 @@ func (lti *LegacyTokenIssuer) Validate(raw string, audiences ...string) (*Legacy
 	return claims, nil
 }
 
+// ParseSIDUnverifiedClaims verifies raw's HMAC signature (no expiry, issuer or
+// audience check) and returns its subject user id and "sid" claim. An
+// expired access token is accepted on purpose: its paired refresh token
+// outlives it, and logout must still be able to revoke that token's family
+// (#402). ok is false when the signature cannot be verified; sid may be
+// empty for a token minted before #402.
+func (lti *LegacyTokenIssuer) ParseSIDUnverifiedClaims(raw string) (userID, sid string, ok bool) {
+	parser := jwt.NewParser(
+		jwt.WithoutClaimsValidation(),
+		jwt.WithValidMethods([]string{"HS256", "HS384", "HS512"}),
+	)
+	token, err := parser.Parse(raw, func(*jwt.Token) (interface{}, error) { return lti.secret, nil })
+	if err != nil || token == nil || !token.Valid {
+		return "", "", false
+	}
+	claims, isMap := token.Claims.(jwt.MapClaims)
+	if !isMap {
+		return "", "", false
+	}
+	userID, _ = claims["user_id"].(string)
+	sid, _ = claims["sid"].(string)
+	return userID, sid, true
+}
+
 func generateLegacyJTI() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {

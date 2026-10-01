@@ -1696,6 +1696,7 @@ func TestConfig_Validate_AS_IssuerFallsBackToJWT(t *testing.T) {
 	cfg.AS.Enabled = true
 	cfg.AS.SigningKeyPath = "/path/to/key"
 	cfg.AS.RulesDir = "/tmp/rules"
+	cfg.AS.Audiences = []string{"wallet-backend"}
 	cfg.JWT.Issuer = "https://example.com"
 	err := cfg.Validate()
 	if err != nil {
@@ -1703,6 +1704,29 @@ func TestConfig_Validate_AS_IssuerFallsBackToJWT(t *testing.T) {
 	}
 	if cfg.AS.Issuer != "https://example.com" {
 		t.Errorf("expected AS issuer to fall back to JWT issuer, got %q", cfg.AS.Issuer)
+	}
+}
+
+// TestConfig_Validate_AS_MissingAudiences is a regression test for the
+// go-tokenauth v0.5.0 dependency bump: go-tokenauth's own Validator now
+// refuses to validate ANY token at all when its configured Audiences is
+// empty (previously "empty means accept any audience"). Config.Validate()
+// must fail fast at startup on the same condition, rather than let an
+// AS-enabled deployment with no audiences configured start up seemingly
+// fine and then silently reject every request once traffic arrives.
+func TestConfig_Validate_AS_MissingAudiences(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPath = "/path/to/key"
+	cfg.AS.RulesDir = "/tmp/rules"
+	cfg.JWT.Issuer = "https://example.com"
+	// No AS.Audiences set.
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for missing as.audiences")
+	}
+	if !strings.Contains(err.Error(), "audiences is required") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 
@@ -2941,6 +2965,175 @@ func TestASConfig_ExternalBaseURL(t *testing.T) {
 	}
 }
 
+func TestConfig_Validate_AS_LegacyRequiresRPIDAudience(t *testing.T) {
+	mk := func(legacy bool, audiences ...string) *Config {
+		cfg := validBaseConfig()
+		cfg.AS.Enabled = true
+		cfg.AS.ExternalURL = "https://wallet.example.com"
+		cfg.AS.Issuer = "https://as.example.com"
+		cfg.AS.SigningKeyPath = "/tmp/as-key.pem"
+		cfg.AS.RulesDir = "/tmp/rules"
+		cfg.AS.Audiences = audiences
+		cfg.AS.Legacy.Enabled = legacy
+		cfg.JWT.Issuer = "wallet-backend"
+		return cfg
+	}
+
+	// RP ID missing from the audiences: every legacy login token would be
+	// rejected at runtime, so this must fail at startup.
+	err := mk(true, "wallet-backend").Validate()
+	if err == nil || !strings.Contains(err.Error(), "as.audiences") {
+		t.Fatalf("legacy enabled without rp_id in as.audiences must be rejected, got %v", err)
+	}
+
+	if err := mk(true, "wallet-backend", "localhost").Validate(); err != nil {
+		t.Errorf("rp_id listed in as.audiences must be accepted: %v", err)
+	}
+
+	// With legacy tokens off the RP ID is irrelevant to the AS.
+	if err := mk(false, "wallet-backend").Validate(); err != nil {
+		t.Errorf("legacy disabled must not require rp_id in as.audiences: %v", err)
+	}
+}
+
+func TestJWTConfig_MaxTokenLifetime(t *testing.T) {
+	if got := (JWTConfig{RefreshDays: 7, ExpiryHours: 24}).MaxTokenLifetime(); got != 7*24*time.Hour {
+		t.Errorf("got %v", got)
+	}
+	if got := (JWTConfig{RefreshDays: 1, ExpiryHours: 720}).MaxTokenLifetime(); got != 720*time.Hour {
+		t.Errorf("got %v", got)
+	}
+	if got := (JWTConfig{ExpiryHours: 24}).MaxTokenLifetime(); got != 24*time.Hour {
+		t.Errorf("got %v", got)
+	}
+}
+
+// Retention must not shrink when jwt lifetimes are later lowered: tokens
+// minted under the earlier, longer configuration are still outstanding.
+func TestJWTConfig_FamilyRetention_NonShrinkingAcrossConfigChanges(t *testing.T) {
+	before := JWTConfig{RefreshDays: 180, ExpiryHours: 24}
+	after := JWTConfig{RefreshDays: 1, ExpiryHours: 1} // lifetimes reduced
+	if after.FamilyRetention() < before.MaxTokenLifetime() {
+		t.Errorf("retention %v under the reduced config is shorter than tokens minted before it (%v)",
+			after.FamilyRetention(), before.MaxTokenLifetime())
+	}
+	if got := (JWTConfig{RefreshDays: 400}).FamilyRetention(); got != 400*24*time.Hour {
+		t.Errorf("lifetime above the floor must win, got %v", got)
+	}
+}
+
+func TestConfig_Validate_AS_LegacyRequiresJWTIssuer(t *testing.T) {
+	mk := func(legacy bool, jwtIssuer string) *Config {
+		cfg := validBaseConfig()
+		cfg.AS.Enabled = true
+		cfg.AS.ExternalURL = "https://wallet.example.com"
+		cfg.AS.Issuer = "https://as.example.com"
+		cfg.AS.SigningKeyPath = "/tmp/as-key.pem"
+		cfg.AS.RulesDir = "/tmp/rules"
+		cfg.AS.Audiences = []string{"wallet-backend", "localhost"}
+		cfg.AS.Legacy.Enabled = legacy
+		cfg.JWT.Issuer = jwtIssuer
+		return cfg
+	}
+	err := mk(true, "").Validate()
+	if err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
+		t.Fatalf("legacy enabled with empty jwt.issuer must be rejected, got %v", err)
+	}
+	if err := mk(true, "wallet-backend").Validate(); err != nil {
+		t.Errorf("non-empty jwt.issuer must be accepted: %v", err)
+	}
+	if err := mk(false, "").Validate(); err != nil {
+		t.Errorf("legacy disabled must not require jwt.issuer: %v", err)
+	}
+}
+
+// The role flag alone (--mode=auth / --mode=all: Load -> EnableForRole ->
+// Validate) must yield a valid configuration, including the audience list
+// and, with legacy on, the RP ID.
+func TestConfig_EnableForRole_DefaultsAudiencesAndValidates(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.JWT.Issuer = "wallet-backend"
+	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
+	cfg.Server.RPID = "wallet.example.com"
+	cfg.AS.Legacy.Enabled = true
+
+	cfg.EnableForRole()
+	if !containsString(cfg.AS.Audiences, "wallet-backend") || !containsString(cfg.AS.Audiences, "wallet.example.com") {
+		t.Fatalf("unexpected default audiences %v", cfg.AS.Audiences)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("role-defaulted config must validate: %v", err)
+	}
+
+	// Legacy off: RP ID not added. Explicit list: untouched.
+	off := validBaseConfig()
+	off.Server.RPID = "wallet.example.com"
+	off.EnableForRole()
+	if containsString(off.AS.Audiences, "wallet.example.com") {
+		t.Errorf("RP ID must not be added when legacy is off: %v", off.AS.Audiences)
+	}
+	ex := validBaseConfig()
+	ex.AS.Audiences = []string{"custom"}
+	ex.EnableForRole()
+	if len(ex.AS.Audiences) != 1 || ex.AS.Audiences[0] != "custom" {
+		t.Errorf("explicit audiences must be preserved: %v", ex.AS.Audiences)
+	}
+}
+
+// chartShapedConfig mirrors what siros-id-stack's templates/04-wallet-backend.yaml
+// renders for backend.yaml: as.enabled true, NO as.audiences, no jwt.issuer,
+// legacy off. config.Load must keep accepting it (documented defaults apply
+// before Validate), otherwise chart-based deployments crash-loop on upgrade.
+const chartShapedConfig = `
+server:
+  port: 8080
+  engine_port: 8082
+  rp_name: Test Wallet
+  rp_id: wallet.example.org
+  rp_origins:
+    - https://wallet.example.org
+  base_url: https://backend.example.org
+as:
+  enabled: true
+  legacy:
+    enabled: %t
+  signing_key_path: /as-cert/tls.key
+  rules_dir: /as-rules
+  default_max_tac: rwlid
+  external_url: https://backend.example.org
+  issuer: https://backend.example.org
+storage:
+  type: memory
+jwt:
+  secret: "test-secret-that-is-at-least-32-bytes!"
+`
+
+func TestLoad_ChartShapedConfig_AppliesASDefaults(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy=%t", legacy), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "backend.yaml")
+			if err := os.WriteFile(path, []byte(fmt.Sprintf(chartShapedConfig, legacy)), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("chart-shaped config must load: %v", err)
+			}
+			for _, a := range defaultASAudiences {
+				if !containsString(cfg.AS.Audiences, a) {
+					t.Errorf("default audience %q missing from %v", a, cfg.AS.Audiences)
+				}
+			}
+			if got := containsString(cfg.AS.Audiences, "wallet.example.org"); got != legacy {
+				t.Errorf("rp_id in audiences = %t, want %t (%v)", got, legacy, cfg.AS.Audiences)
+			}
+			if cfg.JWT.Issuer != "wallet-backend" {
+				t.Errorf("jwt.issuer = %q", cfg.JWT.Issuer)
+			}
+		})
+	}
+}
+
 func TestLoad_ASPKCS11PINFileNotReadAtLoad(t *testing.T) {
 	dir := t.TempDir()
 	missing := filepath.Join(dir, "absent-pin")
@@ -2980,5 +3173,36 @@ func TestPKCS11SigningConfig_ResolvePIN(t *testing.T) {
 	_, err = (&PKCS11SigningConfig{PINPath: missing}).ResolvePIN()
 	if err == nil || !strings.Contains(err.Error(), "pin_path") || strings.Contains(err.Error(), "secret-location-xyz") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// An empty jwt.issuer (e.g. blanked by the environment) with legacy on gets
+// the documented default instead of failing; Load and EnableForRole agree.
+func TestApplyASSecurityDefaults_JWTIssuerAndParity(t *testing.T) {
+	mk := func() *Config {
+		c := validBaseConfig()
+		c.Server.RPID = "wallet.example.org"
+		c.AS = ASConfig{Enabled: true, SigningKeyPath: "/k", RulesDir: "/r", Issuer: "https://x"}
+		c.AS.Legacy.Enabled = true
+		return c
+	}
+	a := mk()
+	a.applyASSecurityDefaults()
+	if a.JWT.Issuer != "wallet-backend" {
+		t.Fatalf("jwt.issuer = %q", a.JWT.Issuer)
+	}
+	if err := a.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	b := mk()
+	b.EnableForRole()
+	if fmt.Sprint(a.AS.Audiences) != fmt.Sprint(b.AS.Audiences) || a.JWT.Issuer != b.JWT.Issuer {
+		t.Errorf("Load and EnableForRole defaults differ: %v/%q vs %v/%q", a.AS.Audiences, a.JWT.Issuer, b.AS.Audiences, b.JWT.Issuer)
+	}
+	// AS disabled: untouched.
+	d := validBaseConfig()
+	d.applyASSecurityDefaults()
+	if len(d.AS.Audiences) != 0 {
+		t.Errorf("AS disabled must not get audiences: %v", d.AS.Audiences)
 	}
 }

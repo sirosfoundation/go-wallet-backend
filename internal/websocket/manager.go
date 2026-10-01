@@ -14,9 +14,9 @@ import (
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 
-	"github.com/sirosfoundation/go-tokenauth/claims"
 	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audience"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -322,18 +322,14 @@ func (m *Manager) validateToken(tokenString string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		// Audience checks apply to new-style tokens only: legacy HMAC tokens
-		// carry the RP ID as "aud" and must not be rejected by them. The
-		// keystore socket is a user-facing surface, so a new-style token must
-		// carry wallet-backend (as internal/server/providers.go requires); a
-		// registry-only token is refused even if as.audiences is empty.
-		if result.Mode != claims.ModeLegacy {
-			if !result.HasAudience("wallet-backend") {
-				return "", errors.New("token audience not accepted")
-			}
-			if aud := m.cfg.AS.Audiences; len(aud) > 0 && !result.HasAudience(aud...) {
-				return "", errors.New("token audience not accepted")
-			}
+		// The AS audience list (as.audiences) is already enforced by the
+		// validator. The keystore socket is a user-facing surface, so beyond
+		// that a new-style token must carry wallet-backend (as
+		// internal/server/providers.go requires); a registry-only token is
+		// refused. Legacy HMAC tokens (aud = RP ID) are exempt, exactly like
+		// middleware.RequireAudience (see audience.Allowed).
+		if !audience.Allowed(result, true, "wallet-backend") {
+			return "", errors.New("token audience not accepted")
 		}
 		// The keystore socket is per-user: an anonymous (identity-free)
 		// token has nothing to bind to.

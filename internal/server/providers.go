@@ -286,7 +286,7 @@ func wiaCallerIdentifier(c *gin.Context) string {
 // a validator is available (AS enabled), legacy HMAC AuthMiddleware otherwise.
 func (p *AuthProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger, middleware.WithSessionAudiences(p.cfg.AS.Audiences))
+		return middleware.TokenAuthMiddleware(p.cfg, p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger)
 	}
 	// AuthMiddlewareWithBlacklist, not the bare AuthMiddleware wrapper: the
 	// latter hardcodes a nil blacklist, which is exactly what left Logout's
@@ -380,7 +380,7 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 // authMiddleware returns the appropriate auth middleware for storage routes.
 func (p *StorageProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger, middleware.WithSessionAudiences(p.cfg.AS.Audiences))
+		return middleware.TokenAuthMiddleware(p.cfg, p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger)
 	}
 	// See AuthProvider.authMiddleware's comment - same fix (#382). When this
 	// provider is combined with an AuthProvider under BackendProvider,
@@ -508,9 +508,7 @@ func (v StandaloneValidator) Close() error { v.Stop(); return v.relay.Close() }
 //
 // Exactly one issuer is configured: go-tokenauth v0.4.0 enforces
 // Issuers[0] strictly and only checks the rest afterwards, so a second entry
-// could never be reached. Audiences are deliberately not configured on the
-// validator: legacy tokens carry aud = RP ID and audience filtering is
-// applied to new-style tokens only.
+// could never be reached.
 //
 // An empty jwt.issuer with legacy enabled would leave the list empty and
 // accept any issuer; callers must have passed requireLegacyIssuer first (the
@@ -562,8 +560,11 @@ func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (
 	v := tokenvalidator.New(tokenvalidator.Config{
 		JWKSURL: relay.url,
 		Issuer:  issuer,
-		// Audiences are checked by the engine itself, for new-style tokens only.
-		Legacy: legacyValidatorConfig(cfg, cfg.LegacyEnabled()),
+		// Legacy tokens carry aud = RP ID, which config validation requires
+		// in as.audiences while legacy is enabled, so the validator can apply
+		// the list uniformly.
+		Audiences: cfg.AS.Audiences,
+		Legacy:    legacyValidatorConfig(cfg, cfg.LegacyEnabled()),
 	})
 	v.Start(context.Background())
 	logger.Warn("Standalone engine has no token revocation source: AS session tokens stay valid at this engine until they expire, even after logout or user revocation. Mitigate with short access token TTLs, or co-host the engine with the backend (shared blacklist).",
@@ -806,13 +807,10 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		relayHandle = relay
 		jwksURL := relay.url
 		tv = tokenvalidator.New(tokenvalidator.Config{
-			JWKSURL: jwksURL,
-			Issuer:  issuer,
-			// Audiences are NOT passed to the validator: it would also apply
-			// them to legacy HMAC tokens (aud = RP ID) and reject those. They
-			// are enforced for new-style tokens only, by
-			// middleware.WithSessionAudiences and the engine/websocket checks.
-			Legacy: legacyValidatorConfig(cfg, cfg.AS.Legacy.Enabled),
+			JWKSURL:   relay.url,
+			Issuer:    issuer,
+			Audiences: cfg.AS.Audiences,
+			Legacy:    legacyValidatorConfig(cfg, cfg.AS.Legacy.Enabled),
 			// Same blacklist as everything else in this process (#382/#383) -
 			// without this, AS-issued/legacy tokens validated through
 			// go-tokenauth (the path taken whenever AS is enabled, i.e. the
@@ -910,7 +908,7 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 // authMiddleware returns the appropriate auth middleware for backend routes.
 func (p *BackendProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.Services().TokenBlacklist, p.logger, middleware.WithSessionAudiences(p.cfg.AS.Audiences))
+		return middleware.TokenAuthMiddleware(p.cfg, p.tokenValidator, p.store.Tenants(), p.Services().TokenBlacklist, p.logger)
 	}
 	// See AuthProvider.authMiddleware's comment - same fix (#382).
 	return middleware.AuthMiddlewareWithBlacklist(p.cfg, p.store, p.Services().TokenBlacklist, p.logger)
@@ -1271,13 +1269,10 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 		}
 		relayHandle = wpRelay
 		tv = tokenvalidator.New(tokenvalidator.Config{
-			JWKSURL: wpRelay.url,
-			Issuer:  issuer,
-			// Audiences are NOT passed to the validator: it would also apply
-			// them to legacy HMAC tokens (aud = RP ID) and reject those. They
-			// are enforced for new-style tokens only, by
-			// middleware.WithSessionAudiences and the engine/websocket checks.
-			Legacy: legacyValidatorConfig(cfg, cfg.AS.Legacy.Enabled),
+			JWKSURL:   wpRelay.url,
+			Issuer:    issuer,
+			Audiences: cfg.AS.Audiences,
+			Legacy:    legacyValidatorConfig(cfg, cfg.AS.Legacy.Enabled),
 			// See NewBackendProvider's identical wiring (#382/#383). This
 			// provider's own services.TokenBlacklist is fine used as-is here:
 			// it never runs co-hosted with BackendProvider (see cmd/server).
@@ -1306,7 +1301,7 @@ func (p *WalletProviderProvider) Name() string         { return "wallet-provider
 // mirrors AuthProvider.authMiddleware().
 func (p *WalletProviderProvider) authMiddleware() gin.HandlerFunc {
 	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger, middleware.WithSessionAudiences(p.cfg.AS.Audiences))
+		return middleware.TokenAuthMiddleware(p.cfg, p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger)
 	}
 	// See AuthProvider.authMiddleware's comment - same fix (#382). This
 	// provider never runs co-hosted with BackendProvider (see cmd/server -

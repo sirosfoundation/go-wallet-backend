@@ -152,6 +152,15 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 		ExpiresAt: now.Add(h.cfg.SessionTTL),
 	}
 
+	// Only legacy-mode clients receive the appToken/refresh token pair, so
+	// only they have a refresh-token family for AS logout to revoke (#402).
+	// Session-mode clients never get those tokens; recording a family for
+	// them would just leave a long-lived revocation marker for nothing.
+	mode := DetectClientMode(c)
+	if mode == ClientModeLegacy {
+		session.FamilyID = resp.SID
+	}
+
 	if err := h.sessions.Create(c.Request.Context(), session); err != nil {
 		h.logger.Error("failed to create session", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errInternalError})
@@ -165,7 +174,6 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 	})
 
 	// Determine response format based on client mode.
-	mode := DetectClientMode(c)
 	if mode == ClientModeSession {
 		// New-style client: no token in body.
 		c.JSON(http.StatusOK, gin.H{
