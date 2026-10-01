@@ -23,6 +23,7 @@ const (
 	coseTagSign1 = 18
 
 	coseHdrAlg     = 1
+	coseHdrCrit    = 2  // RFC 9052 section 3.1
 	coseHdrTyp     = 16 // "type" header parameter
 	coseHdrX5Chain = 33 // RFC 9360
 
@@ -62,6 +63,9 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 	prot, err := decodeHeaderMap(sign1.protected)
 	if err != nil {
 		return parsedList{}, fmt.Errorf("%w protected header: %v", errCWT, err)
+	}
+	if err := checkHeaders(prot, sign1.unprotected); err != nil {
+		return parsedList{}, fmt.Errorf("%w header: %v", errCWT, err)
 	}
 
 	// typ must be integrity-protected: the unprotected header is not covered
@@ -147,7 +151,47 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 	return c.accept(ctx, uri, km, lc)
 }
 
-// claimsDecMode rejects a claims map that repeats a key.
+// understoodHeaders are the header labels this verifier processes; a label
+// listed in crit must be one of them (RFC 9052 section 3.1).
+var understoodHeaders = map[int64]bool{coseHdrAlg: true, coseHdrCrit: true, coseHdrTyp: true, coseHdrX5Chain: true}
+
+// checkHeaders enforces the COSE header rules that the signature does not:
+// a label appears in at most one bucket (RFC 9052 section 3), crit is
+// integrity-protected and non-empty, and every critical label is present in
+// the protected header and understood.
+func checkHeaders(prot, unprot map[int64]any) error {
+	for k := range unprot {
+		if _, dup := prot[k]; dup {
+			return fmt.Errorf("label %d is in both the protected and unprotected header", k)
+		}
+	}
+	if _, ok := unprot[coseHdrCrit]; ok {
+		return errors.New("crit must be in the protected header")
+	}
+	raw, ok := prot[coseHdrCrit]
+	if !ok {
+		return nil
+	}
+	crit, ok := raw.([]any)
+	if !ok || len(crit) == 0 {
+		return errors.New("crit must be a non-empty array")
+	}
+	for _, e := range crit {
+		label, ok := toInt64(e)
+		if !ok {
+			return fmt.Errorf("critical header %v is not understood", e)
+		}
+		if !understoodHeaders[label] {
+			return fmt.Errorf("critical header %d is not understood", label)
+		}
+		if _, present := prot[label]; !present {
+			return fmt.Errorf("critical header %d is not in the protected header", label)
+		}
+	}
+	return nil
+}
+
+// claimsDecMode rejects a map that repeats a key.
 var claimsDecMode = func() cbor.DecMode {
 	dm, err := cbor.DecOptions{DupMapKey: cbor.DupMapKeyEnforcedAPF}.DecMode()
 	if err != nil {
@@ -162,17 +206,7 @@ var claimsDecMode = func() cbor.DecMode {
 // and text-labelled ones (extensions) are ignored. A repeated key is an
 // error.
 func decodeClaims(payload []byte) (map[int64]any, error) {
-	var raw map[any]any
-	if err := claimsDecMode.Unmarshal(payload, &raw); err != nil {
-		return nil, err
-	}
-	out := make(map[int64]any, len(raw))
-	for k, v := range raw {
-		if label, ok := toInt64(k); ok {
-			out[label] = v
-		}
-	}
-	return out, nil
+	return decodeHeaderBucket(payload)
 }
 
 // cwtString reads an optional text claim; a present claim of another type is
@@ -236,7 +270,8 @@ func decodeSign1(data []byte) (*sign1, error) {
 	if err := cbor.Unmarshal(arr[0], &out.protected); err != nil {
 		return nil, fmt.Errorf("protected header: %w", err)
 	}
-	if err := cbor.Unmarshal(arr[1], &out.unprotected); err != nil {
+	var err error
+	if out.unprotected, err = decodeHeaderBucket(arr[1]); err != nil {
 		return nil, fmt.Errorf("unprotected header: %w", err)
 	}
 	if err := cbor.Unmarshal(arr[2], &out.payload); err != nil || out.payload == nil {
@@ -248,12 +283,31 @@ func decodeSign1(data []byte) (*sign1, error) {
 	return out, nil
 }
 
+// decodeHeaderMap decodes the serialized protected header (empty means an
+// empty map).
 func decodeHeaderMap(b []byte) (map[int64]any, error) {
-	m := map[int64]any{}
 	if len(b) == 0 {
-		return m, nil
+		return map[int64]any{}, nil
 	}
-	return m, cbor.Unmarshal(b, &m)
+	return decodeHeaderBucket(b)
+}
+
+// decodeHeaderBucket decodes a COSE header map. Labels may be integers or text
+// strings, so it is decoded with mixed keys: integer labels are returned and
+// text-labelled extension parameters are ignored. A repeated label is an
+// error.
+func decodeHeaderBucket(b []byte) (map[int64]any, error) {
+	var raw map[any]any
+	if err := claimsDecMode.Unmarshal(b, &raw); err != nil {
+		return nil, err
+	}
+	out := make(map[int64]any, len(raw))
+	for k, v := range raw {
+		if label, ok := toInt64(k); ok {
+			out[label] = v
+		}
+	}
+	return out, nil
 }
 
 // headerValue looks a label up in the protected then the unprotected header.

@@ -644,6 +644,74 @@ func cborMap(items ...[2]any) []byte {
 	return b
 }
 
+// signedCWTWithHeaders signs a CWT whose protected header carries the
+// mandatory parameters plus protExtra, and whose unprotected header is
+// unprot (hand-built CBOR).
+func signedCWTWithHeaders(t *testing.T, uri string, protExtra [][2]any, unprot []byte) []byte {
+	t.Helper()
+	key := newKey(t)
+	payload := cborMap(
+		[2]any{int64(cwtClaimSub), uri}, [2]any{int64(cwtClaimIat), time.Now().Unix()},
+		[2]any{int64(cwtClaimTTL), 900},
+		[2]any{int64(cwtClaimStatusList), map[int64]any{statusListKeyBits: 2, statusListKeyLst: zlibBytes(t, 2, map[int]int{3: 1})}})
+	items := [][2]any{
+		{int64(coseHdrAlg), int64(coseAlgES256)}, {int64(coseHdrTyp), "application/statuslist+cwt"},
+		{int64(coseHdrX5Chain), []any{selfSigned(t, key)}},
+	}
+	protBytes := cborMap(append(items, protExtra...)...)
+	tbs, _ := cbor.Marshal([]any{"Signature1", protBytes, []byte{}, payload})
+	sum := sha256.Sum256(tbs)
+	r, s, err := ecdsa.Sign(rand.Reader, key, sum[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	sig := make([]byte, 64)
+	r.FillBytes(sig[:32])
+	s.FillBytes(sig[32:])
+	pb, _ := cbor.Marshal(protBytes)
+	payloadB, _ := cbor.Marshal(payload)
+	sigB, _ := cbor.Marshal(sig)
+	out := append([]byte{0xd2, 0x84}, pb...) // tag 18, array(4)
+	out = append(out, unprot...)
+	out = append(out, payloadB...)
+	return append(out, sigB...)
+}
+
+func TestCWT_HeaderLabels(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name      string
+		protExtra [][2]any
+		unprot    []byte
+		ok        bool
+	}{
+		{"text-labelled non-critical protected header", [][2]any{{"x-ext", "v"}}, cborMap(), true},
+		{"text-labelled non-critical unprotected header", nil, cborMap([2]any{"x-ext", 1}, [2]any{int64(4), []byte("kid")}), true},
+		{"crit naming understood labels", [][2]any{{int64(coseHdrCrit), []any{int64(coseHdrTyp)}}}, cborMap(), true},
+		{"duplicate integer label in protected", [][2]any{{int64(coseHdrAlg), int64(coseAlgES256)}}, cborMap(), false},
+		{"duplicate text label in protected", [][2]any{{"dup", 1}, {"dup", 2}}, cborMap(), false},
+		{"duplicate text label in unprotected", nil, cborMap([2]any{"dup", 1}, [2]any{"dup", 2}), false},
+		{"label in both buckets", nil, cborMap([2]any{int64(coseHdrTyp), "x"}), false},
+		{"unknown critical integer label", [][2]any{{int64(-70000), true}, {int64(coseHdrCrit), []any{int64(-70000)}}}, cborMap(), false},
+		{"critical text label", [][2]any{{"x-ext", 1}, {int64(coseHdrCrit), []any{"x-ext"}}}, cborMap(), false},
+		{"critical label absent from protected header", [][2]any{{int64(coseHdrCrit), []any{int64(99)}}}, cborMap(), false},
+		{"empty crit", [][2]any{{int64(coseHdrCrit), []any{}}}, cborMap(), false},
+		{"crit not an array", [][2]any{{int64(coseHdrCrit), "typ"}}, cborMap(), false},
+		{"crit in unprotected header", nil, cborMap([2]any{int64(coseHdrCrit), []any{int64(coseHdrTyp)}}), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, uri, _ := serveCWT(t, func(u string) []byte {
+				return signedCWTWithHeaders(t, u, tc.protExtra, tc.unprot)
+			}, mediaTypeCWT, trustAll)
+			err := c.Check(ctx, &Reference{Idx: 3, URI: uri})
+			if tc.ok != errors.Is(err, ErrRevoked) {
+				t.Fatalf("ok=%v, got %v", tc.ok, err)
+			}
+		})
+	}
+}
+
 func TestCWT_NullStandardStatusListIsNotAbsent(t *testing.T) {
 	ctx := context.Background()
 	lst := zlibBytes(t, 2, map[int]int{3: 1})
