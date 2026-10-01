@@ -24,6 +24,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -151,7 +152,7 @@ func TestTokenAuthMiddleware_ValidToken(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, logger))
+	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, emptyUsers(), logger))
 	r.GET("/test", func(c *gin.Context) {
 		c.JSON(200, gin.H{
 			"user_id":   c.GetString("user_id"),
@@ -184,7 +185,7 @@ func TestTokenAuthMiddleware_MissingAuth(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, logger))
+	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, emptyUsers(), logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -202,7 +203,7 @@ func TestTokenAuthMiddleware_InvalidToken(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, logger))
+	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, emptyUsers(), logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -229,7 +230,7 @@ func TestTokenAuthMiddleware_DisabledTenant(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, logger))
+	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, emptyUsers(), logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -254,7 +255,7 @@ func TestTokenAuthMiddleware_UnknownTenant(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, logger))
+	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, emptyUsers(), logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -295,7 +296,7 @@ func TestTokenAuthMiddleware_RevokedUserDenied(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, blacklist, logger))
+	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, blacklist, emptyUsers(), logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -330,7 +331,7 @@ func TestTokenAuthMiddleware_NonRevokedUserAllowed(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, blacklist, logger))
+	r.Use(TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, blacklist, emptyUsers(), logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -392,7 +393,7 @@ func TestTokenAuthMiddleware_ModeLegacy_RevokedFamilyTokenRejected(t *testing.T)
 	tokenStr := createLegacyModeTokenWithSID(secret, "user-123", "jti-legacy-mode-family-1", "sid-legacy-mode-family-1")
 
 	router := gin.New()
-	router.Use(TokenAuthMiddleware(cfg, v, tenants, blacklist, logger))
+	router.Use(TokenAuthMiddleware(cfg, v, tenants, blacklist, emptyUsers(), logger))
 	router.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	// Works before the family is revoked.
@@ -620,7 +621,7 @@ func TestTokenAuthMiddleware_TokenBeforeAuthCutoffIsRevoked(t *testing.T) {
 	})
 
 	r := gin.New()
-	r.Use(TokenAuthMiddlewareWithUsers(&config.Config{}, v, tenants, store.Users(), nil, zap.NewNop()))
+	r.Use(TokenAuthMiddleware(&config.Config{}, v, tenants, nil, store.Users(), zap.NewNop()))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/test", nil)
@@ -656,7 +657,7 @@ func TestTokenAuthMiddleware_DeletedAccountTokenIsRevoked(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := gin.New()
-	r.Use(TokenAuthMiddlewareWithUsers(&config.Config{}, v, tenants, store.Users(), nil, zap.NewNop()))
+	r.Use(TokenAuthMiddleware(&config.Config{}, v, tenants, nil, store.Users(), zap.NewNop()))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 	call := func(sub string) int {
 		token := signToken(t, key, issuer, claims.AccessTokenClaims{
@@ -733,7 +734,7 @@ func TestTokenAuthMiddleware_ModeLegacy_FamilyCheckAppliesInsideClockSkewWindow(
 	tokenStr, _ := tok.SignedString([]byte(secret))
 
 	router := gin.New()
-	router.Use(TokenAuthMiddleware(cfg, v, tenants, blacklist, logger))
+	router.Use(TokenAuthMiddleware(cfg, v, tenants, blacklist, emptyUsers(), logger))
 	router.GET("/test", func(c *gin.Context) { c.Status(200) })
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -767,7 +768,7 @@ func TestTokenAuthMiddleware_ModeLegacy_UndeterminableSIDFailsClosed(t *testing.
 
 	tokenStr := createLegacyModeTokenWithSID(validatorSecret, "user-123", "jti-x", "sid-x")
 	router := gin.New()
-	router.Use(TokenAuthMiddleware(cfg, v, tenants, blacklist, logger))
+	router.Use(TokenAuthMiddleware(cfg, v, tenants, blacklist, emptyUsers(), logger))
 	router.GET("/test", func(c *gin.Context) { c.Status(200) })
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
@@ -826,4 +827,21 @@ func TestRequireAudience_LegacyExemptionIsExplicit(t *testing.T) {
 			}
 		})
 	}
+}
+
+// emptyUsers returns a real user lookup over an empty store, for tests that do
+// not exercise the SID-AUTH-06 cut-off but must still supply the lookup.
+func emptyUsers() tokengate.UserLookup { return memory.NewStore().Users() }
+
+// The user lookup is a required parameter: constructing the middleware without
+// one must fail loudly rather than build a path that skips the lifecycle gate.
+func TestTokenAuthMiddleware_NilUsersPanics(t *testing.T) {
+	v, _, _ := setupTokenAuthTest(t)
+	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{}}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("TokenAuthMiddleware with nil users must panic")
+		}
+	}()
+	TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, nil, zap.NewNop())
 }

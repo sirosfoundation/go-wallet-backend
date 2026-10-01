@@ -27,19 +27,7 @@ type TenantLookup interface {
 	GetByID(ctx context.Context, id domain.TenantID) (*domain.Tenant, error)
 }
 
-// TokenAuthMiddleware is TokenAuthMiddlewareWithUsers without the user lookup,
-// so it does NOT enforce the SID-AUTH-06 token cut-off: tokens issued before a
-// wallet instance was revoked keep working. It exists only so that downstream
-// code compiled against the previous exported signature keeps building, and
-// nothing in this repository calls it (TestNoProductionCallerUsesTheWeakTokenAuthMiddleware
-// keeps it that way).
-//
-// Deprecated: use TokenAuthMiddlewareWithUsers, which enforces the cut-off.
-func TokenAuthMiddleware(cfg *config.Config, v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
-	return TokenAuthMiddlewareWithUsers(cfg, v, tenants, nil, blacklist, logger)
-}
-
-// TokenAuthMiddlewareWithUsers validates Bearer tokens using a go-tokenauth validator
+// TokenAuthMiddleware validates Bearer tokens using a go-tokenauth validator
 // and populates the Gin context with the same keys that legacy AuthMiddleware
 // sets, so existing handlers work unchanged.
 //
@@ -53,8 +41,11 @@ func TokenAuthMiddleware(cfg *config.Config, v *validator.Validator, tenants Ten
 //	"token"          (string)           — raw Bearer token
 //	"tokenauth_result" (*claims.Result) — full validation result
 //
-// users may be nil; when set, tokens issued before the user's SID-AUTH-06
-// authorization cut-off (User.AuthInvalidBefore) are refused with 401.
+// users is REQUIRED: tokens issued before the user's SID-AUTH-06
+// authorization cut-off (User.AuthInvalidBefore) are refused with 401. A nil
+// users panics at construction, so a caller that has not been migrated to
+// supply the lookup fails at compile time (signature change) or at startup,
+// never by silently running without the lifecycle gate.
 //
 // blacklist, when non-nil, is checked for user-level revocation
 // (IsUserRevoked) after a token validates - see #391 review: per-jti
@@ -74,7 +65,10 @@ func TokenAuthMiddleware(cfg *config.Config, v *validator.Validator, tenants Ten
 // legacy HMAC token go-tokenauth already validated (see
 // legacytoken.SID) rather than growing that shared type/module for one
 // caller's claim.
-func TokenAuthMiddlewareWithUsers(cfg *config.Config, v *validator.Validator, tenants TenantLookup, users tokengate.UserLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
+func TokenAuthMiddleware(cfg *config.Config, v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, users tokengate.UserLookup, logger *zap.Logger) gin.HandlerFunc {
+	if users == nil {
+		panic("middleware.TokenAuthMiddleware: users lookup is required (it enforces the SID-AUTH-06 token cut-off)")
+	}
 	gate := tokengate.New(users)
 	return func(c *gin.Context) {
 		// Extract Bearer token
