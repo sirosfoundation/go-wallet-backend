@@ -364,8 +364,15 @@ This means:
 - **Network hiccup**: Browser auto-reconnects EventSource. Server replays from
   last confirmed event.
 
-For longer disconnects (session timeout), the client uses `wmp.session.resume`
-via POST to restore the full session state.
+For longer disconnects (the transport is gone but the session is still live),
+the client uses `wmp.session.resume` via POST. Resume only replaces the
+transport of a still-live session; it cannot bring back a session that has
+expired. Idle/TTL cleanup (`cleanupExpired`) calls `CloseSession`, which removes
+the peer, the event buffer, the resumption tokens and the active flows, and
+resume does not extend the session's TTL. After an idle timeout or TTL expiry
+the client must start a new session (`wmp.session.create`, with a fresh bearer
+token if needed) and restart any flow; a resume attempt returns
+`session not found`.
 
 ### Mobile WebView Token Persistence
 
@@ -398,7 +405,7 @@ the WebView's volatile `sessionStorage`), HTTP+SSE provides defense in depth:
 | Native bridge storage | Token survives WebView lifecycle (background, recreate) |
 | HTTP+SSE session | Flow state survives SSE disconnect (no connection = session) |
 | Event replay | Missed progress events replayed on SSE reconnect |
-| `wmp.session.resume` | Recovery from longer outages (session expiry + re-auth) |
+| `wmp.session.resume` | Re-attaches a new transport to a still-live session after a longer outage; does not survive session expiry (start a new session and flow) |
 
 ## Detailed Mapping
 
@@ -823,7 +830,7 @@ SSE endpoint.
 
 The server must buffer events for replay on SSE reconnect. Considerations:
 - Buffer per session, bounded (e.g., last 100 events or last 5 minutes)
-- Events older than the buffer are lost; client must use `wmp.session.resume`
+- Events older than the buffer are lost; `wmp.session.resume` re-attaches to a live session but cannot restore events or state once the session has been closed (idle/TTL expiry), so the client must start a new session and flow
 - Flows are typically short (< 30s for OID4VCI), so buffer is small
 - For deferred credentials (hours/days), use `wmp.message.poll` on reconnect
 
