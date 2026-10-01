@@ -311,6 +311,21 @@ func (r *RedisSessionStore) userSetKey(userID string) string {
 	return r.keyPrefix + "userall:" + url.PathEscape(userID)
 }
 
+// legacyUserKey is the pre-tenant-scoping per-user pointer (`<prefix>user:<userID>`,
+// unescaped, written by earlier releases with the session's TTL). New code never
+// writes it; it is only read and removed so that sessions created by replicas
+// still running the previous release remain reachable during a rolling upgrade.
+// The fallback is bounded by the maximum session TTL (DefaultTTL, 24h by
+// default): once every pre-upgrade session has expired, the key no longer exists.
+func (r *RedisSessionStore) legacyUserKey(userID string) string {
+	return r.keyPrefix + "user:" + userID
+}
+
+// legacyTenantKey is the pre-normalisation tenant set (raw tenant ID).
+func (r *RedisSessionStore) legacyTenantKey(tenantID string) string {
+	return r.keyPrefix + "tenant:" + tenantID
+}
+
 func (r *RedisSessionStore) tenantKey(tenantID string) string {
 	return r.keyPrefix + "tenant:" + normalizeTenant(tenantID)
 }
@@ -339,13 +354,48 @@ func (r *RedisSessionStore) Get(ctx context.Context, sessionID string) (*Session
 func (r *RedisSessionStore) GetByUser(ctx context.Context, tenantID, userID string) (*SessionData, error) {
 	sessionID, err := r.client.Get(ctx, r.userKey(tenantID, userID)).Result()
 	if err == redis.Nil {
-		return nil, ErrSessionNotFound
+		return r.getByLegacyUser(ctx, tenantID, userID)
 	}
 	if err != nil {
 		return nil, err
 	}
 
 	return r.Get(ctx, sessionID)
+}
+
+// getByLegacyUser resolves a session through the legacy `user:<userID>` pointer
+// written before the pointer became tenant-scoped. The legacy pointer is not
+// tenant-aware, so the session is returned only if it belongs to the requested
+// user and to the requested tenant (compared normalised, as everywhere else);
+// otherwise it is reported as not found and never leaks another tenant's
+// session. A match is lazily backfilled into the new pointer and user index so
+// later lookups, Delete and DeleteByUser take the normal path.
+func (r *RedisSessionStore) getByLegacyUser(ctx context.Context, tenantID, userID string) (*SessionData, error) {
+	sessionID, err := r.client.Get(ctx, r.legacyUserKey(userID)).Result()
+	if err == redis.Nil {
+		return nil, ErrSessionNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	session, err := r.Get(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	if session.UserID != userID || normalizeTenant(session.TenantID) != normalizeTenant(tenantID) {
+		return nil, ErrSessionNotFound
+	}
+
+	if ttl := time.Until(session.ExpiresAt); ttl > 0 {
+		pipe := r.client.TxPipeline()
+		pipe.Set(ctx, r.userKey(session.TenantID, session.UserID), session.ID, ttl)
+		pipe.SAdd(ctx, r.tenantKey(session.TenantID), session.ID)
+		r.indexUserSession(ctx, pipe, session, ttl)
+		if _, err := pipe.Exec(ctx); err != nil {
+			r.logger.Warn("Failed to backfill legacy session indexes", zap.Error(err))
+		}
+	}
+	return session, nil
 }
 
 func (r *RedisSessionStore) Put(ctx context.Context, session *SessionData) error {
@@ -419,9 +469,17 @@ func (r *RedisSessionStore) Delete(ctx context.Context, sessionID string) error 
 	pipe.Del(ctx, r.sessionKey(sessionID))
 	pipe.SRem(ctx, r.tenantKey(session.TenantID), sessionID)
 	pipe.ZRem(ctx, r.userSetKey(session.UserID), sessionID)
+	if raw := r.legacyTenantKey(session.TenantID); raw != r.tenantKey(session.TenantID) {
+		pipe.SRem(ctx, raw, sessionID)
+	}
 
 	_, err = pipe.Exec(ctx)
 	if err != nil {
+		return err
+	}
+	// A legacy pointer naming this session must go too (rolling upgrade).
+	if err := compareAndDeleteScript.Run(ctx, r.client,
+		[]string{r.legacyUserKey(session.UserID)}, sessionID).Err(); err != nil {
 		return err
 	}
 	// Drop the (tenant, user) pointer only if it still names this session; a
@@ -444,6 +502,21 @@ func (r *RedisSessionStore) DeleteByUser(ctx context.Context, userID string) err
 		if err := r.Delete(ctx, id); err != nil {
 			return err
 		}
+	}
+	// Sessions created by pre-upgrade replicas are known only through the
+	// legacy pointer; remove the session it names (if it is this user's) and
+	// the pointer itself.
+	if legacyID, err := r.client.Get(ctx, r.legacyUserKey(userID)).Result(); err == nil {
+		if sess, gerr := r.Get(ctx, legacyID); gerr == nil && sess.UserID == userID {
+			if err := r.Delete(ctx, legacyID); err != nil {
+				return err
+			}
+		}
+		if err := r.client.Del(ctx, r.legacyUserKey(userID)).Err(); err != nil {
+			return err
+		}
+	} else if err != redis.Nil {
+		return err
 	}
 	return r.client.Del(ctx, r.userSetKey(userID)).Err()
 }
