@@ -1175,18 +1175,19 @@ func newAuditEmitter(cfg *config.Config, logger *zap.Logger) *audit.Emitter {
 }
 
 // configureWMPExternalURL sets the public base URL for the WMP discovery
-// document: the engine's external URL (server.external_urls.engine_url, which
-// is normally a ws:// or wss:// URL and is mapped to http(s) by
-// SetExternalURL), else the AS's. Unset/invalid leaves
-// /.well-known/wmp-configuration failing closed (503).
+// document from server.external_urls.engine_url (normally a ws:// or wss://
+// URL, mapped to http(s) by SetExternalURL). The WMP routes are mounted on
+// the engine router/port only, so as.external_url (the AS origin) is
+// deliberately NOT used as a fallback: it can point at a host that does not
+// serve them. Unset/invalid leaves /.well-known/wmp-configuration failing
+// closed (503).
 func configureWMPExternalURL(adapter *wsengine.WMPAdapter, cfg *config.Config, logger *zap.Logger) {
-	for _, candidate := range []string{cfg.Server.ExternalURLs.EngineURL, cfg.AS.ExternalURL} {
-		if candidate == "" {
-			continue
-		}
-		if err := adapter.SetExternalURL(candidate); err == nil {
-			return
-		}
+	engineURL := cfg.Server.ExternalURLs.EngineURL
+	if engineURL == "" {
+		logger.Warn("server.external_urls.engine_url is not set; /.well-known/wmp-configuration will return 503")
+		return
 	}
-	logger.Warn("No usable external URL configured (server.external_urls.engine_url or as.external_url); /.well-known/wmp-configuration will return 503")
+	if err := adapter.SetExternalURL(engineURL); err != nil {
+		logger.Warn("server.external_urls.engine_url is not usable for WMP discovery; /.well-known/wmp-configuration will return 503", zap.Error(err))
+	}
 }

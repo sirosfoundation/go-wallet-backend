@@ -1668,9 +1668,10 @@ func TestConfigureWMPExternalURL(t *testing.T) {
 		{"ws engine url", "ws://localhost:8082", "", "http://localhost:8082"},
 		{"https engine url", "https://engine.example.com", "", "https://engine.example.com"},
 		{"http engine url", "http://localhost:8082", "", "http://localhost:8082"},
-		{"invalid engine url falls back to AS", "wss://", "https://as.example.com", "https://as.example.com"},
-		{"query engine url falls back to AS", "wss://x.example/?q=1", "https://as.example.com", "https://as.example.com"},
-		{"empty engine url falls back to AS", "", "https://as.example.com", "https://as.example.com"},
+		{"invalid engine url does not fall back to AS", "wss://", "https://as.example.com", ""},
+		{"query engine url does not fall back to AS", "wss://x.example/?q=1", "https://as.example.com", ""},
+		{"empty engine url does not fall back to AS", "", "https://as.example.com", ""},
+		{"engine url wins over AS", "https://engine.example.com", "https://as.example.com", "https://engine.example.com"},
 		{"nothing usable", "ftp://x", "::", ""},
 		{"nothing configured", "", "", ""},
 	}
