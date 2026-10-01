@@ -1,16 +1,15 @@
 package engine
 
 import (
-	gojosejwt "github.com/go-jose/go-jose/v4/jwt"
-	"net/http"
-	"net/http/httptest"
-
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	gojosejwt "github.com/go-jose/go-jose/v4/jwt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
