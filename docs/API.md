@@ -303,9 +303,13 @@ A user's instances that are no longer live are retained as lifecycle
 records: they are what keeps login and new attestations refused for that
 device. The admin API answers `409 INSTANCE_RETAINED` to `DELETE
 /admin/tenants/{id}/instances/{instance_id}` for one of them, which covers a
-revoked instance and a legacy `suspended` one alike. A live instance, and a
-record with no user behind it (a stray attestation record), can still be
-deleted.
+revoked instance and a legacy `suspended` one alike. A live instance of a
+user is refused too, with `409 INSTANCE_OWNED`: hard deletion would skip the
+token cut-off, session drop and erasure, and deleting the user's last instance
+would leave an empty listing that the login gate reads as an initial
+enrollment, letting every passkey log in again. Revoke it instead
+(`PUT .../instances/{instance_id}/status`), which keeps the tombstone. Only a
+record with no user behind it (a stray attestation record) can be deleted.
 
 The passkey link is recorded when the wallet passes its passkey's base64url
 credential id as `credential_id` to `POST /wallet-provider/wia/generate`. It

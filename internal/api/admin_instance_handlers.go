@@ -42,6 +42,13 @@ const (
 	// because a legacy suspended record is retained for the same reason a
 	// revoked one is.
 	errCodeInstanceRetained = "INSTANCE_RETAINED"
+	// errCodeInstanceOwned refuses the hard delete of a live instance that
+	// belongs to a user. Removing it would skip the lifecycle cascade (token
+	// cut-off, session drop, erasure) and, for the user's last instance,
+	// leave an empty listing that the login gate reads as an initial
+	// enrollment, letting every passkey log in again. The admin has to
+	// revoke it instead, which keeps the tombstone.
+	errCodeInstanceOwned = "INSTANCE_OWNED"
 )
 
 // ListWalletInstances returns all wallet instances for a tenant.
@@ -196,6 +203,22 @@ func (h *AdminHandlers) DeleteWalletInstance(c *gin.Context) {
 		c.JSON(http.StatusConflict, gin.H{
 			"error":   errCodeInstanceRetained,
 			"message": "a wallet instance that is no longer live is retained as a lifecycle record and cannot be deleted",
+		})
+		return
+	}
+
+	// A live instance of a user is not deleted either. Hard deletion bypasses
+	// the lifecycle: nothing cuts off the user's tokens or drops sessions,
+	// and removing the user's last instance leaves an empty listing, which
+	// checkWalletLifecycle treats as an initial enrollment and lets every
+	// passkey log in again (with siblings, the deleted instance's linked
+	// passkey would stop being gated). Revocation does all of that and
+	// leaves the tombstone that keeps the gate closed, so the admin is told
+	// to revoke. Only records with no owner are hard-deleted.
+	if instance.UserID != nil {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":   errCodeInstanceOwned,
+			"message": "a wallet instance that belongs to a user cannot be deleted; revoke it instead (PUT .../instances/{instance_id}/status with status \"revoked\")",
 		})
 		return
 	}

@@ -587,11 +587,10 @@ func (r *replacingInstances) DeleteIfRemovable(ctx context.Context, id string, t
 func TestDeleteWalletInstance_ReplacementBetweenReadAndDeleteSurvives(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	base := memory.NewStore()
-	owner := domain.NewUserID()
 	other := domain.NewUserID()
 	store := &replacingInstanceStore{Store: base, other: other}
 	h := NewAdminHandlers(store, zap.NewNop(), nil)
-	seedInstance(t, h, "inst-1", "acme", &owner)
+	seedInstance(t, h, "inst-1", "acme", nil)
 	router := gin.New()
 	router.DELETE("/admin/tenants/:id/instances/:instance_id", h.DeleteWalletInstance)
 
@@ -606,5 +605,28 @@ func TestDeleteWalletInstance_ReplacementBetweenReadAndDeleteSurvives(t *testing
 	}
 	if got.UserID == nil || *got.UserID != other || got.Status != domain.InstanceStatusActive {
 		t.Fatalf("the replacement must be untouched, got %+v", got)
+	}
+}
+
+// A live instance of a user cannot be hard-deleted: that would skip the
+// lifecycle cascade and, for a last instance, look like a first enrollment to
+// the login gate. The admin is told to revoke instead.
+func TestDeleteWalletInstance_LiveUserOwnedIsRefused(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
+	userID := domain.NewUserID()
+	seedInstance(t, h, "owned-live", "acme", &userID)
+	router := gin.New()
+	router.DELETE("/admin/tenants/:id/instances/:instance_id", h.DeleteWalletInstance)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/admin/tenants/acme/instances/owned-live", nil))
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), errCodeInstanceOwned) {
+		t.Fatalf("expected 409 %s, got %d %s", errCodeInstanceOwned, w.Code, w.Body.String())
+	}
+	got, err := store.WalletInstances().GetByID(context.Background(), "owned-live")
+	if err != nil || got.Status != domain.InstanceStatusActive {
+		t.Fatalf("the live instance must be untouched: %v %+v", err, got)
 	}
 }

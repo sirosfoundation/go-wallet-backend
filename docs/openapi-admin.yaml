@@ -854,9 +854,11 @@ paths:
         that belongs to a user and is no longer live is retained as a
         lifecycle record - it is what keeps the login gate and WIA issuance
         refusing that device - and cannot be deleted. That covers a revoked
-        instance and a legacy `suspended` one alike. What can be removed is a
-        live instance, or a record with no user behind it (a stray
-        attestation record).
+        instance and a legacy `suspended` one alike. A live instance that
+        belongs to a user is refused as well (`INSTANCE_OWNED`): revoke it
+        through the status endpoint, so the token cut-off, session drop and
+        erasure run and the login gate stays closed. Only a record with no
+        user behind it (a stray attestation record) can be removed.
       operationId: deleteWalletInstance
       parameters:
         - $ref: '#/components/parameters/tenantId'
@@ -869,8 +871,9 @@ paths:
         '409':
           description: |
             A user's instance that is no longer live is retained as a
-            lifecycle record and cannot be deleted (`error` is
-            `INSTANCE_RETAINED`).
+            lifecycle record (`error` is `INSTANCE_RETAINED`), and a live
+            instance of a user must be revoked instead of deleted (`error`
+            is `INSTANCE_OWNED`).
           content:
             application/json:
               schema:
