@@ -216,6 +216,15 @@ func (m *MemorySessionStore) Close() error {
 	return nil
 }
 
+// compareAndDeleteScript deletes KEYS[1] only if its value equals ARGV[1]. It
+// runs atomically inside Redis.
+var compareAndDeleteScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+	return redis.call("DEL", KEYS[1])
+end
+return 0
+`)
+
 // RedisSessionStore stores sessions in Redis for horizontal scaling.
 type RedisSessionStore struct {
 	client     *redis.Client
@@ -389,12 +398,12 @@ func (r *RedisSessionStore) Delete(ctx context.Context, sessionID string) error 
 		return err
 	}
 	// Drop the (tenant, user) pointer only if it still names this session; a
-	// newer session may have replaced it.
-	uk := r.userKey(session.TenantID, session.UserID)
-	if cur, gerr := r.client.Get(ctx, uk).Result(); gerr == nil && cur == sessionID {
-		return r.client.Del(ctx, uk).Err()
-	}
-	return nil
+	// newer session may have replaced it. The compare and the delete must be
+	// one atomic step: with a separate GET and DEL another replica could
+	// repoint the key in between and the DEL would remove the live
+	// replacement's pointer.
+	return compareAndDeleteScript.Run(ctx, r.client,
+		[]string{r.userKey(session.TenantID, session.UserID)}, sessionID).Err()
 }
 
 func (r *RedisSessionStore) DeleteByUser(ctx context.Context, userID string) error {
