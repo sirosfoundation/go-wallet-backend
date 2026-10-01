@@ -73,6 +73,16 @@ type UserRevoker interface {
 	RevokeUser(userID string)
 }
 
+// UserLocker is the per-user lock WIAService holds from its instance write to
+// the end of its post-write checks. It is WalletLifecycleService.LockUser.
+// Account deletion takes the same lock for its irreversible phase, so an
+// attestation either finishes before the final sweep (which then sees and
+// removes the instance it bound) or starts after the user record is gone
+// (where WIAService re-checks that the user still exists and refuses).
+type UserLocker interface {
+	LockUser(userID domain.UserID) func()
+}
+
 // UserService handles user-related operations
 type UserService struct {
 	store          storage.Store
@@ -81,6 +91,10 @@ type UserService struct {
 	sessionCleaner SessionCleaner
 	tokenBlacklist TokenRevoker
 	userRevokers   []UserRevoker
+	// locker serializes, per user, the final instance sweep and the removal
+	// of the user record with a WIA request's instance write (see
+	// UserLocker). Nil when no lifecycle service is wired.
+	locker UserLocker
 	// now is the clock behind a deletion tombstone's timestamps; tests
 	// replace it.
 	now func() time.Time
@@ -98,6 +112,13 @@ func NewUserService(store storage.Store, cfg *config.Config, logger *zap.Logger)
 
 // SetClock replaces the clock used to stamp deletion tombstones (tests).
 func (s *UserService) SetClock(now func() time.Time) { s.now = now }
+
+// SetUserLocker wires the per-user lock shared with WIA generation and the
+// lifecycle cascade. Lock order: this lock is taken last and held while only
+// store, session-cleaner and token-revoker calls are made; none of those
+// takes any other per-user lock, and DeleteUser never calls the lifecycle
+// service while holding it.
+func (s *UserService) SetUserLocker(l UserLocker) { s.locker = l }
 
 // SetSessionCleaner sets the session cleanup implementation.
 // When set, DeleteUser will purge active sessions for the deleted user.
@@ -513,6 +534,19 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		s.logger.Warn("wallet instance cleanup failed on the first pass, retrying before the user record is removed",
 			zap.Error(errors.Join(instanceErrs...)), zap.String("user_id", userID.String()))
 	}
+	//
+	// Serialize with attestation from here to the removal of the user record.
+	// Without the lock an admitted WIA request could pass its user-exists
+	// check, this final sweep and the user deletion could both complete, and
+	// the request's Upsert would then bind a new instance to a user that no
+	// longer exists - an orphan that, instance links being write-once, would
+	// refuse re-enrolment of that device for good. WIAService takes the same
+	// lock around its Upsert and re-checks the user inside it. The lock is
+	// per process; a deployment with several replicas still relies on the
+	// WIA-side refusal after the write.
+	if s.locker != nil {
+		defer s.locker.LockUser(userID)()
+	}
 	late, lateErrs := s.listWalletInstances(ctx, userID)
 	instanceErrs = lateErrs
 	// An instance discovered only now can be in a tenant the holder-data
@@ -709,8 +743,8 @@ func (s *UserService) deleteWalletInstances(ctx context.Context, userID domain.U
 		// user, a delete by id would remove that replacement. A mismatch
 		// leaves the record alone and counts as incomplete; the repeat (or
 		// the second pass) works from a fresh listing.
-		if err := s.store.WalletInstances().DeleteForUser(ctx, inst.ID, inst.TenantID, userID); err != nil {
-			if errors.Is(err, storage.ErrNotFound) {
+		if err := s.store.WalletInstances().DeleteIfUnchanged(ctx, inst.ID, inst.TenantID, inst.Binding()); err != nil {
+			if errors.Is(err, storage.ErrNotFound) || errors.Is(err, storage.ErrBindingChanged) {
 				err = fmt.Errorf("record is gone or no longer this user's in tenant %s: %w", inst.TenantID, err)
 			}
 			errs = append(errs, fmt.Errorf("delete wallet instance %s: %w", inst.ID, err))

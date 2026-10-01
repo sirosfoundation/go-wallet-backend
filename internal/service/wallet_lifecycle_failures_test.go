@@ -680,7 +680,7 @@ func (s *failInstances) Delete(ctx context.Context, id string) error {
 	return s.WalletInstanceStore.Delete(ctx, id)
 }
 
-func (s *failInstances) DeleteForUser(ctx context.Context, id string, _ domain.TenantID, _ domain.UserID) error {
+func (s *failInstances) DeleteIfUnchanged(ctx context.Context, id string, _ domain.TenantID, _ domain.InstanceBinding) error {
 	return s.Delete(ctx, id)
 }
 

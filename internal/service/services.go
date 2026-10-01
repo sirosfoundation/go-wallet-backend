@@ -107,6 +107,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	}
 
 	lifecycle := NewWalletLifecycleService(store, logger, audit.NewFromConfig(cfg, logger))
+	userSvc.SetUserLocker(lifecycle)
 	if wiaSvc != nil {
 		wiaSvc.SetLifecycle(lifecycle)
 	}

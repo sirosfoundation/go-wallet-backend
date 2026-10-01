@@ -1009,7 +1009,7 @@ func (f failInstanceDeletes) Delete(context.Context, string) error {
 	return errors.New("storage is down")
 }
 
-func (f failInstanceDeletes) DeleteForUser(context.Context, string, domain.TenantID, domain.UserID) error {
+func (f failInstanceDeletes) DeleteIfUnchanged(context.Context, string, domain.TenantID, domain.InstanceBinding) error {
 	return errors.New("storage is down")
 }
 
@@ -1116,7 +1116,7 @@ func (l *lateInstances) Delete(context.Context, string) error {
 	return errors.New("storage is down")
 }
 
-func (l *lateInstances) DeleteForUser(ctx context.Context, id string, _ domain.TenantID, _ domain.UserID) error {
+func (l *lateInstances) DeleteIfUnchanged(ctx context.Context, id string, _ domain.TenantID, _ domain.InstanceBinding) error {
 	return l.Delete(ctx, id)
 }
 

@@ -700,6 +700,15 @@ func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{},
 		// liveness check and erasure (go-wallet-backend#330, in-process).
 		if s.lifecycle != nil && userID != nil {
 			defer s.lifecycle.LockUser(*userID)()
+			// The check at the top of GenerateWIA ran before the signing
+			// and the native attestation; account deletion (which takes
+			// this same lock for its final sweep and the removal of the
+			// user record) may have completed since. Looked at again inside
+			// the lock, a deleted user can no longer have an instance bound
+			// below it.
+			if err := s.refuseIfUserGone(ctx, userID); err != nil {
+				return "", err
+			}
 		}
 		now := time.Now().UTC()
 		instance := &domain.WalletInstance{

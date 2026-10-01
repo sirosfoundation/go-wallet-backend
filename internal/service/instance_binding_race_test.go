@@ -2,7 +2,10 @@ package service
 
 import (
 	"context"
+	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -171,4 +174,114 @@ func TestRevokeAll_ReplacementAfterListingIsNotRevoked(t *testing.T) {
 	require.NoError(t, gerr)
 	assert.Equal(t, domain.InstanceStatusActive, got.Status)
 	assert.Equal(t, bob, *got.UserID)
+}
+
+// hookGetInstances runs hook on the first GetByID of id, i.e. after the WIA
+// request's user-exists check and before its instance write.
+type hookGetInstances struct {
+	storage.WalletInstanceStore
+	id     string
+	hook   func()
+	once   sync.Once
+	upsert func()
+}
+
+func (h *hookGetInstances) GetByID(ctx context.Context, id string) (*domain.WalletInstance, error) {
+	if id == h.id && h.hook != nil {
+		h.once.Do(h.hook)
+	}
+	return h.WalletInstanceStore.GetByID(ctx, id)
+}
+
+func (h *hookGetInstances) Upsert(ctx context.Context, in *domain.WalletInstance) error {
+	if h.upsert != nil {
+		h.upsert()
+	}
+	return h.WalletInstanceStore.Upsert(ctx, in)
+}
+
+func wireDeletionAndAttestation(t *testing.T, store storage.Store, instances storage.WalletInstanceStore) (*UserService, *WIAService) {
+	t.Helper()
+	lifecycle := NewWalletLifecycleService(store, zap.NewNop(), nil)
+	userSvc := NewUserService(store, testConfig(), zap.NewNop())
+	userSvc.SetUserLocker(lifecycle)
+	wia := newTestWIAServiceUsingStores(t, instances, store.Users())
+	wia.SetLifecycle(lifecycle)
+	return userSvc, wia
+}
+
+// Thread 3, first interleaving: the account is deleted completely after the
+// WIA request passed its user-exists check and before its instance write. The
+// instance must not be bound to the deleted user.
+func TestWIA_AccountDeletedAfterAdmissionLeavesNoOrphanInstance(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	uid := seedWalletUser(t, store)
+
+	hooked := &hookGetInstances{WalletInstanceStore: store.WalletInstances()}
+	userSvc, wia := wireDeletionAndAttestation(t, store, hooked)
+
+	challenge, _, err := wia.CreateChallenge(ctx, domain.DefaultTenantID)
+	require.NoError(t, err)
+	pop, jkt := func() (string, string) {
+		p, key := createTestPop(t, challenge)
+		_, j := signTestPopWithKey(t, challenge, key)
+		return p, j
+	}()
+	hooked.id = jkt
+	hooked.hook = func() { require.NoError(t, userSvc.DeleteUser(ctx, uid, "did:example:"+uid.String())) }
+
+	wiaToken, err := wia.GenerateWIA(ctx, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge})
+	require.Error(t, err, "a WIA must not be issued to a deleted account")
+	assert.Empty(t, wiaToken)
+
+	all, err := store.WalletInstances().GetAllByUser(ctx, uid)
+	require.NoError(t, err)
+	assert.Empty(t, all, "no instance may outlive the account")
+	_, err = store.WalletInstances().GetByID(ctx, jkt)
+	assert.ErrorIs(t, err, storage.ErrNotFound)
+}
+
+// Thread 3, second interleaving: the request is already inside its critical
+// section (holding the user's lock, about to write the instance) when the
+// deletion reaches its final sweep. The deletion must wait for the request and
+// then sweep the instance the request bound.
+func TestDeleteUser_WaitsForAnAttestationInsideItsCriticalSection(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	uid := seedWalletUser(t, store)
+
+	hooked := &hookGetInstances{WalletInstanceStore: store.WalletInstances()}
+	userSvc, wia := wireDeletionAndAttestation(t, store, hooked)
+
+	done := make(chan error, 1)
+	hooked.upsert = func() {
+		go func() { done <- userSvc.DeleteUser(ctx, uid, "did:example:"+uid.String()) }()
+		select {
+		case err := <-done:
+			t.Errorf("DeleteUser finished (%v) while an attestation held the user's lock", err)
+			done <- err
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
+
+	challenge, _, err := wia.CreateChallenge(ctx, domain.DefaultTenantID)
+	require.NoError(t, err)
+	pop, _ := createTestPop(t, challenge)
+	_, err = wia.GenerateWIA(ctx, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge})
+	// The request's last cut-off check may legitimately refuse the WIA once
+	// the deletion has run; what matters is the end state.
+	_ = err
+
+	select {
+	case derr := <-done:
+		require.NoError(t, derr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("DeleteUser never finished")
+	}
+	all, gerr := store.WalletInstances().GetAllByUser(ctx, uid)
+	require.NoError(t, gerr)
+	assert.Empty(t, all, "the instance bound during the deletion must be swept before the user record goes")
+	_, uerr := store.Users().GetByID(ctx, uid)
+	assert.True(t, errors.Is(uerr, storage.ErrNotFound), "the account must be gone, got %v", uerr)
 }

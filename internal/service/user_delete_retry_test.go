@@ -38,7 +38,7 @@ func (s *flakyInstances) Delete(ctx context.Context, id string) error {
 	return s.WalletInstanceStore.Delete(ctx, id)
 }
 
-func (s *flakyInstances) DeleteForUser(ctx context.Context, id string, _ domain.TenantID, _ domain.UserID) error {
+func (s *flakyInstances) DeleteIfUnchanged(ctx context.Context, id string, _ domain.TenantID, _ domain.InstanceBinding) error {
 	return s.Delete(ctx, id)
 }
 
