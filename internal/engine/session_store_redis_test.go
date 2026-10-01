@@ -312,3 +312,30 @@ func TestRedisSessionStore_LegacyPointerExpires(t *testing.T) {
 	assert.ErrorIs(t, err, ErrSessionNotFound)
 	require.NoError(t, store.DeleteByUser(context.Background(), "u1"))
 }
+
+// A replica that Puts a newer session between GetByUser's pointer miss and
+// the legacy backfill must keep its pointer: the backfill is SET NX.
+func TestRedisSessionStore_LegacyBackfillDoesNotOverwriteNewerPointer(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	seedLegacySession(t, store, redisSess("old", "t1", "u1", time.Hour), time.Hour)
+
+	// The interleaving: the pointer miss has happened; now another replica
+	// Puts a newer session before the legacy path runs its backfill.
+	require.NoError(t, store.Put(ctx, redisSess("new", "t1", "u1", time.Hour)))
+	got, err := store.getByLegacyUser(ctx, "t1", "u1")
+	require.NoError(t, err)
+	assert.Equal(t, "old", got.ID, "legacy path returns the session it read")
+
+	ptr, err := mr.Get(store.userKey("t1", "u1"))
+	require.NoError(t, err)
+	assert.Equal(t, "new", ptr, "newer pointer must survive the backfill")
+	cur, err := store.GetByUser(ctx, "t1", "u1")
+	require.NoError(t, err)
+	assert.Equal(t, "new", cur.ID)
+
+	// Memberships were still added, so DeleteByUser finds both.
+	members, err := mr.ZMembers(store.userSetKey("u1"))
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"old", "new"}, members)
+}
