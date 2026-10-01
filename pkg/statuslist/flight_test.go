@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
 // slowServer answers every list URI with a valid token after gate is closed,
@@ -207,5 +209,91 @@ func TestLoad_LastWaiterLeavingCancelsFlight(t *testing.T) {
 	wg.Wait()
 	if err := <-done; err != nil {
 		t.Fatalf("fresh check after abandonment: %v", err)
+	}
+}
+
+// An abandoned load that finishes after a newer one must not restore the
+// status the newer token superseded.
+func TestLoad_OutOfOrderCompletionKeepsNewerStatus(t *testing.T) {
+	key := newKey(t)
+	var fetch atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sub := "https://" + r.Host + r.URL.Path
+		var tok string
+		if fetch.Add(1) == 1 { // older token: everything VALID
+			tok = makeToken(t, tokenOpts{sub: sub, key: key, iat: time.Now().Add(-10 * time.Second)})
+		} else { // newer token: index 1 revoked
+			tok = makeToken(t, tokenOpts{sub: sub, key: key, iat: time.Now().Add(-time.Second), values: map[int]int{1: 1}})
+		}
+		w.Header().Set("Content-Type", mediaTypeJWT)
+		_, _ = w.Write([]byte(tok))
+	}))
+	t.Cleanup(srv.Close)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	slowThenFast := func(context.Context, string, *trust.KeyMaterial) (bool, error) {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release // deliberately ignores the context: a slow signer evaluation
+		}
+		return true, nil
+	}
+	c := NewChecker(srv.Client(), false, slowThenFast)
+	ref := &Reference{Idx: 1, URI: srv.URL + "/statuslists/1"}
+
+	ctxA, cancelA := context.WithCancel(context.Background())
+	aDone := make(chan error, 1)
+	go func() { aDone <- c.Check(ctxA, ref) }()
+	<-entered
+	cancelA()
+	<-aDone
+
+	// B starts a fresh flight (A's was abandoned), sees the newer token.
+	if err := c.Check(context.Background(), ref); !errors.Is(err, ErrRevoked) {
+		t.Fatalf("newer token check = %v, want ErrRevoked", err)
+	}
+	// Let the older load complete, and wait until it has released its slot.
+	close(release)
+	waitFor(t, "older load finished", func() bool { return len(c.loadSem) == 0 })
+
+	if err := c.Check(context.Background(), ref); !errors.Is(err, ErrRevoked) {
+		t.Fatalf("older load restored stale status: %v", err)
+	}
+	if got := fetch.Load(); got != 2 {
+		t.Fatalf("%d fetches, want 2 (the newer entry must still be cached)", got)
+	}
+}
+
+func TestStore_NeverReplacesNewerVersion(t *testing.T) {
+	now := time.Now()
+	c := NewChecker(http.DefaultClient, false, trustAll)
+	c.now = func() time.Time { return now }
+	newer := parsedList{bits: 1, list: []byte{0x02}, expires: now.Add(time.Minute), iat: 200}
+	older := parsedList{bits: 1, list: []byte{0x00}, expires: now.Add(time.Hour), iat: 100}
+
+	if _, _, err := c.store("k", newer); err != nil {
+		t.Fatal(err)
+	}
+	// The older load is answered from the newer entry, which stays cached.
+	_, list, _ := c.store("k", older)
+	if len(list) != 1 || list[0] != 0x02 {
+		t.Fatalf("older load answered with %v, want the newer list", list)
+	}
+	if got := c.cache["k"]; got.iat != 200 || c.cacheBytes != 1 {
+		t.Fatalf("cache entry = iat %d, %d bytes; older replaced the newer", got.iat, c.cacheBytes)
+	}
+	// Same or newer iat does replace.
+	newest := parsedList{bits: 1, list: []byte{0x06}, expires: now.Add(time.Minute), iat: 300}
+	_, _, _ = c.store("k", newest)
+	if c.cache["k"].iat != 300 {
+		t.Fatal("newer version did not replace the cache entry")
+	}
+	// An expired newer entry is not served to the older load, but is not replaced either.
+	now = now.Add(2 * time.Minute)
+	_, list, _ = c.store("k", older)
+	if list[0] != 0x00 || c.cache["k"].iat != 300 {
+		t.Fatalf("older load after expiry: list=%v cached iat=%d", list, c.cache["k"].iat)
 	}
 }

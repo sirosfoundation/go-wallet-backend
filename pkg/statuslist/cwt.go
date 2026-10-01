@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
-	"time"
 
 	"github.com/fxamacker/cbor/v2"
 
@@ -55,40 +54,40 @@ var errCWT = errors.New("status list CWT")
 
 // parseCWT verifies a CWT-form Status List Token and applies the same claim
 // checks and trust decision as the JWT form.
-func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (int, []byte, time.Time, error) {
+func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsedList, error) {
 	sign1, err := decodeSign1(body)
 	if err != nil {
-		return 0, nil, time.Time{}, fmt.Errorf("%w: %v", errCWT, err)
+		return parsedList{}, fmt.Errorf("%w: %v", errCWT, err)
 	}
 	prot, err := decodeHeaderMap(sign1.protected)
 	if err != nil {
-		return 0, nil, time.Time{}, fmt.Errorf("%w protected header: %v", errCWT, err)
+		return parsedList{}, fmt.Errorf("%w protected header: %v", errCWT, err)
 	}
 
 	// typ must be integrity-protected: the unprotected header is not covered
 	// by the signature, so it is not consulted for it.
 	typ, _ := prot[coseHdrTyp].(string)
 	if strings.TrimPrefix(strings.ToLower(typ), "application/") != cwtTypValue {
-		return 0, nil, time.Time{}, fmt.Errorf("%w typ is %q, want %q", errCWT, typ, cwtTypValue)
+		return parsedList{}, fmt.Errorf("%w typ is %q, want %q", errCWT, typ, cwtTypValue)
 	}
 	alg, ok := toInt64(prot[coseHdrAlg])
 	if !ok {
-		return 0, nil, time.Time{}, fmt.Errorf("%w has no alg in its protected header", errCWT)
+		return parsedList{}, fmt.Errorf("%w has no alg in its protected header", errCWT)
 	}
 
 	chain, err := x5chain(headerValue(prot, sign1.unprotected, coseHdrX5Chain))
 	if err != nil {
-		return 0, nil, time.Time{}, fmt.Errorf("%w x5chain: %v", errCWT, err)
+		return parsedList{}, fmt.Errorf("%w x5chain: %v", errCWT, err)
 	}
 	if len(chain) == 0 {
-		return 0, nil, time.Time{}, ErrNoSignerKey
+		return parsedList{}, ErrNoSignerKey
 	}
 	leaf, err := x509.ParseCertificate(chain[0])
 	if err != nil {
-		return 0, nil, time.Time{}, fmt.Errorf("%w x5chain leaf: %v", errCWT, err)
+		return parsedList{}, fmt.Errorf("%w x5chain leaf: %v", errCWT, err)
 	}
 	if err := verifyCOSE(alg, leaf.PublicKey, sign1); err != nil {
-		return 0, nil, time.Time{}, fmt.Errorf("%w signature: %v", errCWT, err)
+		return parsedList{}, fmt.Errorf("%w signature: %v", errCWT, err)
 	}
 	km := &trust.KeyMaterial{Type: "x5c"}
 	for _, der := range chain {
@@ -97,7 +96,7 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (int, [
 
 	var claims map[int64]any
 	if err := cbor.Unmarshal(sign1.payload, &claims); err != nil {
-		return 0, nil, time.Time{}, fmt.Errorf("%w payload: %v", errCWT, err)
+		return parsedList{}, fmt.Errorf("%w payload: %v", errCWT, err)
 	}
 	slRaw, ttlLabel := claims[cwtClaimStatusList], int64(cwtClaimTTL)
 	if slRaw == nil {
@@ -107,27 +106,27 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (int, [
 	}
 	sl, ok := anyMap(slRaw)
 	if !ok {
-		return 0, nil, time.Time{}, fmt.Errorf("%w has no status_list claim", errCWT)
+		return parsedList{}, fmt.Errorf("%w has no status_list claim", errCWT)
 	}
 	// The draft's CDDL uses the text keys "bits" and "lst"; the integer
 	// labels 1 and 2 are also read (vc#703 writes those).
 	bits, ok := toInt64(member(sl, "bits", statusListKeyBits))
 	if !ok {
-		return 0, nil, time.Time{}, fmt.Errorf("%w status_list has no bits", errCWT)
+		return parsedList{}, fmt.Errorf("%w status_list has no bits", errCWT)
 	}
 	lst, ok := member(sl, "lst", statusListKeyLst).([]byte)
 	if !ok || len(lst) == 0 {
-		return 0, nil, time.Time{}, fmt.Errorf("%w status_list has no lst", errCWT)
+		return parsedList{}, fmt.Errorf("%w status_list has no lst", errCWT)
 	}
 	// Present-but-invalid claims are rejected, never read as absent: a
 	// text-valued exp would otherwise skip expiry validation and a
 	// malformed iss would change the trust subject.
 	var lc listClaims
 	if lc.sub, err = cwtString(claims, cwtClaimSub, "sub"); err != nil {
-		return 0, nil, time.Time{}, err
+		return parsedList{}, err
 	}
 	if lc.iss, err = cwtString(claims, cwtClaimIss, "iss"); err != nil {
-		return 0, nil, time.Time{}, err
+		return parsedList{}, err
 	}
 	for _, f := range []struct {
 		dst   **int64
@@ -138,7 +137,7 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (int, [
 		{&lc.nbf, cwtClaimNbf, "nbf"}, {&lc.ttl, ttlLabel, "ttl"},
 	} {
 		if *f.dst, err = cwtInt(claims, f.label, f.name); err != nil {
-			return 0, nil, time.Time{}, err
+			return parsedList{}, err
 		}
 	}
 	lc.bits, lc.lst = int(bits), lst

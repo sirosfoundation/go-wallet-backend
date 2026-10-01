@@ -168,11 +168,17 @@ type flight struct {
 	err     error
 }
 
-type cachedList struct {
+// parsedList is a verified, trust-evaluated status list. iat orders versions
+// of the same list: a cache entry is never replaced by a list with an older
+// iat.
+type parsedList struct {
 	bits    int
 	list    []byte
 	expires time.Time
+	iat     int64
 }
+
+type cachedList = parsedList
 
 // NewChecker returns a Checker that fetches through client, which must be the
 // SSRF-guarded client (HTTPClientConfig.NewHTTPClient).
@@ -318,39 +324,54 @@ func (c *Checker) loadOnce(ctx context.Context, key, uri string) (int, []byte, e
 	if err != nil {
 		return 0, nil, err
 	}
-	var bits int
-	var list []byte
-	var expires time.Time
+	var pl parsedList
 	switch mediaType {
 	case mediaTypeJWT, "":
 		// A missing Content-Type is read as the JWT form, the only one
 		// that ever came without one; a CWT body then fails to parse.
-		bits, list, expires, err = c.parseJWT(ctx, strings.TrimSpace(string(body)), uri)
+		pl, err = c.parseJWT(ctx, strings.TrimSpace(string(body)), uri)
 	case mediaTypeCWT:
-		bits, list, expires, err = c.parseCWT(ctx, body, uri)
+		pl, err = c.parseCWT(ctx, body, uri)
 	default:
 		err = fmt.Errorf("status list has unsupported media type %q", mediaType)
 	}
 	if err != nil {
 		return 0, nil, err
 	}
-	// expires is an absolute deadline fixed before the (possibly slow) trust
-	// call; it is compared against a fresh clock reading so the cache never
-	// outlives the token deadline.
-	if now := c.now(); expires.After(now) && len(list) <= c.cacheLimit {
-		c.mu.Lock()
-		if old, ok := c.cache[key]; ok {
+	return c.store(key, pl)
+}
+
+// store caches pl and returns the list to act on. expires is an absolute
+// deadline fixed before the (possibly slow) trust call; it is compared against
+// a fresh clock reading so the cache never outlives the token deadline.
+//
+// A cache entry is never replaced by an older version (smaller iat): a load
+// that fetched an earlier token but finished after a newer one (say, a slow
+// signer evaluation) must not restore the status the newer token superseded.
+// When the newer entry is still fresh the caller gets that entry's list too.
+func (c *Checker) store(key string, pl parsedList) (int, []byte, error) {
+	now := c.now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	old, had := c.cache[key]
+	if had && old.iat > pl.iat {
+		if now.Before(old.expires) {
+			return old.bits, old.list, nil
+		}
+		return pl.bits, pl.list, nil
+	}
+	if pl.expires.After(now) && len(pl.list) <= c.cacheLimit {
+		if had {
 			c.cacheBytes -= len(old.list)
 		}
-		if len(c.cache) >= maxCacheEntries || c.cacheBytes+len(list) > c.cacheLimit {
+		if len(c.cache) >= maxCacheEntries || c.cacheBytes+len(pl.list) > c.cacheLimit {
 			c.cache = map[string]cachedList{}
 			c.cacheBytes = 0
 		}
-		c.cache[key] = cachedList{bits: bits, list: list, expires: expires}
-		c.cacheBytes += len(list)
-		c.mu.Unlock()
+		c.cache[key] = pl
+		c.cacheBytes += len(pl.list)
 	}
-	return bits, list, nil
+	return pl.bits, pl.list, nil
 }
 
 // fetch returns the raw body and the response media type ("" when the server
@@ -403,20 +424,20 @@ func (c *Checker) fetch(ctx context.Context, uri string) ([]byte, string, error)
 	return body, mt, nil
 }
 
-func (c *Checker) parseJWT(ctx context.Context, token, uri string) (int, []byte, time.Time, error) {
+func (c *Checker) parseJWT(ctx context.Context, token, uri string) (parsedList, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
-		return 0, nil, time.Time{}, errors.New("status list token is not a JWT")
+		return parsedList{}, errors.New("status list token is not a JWT")
 	}
 	var header struct {
 		Typ string          `json:"typ"`
 		JWK json.RawMessage `json:"jwk"`
 	}
 	if err := decodeSegment(parts[0], &header); err != nil {
-		return 0, nil, time.Time{}, fmt.Errorf("status list header: %w", err)
+		return parsedList{}, fmt.Errorf("status list header: %w", err)
 	}
 	if !strings.EqualFold(header.Typ, statusListTokenTyp) {
-		return 0, nil, time.Time{}, fmt.Errorf("status list token typ is %q, want %q", header.Typ, statusListTokenTyp)
+		return parsedList{}, fmt.Errorf("status list token typ is %q, want %q", header.Typ, statusListTokenTyp)
 	}
 	// The list's own header key verifies the JWS; whether that key may
 	// publish status lists is the trust service's decision, taken below once
@@ -424,17 +445,17 @@ func (c *Checker) parseJWT(ctx context.Context, token, uri string) (int, []byte,
 	// an external status service signs with its own key.
 	km, err := trust.VerifyJWTWithEmbeddedKey(token)
 	if errors.Is(err, trust.ErrNoEmbeddedKey) {
-		return 0, nil, time.Time{}, ErrNoSignerKey
+		return parsedList{}, ErrNoSignerKey
 	}
 	if err != nil {
-		return 0, nil, time.Time{}, fmt.Errorf("status list signature: %w", err)
+		return parsedList{}, fmt.Errorf("status list signature: %w", err)
 	}
 	// Precedence when the header carries both: x5c is what is verified and
 	// trust-evaluated; a jwk that is also present must be the x5c leaf's key,
 	// otherwise the header is inconsistent and the list unverifiable.
 	if km.Type == "x5c" {
 		if err := checkJWKMatchesLeaf(header.JWK, km.X5C[0]); err != nil {
-			return 0, nil, time.Time{}, err
+			return parsedList{}, err
 		}
 	}
 
@@ -451,14 +472,14 @@ func (c *Checker) parseJWT(ctx context.Context, token, uri string) (int, []byte,
 		} `json:"status_list"`
 	}
 	if err := decodeSegment(parts[1], &claims); err != nil {
-		return 0, nil, time.Time{}, fmt.Errorf("status list payload: %w", err)
+		return parsedList{}, fmt.Errorf("status list payload: %w", err)
 	}
 	if claims.StatusList == nil {
-		return 0, nil, time.Time{}, errors.New("status list token has no status_list claim")
+		return parsedList{}, errors.New("status list token has no status_list claim")
 	}
 	lst, err := base64.RawURLEncoding.DecodeString(claims.StatusList.Lst)
 	if err != nil {
-		return 0, nil, time.Time{}, fmt.Errorf("status list lst: %w", err)
+		return parsedList{}, fmt.Errorf("status list lst: %w", err)
 	}
 	return c.accept(ctx, uri, km, listClaims{
 		sub: claims.Sub, iss: claims.Iss, iat: claims.Iat, exp: claims.Exp, nbf: claims.Nbf, ttl: claims.TTL,
@@ -477,12 +498,12 @@ type listClaims struct {
 // accept applies the claim checks shared by the JWT and CWT forms, inflates
 // the list and asks the trust service about the (already signature-verified)
 // signer key km. Only a list that passes all of it is returned.
-func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial, lc listClaims) (int, []byte, time.Time, error) {
+func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial, lc listClaims) (parsedList, error) {
 	if lc.iat == nil {
-		return 0, nil, time.Time{}, errors.New("status list token has no iat")
+		return parsedList{}, errors.New("status list token has no iat")
 	}
 	if lc.sub != uri {
-		return 0, nil, time.Time{}, fmt.Errorf("status list sub %q does not match uri %q", lc.sub, uri)
+		return parsedList{}, fmt.Errorf("status list sub %q does not match uri %q", lc.sub, uri)
 	}
 	now := c.now()
 	// A token issued in the future is not yet valid, whatever its ttl or exp
@@ -492,7 +513,7 @@ func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial,
 	// draft defines none, and a publisher that stamps iat ahead of real time
 	// is misconfigured rather than merely skewed.
 	if time.Unix(*lc.iat, 0).After(now) {
-		return 0, nil, time.Time{}, errors.New("status list token is issued in the future (iat)")
+		return parsedList{}, errors.New("status list token is issued in the future (iat)")
 	}
 	// The ttl claim is the token's freshness window, measured from its iat
 	// (not from when this wallet fetched it). Without ttl, a default window
@@ -502,12 +523,12 @@ func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial,
 		expires = time.Unix(*lc.iat, 0).Add(time.Duration(*lc.ttl) * time.Second)
 	}
 	if lc.nbf != nil && now.Before(time.Unix(*lc.nbf, 0)) {
-		return 0, nil, time.Time{}, errors.New("status list token is not yet valid (nbf)")
+		return parsedList{}, errors.New("status list token is not yet valid (nbf)")
 	}
 	if lc.exp != nil {
 		exp := time.Unix(*lc.exp, 0)
 		if !now.Before(exp) {
-			return 0, nil, time.Time{}, errors.New("status list token has expired")
+			return parsedList{}, errors.New("status list token has expired")
 		}
 		if exp.Before(expires) {
 			expires = exp
@@ -521,21 +542,21 @@ func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial,
 	switch lc.bits {
 	case 1, 2, 4, 8:
 	default:
-		return 0, nil, time.Time{}, fmt.Errorf("status list bits %d is not 1, 2, 4 or 8", lc.bits)
+		return parsedList{}, fmt.Errorf("status list bits %d is not 1, 2, 4 or 8", lc.bits)
 	}
 	list, err := inflate(lc.lst)
 	if err != nil {
-		return 0, nil, time.Time{}, err
+		return parsedList{}, err
 	}
 	if c.minEntries > 0 {
 		if n := len(list) * 8 / lc.bits; n < c.minEntries {
-			return 0, nil, time.Time{}, fmt.Errorf("status list has %d entries, below the configured minimum of %d", n, c.minEntries)
+			return parsedList{}, fmt.Errorf("status list has %d entries, below the configured minimum of %d", n, c.minEntries)
 		}
 	}
 	if err := c.evaluateSigner(ctx, lc.iss, uri, km); err != nil {
-		return 0, nil, time.Time{}, err
+		return parsedList{}, err
 	}
-	return lc.bits, list, expires, nil
+	return parsedList{bits: lc.bits, list: list, expires: expires, iat: *lc.iat}, nil
 }
 
 // evaluateSigner asks the trust service whether the list signer may publish
