@@ -21,10 +21,10 @@ var providerActor = LifecycleActor{Kind: "provider"}
 // forever.
 func TestChangeStatus_RetryAdvancesACutoffThatPredatesTheRevocation(t *testing.T) {
 	ctx := context.Background()
-	fs := newFailStore().failOnCalls("users.InvalidateAuthBefore", 2, 3)
+	fs := newFailStore().failOnCalls("users.InvalidateAuthBefore", 1, 2)
 	svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
 	uid := seedWalletUser(t, fs.Store)
-	// Calls 2 and 3 fail: the second cut-off, and the cascade's own repair of it.
+	// Calls 1 and 2 fail: the cut-off after the write, and the cascade's own repair of it.
 	// A second live instance keeps the wallet alive, so no erasure advances
 	// the cut-off behind the test's back.
 	require.NoError(t, fs.Store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
@@ -58,7 +58,7 @@ func TestChangeStatus_RetryAdvancesACutoffThatPredatesTheRevocation(t *testing.T
 func TestChangeStatus_RetryReportsAFailingCutoff(t *testing.T) {
 	ctx := context.Background()
 	newFixture := func(t *testing.T) (*WalletLifecycleService, *failStore, string) {
-		fs := newFailStore().failOnCalls("users.InvalidateAuthBefore", 2, 3)
+		fs := newFailStore().failOnCalls("users.InvalidateAuthBefore", 1, 2)
 		svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
 		uid := seedWalletUser(t, fs.Store)
 		require.NoError(t, fs.Store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
@@ -95,7 +95,7 @@ func TestRevokeAllForUser_FailuresAfterPersistedRevocationsAreIncomplete(t *test
 		assert.Zero(t, n)
 	})
 	t.Run("the cut-off after the sweep fails", func(t *testing.T) {
-		fs := newFailStore().failOnCall("users.InvalidateAuthBefore", 2)
+		fs := newFailStore().failOnCall("users.InvalidateAuthBefore", 1)
 		svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
 		uid := seedWalletUser(t, fs.Store)
 		n, err := svc.RevokeAllForUser(ctx, providerActor, domain.DefaultTenantID, uid, "x")
@@ -185,7 +185,7 @@ func TestEraseWalletData_FailsClosedWhenOtherTenantsCannotBeSeen(t *testing.T) {
 // success; cascade only fills a missing one.
 func TestRevokeAllForUser_RetryRepairsAStaleCutoff(t *testing.T) {
 	ctx := context.Background()
-	fs := newFailStore().failOnCall("users.InvalidateAuthBefore", 2)
+	fs := newFailStore().failOnCalls("users.InvalidateAuthBefore", 1, 2)
 	svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
 	uid := seedWalletUser(t, fs.Store)
 	// A live instance in another tenant keeps the vault, so no erasure
@@ -216,7 +216,7 @@ func TestRevokeAllForUser_RetryRepairsAStaleCutoff(t *testing.T) {
 	assert.True(t, same.Equal(fresh), "a further no-op retry leaves the cut-off alone")
 
 	t.Run("a failing repair is reported", func(t *testing.T) {
-		fs := newFailStore().failOnCall("users.InvalidateAuthBefore", 2)
+		fs := newFailStore().failOnCalls("users.InvalidateAuthBefore", 1, 2)
 		svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
 		uid := seedWalletUser(t, fs.Store)
 		require.NoError(t, fs.Store.UserTenants().AddMembership(ctx, &domain.UserTenantMembership{UserID: uid, TenantID: "acme", Role: "user"}))

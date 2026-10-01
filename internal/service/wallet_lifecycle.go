@@ -173,10 +173,10 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 			//
 			// cascade's ensureCutoff only establishes a cut-off that is
 			// missing, which is not enough here. The first attempt may have
-			// recorded its pre-write cut-off, persisted the revocation, and
-			// then failed to advance the cut-off past that write - leaving
-			// one that predates the revocation, and with it any token minted
-			// in between. So a cut-off older than the revocation is advanced
+			// persisted the revocation and then failed to record the cut-off
+			// (or recorded one older than the revocation, as an earlier
+			// version did) - leaving none, or one that predates the
+			// revocation, and with it any token minted in between. So a cut-off older than the revocation is advanced
 			// now. A cut-off already after it is left alone, which keeps a
 			// retry after a complete cascade the no-op it should be.
 			if err := s.advanceCutoffIfStale(ctx, inst, actor); err != nil {
@@ -202,17 +202,19 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 	// replacement the caller never asked about: it is left alone and the
 	// instance reported as not found.
 	for attempt := 1; ; attempt++ {
-		if target != domain.InstanceStatusActive {
-			// Fail closed: cut off issued tokens before the status is persisted.
-			// If the cut-off cannot be recorded nothing changes and the caller
-			// gets an error; if the status write then fails, the user's tokens
-			// are cut off while the instance stays active, which only costs a
-			// re-login. The reverse order would leave a blocked instance whose
-			// pre-cut-off tokens keep working until a retry.
-			if err := s.cutOffTokens(ctx, inst, actor); err != nil {
-				return nil, err
-			}
-		}
+		// The cut-off is deliberately NOT taken before this write. It is
+		// user-wide, and the user it would hit is read from a snapshot that
+		// the conditional write may reject: if the record was deleted and
+		// attested again for another user in between, a cut-off taken first
+		// would log out the user of the old snapshot while the write fails
+		// and the replacement stays untouched. The binding is confirmed by
+		// the write; the cut-off follows it, below.
+		//
+		// Fail closed all the same: a crash or failure between the write and
+		// the cut-off leaves a revoked instance whose tokens still work, but
+		// the caller is told (ErrErasureIncomplete) and repeating the
+		// request lands in the idempotent branch, where advanceCutoffIfStale
+		// and the cascade's ensureCutoff establish the cut-off.
 		err := s.store.WalletInstances().UpdateStatusIfUnchanged(ctx, instanceID, tenantID, inst.Binding(), target, reason)
 		if err == nil {
 			break
@@ -245,9 +247,8 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 	// from it would skip the very user the revocation now belongs to, leaving
 	// their tokens and sessions alive. If the record was meanwhile replaced
 	// (a different generation) the persisted copy is somebody else's, and
-	// the record that was revoked is the one this request observed. The pre-write cut-off above is necessarily blind to a
-	// bind that lands after it; the one below, from the persisted owner, is
-	// what covers it. When the re-read fails the status is already persisted,
+	// the record that was revoked is the one this request observed. The cut-off below runs from the persisted owner, so a bind
+	// that landed after the write is covered. When the re-read fails the status is already persisted,
 	// so the caller gets ErrErasureIncomplete and the same request, which
 	// re-reads in its idempotent branch above, finishes the job.
 	persisted, err := s.store.WalletInstances().GetByID(ctx, instanceID)
@@ -265,20 +266,12 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 	}
 	s.emitAudit(inst.ID, target, reason, actor)
 	if target != domain.InstanceStatusActive {
-		// Cut the tokens off again, now that the status is persisted. The
-		// first cut-off had to happen before the write (fail closed: a
-		// blocked instance must never be the one with working tokens), but
-		// it leaves a sliver open. A login already past its own lifecycle
-		// check still sees a live instance, mints a token whose iat is after
-		// that first cut-off, and every gate then accepts it - the
-		// post-mint re-check only catches the revocation once it is
-		// visible, and here it is not yet. Advancing the cut-off after the
-		// write closes the sliver by refusing anything minted inside it.
-		//
-		// It costs a re-login to a device that logged in during those
-		// milliseconds, which is the right side to err on and the same side
-		// the user-wide scope of the cut-off already errs on. Serializing
-		// lifecycle changes with login outright is go-wallet-backend#330.
+		// Cut the tokens off now that the status is persisted and the
+		// binding confirmed, so only the user of the record that was really
+		// revoked is affected. A login that raced the write and minted a
+		// token before it is refused too, since the cut-off is taken after
+		// the write. Serializing lifecycle changes with login outright is
+		// go-wallet-backend#330.
 		if err := s.cutOffTokens(ctx, inst, actor); err != nil {
 			return inst, errors.Join(fmt.Errorf("%w: re-cut tokens after the status write: %w", ErrErasureIncomplete, err), s.cascade(ctx, tenantID, inst, actor))
 		}
@@ -290,7 +283,7 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 // advanceCutoffIfStale re-cuts the user's tokens when the recorded cut-off
 // is older than the revocation it belongs to. That happens when the cut-off
 // after the status write failed on an earlier attempt: tokens minted between
-// the pre-write cut-off and the write itself would otherwise stay valid
+// an older cut-off and the write itself would otherwise stay valid
 // forever, since nothing later looks at them again.
 //
 // Instances with no user, and revocations with no recorded time, have nothing
@@ -380,11 +373,6 @@ func (s *WalletLifecycleService) RevokeAllForUser(ctx context.Context, actor Lif
 		for _, inst := range instances {
 			if inst.Status == domain.InstanceStatusRevoked {
 				continue
-			}
-			if changed == 0 {
-				if err := s.cutOffTokens(ctx, inst, actor); err != nil {
-					return 0, err
-				}
 			}
 			if err := s.store.WalletInstances().UpdateStatusIfUnchanged(ctx, inst.ID, tenantID, inst.Binding(), domain.InstanceStatusRevoked, reason); err != nil {
 				err = fmt.Errorf("revoke instance %s: %w", inst.ID, err)

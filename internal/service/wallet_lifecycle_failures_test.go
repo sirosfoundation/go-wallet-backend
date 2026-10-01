@@ -482,26 +482,50 @@ func TestWalletLifecycle_CopyLoadedDuringErasureIsFenced(t *testing.T) {
 	assert.Nil(t, u.PrivateData, "the erasure stands")
 }
 
-// The token cut-off is recorded before the status is persisted: if it cannot
-// be, nothing changes (fail closed), instead of a blocked instance whose
-// pre-cut-off tokens keep working.
-func TestWalletLifecycle_CutoffFailureLeavesStatusUnchanged(t *testing.T) {
+// The token cut-off is recorded after the status write confirmed the binding.
+// If it cannot be recorded the revocation stays persisted and the request is
+// reported incomplete (fail closed and retryable), rather than the cut-off
+// being taken for a record the write may then reject.
+func TestWalletLifecycle_CutoffFailureAfterWriteIsIncompleteAndRetryable(t *testing.T) {
 	ctx := context.Background()
-	fs := newFailStore("users.InvalidateAuthBefore")
-	svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
-	uid := seedWalletUser(t, fs, domain.DefaultTenantID)
-	id := "inst-" + uid.String()
 
-	_, err := svc.ChangeStatus(ctx, userActor(uid), domain.DefaultTenantID, id, domain.InstanceStatusRevoked, "x")
-	assert.ErrorIs(t, err, errBoom)
-	inst, _ := fs.Store.WalletInstances().GetByID(ctx, id)
-	assert.Equal(t, domain.InstanceStatusActive, inst.Status, "status untouched when the cut-off cannot be recorded")
+	t.Run("ChangeStatus", func(t *testing.T) {
+		fs := newFailStore("users.InvalidateAuthBefore")
+		svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
+		uid := seedWalletUser(t, fs, domain.DefaultTenantID)
+		id := "inst-" + uid.String()
 
-	n, err := svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "x")
-	assert.ErrorIs(t, err, errBoom)
-	assert.Zero(t, n)
-	inst, _ = fs.Store.WalletInstances().GetByID(ctx, id)
-	assert.Equal(t, domain.InstanceStatusActive, inst.Status)
+		_, err := svc.ChangeStatus(ctx, userActor(uid), domain.DefaultTenantID, id, domain.InstanceStatusRevoked, "x")
+		assert.ErrorIs(t, err, errBoom)
+		assert.ErrorIs(t, err, ErrErasureIncomplete)
+		inst, _ := fs.Store.WalletInstances().GetByID(ctx, id)
+		assert.Equal(t, domain.InstanceStatusRevoked, inst.Status)
+
+		delete(fs.fail, "users.InvalidateAuthBefore")
+		_, err = svc.ChangeStatus(ctx, userActor(uid), domain.DefaultTenantID, id, domain.InstanceStatusRevoked, "x")
+		require.NoError(t, err)
+		c, _ := fs.Store.Users().GetAuthCutoff(ctx, uid)
+		assert.False(t, c.Before(*inst.DeactivatedAt), "the retry recorded the cut-off")
+	})
+	t.Run("RevokeAllForUser", func(t *testing.T) {
+		fs := newFailStore("users.InvalidateAuthBefore")
+		svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
+		uid := seedWalletUser(t, fs, domain.DefaultTenantID)
+		id := "inst-" + uid.String()
+
+		n, err := svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "x")
+		assert.ErrorIs(t, err, errBoom)
+		assert.ErrorIs(t, err, ErrErasureIncomplete)
+		assert.Equal(t, 1, n)
+		inst, _ := fs.Store.WalletInstances().GetByID(ctx, id)
+		assert.Equal(t, domain.InstanceStatusRevoked, inst.Status)
+
+		delete(fs.fail, "users.InvalidateAuthBefore")
+		_, err = svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "x")
+		require.NoError(t, err)
+		c, _ := fs.Store.Users().GetAuthCutoff(ctx, uid)
+		assert.False(t, c.Before(*inst.DeactivatedAt))
+	})
 }
 
 // attestingInstances inserts a brand-new active instance the first time an

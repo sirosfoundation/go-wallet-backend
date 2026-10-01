@@ -272,8 +272,12 @@ user has expired (see DEPLOYMENT.md, "Account Deletion Tombstones"), and the
 token gate refuses any token whose user has a tombstone. Wallet Instance
 Attestation generation refuses it too, so an old token cannot look like a first
 enrollment.
-The cut-off is recorded before the status change is persisted, so a revoked
-instance never keeps working tokens. The user's other devices log in again
+The cut-off is recorded right after the status change is persisted, once the
+write has confirmed it landed on the record the request read (so a record that
+was replaced for another user in between logs nobody out). If recording it
+fails, the revocation stays persisted, the request answers 409
+`ERASURE_INCOMPLETE`, and repeating it records the cut-off,
+so a revoked instance does not keep working tokens once the request succeeds. The user's other devices log in again
 afterwards and their new tokens work normally; the revoked instance has no
 way back, since revocation cannot be undone. A login or token refresh that races with a lifecycle change is
 refused rather than handed a token that would be rejected on first use; the
