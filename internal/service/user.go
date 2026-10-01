@@ -616,6 +616,28 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// the cut-off only ever moves forward, so repeating it is idempotent. A
 	// record that vanished meanwhile (ErrNotFound) is already covered by the
 	// tombstone.
+	// Re-judge the request's token against the cut-off as it stands now,
+	// immediately before this call advances it. The check at the top ran
+	// before the sweep and the session cleaner, which take time; a lifecycle
+	// revocation (instance revoked or deactivated, a logout-everywhere) that
+	// landed meanwhile advanced the cut-off independently, and a token
+	// admitted before it must not go on to the irreversible phase. The read
+	// has to come before the advance below and not after: this deletion's own
+	// advance refuses the caller's token by design, so afterwards a cut-off
+	// from an independent event can no longer be told apart from ours. Before
+	// it, the only cut-off that can be newer than the token is one somebody
+	// else set (or a previous attempt of this deletion, whose token the
+	// caller replaced with a fresh login, which passes). An unreadable record
+	// fails closed and retryable; a vanished one is covered by the tombstone.
+	cur, err := s.store.Users().GetByID(ctx, userID)
+	switch {
+	case err == nil:
+		if err := refuseIfCutOff(ctx, cur); err != nil {
+			return err
+		}
+	case !errors.Is(err, storage.ErrNotFound):
+		return fmt.Errorf("%w: re-read token cut-off: %w", ErrDeletionIncomplete, err)
+	}
 	if err := s.store.Users().InvalidateAuthBefore(ctx, userID, s.now().UTC()); err != nil && !errors.Is(err, storage.ErrNotFound) {
 		s.logger.Error("Account deletion incomplete: token cut-off could not be advanced",
 			zap.Error(err), zap.String("user_id", userID.String()))
