@@ -241,16 +241,20 @@ kubectl apply -f k8s/deployment.yaml
 ### Rolling Upgrades and the Redis Session Store
 
 Earlier releases kept the per-user session pointer at `<prefix>user:<userID>`.
-This release scopes it by tenant (`<prefix>user:<tenant>:<userID>`) and adds a
-`<prefix>userall:<userID>` index used for account deletion. New writes use only
-the new keys. To keep sessions created by not-yet-upgraded replicas reachable
+This release scopes it by tenant at `<prefix>usert:<b64url(tenant)>:<b64url(userID)>`
+(unpadded base64url, so the `:` separator is unambiguous) and adds a
+`<prefix>userall:<userID>` index used for account deletion. The new pointer
+deliberately does not reuse the `user:` namespace: the legacy key is the raw
+user ID, so with `:` in IDs a legacy user `default:u` and the new
+(tenant `default`, user `u`) would otherwise share one key and could overwrite
+each other's pointer during a rolling upgrade. New writes use only the new keys. To keep sessions created by not-yet-upgraded replicas reachable
 during a rolling upgrade, the store falls back to the legacy pointer:
 
 - `GetByUser` uses the legacy pointer when the new one is absent, returns the
   session only if its user and (normalised) tenant match the request, and
   lazily backfills the new pointer and index.
-- `DeleteByUser` and `Delete` also remove the legacy pointer and the session it
-  names.
+- `DeleteByUser` and `Delete` also remove the legacy pointer, and delete the
+  session it names only if that session belongs to the target user.
 
 The fallback is bounded by the maximum session lifetime (`DefaultTTL`, 24h
 unless configured): legacy keys carry the session TTL and disappear on their
