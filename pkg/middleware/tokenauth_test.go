@@ -685,3 +685,32 @@ func TestRequireAudience_LegacyModeExempt_SessionModeStillEnforced(t *testing.T)
 		t.Errorf("session-mode wrong audience: expected 403, got %d", code)
 	}
 }
+
+// ModeLegacy login tokens (aud=RP ID) pass RequireAudience but must be
+// refused by RequireAudienceStrict, which a narrower future group opts in to.
+func TestRequireAudience_LegacyExemptionIsExplicit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tc := range []struct {
+		name string
+		mw   gin.HandlerFunc
+		want int
+	}{
+		{"RequireAudience admits legacy", RequireAudience("wallet-registry"), 200},
+		{"RequireAudienceStrict refuses legacy", RequireAudienceStrict("wallet-registry"), 403},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			_, r := gin.CreateTestContext(w)
+			r.Use(func(c *gin.Context) {
+				c.Set("tokenauth_result", &claims.Result{Mode: claims.ModeLegacy, Audience: []string{"wallet.example.com"}})
+				c.Next()
+			})
+			r.Use(tc.mw)
+			r.GET("/test", func(c *gin.Context) { c.Status(200) })
+			r.ServeHTTP(w, httptest.NewRequest("GET", "/test", nil))
+			if w.Code != tc.want {
+				t.Fatalf("got %d, want %d", w.Code, tc.want)
+			}
+		})
+	}
+}

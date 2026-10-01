@@ -20,6 +20,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	ws "github.com/sirosfoundation/go-wallet-backend/internal/websocket"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audience"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/legacytoken"
 )
@@ -795,6 +796,11 @@ func (m *Manager) unregisterSession(session *Session) {
 	session.logger.Info("Session closed", zap.String("session_id", session.ID))
 }
 
+// engineAdmitsLegacyTokens is whether the engine transport accepts ModeLegacy
+// (HMAC login) tokens without an audience match. True today, as for every
+// other guarded route group; see audience.Allowed.
+const engineAdmitsLegacyTokens = true
+
 // validateToken authenticates tokenString and returns its identity.
 // tac is only ever populated on the go-tokenauth path - the legacy HMAC
 // path (below) has no TAC concept at all, so callers must treat an empty
@@ -819,13 +825,14 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 		// wallet-registry or wallet-backend audience - never a broader one.
 		//
 		// Legacy (HMAC) tokens are exempt, exactly like
-		// middleware.RequireAudience: WebAuthnService/UserService always mint
-		// them with aud=Server.RPID, which go-tokenauth preserves in
-		// result.Audience (and has already validated against AS.Audiences),
-		// so requiring wallet-registry/wallet-backend here would reject every
-		// real WebAuthn app token before the family check below ever ran.
-		// Session-mode tokens keep the strict check.
-		if result.Mode != claims.ModeLegacy && !result.HasAudience("wallet-registry", "wallet-backend") {
+		// middleware.RequireAudience (see audience.Allowed for why:
+		// they carry aud=Server.RPID, already validated against
+		// AS.Audiences). The exemption is an explicit opt-in constant, not an
+		// implicit special case: if the engine transport is ever restricted
+		// to a narrower audience that ordinary login tokens must not reach,
+		// flip engineAdmitsLegacyTokens to false. Session-mode tokens always
+		// keep the strict check.
+		if !audience.Allowed(result, engineAdmitsLegacyTokens, "wallet-registry", "wallet-backend") {
 			return "", "", "", errors.New("token audience not permitted for engine transport")
 		}
 		// Per-jti revocation is already enforced inside Validate itself (the
