@@ -711,15 +711,14 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// token cut-off was advanced (it has to: advancing earlier would refuse the
 	// caller's own token and cost them the retry a failed sweep promises). A
 	// request the middleware admitted before the cut-off can therefore have
-	// written a credential or presentation after that sweep and before the
-	// cut-off landed: its mutation check still saw the old cut-off. From here
-	// on every such write is refused (RefuseNow reads the advanced cut-off, and
-	// the tombstone covers the record's removal), so one more sweep, after the
-	// fence, removes whatever an already-admitted request left behind. A write
-	// that passed its check just before the fence and is persisted after this
-	// sweep is the residual window a per-process check cannot close without a
-	// lock around the credential write paths; the final user deletion below
-	// then makes every later write refuse.
+	// written a credential or presentation after that sweep. This is the sweep
+	// that follows the advance: the invariant of the holder-write fence is
+	// that every erasure advances the cut-off BEFORE its final sweep, and that
+	// a holder write re-reads the cut-off AFTER it persists and rolls itself
+	// back if it is now refused (tokengate.ConfirmWrite). A write that
+	// persisted before the advance is therefore found by this sweep, and one
+	// that persists after it removes itself. Only a write whose own rollback
+	// fails can outlive it (see ConfirmWrite).
 	//
 	// A failure here is retryable and fails closed: the user record is kept,
 	// the cut-off and revocations only move forward, and the repeat (with a
@@ -755,6 +754,25 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		return fmt.Errorf("failed to delete user: %w", err)
 	}
 
+	// Last sweep, after the record is gone. A token issued after the cut-off
+	// (a fresh login, which the cut-off rightly lets through so a failed
+	// deletion can be retried) is not refused by it, so such a request could
+	// persist holder data between the final sweep above and the record's
+	// removal. From here every write is refused by the deletion tombstone
+	// (tokengate.RefuseNow) and rolls itself back, so this sweep removes
+	// whatever got in before. A failure is reported, not swallowed: the account
+	// is already gone, so this is not retryable by the user and an operator
+	// has to clear the remainder.
+	var lastErrs []error
+	for _, tenantID := range tenantIDs {
+		lastErrs = append(lastErrs, s.eraseHolderData(ctx, tenantID, holderDID)...)
+	}
+	if len(lastErrs) > 0 {
+		s.logger.Error("Account deleted but holder data written during the deletion could not be removed",
+			zap.Error(errors.Join(lastErrs...)), zap.String("user_id", userID.String()))
+		return fmt.Errorf("%w: sweep after user removal: %w", ErrDeletionIncomplete, errors.Join(lastErrs...))
+	}
+
 	s.logger.Info("User deleted")
 	return nil
 }
@@ -773,7 +791,9 @@ func (s *UserService) listWalletInstances(ctx context.Context, userID domain.Use
 
 // eraseHolderData removes the holder's credentials and presentations in one
 // tenant, logging what it could not remove. Used by the account-deletion
-// sweep, including for a tenant discovered late.
+// sweep, including for a tenant discovered late. A record that is already gone
+// when its delete runs is not a failure: an in-flight holder write rolls its
+// own record back (tokengate.ConfirmWrite) concurrently with the sweep.
 func (s *UserService) eraseHolderData(ctx context.Context, tenantID domain.TenantID, holderDID string) []error {
 	var errs []error
 	credentials, err := s.store.Credentials().GetAllByHolder(ctx, tenantID, holderDID)
@@ -781,7 +801,7 @@ func (s *UserService) eraseHolderData(ctx context.Context, tenantID domain.Tenan
 		errs = append(errs, fmt.Errorf("list credentials in tenant %s: %w", tenantID, err))
 	}
 	for _, cred := range credentials {
-		if err := s.store.Credentials().Delete(ctx, tenantID, holderDID, cred.CredentialIdentifier); err != nil {
+		if err := s.store.Credentials().Delete(ctx, tenantID, holderDID, cred.CredentialIdentifier); err != nil && !errors.Is(err, storage.ErrNotFound) {
 			errs = append(errs, fmt.Errorf("delete credential %s: %w", cred.CredentialIdentifier, err))
 		}
 	}
@@ -790,7 +810,7 @@ func (s *UserService) eraseHolderData(ctx context.Context, tenantID domain.Tenan
 		errs = append(errs, fmt.Errorf("list presentations in tenant %s: %w", tenantID, err))
 	}
 	for _, pres := range presentations {
-		if err := s.store.Presentations().Delete(ctx, tenantID, holderDID, pres.PresentationIdentifier); err != nil {
+		if err := s.store.Presentations().Delete(ctx, tenantID, holderDID, pres.PresentationIdentifier); err != nil && !errors.Is(err, storage.ErrNotFound) {
 			errs = append(errs, fmt.Errorf("delete presentation %s: %w", pres.PresentationIdentifier, err))
 		}
 	}

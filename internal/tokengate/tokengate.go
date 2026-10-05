@@ -165,6 +165,56 @@ func IssuedAtFrom(ctx context.Context) (time.Time, bool) {
 	return t, ok
 }
 
+// ErrWriteNotRolledBack is joined onto ErrRevoked by ConfirmWrite when a write
+// was found to have landed after the user's authorization was cut off and the
+// compensating delete failed too: the record is still stored. The caller must
+// treat the operation as failed; the erasure that advanced the cut-off sweeps
+// holder data after advancing it, but a sweep that already ran does not see
+// this record, so it can remain until the next erasure or an operator
+// removes it.
+var ErrWriteNotRolledBack = errors.New("write landed after authorization was revoked and could not be rolled back")
+
+// rollbackTimeout bounds the compensating delete, which runs on a context
+// detached from the request's cancellation: a client that hangs up must not
+// leave the record behind.
+const rollbackTimeout = 10 * time.Second
+
+// ConfirmWrite is the post-write half of the storage-level fence for a holder
+// write (credential, presentation) that creates a record keyed by holder DID,
+// in a store that cannot make the write conditional on the user's cut-off
+// (the user and holder data are separate collections). Call it immediately
+// after the write succeeded, with a rollback that deletes exactly that record.
+//
+// It re-reads the user's cut-off; if the request's token is now refused (the
+// cut-off advanced, or the account was deleted) the record is rolled back and
+// ErrRevoked returned. A failed re-read also rolls back and fails closed,
+// returning the read error. A failed rollback returns ErrRevoked joined with
+// ErrWriteNotRolledBack, and the caller must report the operation as failed.
+//
+// Together with the erasure invariant - every erasure advances the cut-off
+// BEFORE it sweeps holder data - this closes the window without a
+// cross-collection transaction. Take a write W, its re-read R, and an erasure's
+// cut-off advance A followed by its sweep S (A < S). If R sees A, W is rolled
+// back by its own request. Otherwise R < A, hence W < R < A < S, and S, which
+// lists after A, finds W and deletes it. Either way no record outlives the
+// erasure, except when the rollback itself fails after S already ran.
+//
+// A context without a token (WithSubject) is not judged and the write stays.
+func ConfirmWrite(ctx context.Context, users UserLookup, rollback func(ctx context.Context) error) error {
+	err := RefuseNow(ctx, users)
+	if err == nil {
+		return nil
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rollbackTimeout)
+	defer cancel()
+	if rerr := rollback(rctx); rerr != nil && !errors.Is(rerr, storage.ErrNotFound) {
+		// A record already gone (the erasure's sweep got it) is the outcome
+		// wanted, not a failure.
+		return errors.Join(err, fmt.Errorf("%w: %w", ErrWriteNotRolledBack, rerr))
+	}
+	return err
+}
+
 // WithIssuedAt records, on the request context, the iat of the bearer token
 // that authenticated the request. The middlewares call it once the token has
 // passed Gate.Check, so that a write further down can judge the same token

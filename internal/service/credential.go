@@ -64,6 +64,20 @@ func (s *CredentialService) Store(ctx context.Context, tenantID domain.TenantID,
 		return nil, err
 	}
 
+	// Storage-level fence. The check above is only an admission check: an
+	// erasure (lifecycle cascade, account deletion) can advance the user's
+	// cut-off and sweep holder data between it and the Create above, which
+	// would then resurrect erased data. Re-read the cut-off now that the
+	// record is persisted; if the token is refused, take the record out again.
+	// See tokengate.ConfirmWrite for why this is sound without a transaction.
+	if err := tokengate.ConfirmWrite(ctx, s.store.Users(), func(rctx context.Context) error {
+		return s.store.Credentials().Delete(rctx, tenantID, req.HolderDID, req.CredentialIdentifier)
+	}); err != nil {
+		s.logger.Error("Credential write fenced out by a concurrent revocation", zap.Error(err),
+			zap.String("tenant_id", string(tenantID)), zap.Bool("left_behind", errors.Is(err, tokengate.ErrWriteNotRolledBack)))
+		return nil, err
+	}
+
 	s.logger.Info("Stored credential",
 		zap.String("tenant_id", string(tenantID)),
 		zap.String("credential_id", req.CredentialIdentifier))
@@ -134,12 +148,28 @@ func (s *CredentialService) Update(ctx context.Context, tenantID domain.TenantID
 		return nil, err
 	}
 
+	// Copy for the fence's rollback, taken before the fields change.
+	previous := *credential
+
 	// Update fields
 	credential.InstanceID = req.InstanceID
 	credential.SigCount = req.SigCount
 
 	if err := s.store.Credentials().Update(ctx, credential); err != nil {
 		s.logger.Error("Failed to update credential", zap.Error(err))
+		return nil, err
+	}
+
+	// Storage-level fence, as in Store. An update cannot resurrect an erased
+	// record (it is keyed by the existing record and does not upsert), but a
+	// revoked token must not change what it no longer may touch: when the
+	// cut-off advanced meanwhile, put the previous values back. If the
+	// erasure already removed the record there is nothing to restore.
+	if err := tokengate.ConfirmWrite(ctx, s.store.Users(), func(rctx context.Context) error {
+		return s.store.Credentials().Update(rctx, &previous)
+	}); err != nil {
+		s.logger.Error("Credential update fenced out by a concurrent revocation", zap.Error(err),
+			zap.String("tenant_id", string(tenantID)), zap.Bool("not_restored", errors.Is(err, tokengate.ErrWriteNotRolledBack)))
 		return nil, err
 	}
 

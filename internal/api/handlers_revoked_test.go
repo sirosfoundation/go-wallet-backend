@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -28,6 +29,11 @@ func TestAbortIfTokenRevoked_MapsStaleWriteTo401(t *testing.T) {
 		"stale":          storage.ErrStaleWrite,
 		"wrapped stale":  fmt.Errorf("update user: %w", storage.ErrStaleWrite),
 		"double wrapped": fmt.Errorf("svc: %w", fmt.Errorf("store: %w", storage.ErrStaleWrite)),
+		// A holder write that was fenced out but could not be rolled back is
+		// still a refusal to the caller (the left-behind record is logged).
+		"not rolled back": errors.Join(tokengate.ErrRevoked, fmt.Errorf("%w: store down", tokengate.ErrWriteNotRolledBack)),
+		// DeleteUser's cut-off compare-and-set lost to an independent revocation.
+		"delete cas": fmt.Errorf("%w: a lifecycle revocation landed during the deletion", tokengate.ErrRevoked),
 	}
 	for name, err := range cases {
 		t.Run(name, func(t *testing.T) {

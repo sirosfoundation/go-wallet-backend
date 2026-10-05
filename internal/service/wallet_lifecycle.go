@@ -639,6 +639,17 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	// the user, the one the request arrived on included: a deactivated
 	// wallet needs a new enrollment, and the session that deactivated it
 	// must not be able to write new wallet data afterwards.
+	//
+	// The cut-off is advanced HERE, before the first holder sweep, and not only
+	// by the EraseWalletData below: the holder-write fence (tokengate.
+	// ConfirmWrite) is sound only if every erasure advances the cut-off before
+	// it sweeps. ensureCutoff/cutOffTokens already set one at least as new as
+	// the revocation, but a token minted after that and before this sweep
+	// would still pass the fence and could write after the sweep. A failure
+	// stops the erasure before anything is deleted and is retryable.
+	if err := s.store.Users().InvalidateAuthBefore(ctx, userID, time.Now()); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return append(errs, fmt.Errorf("advance token cut-off before the holder-data sweep: %w", err))
+	}
 	for _, tid := range tenants {
 		errs = append(errs, s.eraseHolderData(ctx, tid, holder)...)
 	}
@@ -744,7 +755,7 @@ func (s *WalletLifecycleService) eraseHolderData(ctx context.Context, tid domain
 		errs = append(errs, fmt.Errorf("list credentials: %w", err))
 	}
 	for _, c := range creds {
-		if err := s.store.Credentials().Delete(ctx, tid, did, c.CredentialIdentifier); err != nil {
+		if err := s.store.Credentials().Delete(ctx, tid, did, c.CredentialIdentifier); err != nil && !errors.Is(err, storage.ErrNotFound) {
 			errs = append(errs, fmt.Errorf("delete credential %s: %w", c.CredentialIdentifier, err))
 		}
 	}
@@ -753,7 +764,7 @@ func (s *WalletLifecycleService) eraseHolderData(ctx context.Context, tid domain
 		errs = append(errs, fmt.Errorf("list presentations: %w", err))
 	}
 	for _, p := range pres {
-		if err := s.store.Presentations().Delete(ctx, tid, did, p.PresentationIdentifier); err != nil {
+		if err := s.store.Presentations().Delete(ctx, tid, did, p.PresentationIdentifier); err != nil && !errors.Is(err, storage.ErrNotFound) {
 			errs = append(errs, fmt.Errorf("delete presentation %s: %w", p.PresentationIdentifier, err))
 		}
 	}

@@ -707,7 +707,7 @@ func TestWalletLifecycle_RevokeAllAdvancesTheCutoffAfterTheSweep(t *testing.T) {
 	_, err = svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "again")
 	require.NoError(t, err)
 	again, _ := store.Users().GetByID(ctx, uid)
-	assert.Equal(t, fence+1, again.AuthFence, "only the idempotent erasure writes again")
+	assert.Equal(t, fence+2, again.AuthFence, "only the idempotent erasure writes again: its pre-sweep cut-off and the key-material erase")
 }
 
 func (s *failInstances) GetAllByUser(ctx context.Context, u domain.UserID) ([]*domain.WalletInstance, error) {
