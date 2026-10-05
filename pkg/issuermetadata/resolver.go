@@ -94,6 +94,25 @@ type Config struct {
 	// MetadataTypePreferSigned. New rejects any value ParseMetadataType does
 	// not know.
 	MetadataType MetadataType
+
+	// PreferSigned is the pre-MetadataType switch for the Accept header.
+	//
+	// Deprecated: use MetadataType. Kept so existing callers keep compiling.
+	//
+	// Precedence: a non-empty MetadataType always wins and PreferSigned is
+	// ignored. Only when MetadataType is empty and PreferSigned is non-nil is
+	// it mapped: true -> MetadataTypePreferSigned, false ->
+	// MetadataTypePreferUnsigned. Both unset gives the default,
+	// MetadataTypePreferSigned.
+	//
+	// Mapping note: the old flag only ordered the media types in a single
+	// request (false sent "application/json, application/jwt;q=0.9") and never
+	// retried. There is no exact equivalent: prefer-unsigned asks for
+	// application/json alone first and, only after a 4xx other than 429,
+	// retries once with application/jwt (where the old behaviour was a hard
+	// error). It keeps the unsigned preference and is strictly more tolerant,
+	// never less verified; a signed response is still verified.
+	PreferSigned *bool
 }
 
 // MetadataType is the metadata-representation policy of a Resolver.
@@ -218,6 +237,14 @@ type Resolver struct {
 func New(cfg Config) (*Resolver, error) {
 	if cfg.CacheTTL == 0 {
 		cfg.CacheTTL = 5 * time.Minute
+	}
+	if cfg.MetadataType == "" && cfg.PreferSigned != nil {
+		// Deprecated flag; see Config.PreferSigned for the precedence rule.
+		if *cfg.PreferSigned {
+			cfg.MetadataType = MetadataTypePreferSigned
+		} else {
+			cfg.MetadataType = MetadataTypePreferUnsigned
+		}
 	}
 	mt, err := ParseMetadataType(string(cfg.MetadataType))
 	if err != nil {

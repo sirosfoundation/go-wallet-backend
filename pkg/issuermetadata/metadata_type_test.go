@@ -203,3 +203,57 @@ func TestResolve_PreferModes_TerminalStatuses(t *testing.T) {
 		}
 	}
 }
+
+func TestNew_DeprecatedPreferSignedPrecedence(t *testing.T) {
+	yes, no := true, false
+	cases := []struct {
+		name string
+		cfg  Config
+		want MetadataType
+	}{
+		{"both unset -> default", Config{}, MetadataTypePreferSigned},
+		{"PreferSigned true -> prefer-signed", Config{PreferSigned: &yes}, MetadataTypePreferSigned},
+		{"PreferSigned false -> prefer-unsigned", Config{PreferSigned: &no}, MetadataTypePreferUnsigned},
+		{"MetadataType wins over true", Config{MetadataType: MetadataTypeRequireUnsigned, PreferSigned: &yes}, MetadataTypeRequireUnsigned},
+		{"MetadataType wins over false", Config{MetadataType: MetadataTypeRequireSigned, PreferSigned: &no}, MetadataTypeRequireSigned},
+		{"MetadataType any wins over false", Config{MetadataType: MetadataTypeAny, PreferSigned: &no}, MetadataTypeAny},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r, err := New(tc.cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if r.cfg.MetadataType != tc.want {
+				t.Errorf("effective MetadataType = %q, want %q", r.cfg.MetadataType, tc.want)
+			}
+		})
+	}
+	if _, err := New(Config{MetadataType: "bogus", PreferSigned: &yes}); err == nil {
+		t.Error("an invalid MetadataType must still be rejected when PreferSigned is set")
+	}
+}
+
+// A legacy Config{PreferSigned: &false} still compiles and drives the first
+// request's Accept header to application/json.
+func TestResolve_DeprecatedPreferSignedFalseAsksJSONFirst(t *testing.T) {
+	no := false
+	var got []string
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.Header.Get("Accept"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"credential_issuer":"` + server.URL + `"}`))
+	}))
+	defer server.Close()
+	r, err := New(Config{AllowHTTP: true, PreferSigned: &no})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.ResolveWithInfo(context.Background(), server.URL); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, []string{"application/json"}) {
+		t.Errorf("Accept sequence = %q", got)
+	}
+}
