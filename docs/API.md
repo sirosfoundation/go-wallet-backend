@@ -288,6 +288,57 @@ itself, so a session that outlived the change cannot mint a fresh token - and
 is re-checked for an established WebSocket session at every flow start, so it
 also holds across separate engine processes or instances.
 
+##### Erasure and requests already in flight
+
+A request the gate admitted just before a cut-off can still be running when
+the cut-off lands and the wallet is erased (instance revocation cascade, or
+`DELETE /user`). The backend closes that window for stored holder data with an
+ordering rule and a post-write check, not with a cross-collection transaction:
+
+1. **Every erasure advances the user's cut-off first and sweeps holder data
+   after it.** The lifecycle cascade advances the cut-off before its first
+   holder sweep (and again with the key-material erase). `DELETE /user` advances
+   it before its final sweep, and sweeps once more after the user record is
+   removed.
+2. **A holder write re-reads the cut-off after it is persisted.** Credential
+   create (`POST /storage/vc`) and presentation create (`POST /storage/vp`)
+   delete the record they just wrote and answer `401` if the token is now
+   refused (cut-off advanced, or the account has a deletion tombstone). A
+   credential update restores the previous values instead. If the re-read
+   itself fails the write is taken back too (fails closed, `5xx`).
+
+Why that is enough: take a write W, its re-read R, and an erasure's cut-off
+advance A followed by its sweep S. If R sees A, W removes itself. Otherwise
+R < A, so W < A < S and S, which lists after A, finds W and deletes it.
+`DELETE /user` additionally takes the cut-off with a compare-and-set
+(`UserStore.InvalidateAuthBeforeForToken`, one conditional write in the store):
+a lifecycle revocation that lands between the request's last check and the
+advance makes the deletion answer `401` and delete nothing irreversible, while
+a cut-off left by an earlier attempt of the same deletion (a replaced token)
+still lets a fresh login retry.
+
+What is **not** guaranteed:
+
+- If the compensating delete of a fenced-out write fails *and* the erasure's
+  sweep has already run, the record stays. The request still fails (`401`, and
+  the log line has `left_behind=true`), and the next erasure sweep removes it,
+  but until then the data is there. This needs two storage failures at once.
+- A token issued *after* the cut-off (a fresh login, which must pass so a failed
+  deletion can be retried) is not refused by the cut-off. `DELETE /user`'s last
+  sweep after the user record is removed covers its writes; a lifecycle
+  revocation has no such sweep and relies on a deactivated wallet refusing new
+  logins; a write by a token minted in the gap between that refusal taking
+  effect and the cut-off advance can stay.
+- Delete and update-in-place operations are not fenced beyond the admission
+  check: they cannot create data, so a late one removes or changes only
+  something the erasure is removing anyway.
+- Writes that do not go through the credential/presentation services (the
+  user record's own fields, passkeys, private data) are covered by the user
+  store's write fence (`ErrStaleWrite`), not by this post-write check.
+- The check relies on the store returning a record's write to a later read by
+  the same process (true of the memory store and of MongoDB reading from the
+  primary). A deployment reading from lagging secondaries can miss it.
+
 An engine deployed without the backend role in the same process enforces the
 cut-off only when persistent storage is configured; with memory storage it
 logs a warning at startup and relies on the token lifetime. There is no

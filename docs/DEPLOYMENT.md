@@ -568,6 +568,14 @@ one replica is supported, but these limits apply:
   concurrent erasure on another replica is revoked again (and the erasure
   re-run) instead of being kept. No external lock service is required.
 
+- **Holder-write fence.** A credential or presentation write re-reads the
+  user's token cut-off after it persists and removes itself if the token was
+  cut off meanwhile (`tokengate.ConfirmWrite`); every erasure advances the
+  cut-off before it sweeps. This is a store-level check, not an in-process lock,
+  so it holds across replicas as long as reads see the write (MongoDB: read
+  from the primary). See "Erasure and requests already in flight" in API.md for
+  the exact guarantee and its limits.
+
 #### Token revocation with several replicas
 
 Token revocation state is held **in memory, per process**: revoked access-token

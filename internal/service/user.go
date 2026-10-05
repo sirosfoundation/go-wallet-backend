@@ -391,6 +391,14 @@ var ErrDeletionIncomplete = errors.New("account deletion incomplete")
 //     refused by the gate even with the blacklist disabled, whichever later
 //     step fails; a token from a fresh login still passes and can repeat the
 //     request.
+//   - That advance is a compare-and-set against the request's token
+//     (UserStore.InvalidateAuthBeforeForToken): an independent revocation that
+//     landed since the token was admitted answers tokengate.ErrRevoked (401)
+//     with nothing irreversible done. A final holder sweep follows the advance
+//     and another follows the user's removal; they pair with the holder-write
+//     fence (tokengate.ConfirmWrite), and the sweep after the removal fails
+//     closed as ErrDeletionIncomplete, which the user cannot repeat (the
+//     account is gone) - an operator clears the remainder.
 //   - Still best-effort, logged only: pending WebAuthn challenges, invite
 //     used_by references, tenant-membership removal, and the token
 //     blacklist's RevokeUser. A failure of the final Users().Delete answers a
