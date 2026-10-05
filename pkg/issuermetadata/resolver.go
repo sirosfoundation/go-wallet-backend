@@ -108,7 +108,7 @@ type Config struct {
 	// Mapping note: the old flag only ordered the media types in a single
 	// request (false sent "application/json, application/jwt;q=0.9") and never
 	// retried. There is no exact equivalent: prefer-unsigned asks for
-	// application/json alone first and, only after a 4xx other than 429,
+	// application/json alone first and, only after an HTTP 406,
 	// retries once with application/jwt (where the old behaviour was a hard
 	// error). It keeps the unsigned preference and is strictly more tolerant,
 	// never less verified; a signed response is still verified.
@@ -128,12 +128,15 @@ const (
 	// issuer serves. No retry.
 	MetadataTypeAny MetadataType = "any"
 	// MetadataTypePreferSigned requests application/jwt first and, if the
-	// issuer answers with a 4xx other than 429 (406 from a compliant issuer
-	// without signed metadata; other 4xx from issuers that do not implement
-	// negotiation, #371), retries once with application/json.
+	// issuer answers 406 Not Acceptable (how a compliant issuer says it cannot
+	// serve the requested media type), retries once with application/json.
 	//
-	// The retry is triggered by that status alone. A signed response that is
-	// present but fails verification (bad signature, wrong typ/sub/iat,
+	// The retry is triggered by 406 alone. Every other status (400, 401, 403,
+	// 404, 415, 429, 5xx, redirects) is terminal: an issuer that rejects an
+	// Accept header with some other 4xx is not negotiating, and retrying would
+	// mask real errors. A 200 of the other form is accepted as is.
+	//
+	// A signed response that is present but fails verification (bad signature, wrong typ/sub/iat,
 	// untrusted signer, malformed JWS) is a hard error and is never answered
 	// by falling back to the unsigned document: that would let anyone able to
 	// corrupt the signed form downgrade the wallet to unauthenticated data.
@@ -145,7 +148,7 @@ const (
 	// fallback.
 	MetadataTypeRequireSigned MetadataType = "require-signed"
 	// MetadataTypePreferUnsigned is the mirror of prefer-signed: application/json
-	// first, one retry with application/jwt after a 4xx other than 429. A
+	// first, one retry with application/jwt after a 406 only. A
 	// signed response that fails verification is a hard error.
 	MetadataTypePreferUnsigned MetadataType = "prefer-unsigned"
 	// MetadataTypeRequireUnsigned requests only application/json and rejects an
@@ -399,10 +402,9 @@ func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*f
 			return result, nil
 		}
 		lastStatus = status
-		// 406 is how a compliant issuer says it lacks the requested form;
-		// other 4xx cover issuers that do not implement negotiation. 429 and
-		// everything else (3xx, 5xx) say nothing about the media type.
-		retryable := status >= 400 && status < 500 && status != http.StatusTooManyRequests
+		// 406 is how a compliant issuer says it lacks the requested form.
+		// Every other status (other 4xx, 429, 3xx, 5xx) is terminal.
+		retryable := status == http.StatusNotAcceptable
 		if !retryable || i == len(accepts)-1 {
 			break
 		}

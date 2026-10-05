@@ -616,35 +616,31 @@ func TestResolve_PreferUnsigned_RetriesSignedOn406(t *testing.T) {
 	}
 }
 
-// TestResolve_ClientError_RetriesOtherRepresentation verifies that with the
-// fallback on, any 4xx on the preferred representation (not just 406) triggers
-// one retry with the other media type (#371).
-func TestResolve_ClientError_RetriesOtherRepresentation(t *testing.T) {
-	for _, status := range []int{400, 401, 403, 404, 406, 415, 451} {
-		t.Run(http.StatusText(status), func(t *testing.T) {
-			var accepts []string
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				accepts = append(accepts, r.Header.Get("Accept"))
-				w.WriteHeader(status)
-			}))
-			defer server.Close()
+// TestResolve_NotAcceptable_RetriesOtherRepresentation verifies that with the
+// fallback on, a 406 on the preferred representation triggers exactly one retry
+// with the other media type (#371).
+func TestResolve_NotAcceptable_RetriesOtherRepresentation(t *testing.T) {
+	var accepts []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		accepts = append(accepts, r.Header.Get("Accept"))
+		w.WriteHeader(http.StatusNotAcceptable)
+	}))
+	defer server.Close()
 
-			r := newTestResolverPreferSigned(t)
-			if _, err := r.Resolve(context.Background(), server.URL); err == nil {
-				t.Errorf("expected error for %d on both representations", status)
-			}
-			if len(accepts) != 2 || accepts[0] != "application/jwt" || accepts[1] != "application/json" {
-				t.Errorf("a %d must trigger exactly one retry with the other media type; got %v", status, accepts)
-			}
-		})
+	r := newTestResolverPreferSigned(t)
+	if _, err := r.Resolve(context.Background(), server.URL); err == nil {
+		t.Error("expected error for 406 on both representations")
+	}
+	if len(accepts) != 2 || accepts[0] != "application/jwt" || accepts[1] != "application/json" {
+		t.Errorf("a 406 must trigger exactly one retry with the other media type; got %v", accepts)
 	}
 }
 
 // TestResolve_TerminalStatuses_NoRetry verifies statuses that are not a
-// representation problem are terminal even with the fallback on: 429 (a retry
-// only adds load) and 5xx.
+// 406 are terminal even with the fallback on: other 4xx (400, 401, 403, 404,
+// 415, 451), 429 (a retry only adds load), redirects without a Location, and 5xx.
 func TestResolve_TerminalStatuses_NoRetry(t *testing.T) {
-	for _, status := range []int{429, 500, 502, 503} {
+	for _, status := range []int{400, 401, 403, 404, 415, 429, 451, 500, 502, 503} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
 			var attempts int
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -665,13 +661,13 @@ func TestResolve_TerminalStatuses_NoRetry(t *testing.T) {
 }
 
 // TestResolve_ClientErrorThenOK_Succeeds verifies the point of the fallback: a
-// 4xx on the first representation followed by 200 on the second resolves.
-func TestResolve_ClientErrorThenOK_Succeeds(t *testing.T) {
+// 406 on the first representation followed by 200 on the second resolves.
+func TestResolve_NotAcceptableThenOK_Succeeds(t *testing.T) {
 	var attempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		attempts++
 		if r.Header.Get("Accept") == "application/jwt" {
-			w.WriteHeader(http.StatusForbidden)
+			w.WriteHeader(http.StatusNotAcceptable)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -1180,7 +1176,7 @@ func TestResolve_AcceptHeader(t *testing.T) {
 	resolver.Resolve(context.Background(), server.URL) //nolint:errcheck
 
 	// Default is prefer-signed: the first request advertises only
-	// application/jwt. Unsigned JSON is requested separately, only after a 4xx.
+	// application/jwt. Unsigned JSON is requested separately, only after a 406.
 	if acceptHeader != "application/jwt" {
 		t.Errorf("expected preferred Accept header application/jwt, got %q", acceptHeader)
 	}
@@ -1240,12 +1236,12 @@ func TestResolve_TrustEvaluatorError(t *testing.T) {
 }
 
 // The fallback is on by default (#371): a resolver built without saying so
-// retries the other media type after a 4xx.
+// retries the other media type after a 406.
 func TestResolve_FallbackOnByDefault(t *testing.T) {
 	var attempts int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		attempts++
-		w.WriteHeader(http.StatusBadRequest)
+		w.WriteHeader(http.StatusNotAcceptable)
 	}))
 	defer server.Close()
 
@@ -1255,6 +1251,6 @@ func TestResolve_FallbackOnByDefault(t *testing.T) {
 	}
 	_, _ = r.Resolve(context.Background(), server.URL)
 	if attempts != 2 {
-		t.Errorf("default must retry once after a 4xx; got %d requests", attempts)
+		t.Errorf("default must retry once after a 406; got %d requests", attempts)
 	}
 }

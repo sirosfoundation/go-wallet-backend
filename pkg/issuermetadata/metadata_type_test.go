@@ -40,6 +40,8 @@ const (
 	r406 reply = iota
 	r400
 	r500
+	r403
+	r404
 	rSigned   // valid application/jwt
 	rBadSig   // application/jwt whose signature does not verify
 	rUnsigned // plain JSON
@@ -59,6 +61,11 @@ func TestResolve_MetadataTypeMatrix(t *testing.T) {
 	signedOnly := behaviour{rSigned, r406, rSigned}
 	unsignedOnly := behaviour{r406, rUnsigned, rUnsigned}
 	jwtBadRequest := behaviour{r400, rUnsigned, rUnsigned}
+	jwtForbidden := behaviour{r403, rUnsigned, rUnsigned}
+	jwtNotFound := behaviour{r404, rUnsigned, rUnsigned}
+	jsonBadRequest := behaviour{rSigned, r400, rSigned}
+	jsonForbidden := behaviour{rSigned, r403, rSigned}
+	jsonNotFound := behaviour{rSigned, r404, rSigned}
 	badSigAndUnsigned := behaviour{rBadSig, rUnsigned, rBadSig}
 	badSigOnly := behaviour{rBadSig, r406, rBadSig}
 	ignoresAcceptUnsigned := behaviour{rUnsigned, rUnsigned, rUnsigned}
@@ -86,7 +93,9 @@ func TestResolve_MetadataTypeMatrix(t *testing.T) {
 		// prefer-signed.
 		{"prefer-signed/both", MetadataTypePreferSigned, compliantBoth, want{true, true, []string{jwtA}}},
 		{"prefer-signed/unsignedOnly-406", MetadataTypePreferSigned, unsignedOnly, want{true, false, []string{jwtA, jsonA}}},
-		{"prefer-signed/jwt-400", MetadataTypePreferSigned, jwtBadRequest, want{true, false, []string{jwtA, jsonA}}},
+		{"prefer-signed/jwt-400-terminal", MetadataTypePreferSigned, jwtBadRequest, want{false, false, []string{jwtA}}},
+		{"prefer-signed/jwt-403-terminal", MetadataTypePreferSigned, jwtForbidden, want{false, false, []string{jwtA}}},
+		{"prefer-signed/jwt-404-terminal", MetadataTypePreferSigned, jwtNotFound, want{false, false, []string{jwtA}}},
 		{"prefer-signed/none", MetadataTypePreferSigned, none, want{false, false, []string{jwtA, jsonA}}},
 		{"prefer-signed/badSig-no-downgrade", MetadataTypePreferSigned, badSigAndUnsigned, want{false, false, []string{jwtA}}},
 		{"prefer-signed/5xx-terminal", MetadataTypePreferSigned, down, want{false, false, []string{jwtA}}},
@@ -102,6 +111,9 @@ func TestResolve_MetadataTypeMatrix(t *testing.T) {
 		// prefer-unsigned.
 		{"prefer-unsigned/both", MetadataTypePreferUnsigned, compliantBoth, want{true, false, []string{jsonA}}},
 		{"prefer-unsigned/signedOnly-406", MetadataTypePreferUnsigned, signedOnly, want{true, true, []string{jsonA, jwtA}}},
+		{"prefer-unsigned/json-400-terminal", MetadataTypePreferUnsigned, jsonBadRequest, want{false, false, []string{jsonA}}},
+		{"prefer-unsigned/json-403-terminal", MetadataTypePreferUnsigned, jsonForbidden, want{false, false, []string{jsonA}}},
+		{"prefer-unsigned/json-404-terminal", MetadataTypePreferUnsigned, jsonNotFound, want{false, false, []string{jsonA}}},
 		{"prefer-unsigned/none", MetadataTypePreferUnsigned, none, want{false, false, []string{jsonA, jwtA}}},
 		{"prefer-unsigned/badSig-no-fallthrough", MetadataTypePreferUnsigned, behaviour{rBadSig, rBadSig, rBadSig}, want{false, false, []string{jsonA}}},
 		{"prefer-unsigned/badSigOnly", MetadataTypePreferUnsigned, badSigOnly, want{false, false, []string{jsonA, jwtA}}},
@@ -140,6 +152,10 @@ func TestResolve_MetadataTypeMatrix(t *testing.T) {
 					w.WriteHeader(http.StatusNotAcceptable)
 				case r400:
 					w.WriteHeader(http.StatusBadRequest)
+				case r403:
+					w.WriteHeader(http.StatusForbidden)
+				case r404:
+					w.WriteHeader(http.StatusNotFound)
 				case r500:
 					w.WriteHeader(http.StatusInternalServerError)
 				case rSigned, rBadSig:
@@ -186,10 +202,10 @@ func TestResolve_MetadataTypeMatrix(t *testing.T) {
 	}
 }
 
-// 429 and other non-4xx statuses never trigger the prefer-* fallback.
+// Only 406 triggers the prefer-* fallback; 429, 4xx and 5xx are terminal.
 func TestResolve_PreferModes_TerminalStatuses(t *testing.T) {
 	for _, mode := range []MetadataType{MetadataTypePreferSigned, MetadataTypePreferUnsigned} {
-		for _, status := range []int{429, 500, 503} {
+		for _, status := range []int{400, 401, 403, 404, 415, 429, 500, 503} {
 			var n int
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				n++

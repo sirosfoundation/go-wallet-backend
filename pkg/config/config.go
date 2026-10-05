@@ -291,9 +291,9 @@ type HTTPClientConfig struct {
 	// "prefer-signed" (default), "require-signed", "prefer-unsigned",
 	// "require-unsigned", "any". Each request carries one Accept value. A
 	// compliant issuer answers 406 when it cannot serve it.
-	// prefer-signed asks for application/jwt, and after a 4xx other than 429
-	// (406, or another 4xx from an issuer without content negotiation) retries
-	// once with application/json; prefer-unsigned is the mirror image. A signed
+	// prefer-signed asks for application/jwt, and after a 406 (and only a 406;
+	// every other status is terminal) retries once with application/json;
+	// prefer-unsigned is the mirror image. A signed
 	// response that is present but fails verification is always an error and
 	// never triggers the fallback. require-signed asks only for application/jwt
 	// and rejects unsigned metadata; require-unsigned asks only for
@@ -1914,7 +1914,7 @@ func defaultConfig() *Config {
 		},
 		HTTPClient: HTTPClientConfig{
 			Timeout:      30,                                              // 30 seconds default
-			MetadataType: string(issuermetadata.MetadataTypePreferSigned), // signed first, unsigned on 4xx
+			MetadataType: string(issuermetadata.MetadataTypePreferSigned), // signed first, unsigned on 406
 			// AllowPrivateIPs defaults to false — SSRF protection blocks private/loopback IPs.
 			// Set allow_private_ips: true in config when issuers are on internal networks.
 		},
