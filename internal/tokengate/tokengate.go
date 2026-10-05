@@ -157,6 +157,14 @@ func RefuseNow(ctx context.Context, users UserLookup) error {
 	return RefuseLoaded(ctx, cutoff)
 }
 
+// IssuedAtFrom returns the iat of the bearer token that authenticated the
+// request, as recorded by WithIssuedAt or WithSubject. ok is false for a
+// context without a token (an internal caller), which is not judged.
+func IssuedAtFrom(ctx context.Context) (time.Time, bool) {
+	t, ok := ctx.Value(issuedAtKey{}).(time.Time)
+	return t, ok
+}
+
 // WithIssuedAt records, on the request context, the iat of the bearer token
 // that authenticated the request. The middlewares call it once the token has
 // passed Gate.Check, so that a write further down can judge the same token

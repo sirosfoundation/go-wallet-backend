@@ -40,6 +40,16 @@ func (u *fenceHookUsers) InvalidateAuthBefore(ctx context.Context, id domain.Use
 	return nil
 }
 
+func (u *fenceHookUsers) InvalidateAuthBeforeForToken(ctx context.Context, id domain.UserID, t, iat time.Time) error {
+	if err := u.UserStore.InvalidateAuthBeforeForToken(ctx, id, t, iat); err != nil {
+		return err
+	}
+	if u.h.afterFence != nil {
+		u.h.afterFence(ctx)
+	}
+	return nil
+}
+
 // A write admitted before the cut-off lands after the first sweep and before
 // the cut-off is advanced. Account deletion must still leave no holder data.
 func TestDeleteUser_RemovesHolderDataWrittenByAnAlreadyAdmittedRequest(t *testing.T) {

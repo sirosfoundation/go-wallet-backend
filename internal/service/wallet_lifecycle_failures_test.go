@@ -152,6 +152,13 @@ func (s *failUsers) InvalidateAuthBefore(ctx context.Context, id domain.UserID, 
 	return s.UserStore.InvalidateAuthBefore(ctx, id, t)
 }
 
+func (s *failUsers) InvalidateAuthBeforeForToken(ctx context.Context, id domain.UserID, t, iat time.Time) error {
+	if err := s.f.err("users.InvalidateAuthBefore"); err != nil {
+		return err
+	}
+	return s.UserStore.InvalidateAuthBeforeForToken(ctx, id, t, iat)
+}
+
 type failUserTenants struct {
 	storage.UserTenantStore
 	f *failStore

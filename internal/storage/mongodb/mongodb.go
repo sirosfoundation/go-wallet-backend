@@ -480,6 +480,42 @@ func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, 
 	return nil
 }
 
+// cutoffNotRefusingFilter matches the user whose stored cut-off does not
+// refuse a token issued at tokenIssuedAt: unset, or earlier than the start of
+// the token's second (whole-second comparison, see tokengate.IssuedBeforeCutoff:
+// refused when iat.Unix() <= cutoff.Unix(), i.e. kept when cutoff < iat second).
+// A zero tokenIssuedAt adds no condition.
+func cutoffNotRefusingFilter(id domain.UserID, tokenIssuedAt time.Time) bson.M {
+	filter := bson.M{"_id.id": id.String()}
+	if !tokenIssuedAt.IsZero() {
+		filter["$or"] = bson.A{
+			bson.M{"auth_invalid_before": bson.M{"$lt": time.Unix(tokenIssuedAt.Unix(), 0)}},
+			bson.M{"auth_invalid_before": nil}, // unset or null (zero cut-off is omitted)
+		}
+	}
+	return filter
+}
+
+func (s *UserStore) InvalidateAuthBeforeForToken(ctx context.Context, id domain.UserID, t time.Time, tokenIssuedAt time.Time) error {
+	// One conditional UpdateOne: the check and the advance are a single atomic
+	// document write, so no independent cut-off can land between them.
+	result, err := s.collection.UpdateOne(ctx, cutoffNotRefusingFilter(id, tokenIssuedAt), mongo.Pipeline{cutoffStage(t, nil)})
+	if err != nil {
+		return fmt.Errorf("failed to set auth cut-off: %w", err)
+	}
+	if result.MatchedCount == 0 {
+		n, err := s.collection.CountDocuments(ctx, bson.M{"_id.id": id.String()})
+		if err != nil {
+			return fmt.Errorf("failed to set auth cut-off: %w", err)
+		}
+		if n == 0 {
+			return storage.ErrNotFound
+		}
+		return storage.ErrStaleWrite
+	}
+	return nil
+}
+
 func (s *UserStore) EraseWalletData(ctx context.Context, id domain.UserID, fence time.Time) error {
 	// One pipeline update: the erasure and the fence advance land together,
 	// so no record loaded before this write can pass Update's stale check.

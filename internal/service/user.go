@@ -268,6 +268,13 @@ func refuseIfCutOff(ctx context.Context, user *domain.User) error {
 	return tokengate.RefuseLoaded(ctx, user.AuthInvalidBefore)
 }
 
+// requestIssuedAt is the iat of the request's bearer token, or the zero time
+// for a context without one (an internal caller), which the store does not judge.
+func requestIssuedAt(ctx context.Context) time.Time {
+	t, _ := tokengate.IssuedAtFrom(ctx)
+	return t
+}
+
 // UpdatePrivateData updates user's private data with optimistic locking
 func (s *UserService) UpdatePrivateData(ctx context.Context, userID domain.UserID, data []byte, ifMatch string) (string, error) {
 	user, err := s.store.Users().GetByID(ctx, userID)
@@ -634,29 +641,23 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// the cut-off only ever moves forward, so repeating it is idempotent. A
 	// record that vanished meanwhile (ErrNotFound) is already covered by the
 	// tombstone.
-	// Re-judge the request's token against the cut-off as it stands now,
-	// immediately before this call advances it. The check at the top ran
-	// before the sweep and the session cleaner, which take time; a lifecycle
-	// revocation (instance revoked or deactivated, a logout-everywhere) that
-	// landed meanwhile advanced the cut-off independently, and a token
-	// admitted before it must not go on to the irreversible phase. The read
-	// has to come before the advance below and not after: this deletion's own
-	// advance refuses the caller's token by design, so afterwards a cut-off
-	// from an independent event can no longer be told apart from ours. Before
-	// it, the only cut-off that can be newer than the token is one somebody
-	// else set (or a previous attempt of this deletion, whose token the
-	// caller replaced with a fresh login, which passes). An unreadable record
-	// fails closed and retryable; a vanished one is covered by the tombstone.
-	cur, err := s.store.Users().GetByID(ctx, userID)
-	switch {
-	case err == nil:
-		if err := refuseIfCutOff(ctx, cur); err != nil {
-			return err
+	// The advance is a compare-and-set on the stored cut-off, judged against
+	// the request's token (UserStore.InvalidateAuthBeforeForToken). The check
+	// at the top ran before the sweep and the session cleaner, which take
+	// time; a lifecycle revocation (instance revoked or deactivated, a
+	// logout-everywhere) that landed meanwhile advanced the cut-off
+	// independently, and a token admitted before it must not go on to the
+	// irreversible phase. Reading the cut-off and then advancing it
+	// unconditionally would leave a window between the two for such a
+	// revocation; the store checks and advances in one atomic step instead, so
+	// there is none. A cut-off left by an earlier attempt of this deletion
+	// belongs to a replaced token, so a fresh login (iat after it) passes.
+	// A stale answer is a revoked token (401), and nothing has been advanced
+	// or deleted irreversibly. A vanished record is covered by the tombstone.
+	if err := s.store.Users().InvalidateAuthBeforeForToken(ctx, userID, s.now().UTC(), requestIssuedAt(ctx)); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		if errors.Is(err, storage.ErrStaleWrite) {
+			return fmt.Errorf("%w: a lifecycle revocation landed during the deletion", tokengate.ErrRevoked)
 		}
-	case !errors.Is(err, storage.ErrNotFound):
-		return fmt.Errorf("%w: re-read token cut-off: %w", ErrDeletionIncomplete, err)
-	}
-	if err := s.store.Users().InvalidateAuthBefore(ctx, userID, s.now().UTC()); err != nil && !errors.Is(err, storage.ErrNotFound) {
 		s.logger.Error("Account deletion incomplete: token cut-off could not be advanced",
 			zap.Error(err), zap.String("user_id", userID.String()))
 		return fmt.Errorf("%w: advance token cut-off: %w", ErrDeletionIncomplete, err)

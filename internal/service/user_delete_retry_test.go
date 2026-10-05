@@ -163,6 +163,13 @@ func (u *failingCutoffUsers) InvalidateAuthBefore(ctx context.Context, id domain
 	return u.UserStore.InvalidateAuthBefore(ctx, id, t)
 }
 
+func (u *failingCutoffUsers) InvalidateAuthBeforeForToken(ctx context.Context, id domain.UserID, t, iat time.Time) error {
+	if u.f.fail {
+		return errors.New("user store is down")
+	}
+	return u.UserStore.InvalidateAuthBeforeForToken(ctx, id, t, iat)
+}
+
 // With the token blacklist disabled the gate is the only thing standing
 // between an incompletely deleted account and its old bearer tokens. The
 // cut-off is on the record before the irreversible phase, so old tokens are

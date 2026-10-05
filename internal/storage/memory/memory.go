@@ -458,6 +458,20 @@ func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, 
 	return nil
 }
 
+func (s *UserStore) InvalidateAuthBeforeForToken(ctx context.Context, id domain.UserID, t time.Time, tokenIssuedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, exists := s.data[id.String()]
+	if !exists {
+		return storage.ErrNotFound
+	}
+	if !tokenIssuedAt.IsZero() && !user.AuthInvalidBefore.IsZero() && tokenIssuedAt.Unix() <= user.AuthInvalidBefore.Unix() {
+		return storage.ErrStaleWrite
+	}
+	advanceCutoff(user, t)
+	return nil
+}
+
 // advanceCutoff moves the cut-off forward, ignoring a delayed older event so
 // it cannot roll one back. The fence counter always advances, so every
 // lifecycle write invalidates records loaded before it.

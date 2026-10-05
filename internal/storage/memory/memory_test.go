@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -2567,5 +2568,55 @@ func TestUserStore_FenceRefusesStaleCopyAtEqualCutoff(t *testing.T) {
 	fresh.DID = "did:new"
 	if err := store.Users().Update(ctx, fresh); err != nil {
 		t.Fatalf("a record loaded after the writes updates fine: %v", err)
+	}
+}
+
+func TestUserStore_InvalidateAuthBeforeForToken(t *testing.T) {
+	store := NewStore()
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:x"}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().Truncate(time.Second)
+	tokenIat := base.Add(-time.Minute)
+
+	// No cut-off yet: the token is not refused, so the advance happens.
+	if err := store.Users().InvalidateAuthBeforeForToken(ctx, uid, base, tokenIat); err != nil {
+		t.Fatalf("first advance: %v", err)
+	}
+	u, _ := store.Users().GetByID(ctx, uid)
+	if !u.AuthInvalidBefore.Equal(base) || u.AuthFence != 1 {
+		t.Fatalf("cut-off %v fence %d", u.AuthInvalidBefore, u.AuthFence)
+	}
+
+	// The cut-off now refuses the same token (an independent revocation landed
+	// since it was admitted): nothing is written.
+	later := base.Add(time.Hour)
+	if err := store.Users().InvalidateAuthBeforeForToken(ctx, uid, later, tokenIat); !errors.Is(err, storage.ErrStaleWrite) {
+		t.Fatalf("want ErrStaleWrite, got %v", err)
+	}
+	u, _ = store.Users().GetByID(ctx, uid)
+	if !u.AuthInvalidBefore.Equal(base) || u.AuthFence != 1 {
+		t.Fatalf("refused call must not write: %v fence %d", u.AuthInvalidBefore, u.AuthFence)
+	}
+
+	// Same second as the cut-off is refused too (whole-second comparison).
+	if err := store.Users().InvalidateAuthBeforeForToken(ctx, uid, later, base.Add(300*time.Millisecond)); !errors.Is(err, storage.ErrStaleWrite) {
+		t.Fatalf("same-second token: want ErrStaleWrite, got %v", err)
+	}
+
+	// A fresh token (next second) passes, as after a retry of a deletion.
+	if err := store.Users().InvalidateAuthBeforeForToken(ctx, uid, later, base.Add(time.Second)); err != nil {
+		t.Fatalf("fresh token: %v", err)
+	}
+
+	// No token to judge: unconditional.
+	if err := store.Users().InvalidateAuthBeforeForToken(ctx, uid, later.Add(time.Hour), time.Time{}); err != nil {
+		t.Fatalf("zero iat: %v", err)
+	}
+
+	if err := store.Users().InvalidateAuthBeforeForToken(ctx, domain.NewUserID(), later, tokenIat); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("unknown user: want ErrNotFound, got %v", err)
 	}
 }

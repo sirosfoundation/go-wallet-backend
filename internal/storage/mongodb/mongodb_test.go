@@ -1191,3 +1191,48 @@ func TestUserStore_DeletionTombstones(t *testing.T) {
 	_, err = users.GetDeletionTombstone(ctx, id)
 	require.ErrorIs(t, err, storage.ErrNotFound)
 }
+
+// The filter is what makes the compare-and-set atomic, so its shape is tested
+// without a database: whole-second comparison against the token's iat, unset
+// cut-off matches, and no iat adds no condition.
+func TestCutoffNotRefusingFilter(t *testing.T) {
+	uid := domain.NewUserID()
+	iat := time.Unix(1_700_000_000, 700_000_000)
+
+	f := cutoffNotRefusingFilter(uid, iat)
+	assert.Equal(t, uid.String(), f["_id.id"])
+	or, ok := f["$or"].(bson.A)
+	require.True(t, ok)
+	require.Len(t, or, 2)
+	assert.Equal(t, bson.M{"auth_invalid_before": bson.M{"$lt": time.Unix(1_700_000_000, 0)}}, or[0])
+	assert.Equal(t, bson.M{"auth_invalid_before": nil}, or[1])
+
+	assert.NotContains(t, cutoffNotRefusingFilter(uid, time.Time{}), "$or")
+}
+
+func TestUserStore_InvalidateAuthBeforeForToken(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:x"}))
+	base := time.Now().Truncate(time.Second)
+	tokenIat := base.Add(-time.Minute)
+
+	require.NoError(t, store.Users().InvalidateAuthBeforeForToken(ctx, uid, base, tokenIat), "no cut-off yet (field unset)")
+	u, err := store.Users().GetByID(ctx, uid)
+	require.NoError(t, err)
+	assert.True(t, u.AuthInvalidBefore.Equal(base))
+	assert.EqualValues(t, 1, u.AuthFence)
+
+	later := base.Add(time.Hour)
+	assert.ErrorIs(t, store.Users().InvalidateAuthBeforeForToken(ctx, uid, later, tokenIat), storage.ErrStaleWrite)
+	assert.ErrorIs(t, store.Users().InvalidateAuthBeforeForToken(ctx, uid, later, base.Add(300*time.Millisecond)), storage.ErrStaleWrite, "same second")
+	u, err = store.Users().GetByID(ctx, uid)
+	require.NoError(t, err)
+	assert.True(t, u.AuthInvalidBefore.Equal(base), "a refused call writes nothing")
+	assert.EqualValues(t, 1, u.AuthFence)
+
+	require.NoError(t, store.Users().InvalidateAuthBeforeForToken(ctx, uid, later, base.Add(time.Second)), "fresh token")
+	require.NoError(t, store.Users().InvalidateAuthBeforeForToken(ctx, uid, later.Add(time.Hour), time.Time{}), "no token: unconditional")
+	assert.ErrorIs(t, store.Users().InvalidateAuthBeforeForToken(ctx, domain.NewUserID(), later, tokenIat), storage.ErrNotFound)
+}

@@ -20,7 +20,8 @@ var (
 	// again (a different generation). Nothing was written. A record that does
 	// not exist, or belongs to another tenant, still answers ErrNotFound.
 	ErrBindingChanged = errors.New("wallet instance binding changed")
-	// ErrStaleWrite is returned by UserStore.Update when the stored record's
+	// ErrStaleWrite is returned by UserStore.Update (and by
+	// UserStore.InvalidateAuthBeforeForToken) when the stored record's
 	// lifecycle cut-off (User.AuthInvalidBefore) advanced after the caller
 	// loaded the record: writing the stale copy back would undo a wallet
 	// suspension/revocation. Callers reload and re-check the lifecycle state.
@@ -125,6 +126,19 @@ type UserStore interface {
 	// moves forward, so a delayed older event cannot roll it back. Touches no
 	// other field.
 	InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error
+
+	// InvalidateAuthBeforeForToken is InvalidateAuthBefore made conditional on
+	// the token it acts for: a compare-and-set, atomic in the store. It
+	// advances the cut-off to t only while the stored cut-off does not already
+	// refuse a token issued at tokenIssuedAt (stored cut-off, in whole seconds,
+	// earlier than tokenIssuedAt's second - the comparison tokengate
+	// .IssuedBeforeCutoff makes). Otherwise an independent revocation has
+	// landed since the caller's token was admitted: nothing is written and
+	// ErrStaleWrite is returned. A zero tokenIssuedAt means the caller has no
+	// token to judge (an internal caller) and the call is unconditional. A
+	// cut-off left by an earlier attempt of the same operation belongs to a
+	// token the caller has since replaced, so a fresh token passes.
+	InvalidateAuthBeforeForToken(ctx context.Context, id domain.UserID, t time.Time, tokenIssuedAt time.Time) error
 
 	// EraseWalletData erases the user's wallet key material - PrivateData,
 	// PrivateDataETag and Keys - and, in the same write, advances the auth
