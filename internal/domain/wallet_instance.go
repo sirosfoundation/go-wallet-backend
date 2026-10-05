@@ -38,6 +38,16 @@ const (
 // has nothing left to use it.
 func (s InstanceStatus) IsLive() bool { return s == InstanceStatusActive }
 
+// IsKnownNonLive reports whether s is a status that positively means "this
+// instance cannot be used": revoked, or the legacy suspended state. It is not
+// the complement of IsLive. An unknown or corrupted value is neither live nor
+// known non-live, and a decision that destroys data or declares the wallet
+// deactivated must not be taken on it: those callers use this instead of
+// !IsLive and fail closed on anything else.
+func (s InstanceStatus) IsKnownNonLive() bool {
+	return s == InstanceStatusRevoked || s == InstanceStatusLegacySuspended
+}
+
 // ErrInvalidStatusTransition is returned when a status transition is not allowed.
 var ErrInvalidStatusTransition = errors.New("invalid status transition")
 

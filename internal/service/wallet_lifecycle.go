@@ -541,6 +541,13 @@ func (s *WalletLifecycleService) cascadeLocked(ctx context.Context, tenantID dom
 		if other.Status.IsLive() {
 			return s.incomplete(userID, errs) // the wallet still has a usable instance
 		}
+		if !other.Status.IsKnownNonLive() {
+			// Neither live nor known to be dead: an unrecognized or corrupted
+			// status. Declaring the wallet deactivated on it could erase data
+			// that instance still needs, so fail closed.
+			errs = append(errs, fmt.Errorf("instance %s has unrecognized status %q: not erasing", other.ID, other.Status))
+			return s.incomplete(userID, errs)
+		}
 	}
 	errs = append(errs, s.eraseWalletData(ctx, tenantID, userID)...)
 	return s.incomplete(userID, errs)
@@ -724,7 +731,8 @@ func (s *WalletLifecycleService) userTenants(ctx context.Context, userID domain.
 }
 
 // liveInstanceIn reports whether the user still has a non-revoked wallet
-// instance in any of tenants other than exclude. A listing failure is
+// instance in any of tenants other than exclude. A listing failure, and an
+// instance whose status is neither live nor a known non-live one, is
 // recorded in errs and counts as "live" (fail closed: keep the data).
 func (s *WalletLifecycleService) liveInstanceIn(ctx context.Context, tenants []domain.TenantID, exclude domain.TenantID, userID domain.UserID, errs *[]error) bool {
 	for _, tid := range tenants {
@@ -738,6 +746,10 @@ func (s *WalletLifecycleService) liveInstanceIn(ctx context.Context, tenants []d
 		}
 		for _, inst := range instances {
 			if inst.Status.IsLive() {
+				return true
+			}
+			if !inst.Status.IsKnownNonLive() {
+				*errs = append(*errs, fmt.Errorf("instance %s in tenant %s has unrecognized status %q: not erasing", inst.ID, tid, inst.Status))
 				return true
 			}
 		}

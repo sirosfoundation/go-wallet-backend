@@ -72,6 +72,26 @@ func TestCheckWalletLifecycle(t *testing.T) {
 			"a revoked instance this passkey is not linked to must not block the login")
 	})
 
+	// An unrecognized status must fail closed: the login is refused, but it
+	// is not reported as a deactivated wallet (nothing established that),
+	// and it is never treated as enrollment or as a live instance.
+	t.Run("unknown status instance: refused, not reported as deactivated", func(t *testing.T) {
+		s := &WebAuthnService{store: memory.NewStore()}
+		seedRawInstance(t, s.store, domain.DefaultTenantID, "i1", userID, "pk-1", unknownInstanceStatus)
+		err := s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1")
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrWalletDeactivated)
+		assert.NotErrorIs(t, err, ErrWalletInstanceRevoked)
+	})
+
+	t.Run("unknown status linked to this passkey beside an active one: refused", func(t *testing.T) {
+		s := &WebAuthnService{store: memory.NewStore()}
+		seedRawInstance(t, s.store, domain.DefaultTenantID, "i1", userID, "pk-1", unknownInstanceStatus)
+		seedLifecycleInstance(t, s, "i2", userID, "pk-2", domain.InstanceStatusActive)
+		assert.Error(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1"))
+		assert.NoError(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-2"))
+	})
+
 	t.Run("every instance revoked: wallet deactivated, any passkey refused", func(t *testing.T) {
 		s := &WebAuthnService{store: memory.NewStore()}
 		seedLifecycleInstance(t, s, "i1", userID, "", domain.InstanceStatusRevoked)

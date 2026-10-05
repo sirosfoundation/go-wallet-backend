@@ -2561,9 +2561,12 @@ func (s *WebAuthnService) checkWalletLifecycle(ctx context.Context, tenantID dom
 	// than letting store ordering decide.
 	anyLive := false
 	linkedRevoked := false
+	var unknown *domain.WalletInstance
 	for _, inst := range instances {
 		if inst.Status.IsLive() {
 			anyLive = true
+		} else if !inst.Status.IsKnownNonLive() {
+			unknown = inst
 		}
 		if inst.CredentialID == "" || inst.CredentialID != credentialID {
 			continue
@@ -2573,6 +2576,12 @@ func (s *WebAuthnService) checkWalletLifecycle(ctx context.Context, tenantID dom
 		}
 	}
 	if !anyLive {
+		if unknown != nil {
+			// An unrecognized status is not evidence that the wallet is
+			// deactivated: refuse the login, but without claiming a
+			// lifecycle state nobody established.
+			return fmt.Errorf("check wallet lifecycle: instance %s has unrecognized status %q", unknown.ID, unknown.Status)
+		}
 		return ErrWalletDeactivated
 	}
 	if linkedRevoked {
