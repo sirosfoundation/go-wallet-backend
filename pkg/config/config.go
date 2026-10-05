@@ -15,6 +15,8 @@ import (
 
 	"github.com/kelseyhightower/envconfig"
 	"gopkg.in/yaml.v3"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 )
 
 // Config represents the application configuration
@@ -284,19 +286,25 @@ type HTTPClientConfig struct {
 	// Env: WALLET_HTTP_CLIENT_ALLOW_HTTP
 	AllowHTTP bool `yaml:"allow_http" envconfig:"ALLOW_HTTP"`
 
-	// MetadataFallbackOn4xx enables a workaround for non-compliant OpenID4VCI
-	// issuers that answer the issuer-metadata resolver's preferred Accept with
-	// a 4xx (406, but also 400, 404, 415, ...) instead of serving an acceptable
-	// representation: the resolver retries once with the alternate media type
-	// (JSON<->JWT). HTTP 429 is never retried this way. It only triggers after
-	// a failed first attempt, at the cost of one extra request to an issuer
-	// that really is down or missing. Default: true. Set false for strict
-	// content negotiation, where any non-200 is terminal.
-	// Env: WALLET_HTTP_CLIENT_METADATA_FALLBACK_ON_4XX
+	// MetadataType selects which representation of OpenID4VCI issuer metadata
+	// the wallet requests and accepts (OpenID4VCI 12.2.2). One of:
+	// "prefer-signed" (default), "require-signed", "prefer-unsigned",
+	// "require-unsigned", "any". Each request carries one Accept value. A
+	// compliant issuer answers 406 when it cannot serve it.
+	// prefer-signed asks for application/jwt, and after a 4xx other than 429
+	// (406, or another 4xx from an issuer without content negotiation) retries
+	// once with application/json; prefer-unsigned is the mirror image. A signed
+	// response that is present but fails verification is always an error and
+	// never triggers the fallback. require-signed asks only for application/jwt
+	// and rejects unsigned metadata; require-unsigned asks only for
+	// application/json and rejects application/jwt; neither falls back. any
+	// sends one request accepting both and takes what the issuer serves.
+	// Unknown values are rejected at startup.
+	// Env: WALLET_HTTP_CLIENT_METADATA_TYPE
 	// Only the wallet server builds an issuer-metadata resolver; the registry
 	// server shares this struct but never reads the field (docs:"wallet-only"
 	// keeps it out of the registry reference).
-	MetadataFallbackOn4xx bool `yaml:"metadata_fallback_on_4xx" envconfig:"METADATA_FALLBACK_ON_4XX" docs:"wallet-only"`
+	MetadataType string `yaml:"metadata_type" envconfig:"METADATA_TYPE" docs:"wallet-only"`
 
 	// TrustedIdPHosts lists hostnames of operator-configured OIDC identity
 	// providers that may resolve to private/loopback/link-local addresses.
@@ -1905,8 +1913,8 @@ func defaultConfig() *Config {
 			},
 		},
 		HTTPClient: HTTPClientConfig{
-			Timeout:               30,   // 30 seconds default
-			MetadataFallbackOn4xx: true, // retry the other media type on a 4xx (#371)
+			Timeout:      30,                                              // 30 seconds default
+			MetadataType: string(issuermetadata.MetadataTypePreferSigned), // signed first, unsigned on 4xx
 			// AllowPrivateIPs defaults to false — SSRF protection blocks private/loopback IPs.
 			// Set allow_private_ips: true in config when issuers are on internal networks.
 		},
@@ -2211,6 +2219,10 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("wallet_provider.attestation.status_list.maintenance_period_seconds (%d) is below the 31-day (%d) minimum CS-04 §7.2.2 requires to still be remaining at presentation",
 				c.WalletProvider.Attestation.StatusList.MaintenancePeriodSeconds, StatusListRefMinMaintenanceSeconds)
 		}
+	}
+
+	if _, err := issuermetadata.ParseMetadataType(c.HTTPClient.MetadataType); err != nil {
+		return fmt.Errorf("http_client.metadata_type: %w", err)
 	}
 
 	if err := c.Presentation.DCQLConsentCheck.validate(); err != nil {

@@ -406,11 +406,10 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 	// the backend provider, or when resolution is disabled on the backend).
 	metadataResolver := sharedResolver
 	if metadataResolver == nil {
-		fallbackOn4xx := cfg.HTTPClient.MetadataFallbackOn4xx
 		r, err := issuermetadata.New(issuermetadata.Config{
-			HTTPClient:    cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
-			AllowHTTP:     cfg.HTTPClient.AllowsPlaintext(),
-			FallbackOn4xx: &fallbackOn4xx,
+			HTTPClient:   cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
+			AllowHTTP:    cfg.HTTPClient.AllowsPlaintext(),
+			MetadataType: issuermetadata.MetadataType(cfg.HTTPClient.MetadataType), // validated by Config.Validate and New
 		})
 		if err != nil {
 			return nil, fmt.Errorf("creating issuer metadata resolver: %w", err)
@@ -556,11 +555,10 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 	// so that a startup failure here does not affect deployments that don't use it.
 	var metadataResolver *issuermetadata.Resolver
 	if cfg.AuthZENProxy.Enabled && cfg.AuthZENProxy.AllowResolution {
-		fallbackOn4xx := cfg.HTTPClient.MetadataFallbackOn4xx
 		r, err := issuermetadata.New(issuermetadata.Config{
-			HTTPClient:    cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
-			AllowHTTP:     cfg.HTTPClient.AllowsPlaintext(),
-			FallbackOn4xx: &fallbackOn4xx,
+			HTTPClient:   cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
+			AllowHTTP:    cfg.HTTPClient.AllowsPlaintext(),
+			MetadataType: issuermetadata.MetadataType(cfg.HTTPClient.MetadataType), // validated by Config.Validate and New
 		})
 		if err != nil {
 			if closeErr := store.Close(); closeErr != nil {

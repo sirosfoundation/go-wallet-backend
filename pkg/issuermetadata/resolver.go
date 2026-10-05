@@ -89,18 +89,92 @@ type Config struct {
 	// cryptographic signature verification is performed (no trust decision).
 	TrustEvaluator TrustEvaluator
 
-	// PreferSigned controls whether the resolver sends Accept headers
-	// preferring signed (application/jwt) responses. Default: true.
-	PreferSigned *bool
+	// MetadataType selects which representation of the issuer metadata the
+	// resolver asks for and accepts (OpenID4VCI §12.2.2). Empty means
+	// MetadataTypePreferSigned. New rejects any value ParseMetadataType does
+	// not know.
+	MetadataType MetadataType
+}
 
-	// FallbackOn4xx enables a workaround for non-compliant issuers that answer
-	// the preferred Accept with a 4xx (406 Not Acceptable, but also 400, 404,
-	// 415, ... some servers only serve what their Accept list names) instead of
-	// serving an acceptable representation: the resolver retries once with the
-	// alternate media type. HTTP 429 is never retried this way. Default: true
-	// when nil (set false for strict content negotiation, where any non-200
-	// is terminal).
-	FallbackOn4xx *bool
+// MetadataType is the metadata-representation policy of a Resolver.
+//
+// Each request carries a single Accept value (no q-weights, which not every
+// issuer honours); a policy with a preference issues the requests in order.
+// A compliant issuer that cannot serve the requested media type answers 406.
+type MetadataType string
+
+const (
+	// MetadataTypeAny sends one request accepting both media types
+	// (Accept: application/jwt, application/json) and takes whichever the
+	// issuer serves. No retry.
+	MetadataTypeAny MetadataType = "any"
+	// MetadataTypePreferSigned requests application/jwt first and, if the
+	// issuer answers with a 4xx other than 429 (406 from a compliant issuer
+	// without signed metadata; other 4xx from issuers that do not implement
+	// negotiation, #371), retries once with application/json.
+	//
+	// The retry is triggered by that status alone. A signed response that is
+	// present but fails verification (bad signature, wrong typ/sub/iat,
+	// untrusted signer, malformed JWS) is a hard error and is never answered
+	// by falling back to the unsigned document: that would let anyone able to
+	// corrupt the signed form downgrade the wallet to unauthenticated data.
+	// A 200 carrying unsigned JSON (the issuer ignoring Accept) is accepted.
+	MetadataTypePreferSigned MetadataType = "prefer-signed"
+	// MetadataTypeRequireSigned requests only application/jwt and accepts only
+	// signed metadata (an application/jwt body, or JSON whose signed_metadata
+	// verifies). Any non-200, and any unsigned 200, is an error; never a
+	// fallback.
+	MetadataTypeRequireSigned MetadataType = "require-signed"
+	// MetadataTypePreferUnsigned is the mirror of prefer-signed: application/json
+	// first, one retry with application/jwt after a 4xx other than 429. A
+	// signed response that fails verification is a hard error.
+	MetadataTypePreferUnsigned MetadataType = "prefer-unsigned"
+	// MetadataTypeRequireUnsigned requests only application/json and rejects an
+	// application/jwt response. Any non-200 is an error; never a fallback.
+	// A legacy signed_metadata field inside the JSON, if present, is still
+	// verified and a failure is an error.
+	MetadataTypeRequireUnsigned MetadataType = "require-unsigned"
+)
+
+// MetadataTypes lists every valid MetadataType value.
+var MetadataTypes = []MetadataType{
+	MetadataTypeAny, MetadataTypePreferSigned, MetadataTypeRequireSigned,
+	MetadataTypePreferUnsigned, MetadataTypeRequireUnsigned,
+}
+
+// ParseMetadataType maps s (case-sensitive) to a MetadataType; the empty string
+// is the default, MetadataTypePreferSigned. Unknown values are an error.
+func ParseMetadataType(s string) (MetadataType, error) {
+	if s == "" {
+		return MetadataTypePreferSigned, nil
+	}
+	for _, t := range MetadataTypes {
+		if string(t) == s {
+			return t, nil
+		}
+	}
+	names := make([]string, len(MetadataTypes))
+	for i, t := range MetadataTypes {
+		names[i] = string(t)
+	}
+	return "", fmt.Errorf("invalid metadata type %q: must be one of %s", s, strings.Join(names, ", "))
+}
+
+// accepts returns the Accept value of each request stage, in order.
+func (t MetadataType) accepts() []string {
+	const jwt, js = "application/jwt", "application/json"
+	switch t {
+	case MetadataTypeAny:
+		return []string{jwt + ", " + js}
+	case MetadataTypeRequireSigned:
+		return []string{jwt}
+	case MetadataTypePreferUnsigned:
+		return []string{js, jwt}
+	case MetadataTypeRequireUnsigned:
+		return []string{js}
+	default: // prefer-signed
+		return []string{jwt, js}
+	}
 }
 
 type cachedEntry struct {
@@ -145,6 +219,11 @@ func New(cfg Config) (*Resolver, error) {
 	if cfg.CacheTTL == 0 {
 		cfg.CacheTTL = 5 * time.Minute
 	}
+	mt, err := ParseMetadataType(string(cfg.MetadataType))
+	if err != nil {
+		return nil, err
+	}
+	cfg.MetadataType = mt
 
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
@@ -274,53 +353,30 @@ func (r *Resolver) validateURL(issuerURL string) error {
 	return nil
 }
 
-// preferSigned returns whether to prefer signed metadata in Accept headers.
-func (r *Resolver) preferSigned() bool {
-	if r.cfg.PreferSigned != nil {
-		return *r.cfg.PreferSigned
-	}
-	return true
-}
-
-// fallbackOn4xx reports whether a 4xx on the preferred Accept should trigger a
-// retry with the alternate media type.
-func (r *Resolver) fallbackOn4xx() bool {
-	if r.cfg.FallbackOn4xx != nil {
-		return *r.cfg.FallbackOn4xx
-	}
-	return true
-}
-
 func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*fetchResult, error) {
-	// Content negotiation per OpenID4VCI §12.2.2. When preferring signed
-	// metadata, some issuers reject the application/jwt Accept with a 4xx
-	// instead of falling back to JSON (and the reverse when unsigned is
-	// preferred); retry once requesting the other representation in that case.
-	accepts := []string{"application/json", "application/jwt"}
-	if r.preferSigned() {
-		accepts = []string{"application/jwt", "application/json"}
-	}
-	// With the 4xx fallback turned off, only the preferred representation is
-	// requested and any non-200 status is terminal.
-	if !r.fallbackOn4xx() {
-		accepts = accepts[:1]
-	}
-
+	// Content negotiation per OpenID4VCI §12.2.2, driven by the configured
+	// MetadataType: one Accept value per request, in preference order. Only an
+	// HTTP status moves on to the next stage; an error while processing a 200
+	// (including a failed signature verification) is returned as is.
+	accepts := r.cfg.MetadataType.accepts()
 	var lastStatus int
-	for _, accept := range accepts {
+	for i, accept := range accepts {
 		result, status, err := r.fetchOnce(ctx, issuerURL, metadataURL, accept)
 		if err != nil {
 			return nil, err
 		}
 		if status == http.StatusOK {
+			if r.cfg.MetadataType == MetadataTypeRequireSigned && !result.signed {
+				return nil, errors.New("metadata type require-signed: issuer returned unsigned metadata")
+			}
 			return result, nil
 		}
 		lastStatus = status
-		// A client error on the preferred representation may just mean the
-		// issuer does not serve that media type, so try the other one. Other
-		// statuses are terminal, as is 429: it says nothing about the media
-		// type, and an immediate second request only adds load.
-		if status < 400 || status >= 500 || status == http.StatusTooManyRequests {
+		// 406 is how a compliant issuer says it lacks the requested form;
+		// other 4xx cover issuers that do not implement negotiation. 429 and
+		// everything else (3xx, 5xx) say nothing about the media type.
+		retryable := status >= 400 && status < 500 && status != http.StatusTooManyRequests
+		if !retryable || i == len(accepts)-1 {
 			break
 		}
 	}
@@ -368,6 +424,9 @@ func (r *Resolver) fetchOnce(ctx context.Context, issuerURL, metadataURL, accept
 
 	switch mediaType {
 	case "application/jwt":
+		if r.cfg.MetadataType == MetadataTypeRequireUnsigned {
+			return nil, resp.StatusCode, errors.New("metadata type require-unsigned: issuer returned application/jwt")
+		}
 		// Entire response body is a JWS per OpenID4VCI §12.2.3
 		res, err := r.handleJWTResponse(ctx, issuerURL, strings.TrimSpace(string(body)))
 		return res, resp.StatusCode, err

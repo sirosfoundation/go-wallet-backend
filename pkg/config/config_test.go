@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kelseyhightower/envconfig"
 )
 
 // validBaseConfig returns a minimal valid Config for testing.
@@ -2621,9 +2623,38 @@ func TestConfig_Validate_RejectsATrustCacheTTLThatOverflows(t *testing.T) {
 	}
 }
 
-func TestDefaultConfig_MetadataFallbackOn4xxIsOn(t *testing.T) {
-	if !defaultConfig().HTTPClient.MetadataFallbackOn4xx {
-		t.Error("metadata 4xx fallback must default to on (#371)")
+func TestDefaultConfig_MetadataTypeIsPreferSigned(t *testing.T) {
+	if got := defaultConfig().HTTPClient.MetadataType; got != "prefer-signed" {
+		t.Errorf("default http_client.metadata_type = %q, want prefer-signed", got)
+	}
+}
+
+func TestConfig_Validate_MetadataType(t *testing.T) {
+	for _, v := range []string{"", "any", "prefer-signed", "require-signed", "prefer-unsigned", "require-unsigned"} {
+		cfg := validBaseConfig()
+		cfg.HTTPClient.MetadataType = v
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("metadata_type %q must be valid: %v", v, err)
+		}
+	}
+	for _, v := range []string{"signed", "Prefer-Signed", "true", "prefer_signed"} {
+		cfg := validBaseConfig()
+		cfg.HTTPClient.MetadataType = v
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "http_client.metadata_type") {
+			t.Errorf("metadata_type %q must be rejected with a clear error, got %v", v, err)
+		}
+	}
+}
+
+func TestLoad_MetadataTypeEnvOverride(t *testing.T) {
+	t.Setenv("WALLET_HTTP_CLIENT_METADATA_TYPE", "require-signed")
+	cfg := defaultConfig()
+	if err := envconfig.Process("WALLET", cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HTTPClient.MetadataType != "require-signed" {
+		t.Errorf("env override not applied: %q", cfg.HTTPClient.MetadataType)
 	}
 }
 
