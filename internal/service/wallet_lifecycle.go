@@ -677,6 +677,24 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	if err := s.store.Users().EraseWalletData(ctx, userID, time.Now()); err != nil {
 		errs = append(errs, fmt.Errorf("erase wallet key material: %w", err))
 	}
+	// Final sweep, after the point where the wallet is refused everything it
+	// can be refused: the revocation is persisted (the login gate refuses new
+	// logins, and refreshes, for the wallet, and a login whose gate check
+	// predates it fails the re-check after it mints, see mintTokens), and the
+	// token cut-off has been advanced twice since, the last time atomically
+	// with the erasure of the key material just above. The sweeps above ran
+	// between those advances. A holder write by a token that was valid at the
+	// first one (iat after it) passes the post-write re-check until the last
+	// one lands, so it can persist after the first sweep listed the holder's
+	// records and be missed by it. This sweep lists after the last advance
+	// and finds it, which is what DeleteUser's sweep after the record's
+	// removal does for an account. It runs whether or not the key-material
+	// erase succeeded: the data it may find is erased either way, and a
+	// failure here, like any other step, is ErrErasureIncomplete and
+	// retryable - repeating the request sweeps again.
+	for _, tid := range tenants {
+		errs = append(errs, s.eraseHolderData(ctx, tid, holder)...)
+	}
 	// Only claim the erasure happened when every step of it did: an
 	// ErrErasureIncomplete cascade would otherwise leave a "wallet data
 	// erased" line in the log for data that is still there, which is

@@ -297,9 +297,9 @@ ordering rule and a post-write check, not with a cross-collection transaction:
 
 1. **Every erasure advances the user's cut-off first and sweeps holder data
    after it.** The lifecycle cascade advances the cut-off before its first
-   holder sweep (and again with the key-material erase). `DELETE /user` advances
-   it before its final sweep, and sweeps once more after the user record is
-   removed.
+   holder sweep (and again with the key-material erase), and sweeps once more
+   after that. `DELETE /user` advances it before its final sweep, and sweeps
+   once more after the user record is removed.
 2. **A holder write re-reads the cut-off after it is persisted.** Credential
    create (`POST /storage/vc`) and presentation create (`POST /storage/vp`)
    delete the record they just wrote and answer `401` if the token is now
@@ -324,11 +324,22 @@ What is **not** guaranteed:
   the log line has `left_behind=true`), and the next erasure sweep removes it,
   but until then the data is there. This needs two storage failures at once.
 - A token issued *after* the cut-off (a fresh login, which must pass so a failed
-  deletion can be retried) is not refused by the cut-off. `DELETE /user`'s last
-  sweep after the user record is removed covers its writes; a lifecycle
-  revocation has no such sweep and relies on a deactivated wallet refusing new
-  logins; a write by a token minted in the gap between that refusal taking
-  effect and the cut-off advance can stay.
+  deletion can be retried) is not refused by the cut-off, so its write can
+  persist after an erasure's first sweep listed the holder. Both erasures
+  therefore end with a sweep that follows the last cut-off advance and the point
+  where new writes are refused: `DELETE /user` after the user record is removed
+  (the deletion tombstone refuses everything from then on), and the lifecycle
+  cascade after the key-material erase, which advances the cut-off atomically.
+  By then the revocation is persisted, so the login gate refuses new logins and
+  refreshes for the wallet, and a login whose gate check predates it fails the
+  re-check after it mints its token. A failing final sweep is
+  `ERASURE_INCOMPLETE` (lifecycle, retryable by repeating) or, for `DELETE
+  /user`, `202 DELETION_CLEANUP_PENDING` (the account is already gone). What
+  remains: a write by a token that is valid after the lifecycle cascade's last
+  sweep, which needs a login the gate lets through for that wallet - a user with
+  no wallet instance at all in the tenant being logged into (a first enrollment,
+  which the gate does not refuse) - and that write is not swept until the next
+  erasure.
 - Delete and update-in-place operations are not fenced beyond the admission
   check: they cannot create data, so a late one removes or changes only
   something the erasure is removing anyway.

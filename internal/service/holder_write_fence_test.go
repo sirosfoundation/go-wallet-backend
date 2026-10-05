@@ -600,3 +600,163 @@ func TestHolderSweeps_RecordAlreadyGoneIsNotAFailure(t *testing.T) {
 		})
 	}
 }
+
+// eraseHookStore runs a hook right after UserStore.EraseWalletData returns:
+// the point the lifecycle cascade's final holder sweep must follow.
+type eraseHookStore struct {
+	storage.Store
+	afterErase func()
+}
+
+type eraseHookUsers struct {
+	storage.UserStore
+	s *eraseHookStore
+}
+
+func (s *eraseHookStore) Users() storage.UserStore { return &eraseHookUsers{s.Store.Users(), s} }
+
+func (u *eraseHookUsers) EraseWalletData(ctx context.Context, id domain.UserID, at time.Time) error {
+	err := u.UserStore.EraseWalletData(ctx, id, at)
+	if u.s.afterErase != nil {
+		u.s.afterErase()
+	}
+	return err
+}
+
+// A token issued after the cascade's cut-off advances is not refused by the
+// post-write re-check, so its write can land after the cascade's first holder
+// sweep. The cascade's final sweep, which follows the last cut-off advance,
+// has to take it.
+func TestLifecycleErase_FinalSweepTakesAFreshTokensWrite(t *testing.T) {
+	ctx := context.Background()
+	inner := memory.NewStore()
+	uid := seedWalletUser(t, inner, domain.DefaultTenantID)
+	did := "did:example:" + uid.String()
+	creds := NewCredentialService(inner, &config.Config{}, zap.NewNop())
+	pres := NewPresentationService(inner, zap.NewNop())
+	fresh := tokengate.WithSubject(ctx, uid.String(), time.Now().Add(time.Hour))
+
+	var cerr, perr error
+	hs := &eraseHookStore{Store: inner}
+	hs.afterErase = func() {
+		_, cerr = creds.Store(fresh, domain.DefaultTenantID, &domain.StoreCredentialRequest{
+			HolderDID: did, CredentialIdentifier: "late-cred", Credential: "jwt", Format: domain.FormatJWTVC,
+		})
+		perr = pres.Store(fresh, domain.DefaultTenantID, &domain.VerifiablePresentation{
+			HolderDID: did, PresentationIdentifier: "late-pres", Presentation: "jwt",
+		})
+	}
+	svc := NewWalletLifecycleService(hs, zap.NewNop(), nil)
+	_, err := svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "test")
+	require.NoError(t, err)
+	require.NoError(t, cerr, "the fresh token was legitimately admitted")
+	require.NoError(t, perr)
+
+	assert.Zero(t, holderDataCount(t, inner, domain.DefaultTenantID, did), "the final sweep takes what the first one could not see")
+}
+
+// A failing final sweep is not success: the request is ErrErasureIncomplete,
+// so repeating it sweeps again.
+func TestLifecycleErase_FailedFinalSweepIsIncompleteAndRetryable(t *testing.T) {
+	ctx := context.Background()
+	inner := memory.NewStore()
+	uid := seedWalletUser(t, inner, domain.DefaultTenantID)
+	did := "did:example:" + uid.String()
+	var erased atomic.Bool
+	hs := &eraseHookStore{Store: inner, afterErase: func() { erased.Store(true) }}
+	flaky := &failListAfterStore{Store: hs, after: &erased}
+	svc := NewWalletLifecycleService(flaky, zap.NewNop(), nil)
+
+	_, err := svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "test")
+	require.ErrorIs(t, err, ErrErasureIncomplete)
+
+	flaky.broken.Store(false)
+	flaky.after = nil
+	_, err = svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "test")
+	require.NoError(t, err, "repeating the request completes it")
+	assert.Zero(t, holderDataCount(t, inner, domain.DefaultTenantID, did))
+}
+
+type failListAfterStore struct {
+	storage.Store
+	after  *atomic.Bool
+	broken atomic.Bool
+}
+
+type failListAfterCreds struct {
+	storage.CredentialStore
+	s *failListAfterStore
+}
+
+func (s *failListAfterStore) Credentials() storage.CredentialStore {
+	return &failListAfterCreds{s.Store.Credentials(), s}
+}
+
+func (c *failListAfterCreds) GetAllByHolder(ctx context.Context, t domain.TenantID, h string) ([]*domain.VerifiableCredential, error) {
+	if c.s.after != nil && c.s.after.Load() {
+		c.s.broken.Store(true)
+	}
+	if c.s.broken.Load() {
+		return nil, errors.New("db down")
+	}
+	return c.CredentialStore.GetAllByHolder(ctx, t, h)
+}
+
+// The same, with real concurrency: writers holding a token the cut-off does
+// not refuse run against the cascade, and are quiesced right after the
+// key-material erase. Everything they managed to persist has to be gone when
+// the cascade returns, which only the final sweep guarantees for a write that
+// landed after the first sweep listed the holder. Run with -race and -count.
+func TestLifecycleErase_ConcurrentFreshTokenWritersAreSweptAway(t *testing.T) {
+	ctx := context.Background()
+	inner := memory.NewStore()
+	uid := seedWalletUser(t, inner, domain.DefaultTenantID)
+	did := "did:example:" + uid.String()
+	creds := NewCredentialService(inner, &config.Config{}, zap.NewNop())
+	pres := NewPresentationService(inner, zap.NewNop())
+	fresh := tokengate.WithSubject(ctx, uid.String(), time.Now().Add(time.Hour))
+
+	const writers = 8
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	var accepted atomic.Int64
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; ; i++ {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				id := fmt.Sprintf("w%d-%d", w, i)
+				var err error
+				if i%2 == 0 {
+					_, err = creds.Store(fresh, domain.DefaultTenantID, &domain.StoreCredentialRequest{
+						HolderDID: did, CredentialIdentifier: id, Credential: "jwt", Format: domain.FormatJWTVC,
+					})
+				} else {
+					err = pres.Store(fresh, domain.DefaultTenantID, &domain.VerifiablePresentation{
+						HolderDID: did, PresentationIdentifier: id, Presentation: "jwt",
+					})
+				}
+				if err == nil {
+					accepted.Add(1)
+				}
+			}
+		}(w)
+	}
+	for accepted.Load() < 20 {
+		time.Sleep(time.Millisecond)
+	}
+	hs := &eraseHookStore{Store: inner, afterErase: func() {
+		close(stop)
+		wg.Wait()
+	}}
+	svc := NewWalletLifecycleService(hs, zap.NewNop(), nil)
+	_, err := svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "test")
+	require.NoError(t, err)
+	assert.Positive(t, accepted.Load())
+	assert.Zero(t, holderDataCount(t, inner, domain.DefaultTenantID, did))
+}
