@@ -1092,6 +1092,19 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 			c.JSON(404, gin.H{"error": "User not found"})
 			return
 		}
+		if errors.Is(err, service.ErrDeletionCleanupPending) {
+			// The account is gone. Telling the caller to repeat the request
+			// would be wrong: their token is refused from now on, and the
+			// remainder is for an operator. 202, not an error status, since
+			// what the caller asked for has happened.
+			h.logger.Error("Account deleted but cleanup incomplete", zap.Error(err))
+			c.JSON(http.StatusAccepted, gin.H{
+				"error":   errCodeDeletionCleanupPending,
+				"result":  "DELETED",
+				"message": "the account was deleted; some wallet data written while it was being deleted could not be removed yet and will be cleared by an operator. It is refused to every token and cannot be read; do not repeat the request",
+			})
+			return
+		}
 		if errors.Is(err, service.ErrDeletionIncomplete) {
 			// The account still exists on purpose, so the caller can repeat
 			// the request rather than be left with a stranded wallet

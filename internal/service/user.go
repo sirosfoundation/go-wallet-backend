@@ -346,6 +346,18 @@ func (s *UserService) LogoutEverywhere(ctx context.Context, userID domain.UserID
 // WalletLifecycleService's ErrErasureIncomplete.
 var ErrDeletionIncomplete = errors.New("account deletion incomplete")
 
+// ErrDeletionCleanupPending is returned when the account WAS deleted - the
+// user record and passkeys are gone, the tombstone refuses every further write
+// for the identity - but the sweep that follows the removal could not confirm
+// that no holder data written during the deletion is left. It is deliberately
+// not an ErrDeletionIncomplete: that one promises the account still exists and
+// the request can be repeated, and here neither is true (the caller's token is
+// refused by the tombstone from now on). Nothing the user can do finishes it;
+// the leftover holder data can no longer be reached or written by anyone but
+// an operator, and is not served to any token. Callers must not tell the user
+// to retry.
+var ErrDeletionCleanupPending = errors.New("account deleted, cleanup of data written during the deletion incomplete")
+
 // DeleteUser removes a user and everything of theirs, in every tenant: stored
 // credentials and presentations, wallet instances, pending challenges, live
 // sessions, tenant memberships, and finally the user record with its
@@ -396,9 +408,12 @@ var ErrDeletionIncomplete = errors.New("account deletion incomplete")
 //     landed since the token was admitted answers tokengate.ErrRevoked (401)
 //     with nothing irreversible done. A final holder sweep follows the advance
 //     and another follows the user's removal; they pair with the holder-write
-//     fence (tokengate.ConfirmWrite), and the sweep after the removal fails
-//     closed as ErrDeletionIncomplete, which the user cannot repeat (the
-//     account is gone) - an operator clears the remainder.
+//     fence (tokengate.ConfirmWrite). The sweep after the removal cannot keep
+//     the record until it succeeds - that sweep is only sound once the
+//     tombstone refuses every write, which needs the record gone - so its
+//     failure is reported as ErrDeletionCleanupPending: the account is
+//     deleted, the user cannot repeat anything, and an operator clears the
+//     remainder.
 //   - Still best-effort, logged only: pending WebAuthn challenges, invite
 //     used_by references, tenant-membership removal, and the token
 //     blacklist's RevokeUser. A failure of the final Users().Delete answers a
@@ -770,7 +785,9 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// (tokengate.RefuseNow) and rolls itself back, so this sweep removes
 	// whatever got in before. A failure is reported, not swallowed: the account
 	// is already gone, so this is not retryable by the user and an operator
-	// has to clear the remainder.
+	// has to clear the remainder. It is ErrDeletionCleanupPending and not
+	// ErrDeletionIncomplete, so a caller does not tell the user to repeat a
+	// request that can no longer work.
 	var lastErrs []error
 	for _, tenantID := range tenantIDs {
 		lastErrs = append(lastErrs, s.eraseHolderData(ctx, tenantID, holderDID)...)
@@ -778,7 +795,7 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	if len(lastErrs) > 0 {
 		s.logger.Error("Account deleted but holder data written during the deletion could not be removed",
 			zap.Error(errors.Join(lastErrs...)), zap.String("user_id", userID.String()))
-		return fmt.Errorf("%w: sweep after user removal: %w", ErrDeletionIncomplete, errors.Join(lastErrs...))
+		return fmt.Errorf("%w: sweep after user removal: %w", ErrDeletionCleanupPending, errors.Join(lastErrs...))
 	}
 
 	s.logger.Info("User deleted")

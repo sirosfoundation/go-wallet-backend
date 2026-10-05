@@ -25,6 +25,9 @@ const (
 	// errCodeDeletionIncomplete is returned when account deletion left a
 	// wallet instance behind. The account still exists; repeat the request.
 	errCodeDeletionIncomplete = "DELETION_INCOMPLETE"
+	// errCodeDeletionCleanupPending is returned when the account was deleted
+	// but the sweep after its removal failed. Do not repeat the request.
+	errCodeDeletionCleanupPending = "DELETION_CLEANUP_PENDING"
 	// errCodeLifecycleNotSupported is returned when a lifecycle operation is
 	// reached without a lifecycle service behind it. It means the operation
 	// did not happen, not that it half happened.

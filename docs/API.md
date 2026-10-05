@@ -436,6 +436,15 @@ refused from then on until the process restarts, so an operator has to finish
 it. Pending challenges, invite references and membership rows are removed on a
 best-effort basis.
 
+The last step is a sweep of holder data after the user record is removed, for
+a credential or presentation that a token issued after the token cut-off wrote
+while the deletion ran. It can only be sound once the record is gone (the
+deletion tombstone then refuses every write), so it cannot hold the record
+back. If it fails, the answer is `202` with `DELETION_CLEANUP_PENDING` and
+`"result": "DELETED"`: the account **is** deleted, repeating the request is
+pointless (the token is refused and the account is unknown), and an operator
+clears the remainder. The leftover is not served to any token.
+
 ### Credential Management
 
 All credential endpoints require authentication.
