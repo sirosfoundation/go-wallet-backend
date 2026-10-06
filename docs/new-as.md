@@ -225,7 +225,10 @@ model: login returned an HS256 `appToken` (and optionally a `refreshToken`)
 signed with `jwt.secret`; the client sent it as `Authorization: Bearer` on
 every call, and the same token proved the session and authorised the request.
 It was switched off, in a first step, with `as.legacy.enabled=false`
-(`WALLET_AS_LEGACY_ENABLED=false`); this change deletes the code.
+(`WALLET_AS_LEGACY_ENABLED=false`); this change deletes the code. There was
+never an expiry ramp-down or a sunset schedule: legacy tokens used the ordinary
+`jwt.expiry_hours` / `jwt.refresh_days` lifetimes, and `as.legacy.sunset_date`
+was already ignored.
 
 ### What replaced it
 
@@ -381,10 +384,10 @@ token type.
 | Task | New/Modify | Description |
 |------|-----------|-------------|
 | 3.1 Client detection | New: `internal/as/compat.go` | Detect legacy vs new-style from `X-Token-Mode` header. |
-| 3.2 Legacy token issuer | New: `internal/as/legacy_token.go` | Issue HMAC all-in-one JWTs with configurable (ramping-down) expiry. |
+| 3.2 Legacy token issuer | New: `internal/as/legacy_token.go` | Issue HMAC all-in-one JWTs with the `jwt.expiry_hours` lifetime. |
 | 3.3 Dual-mode login response | New: `internal/as/passkey.go`, `internal/as/oidc.go` | Based on client mode, return `appToken` in body (legacy) or set session cookie (new). |
-| 3.4 Deprecation headers | New: `internal/as/deprecation.go` | Add a `Deprecation` header on legacy responses. |
-| 3.5 Refresh token compat | New: `internal/as/refresh.go` | `POST /auth/token/refresh` validates refresh token, issues new legacy token at current ramp-down expiry. |
+| 3.4 Deprecation headers | Removed: `internal/as/deprecation.go` | Was never mounted on a route, so no `Deprecation` header was ever sent; deleted with the legacy AS. |
+| 3.5 Refresh token compat | `/user/session/refresh` | Legacy refresh stays on the existing `/user/session/refresh` route; no `/auth/token/refresh` bridge route exists. |
 | 3.6 Unified auth middleware | Modify: `pkg/middleware/auth.go` | Single middleware accepting both session-cookie+access-token and legacy Bearer tokens. Sets identical context. |
 
 ### Phase 4: SPOCP policy authorization
