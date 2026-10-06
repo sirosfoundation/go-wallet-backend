@@ -285,3 +285,68 @@ func TestDeleteUser_WaitsForAnAttestationInsideItsCriticalSection(t *testing.T) 
 	_, uerr := store.Users().GetByID(ctx, uid)
 	assert.True(t, errors.Is(uerr, storage.ErrNotFound), "the account must be gone, got %v", uerr)
 }
+
+// afterWriteInstances runs hook right after the first successful conditional
+// status write for id: the record the write revoked is then replaced.
+type afterWriteInstances struct {
+	storage.WalletInstanceStore
+	match string
+	hook  func()
+	fired bool
+}
+
+func (a *afterWriteInstances) UpdateStatusIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, exp domain.InstanceBinding, st domain.InstanceStatus, reason string) error {
+	if err := a.WalletInstanceStore.UpdateStatusIfUnchanged(ctx, id, tenantID, exp, st, reason); err != nil {
+		return err
+	}
+	if !a.fired && id == a.match {
+		a.fired = true
+		a.hook()
+	}
+	return nil
+}
+
+// After the conditional status write the revoked record can be gone and its
+// id taken by a replacement of another user (account deletion removed it, a
+// concurrent attestation inserted the same thumbprint). That is a lost binding:
+// no cut-off and no cascade may run, neither against the replacement's owner
+// nor against the stale pre-write owner.
+func TestChangeStatus_ReplacementAfterTheWriteRunsNoCascade(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewStore()
+	alice := seedWalletUser(t, base, domain.DefaultTenantID)
+	bob := seedWalletUser(t, base, domain.DefaultTenantID)
+	id := "shared-thumbprint"
+	require.NoError(t, base.WalletInstances().Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: domain.DefaultTenantID, UserID: &alice, Status: domain.InstanceStatusActive}))
+	aliceCutoff, err := base.Users().GetAuthCutoff(ctx, alice)
+	require.NoError(t, err)
+
+	hooked := &afterWriteInstances{WalletInstanceStore: base.WalletInstances(), match: id}
+	hooked.hook = func() { replaceInstance(t, base.WalletInstances(), id, domain.DefaultTenantID, &bob) }
+	svc := NewWalletLifecycleService(&racingInstanceStore{Store: base, instances: hooked}, zap.NewNop(), nil)
+	cleaner := &fakeSessionCleaner{}
+	svc.SetSessionCleaner(cleaner)
+
+	_, err = svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, domain.DefaultTenantID, id, domain.InstanceStatusRevoked, "lost")
+	require.ErrorIs(t, err, ErrErasureIncomplete, "the lost binding is reported, not swallowed")
+
+	got, err := base.WalletInstances().GetByID(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, domain.InstanceStatusActive, got.Status, "the replacement must not be touched")
+	require.NotNil(t, got.UserID)
+	assert.Equal(t, bob, *got.UserID)
+	assert.Empty(t, cleaner.users, "no session cleanup for anybody")
+	creds, pres := countHolderData(t, base, domain.DefaultTenantID, bob)
+	assert.NotZero(t, creds+pres, "bob's wallet data must not be erased")
+	acreds, apres := countHolderData(t, base, domain.DefaultTenantID, alice)
+	assert.NotZero(t, acreds+apres, "no cascade ran against the stale pre-write owner either")
+	for _, u := range []domain.UserID{alice, bob} {
+		c, err := base.Users().GetAuthCutoff(ctx, u)
+		require.NoError(t, err)
+		if u == alice {
+			assert.True(t, c.Equal(aliceCutoff), "no token cut-off for the stale owner")
+		} else {
+			assert.True(t, c.IsZero(), "no token cut-off for the replacement's owner")
+		}
+	}
+}

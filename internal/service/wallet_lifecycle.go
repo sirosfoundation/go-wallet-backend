@@ -245,12 +245,11 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 	// the write (the bind is not conditional on status), and the pre-write
 	// copy still says "no owner": cutting off tokens and running the cascade
 	// from it would skip the very user the revocation now belongs to, leaving
-	// their tokens and sessions alive. If the record was meanwhile replaced
-	// (a different generation) the persisted copy is somebody else's, and
-	// the record that was revoked is the one this request observed. The cut-off below runs from the persisted owner, so a bind
-	// that landed after the write is covered. When the re-read fails the status is already persisted,
-	// so the caller gets ErrErasureIncomplete and the same request, which
-	// re-reads in its idempotent branch above, finishes the job.
+	// their tokens and sessions alive. The cut-off below runs from the
+	// persisted owner, so a bind that landed after the write is covered. When
+	// the re-read fails the status is already persisted, so the caller gets
+	// ErrErasureIncomplete and the same request, which re-reads in its
+	// idempotent branch above, finishes the job.
 	persisted, err := s.store.WalletInstances().GetByID(ctx, instanceID)
 	if err != nil {
 		inst.Status = target
@@ -258,18 +257,22 @@ func (s *WalletLifecycleService) ChangeStatus(ctx context.Context, actor Lifecyc
 		s.emitAudit(inst.ID, target, reason, actor)
 		return inst, fmt.Errorf("%w: re-read instance after the status write: %w", ErrErasureIncomplete, err)
 	}
-	if persisted.Generation == inst.Generation {
-		inst = persisted
-	} else {
+	if persisted.Generation != inst.Generation || persisted.TenantID != tenantID {
+		// The record this request revoked is gone and the id now belongs to a
+		// replacement (account deletion removed the revoked record and a
+		// concurrent attestation inserted the same thumbprint again). The
+		// binding is lost: the replacement is somebody else's and was never
+		// revoked by this request, so neither a token cut-off nor the cascade
+		// may run against it - and the pre-write copy's owner is not a
+		// reliable target either, since what removed the record owns its
+		// cleanup. Stop and tell the caller the revocation could not be
+		// completed against the record it observed.
 		inst.Status = target
 		inst.UpdatedAt = time.Now().UTC()
-		if target == domain.InstanceStatusRevoked {
-			// Same as in RevokeAllForUser: the cascade's cut-off check
-			// needs the revocation time, which this local copy lacks.
-			revokedAt := inst.UpdatedAt
-			inst.DeactivatedAt = &revokedAt
-		}
+		s.emitAudit(inst.ID, target, reason, actor)
+		return inst, fmt.Errorf("%w: the instance was replaced after the status write; no cut-off or cascade was run against the replacement", ErrErasureIncomplete)
 	}
+	inst = persisted
 	s.emitAudit(inst.ID, target, reason, actor)
 	if target != domain.InstanceStatusActive {
 		// Cut the tokens off now that the status is persisted and the
