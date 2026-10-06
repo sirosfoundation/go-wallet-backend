@@ -63,7 +63,7 @@ func TestFIDO2AttestationService_Verify_CutoffBeforeWriteIsRefused(t *testing.T)
 			store := memory.NewStore()
 			uid := domain.NewUserID()
 			require.NoError(t, store.Users().Create(base, &domain.User{UUID: uid}))
-			require.NoError(t, store.WalletInstances().Upsert(base, &domain.WalletInstance{ID: "inst"}))
+			require.NoError(t, store.WalletInstances().Upsert(base, &domain.WalletInstance{ID: "inst", UserID: &uid, Status: domain.InstanceStatusActive}))
 			cutoff := time.Now().Truncate(time.Second)
 
 			svc := NewFIDO2AttestationService(testFIDO2AttestationConfig(true), store.WalletInstances(), store.KeyAttestations(),

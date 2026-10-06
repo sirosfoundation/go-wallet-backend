@@ -429,7 +429,8 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 }
 
 // ErrKeyAttestationInstanceRefused is returned when the wallet instance a key
-// attestation is requested for belongs to another user.
+// attestation is requested for (or a FIDO2 attestation is recorded for) belongs
+// to another user or tenant, or is unknown.
 var ErrKeyAttestationInstanceRefused = errors.New("wallet instance not usable by this caller")
 
 type kaTenantKey struct{}
@@ -443,38 +444,52 @@ func WithKeyAttestationTenant(ctx context.Context, tenantID domain.TenantID) con
 }
 
 // refuseKeyAttestationInstance validates the wallet instance at the minting
-// boundary. A record that is not live (revoked, suspended, or of a status this
-// build does not recognize) is refused as a revoked token (401): fail closed,
-// nothing is changed. A record owned by a user other than the token's subject
-// is refused, as is an unbound one (when the token has a subject) and one
-// recorded in another tenant. An id the store does not know binds no lifecycle state and is
-// not judged; a failed lookup refuses.
+// boundary (see refuseWalletInstance). An id the store does not know binds no
+// lifecycle state and is not judged.
 func (s *WalletProviderService) refuseKeyAttestationInstance(ctx context.Context, walletInstanceID string) error {
 	if walletInstanceID == "" || s.instances == nil {
 		return nil
 	}
-	instance, err := s.instances.GetByID(ctx, walletInstanceID)
+	_, err := refuseWalletInstance(ctx, s.instances, walletInstanceID, false)
+	return err
+}
+
+// refuseWalletInstance is the one ownership/status gate for a request that
+// names a wallet instance (key attestation minting, FIDO2 attestation
+// recording). A record that is not live (revoked, suspended, or of a status
+// this build does not recognize) is refused as a revoked token (401): fail
+// closed, nothing is changed. A record owned by a user other than the token's
+// subject is refused, as is an unbound one (when the token has a subject) and
+// one recorded in another tenant. An id the store does not know is not judged
+// unless requireKnown is set, in which case it is refused like a foreign one;
+// a failed lookup refuses. On success the instance record is returned (nil for
+// an unknown id that is not judged).
+func refuseWalletInstance(ctx context.Context, instances storage.WalletInstanceStore, walletInstanceID string, requireKnown bool) (*domain.WalletInstance, error) {
+	instance, err := instances.GetByID(ctx, walletInstanceID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			return nil
+			if requireKnown {
+				return nil, ErrKeyAttestationInstanceRefused
+			}
+			return nil, nil
 		}
-		return fmt.Errorf("recheck wallet instance: %w", err)
+		return nil, fmt.Errorf("recheck wallet instance: %w", err)
 	}
 	if !instance.Status.IsLive() {
-		return fmt.Errorf("%w: wallet instance is not live", tokengate.ErrRevoked)
+		return nil, fmt.Errorf("%w: wallet instance is not live", tokengate.ErrRevoked)
 	}
 	if tenantID, ok := ctx.Value(kaTenantKey{}).(domain.TenantID); ok && tenantID != "" && instance.TenantID != tenantID {
-		return ErrKeyAttestationInstanceRefused
+		return nil, ErrKeyAttestationInstanceRefused
 	}
-	// A caller with a subject may only mint for an instance bound to that
+	// A caller with a subject may only act for an instance bound to that
 	// subject. An unbound instance (anonymous or legacy attestation) is
 	// nobody's yet: the WIA flow binds it when its holder attests with a user
 	// token, so until then it is refused rather than open to any user who
 	// knows its id.
 	if subject := tokengate.SubjectFrom(ctx); subject != "" && (instance.UserID == nil || instance.UserID.String() != subject) {
-		return ErrKeyAttestationInstanceRefused
+		return nil, ErrKeyAttestationInstanceRefused
 	}
-	return nil
+	return instance, nil
 }
 
 // nativeAttestationSources are the WalletInstance.AttestationSource values

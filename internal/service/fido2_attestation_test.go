@@ -252,7 +252,7 @@ func expectedThumbprint(t *testing.T, pub *ecdsa.PublicKey) string {
 func TestFIDO2AttestationService_TrustedByPDP(t *testing.T) {
 	cfg := testFIDO2AttestationConfig(true)
 	store := memory.NewStore()
-	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{ID: "test-instance"}); err != nil {
+	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{ID: "test-instance", Status: domain.InstanceStatusActive}); err != nil {
 		t.Fatalf("seed instance: %v", err)
 	}
 
@@ -303,7 +303,7 @@ func TestFIDO2AttestationService_TrustedByPDP(t *testing.T) {
 func TestFIDO2AttestationService_NotTrustedByPDP(t *testing.T) {
 	cfg := testFIDO2AttestationConfig(true)
 	store := memory.NewStore()
-	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{ID: "test-instance"}); err != nil {
+	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{ID: "test-instance", Status: domain.InstanceStatusActive}); err != nil {
 		t.Fatalf("seed instance: %v", err)
 	}
 

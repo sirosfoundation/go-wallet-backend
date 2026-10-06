@@ -195,12 +195,17 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 		return fmt.Errorf("%w: compute key thumbprint: %v", ErrFIDO2AttestationInvalid, err)
 	}
 
-	// TenantID is for auditing/scoping only - best-effort lookup, not part
-	// of the trust decision (which is keyed by thumbprint alone).
-	var tenantID domain.TenantID
-	if instance, err := s.instances.GetByID(ctx, req.WalletInstanceID); err == nil {
-		tenantID = instance.TenantID
+	// The instance the evidence is recorded for must be live and belong to the
+	// authenticated tenant and user: keyAttestationTrustsBatch later treats the
+	// recorded evidence as trusted, so a token from another live device must not
+	// be able to attach it to a revoked or foreign instance. Same gate as key
+	// attestation generation; an unknown instance is refused too, since there is
+	// nothing to attach the evidence to.
+	instance, err := refuseWalletInstance(ctx, s.instances, req.WalletInstanceID, true)
+	if err != nil {
+		return err
 	}
+	tenantID := instance.TenantID
 
 	verifiedAt := time.Now().UTC()
 	rec := &domain.KeyAttestationRecord{
