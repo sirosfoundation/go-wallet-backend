@@ -135,7 +135,15 @@ func TestWalletInstanceStore_DeleteIfRemovable(t *testing.T) {
 	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{
 		ID: "del-stray", TenantID: "acme", Status: domain.InstanceStatusRevoked,
 	}))
-	require.NoError(t, wis.DeleteIfRemovable(ctx, "del-stray", "acme", bindingOf(t, wis, "del-stray")), "a record with no user is removable")
+	err = wis.DeleteIfRemovable(ctx, "del-stray", "acme", bindingOf(t, wis, "del-stray"))
+	require.True(t, errors.Is(err, domain.ErrInvalidStatusTransition), "an unowned tombstone must survive, got %v", err)
+	_, err = wis.GetByID(ctx, "del-stray")
+	require.NoError(t, err, "the unowned tombstone must survive")
+
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{
+		ID: "del-stray-live", TenantID: "acme", Status: domain.InstanceStatusActive,
+	}))
+	require.NoError(t, wis.DeleteIfRemovable(ctx, "del-stray-live", "acme", bindingOf(t, wis, "del-stray-live")), "an active unowned record is removable")
 
 	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{
 		ID: "del-other", TenantID: "other", UserID: &uid, Status: domain.InstanceStatusActive,

@@ -485,7 +485,8 @@ type WalletInstanceStore interface {
 	DeleteForUser(ctx context.Context, id string, tenantID domain.TenantID, userID domain.UserID) error
 
 	// DeleteIfRemovable hard-deletes a wallet instance only while it is
-	// still removable (live, or bound to no user) AND still the record the
+	// still removable (status active; ownership is irrelevant, every
+	// non-live record is a tombstone) AND still the record the
 	// caller read (expected owner and generation). It returns
 	// storage.ErrBindingChanged when the record was replaced, and
 	// domain.ErrInvalidStatusTransition when the record exists but has

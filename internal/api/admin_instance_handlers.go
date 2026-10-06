@@ -204,9 +204,11 @@ func (h *AdminHandlers) DeleteWalletInstance(c *gin.Context) {
 	// SID-AUTH-06: a revoked instance of a user is the record that keeps the
 	// login gate and the WIA guard refusing that wallet. Deleting it would
 	// make the user look never-enrolled and re-open both. Revocation is
-	// terminal, so the record stays as a tombstone; only instances without
-	// a user (stray attestation records) or non-revoked ones may be removed.
-	if !instance.Status.IsLive() && instance.UserID != nil {
+	// terminal, so the record stays as a tombstone, whoever owns it: an
+	// anonymous WIA attestation leaves an unowned record, and deleting its
+	// tombstone would let the same key enroll again as a fresh active
+	// instance. Only active records can be hard-deleted.
+	if !instance.Status.IsLive() {
 		c.JSON(http.StatusConflict, gin.H{
 			"error":   errCodeInstanceRetained,
 			"message": "a wallet instance that is no longer live is retained as a lifecycle record and cannot be deleted",

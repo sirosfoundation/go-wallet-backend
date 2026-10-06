@@ -288,7 +288,7 @@ func (s *WalletInstanceStore) DeleteIfRemovable(_ context.Context, id string, te
 	if !expected.Matches(inst) {
 		return storage.ErrBindingChanged
 	}
-	if !inst.Status.IsLive() && inst.UserID != nil {
+	if !inst.Status.IsLive() {
 		return domain.ErrInvalidStatusTransition
 	}
 	delete(s.data, id)

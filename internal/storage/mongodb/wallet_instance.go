@@ -420,11 +420,9 @@ func (s *WalletInstanceStore) DeleteIfRemovable(ctx context.Context, id string, 
 	bound := bindingFilter(id, tenantID, expected)
 	filter := bson.M{"$and": []bson.M{
 		bound,
-		{"$or": []bson.M{
-			{"status": domain.InstanceStatusActive},
-			{"user_id": bson.M{"$in": []interface{}{nil, ""}}},
-			{"user_id": bson.M{"$exists": false}},
-		}},
+		// Ownership does not decide: a non-live record is a lifecycle
+		// tombstone even when no user is bound (anonymous WIA).
+		{"status": domain.InstanceStatusActive},
 	}}
 	res, err := s.collection.DeleteOne(ctx, filter)
 	if err != nil {

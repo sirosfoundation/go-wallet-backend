@@ -419,7 +419,8 @@ func TestUpdateWalletInstanceStatus_LifecycleCascade(t *testing.T) {
 
 // SID-AUTH-06: a revoked instance of a user is the tombstone that keeps the
 // login gate and WIA guard refusing the wallet; the admin API must not delete
-// it. Stray records without a user can still be removed.
+// it, and the same holds for an unowned (anonymous WIA) record: deleting its
+// tombstone would let the key enroll again as a fresh active instance.
 func TestDeleteWalletInstance_RevokedInstanceIsRetained(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
@@ -446,8 +447,11 @@ func TestDeleteWalletInstance_RevokedInstanceIsRetained(t *testing.T) {
 
 	w = httptest.NewRecorder()
 	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/admin/tenants/acme/instances/stray-revoked", nil))
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("a revoked record without a user may be deleted, got %d %s", w.Code, w.Body.String())
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), errCodeInstanceRetained) {
+		t.Fatalf("a revoked record without a user must be retained, got %d %s", w.Code, w.Body.String())
+	}
+	if _, err := store.WalletInstances().GetByID(context.Background(), "stray-revoked"); err != nil {
+		t.Fatalf("the unowned tombstone must still exist: %v", err)
 	}
 }
 

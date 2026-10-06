@@ -445,14 +445,26 @@ func TestWalletInstanceStore_DeleteIfRemovable(t *testing.T) {
 		t.Errorf("the tombstone must still be there, got %v", err)
 	}
 
-	// A stray record with no user is removable whatever its status.
+	// An unowned (anonymous WIA) tombstone is retained too; an active
+	// unowned record is removable.
 	if err := wis.Upsert(ctx, &domain.WalletInstance{
 		ID: "inst-stray", TenantID: "acme", Status: domain.InstanceStatusRevoked,
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := wis.DeleteIfRemovable(ctx, "inst-stray", "acme", bindingOf(t, wis, "inst-stray")); err != nil {
-		t.Fatalf("a record with no user must be removable: %v", err)
+	if err := wis.DeleteIfRemovable(ctx, "inst-stray", "acme", bindingOf(t, wis, "inst-stray")); !errors.Is(err, domain.ErrInvalidStatusTransition) {
+		t.Fatalf("an unowned tombstone must survive, got %v", err)
+	}
+	if _, err := wis.GetByID(ctx, "inst-stray"); err != nil {
+		t.Errorf("the unowned tombstone must still be there, got %v", err)
+	}
+	if err := wis.Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-stray-live", TenantID: "acme", Status: domain.InstanceStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wis.DeleteIfRemovable(ctx, "inst-stray-live", "acme", bindingOf(t, wis, "inst-stray-live")); err != nil {
+		t.Fatalf("an active unowned record must be removable: %v", err)
 	}
 
 	// Another tenant's record is not found.
