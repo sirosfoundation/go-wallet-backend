@@ -109,17 +109,30 @@ type TransactionData struct {
 type HashAlgList []string
 
 // UnmarshalJSON accepts either a JSON string or an array of strings.
+//
+// The list must be non-empty and hold non-empty names: OID4VP defines the
+// member as a non-empty array of algorithm identifiers, one of which the
+// wallet must use, so an empty list leaves it nothing valid to choose. Anything
+// else is rejected as invalid transaction_data, and `null` is not the same as
+// leaving the member out.
 func (l *HashAlgList) UnmarshalJSON(b []byte) error {
+	errInvalid := errors.New("transaction_data_hashes_alg must be a non-empty string or a non-empty array of non-empty strings")
+	var algs []string
 	var one string
-	if err := json.Unmarshal(b, &one); err == nil {
-		*l = HashAlgList{one}
-		return nil
+	if err := json.Unmarshal(b, &one); err == nil && string(b) != "null" {
+		algs = []string{one}
+	} else if err := json.Unmarshal(b, &algs); err != nil || algs == nil {
+		return errInvalid
 	}
-	var many []string
-	if err := json.Unmarshal(b, &many); err != nil {
-		return errors.New("transaction_data_hashes_alg must be a string or an array of strings")
+	if len(algs) == 0 {
+		return errInvalid
 	}
-	*l = HashAlgList(many)
+	for _, a := range algs {
+		if a == "" {
+			return errInvalid
+		}
+	}
+	*l = HashAlgList(algs)
 	return nil
 }
 
@@ -212,15 +225,21 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	}
 
 	// OID4VP §5 / §6: Validate request parameters before proceeding
+	// A transaction_data problem does not end the flow yet. Telling the
+	// verifier means contacting the response_uri the request itself supplied,
+	// and until verifier trust has been established that is an arbitrary,
+	// attacker-chosen URL: an unauthenticated request could aim the backend at
+	// an internal service just by carrying transaction_data. The request is
+	// refused below, after trust evaluation, and the verifier is told only then.
+	var pendingTransactionDataErr *transactionDataError
+	var validationErr error
 	if err := h.validateAuthorizationRequest(authReq, msg); err != nil {
 		h.Logger.Debug("authorization request validation failed", zap.Error(err))
-		var tdErr *transactionDataError
-		if errors.As(err, &tdErr) {
-			h.failTransactionData(ctx, authReq, tdErr)
+		if !errors.As(err, &pendingTransactionDataErr) {
+			_ = h.Error(StepParsingRequest, ErrCodeInvalidMessage, ErrCodeInvalidMessage.UserFacingMessage())
 			return err
 		}
-		_ = h.Error(StepParsingRequest, ErrCodeInvalidMessage, ErrCodeInvalidMessage.UserFacingMessage())
-		return err
+		validationErr = err
 	}
 
 	h.SetData("auth_request", authReq)
@@ -231,6 +250,11 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 		h.Logger.Debug("verifier trust evaluation failed", zap.Error(err))
 		_ = h.Error(StepEvaluatingVerifierTrust, ErrCodeUntrustedVerifier, ErrCodeUntrustedVerifier.UserFacingMessage())
 		return err
+	}
+	if pendingTransactionDataErr != nil {
+		// The verifier is trusted now, so it may be told.
+		h.failTransactionData(ctx, authReq, pendingTransactionDataErr)
+		return validationErr
 	}
 
 	// Step 3: Send credential_selection with dcql_query + verifier; wait for consent or decline
@@ -2405,9 +2429,18 @@ func validateTransactionData(authReq *AuthorizationRequest, msg *FlowStartMessag
 // verifier is told so its session ends now, as for a decline, and the client
 // gets the error code (and any redirect the verifier returned) to explain it to
 // the user in their own language.
+//
+// Only call it once the verifier's trust has been established (see Execute).
 func (h *OID4VPHandler) failTransactionData(ctx context.Context, authReq *AuthorizationRequest, tdErr *transactionDataError) {
 	details := map[string]interface{}{}
-	if redirectURI := h.submitErrorResponse(ctx, authReq, "invalid_transaction_data", transactionDataVerifierDescription); redirectURI != "" {
+	if authReq.ResponseMode == ResponseModeDirectPostJWT {
+		// An error for direct_post.jwt must itself be a JWT (JARM), which
+		// submitErrorResponse does not build: it posts plain form fields that
+		// such a verifier rejects. Sending that would only produce a failed
+		// request, so the verifier is not contacted and its session ends by
+		// timeout, as it does for every other failure in this mode today.
+		h.Logger.Info("not notifying a direct_post.jwt verifier of the transaction_data failure: error responses in this mode are not implemented")
+	} else if redirectURI := h.submitErrorResponse(ctx, authReq, "invalid_transaction_data", transactionDataVerifierDescription); redirectURI != "" {
 		details["redirect_uri"] = redirectURI
 	}
 	_ = h.ErrorWithDetails(StepParsingRequest, tdErr.code, tdErr.code.UserFacingMessage(), details)
