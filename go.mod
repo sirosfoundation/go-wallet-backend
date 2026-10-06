@@ -17,14 +17,14 @@ require (
 	github.com/kelseyhightower/envconfig v1.4.0
 	github.com/prometheus/client_golang v1.24.1
 	github.com/redis/go-redis/v9 v9.22.0
-	github.com/sirosfoundation/go-cryptoutil v0.7.1
-	github.com/sirosfoundation/go-cryptoutil/pkcs11pool v0.7.1
+	github.com/sirosfoundation/go-cryptoutil v0.6.0
+	github.com/sirosfoundation/go-cryptoutil/pkcs11pool v0.1.1
 	github.com/sirosfoundation/go-siros-set v0.1.0
 	github.com/sirosfoundation/go-spocp v0.1.0
 	github.com/sirosfoundation/go-tokenauth v0.5.0
-	github.com/sirosfoundation/go-trust v0.23.2
+	github.com/sirosfoundation/go-trust v0.21.1
 	github.com/sirosfoundation/go-ts11client v0.0.0-20260820233304-8809951d6f67
-	github.com/sirosfoundation/go-wmp v0.5.0
+	github.com/sirosfoundation/go-wmp v0.5.1-0.20261006191018-e49d0fcfb272
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.1
 	go.mongodb.org/mongo-driver v1.17.10

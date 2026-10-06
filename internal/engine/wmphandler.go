@@ -413,8 +413,13 @@ type wmpSession struct {
 	pumpDone     chan struct{} // closed once the event pump has drained and exited
 	lastActivity time.Time
 	capabilities wmp.Capabilities // negotiated capabilities for resume echo
-	security     wmp.SecurityMode // negotiated security mode for resume echo
-	expiresAt    time.Time        // absolute session deadline from TTL
+	// offered is what the client OFFERED in wmp.session.create, as received.
+	// Feature gating reads this, never capabilities: negotiation falls back to
+	// every server capability when the client offers none (see the session
+	// create handler), which would read as support the client never claimed.
+	offered   wmp.Capabilities
+	security  wmp.SecurityMode // negotiated security mode for resume echo
+	expiresAt time.Time        // absolute session deadline from TTL
 	// ownerTokenID is the jti of the token the session was created with. It
 	// is compared for sessions with no user identity (anonymous tokens all
 	// have UserID == ""), which user/tenant alone cannot tell apart.
@@ -1062,6 +1067,7 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, caller wmpCaller, 
 		pumpDone:     make(chan struct{}),
 		lastActivity: time.Now(),
 		capabilities: negotiated,
+		offered:      params.CapabilitiesOffered,
 		security:     params.Security,
 		expiresAt:    expiresAt,
 		ownerTokenID: tokenID,
@@ -1364,6 +1370,7 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 		pumpDone:     make(chan struct{}),
 		lastActivity: time.Now(),
 		capabilities: oldWS.capabilities,
+		offered:      oldWS.offered,
 		security:     oldWS.security,
 		expiresAt:    oldWS.expiresAt,
 		ownerTokenID: oldWS.ownerTokenID,
@@ -1649,6 +1656,25 @@ func (h *wmpEngineHandler) authorizeFlow(ctx context.Context, flowID string) (fl
 	return flow, h.authorizeProtocol(ctx, flow.Protocol, h.logger().With(zap.String("flow_id", flowID)))
 }
 
+// declaredFeatures maps the capabilities this session's client offered to the
+// engine's feature declarations (FlowStartMessage.Features), so a WMP client is
+// held to the same rule as a WebSocket one: transaction_data is only sent to a
+// client that said it can handle it. A session that offered nothing declares
+// nothing.
+func (h *wmpEngineHandler) declaredFeatures() []string {
+	h.adapter.mu.RLock()
+	ws, ok := h.adapter.peers[h.sessionID]
+	h.adapter.mu.RUnlock()
+	if !ok {
+		return nil
+	}
+	var features []string
+	if ws.offered.OffersTransactionData(wmp.TransactionDataVersion1) {
+		features = append(features, FeatureTransactionDataV1)
+	}
+	return features
+}
+
 // FlowStart handles wmp.flow.start — launches an engine flow goroutine.
 func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartParams) (*wmp.FlowStartResult, error) {
 	protocol := Protocol(params.FlowType)
@@ -1700,6 +1726,10 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 	}
 	startMsg.FlowID = flowID
 	startMsg.Protocol = protocol
+	// Declared features come from what the session OFFERED, not from the flow
+	// params: WMP defines the capability at session level, and a `features`
+	// member a client slipped into the params must not stand in for it.
+	startMsg.Features = h.declaredFeatures()
 
 	// checkSlot rejects a duplicate client-supplied flow_id (which would
 	// overwrite a live flow's map entry, bypassing the limit, and let either
@@ -2304,6 +2334,7 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 			ProofType:             m.Params.ProofType,
 			ParentFlowID:          m.FlowID,
 			TransactionData:       convertTransactionData(m.Params.TransactionData),
+			ResponseMode:          m.Params.ResponseMode,
 			Issuer:                m.Params.Issuer,
 			ProofTypesSupported:   m.Params.ProofTypesSupported,
 			Count:                 m.Params.Count,
@@ -2376,11 +2407,17 @@ func convertTransactionData(in []TransactionData) []openid4x.TransactionData {
 	for i, td := range in {
 		out[i] = openid4x.TransactionData{
 			Type:                     td.Type,
-			Params:                   td.Params,
+			Raw:                      td.Raw,
+			Payload:                  td.Payload,
 			CredentialIDs:            td.CredentialIDs,
-			HashAlgorithm:            td.HashAlgorithm,
-			TransactionDataHashesAlg: td.TransactionDataHashesAlg,
+			TransactionDataHashesAlg: openid4x.HashAlgs(td.TransactionDataHashesAlg),
 		}
+		// Params and HashAlgorithm are deprecated in go-wmp (TS12 types use
+		// Payload and the hash algorithm list) but are still copied: a pre-TS12
+		// entry carries its members there, and dropping them would give a WMP
+		// client less than a WebSocket client gets.
+		out[i].Params = td.Params               //nolint:staticcheck // deprecated, kept for pre-TS12 entries
+		out[i].HashAlgorithm = td.HashAlgorithm //nolint:staticcheck // deprecated, kept for pre-TS12 entries
 	}
 	return out
 }

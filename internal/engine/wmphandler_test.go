@@ -1683,12 +1683,15 @@ func TestWmpSessionTransport_SendJSON_SignRequest_FieldParity(t *testing.T) {
 			ATH:                   "ath-1",
 			KeyID:                 "instance-key-1",
 			AttestationChallenge:  "chal-abc",
+			ResponseMode:          "direct_post",
 			TransactionData: []TransactionData{{
 				Type:                     "payment",
+				Raw:                      "eyJ0eXBlIjoicGF5bWVudCJ9",
+				Payload:                  json.RawMessage(`{"amount":"10"}`),
 				Params:                   map[string]interface{}{"amount": "10"},
 				CredentialIDs:            []string{"cred-1"},
 				HashAlgorithm:            "sha-256",
-				TransactionDataHashesAlg: "sha-256",
+				TransactionDataHashesAlg: HashAlgList{"sha-256", "sha-384"},
 			}},
 			CredentialsToInclude: []CredentialRef{{
 				CredentialQueryID: "q-1",
@@ -1757,6 +1760,14 @@ func TestWmpSessionTransport_SendJSON_SignRequest_FieldParity(t *testing.T) {
 	require.Len(t, params.TransactionData, 1)
 	assert.Equal(t, in.Params.TransactionData[0].Type, params.TransactionData[0].Type)
 	assert.Equal(t, in.Params.TransactionData[0].CredentialIDs, params.TransactionData[0].CredentialIDs)
+	// What the wallet needs to bind the presentation correctly: the string it
+	// must hash, the payload it validates and shows, the hash algorithm list
+	// and the response mode. Losing any of them over WMP while the WebSocket
+	// client gets them would be the parity bug this test exists to catch.
+	assert.Equal(t, in.Params.TransactionData[0].Raw, params.TransactionData[0].Raw)
+	assert.JSONEq(t, string(in.Params.TransactionData[0].Payload), string(params.TransactionData[0].Payload))
+	assert.Equal(t, openid4x.HashAlgs{"sha-256", "sha-384"}, params.TransactionData[0].TransactionDataHashesAlg)
+	assert.Equal(t, in.Params.ResponseMode, params.ResponseMode)
 	require.Len(t, params.CredentialsToInclude, 1)
 	assert.Equal(t, in.Params.CredentialsToInclude[0].CredentialID, params.CredentialsToInclude[0].CredentialID)
 	assert.Equal(t, in.Params.CredentialsToInclude[0].DisclosedClaims, params.CredentialsToInclude[0].DisclosedClaims)
