@@ -65,7 +65,7 @@ Fully abstracted storage with multiple implementations:
 
 Business logic and orchestration:
 
-- **UserService**: User registration, authentication, JWT management
+- **UserService**: User registration and account management (tokens are issued by the AS, `internal/as`)
 - **KeystoreService**: Key management, signing operations
 - **IssuanceService** [TODO]: OpenID4VCI credential issuance
 - **VerificationService** [TODO]: OpenID4VP presentation verification
@@ -85,7 +85,7 @@ HTTP handlers using Gin framework:
 
 HTTP middleware:
 
-- **AuthMiddleware**: JWT authentication
+- **TokenAuthMiddleware**: validates AS-issued asymmetric session tokens (go-tokenauth, JWKS); HMAC tokens are never accepted
 - **Logger**: Request logging
 - **RateLimit** [TODO]: Rate limiting
 - **CORS**: Cross-origin resource sharing
@@ -123,7 +123,7 @@ Client Request
 
 All application state is stored externally:
 
-- User sessions: JWT tokens (stateless) or Redis
+- User sessions: AS sessions (MongoDB-backed when shared across replicas) and short-lived asymmetric access tokens
 - WebAuthn challenges: Shared storage (MongoDB/Redis)
 - Credentials: Shared database
 
@@ -170,11 +170,11 @@ WALLET_STORAGE_MONGODB_URI=mongodb://cluster:27017
 ### Authentication
 
 1. **WebAuthn**: Hardware security keys
-2. **JWT**: Stateless session management
+2. **AS session tokens**: cookie-bound AS session + short-lived ES256/ES384/EdDSA access tokens from `/auth/token` (the legacy HMAC token flow was removed, see [new-as.md](new-as.md#removal-of-the-legacy-as))
 
 ### Authorization
 
-- JWT claims include user_id and did
+- Access token claims include `sub` (user), `tenant_id` and `tac` (permissions)
 - Middleware validates tokens
 - Handlers check permissions
 

@@ -112,9 +112,12 @@ storage:
     database: "wallet"
 
 jwt:
-  secret: "your-secret"
-  expiry_hours: 24
+  secret: "your-secret"   # >= 32 bytes; keys the OIDC state cookie (no token is signed with it)
 ```
+
+Note: this backend only accepts AS-issued session tokens (`X-Token-Mode: session`,
+`/auth/token`). The reference implementation's HS256 `appToken` flow is not
+supported; see [new-as.md](new-as.md#removal-of-the-legacy-as).
 
 ## API Compatibility
 
@@ -265,13 +268,9 @@ mongodb://user:pass@localhost:27017/wallet
 
 ### Issue: Authentication fails
 
-**Solution**: Verify JWT secret matches
-```bash
-# Check secret
-echo $WALLET_JWT_SECRET
-
-# Regenerate tokens if secret changed
-```
+**Solution**: Clients must use session mode (`X-Token-Mode: session` on `/auth/passkey/*`, then
+`POST /auth/token` for access tokens). HS256 tokens signed with `WALLET_JWT_SECRET` are not
+accepted (401), and the old `/user/*-webauthn-*` endpoints answer `410 legacy_tokens_disabled`.
 
 ### Issue: Missing features
 
