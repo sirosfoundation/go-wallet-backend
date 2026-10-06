@@ -79,7 +79,19 @@ logging:
 jwt:
   # IMPORTANT: Use a strong secret (min 32 characters)
   # Generate with: openssl rand -base64 32
+  # (It signs no tokens: it keys the OIDC state-binding cookie.)
   secret: "${WALLET_JWT_SECRET}"
-  expiry_hours: 24
-  refresh_days: 7
+  # Fallback for as.issuer (the "iss" of AS-issued access tokens)
   issuer: "wallet.example.com"
+
+# Authorization Server: AS-issued session tokens are the only authentication
+# mechanism (the legacy HMAC token flow was removed; remove any as.legacy.*,
+# jwt.expiry_hours and jwt.refresh_days from older configs). A signing key is
+# required: an ECDSA P-256/P-384 or Ed25519 PEM key, or an HSM key
+# (as.signing_key_pkcs11).
+as:
+  enabled: true
+  signing_key_path: "/etc/wallet-backend/as-signing-key.pem"
+  rules_dir: "/app/rules"
+  external_url: "https://wallet.example.com"
+  issuer: "https://wallet.example.com"
