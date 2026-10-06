@@ -12,8 +12,10 @@ package server
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-contrib/cors"
@@ -153,7 +155,25 @@ type Manager struct {
 
 	// Readiness management for /readyz endpoint
 	readiness *health.ReadinessManager
+
+	// serveErrs receives fatal errors returned by a serving goroutine after
+	// Start succeeded (anything other than http.ErrServerClosed).
+	serveErrs chan error
+
+	// listeners holds every listener bound by listenAndServe so Shutdown can
+	// close them explicitly: http.Server.Shutdown only closes listeners that
+	// Serve has already registered, so a listener whose Serve goroutine has not
+	// yet run would otherwise stay bound after a failed Start.
+	listenersMu sync.Mutex
+	listeners   []net.Listener
+	// serveWG tracks the serving goroutines so Shutdown can wait for them.
+	serveWG sync.WaitGroup
 }
+
+// ServeErrors returns a channel that receives the first fatal error of a
+// listener that stopped serving after Start succeeded. The caller should shut
+// down and exit non-zero instead of running without that listener.
+func (m *Manager) ServeErrors() <-chan error { return m.serveErrs }
 
 // NewManager creates a new server manager
 func NewManager(cfg *ServerConfig, logger *zap.Logger) *Manager {
@@ -161,6 +181,7 @@ func NewManager(cfg *ServerConfig, logger *zap.Logger) *Manager {
 		cfg:       cfg,
 		logger:    logger,
 		providers: make([]RouteProvider, 0),
+		serveErrs: make(chan error, 8),
 		readiness: health.NewReadinessManager(
 			health.WithCacheTTL(2*time.Second),
 			health.WithCheckTimeout(2*time.Second),
@@ -200,8 +221,51 @@ func (c *providerChecker) CheckReady(ctx context.Context) error {
 	return c.checker.CheckReady(ctx)
 }
 
-// Start builds routers and starts http servers
+// Start builds routers and starts http servers. Listeners are bound
+// synchronously, so an occupied port or invalid address is returned as an
+// error instead of being logged from a serving goroutine. If startup fails
+// after some listeners were bound, they are closed again and their serving
+// goroutines have exited before Start returns.
 func (m *Manager) Start(ctx context.Context) error {
+	if err := m.start(ctx); err != nil {
+		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = m.Shutdown(sctx)
+		return err
+	}
+	return nil
+}
+
+// listenAndServe binds srv.Addr synchronously and serves it in a goroutine.
+func (m *Manager) listenAndServe(srv *http.Server, tlsCfg *config.TLSConfig, listeningMsg, errMsg string, fields []zap.Field) error {
+	// Validate the certificate before binding so a bad TLS setup aborts
+	// startup (and nothing extra needs releasing).
+	if err := tlsCfg.PrepareTLS(srv); err != nil {
+		return fmt.Errorf("%s: %w", errMsg, err)
+	}
+	ln, err := net.Listen("tcp", srv.Addr)
+	if err != nil {
+		return fmt.Errorf("%s: cannot listen on %s: %w", errMsg, srv.Addr, err)
+	}
+	m.listenersMu.Lock()
+	m.listeners = append(m.listeners, ln)
+	m.listenersMu.Unlock()
+	m.logger.Info(listeningMsg, fields...)
+	m.serveWG.Add(1)
+	go func() {
+		defer m.serveWG.Done()
+		if err := tlsCfg.Serve(srv, ln); err != nil && err != http.ErrServerClosed {
+			m.logger.Error(errMsg, zap.Error(err))
+			select {
+			case m.serveErrs <- fmt.Errorf("%s: %w", errMsg, err):
+			default:
+			}
+		}
+	}()
+	return nil
+}
+
+func (m *Manager) start(ctx context.Context) error {
 	// Set Gin mode
 	if m.cfg.LoggingLevel == "debug" {
 		gin.SetMode(gin.DebugMode)
@@ -261,12 +325,9 @@ func (m *Manager) Start(ctx context.Context) error {
 		IdleTimeout:  60 * time.Second,
 	}
 
-	go func() {
-		m.logger.Info("HTTP server listening", zap.String("address", httpAddr))
-		if err := m.cfg.TLS.ListenAndServe(m.httpServer); err != nil && err != http.ErrServerClosed {
-			m.logger.Error("HTTP server error", zap.Error(err))
-		}
-	}()
+	if err := m.listenAndServe(m.httpServer, &m.cfg.TLS, "HTTP server listening", "HTTP server error", []zap.Field{zap.String("address", httpAddr)}); err != nil {
+		return err
+	}
 
 	// Start WebSocket server if providers registered
 	if m.wsRouter != nil {
@@ -282,12 +343,9 @@ func (m *Manager) Start(ctx context.Context) error {
 		// Add status to WebSocket server too
 		m.addStatusEndpoints(m.wsRouter)
 
-		go func() {
-			m.logger.Info("WebSocket server listening", zap.String("address", wsAddr))
-			if err := m.cfg.TLS.ListenAndServe(m.wsServer); err != nil && err != http.ErrServerClosed {
-				m.logger.Error("WebSocket server error", zap.Error(err))
-			}
-		}()
+		if err := m.listenAndServe(m.wsServer, &m.cfg.TLS, "WebSocket server listening", "WebSocket server error", []zap.Field{zap.String("address", wsAddr)}); err != nil {
+			return err
+		}
 	}
 
 	// Start wallet-provider server if providers registered on separate port
@@ -308,12 +366,9 @@ func (m *Manager) Start(ctx context.Context) error {
 			IdleTimeout:  60 * time.Second,
 		}
 
-		go func() {
-			m.logger.Info("Wallet-provider server listening (PKCS#11 isolated)", zap.String("address", wpAddr))
-			if err := m.cfg.TLS.ListenAndServe(m.wpServer); err != nil && err != http.ErrServerClosed {
-				m.logger.Error("Wallet-provider server error", zap.Error(err))
-			}
-		}()
+		if err := m.listenAndServe(m.wpServer, &m.cfg.TLS, "Wallet-provider server listening (PKCS#11 isolated)", "Wallet-provider server error", []zap.Field{zap.String("address", wpAddr)}); err != nil {
+			return err
+		}
 	}
 
 	// Start admin server if configured
@@ -373,6 +428,20 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 			errs = append(errs, fmt.Errorf("admin server shutdown: %w", err))
 		}
 	}
+
+	// Release every bound listener, including ones whose Serve goroutine had
+	// not registered them with its http.Server yet. Already-closed listeners
+	// (closed by Server.Shutdown) report an error that is expected here.
+	m.listenersMu.Lock()
+	for _, ln := range m.listeners {
+		_ = ln.Close()
+	}
+	m.listeners = nil
+	m.listenersMu.Unlock()
+
+	// Serve returns once its listener is closed; waiting guarantees nothing is
+	// still bound or serving when Shutdown (and so a failed Start) returns.
+	m.serveWG.Wait()
 
 	if len(errs) > 0 {
 		return fmt.Errorf("shutdown errors: %v", errs)
@@ -528,12 +597,9 @@ func (m *Manager) startAdminServer() error {
 	// otherwise fall back to the shared TLS configuration.
 	adminTLS := effectiveAdminTLS(&m.cfg.TLS, m.cfg.AdminTLS)
 
-	go func() {
-		m.logger.Info("Admin server listening", zap.String("address", adminAddr), zap.Bool("tls", adminTLS.Enabled))
-		if err := adminTLS.ListenAndServe(m.adminServer); err != nil && err != http.ErrServerClosed {
-			m.logger.Error("Admin server error", zap.Error(err))
-		}
-	}()
+	if err := m.listenAndServe(m.adminServer, adminTLS, "Admin server listening", "Admin server error", []zap.Field{zap.String("address", adminAddr), zap.Bool("tls", adminTLS.Enabled)}); err != nil {
+		return err
+	}
 
 	return nil
 }

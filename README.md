@@ -78,7 +78,6 @@ See [go-trust documentation](https://github.com/sirosfoundation/go-trust) for mo
 go-wallet-backend/
 ├── cmd/
 │   ├── server/          # Main application entry point
-│   ├── registry/        # VCTM registry server
 │   └── wallet-admin/    # Admin CLI tool
 ├── internal/
 │   ├── api/             # HTTP handlers and routes
@@ -88,7 +87,7 @@ go-wallet-backend/
 │   ├── storage/         # Storage implementations
 │   ├── modes/           # Server operation modes
 │   ├── metadata/        # Issuer/verifier metadata fetching
-│   └── registry/        # VCTM registry handlers
+│   └── registry/        # VCTM registry role (--mode=registry) handlers
 ├── pkg/
 │   ├── config/          # Configuration management
 │   ├── middleware/      # HTTP middleware

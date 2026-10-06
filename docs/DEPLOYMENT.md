@@ -313,6 +313,61 @@ Apply:
 kubectl apply -f k8s/ingress.yaml
 ```
 
+## VCTM Registry Deployment
+
+The registry is a role of the main server binary. Deploy it either together
+with other roles (`--mode=backend,registry,engine,auth`, served from the shared
+HTTP port under `/registry`) or on its own (`--mode=registry`).
+
+### Registry-only
+
+```bash
+./server --mode=registry --config configs/config.registry.yaml
+```
+
+or with the main image:
+
+```bash
+docker run -p 8097:8097 -v $PWD/registry.yaml:/etc/wallet/config.yaml \
+  sirosfoundation/go-wallet-backend --mode=registry --config /etc/wallet/config.yaml
+```
+
+A registry-only process listens on `server.registry_host`/`server.registry_port`
+(default `0.0.0.0:8097`); `WALLET_SERVER_REGISTRY_PORT` overrides it. Backend-only
+settings (storage, `jwt.secret` when not needed, ...) are not required. The one
+exception is `server.rp_id`: while `as.legacy.enabled` is true and a `jwt.secret`
+is configured, it must be set to the RP ID of the backend that issues the legacy
+HMAC tokens (their `aud` claim; go-tokenauth applies its audience list to them
+too). Startup fails with a clear error if it is left at the default `localhost`;
+alternatively set `as.legacy.enabled: false`. The one exemption is a
+registry-only process started from the deprecated `registry.yaml` / `REGISTRY_*`
+alias (which has no `rp_id`) with no `server.rp_id` set: it keeps starting and
+validates legacy HMAC tokens without an audience check (signature, `jwt.issuer`,
+expiry and revocation are still enforced) until the deprecated configuration is
+removed; see [REGISTRY_MIGRATION.md](REGISTRY_MIGRATION.md).
+
+When `registry.require_auth` is `true` the process needs the settings to build
+the shared token validator (the AS itself is *not* run, keep `as.enabled` false):
+
+| Setting | Why |
+|---------|-----|
+| `as.external_url` | JWKS is fetched from `<as.external_url>/auth/.well-known/jwks.json` (no override) |
+| `as.issuer` (or `jwt.issuer`) | expected `iss` |
+| `jwt.secret` / `jwt.secret_path` (>= 32 bytes) | only while `as.legacy.enabled` is true (legacy HMAC tokens); set `as.legacy.enabled: false` to drop it |
+
+New-style tokens must carry the `wallet-registry` audience. Startup fails with a
+message naming any missing field.
+
+### go-wallet-registry image (transition helper)
+
+`sirosfoundation/go-wallet-registry` is still published for one transition
+period. It is the same server binary with `--mode=registry` fixed in the
+entrypoint and `--config /app/configs/config.registry.yaml` as the default
+argument (`Dockerfile.registry`). Overriding the container args therefore keeps
+the registry role; a mounted config file must be in the *backend* layout with a
+`registry:` section. Listen port stays 8097. Prefer the main image with
+`--mode=registry` for new deployments.
+
 ## Cloud Provider Specific
 
 ### AWS (ECS)

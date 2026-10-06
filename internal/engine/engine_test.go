@@ -216,3 +216,21 @@ func TestRegistryClient_registryURL_Configured(t *testing.T) {
 
 	assert.Equal(t, "https://registry.example.com", rc.registryURL())
 }
+
+func TestRegistryClient_SetHandler(t *testing.T) {
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/registry/type-metadata" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"vct":"` + r.URL.Query().Get("vct") + `","name":"N"}`))
+	})
+	rc := NewRegistryClient(&config.Config{}, zap.NewNop())
+	rc.SetHandler(h)
+	assert.Equal(t, "https://registry.internal/registry", rc.registryURL())
+	md, err := rc.FetchTypeMetadata(context.Background(), "v1")
+	require.NoError(t, err)
+	require.NotNil(t, md)
+	assert.Equal(t, "N", md.Name)
+}

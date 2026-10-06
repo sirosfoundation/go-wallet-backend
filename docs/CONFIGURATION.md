@@ -5,7 +5,7 @@
 This document describes all configuration options for go-wallet-backend.
 Configuration is loaded from a YAML file and can be overridden by environment variables.
 
-Environment variables use the prefix `WALLET_` for the main backend and `REGISTRY_` for the registry server.
+Environment variables use the prefix `WALLET_` (the registry role's settings are `WALLET_REGISTRY_*`).
 
 ## Table of Contents
 
@@ -23,18 +23,7 @@ Environment variables use the prefix `WALLET_` for the main backend and `REGISTR
 - [authzen_proxy](#authzen_proxy)
 - [audit](#audit)
 - [presentation](#presentation)
-- [Registry Server](#registry-server)
-- [registry.server](#registryserver)
-- [registry.source](#registrysource)
-- [registry.sources](#registrysources)
-- [registry.cache](#registrycache)
-- [registry.dynamic_cache](#registrydynamic_cache)
-- [registry.image_embed](#registryimage_embed)
-- [registry.filter](#registryfilter)
-- [registry.rate_limit](#registryrate_limit)
-- [registry.jwt](#registryjwt)
-- [registry.logging](#registrylogging)
-- [registry.http_client](#registryhttp_client)
+- [registry](#registry)
 
 ---
 
@@ -308,160 +297,37 @@ Environment prefix: `WALLET_PRESENTATION`
 |----------|-------------|------|-------------|
 | `presentation.dcql_consent_check` | `WALLET_PRESENTATION_DCQL_CONSENT_CHECK` | DCQLConsentCheckMode | DCQLConsentCheck compares the user's consent (selected credential query ids and disclosed claims) with the DCQL query the backend sent to the client, before any signing. The frontend is not trusted to have honoured the query. Values: `off` (no check); `warn` (default: log a warning with the reason class and query id, never refuse; claim-path matching can disagree with a real verifier's notion of a path, so a deployer opts into enforcement); `enforce` (refuse with PRESENTATION_ERROR and answer the verifier access_denied, without signing). Nothing about claim names or values is logged. Not enforced: credential_sets satisfaction (only that no query outside every option is selected), `values` constraints, and the contents of the resulting vp_token. Unknown values fail at startup. Env: WALLET_PRESENTATION_DCQL_CONSENT_CHECK |
 
-## Registry Server
+## registry
 
-The registry server (`cmd/registry`) has its own configuration file. It serves VCTM (Verifiable Credential Type Metadata) fetched from upstream registries.
+Registry configures the VCTM registry role (--mode=registry). It replaces the retired standalone registry configuration file (configs/registry.yaml, REGISTRY_* environment variables).
 
-Environment prefix: `REGISTRY`
-
-
-## registry.server
-
-Server configuration
-
-Environment prefix: `REGISTRY_SERVER`
+Environment prefix: `WALLET_REGISTRY`
 
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
-| `server.host` | `REGISTRY_SERVER_HOST` | string |  |
-| `server.port` | `REGISTRY_SERVER_PORT` | integer |  |
-| `server.served_by_header` | `REGISTRY_SERVER_SERVEDBYHEADER` | string |  |
-| `server.tls.enabled` | `REGISTRY_SERVER_TLS_ENABLED` | boolean | Enabled enables TLS for the HTTP listeners |
-| `server.tls.cert_file` | `REGISTRY_SERVER_TLS_CERT_FILE` | string | CertFile is the path to the TLS certificate file |
-| `server.tls.key_file` | `REGISTRY_SERVER_TLS_KEY_FILE` | string | KeyFile is the path to the TLS private key file |
-| `server.tls.min_version` | `REGISTRY_SERVER_TLS_MIN_VERSION` | string | MinVersion is the minimum TLS version (tls12 or tls13, default: tls12) |
-| `server.cors.allowed_origins` | `REGISTRY_SERVER_CORS_ALLOWED_ORIGINS` | string list | AllowedOrigins is a list of origins that may access the resource. Use "*" to allow all origins (default for development). |
-| `server.cors.allowed_methods` | `REGISTRY_SERVER_CORS_ALLOWED_METHODS` | string list | AllowedMethods is a list of HTTP methods allowed for cross-origin requests. |
-| `server.cors.allowed_headers` | `REGISTRY_SERVER_CORS_ALLOWED_HEADERS` | string list | AllowedHeaders is a list of request headers allowed in cross-origin requests. |
-| `server.cors.exposed_headers` | `REGISTRY_SERVER_CORS_EXPOSED_HEADERS` | string list | ExposedHeaders is a list of headers that browsers are allowed to access. |
-| `server.cors.allow_credentials` | `REGISTRY_SERVER_CORS_ALLOW_CREDENTIALS` | boolean | AllowCredentials indicates whether the request can include credentials. Cannot be true when AllowedOrigins is "*". |
-| `server.cors.max_age` | `REGISTRY_SERVER_CORS_MAX_AGE` | integer | MaxAge indicates how long (in seconds) the results of a preflight request can be cached. |
-
-## registry.source
-
-Source is the legacy single-registry source configuration. Use Sources for multi-registry support. If Sources is empty, Source is used.
-
-Environment prefix: `REGISTRY_SOURCE`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `source.url` | `REGISTRY_SOURCE_URL` | string | URL of the upstream registry. The actual endpoint is determined by the Mode setting. |
-| `source.mode` | `REGISTRY_SOURCE_MODE` | string (`ts11` or `registry`) | Mode selects which API endpoint to use: "ts11" (default) or "registry" (all credentials). |
-| `source.local_overrides` | `REGISTRY_SOURCE_LOCAL_OVERRIDES` | string list | LocalOverrides is a list of local file or directory paths containing VCTM JSON files. These are loaded at startup and take priority over entries fetched from the remote registry. Directories are scanned for *.json files. Entries are keyed by their "vct" field. |
-| `source.poll_interval` | `REGISTRY_SOURCE_POLL_INTERVAL` | duration | PollInterval is how often to poll the upstream registry for updates |
-| `source.timeout` | `REGISTRY_SOURCE_TIMEOUT` | duration | Timeout for HTTP requests to the upstream registry |
-
-## registry.sources
-
-Sources is an ordered list of remote registry URLs to fetch from. Schemas fetched from later sources in the list overwrite earlier ones, allowing a registry to extend or override another. When non-empty, the Source.URL field is ignored for remote fetching (Source.PollInterval and Source.LocalOverrides remain global settings). (list of entries, each with the fields below)
-
-Environment prefix: `REGISTRY_SOURCES`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `sources[*].url` | `REGISTRY_SOURCES_URL` | string | URL is the base URL of the registry (e.g. "https://registry.siros.org"). The actual endpoint path is determined by the Mode setting. For backward compatibility, if a full path to a specific endpoint is given (e.g. ending in schemas.json or registry.json), it is used as-is regardless of Mode. |
-| `sources[*].mode` | `REGISTRY_SOURCES_MODE` | string (`ts11` or `registry`) | Mode selects which API endpoint to use: "ts11" (default) for only TS11-compliant credentials, or "registry" for all credentials including non-TS11. |
-| `sources[*].timeout` | `REGISTRY_SOURCES_TIMEOUT` | duration | Timeout for HTTP requests to this source. Zero means no per-source timeout (the shared http.Client timeout applies). |
-
-## registry.cache
-
-Cache configuration
-
-Environment prefix: `REGISTRY_CACHE`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `cache.path` | `REGISTRY_CACHE_PATH` | string | Path to the cache file (JSON format) |
-| `cache.max_age` | `REGISTRY_CACHE_MAX_AGE` | duration | MaxAge is the maximum age of cached data before forcing a refresh |
-
-## registry.dynamic_cache
-
-DynamicCache configuration for on-demand URL fetching
-
-Environment prefix: `REGISTRY_DYNAMIC_CACHE`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `dynamic_cache.enabled` | `REGISTRY_DYNAMIC_CACHE_ENABLED` | boolean | Enabled controls whether dynamic URL fetching is active |
-| `dynamic_cache.default_ttl` | `REGISTRY_DYNAMIC_CACHE_DEFAULT_TTL` | duration | DefaultTTL is the default cache TTL for dynamically fetched VCTMs when no HTTP cache headers are present |
-| `dynamic_cache.max_ttl` | `REGISTRY_DYNAMIC_CACHE_MAX_TTL` | duration | MaxTTL is the maximum cache TTL to respect from HTTP headers Values larger than this will be capped |
-| `dynamic_cache.min_ttl` | `REGISTRY_DYNAMIC_CACHE_MIN_TTL` | duration | MinTTL is the minimum cache TTL; shorter values from HTTP headers will be bumped up to this value |
-| `dynamic_cache.timeout` | `REGISTRY_DYNAMIC_CACHE_TIMEOUT` | duration | Timeout for HTTP requests when fetching VCTMs dynamically |
-| `dynamic_cache.allowed_hosts` | `REGISTRY_DYNAMIC_CACHE_ALLOWED_HOSTS` | string list | AllowedHosts is an optional list of host patterns (regexps) that are allowed for dynamic fetching. If empty, all HTTPS hosts are allowed. |
-
-## registry.image_embed
-
-ImageEmbed configuration for embedding images as data URIs
-
-Environment prefix: `REGISTRY_IMAGE_EMBED`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `image_embed.enabled` | `REGISTRY_IMAGE_EMBED_ENABLED` | boolean | Enabled controls whether image embedding is active |
-| `image_embed.max_image_size` | `REGISTRY_IMAGE_EMBED_MAX_IMAGE_SIZE` | integer | MaxImageSize is the maximum size in bytes for images to embed Images larger than this will be left as URLs |
-| `image_embed.timeout` | `REGISTRY_IMAGE_EMBED_TIMEOUT` | duration | Timeout for fetching individual images |
-| `image_embed.concurrent_fetches` | `REGISTRY_IMAGE_EMBED_CONCURRENT_FETCHES` | integer | ConcurrentFetches is the maximum number of concurrent image fetches |
-
-## registry.filter
-
-Filter configuration for include/exclude patterns
-
-Environment prefix: `REGISTRY_FILTER`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `filter.include_patterns` | `REGISTRY_FILTER_INCLUDE_PATTERNS` | string list | IncludePatterns are regexps that VCT IDs must match to be included If empty, all VCT IDs are included (unless excluded) |
-| `filter.exclude_patterns` | `REGISTRY_FILTER_EXCLUDE_PATTERNS` | string list | ExcludePatterns are regexps that cause VCT IDs to be excluded |
-
-## registry.rate_limit
-
-Rate limiting configuration
-
-Environment prefix: `REGISTRY_RATE_LIMIT`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `rate_limit.enabled` | `REGISTRY_RATE_LIMIT_ENABLED` | boolean | Enabled controls whether rate limiting is active |
-| `rate_limit.authenticated_rpm` | `REGISTRY_RATE_LIMIT_AUTHENTICATED_RPM` | integer | AuthenticatedRPM is requests per minute for authenticated clients |
-| `rate_limit.unauthenticated_rpm` | `REGISTRY_RATE_LIMIT_UNAUTHENTICATED_RPM` | integer | UnauthenticatedRPM is requests per minute for unauthenticated clients |
-| `rate_limit.burst_multiplier` | `REGISTRY_RATE_LIMIT_BURST_MULTIPLIER` | integer | BurstMultiplier allows bursts of this multiple of the rate limit |
-
-## registry.jwt
-
-JWT configuration for authentication
-
-Environment prefix: `REGISTRY_JWT`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `jwt.secret` | `REGISTRY_JWT_SECRET` | string | Secret is the shared secret for validating JWT signatures (HMAC) |
-| `jwt.secret_path` | `REGISTRY_JWT_SECRET_PATH` | string | SecretPath is an alternative to Secret: path to a file containing the JWT secret. If both Secret and SecretPath are set, SecretPath takes precedence. |
-| `jwt.issuer` | `REGISTRY_JWT_ISSUER` | string | Issuer is the expected issuer claim in the JWT |
-| `jwt.require_auth` | `REGISTRY_JWT_REQUIRE_AUTH` | boolean | RequireAuth requires authentication for all requests (if false, unauthenticated access is allowed) |
-
-## registry.logging
-
-Logging configuration
-
-Environment prefix: `REGISTRY_LOGGING`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `logging.level` | `REGISTRY_LOGGING_LEVEL` | string | debug, info, warn, error |
-| `logging.format` | `REGISTRY_LOGGING_FORMAT` | string | json, text |
-
-## registry.http_client
-
-HTTPClient configuration for outbound requests (proxy, TLS settings)
-
-Environment prefix: `REGISTRY_HTTP_CLIENT`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `http_client.proxy_url` | `REGISTRY_HTTP_CLIENT_PROXY_URL` | string | ProxyURL is the URL of the HTTP proxy for egress requests (e.g., http://proxy:8080) |
-| `http_client.timeout` | `REGISTRY_HTTP_CLIENT_TIMEOUT` | integer | Timeout is the timeout for HTTP requests in seconds (default: 30) |
-| `http_client.insecure_skip_verify` | `REGISTRY_HTTP_CLIENT_INSECURE_SKIP_VERIFY` | boolean | InsecureSkipVerify disables TLS certificate verification (not recommended for production) |
-| `http_client.allow_private_ips` | `REGISTRY_HTTP_CLIENT_ALLOW_PRIVATE_IPS` | boolean | AllowPrivateIPs permits outbound requests to private/internal/loopback/link-local ranges. Required when credential issuers run on Docker, k8s internal networks, or localhost. Default: false (private/loopback/cloud-metadata IPs are blocked by the SSRF DialContext). Set to true when issuers are hosted on internal networks (dev/staging environments). Env: WALLET_HTTP_CLIENT_ALLOW_PRIVATE_IPS |
-| `http_client.allow_http` | `REGISTRY_HTTP_CLIENT_ALLOW_HTTP` | boolean | AllowHTTP permits non-TLS (plain HTTP) for every fetch that goes through the client this configuration builds - request objects, issuer and verifier metadata, JWKS, logos, registry and proxy calls - not only for metadata resolution, which was its scope while the resolver was the sole consumer. Code that builds its own client rather than taking this one is not governed by it; see NewHTTPClient for which paths those are. Default: false (HTTPS required). Use only for local development. It is not the only setting that permits plaintext: see AllowsPlaintext, which is what every check in the codebase actually consults. Env: WALLET_HTTP_CLIENT_ALLOW_HTTP |
-| `http_client.trusted_idp_hosts` | `REGISTRY_HTTP_CLIENT_TRUSTED_IDP_HOSTS` | string list | TrustedIdPHosts lists hostnames of operator-configured OIDC identity providers that may resolve to private/loopback/link-local addresses. It applies only to the client NewIdPHTTPClient builds (the AS's OIDC discovery, token exchange and JWKS fetches), never to the client used for issuers, verifiers and other counterparties. Matching is by exact, case-insensitive hostname of every request, redirect hops and the token_endpoint/jwks_uri named by a discovery document included, so a discovery document cannot steer the request to an unlisted internal host. Cloud metadata endpoints stay blocked regardless. Only the wallet server's AS reads this setting; the registry has no identity-provider client and ignores it. Env: WALLET_HTTP_CLIENT_TRUSTED_IDP_HOSTS (comma-separated) |
+| `registry.source.url` | `WALLET_REGISTRY_SOURCE_URL` | string | URL of the upstream registry. The actual endpoint is determined by the Mode setting. |
+| `registry.source.mode` | `WALLET_REGISTRY_SOURCE_MODE` | RegistryAPIMode | Mode selects which API endpoint to use: "ts11" (default) or "registry" (all credentials). |
+| `registry.source.local_overrides` | `WALLET_REGISTRY_SOURCE_LOCAL_OVERRIDES` | string list | LocalOverrides is a list of local file or directory paths containing VCTM JSON files. These are loaded at startup and take priority over entries fetched from the remote registry. Directories are scanned for *.json files. Entries are keyed by their "vct" field. |
+| `registry.source.poll_interval` | `WALLET_REGISTRY_SOURCE_POLL_INTERVAL` | duration | PollInterval is how often to poll the upstream registry for updates |
+| `registry.source.timeout` | `WALLET_REGISTRY_SOURCE_TIMEOUT` | duration | Timeout for HTTP requests to the upstream registry |
+| `registry.sources` | `WALLET_REGISTRY_SOURCES` | RegistryRemoteSourceConfig list | Sources is an ordered list of remote registry URLs to fetch from. Schemas fetched from later sources in the list overwrite earlier ones, allowing a registry to extend or override another. When non-empty, the Source.URL field is ignored for remote fetching (Source.PollInterval and Source.LocalOverrides remain global settings). |
+| `registry.cache.path` | `WALLET_REGISTRY_CACHE_PATH` | string | Path to the cache file (JSON format) |
+| `registry.cache.max_age` | `WALLET_REGISTRY_CACHE_MAX_AGE` | duration | MaxAge is the maximum age of cached data before forcing a refresh |
+| `registry.dynamic_cache.enabled` | `WALLET_REGISTRY_DYNAMIC_CACHE_ENABLED` | boolean | Enabled controls whether dynamic URL fetching is active |
+| `registry.dynamic_cache.default_ttl` | `WALLET_REGISTRY_DYNAMIC_CACHE_DEFAULT_TTL` | duration | DefaultTTL is the default cache TTL for dynamically fetched VCTMs when no HTTP cache headers are present |
+| `registry.dynamic_cache.max_ttl` | `WALLET_REGISTRY_DYNAMIC_CACHE_MAX_TTL` | duration | MaxTTL is the maximum cache TTL to respect from HTTP headers Values larger than this will be capped |
+| `registry.dynamic_cache.min_ttl` | `WALLET_REGISTRY_DYNAMIC_CACHE_MIN_TTL` | duration | MinTTL is the minimum cache TTL; shorter values from HTTP headers will be bumped up to this value |
+| `registry.dynamic_cache.timeout` | `WALLET_REGISTRY_DYNAMIC_CACHE_TIMEOUT` | duration | Timeout for HTTP requests when fetching VCTMs dynamically |
+| `registry.dynamic_cache.allowed_hosts` | `WALLET_REGISTRY_DYNAMIC_CACHE_ALLOWED_HOSTS` | string list | AllowedHosts is an optional list of host patterns (regexps) that are allowed for dynamic fetching. If empty, all HTTPS hosts are allowed. |
+| `registry.image_embed.enabled` | `WALLET_REGISTRY_IMAGE_EMBED_ENABLED` | boolean | Enabled controls whether image embedding is active |
+| `registry.image_embed.max_image_size` | `WALLET_REGISTRY_IMAGE_EMBED_MAX_IMAGE_SIZE` | integer | MaxImageSize is the maximum size in bytes for images to embed Images larger than this will be left as URLs |
+| `registry.image_embed.timeout` | `WALLET_REGISTRY_IMAGE_EMBED_TIMEOUT` | duration | Timeout for fetching individual images |
+| `registry.image_embed.concurrent_fetches` | `WALLET_REGISTRY_IMAGE_EMBED_CONCURRENT_FETCHES` | integer | ConcurrentFetches is the maximum number of concurrent image fetches |
+| `registry.filter.include_patterns` | `WALLET_REGISTRY_FILTER_INCLUDE_PATTERNS` | string list | IncludePatterns are regexps that VCT IDs must match to be included If empty, all VCT IDs are included (unless excluded) |
+| `registry.filter.exclude_patterns` | `WALLET_REGISTRY_FILTER_EXCLUDE_PATTERNS` | string list | ExcludePatterns are regexps that cause VCT IDs to be excluded |
+| `registry.rate_limit.enabled` | `WALLET_REGISTRY_RATE_LIMIT_ENABLED` | boolean | Enabled controls whether rate limiting is active |
+| `registry.rate_limit.authenticated_rpm` | `WALLET_REGISTRY_RATE_LIMIT_AUTHENTICATED_RPM` | integer | AuthenticatedRPM is requests per minute for authenticated clients |
+| `registry.rate_limit.unauthenticated_rpm` | `WALLET_REGISTRY_RATE_LIMIT_UNAUTHENTICATED_RPM` | integer | UnauthenticatedRPM is requests per minute for unauthenticated clients |
+| `registry.rate_limit.burst_multiplier` | `WALLET_REGISTRY_RATE_LIMIT_BURST_MULTIPLIER` | integer | BurstMultiplier allows bursts of this multiple of the rate limit |
+| `registry.require_auth` | `WALLET_REGISTRY_REQUIRE_AUTH` | boolean | RequireAuth requires a valid access token on all registry requests. If false (default), unauthenticated access is allowed (with the lower unauthenticated rate limit); valid tokens are still recognised. Tokens are validated with the same go-tokenauth validator as the other roles; see ValidateRegistry for the as.* fields this needs when the registry runs without the auth role. |
 

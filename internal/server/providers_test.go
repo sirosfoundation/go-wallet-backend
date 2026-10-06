@@ -272,7 +272,7 @@ func TestRegistryProvider_CheckReady_Healthy(t *testing.T) {
 	store := registry.NewStore("")
 
 	provider := &RegistryProvider{
-		cfg:    cfg,
+		rcfg:   cfg,
 		logger: logger,
 		store:  store,
 	}
@@ -288,7 +288,7 @@ func TestRegistryProvider_CheckReady_NilStore(t *testing.T) {
 	cfg := registry.DefaultConfig()
 
 	provider := &RegistryProvider{
-		cfg:    cfg,
+		rcfg:   cfg,
 		logger: logger,
 		store:  nil,
 	}
@@ -309,7 +309,7 @@ func TestRegistryProvider_CheckReady_EmptyStore(t *testing.T) {
 	store := registry.NewStore("")   // Empty store
 
 	provider := &RegistryProvider{
-		cfg:    cfg,
+		rcfg:   cfg,
 		logger: logger,
 		store:  store,
 	}

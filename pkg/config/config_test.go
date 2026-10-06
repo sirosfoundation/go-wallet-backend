@@ -2961,6 +2961,25 @@ func TestASConfig_ExternalBaseURL(t *testing.T) {
 	}
 }
 
+// Errors from reading a secret file are logged at startup; they must name the
+// failure but not the file path (the caller wraps them with the config key).
+func TestReadSecretFile_ErrorsDoNotNameThePath(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "very-distinctive-secret-file-name")
+	_, err := readSecretFile(missing)
+	if err == nil || strings.Contains(err.Error(), "very-distinctive-secret-file-name") {
+		t.Fatalf("missing-file error must not include the path, got %v", err)
+	}
+	empty := filepath.Join(dir, "very-distinctive-empty-file")
+	if werr := os.WriteFile(empty, []byte("  \n"), 0o600); werr != nil {
+		t.Fatal(werr)
+	}
+	_, err = readSecretFile(empty)
+	if err == nil || strings.Contains(err.Error(), "very-distinctive-empty-file") || !strings.Contains(err.Error(), "is empty") {
+		t.Fatalf("empty-file error must say so without the path, got %v", err)
+	}
+}
+
 // The role flag alone (--mode=auth / --mode=all: Load -> EnableForRole ->
 // Validate) must yield a valid configuration, including the audience list.
 func TestConfig_EnableForRole_DefaultsAudiencesAndValidates(t *testing.T) {
