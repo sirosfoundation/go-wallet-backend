@@ -419,6 +419,11 @@ type HTTPClientConfig struct {
 	// and rejects unsigned metadata; require-unsigned asks only for
 	// application/json and rejects application/jwt; neither falls back. any
 	// sends one request accepting both and takes what the issuer serves.
+	// The prefer-* modes retry the other form only after an HTTP 406. An issuer
+	// that answers a different 4xx (400, 415, ...) to an Accept header it
+	// cannot satisfy is not negotiating, so the wallet does not retry; serve
+	// such issuers with "any", which sends a single request with
+	// Accept: application/jwt, application/json and needs no retry.
 	// Unknown values are rejected at startup.
 	// Env: WALLET_HTTP_CLIENT_METADATA_TYPE
 	// Only the wallet server builds an issuer-metadata resolver; the registry

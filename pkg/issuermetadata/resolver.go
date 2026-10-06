@@ -126,12 +126,18 @@ const (
 	// MetadataTypeAny sends one request accepting both media types
 	// (Accept: application/jwt, application/json) and takes whichever the
 	// issuer serves. No retry.
+	//
+	// This is the mode for issuers that answer a 4xx other than 406 to an
+	// Accept header they cannot satisfy (for example 400 or 415 for
+	// Accept: application/jwt): the prefer-* modes retry only after a 406, so
+	// such an issuer must be configured with any.
 	MetadataTypeAny MetadataType = "any"
 	// MetadataTypePreferSigned requests application/jwt first and, if the
 	// issuer answers 406 Not Acceptable (how a compliant issuer says it cannot
 	// serve the requested media type), retries once with application/json.
 	//
-	// The retry is triggered by 406 alone. Every other status (400, 401, 403,
+	// The retry is triggered by 406 alone; use MetadataTypeAny for issuers that
+	// reject Accept: application/jwt with another 4xx. Every other status (400, 401, 403,
 	// 404, 415, 429, 5xx, redirects) is terminal: an issuer that rejects an
 	// Accept header with some other 4xx is not negotiating, and retrying would
 	// mask real errors. A 200 of the other form is accepted as is.
