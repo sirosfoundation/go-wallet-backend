@@ -2,6 +2,9 @@ package engine
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/base64"
@@ -19,6 +22,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
 // tdClient is a client that declared FeatureTransactionDataV1.
@@ -141,9 +147,14 @@ func TestHashAlgList_Unmarshal(t *testing.T) {
 	}{
 		"array (OID4VP 1.0 request form)": {`["sha-256","sha-384"]`, HashAlgList{"sha-256", "sha-384"}, false},
 		"bare string tolerated":           {`"sha-384"`, HashAlgList{"sha-384"}, false},
-		"empty array":                     {`[]`, HashAlgList{}, false},
-		"number rejected":                 {`5`, nil, true},
-		"array of numbers rejected":       {`[1,2]`, nil, true},
+		// OID4VP: a non-empty array of algorithm identifiers. An empty list
+		// leaves the wallet nothing valid to choose, so it is invalid, not "absent".
+		"empty array rejected":         {`[]`, nil, true},
+		"null rejected":                {`null`, nil, true},
+		"empty string rejected":        {`""`, nil, true},
+		"empty name in array rejected": {`["sha-256",""]`, nil, true},
+		"number rejected":              {`5`, nil, true},
+		"array of numbers rejected":    {`[1,2]`, nil, true},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -362,21 +373,29 @@ func TestParseRequestFromURL_InvalidTransactionDataJSON(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid transaction_data")
 }
 
-// End to end through Execute: a verifier that sends transaction_data in an
-// inline URL to a client that never declared support must be refused, the
-// verifier told, and the client given the distinct error. This is the wiring
-// the unit tests above cannot show: parse -> validate -> typed error ->
-// failTransactionData, instead of the generic invalid-request path.
-func TestExecute_InlineTransactionData_RefusedForClientThatDidNotDeclare(t *testing.T) {
-	var form url.Values
-	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.NoError(t, r.ParseForm())
-		form = r.PostForm
+// --- Execute: the verifier is contacted only after its trust is established ---
+
+// executeRecorder runs Execute for a request and records what the verifier's
+// response_uri received and which flow errors the client saw.
+type executeRecorder struct {
+	verifierHits chan url.Values
+	clientErrors chan FlowErrorMessage
+	verifierURL  string
+	handler      *OID4VPHandler
+}
+
+func newExecuteRecorder(t *testing.T, cfg *config.Config, trustSvc *TrustService) *executeRecorder {
+	t.Helper()
+	r := &executeRecorder{verifierHits: make(chan url.Values, 4), clientErrors: make(chan FlowErrorMessage, 8)}
+
+	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		_ = req.ParseForm()
+		r.verifierHits <- req.PostForm
 		w.WriteHeader(http.StatusOK)
 	}))
-	defer verifier.Close()
+	t.Cleanup(verifier.Close)
+	r.verifierURL = verifier.URL
 
-	errs := make(chan FlowErrorMessage, 4)
 	conn, cleanup := wsTestServer(t, func(srv *websocket.Conn) {
 		defer srv.Close()
 		for {
@@ -386,55 +405,169 @@ func TestExecute_InlineTransactionData_RefusedForClientThatDidNotDeclare(t *test
 			}
 			var m FlowErrorMessage
 			if json.Unmarshal(data, &m) == nil && m.Type == TypeFlowError {
-				errs <- m
+				r.clientErrors <- m
 			}
 		}
 	})
-	defer cleanup()
+	t.Cleanup(cleanup)
 
-	h := &OID4VPHandler{}
-	h.BaseHandler = BaseHandler{Logger: zap.NewNop(), Flow: &Flow{ID: "flow-1", Session: testSession(conn)}}
-	h.httpClient = verifier.Client()
+	r.handler = &OID4VPHandler{}
+	r.handler.BaseHandler = BaseHandler{
+		Logger: zap.NewNop(), Config: cfg, TrustSvc: trustSvc,
+		Flow: &Flow{ID: "flow-1", Session: testSession(conn), Data: map[string]interface{}{}},
+	}
+	r.handler.httpClient = verifier.Client()
+	return r
+}
+
+// run calls Execute; a panic means Execute carried on past where the test
+// expects it to stop, which is reported as a plain failure.
+func (r *executeRecorder) run(t *testing.T, msg *FlowStartMessage) (err error) {
+	t.Helper()
+	defer func() {
+		if rec := recover(); rec != nil {
+			t.Fatalf("Execute continued past where this test expects it to stop: %v", rec)
+		}
+	}()
+	return r.handler.Execute(context.Background(), msg)
+}
+
+func (r *executeRecorder) clientError(t *testing.T) FlowErrorMessage {
+	t.Helper()
+	select {
+	case m := <-r.clientErrors:
+		return m
+	case <-time.After(2 * time.Second):
+		t.Fatal("client never received a flow_error")
+		return FlowErrorMessage{}
+	}
+}
+
+func (r *executeRecorder) verifierWasContacted() bool {
+	select {
+	case <-r.verifierHits:
+		return true
+	case <-time.After(300 * time.Millisecond):
+		return false
+	}
+}
+
+// Security: refusing transaction_data means telling the verifier, which means
+// POSTing to the response_uri the REQUEST supplied. Until the verifier's trust
+// is established that is an attacker-chosen URL, so an unauthenticated request
+// must not be able to aim the backend at it just by carrying transaction_data.
+// An unsigned decentralized_identifier request passes request validation and is
+// then refused by trust evaluation: the verifier must never be contacted, and
+// the client must hear "untrusted verifier", not the transaction_data error.
+func TestExecute_TransactionDataFromUntrustedVerifier_VerifierIsNotContacted(t *testing.T) {
+	r := newExecuteRecorder(t, testConfig(), nil)
 
 	q := url.Values{}
-	q.Set("client_id", "https://verifier.example.com")
-	q.Set("client_id_scheme", ClientIDSchemeRedirectURI)
+	q.Set("client_id", ClientIDSchemeDecentralizedIdentifier+":did:web:verifier.example")
+	q.Set("client_id_scheme", ClientIDSchemeDecentralizedIdentifier)
 	q.Set("response_type", "vp_token")
 	q.Set("response_mode", ResponseModeDirectPost)
-	q.Set("response_uri", verifier.URL)
+	q.Set("response_uri", r.verifierURL)
 	q.Set("nonce", "n-1")
 	q.Set("state", "st-1")
 	q.Set("dcql_query", `{"credentials":[{"id":"pay","format":"dc+sd-jwt","meta":{"vct_values":["x"]}}]}`)
 	q.Set("transaction_data", string(owfRaw(t)))
 
 	// A client from before the feature: no Features in its flow_start.
-	// Execute continuing past validation is exactly the failure this guards
-	// against; with this minimal handler that surfaces as a panic further on,
-	// which is reported as a plain test failure instead of aborting the package.
-	var err error
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				t.Fatalf("Execute continued past request validation (transaction_data was not refused): %v", r)
-			}
-		}()
-		err = h.Execute(context.Background(), &FlowStartMessage{
-			Protocol:   ProtocolOID4VP,
-			RequestURI: "openid4vp://?" + q.Encode(),
-		})
-	}()
+	err := r.run(t, &FlowStartMessage{Protocol: ProtocolOID4VP, RequestURI: "openid4vp://?" + q.Encode()})
+	require.Error(t, err)
+
+	assert.False(t, r.verifierWasContacted(), "the verifier must not be contacted before its trust is established")
+	assert.Equal(t, ErrCodeUntrustedVerifier, r.clientError(t).Error.Code)
+}
+
+// The other half: once the verifier IS trusted, a transaction_data request from
+// a client that did not declare support is refused, the verifier is told, and
+// the client gets the distinct error and the verifier's redirect.
+func TestExecute_TransactionDataFromTrustedVerifier_RefusedAndVerifierTold(t *testing.T) {
+	const (
+		did      = "did:web:verifier.example"
+		clientID = ClientIDSchemeDecentralizedIdentifier + ":" + did
+		kid      = did + "#jwk-1"
+	)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	stub := &stubDIDResolver{
+		didDoc: map[string]interface{}{
+			"id": did,
+			"verificationMethod": []interface{}{map[string]interface{}{
+				"id": kid, "type": "JsonWebKey2020", "controller": did, "publicKeyJwk": ecPublicJWK(&key.PublicKey, kid),
+			}},
+		},
+		decisionOk: true, decision: true,
+	}
+	cfg := testConfig()
+	cfg.Trust.PDPURL = "http://pdp.test"
+	trustSvc := trust.NewService(cfg, zap.NewNop(), func(_ string, _ time.Duration) (trust.TrustEvaluator, error) { return stub, nil })
+	r := newExecuteRecorder(t, cfg, trustSvc)
+
+	payload, err := json.Marshal(map[string]any{
+		"client_id": clientID, "response_type": "vp_token", "response_mode": ResponseModeDirectPost,
+		"response_uri": r.verifierURL, "nonce": "n-1", "state": "st-1",
+		"dcql_query":       json.RawMessage(`{"credentials":[{"id":"pay","format":"dc+sd-jwt","meta":{"vct_values":["x"]}}]}`),
+		"transaction_data": []string{string(owfRawEntry(t))},
+	})
+	require.NoError(t, err)
+	jwt := signedKidJWT(t, key, kid, payload)
+
+	q := url.Values{}
+	q.Set("client_id", clientID)
+	q.Set("request", jwt)
+	err = r.run(t, &FlowStartMessage{Protocol: ProtocolOID4VP, RequestURI: "openid4vp://?" + q.Encode()})
 
 	var tdErr *transactionDataError
 	require.True(t, errors.As(err, &tdErr), "Execute returned %v", err)
 	assert.Equal(t, ErrCodeUnsupportedTransactionData, tdErr.code)
 
-	assert.Equal(t, "invalid_transaction_data", form.Get("error"), "verifier must be told")
-	assert.Equal(t, "st-1", form.Get("state"))
-
 	select {
-	case m := <-errs:
-		assert.Equal(t, ErrCodeUnsupportedTransactionData, m.Error.Code, "client must get the distinct code, not the generic one")
+	case form := <-r.verifierHits:
+		assert.Equal(t, "invalid_transaction_data", form.Get("error"))
+		assert.Equal(t, "st-1", form.Get("state"))
 	case <-time.After(2 * time.Second):
-		t.Fatal("client never received a flow_error")
+		t.Fatal("a trusted verifier was not told")
 	}
+	assert.Equal(t, ErrCodeUnsupportedTransactionData, r.clientError(t).Error.Code)
+}
+
+// owfRawEntry is the single base64url entry owfRaw wraps in an array.
+func owfRawEntry(t *testing.T) []byte {
+	t.Helper()
+	var arr []string
+	require.NoError(t, json.Unmarshal(owfRaw(t), &arr))
+	return []byte(arr[0])
+}
+
+// signedKidJWT signs payload with an ES256 key identified by kid, the way
+// buildKidSignedJWT does but with a caller-supplied payload.
+func signedKidJWT(t *testing.T, key *ecdsa.PrivateKey, kid string, payload []byte) string {
+	t.Helper()
+	enc := base64.RawURLEncoding.EncodeToString
+	signingInput := enc([]byte(`{"alg":"ES256","kid":"`+kid+`"}`)) + "." + enc(payload)
+	sum := sha256.Sum256([]byte(signingInput))
+	rr, ss, err := ecdsa.Sign(rand.Reader, key, sum[:])
+	require.NoError(t, err)
+	n := (key.Curve.Params().BitSize + 7) / 8
+	sig := make([]byte, 2*n)
+	rr.FillBytes(sig[:n])
+	ss.FillBytes(sig[n:])
+	return signingInput + "." + enc(sig)
+}
+
+// direct_post.jwt needs an error response that is itself a JWT, which this does
+// not build. Posting plain form fields would only be rejected by such a
+// verifier, so it is not contacted.
+func TestFailTransactionData_DirectPostJWTVerifierIsNotSentAForm(t *testing.T) {
+	r := newExecuteRecorder(t, testConfig(), nil)
+	authReq := &AuthorizationRequest{ResponseMode: ResponseModeDirectPostJWT, ResponseURI: r.verifierURL, State: "st-1"}
+	tdErr := newTransactionDataError(ErrCodeUnsupportedTransactionData, "x").(*transactionDataError)
+
+	r.handler.failTransactionData(context.Background(), authReq, tdErr)
+
+	assert.False(t, r.verifierWasContacted(), "no form POST to a direct_post.jwt verifier")
+	assert.Equal(t, ErrCodeUnsupportedTransactionData, r.clientError(t).Error.Code, "the client is still told")
 }
