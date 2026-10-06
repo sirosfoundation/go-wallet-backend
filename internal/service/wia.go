@@ -910,10 +910,20 @@ func (s *WIAService) refuseIfWalletDeactivated(ctx context.Context, tenantID dom
 	if len(instances) == 0 {
 		return nil
 	}
+	var unknown *domain.WalletInstance
 	for _, inst := range instances {
 		if inst.Status.IsLive() {
 			return nil
 		}
+		if !inst.Status.IsKnownNonLive() {
+			unknown = inst
+		}
+	}
+	if unknown != nil {
+		// Refused either way, but an unrecognised status does not establish
+		// that the wallet is deactivated.
+		s.emitAuditFailure("instance_status_unrecognized", fmt.Errorf("instance %s has unrecognized status %q", unknown.ID, unknown.Status))
+		return fmt.Errorf("check wallet lifecycle: instance %s has unrecognized status %q", unknown.ID, unknown.Status)
 	}
 	s.emitAuditFailure("wallet_deactivated", errors.New("no live wallet instance remains for the user"))
 	return fmt.Errorf("%w: wallet deactivated, no live instance remains", ErrWIAInstanceDeactivated)
@@ -938,6 +948,7 @@ func (s *WIAService) revokeIfWalletDeactivatedMeanwhile(ctx context.Context, ten
 		return fmt.Errorf("re-check wallet lifecycle: %w", err)
 	}
 	others := 0
+	var unknown *domain.WalletInstance
 	for _, inst := range instances {
 		if inst.ID == newID {
 			continue
@@ -946,9 +957,21 @@ func (s *WIAService) revokeIfWalletDeactivatedMeanwhile(ctx context.Context, ten
 		if inst.Status.IsLive() {
 			return nil
 		}
+		if !inst.Status.IsKnownNonLive() {
+			unknown = inst
+		}
 	}
 	if others == 0 {
 		return nil
+	}
+	if unknown != nil {
+		// An unrecognised status is not evidence that the wallet was
+		// deactivated, so it must not trigger the destructive revoke of the
+		// new instance. Refuse the attestation without claiming a lifecycle
+		// state nobody established (the login gate does the same) and leave
+		// every record alone; the operator can repair the corrupt record.
+		s.emitAuditFailure("instance_status_unrecognized", fmt.Errorf("instance %s has unrecognized status %q", unknown.ID, unknown.Status))
+		return fmt.Errorf("re-check wallet lifecycle: instance %s has unrecognized status %q", unknown.ID, unknown.Status)
 	}
 	// GetByUser above says nothing about newID itself: it is skipped there,
 	// and a first attestation of the same instance key that raced this one
