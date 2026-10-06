@@ -1706,3 +1706,75 @@ func TestLegacyValidatorConfig_UsesJWTIssuer(t *testing.T) {
 		t.Fatalf("legacy token minted with JWT.Issuer must validate when AS.Issuer differs: %v", err)
 	}
 }
+
+// The engine validates handshake tokens with whatever validator it is given.
+// In split mode there is no backend provider in the process to borrow one
+// from, so it builds its own from config - and these pin the parts a
+// deployment gets wrong.
+func TestNewASTokenValidator_DerivesJWKSFromExternalURL(t *testing.T) {
+	// The JWKS URL has to come from as.external_url, not the listen address:
+	// the process validating these tokens is not the one issuing them, and in
+	// split mode is not even in the same pod.
+	cfg := &config.Config{
+		AS: config.ASConfig{ExternalURL: "https://api.example.com", Issuer: "https://as.example.com"},
+	}
+	if got, want := ASJWKSURL(cfg), "https://api.example.com/auth/.well-known/jwks.json"; got != want {
+		t.Fatalf("ASJWKSURL() = %q, want %q", got, want)
+	}
+}
+
+func TestNewASTokenValidator_FallsBackToJWTIssuer(t *testing.T) {
+	// AS.Issuer is optional; when a deployment omits it the tokens still carry
+	// iss=JWT.Issuer, so the validator has to expect that rather than "".
+	cfg := &config.Config{
+		JWT: config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "https://jwt.example.com"},
+		AS: config.ASConfig{
+			ExternalURL: "https://api.example.com",
+			Audiences:   []string{"wallet-backend"},
+			Legacy:      config.ASLegacyConfig{Enabled: true},
+		},
+	}
+
+	v := NewASTokenValidator(cfg, nil)
+	tok := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
+		"iss": cfg.JWT.Issuer, "aud": "wallet-backend", "sub": "user-1",
+		"tenant_id": "default", "exp": time.Now().Add(time.Hour).Unix(),
+	})
+	raw, err := tok.SignedString([]byte(cfg.JWT.Secret))
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if _, err := v.Validate(context.Background(), raw); err != nil {
+		t.Fatalf("validating a token issued with iss=JWT.Issuer: %v", err)
+	}
+}
+
+func TestNewASTokenValidator_AcceptsANilRevocationChecker(t *testing.T) {
+	// A role with no store has no blacklist to consult. That has to build and
+	// validate rather than panic - it is the split-mode engine's situation,
+	// and the cost is documented at the call site rather than enforced here.
+	cfg := &config.Config{
+		JWT: config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "https://jwt.example.com"},
+		AS: config.ASConfig{
+			ExternalURL: "https://api.example.com",
+			Audiences:   []string{"wallet-backend"},
+			Legacy:      config.ASLegacyConfig{Enabled: true},
+		},
+	}
+
+	v := NewASTokenValidator(cfg, nil)
+	if v == nil {
+		t.Fatal("NewASTokenValidator returned nil")
+	}
+	tok := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
+		"iss": cfg.JWT.Issuer, "aud": "wallet-backend", "sub": "user-1",
+		"tenant_id": "default", "exp": time.Now().Add(time.Hour).Unix(),
+	})
+	raw, err := tok.SignedString([]byte(cfg.JWT.Secret))
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if _, err := v.Validate(context.Background(), raw); err != nil {
+		t.Fatalf("validate with no revocation checker: %v", err)
+	}
+}

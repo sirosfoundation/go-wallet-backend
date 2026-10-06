@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/kelseyhightower/envconfig"
+	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 	"go.uber.org/zap"
 	"gopkg.in/yaml.v3"
 
@@ -32,6 +33,16 @@ var (
 	version            = "dev"
 	buildTime          = "unknown"
 )
+
+// tokenValidatorResource lets a validator this process owns be shut down with
+// everything else. Only the split-mode engine builds one; every other role
+// borrows the backend provider's, which that provider closes.
+type tokenValidatorResource struct{ tv *tokenvalidator.Validator }
+
+func (r tokenValidatorResource) Close() error {
+	r.tv.Stop()
+	return nil
+}
 
 func main() {
 	flag.Parse()
@@ -246,8 +257,27 @@ func main() {
 			logger.Fatal("Failed to create engine provider", zap.Error(err))
 		}
 		// Wire token validator for WebSocket handshake auth
-		if backendProvider != nil && backendProvider.TokenValidator() != nil {
+		switch {
+		case backendProvider != nil && backendProvider.TokenValidator() != nil:
 			provider.SetTokenValidator(backendProvider.TokenValidator())
+		case backendCfg != nil && backendCfg.AS.Enabled:
+			// Split-mode: the engine runs without the backend role, so there is
+			// no sibling provider to borrow a validator from. Build one that
+			// fetches the AS's JWKS over HTTP instead - otherwise validateToken
+			// falls back to legacy HMAC and rejects every asymmetric AS token
+			// with "unexpected signing method", which is every token once the
+			// AS is enabled.
+			tv := server.NewASTokenValidator(backendCfg, nil)
+			tv.Start(context.Background())
+			resources = append(resources, tokenValidatorResource{tv})
+			provider.SetTokenValidator(tv)
+			logger.Info("Engine token validator built from config (split mode)",
+				zap.String("jwks_url", server.ASJWKSURL(backendCfg)),
+			)
+			// No store in this process means no blacklist to consult, so a
+			// token revoked elsewhere stays usable on an engine socket until
+			// it expires. Co-hosting the backend role shares the real one.
+			logger.Warn("Engine cannot check token revocation in split mode; revoked tokens remain valid on WebSocket sessions until expiry")
 		}
 		// Wire the same token blacklist the HTTP auth middlewares use, so a
 		// revoked token (or a deleted user's other tokens) is rejected

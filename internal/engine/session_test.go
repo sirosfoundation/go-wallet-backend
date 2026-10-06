@@ -1485,3 +1485,27 @@ func TestManager_validateToken_CancelledContextFailsClosed(t *testing.T) {
 	_, _, _, err = withValidator.validateToken(context.Background(), tokenString)
 	require.NoError(t, err)
 }
+
+// The engine authenticates WebSocket handshakes with whatever validator it was
+// given. Without one it falls back to legacy HMAC, which rejects an asymmetric
+// AS token on the algorithm before it ever looks at a key - so a split-mode
+// deployment, where there is no backend provider in the process to borrow a
+// validator from, could not authenticate anyone.
+func TestManager_validateToken_RejectsAsymmetricTokenWithoutValidator(t *testing.T) {
+	m := NewManager(&config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}, zap.NewNop())
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	token := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
+		"user_id":   "test-user-123",
+		"tenant_id": "test-tenant",
+		"exp":       time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString(key)
+	require.NoError(t, err)
+
+	_, _, _, err = m.validateToken(context.Background(), tokenString)
+	require.Error(t, err)
+	// The message a split-mode operator sees in the engine log today.
+	assert.Contains(t, err.Error(), "unexpected signing method")
+}

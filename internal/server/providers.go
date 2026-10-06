@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
+	"github.com/sirosfoundation/go-tokenauth/revocation"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/api"
 	"github.com/sirosfoundation/go-wallet-backend/internal/as"
@@ -615,28 +616,17 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		asModule.SetOIDCGateRateLimiter(authProvider.gateRateLimiter)
 
 		// Create go-tokenauth validator for protecting resource endpoints.
-		issuer := cfg.AS.Issuer
-		if issuer == "" {
-			issuer = cfg.JWT.Issuer
-		}
-		jwksURL := cfg.AS.ExternalURL + "/auth/.well-known/jwks.json"
-		tv = tokenvalidator.New(tokenvalidator.Config{
-			JWKSURL:   jwksURL,
-			Issuer:    issuer,
-			Audiences: cfg.AS.Audiences,
-			Legacy:    legacyValidatorConfig(cfg),
-			// Same blacklist as everything else in this process (#382/#383) -
-			// without this, AS-issued/legacy tokens validated through
-			// go-tokenauth (the path taken whenever AS is enabled, i.e. the
-			// common case) would never consult the blacklist at all, since
-			// go-tokenauth's Validator has its own independent validation
-			// path that AuthMiddlewareWithBlacklist's check is never reached
-			// by.
-			Revocation: blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist},
-		})
+		//
+		// Same blacklist as everything else in this process (#382/#383) -
+		// without this, AS-issued/legacy tokens validated through
+		// go-tokenauth (the path taken whenever AS is enabled, i.e. the
+		// common case) would never consult the blacklist at all, since
+		// go-tokenauth's Validator has its own independent validation path
+		// that AuthMiddlewareWithBlacklist's check is never reached by.
+		tv = NewASTokenValidator(cfg, blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist})
 		tv.Start(context.Background())
 		logger.Info("Authorization Server module initialized",
-			zap.String("jwks_url", jwksURL),
+			zap.String("jwks_url", ASJWKSURL(cfg)),
 			zap.Strings("audiences", cfg.AS.Audiences),
 		)
 	}
@@ -1140,6 +1130,37 @@ func newAuditEmitter(cfg *config.Config, logger *zap.Logger) *audit.Emitter {
 // shared Issuer is the AS issuer (AS.Issuer). go-tokenauth v0.5 falls back to
 // the shared Issuer when Legacy.Issuers is empty, which would reject every
 // legacy token in a deployment that configures the two differently.
+// ASJWKSURL is where this deployment's Authorization Server publishes the keys
+// its tokens are signed with.
+//
+// Derived from as.external_url rather than the listen address: a process
+// validating these tokens may not be the one issuing them, and in a split-mode
+// deployment is not even in the same pod.
+func ASJWKSURL(cfg *config.Config) string {
+	return cfg.AS.ExternalURL + "/auth/.well-known/jwks.json"
+}
+
+// NewASTokenValidator builds a validator for the tokens this deployment's
+// Authorization Server issues.
+//
+// Shared by every role that has to verify one, so the issuer, audiences and
+// JWKS URL are derived in a single place. A role that cannot reach a token
+// blacklist passes a nil revocation checker; see SetTokenValidator on
+// EngineProvider for what that costs.
+func NewASTokenValidator(cfg *config.Config, revocation revocation.Checker) *tokenvalidator.Validator {
+	issuer := cfg.AS.Issuer
+	if issuer == "" {
+		issuer = cfg.JWT.Issuer
+	}
+	return tokenvalidator.New(tokenvalidator.Config{
+		JWKSURL:    ASJWKSURL(cfg),
+		Issuer:     issuer,
+		Audiences:  cfg.AS.Audiences,
+		Legacy:     legacyValidatorConfig(cfg),
+		Revocation: revocation,
+	})
+}
+
 func legacyValidatorConfig(cfg *config.Config) tokenvalidator.LegacyConfig {
 	return tokenvalidator.LegacyConfig{
 		Enabled:    cfg.AS.Legacy.Enabled,
