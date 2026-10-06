@@ -165,6 +165,26 @@ func TestGenerateKeyAttestation_RefusesNonLiveOrForeignInstance(t *testing.T) {
 	assert.ErrorIs(t, err, ErrKeyAttestationInstanceRefused)
 }
 
+// An instance not yet bound to a user is nobody's: a token with a subject must
+// not mint a KA for it merely by knowing its id. Once bound to the caller it
+// is accepted.
+func TestGenerateKeyAttestation_RefusesUnboundInstanceForSubject(t *testing.T) {
+	base := context.Background()
+	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
+	user := domain.NewUserID()
+	require.NoError(t, instances.Upsert(base, &domain.WalletInstance{ID: "anon", TenantID: "t", Status: domain.InstanceStatusActive}))
+	jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "a", "y": "b"}}
+	ctx := tokengate.WithSubject(base, user.String(), time.Now())
+
+	ka, err := svc.GenerateKeyAttestation(ctx, jwks, "n", nil, "anon", "")
+	assert.ErrorIs(t, err, ErrKeyAttestationInstanceRefused)
+	assert.Empty(t, ka)
+
+	require.NoError(t, instances.Upsert(base, &domain.WalletInstance{ID: "anon", TenantID: "t", UserID: &user, Status: domain.InstanceStatusActive}))
+	_, err = svc.GenerateKeyAttestation(ctx, jwks, "n", nil, "anon", "")
+	assert.NoError(t, err, "bound to the caller")
+}
+
 // flipAfterGets reports a revoked status from the nth GetByID on, modelling an
 // instance revoked while the KA is being signed.
 type flipAfterGets struct {

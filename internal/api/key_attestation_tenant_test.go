@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -21,6 +22,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -84,5 +86,37 @@ func TestHandlers_GenerateKeyAttestation_InstanceTenantScoping(t *testing.T) {
 	}
 	if w := post("tenant-b"); w.Code != http.StatusOK {
 		t.Fatalf("the owning tenant must be accepted, got %d %s", w.Code, w.Body.String())
+	}
+
+	// A token with a subject must not mint for an instance bound to nobody
+	// (403), nor for another user's; the bound owner is accepted.
+	owner, other := domain.NewUserID(), domain.NewUserID()
+	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{
+		ID: "inst-owned", TenantID: "tenant-b", UserID: &owner, Status: domain.InstanceStatusActive,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	postAs := func(subject, instance string) *httptest.ResponseRecorder {
+		router := gin.New()
+		router.POST("/ka", func(c *gin.Context) {
+			c.Set("tenant_id", "tenant-b")
+			c.Request = c.Request.WithContext(tokengate.WithSubject(c.Request.Context(), subject, time.Now()))
+			handlers.GenerateKeyAttestation(c)
+		})
+		body := `{"jwks":[{"kty":"EC","crv":"P-256","x":"a","y":"b"}],"openid4vci":{"nonce":"n"},"wallet_instance_id":"` + instance + `"}`
+		req := httptest.NewRequest(http.MethodPost, "/ka", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+	if w := postAs(owner.String(), "inst-b"); w.Code != http.StatusForbidden {
+		t.Fatalf("an unbound instance must be refused with 403 for a user token, got %d %s", w.Code, w.Body.String())
+	}
+	if w := postAs(other.String(), "inst-owned"); w.Code != http.StatusForbidden {
+		t.Fatalf("another user's instance must be refused with 403, got %d %s", w.Code, w.Body.String())
+	}
+	if w := postAs(owner.String(), "inst-owned"); w.Code != http.StatusOK {
+		t.Fatalf("the bound owner must be accepted, got %d %s", w.Code, w.Body.String())
 	}
 }

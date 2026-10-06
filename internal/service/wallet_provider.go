@@ -446,7 +446,8 @@ func WithKeyAttestationTenant(ctx context.Context, tenantID domain.TenantID) con
 // boundary. A record that is not live (revoked, suspended, or of a status this
 // build does not recognize) is refused as a revoked token (401): fail closed,
 // nothing is changed. A record owned by a user other than the token's subject
-// is refused, as is one recorded in another tenant. An id the store does not know binds no lifecycle state and is
+// is refused, as is an unbound one (when the token has a subject) and one
+// recorded in another tenant. An id the store does not know binds no lifecycle state and is
 // not judged; a failed lookup refuses.
 func (s *WalletProviderService) refuseKeyAttestationInstance(ctx context.Context, walletInstanceID string) error {
 	if walletInstanceID == "" || s.instances == nil {
@@ -465,7 +466,12 @@ func (s *WalletProviderService) refuseKeyAttestationInstance(ctx context.Context
 	if tenantID, ok := ctx.Value(kaTenantKey{}).(domain.TenantID); ok && tenantID != "" && instance.TenantID != tenantID {
 		return ErrKeyAttestationInstanceRefused
 	}
-	if subject := tokengate.SubjectFrom(ctx); subject != "" && instance.UserID != nil && instance.UserID.String() != subject {
+	// A caller with a subject may only mint for an instance bound to that
+	// subject. An unbound instance (anonymous or legacy attestation) is
+	// nobody's yet: the WIA flow binds it when its holder attests with a user
+	// token, so until then it is refused rather than open to any user who
+	// knows its id.
+	if subject := tokengate.SubjectFrom(ctx); subject != "" && (instance.UserID == nil || instance.UserID.String() != subject) {
 		return ErrKeyAttestationInstanceRefused
 	}
 	return nil
