@@ -1,0 +1,440 @@
+package engine
+
+import (
+	"context"
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"hash"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/gorilla/websocket"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+)
+
+// tdClient is a client that declared FeatureTransactionDataV1.
+var tdClient = &FlowStartMessage{Features: []string{FeatureTransactionDataV1}}
+
+type tdVector struct {
+	Name         string            `json:"name"`
+	Note         string            `json:"note"`
+	JSON         string            `json:"json"`
+	Raw          string            `json:"raw"`
+	Noncanonical bool              `json:"noncanonical"`
+	Hashes       map[string]string `json:"hashes"`
+}
+
+// loadTDVectors reads the shared golden vectors. The hashes in the file were
+// computed with Python's hashlib over the ASCII bytes of `raw`, so agreement
+// with Go's crypto here is agreement between two independent implementations,
+// not a function checking itself.
+func loadTDVectors(t *testing.T) []tdVector {
+	t.Helper()
+	b, err := os.ReadFile("testdata/ts12/transaction_data_vectors.json")
+	require.NoError(t, err)
+	var f struct {
+		Vectors []tdVector `json:"vectors"`
+	}
+	require.NoError(t, json.Unmarshal(b, &f))
+	require.NotEmpty(t, f.Vectors)
+	return f.Vectors
+}
+
+func tdHash(t *testing.T, alg string) hash.Hash {
+	t.Helper()
+	switch alg {
+	case "sha-256":
+		return sha256.New()
+	case "sha-384":
+		return sha512.New384()
+	case "sha-512":
+		return sha512.New()
+	}
+	t.Fatalf("unknown alg %q", alg)
+	return nil
+}
+
+func hashOf(t *testing.T, alg, in string) string {
+	h := tdHash(t, alg)
+	h.Write([]byte(in))
+	return base64.RawURLEncoding.EncodeToString(h.Sum(nil))
+}
+
+func rawArray(t *testing.T, entries ...string) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(entries)
+	require.NoError(t, err)
+	return b
+}
+
+// --- Golden vectors ---
+
+// The vector file itself must be internally consistent: raw decodes to json,
+// and every hash is what Go computes over raw as received.
+func TestTransactionDataVectors_Consistent(t *testing.T) {
+	for _, v := range loadTDVectors(t) {
+		t.Run(v.Name, func(t *testing.T) {
+			dec, err := base64.RawURLEncoding.DecodeString(v.Raw)
+			require.NoError(t, err)
+			assert.Equal(t, v.JSON, string(dec))
+			for alg, want := range v.Hashes {
+				assert.Equal(t, want, hashOf(t, alg, v.Raw), alg)
+			}
+		})
+	}
+}
+
+// decodeTransactionData must hand back each entry exactly as the verifier sent
+// it. This is what a presentation has to hash, and it is the property a
+// decode-then-re-encode design cannot have.
+func TestDecodeTransactionData_PreservesRawStringExactly(t *testing.T) {
+	for _, v := range loadTDVectors(t) {
+		t.Run(v.Name, func(t *testing.T) {
+			entries, err := decodeTransactionData(rawArray(t, v.Raw))
+			require.NoError(t, err)
+			require.Len(t, entries, 1)
+			assert.Equal(t, v.Raw, entries[0].Raw)
+			assert.Equal(t, "urn:eudi:sca:payment:1", entries[0].Data.Type)
+		})
+	}
+}
+
+// Documents why the raw string is carried and not re-derived: re-serializing
+// the decoded object (the only thing a client gets today) does not reproduce
+// the hash for any non-canonical entry. sorted_compact is the control: the one
+// shape a re-serializer happens to reproduce, which shows the comparison can
+// pass and is not vacuously failing.
+func TestTransactionDataReserializationDoesNotReproduceHash(t *testing.T) {
+	for _, v := range loadTDVectors(t) {
+		t.Run(v.Name, func(t *testing.T) {
+			var generic map[string]any
+			require.NoError(t, json.Unmarshal([]byte(v.JSON), &generic))
+			reencoded, err := json.Marshal(generic)
+			require.NoError(t, err)
+			got := hashOf(t, "sha-256", base64.RawURLEncoding.EncodeToString(reencoded))
+			if v.Noncanonical {
+				assert.NotEqual(t, v.Hashes["sha-256"], got,
+					"re-serialization reproduced the hash; the vector no longer demonstrates the problem")
+			} else {
+				assert.Equal(t, v.Hashes["sha-256"], got, "control vector should survive re-serialization")
+			}
+		})
+	}
+}
+
+// --- hash algorithm member (B7) ---
+
+func TestHashAlgList_Unmarshal(t *testing.T) {
+	cases := map[string]struct {
+		in   string
+		want HashAlgList
+		err  bool
+	}{
+		"array (OID4VP 1.0 request form)": {`["sha-256","sha-384"]`, HashAlgList{"sha-256", "sha-384"}, false},
+		"bare string tolerated":           {`"sha-384"`, HashAlgList{"sha-384"}, false},
+		"empty array":                     {`[]`, HashAlgList{}, false},
+		"number rejected":                 {`5`, nil, true},
+		"array of numbers rejected":       {`[1,2]`, nil, true},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			var got HashAlgList
+			err := json.Unmarshal([]byte(c.in), &got)
+			if c.err {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, c.want, got)
+		})
+	}
+}
+
+// A verifier following the specification sends the array. Before the fix this
+// failed to unmarshal and the whole request was rejected as invalid JSON.
+func TestDecodeTransactionData_AcceptsHashAlgArrayAndString(t *testing.T) {
+	byName := map[string]tdVector{}
+	for _, v := range loadTDVectors(t) {
+		byName[v.Name] = v
+	}
+	arr, err := decodeTransactionData(rawArray(t, byName["hash_alg_array"].Raw))
+	require.NoError(t, err)
+	assert.Equal(t, HashAlgList{"sha-256", "sha-384"}, arr[0].Data.TransactionDataHashesAlg)
+
+	str, err := decodeTransactionData(rawArray(t, byName["hash_alg_string"].Raw))
+	require.NoError(t, err)
+	assert.Equal(t, HashAlgList{"sha-384"}, str[0].Data.TransactionDataHashesAlg)
+}
+
+func TestDecodeTransactionData_MalformedAlgIsAStructuralError(t *testing.T) {
+	enc := base64.RawURLEncoding.EncodeToString([]byte(`{"type":"x","transaction_data_hashes_alg":7}`))
+	_, err := decodeTransactionData(rawArray(t, enc))
+	require.Error(t, err)
+	var tdErr *transactionDataError
+	require.True(t, errors.As(err, &tdErr))
+	assert.Equal(t, ErrCodeInvalidMessage, tdErr.code)
+	assert.Contains(t, err.Error(), "invalid JSON")
+}
+
+// --- Support gate ---
+
+func owfRaw(t *testing.T) json.RawMessage {
+	t.Helper()
+	enc := base64.RawURLEncoding.EncodeToString([]byte(`{"type":"owf_payment_initiation","credential_ids":["pay"]}`))
+	return rawArray(t, enc)
+}
+
+func TestValidateTransactionData_RefusesClientThatDidNotDeclareSupport(t *testing.T) {
+	for name, msg := range map[string]*FlowStartMessage{
+		"nil message":         nil,
+		"no features":         {},
+		"unrelated feature":   {Features: []string{"something_else"}},
+		"lookalike (version)": {Features: []string{"transaction_data.v2"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			authReq := &AuthorizationRequest{TransactionDataRaw: owfRaw(t)}
+			err := validateTransactionData(authReq, msg)
+			require.Error(t, err)
+			var tdErr *transactionDataError
+			require.True(t, errors.As(err, &tdErr))
+			assert.Equal(t, ErrCodeUnsupportedTransactionData, tdErr.code)
+			assert.Empty(t, authReq.TransactionData, "nothing may be forwarded to a client that cannot honour it")
+		})
+	}
+}
+
+func TestValidateTransactionData_AcceptsDeclaringClient(t *testing.T) {
+	authReq := &AuthorizationRequest{TransactionDataRaw: owfRaw(t)}
+	require.NoError(t, validateTransactionData(authReq, tdClient))
+	require.Len(t, authReq.TransactionData, 1)
+}
+
+// Behaviour for requests WITHOUT transaction_data must be untouched for every
+// client, declaring or not: this is the backward-compatibility guarantee.
+func TestValidateTransactionData_NoTransactionDataIsUnaffectedByDeclaration(t *testing.T) {
+	for name, msg := range map[string]*FlowStartMessage{"nil": nil, "none": {}, "declared": tdClient} {
+		t.Run(name, func(t *testing.T) {
+			assert.NoError(t, validateTransactionData(&AuthorizationRequest{}, msg))
+			assert.NoError(t, validateTransactionData(&AuthorizationRequest{TransactionDataRaw: json.RawMessage(`[]`)}, msg))
+		})
+	}
+}
+
+func TestValidateTransactionData_StructuralErrorsKeepGenericCode(t *testing.T) {
+	err := validateTransactionData(&AuthorizationRequest{TransactionDataRaw: json.RawMessage(`null`)}, tdClient)
+	var tdErr *transactionDataError
+	require.True(t, errors.As(err, &tdErr))
+	assert.Equal(t, ErrCodeInvalidMessage, tdErr.code)
+}
+
+func TestValidateTransactionData_UnsupportedTypeUsesUnsupportedCode(t *testing.T) {
+	enc := base64.RawURLEncoding.EncodeToString([]byte(`{"type":"urn:eudi:sca:payment:1","credential_ids":["pay"]}`))
+	err := validateTransactionData(&AuthorizationRequest{TransactionDataRaw: rawArray(t, enc)}, tdClient)
+	var tdErr *transactionDataError
+	require.True(t, errors.As(err, &tdErr))
+	assert.Equal(t, ErrCodeUnsupportedTransactionData, tdErr.code)
+	assert.Contains(t, err.Error(), "unsupported transaction_data type")
+}
+
+func TestFlowStartMessage_Supports(t *testing.T) {
+	var nilMsg *FlowStartMessage
+	assert.False(t, nilMsg.Supports(FeatureTransactionDataV1))
+	assert.False(t, (&FlowStartMessage{}).Supports(FeatureTransactionDataV1))
+	assert.True(t, tdClient.Supports(FeatureTransactionDataV1))
+	// An unknown declared feature is ignored rather than rejected, so a newer
+	// client can talk to this engine.
+	assert.True(t, (&FlowStartMessage{Features: []string{"future_thing", FeatureTransactionDataV1}}).Supports(FeatureTransactionDataV1))
+}
+
+// The wire name is part of the contract with every client.
+func TestFlowStartMessage_FeaturesWireName(t *testing.T) {
+	var m FlowStartMessage
+	require.NoError(t, json.Unmarshal([]byte(`{"type":"flow_start","protocol":"oid4vp","features":["transaction_data.v1"]}`), &m))
+	assert.True(t, m.Supports(FeatureTransactionDataV1))
+
+	// Existing clients send no `features`: still decodes, supports nothing.
+	var old FlowStartMessage
+	require.NoError(t, json.Unmarshal([]byte(`{"type":"flow_start","protocol":"oid4vp"}`), &old))
+	assert.False(t, old.Supports(FeatureTransactionDataV1))
+}
+
+// --- Verifier is told ---
+
+// The gate is only useful if both ends hear about it: the verifier gets
+// invalid_transaction_data so its session ends now, and the client gets the
+// distinct error code so it can tell the user to update.
+func TestFailTransactionData_NotifiesVerifierAndClient(t *testing.T) {
+	var form url.Values
+	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		form = r.PostForm
+		_, _ = w.Write([]byte(`{"redirect_uri":"https://verifier.example.com/back"}`))
+	}))
+	defer verifier.Close()
+
+	got := make(chan FlowErrorMessage, 1)
+	conn, cleanup := wsTestServer(t, func(srv *websocket.Conn) {
+		defer srv.Close()
+		_, data, err := srv.ReadMessage()
+		if err != nil {
+			return
+		}
+		var m FlowErrorMessage
+		if json.Unmarshal(data, &m) == nil {
+			got <- m
+		}
+	})
+	defer cleanup()
+
+	h := &OID4VPHandler{}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop(), Flow: &Flow{ID: "flow-1", Session: testSession(conn)}}
+	h.httpClient = verifier.Client()
+
+	authReq := &AuthorizationRequest{ResponseMode: ResponseModeDirectPost, ResponseURI: verifier.URL, State: "st-1"}
+	tdErr := newTransactionDataError(ErrCodeUnsupportedTransactionData, "x").(*transactionDataError)
+	h.failTransactionData(context.Background(), authReq, tdErr)
+
+	assert.Equal(t, "invalid_transaction_data", form.Get("error"))
+	assert.Equal(t, transactionDataVerifierDescription, form.Get("error_description"))
+	assert.Equal(t, "st-1", form.Get("state"))
+
+	select {
+	case m := <-got:
+		assert.Equal(t, TypeFlowError, m.Type)
+		assert.Equal(t, "flow-1", m.FlowID)
+		assert.Equal(t, StepParsingRequest, m.Step)
+		assert.Equal(t, ErrCodeUnsupportedTransactionData, m.Error.Code)
+		assert.Equal(t, "https://verifier.example.com/back", m.Error.Details["redirect_uri"])
+	case <-time.After(2 * time.Second):
+		t.Fatal("client never received the flow_error")
+	}
+}
+
+func TestUnsupportedTransactionData_UserFacingMessage(t *testing.T) {
+	msg := ErrCodeUnsupportedTransactionData.UserFacingMessage()
+	assert.NotEqual(t, ErrorCode("").UserFacingMessage(), msg, "must have its own message, not the generic fallback")
+	assert.Contains(t, msg, "update")
+}
+
+// --- Inline-URL requests must not drop transaction_data ---
+
+func inlineURL(t *testing.T, params map[string]string) *url.URL {
+	t.Helper()
+	q := url.Values{}
+	for k, v := range params {
+		q.Set(k, v)
+	}
+	return &url.URL{RawQuery: q.Encode()}
+}
+
+func TestParseRequestFromURL_KeepsTransactionData(t *testing.T) {
+	h := &OID4VPHandler{}
+	arr := string(rawArray(t, loadTDVectors(t)[1].Raw))
+	authReq, err := h.parseRequestFromURL(inlineURL(t, map[string]string{
+		"client_id": "x", "nonce": "n", "transaction_data": arr,
+	}))
+	require.NoError(t, err)
+	assert.JSONEq(t, arr, string(authReq.TransactionDataRaw))
+
+	entries, err := decodeTransactionData(authReq.TransactionDataRaw)
+	require.NoError(t, err)
+	assert.Equal(t, loadTDVectors(t)[1].Raw, entries[0].Raw, "the raw string must survive the by-value query form too")
+}
+
+func TestParseRequestFromURL_NoTransactionDataStaysEmpty(t *testing.T) {
+	authReq, err := (&OID4VPHandler{}).parseRequestFromURL(inlineURL(t, map[string]string{"client_id": "x", "nonce": "n"}))
+	require.NoError(t, err)
+	assert.Empty(t, authReq.TransactionDataRaw)
+}
+
+func TestParseRequestFromURL_InvalidTransactionDataJSON(t *testing.T) {
+	_, err := (&OID4VPHandler{}).parseRequestFromURL(inlineURL(t, map[string]string{"transaction_data": "{not json"}))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid transaction_data")
+}
+
+// End to end through Execute: a verifier that sends transaction_data in an
+// inline URL to a client that never declared support must be refused, the
+// verifier told, and the client given the distinct error. This is the wiring
+// the unit tests above cannot show: parse -> validate -> typed error ->
+// failTransactionData, instead of the generic invalid-request path.
+func TestExecute_InlineTransactionData_RefusedForClientThatDidNotDeclare(t *testing.T) {
+	var form url.Values
+	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		form = r.PostForm
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer verifier.Close()
+
+	errs := make(chan FlowErrorMessage, 4)
+	conn, cleanup := wsTestServer(t, func(srv *websocket.Conn) {
+		defer srv.Close()
+		for {
+			_, data, err := srv.ReadMessage()
+			if err != nil {
+				return
+			}
+			var m FlowErrorMessage
+			if json.Unmarshal(data, &m) == nil && m.Type == TypeFlowError {
+				errs <- m
+			}
+		}
+	})
+	defer cleanup()
+
+	h := &OID4VPHandler{}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop(), Flow: &Flow{ID: "flow-1", Session: testSession(conn)}}
+	h.httpClient = verifier.Client()
+
+	q := url.Values{}
+	q.Set("client_id", "https://verifier.example.com")
+	q.Set("client_id_scheme", ClientIDSchemeRedirectURI)
+	q.Set("response_type", "vp_token")
+	q.Set("response_mode", ResponseModeDirectPost)
+	q.Set("response_uri", verifier.URL)
+	q.Set("nonce", "n-1")
+	q.Set("state", "st-1")
+	q.Set("dcql_query", `{"credentials":[{"id":"pay","format":"dc+sd-jwt","meta":{"vct_values":["x"]}}]}`)
+	q.Set("transaction_data", string(owfRaw(t)))
+
+	// A client from before the feature: no Features in its flow_start.
+	// Execute continuing past validation is exactly the failure this guards
+	// against; with this minimal handler that surfaces as a panic further on,
+	// which is reported as a plain test failure instead of aborting the package.
+	var err error
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("Execute continued past request validation (transaction_data was not refused): %v", r)
+			}
+		}()
+		err = h.Execute(context.Background(), &FlowStartMessage{
+			Protocol:   ProtocolOID4VP,
+			RequestURI: "openid4vp://?" + q.Encode(),
+		})
+	}()
+
+	var tdErr *transactionDataError
+	require.True(t, errors.As(err, &tdErr), "Execute returned %v", err)
+	assert.Equal(t, ErrCodeUnsupportedTransactionData, tdErr.code)
+
+	assert.Equal(t, "invalid_transaction_data", form.Get("error"), "verifier must be told")
+	assert.Equal(t, "st-1", form.Get("state"))
+
+	select {
+	case m := <-errs:
+		assert.Equal(t, ErrCodeUnsupportedTransactionData, m.Error.Code, "client must get the distinct code, not the generic one")
+	case <-time.After(2 * time.Second):
+		t.Fatal("client never received a flow_error")
+	}
+}
