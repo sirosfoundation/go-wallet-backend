@@ -1511,7 +1511,7 @@ func TestValidateTransactionData_Empty(t *testing.T) {
 }
 
 func TestValidateTransactionData_Valid(t *testing.T) {
-	td := TransactionData{Type: "owf_payment_initiation"}
+	td := TransactionData{Type: "owf_payment_initiation", CredentialIDs: []string{"pay"}}
 	tdJSON, _ := json.Marshal(td)
 	encoded := base64.RawURLEncoding.EncodeToString(tdJSON)
 	raw, _ := json.Marshal([]string{encoded})
@@ -1540,16 +1540,19 @@ func TestValidateTransactionData_InvalidJSON(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid JSON")
 }
 
-func TestValidateTransactionData_UnsupportedType(t *testing.T) {
-	td := TransactionData{Type: "unsupported_type"}
+// The engine does not judge whether a type is supported: that depends on the
+// type metadata of the attestation the entry is bound to, which the wallet
+// resolves. A well-formed entry of any type goes to a client that declared
+// the feature, and the client refuses what it cannot handle.
+func TestValidateTransactionData_EngineDoesNotJudgeTheType(t *testing.T) {
+	td := TransactionData{Type: "some_type_the_engine_has_never_heard_of", CredentialIDs: []string{"pay"}}
 	tdJSON, _ := json.Marshal(td)
 	encoded := base64.RawURLEncoding.EncodeToString(tdJSON)
 	raw, _ := json.Marshal([]string{encoded})
 
 	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
-	err := validateTransactionData(authReq, tdClient)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsupported transaction_data type")
+	require.NoError(t, validateTransactionData(authReq, tdClient))
+	require.Len(t, authReq.TransactionData, 1)
 }
 
 func TestValidateTransactionData_NotStringArray(t *testing.T) {
@@ -2314,7 +2317,7 @@ func TestValidateAuthorizationRequest_OriginMismatchViaMsg(t *testing.T) {
 }
 
 func TestValidateAuthorizationRequest_WithTransactionData(t *testing.T) {
-	td := TransactionData{Type: "owf_payment_initiation"}
+	td := TransactionData{Type: "owf_payment_initiation", CredentialIDs: []string{"pay"}}
 	tdJSON, _ := json.Marshal(td)
 	encoded := base64.RawURLEncoding.EncodeToString(tdJSON)
 	raw, _ := json.Marshal([]string{encoded})
