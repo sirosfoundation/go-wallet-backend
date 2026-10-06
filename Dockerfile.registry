@@ -16,7 +16,6 @@ RUN apk add --no-cache git ca-certificates
 
 ARG VERSION=dev
 ARG COMMIT=unknown
-ARG BUILD_TIME=unknown
 
 COPY go.mod go.sum ./
 RUN go mod download
@@ -25,7 +24,7 @@ COPY . .
 
 # Build the main server binary (the registry role is part of it)
 RUN CGO_ENABLED=0 GOOS=linux go build \
-    -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildTime=${BUILD_TIME}" \
+    -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
     -o server cmd/server/main.go
 
 # Data directory for the VCTM cache - copied with correct ownership

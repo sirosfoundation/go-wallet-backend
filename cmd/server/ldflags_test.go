@@ -10,7 +10,7 @@ import (
 // in a Dockerfile leaves the binary reporting version=dev. Check that every
 // -X main.<name> the server images pass names a real package-level string.
 func TestDockerfileLinkerSymbolsExist(t *testing.T) {
-	known := map[string]*string{"version": &version, "commit": &commit, "buildTime": &buildTime}
+	known := map[string]*string{"version": &version, "commit": &commit}
 	re := regexp.MustCompile(`-X main\.(\w+)=`)
 	for _, f := range []string{"../../Dockerfile", "../../Dockerfile.registry"} {
 		data, err := os.ReadFile(f)
