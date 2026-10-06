@@ -126,15 +126,18 @@ func TestDeleteUser_CleanerFailingBeforeRevocationIsRetryable(t *testing.T) {
 	assert.ErrorIs(t, gerr, storage.ErrNotFound)
 }
 
-// The one failure that cannot be retried by the user: the cleaner recovers
-// for the first pass and fails after the permanent revocations. The record is
-// kept and the error is reported, not swallowed.
+// The failure that cannot be retried by the user: the cleaner recovers for
+// the first pass and fails after the blacklist revoked the user for good. The
+// record is kept and the error is reported, not swallowed, and it is not the
+// retryable ErrDeletionIncomplete.
 func TestDeleteUser_CleanerFailingAfterRevocationKeepsTheRecord(t *testing.T) {
 	ctx := context.Background()
 	svc, fs, uid, bl, ur := newDeleteFixture(t)
 	svc.SetSessionCleaner(&scriptedCleaner{failOn: map[int]bool{2: true}})
 
-	require.ErrorIs(t, svc.DeleteUser(ctx, uid, uid.String()), ErrDeletionIncomplete)
+	err := svc.DeleteUser(ctx, uid, uid.String())
+	require.ErrorIs(t, err, ErrDeletionOperatorRequired)
+	assert.NotErrorIs(t, err, ErrDeletionIncomplete, "repeating cannot get past the revoked token gate")
 	assert.Equal(t, 1, bl.calls)
 	assert.Equal(t, 1, ur.calls)
 	_, gerr := fs.Store.Users().GetByID(ctx, uid)
@@ -229,4 +232,76 @@ func TestDeleteUser_CutoffAdvanceFailureIsRetryableAndIrreversibleFree(t *testin
 
 	fs.fail = false
 	require.NoError(t, svc.DeleteUser(ctx, uid, uid.String()))
+}
+
+// A blacklist that did not take effect (RevokeUser failed) leaves a fresh
+// login able to pass the gate, so the second-cleaner failure stays retryable.
+type failingRevoker struct{}
+
+func (failingRevoker) RevokeUser(context.Context, string) error { return errors.New("redis down") }
+
+func TestDeleteUser_CleanerFailingAfterFailedBlacklistRevocationStaysRetryable(t *testing.T) {
+	ctx := context.Background()
+	svc, fs, uid, _, _ := newDeleteFixture(t)
+	svc.SetTokenBlacklist(failingRevoker{})
+	svc.SetSessionCleaner(&scriptedCleaner{failOn: map[int]bool{2: true}})
+
+	err := svc.DeleteUser(ctx, uid, uid.String())
+	require.ErrorIs(t, err, ErrDeletionIncomplete)
+	assert.NotErrorIs(t, err, ErrDeletionOperatorRequired)
+	_, gerr := fs.Store.Users().GetByID(ctx, uid)
+	assert.NoError(t, gerr)
+}
+
+// countingHolderStore fails GetAllByHolder from the n-th call on, so only the
+// final sweep (after the permanent revocation) fails.
+type countingHolderStore struct {
+	storage.Store
+	calls, failFrom int
+}
+
+type countingHolderCreds struct {
+	storage.CredentialStore
+	s *countingHolderStore
+}
+
+func (s *countingHolderStore) Credentials() storage.CredentialStore {
+	return &countingHolderCreds{s.Store.Credentials(), s}
+}
+
+func (c *countingHolderCreds) GetAllByHolder(ctx context.Context, tid domain.TenantID, did string) ([]*domain.VerifiableCredential, error) {
+	c.s.calls++
+	if c.s.calls >= c.s.failFrom {
+		return nil, errors.New("db down")
+	}
+	return c.CredentialStore.GetAllByHolder(ctx, tid, did)
+}
+
+func TestDeleteUser_FinalSweepFailureAfterBlacklistIsOperatorOnly(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name      string
+		blacklist TokenRevoker
+		want      error
+		notWant   error
+	}{
+		{"blacklist in force", &countingRevoker{}, ErrDeletionOperatorRequired, ErrDeletionIncomplete},
+		{"no blacklist: a fresh login can retry", nil, ErrDeletionIncomplete, ErrDeletionOperatorRequired},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &countingHolderStore{Store: memory.NewStore(), failFrom: 2}
+			svc := NewUserService(fs, testConfig(), zap.NewNop())
+			if tc.blacklist != nil {
+				svc.SetTokenBlacklist(tc.blacklist)
+			}
+			uid := domain.NewUserID()
+			require.NoError(t, fs.Store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:key:" + uid.String()}))
+
+			err := svc.DeleteUser(ctx, uid, uid.String())
+			require.ErrorIs(t, err, tc.want)
+			assert.NotErrorIs(t, err, tc.notWant)
+			_, gerr := fs.Store.Users().GetByID(ctx, uid)
+			assert.NoError(t, gerr, "the record is kept")
+		})
+	}
 }

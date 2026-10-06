@@ -440,12 +440,17 @@ not drop the user's sessions. In all of these nothing has been revoked for
 good yet, so the token the request came on keeps working and the same request
 can be sent again. The permanent token revocation (the in-process token
 blacklist and the engine's revoked-user set) is applied only after the sweep
-found nothing outstanding. The one case that can no longer be retried by the
-user is a session store that fails on its second pass, after that revocation:
-the record is kept and the error is returned, but the user's own tokens are
-refused from then on until the process restarts, so an operator has to finish
-it. Pending challenges, invite references and membership rows are removed on a
-best-effort basis.
+found nothing outstanding. The cases that can no longer be retried by the user
+are a session store that fails on its second pass, or the final holder-data
+sweep failing, after the token blacklist revoked the user for good: the record
+is kept, but every token of the user, a fresh login's included, is refused until
+the process restarts, so repeating the request cannot work and an operator has
+to finish it. The answer is `202` with `DELETION_OPERATOR_REQUIRED` and
+`"result": "PENDING"` (the account is not deleted yet, and the caller must not
+repeat the request). Where no blacklist revocation took effect, the same
+failures remain `409 DELETION_INCOMPLETE`, because a fresh login passes the
+token cut-off and can repeat the request. Pending challenges, invite references
+and membership rows are removed on a best-effort basis.
 
 The last step is a sweep of holder data after the user record is removed, for
 a credential or presentation that a token issued after the token cut-off wrote

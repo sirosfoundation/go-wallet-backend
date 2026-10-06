@@ -86,3 +86,51 @@ func TestDeleteUser_PostRemovalCleanupFailureIsNotAskedToRepeat(t *testing.T) {
 	_, err := inner.Users().GetByID(context.Background(), domain.UserIDFromString(userID))
 	assert.ErrorIs(t, err, storage.ErrNotFound)
 }
+
+type failingSecondCleaner struct{ calls int }
+
+func (c *failingSecondCleaner) DeleteByUser(context.Context, string) error {
+	c.calls++
+	if c.calls >= 2 {
+		return errors.New("session store is down")
+	}
+	return nil
+}
+
+type okRevoker struct{}
+
+func (okRevoker) RevokeUser(context.Context, string) error { return nil }
+
+// A session store failing after the user's tokens were revoked for good cannot
+// be fixed by repeating the request: the answer must say an operator is needed
+// and must not claim the account is deleted or ask the caller to retry.
+func TestDeleteUser_OperatorRequiredIsNotAskedToRepeat(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		JWT:    config.JWTConfig{Secret: "test-secret", ExpiryHours: 24, Issuer: "test-wallet"},
+	}
+	inner := memory.NewStore()
+	const userID = "user-operator-required"
+	require.NoError(t, inner.Users().Create(context.Background(), &domain.User{
+		UUID: domain.UserIDFromString(userID), DID: domain.HolderDID(userID),
+	}))
+	logger := zap.NewNop()
+	services := service.NewServices(inner, cfg, logger)
+	services.User.SetTokenBlacklist(okRevoker{})
+	services.User.SetSessionCleaner(&failingSecondCleaner{})
+	handlers := NewHandlers(services, cfg, logger, []string{"test"})
+	router := gin.New()
+	router.DELETE("/user", legacyAuthContext(userID), handlers.DeleteUser)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/user", nil))
+
+	assert.Equal(t, http.StatusAccepted, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), errCodeDeletionOperatorRequired)
+	assert.Contains(t, w.Body.String(), `"result":"PENDING"`)
+	assert.NotContains(t, w.Body.String(), errCodeDeletionIncomplete)
+	assert.NotContains(t, w.Body.String(), "repeat the request to finish")
+	_, err := inner.Users().GetByID(context.Background(), domain.UserIDFromString(userID))
+	assert.NoError(t, err, "the record is kept for the operator")
+}

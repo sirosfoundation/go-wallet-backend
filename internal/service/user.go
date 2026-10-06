@@ -358,6 +358,15 @@ var ErrDeletionIncomplete = errors.New("account deletion incomplete")
 // to retry.
 var ErrDeletionCleanupPending = errors.New("account deleted, cleanup of data written during the deletion incomplete")
 
+// ErrDeletionOperatorRequired is returned when the deletion stopped after the
+// permanent token revocation (the token blacklist's RevokeUser, which has no
+// undo and is not time-scoped) took effect, so every token the user can obtain
+// - a fresh login's included - is refused until the process restarts. The user
+// record is kept, but unlike ErrDeletionIncomplete the caller cannot repeat the
+// request: it would not get past the token gate. Only an operator (or a
+// restart) can finish it. Callers must not tell the user to retry.
+var ErrDeletionOperatorRequired = errors.New("account deletion stalled after the user's tokens were revoked, an operator must finish it")
+
 // DeleteUser removes a user and everything of theirs, in every tenant: stored
 // credentials and presentations, wallet instances, pending challenges, live
 // sessions, tenant memberships, and finally the user record with its
@@ -391,12 +400,14 @@ var ErrDeletionCleanupPending = errors.New("account deleted, cleanup of data wri
 //     has revoked anything for good, so the caller's token still works and the
 //     same request can be sent again; each retry re-derives everything from
 //     the store, so removals that already succeeded are simply not found again.
-//   - ErrDeletionIncomplete after the permanent revocations: only a session
-//     cleaner that fails on its second run, after the token blacklist and the
-//     engine have barred the user id for good. The record is kept, but the
-//     user's own tokens are refused from then on (both revocations last until
-//     the process restarts), so finishing the deletion takes an operator or a
-//     restart, not the user.
+//   - ErrDeletionOperatorRequired: a session cleaner that fails on its second
+//     run, or the final holder sweep failing, after the token blacklist has
+//     barred the user id for good. The record is kept, but the user's own
+//     tokens - a fresh login's included - are refused from then on (the
+//     revocation lasts until the process restarts), so finishing the deletion
+//     takes an operator or a restart, not the user. Without a successful
+//     blacklist revocation the same failures stay ErrDeletionIncomplete: the
+//     cut-off lets a fresh login through, which can repeat the request.
 //   - The token cut-off (User.AuthInvalidBefore) is advanced, durably, just
 //     before those revocations, and a failure to do so is a retryable
 //     ErrDeletionIncomplete. From then on every token issued before it is
@@ -703,9 +714,17 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// registration that instead completed *before* this revocation is
 	// still guaranteed to be present in m.sessions by the time the scan
 	// below runs. Reversing this order would reopen that gap.
+	// lockedOut records that the caller can no longer repeat the request:
+	// only a successful blacklist revocation refuses a fresh login's token at
+	// the gate. Without it (no blacklist, or RevokeUser failed) the cut-off
+	// still lets a token issued after it through, so a failure further down
+	// stays retryable.
+	lockedOut := false
 	if s.tokenBlacklist != nil {
 		if err := s.tokenBlacklist.RevokeUser(ctx, userID.String()); err != nil {
 			s.logger.Warn("Failed to revoke tokens for deleted user", zap.Error(err))
+		} else {
+			lockedOut = true
 		}
 	}
 
@@ -720,13 +739,13 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// token gate refuse them, but they should not exist at all.
 	if s.sessionCleaner != nil {
 		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
-			// The permanent revocations above are already in force, so this
-			// failure is the one that cannot be retried by the user: their
-			// tokens are refused from here on. It is reported, not swallowed,
+			// With the blacklist revocation in force this failure cannot be
+			// retried by the user: their tokens are refused from here on
+			// (ErrDeletionOperatorRequired). It is reported, not swallowed,
 			// and the record is kept for an operator or a restart to finish.
 			s.logger.Error("Account deletion incomplete: sessions could not be dropped after the user was revoked",
 				zap.Error(err), zap.String("user_id", userID.String()))
-			return fmt.Errorf("%w: drop sessions: %w", ErrDeletionIncomplete, err)
+			return fmt.Errorf("%w: drop sessions: %w", deletionStallErr(lockedOut), err)
 		}
 	}
 
@@ -743,9 +762,10 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// that persists after it removes itself. Only a write whose own rollback
 	// fails can outlive it (see ConfirmWrite).
 	//
-	// A failure here is retryable and fails closed: the user record is kept,
-	// the cut-off and revocations only move forward, and the repeat (with a
-	// fresh login) sweeps again.
+	// A failure here fails closed: the user record is kept and the cut-off and
+	// revocations only move forward. It is retryable (a fresh login passes
+	// the gate and sweeps again) unless the token blacklist already refuses
+	// every token of the user, which makes it ErrDeletionOperatorRequired.
 	var finalErrs []error
 	for _, tenantID := range tenantIDs {
 		finalErrs = append(finalErrs, s.eraseHolderData(ctx, tenantID, holderDID)...)
@@ -753,7 +773,7 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	if len(finalErrs) > 0 {
 		s.logger.Error("Account deletion incomplete: holder data could not be removed after the token cut-off",
 			zap.Error(errors.Join(finalErrs...)), zap.String("user_id", userID.String()))
-		return fmt.Errorf("%w: final holder-data sweep: %w", ErrDeletionIncomplete, errors.Join(finalErrs...))
+		return fmt.Errorf("%w: final holder-data sweep: %w", deletionStallErr(lockedOut), errors.Join(finalErrs...))
 	}
 
 	// Memberships come last, once nothing is outstanding anywhere. They are
@@ -800,6 +820,16 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 
 	s.logger.Info("User deleted")
 	return nil
+}
+
+// deletionStallErr picks the sentinel for a failure after the permanent
+// revocation point: retryable (ErrDeletionIncomplete) while a fresh login still
+// passes the token gate, ErrDeletionOperatorRequired once it does not.
+func deletionStallErr(lockedOut bool) error {
+	if lockedOut {
+		return ErrDeletionOperatorRequired
+	}
+	return ErrDeletionIncomplete
 }
 
 // listWalletInstances lists every wallet instance of the user across all

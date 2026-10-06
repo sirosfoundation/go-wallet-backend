@@ -28,6 +28,10 @@ const (
 	// errCodeDeletionCleanupPending is returned when the account was deleted
 	// but the sweep after its removal failed. Do not repeat the request.
 	errCodeDeletionCleanupPending = "DELETION_CLEANUP_PENDING"
+	// errCodeDeletionOperatorRequired is returned when the deletion stalled
+	// after the user's tokens were revoked for good: the record still exists
+	// but the user cannot repeat the request. Do not repeat it.
+	errCodeDeletionOperatorRequired = "DELETION_OPERATOR_REQUIRED"
 	// errCodeLifecycleNotSupported is returned when a lifecycle operation is
 	// reached without a lifecycle service behind it. It means the operation
 	// did not happen, not that it half happened.

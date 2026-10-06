@@ -1105,6 +1105,19 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 			})
 			return
 		}
+		if errors.Is(err, service.ErrDeletionOperatorRequired) {
+			// The user's tokens are already refused for good, so repeating
+			// the request cannot get past the gate. The account record still
+			// exists and an operator has to finish the deletion. 202: the
+			// deletion is under way, not failed and not done.
+			h.logger.Error("Account deletion stalled after token revocation, operator required", zap.Error(err))
+			c.JSON(http.StatusAccepted, gin.H{
+				"error":   errCodeDeletionOperatorRequired,
+				"result":  "PENDING",
+				"message": "the account's tokens have been revoked and the deletion has begun, but part of it could not be completed and only an operator can finish it; do not repeat the request",
+			})
+			return
+		}
 		if errors.Is(err, service.ErrDeletionIncomplete) {
 			// The account still exists on purpose, so the caller can repeat
 			// the request rather than be left with a stranded wallet
