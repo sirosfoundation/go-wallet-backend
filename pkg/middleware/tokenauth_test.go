@@ -845,3 +845,40 @@ func TestTokenAuthMiddleware_NilUsersPanics(t *testing.T) {
 	}()
 	TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, nil, zap.NewNop())
 }
+
+// TokenAuthMiddlewareWithValidate (the registry's entry point) requires the
+// lookup too: nil refuses at construction, never builds a gate-less chain.
+func TestTokenAuthMiddlewareWithValidate_NilUsersPanics(t *testing.T) {
+	v, _, _ := setupTokenAuthTest(t)
+	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{}}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("TokenAuthMiddlewareWithValidate with nil users must panic")
+		}
+	}()
+	TokenAuthMiddlewareWithValidate(testTokenAuthConfig(), v.Validate, tenants, nil, nil, zap.NewNop())
+}
+
+// With the explicit no-op lookup the chain builds and serves a valid token.
+func TestTokenAuthMiddlewareWithValidate_NoUserRecordsServesValidToken(t *testing.T) {
+	v, key, issuer := setupTokenAuthTest(t)
+	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{
+		"test-tenant": {ID: "test-tenant", Enabled: true},
+	}}
+	token := signToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   jwt.Claims{Subject: "user-123", Audience: jwt.Audience{testTokenAudience}},
+		TenantID: "test-tenant",
+		TAC:      "rwl",
+	})
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(TokenAuthMiddlewareWithValidate(testTokenAuthConfig(), v.Validate, tenants, nil, tokengate.NoUserRecords{}, zap.NewNop()))
+	r.GET("/x", func(c *gin.Context) { c.Status(200) })
+	req := httptest.NewRequest(http.MethodGet, "/x", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+}

@@ -133,3 +133,19 @@ func TestRefuseNow(t *testing.T) {
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, ErrRevoked, "a store failure is not a revocation")
 }
+
+// NoUserRecords is the registry's explicit "no user database" lookup: a gate
+// over it must never refuse a token, however old or odd, for cut-off reasons.
+func TestNoUserRecords_NeverRefuses(t *testing.T) {
+	g := New(NoUserRecords{})
+	require.NotNil(t, g, "NoUserRecords is a real lookup, not the nil-gate shortcut")
+	now := time.Now()
+	for name, iat := range map[string]time.Time{
+		"recent": now, "ancient": now.Add(-10 * 365 * 24 * time.Hour), "zero iat": {},
+	} {
+		assert.NoError(t, g.Check(context.Background(), "any-user", iat), name)
+	}
+	_, err := NoUserRecords{}.GetAuthCutoff(context.Background(), domain.UserIDFromString("u"))
+	assert.ErrorIs(t, err, storage.ErrNotFound)
+	assert.NoError(t, RefuseIfDeleted(context.Background(), NoUserRecords{}, "u"))
+}
