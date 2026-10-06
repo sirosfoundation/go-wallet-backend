@@ -118,8 +118,14 @@ const (
 	// was never asked, so reporting this to the wallet as "declined" would be
 	// wrong. The verifier is told neither apart - see submitErrorResponse.
 	ErrCodeNoMatchingCredentials ErrorCode = "NO_MATCHING_CREDENTIALS"
-	ErrCodeInternalError         ErrorCode = "INTERNAL_ERROR"
-	ErrCodeTooManyRequests       ErrorCode = "TOO_MANY_REQUESTS"
+	// ErrCodeUnsupportedTransactionData is returned when a request carries
+	// OID4VP transaction_data this wallet cannot process: the client did not
+	// declare FeatureTransactionDataV1, or the type is not supported. The
+	// wallet refuses rather than present without the transaction hashes or
+	// without showing the user what they are authorizing.
+	ErrCodeUnsupportedTransactionData ErrorCode = "UNSUPPORTED_TRANSACTION_DATA"
+	ErrCodeInternalError              ErrorCode = "INTERNAL_ERROR"
+	ErrCodeTooManyRequests            ErrorCode = "TOO_MANY_REQUESTS"
 )
 
 // UserFacingMessage returns a generic user-facing message for an error code.
@@ -168,6 +174,8 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "Presentation failed"
 	case ErrCodeNoMatchingCredentials:
 		return "You do not have any credentials that match this request"
+	case ErrCodeUnsupportedTransactionData:
+		return "This wallet cannot process the transaction in this request. Please update the wallet and try again"
 	case ErrCodeInternalError:
 		return "Internal server error"
 	case ErrCodeTooManyRequests:
@@ -278,6 +286,17 @@ type FlowStartMessage struct {
 	// client that never sends this behaves exactly as before.
 	AuthorizationDetails []AuthorizationDetail `json:"authorization_details,omitempty"`
 
+	// Features lists the optional protocol features this client implements,
+	// declared per flow. The engine only sends a client work it can do
+	// correctly: a client that omits a feature is treated as not supporting it,
+	// so an older frontend or SDK keeps working exactly as before and is
+	// refused (with an explicit error) rather than silently mishandling a
+	// request that needs the feature. Unknown entries are ignored, so a newer
+	// client can declare features an older engine does not know.
+	//
+	// Today's only feature is FeatureTransactionDataV1.
+	Features []string `json:"features,omitempty"`
+
 	// Resumption fields (same-tab redirect flow)
 	AuthCode     string `json:"auth_code,omitempty"`     // Authorization code from OAuth redirect
 	CodeVerifier string `json:"code_verifier,omitempty"` // PKCE code verifier (saved by client before redirect)
@@ -314,6 +333,29 @@ type FlowStartMessage struct {
 	// SignActionSignClientAuth of the renewal so the client signs with that
 	// same key. Takes precedence over DPoPJWK.
 	DPoPKeyID string `json:"dpop_key_id,omitempty"`
+}
+
+// FeatureTransactionDataV1 is declared by a client that can process OID4VP
+// `transaction_data` end to end: validate it against the attestation's type
+// metadata, show it to the user, and bind it into the presentation by hashing
+// each entry exactly as received (the base64url string, never a re-encoding of
+// it). A client must not declare it until all of that is implemented, because
+// a client that ignores the field signs a presentation without the hashes and
+// without the user ever seeing the transaction (EC TS12 payment SCA).
+const FeatureTransactionDataV1 = "transaction_data.v1"
+
+// Supports reports whether the client declared feature. It is safe on a nil
+// message, which means "declared nothing".
+func (m *FlowStartMessage) Supports(feature string) bool {
+	if m == nil {
+		return false
+	}
+	for _, f := range m.Features {
+		if f == feature {
+			return true
+		}
+	}
+	return false
 }
 
 // authorizationDetailTypeOpenIDCredential is the only `type` OID4VCI 1.0
