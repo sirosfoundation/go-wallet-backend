@@ -395,6 +395,12 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 				return "", err
 			}
 			if !existing.Status.IsLive() {
+				if !existing.Status.IsKnownNonLive() {
+					// Refused, but an unrecognized status does not establish
+					// that the instance was deactivated.
+					s.emitAuditFailure("instance_status_unrecognized", fmt.Errorf("instance %s has unrecognized status %q", existing.ID, existing.Status))
+					return "", fmt.Errorf("check wallet instance status: instance %s has unrecognized status %q", existing.ID, existing.Status)
+				}
 				s.emitAuditFailure("instance_deactivated", fmt.Errorf("wallet instance status is %s", existing.Status))
 				return "", fmt.Errorf("%w: status is %s", ErrWIAInstanceDeactivated, existing.Status)
 			}
@@ -853,6 +859,10 @@ func (s *WIAService) recheckLifecycleAfterWrite(ctx context.Context, tenantID do
 		return fmt.Errorf("%w: instance was bound to another user", ErrWIAInstanceNotOwned)
 	}
 	if !inst.Status.IsLive() {
+		if !inst.Status.IsKnownNonLive() {
+			s.emitAuditFailure("instance_status_unrecognized", fmt.Errorf("instance %s has unrecognized status %q", inst.ID, inst.Status))
+			return fmt.Errorf("re-check wallet instance status: instance %s has unrecognized status %q", inst.ID, inst.Status)
+		}
 		s.emitAuditFailure("instance_deactivated", fmt.Errorf("wallet instance became %s during attestation", inst.Status))
 		return fmt.Errorf("%w: status is %s", ErrWIAInstanceDeactivated, inst.Status)
 	}

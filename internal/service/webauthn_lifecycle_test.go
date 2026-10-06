@@ -88,8 +88,23 @@ func TestCheckWalletLifecycle(t *testing.T) {
 		s := &WebAuthnService{store: memory.NewStore()}
 		seedRawInstance(t, s.store, domain.DefaultTenantID, "i1", userID, "pk-1", unknownInstanceStatus)
 		seedLifecycleInstance(t, s, "i2", userID, "pk-2", domain.InstanceStatusActive)
-		assert.Error(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1"))
-		assert.NoError(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-2"))
+		for _, pk := range []string{"pk-1", "pk-2"} {
+			err := s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, pk)
+			require.Error(t, err, "an unrecognized status refuses every passkey, not only the linked one: %s", pk)
+			assert.NotErrorIs(t, err, ErrWalletDeactivated)
+			assert.NotErrorIs(t, err, ErrWalletInstanceRevoked, "no lifecycle state was established")
+		}
+	})
+
+	t.Run("unknown status beside a revoked linked instance: unrecognized, not revoked", func(t *testing.T) {
+		s := &WebAuthnService{store: memory.NewStore()}
+		seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusRevoked)
+		seedRawInstance(t, s.store, domain.DefaultTenantID, "i2", userID, "pk-2", unknownInstanceStatus)
+		seedLifecycleInstance(t, s, "i3", userID, "pk-3", domain.InstanceStatusActive)
+		err := s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1")
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrWalletInstanceRevoked)
+		assert.Contains(t, err.Error(), "unrecognized status")
 	})
 
 	t.Run("every instance revoked: wallet deactivated, any passkey refused", func(t *testing.T) {

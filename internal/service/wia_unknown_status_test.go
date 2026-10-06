@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"testing"
 
@@ -12,6 +13,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	jwkpkg "github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 )
 
 // racingCorruptInstances models the sibling instance ending up with an
@@ -149,4 +151,75 @@ func TestWIAService_GenerateWIA_UnknownStatusSiblingRefusedBeforeInsert(t *testi
 	byUser, err := instances.GetByUser(ctx, domain.DefaultTenantID, uid)
 	require.NoError(t, err)
 	assert.Len(t, byUser, 2, "no new instance recorded")
+}
+
+// statusOverrideInstances reports unknownInstanceStatus for id once armed,
+// modelling a record whose stored status this build does not recognize.
+type statusOverrideInstances struct {
+	storage.WalletInstanceStore
+	id    string
+	armed func() bool
+}
+
+func (o *statusOverrideInstances) GetByID(ctx context.Context, id string) (*domain.WalletInstance, error) {
+	inst, err := o.WalletInstanceStore.GetByID(ctx, id)
+	if err != nil || id != o.id || !o.armed() {
+		return inst, err
+	}
+	cp := *inst
+	cp.Status = unknownInstanceStatus
+	return &cp, nil
+}
+
+// An unrecognized status on the attesting instance's own record is refused
+// without INSTANCE_DEACTIVATED: nothing established a deactivation.
+func TestWIAService_GenerateWIA_UnknownOwnStatusIsNotDeactivation(t *testing.T) {
+	ctx := context.Background()
+	base := memory.NewStore().WalletInstances()
+	svc0 := newTestWIAServiceUsing(t, base)
+	challenge, _, err := svc0.CreateChallenge(ctx, domain.DefaultTenantID)
+	require.NoError(t, err)
+	pop, key := createTestPop(t, challenge)
+	_, err = svc0.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge})
+	require.NoError(t, err)
+	jkt, err := jwkpkg.Thumbprint(map[string]interface{}{
+		"kty": "EC", "crv": "P-256",
+		"x": base64.RawURLEncoding.EncodeToString(key.PublicKey.X.FillBytes(make([]byte, 32))),
+		"y": base64.RawURLEncoding.EncodeToString(key.PublicKey.Y.FillBytes(make([]byte, 32))),
+	})
+	require.NoError(t, err)
+
+	t.Run("pre-write gate", func(t *testing.T) {
+		svc := newTestWIAServiceUsing(t, &statusOverrideInstances{WalletInstanceStore: base, id: jkt, armed: func() bool { return true }})
+		c, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+		require.NoError(t, err)
+		_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{Pop: createTestPopWithKey(t, c, key), Challenge: c})
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrWIAInstanceDeactivated)
+		assert.Contains(t, err.Error(), "unrecognized status")
+	})
+
+	t.Run("post-write re-check", func(t *testing.T) {
+		fresh := memory.NewStore().WalletInstances()
+		upserted := false
+		o := &afterUpsertInstances{WalletInstanceStore: fresh, upserted: &upserted}
+		svc := newTestWIAServiceUsing(t, &statusOverrideInstances{WalletInstanceStore: o, id: jkt, armed: func() bool { return upserted }})
+		c, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+		require.NoError(t, err)
+		_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{Pop: createTestPopWithKey(t, c, key), Challenge: c})
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrWIAInstanceDeactivated)
+		assert.Contains(t, err.Error(), "unrecognized status")
+	})
+}
+
+type afterUpsertInstances struct {
+	storage.WalletInstanceStore
+	upserted *bool
+}
+
+func (a *afterUpsertInstances) Upsert(ctx context.Context, inst *domain.WalletInstance) error {
+	err := a.WalletInstanceStore.Upsert(ctx, inst)
+	*a.upserted = true
+	return err
 }

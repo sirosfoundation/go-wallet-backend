@@ -2567,21 +2567,25 @@ func (s *WebAuthnService) checkWalletLifecycle(ctx context.Context, tenantID dom
 			anyLive = true
 		} else if !inst.Status.IsKnownNonLive() {
 			unknown = inst
+			continue
 		}
 		if inst.CredentialID == "" || inst.CredentialID != credentialID {
 			continue
 		}
-		if !inst.Status.IsLive() {
+		// Only a status that positively means "cannot be used" counts.
+		if inst.Status.IsKnownNonLive() {
 			linkedRevoked = true
 		}
 	}
+	if unknown != nil {
+		// An unrecognized status is not evidence that the wallet is
+		// deactivated or that this passkey is revoked, and it is not
+		// evidence that it is fine either: refuse the login whichever
+		// sibling is live, without claiming a lifecycle state nobody
+		// established.
+		return fmt.Errorf("check wallet lifecycle: instance %s has unrecognized status %q", unknown.ID, unknown.Status)
+	}
 	if !anyLive {
-		if unknown != nil {
-			// An unrecognized status is not evidence that the wallet is
-			// deactivated: refuse the login, but without claiming a
-			// lifecycle state nobody established.
-			return fmt.Errorf("check wallet lifecycle: instance %s has unrecognized status %q", unknown.ID, unknown.Status)
-		}
 		return ErrWalletDeactivated
 	}
 	if linkedRevoked {
