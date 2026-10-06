@@ -351,7 +351,7 @@ the shared token validator (the AS itself is *not* run, keep `as.enabled` false)
 
 | Setting | Why |
 |---------|-----|
-| `as.external_url` | JWKS is fetched from `<as.external_url>/auth/.well-known/jwks.json` (no override) |
+| `as.external_url` | JWKS is fetched from `<as.external_url>/auth/.well-known/jwks.json` (no override) The host must be listed in `http_client.trusted_idp_hosts` when it is a private/cluster-internal address or plain `http` (see [Split mode](#split-mode-as-jwks)) |
 | `as.issuer` (or `jwt.issuer`) | expected `iss` |
 | `jwt.secret` / `jwt.secret_path` (>= 32 bytes) | only while `as.legacy.enabled` is true (legacy HMAC tokens); set `as.legacy.enabled: false` to drop it |
 
@@ -591,6 +591,18 @@ survive across replicas and restarts; only the revocation markers are process-lo
 ### Token revocation limits
 
 Token revocation (logout, revoked user) is enforced through an in-process token blacklist, so it only takes effect in the process that holds it (single-replica limitation, tracked in issues #407 and #415). A shared revocation source is not implemented.
+
+<a id="split-mode-as-jwks"></a>
+**Split mode: reaching the AS for its signing keys.** The standalone engine, a registry-only process and an isolated wallet-provider fetch the AS keys from `as.external_url`. In a split-pod deployment that is usually a cluster-internal address, which the default HTTP client policy refuses (plain http and a private address). Do not open the global `http_client.allow_http` / `allow_private_ips` for this: they also loosen the policy for third-party issuers and verifiers. Instead list exactly the AS host in `http_client.trusted_idp_hosts`; for this one fetch that host may be private and may use plain `http`. Cloud-metadata addresses stay blocked. Example (engine and registry pods):
+
+```yaml
+as:
+  external_url: http://backend.wallet.svc:8080
+http_client:
+  trusted_idp_hosts: ["backend.wallet.svc"]   # or WALLET_HTTP_CLIENT_TRUSTED_IDP_HOSTS=backend.wallet.svc
+```
+
+Without the entry, startup fails with an error naming the host to add. Use an `https` `as.external_url` where available.
 
 **Standalone engine (`--mode=engine`, no backend provider):** when `as.external_url` is set, the engine accepts AS-signed ES256 session tokens, but it has no revocation checker and no token blacklist is wired into it. Consequence: after a logout or user revocation at the backend, a token **stays valid at the standalone engine until it expires**; a new WebSocket handshake with it is still accepted. The engine logs a warning at startup when it is built this way.
 

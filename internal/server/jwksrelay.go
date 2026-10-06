@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
+	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
@@ -19,8 +20,10 @@ import (
 // scheme policy, no address guard, and it follows HTTPS->HTTP redirects. An
 // on-path attacker could substitute the keys and forge session tokens. Since
 // the validator has no client option, keys are fetched by us with the guarded
-// client (cfg.HTTPClient.NewHTTPClient: plaintext policy and SSRF guards
-// applied to every request and redirect hop) and handed to the validator over
+// client (cfg.HTTPClient.NewOwnASHTTPClient: plaintext policy and SSRF guards
+// applied to every request and redirect hop, with the operator's
+// http_client.trusted_idp_hosts reachable on private addresses and over plain
+// http, because the host is the deployment's own AS) and handed to the validator over
 // a loopback-only relay. The relay serves public keys only.
 
 // jwksRelay serves a JWKS document on a loopback port, produced by fetch on
@@ -65,26 +68,39 @@ func (r *jwksRelay) Close() error {
 	return r.srv.Close()
 }
 
-// asJWKSURL returns <as.external_url>/auth/.well-known/jwks.json, refusing a
-// plain-http external_url unless the HTTP client policy allows plaintext.
+// asJWKSURL returns <as.external_url>/auth/.well-known/jwks.json.
+//
+// A plain-http external_url is accepted only when its host is listed in
+// http_client.trusted_idp_hosts (the narrow, per-host allowance; see
+// HTTPClientConfig.NewOwnASHTTPClient) or the global policy allows plaintext
+// (http_client.allow_http and friends). Otherwise startup fails with the
+// setting to change.
 func asJWKSURL(cfg *config.Config) (string, error) {
 	u, err := cfg.AS.ExternalBaseURL()
 	if err != nil {
 		return "", err
 	}
-	if u.Scheme == "http" && !cfg.HTTPClient.AllowsPlaintext() {
-		return "", fmt.Errorf("as.external_url %q uses plain http; use https or set http_client.allow_http for local development", cfg.AS.ExternalURL)
+	if u.Scheme == "http" && !cfg.HTTPClient.AllowsPlaintext() && !cfg.HTTPClient.IsTrustedIdPHost(u.Hostname()) {
+		return "", fmt.Errorf("as.external_url %q uses plain http and host %q is not trusted: "+
+			"add %q to http_client.trusted_idp_hosts (env WALLET_HTTP_CLIENT_TRUSTED_IDP_HOSTS) to fetch this deployment's own AS keys over http from that host only, "+
+			"or use an https as.external_url", cfg.AS.ExternalURL, u.Hostname(), u.Hostname())
 	}
 	return u.JoinPath("auth", ".well-known", "jwks.json").String(), nil
 }
 
-// newRemoteJWKSRelay relays the AS JWKS fetched with the guarded HTTP client.
+// newRemoteJWKSRelay relays the AS JWKS fetched with the own-AS client (the
+// IdP-client policy: only http_client.trusted_idp_hosts may be private, and
+// plain http only to those).
 func newRemoteJWKSRelay(cfg *config.Config) (*jwksRelay, error) {
 	target, err := asJWKSURL(cfg)
 	if err != nil {
 		return nil, err
 	}
-	client := cfg.HTTPClient.NewHTTPClient(10 * time.Second)
+	host := ""
+	if u, perr := url.Parse(target); perr == nil {
+		host = u.Hostname()
+	}
+	client := cfg.HTTPClient.NewOwnASHTTPClient(10 * time.Second)
 	return startJWKSRelay(func(ctx context.Context) ([]byte, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
 		if err != nil {
@@ -93,6 +109,8 @@ func newRemoteJWKSRelay(cfg *config.Config) (*jwksRelay, error) {
 		req.Header.Set("Accept", "application/json")
 		resp, err := client.Do(req)
 		if err != nil {
+			err = fmt.Errorf("fetching AS JWKS from as.external_url %q failed (if the host is a private or cluster-internal address, add %q to http_client.trusted_idp_hosts): %w", cfg.AS.ExternalURL, host, err)
+			zap.L().Error("AS JWKS fetch failed", zap.Error(err))
 			return nil, err
 		}
 		defer func() { _ = resp.Body.Close() }()
