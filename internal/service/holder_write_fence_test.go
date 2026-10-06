@@ -31,6 +31,24 @@ type raceStore struct {
 	beforeWrite func() // after admission, before the store write executes
 	afterWrite  func() // after the store write persisted, before the re-read
 	failDeletes atomic.Bool
+	// beforeRecheck runs once, at the fence's re-read of the cut-off, i.e.
+	// after the service has captured the identity of what it wrote.
+	beforeRecheck func()
+}
+
+type recheckUsers struct {
+	storage.UserStore
+	s *raceStore
+}
+
+func (s *raceStore) Users() storage.UserStore { return &recheckUsers{s.Store.Users(), s} }
+
+func (u *recheckUsers) GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, error) {
+	if h := u.s.beforeRecheck; h != nil {
+		u.s.beforeRecheck = nil
+		h()
+	}
+	return u.UserStore.GetAuthCutoff(ctx, id)
 }
 
 type raceCreds struct {
@@ -77,6 +95,27 @@ func (c *raceCreds) Delete(ctx context.Context, t domain.TenantID, h, id string)
 		return errors.New("credential store delete is down")
 	}
 	return c.CredentialStore.Delete(ctx, t, h, id)
+}
+
+func (c *raceCreds) DeleteIfUnchanged(ctx context.Context, t domain.TenantID, id int64, token string) error {
+	if c.s.failDeletes.Load() {
+		return errors.New("credential store delete is down")
+	}
+	return c.CredentialStore.DeleteIfUnchanged(ctx, t, id, token)
+}
+
+func (c *raceCreds) RestoreIfUnchanged(ctx context.Context, written, previous *domain.VerifiableCredential) error {
+	if c.s.failDeletes.Load() {
+		return errors.New("credential store restore is down")
+	}
+	return c.CredentialStore.RestoreIfUnchanged(ctx, written, previous)
+}
+
+func (p *racePres) DeleteByID(ctx context.Context, t domain.TenantID, id int64) error {
+	if p.s.failDeletes.Load() {
+		return errors.New("presentation store delete is down")
+	}
+	return p.PresentationStore.DeleteByID(ctx, t, id)
 }
 
 func (p *racePres) Create(ctx context.Context, pres *domain.VerifiablePresentation) error {
@@ -759,4 +798,80 @@ func TestLifecycleErase_ConcurrentFreshTokenWritersAreSweptAway(t *testing.T) {
 	require.NoError(t, err)
 	assert.Positive(t, accepted.Load())
 	assert.Zero(t, holderDataCount(t, inner, domain.DefaultTenantID, did))
+}
+
+// The rollback is conditional on the record the stale request created: when an
+// erasure removed it and a fresh, authorised request recreated the same
+// identifier before the rollback ran, the replacement survives and the stale
+// request still gets the revoked error.
+func TestHolderWriteFence_RollbackNeverTouchesAReplacement(t *testing.T) {
+	// After the erasure the cut-off is in the past of the fresh token.
+	freshCtx := func(f *fenceFixture) context.Context {
+		return tokengate.WithSubject(context.Background(), f.uid.String(), time.Now().Add(time.Hour))
+	}
+	t.Run("credential create", func(t *testing.T) {
+		f := newFenceFixture(t)
+		f.rs.afterWrite = func() {
+			f.rs.afterWrite = nil
+			f.cutoffThenSweep(t) // erases the stale request's record
+			require.NoError(t, f.storeCred(freshCtx(f), "same-id"), "a post-cut-off request recreates the identifier")
+		}
+		err := f.storeCred(f.tokCtx, "same-id")
+		require.ErrorIs(t, err, tokengate.ErrRevoked)
+		assert.NotErrorIs(t, err, tokengate.ErrWriteNotRolledBack)
+		got, gerr := f.inner.Credentials().GetByIdentifier(context.Background(), domain.DefaultTenantID, f.did, "same-id")
+		require.NoError(t, gerr, "the fresh request's record must survive the stale rollback")
+		assert.NotEmpty(t, got.WriteToken)
+	})
+	t.Run("presentation create", func(t *testing.T) {
+		f := newFenceFixture(t)
+		f.rs.afterWrite = func() {
+			f.rs.afterWrite = nil
+			f.cutoffThenSweep(t)
+			require.NoError(t, f.storePres(freshCtx(f), "same-id"))
+		}
+		err := f.storePres(f.tokCtx, "same-id")
+		require.ErrorIs(t, err, tokengate.ErrRevoked)
+		assert.NotErrorIs(t, err, tokengate.ErrWriteNotRolledBack)
+		_, gerr := f.inner.Presentations().GetByIdentifier(context.Background(), domain.DefaultTenantID, f.did, "same-id")
+		require.NoError(t, gerr, "the fresh request's record must survive the stale rollback")
+	})
+	t.Run("credential update restore does not overwrite a fresh record", func(t *testing.T) {
+		f := newFenceFixture(t)
+		require.NoError(t, f.storeCred(context.Background(), "c1"))
+		f.rs.afterWrite = func() {
+			f.rs.afterWrite = nil
+			f.cutoffThenSweep(t) // removes the record the stale update changed
+			_, err := f.creds.Store(freshCtx(f), domain.DefaultTenantID, &domain.StoreCredentialRequest{
+				HolderDID: f.did, CredentialIdentifier: "c1", Credential: "fresh", Format: domain.FormatJWTVC, InstanceID: 42,
+			})
+			require.NoError(t, err)
+		}
+		_, err := f.creds.Update(f.tokCtx, domain.DefaultTenantID, f.did, &domain.UpdateCredentialRequest{CredentialIdentifier: "c1", InstanceID: 7, SigCount: 9})
+		require.ErrorIs(t, err, tokengate.ErrRevoked)
+		assert.NotErrorIs(t, err, tokengate.ErrWriteNotRolledBack)
+		got, gerr := f.inner.Credentials().GetByIdentifier(context.Background(), domain.DefaultTenantID, f.did, "c1")
+		require.NoError(t, gerr)
+		assert.Equal(t, "fresh", got.Credential, "the stale restore must not overwrite the replacement")
+		assert.Equal(t, 42, got.InstanceID)
+	})
+	t.Run("credential update restore does not overwrite a later update", func(t *testing.T) {
+		f := newFenceFixture(t)
+		require.NoError(t, f.storeCred(context.Background(), "c1"))
+		f.rs.afterWrite = func() {
+			f.rs.afterWrite = nil
+			f.rs.beforeRecheck = func() {
+				require.NoError(t, f.inner.Users().InvalidateAuthBefore(context.Background(), f.uid, time.Now()))
+				// A fresh request updates the same record before the stale restore.
+				_, err := f.creds.Update(freshCtx(f), domain.DefaultTenantID, f.did, &domain.UpdateCredentialRequest{CredentialIdentifier: "c1", InstanceID: 55, SigCount: 66})
+				require.NoError(t, err)
+			}
+		}
+		_, err := f.creds.Update(f.tokCtx, domain.DefaultTenantID, f.did, &domain.UpdateCredentialRequest{CredentialIdentifier: "c1", InstanceID: 7, SigCount: 9})
+		require.ErrorIs(t, err, tokengate.ErrRevoked)
+		got, gerr := f.inner.Credentials().GetByIdentifier(context.Background(), domain.DefaultTenantID, f.did, "c1")
+		require.NoError(t, gerr)
+		assert.Equal(t, 55, got.InstanceID, "a fresh update must survive the stale restore")
+		assert.Equal(t, 66, got.SigCount)
+	})
 }

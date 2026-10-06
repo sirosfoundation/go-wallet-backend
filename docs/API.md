@@ -305,7 +305,15 @@ ordering rule and a post-write check, not with a cross-collection transaction:
    delete the record they just wrote and answer `401` if the token is now
    refused (cut-off advanced, or the account has a deletion tombstone). A
    credential update restores the previous values instead. If the re-read
-   itself fails the write is taken back too (fails closed, `5xx`).
+   itself fails the write is taken back too (fails closed, `5xx`). The
+   rollback is conditional on the record this request wrote - its immutable
+   store-assigned id and, for credentials, a per-write token - and is one atomic
+   conditional store operation (`DeleteIfUnchanged`, `RestoreIfUnchanged`,
+   `DeleteByID`), not a delete by `(tenant, holder, identifier)`. If an erasure
+   removed the record and a fresh, authorised request recreated the same
+   identifier (or updated the record) before the rollback ran, the stale
+   request's rollback finds no matching record and leaves the replacement
+   alone; the stale request still answers `401`.
 
 Why that is enough: take a write W, its re-read R, and an erasure's cut-off
 advance A followed by its sweep S. If R sees A, W removes itself. Otherwise

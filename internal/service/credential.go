@@ -70,8 +70,16 @@ func (s *CredentialService) Store(ctx context.Context, tenantID domain.TenantID,
 	// would then resurrect erased data. Re-read the cut-off now that the
 	// record is persisted; if the token is refused, take the record out again.
 	// See tokengate.ConfirmWrite for why this is sound without a transaction.
+	//
+	// The rollback is conditional on the record this request created (its
+	// store-assigned id and write token), not on the business key: if an erasure
+	// removed the record and a fresh, authorised request recreated the same
+	// credential identifier before the rollback runs, that replacement is a
+	// different record and is left alone. Both are captured now: the in-memory
+	// store hands out the stored pointer, which a later write mutates.
+	createdID, createdToken := credential.ID, credential.WriteToken
 	if err := tokengate.ConfirmWrite(ctx, s.store.Users(), func(rctx context.Context) error {
-		return s.store.Credentials().Delete(rctx, tenantID, req.HolderDID, req.CredentialIdentifier)
+		return s.store.Credentials().DeleteIfUnchanged(rctx, tenantID, createdID, createdToken)
 	}); err != nil {
 		s.logger.Error("Credential write fenced out by a concurrent revocation", zap.Error(err),
 			zap.String("tenant_id", string(tenantID)), zap.Bool("left_behind", errors.Is(err, tokengate.ErrWriteNotRolledBack)))
@@ -164,9 +172,13 @@ func (s *CredentialService) Update(ctx context.Context, tenantID domain.TenantID
 	// record (it is keyed by the existing record and does not upsert), but a
 	// revoked token must not change what it no longer may touch: when the
 	// cut-off advanced meanwhile, put the previous values back. If the
-	// erasure already removed the record there is nothing to restore.
+	// erasure already removed the record there is nothing to restore. The
+	// restore is conditional on the write token this update produced, so it
+	// cannot overwrite a record that was recreated, or updated again by a fresh
+	// request, in the meantime.
+	written := *credential
 	if err := tokengate.ConfirmWrite(ctx, s.store.Users(), func(rctx context.Context) error {
-		return s.store.Credentials().Update(rctx, &previous)
+		return s.store.Credentials().RestoreIfUnchanged(rctx, &written, &previous)
 	}); err != nil {
 		s.logger.Error("Credential update fenced out by a concurrent revocation", zap.Error(err),
 			zap.String("tenant_id", string(tenantID)), zap.Bool("not_restored", errors.Is(err, tokengate.ErrWriteNotRolledBack)))

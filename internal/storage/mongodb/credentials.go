@@ -31,6 +31,7 @@ func (s *CredentialStore) Create(ctx context.Context, credential *domain.Verifia
 	credential.ID = id
 	credential.CreatedAt = time.Now()
 	credential.UpdatedAt = time.Now()
+	credential.WriteToken = storage.NewWriteToken()
 
 	_, err = s.collection.InsertOne(ctx, credential)
 	if err != nil {
@@ -86,6 +87,7 @@ func (s *CredentialStore) GetAllByHolder(ctx context.Context, tenantID domain.Te
 
 func (s *CredentialStore) Update(ctx context.Context, credential *domain.VerifiableCredential) error {
 	credential.UpdatedAt = time.Now()
+	credential.WriteToken = storage.NewWriteToken()
 	result, err := s.collection.ReplaceOne(ctx, bson.M{"_id": credential.ID}, credential)
 	if err != nil {
 		return fmt.Errorf("failed to update credential: %w", err)
@@ -106,6 +108,51 @@ func (s *CredentialStore) Delete(ctx context.Context, tenantID domain.TenantID, 
 		return fmt.Errorf("failed to delete credential: %w", err)
 	}
 	if result.DeletedCount == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+// DeleteIfUnchanged deletes the record in one atomic filtered DeleteOne: the
+// filter carries the record id and the write token, so a record that was
+// removed and recreated under the same business key (new id, new token) does
+// not match.
+func (s *CredentialStore) DeleteIfUnchanged(ctx context.Context, tenantID domain.TenantID, id int64, writeToken string) error {
+	if writeToken == "" {
+		return storage.ErrNotFound
+	}
+	result, err := s.collection.DeleteOne(ctx, bson.M{
+		"_id":         id,
+		"tenant_id":   string(tenantID),
+		"write_token": writeToken,
+	})
+	if err != nil {
+		return fmt.Errorf("failed to delete credential: %w", err)
+	}
+	if result.DeletedCount == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+// RestoreIfUnchanged is one atomic filtered ReplaceOne on the record id and the
+// write token of the write being undone.
+func (s *CredentialStore) RestoreIfUnchanged(ctx context.Context, written, previous *domain.VerifiableCredential) error {
+	if written.WriteToken == "" {
+		return storage.ErrNotFound
+	}
+	restored := *previous
+	restored.ID = written.ID
+	restored.WriteToken = storage.NewWriteToken() // a restore is itself a new write
+	result, err := s.collection.ReplaceOne(ctx, bson.M{
+		"_id":         written.ID,
+		"tenant_id":   string(written.TenantID),
+		"write_token": written.WriteToken,
+	}, &restored)
+	if err != nil {
+		return fmt.Errorf("failed to restore credential: %w", err)
+	}
+	if result.MatchedCount == 0 {
 		return storage.ErrNotFound
 	}
 	return nil
@@ -202,6 +249,17 @@ func (s *PresentationStore) Delete(ctx context.Context, tenantID domain.TenantID
 		"holder_did":              holderDID,
 		"presentation_identifier": presentationIdentifier,
 	})
+	if err != nil {
+		return fmt.Errorf("failed to delete presentation: %w", err)
+	}
+	if result.DeletedCount == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+func (s *PresentationStore) DeleteByID(ctx context.Context, tenantID domain.TenantID, id int64) error {
+	result, err := s.collection.DeleteOne(ctx, bson.M{"_id": id, "tenant_id": string(tenantID)})
 	if err != nil {
 		return fmt.Errorf("failed to delete presentation: %w", err)
 	}

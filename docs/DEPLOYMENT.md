@@ -625,7 +625,9 @@ one replica is supported, but these limits apply:
 
 - **Holder-write fence.** A credential or presentation write re-reads the
   user's token cut-off after it persists and removes itself if the token was
-  cut off meanwhile (`tokengate.ConfirmWrite`); every erasure advances the
+  cut off meanwhile (`tokengate.ConfirmWrite`), by a rollback conditional on the
+  exact record it wrote (id and write token), so it never removes a record
+  recreated under the same identifier; every erasure advances the
   cut-off before it sweeps. This is a store-level check, not an in-process lock,
   so it holds across replicas as long as reads see the write (MongoDB: read
   from the primary). See "Erasure and requests already in flight" in API.md for

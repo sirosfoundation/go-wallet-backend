@@ -575,6 +575,7 @@ func (s *CredentialStore) Create(ctx context.Context, credential *domain.Verifia
 	credential.ID = s.nextID
 	credential.CreatedAt = time.Now()
 	credential.UpdatedAt = time.Now()
+	credential.WriteToken = storage.NewWriteToken()
 	s.data[credential.ID] = credential
 	return nil
 }
@@ -628,7 +629,35 @@ func (s *CredentialStore) Update(ctx context.Context, credential *domain.Verifia
 	}
 
 	credential.UpdatedAt = time.Now()
+	credential.WriteToken = storage.NewWriteToken()
 	s.data[credential.ID] = credential
+	return nil
+}
+
+func (s *CredentialStore) DeleteIfUnchanged(ctx context.Context, tenantID domain.TenantID, id int64, writeToken string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cred, exists := s.data[id]
+	if !exists || cred.TenantID != tenantID || writeToken == "" || cred.WriteToken != writeToken {
+		return storage.ErrNotFound
+	}
+	delete(s.data, id)
+	return nil
+}
+
+func (s *CredentialStore) RestoreIfUnchanged(ctx context.Context, written, previous *domain.VerifiableCredential) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cur, exists := s.data[written.ID]
+	if !exists || cur.TenantID != written.TenantID || written.WriteToken == "" || cur.WriteToken != written.WriteToken {
+		return storage.ErrNotFound
+	}
+	restored := *previous
+	restored.ID = written.ID
+	restored.WriteToken = storage.NewWriteToken() // a restore is itself a new write
+	s.data[written.ID] = &restored
 	return nil
 }
 
@@ -733,6 +762,18 @@ func (s *PresentationStore) Delete(ctx context.Context, tenantID domain.TenantID
 		}
 	}
 	return storage.ErrNotFound
+}
+
+func (s *PresentationStore) DeleteByID(ctx context.Context, tenantID domain.TenantID, id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	pres, exists := s.data[id]
+	if !exists || pres.TenantID != tenantID {
+		return storage.ErrNotFound
+	}
+	delete(s.data, id)
+	return nil
 }
 
 // ChallengeStore implements in-memory challenge storage

@@ -190,7 +190,12 @@ const rollbackTimeout = 10 * time.Second
 // write (credential, presentation) that creates a record keyed by holder DID,
 // in a store that cannot make the write conditional on the user's cut-off
 // (the user and holder data are separate collections). Call it immediately
-// after the write succeeded, with a rollback that deletes exactly that record.
+// after the write succeeded, with a rollback that deletes exactly that record:
+// it must be conditional on the record the write produced (its immutable id and
+// write token), never on the business key, because an erasure can remove the
+// record and a fresh, authorised request can recreate the same key before the
+// rollback runs. A rollback that finds no matching record returns
+// storage.ErrNotFound, which is the wanted outcome, not a failure.
 //
 // It re-reads the user's cut-off; if the request's token is now refused (the
 // cut-off advanced, or the account was deleted) the record is rolled back and

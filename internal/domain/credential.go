@@ -29,6 +29,12 @@ type VerifiableCredential struct {
 	SigCount                   int              `json:"sigCount" bson:"sig_count" gorm:"default:0"`
 	CreatedAt                  time.Time        `json:"createdAt,omitempty" bson:"created_at" gorm:"autoCreateTime"`
 	UpdatedAt                  time.Time        `json:"updatedAt,omitempty" bson:"updated_at" gorm:"autoUpdateTime"`
+	// WriteToken identifies the most recent write to this record. The store
+	// assigns a fresh unguessable value on every Create and Update, and the
+	// holder-write fence's compensating rollback is conditional on it
+	// (CredentialStore.DeleteIfUnchanged / RestoreIfUnchanged), so a rollback
+	// can only undo the write it belongs to, never a later one.
+	WriteToken string `json:"-" bson:"write_token,omitempty" gorm:"size:64"`
 }
 
 // TableName specifies the table name for GORM

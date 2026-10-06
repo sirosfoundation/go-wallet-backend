@@ -213,6 +213,20 @@ type CredentialStore interface {
 
 	// Delete deletes a credential
 	Delete(ctx context.Context, tenantID domain.TenantID, holderDID, credentialIdentifier string) error
+
+	// DeleteIfUnchanged deletes the credential with this record id only if its
+	// WriteToken is still writeToken, in one atomic conditional operation. It
+	// returns ErrNotFound when no such record exists: it is gone, or it was
+	// replaced (a different id) or changed (a different token) since. It is the
+	// compensating rollback of a write and must never touch a record that this
+	// write did not produce.
+	DeleteIfUnchanged(ctx context.Context, tenantID domain.TenantID, id int64, writeToken string) error
+
+	// RestoreIfUnchanged replaces the credential written (matched by record id
+	// and WriteToken, atomically) with previous. It returns ErrNotFound when the
+	// record is gone or has been written since, in which case nothing is
+	// changed.
+	RestoreIfUnchanged(ctx context.Context, written, previous *domain.VerifiableCredential) error
 }
 
 // PresentationStore defines the interface for presentation storage operations
@@ -234,6 +248,12 @@ type PresentationStore interface {
 
 	// Delete deletes a presentation
 	Delete(ctx context.Context, tenantID domain.TenantID, holderDID, presentationIdentifier string) error
+
+	// DeleteByID deletes the presentation with this record id (never reused,
+	// unlike its business key). It returns ErrNotFound when that record is gone,
+	// including when a different record now holds the same identifier. It is the
+	// compensating rollback of a write.
+	DeleteByID(ctx context.Context, tenantID domain.TenantID, id int64) error
 }
 
 // ChallengeStore defines the interface for WebAuthn challenge storage

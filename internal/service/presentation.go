@@ -59,9 +59,12 @@ func (s *PresentationService) Store(ctx context.Context, tenantID domain.TenantI
 	// Storage-level fence: the admission check above does not stop an erasure
 	// that runs between it and the Create. Re-read the cut-off now that the
 	// record is persisted and take it out again if the token is refused
-	// (tokengate.ConfirmWrite).
+	// (tokengate.ConfirmWrite). The rollback deletes the record this request
+	// created by its store-assigned id, not by business key, so a replacement
+	// created under the same identifier after an erasure is never touched.
+	createdID := presentation.ID
 	if err := tokengate.ConfirmWrite(ctx, s.store.Users(), func(rctx context.Context) error {
-		return s.store.Presentations().Delete(rctx, tenantID, presentation.HolderDID, presentation.PresentationIdentifier)
+		return s.store.Presentations().DeleteByID(rctx, tenantID, createdID)
 	}); err != nil {
 		s.logger.Error("Presentation write fenced out by a concurrent revocation", zap.Error(err),
 			zap.String("tenant_id", string(tenantID)), zap.Bool("left_behind", errors.Is(err, tokengate.ErrWriteNotRolledBack)))
