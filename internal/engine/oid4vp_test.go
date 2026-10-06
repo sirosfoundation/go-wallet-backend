@@ -1507,17 +1507,17 @@ func TestValidateResponseURIOrigin_NilMsg(t *testing.T) {
 
 func TestValidateTransactionData_Empty(t *testing.T) {
 	authReq := &AuthorizationRequest{}
-	assert.NoError(t, validateTransactionData(authReq))
+	assert.NoError(t, validateTransactionData(authReq, tdClient))
 }
 
 func TestValidateTransactionData_Valid(t *testing.T) {
-	td := TransactionData{Type: "owf_payment_initiation"}
+	td := TransactionData{Type: "owf_payment_initiation", CredentialIDs: []string{"pay"}}
 	tdJSON, _ := json.Marshal(td)
 	encoded := base64.RawURLEncoding.EncodeToString(tdJSON)
 	raw, _ := json.Marshal([]string{encoded})
 
 	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
-	err := validateTransactionData(authReq)
+	err := validateTransactionData(authReq, tdClient)
 	assert.NoError(t, err)
 	require.Len(t, authReq.TransactionData, 1)
 	assert.Equal(t, "owf_payment_initiation", authReq.TransactionData[0].Type)
@@ -1526,7 +1526,7 @@ func TestValidateTransactionData_Valid(t *testing.T) {
 func TestValidateTransactionData_InvalidBase64(t *testing.T) {
 	raw, _ := json.Marshal([]string{"not-valid-base64!!!"})
 	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
-	err := validateTransactionData(authReq)
+	err := validateTransactionData(authReq, tdClient)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid base64url encoding")
 }
@@ -1535,33 +1535,36 @@ func TestValidateTransactionData_InvalidJSON(t *testing.T) {
 	encoded := base64.RawURLEncoding.EncodeToString([]byte("{bad json"))
 	raw, _ := json.Marshal([]string{encoded})
 	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
-	err := validateTransactionData(authReq)
+	err := validateTransactionData(authReq, tdClient)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid JSON")
 }
 
-func TestValidateTransactionData_UnsupportedType(t *testing.T) {
-	td := TransactionData{Type: "unsupported_type"}
+// The engine does not judge whether a type is supported: that depends on the
+// type metadata of the attestation the entry is bound to, which the wallet
+// resolves. A well-formed entry of any type goes to a client that declared
+// the feature, and the client refuses what it cannot handle.
+func TestValidateTransactionData_EngineDoesNotJudgeTheType(t *testing.T) {
+	td := TransactionData{Type: "some_type_the_engine_has_never_heard_of", CredentialIDs: []string{"pay"}}
 	tdJSON, _ := json.Marshal(td)
 	encoded := base64.RawURLEncoding.EncodeToString(tdJSON)
 	raw, _ := json.Marshal([]string{encoded})
 
 	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
-	err := validateTransactionData(authReq)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsupported transaction_data type")
+	require.NoError(t, validateTransactionData(authReq, tdClient))
+	require.Len(t, authReq.TransactionData, 1)
 }
 
 func TestValidateTransactionData_NotStringArray(t *testing.T) {
 	authReq := &AuthorizationRequest{TransactionDataRaw: json.RawMessage(`[123, 456]`)}
-	err := validateTransactionData(authReq)
+	err := validateTransactionData(authReq, tdClient)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "expected array of base64url strings")
 }
 
 func TestValidateTransactionData_Null(t *testing.T) {
 	authReq := &AuthorizationRequest{TransactionDataRaw: json.RawMessage(`null`)}
-	err := validateTransactionData(authReq)
+	err := validateTransactionData(authReq, tdClient)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "must be an array, not null")
 }
@@ -2314,7 +2317,7 @@ func TestValidateAuthorizationRequest_OriginMismatchViaMsg(t *testing.T) {
 }
 
 func TestValidateAuthorizationRequest_WithTransactionData(t *testing.T) {
-	td := TransactionData{Type: "owf_payment_initiation"}
+	td := TransactionData{Type: "owf_payment_initiation", CredentialIDs: []string{"pay"}}
 	tdJSON, _ := json.Marshal(td)
 	encoded := base64.RawURLEncoding.EncodeToString(tdJSON)
 	raw, _ := json.Marshal([]string{encoded})
@@ -2328,7 +2331,7 @@ func TestValidateAuthorizationRequest_WithTransactionData(t *testing.T) {
 		ClientIDScheme:     ClientIDSchemeRedirectURI,
 		TransactionDataRaw: raw,
 	}
-	err := h.validateAuthorizationRequest(authReq, nil)
+	err := h.validateAuthorizationRequest(authReq, tdClient)
 	assert.NoError(t, err)
 	require.Len(t, authReq.TransactionData, 1)
 }
