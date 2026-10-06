@@ -326,7 +326,7 @@ func TestPasskeyFinish_LegacyClientRefusedWhenLegacyDisabled(t *testing.T) {
 		finishLoginResp: &service.FinishLoginResponse{UUID: "u", TenantID: "t", Token: "SECRETVALUE"},
 		finishRegResp:   &service.FinishRegistrationResponse{UUID: "u", TenantID: "t", Token: "SECRETVALUE"},
 	}
-	// as.legacy.enabled=false, no sunset date: config alone decides.
+	// as.legacy.enabled=false: config alone decides.
 	cfg := &config.ASConfig{DefaultMaxTAC: "rwl", SessionTTL: time.Hour, InsecureCookies: true}
 	h := NewPasskeyHandlers(mock, NewMemorySessionStore(), nil, cfg, zap.NewNop())
 	router := gin.New()

@@ -86,6 +86,10 @@ func (p *AuthProvider) legacyIssuanceGate() gin.HandlerFunc {
 // role combination (backend without AS, isolated wallet-provider, standalone
 // engine) logs it; providers must not call it themselves.
 func LogLegacyTokenStatus(cfg *config.Config, logger *zap.Logger) {
+	for _, name := range cfg.DeprecatedSettings() {
+		logger.Warn("Ignoring removed configuration setting; sunsetting the legacy AS is done only by as.legacy.enabled=false",
+			zap.String("setting", name))
+	}
 	if cfg.LegacyEnabled() {
 		logger.Info("Legacy HMAC session tokens are enabled (as.legacy.enabled=true)")
 		return

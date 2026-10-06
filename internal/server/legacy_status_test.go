@@ -46,6 +46,15 @@ func TestLogLegacyTokenStatus(t *testing.T) {
 	}
 }
 
+func TestLogLegacyTokenStatus_WarnsAboutIgnoredSunsetDate(t *testing.T) {
+	core, logs := observer.New(zap.InfoLevel)
+	cfg := &config.Config{AS: config.ASConfig{Enabled: true, Legacy: config.ASLegacyConfig{Enabled: true, SunsetDate: "2027-10-01T00:00:00Z"}}}
+	LogLegacyTokenStatus(cfg, zap.New(core))
+	require.Equal(t, 2, logs.Len())
+	assert.Equal(t, "warn", logs.All()[0].Level.String())
+	assert.Contains(t, logs.All()[0].ContextMap()["setting"], "as.legacy.sunset_date")
+}
+
 func TestAuthProvider_legacyIssuanceGate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	status := func(cfg *config.Config) int {

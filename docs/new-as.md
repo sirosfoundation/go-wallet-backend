@@ -273,7 +273,7 @@ as:
     enabled: true                    # kill switch
     hmac_secret: "..."               # existing secret (or file path)
     max_expiry: "24h"                # current value
-    deprecation_header: true         # send Deprecation + Sunset headers
+    deprecation_header: true         # send a Deprecation header
     reduction_schedule:              # automated ramp-down
       - { after: "2026-09-01", max: "12h" }
       - { after: "2026-12-01", max: "4h" }
@@ -281,15 +281,11 @@ as:
       - { after: "2027-06-01", max: "15m" }
 ```
 
-Legacy responses include RFC 8594 deprecation headers:
-```
-Deprecation: true
-Sunset: 2027-10-01T00:00:00Z
-```
+Legacy responses include a `Deprecation: true` header (when `deprecation_header` is set). There is no sunset date: the legacy AS is sunset by setting `as.legacy.enabled=false`, after clients have moved to session mode.
 
 ### Disabling legacy: `as.legacy.enabled=false` (implemented)
 
-The only switch is configuration. `as.legacy.enabled` defaults to `true`, so existing deployments are unchanged. `as.legacy.sunset_date` stays informational (Sunset header) and disables nothing. With `as.legacy.enabled=false`:
+The only switch is configuration. `as.legacy.enabled` defaults to `true`, so existing deployments are unchanged. Sunsetting the legacy AS is done only by flipping it to `false`, and clients must have moved to session mode first. The former `as.legacy.sunset_date` setting (env `WALLET_AS_LEGACY_SUNSET_DATE`) no longer has any effect; a config that still sets it loads, and a warning is logged at startup. With `as.legacy.enabled=false`:
 
 - HMAC tokens are refused everywhere: `TokenAuthMiddleware`, the engine handshake (including the standalone-engine HMAC fallback), the no-AS `AuthMiddlewareWithBlacklist` path, and the keystore websocket. No legacy issuer is created.
 - Legacy issuance answers `410 legacy_tokens_disabled`: `/user/{register,login}-webauthn-*` and `/user/session/refresh` (whether or not this process runs the AS) and legacy-mode (`X-Token-Mode` absent) `/auth/passkey/{login,register}/*`. These 410s sit before any OIDC gate, so legacy-mode requests get `legacy_tokens_disabled` rather than an OIDC error. Session-mode clients are unaffected.
@@ -388,7 +384,7 @@ Backend service code sees the same context (`user_id`, `tenant_id`, `tac`) regar
 | 3.1 Client detection | New: `internal/as/compat.go` | Detect legacy vs new-style from `X-Token-Mode` header. |
 | 3.2 Legacy token issuer | New: `internal/as/legacy_token.go` | Issue HMAC all-in-one JWTs with configurable (ramping-down) expiry. |
 | 3.3 Dual-mode login response | New: `internal/as/passkey.go`, `internal/as/oidc.go` | Based on client mode, return `appToken` in body (legacy) or set session cookie (new). |
-| 3.4 Deprecation headers | New: `internal/as/deprecation.go` | Add `Deprecation` + `Sunset` headers on legacy responses. |
+| 3.4 Deprecation headers | New: `internal/as/deprecation.go` | Add a `Deprecation` header on legacy responses. |
 | 3.5 Refresh token compat | New: `internal/as/refresh.go` | `POST /auth/token/refresh` validates refresh token, issues new legacy token at current ramp-down expiry. |
 | 3.6 Unified auth middleware | Modify: `pkg/middleware/auth.go` | Single middleware accepting both session-cookie+access-token and legacy Bearer tokens. Sets identical context. |
 

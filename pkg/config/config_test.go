@@ -3208,3 +3208,36 @@ func TestApplyASSecurityDefaults_JWTIssuerAndParity(t *testing.T) {
 		t.Errorf("AS disabled must not get audiences: %v", d.AS.Audiences)
 	}
 }
+
+// as.legacy.sunset_date shipped in v0.10.0; it is now a no-op that must still
+// load and be reported by DeprecatedSettings so the process can warn.
+func TestLoad_DeprecatedSunsetDateStillLoads(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := `
+server:
+  host: localhost
+  port: 8080
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+storage:
+  type: memory
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+as:
+  legacy:
+    sunset_date: "2027-10-01T00:00:00Z"
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("a config that still sets as.legacy.sunset_date must load: %v", err)
+	}
+	if got := cfg.DeprecatedSettings(); len(got) != 1 || !strings.Contains(got[0], "as.legacy.sunset_date") {
+		t.Errorf("DeprecatedSettings() = %v, want as.legacy.sunset_date", got)
+	}
+	if got := (&Config{}).DeprecatedSettings(); len(got) != 0 {
+		t.Errorf("DeprecatedSettings() on a clean config = %v, want none", got)
+	}
+}

@@ -166,14 +166,27 @@ type ASLegacyConfig struct {
 	// Default: true (for backward compatibility)
 	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
 
-	// DeprecationHeader controls whether Deprecation + Sunset headers
-	// are sent on legacy token responses.
+	// DeprecationHeader controls whether a Deprecation header is sent on
+	// legacy token responses.
 	DeprecationHeader bool `yaml:"deprecation_header" envconfig:"DEPRECATION_HEADER"`
 
-	// SunsetDate is the date advertised in the Sunset HTTP header on legacy token
-	// responses. Informational only. It does not disable
-	// anything; use enabled=false for that. Format: RFC 3339 date (e.g. "2027-10-01T00:00:00Z").
+	// SunsetDate is a removed setting kept for one release so that existing
+	// configs still load. It is ignored (a warning is logged at startup).
+	// Sunsetting the legacy AS is done only by as.legacy.enabled=false.
+	//
+	// Deprecated: no effect; remove it from the configuration.
 	SunsetDate string `yaml:"sunset_date" envconfig:"SUNSET_DATE"`
+}
+
+// DeprecatedSettings returns the names of settings that are present in the
+// configuration but no longer have any effect, so the process can warn about
+// them at startup.
+func (c *Config) DeprecatedSettings() []string {
+	var out []string
+	if c.AS.Legacy.SunsetDate != "" {
+		out = append(out, "as.legacy.sunset_date (WALLET_AS_LEGACY_SUNSET_DATE)")
+	}
+	return out
 }
 
 // LegacyEnabled reports whether legacy (HMAC) session tokens are permitted.
