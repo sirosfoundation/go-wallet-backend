@@ -577,6 +577,10 @@ func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (
 	return &StandaloneValidator{Validator: v, relay: relay}, nil
 }
 
+// SetRegistryHandler wires a co-located registry (see
+// RegistryProvider.InProcessHandler) into the engine's VCTM client.
+func (p *EngineProvider) SetRegistryHandler(h http.Handler) { p.manager.SetRegistryHandler(h) }
+
 // SetTokenValidator passes the go-tokenauth validator to the WebSocket engine
 // so it can validate both new-style and legacy tokens during the handshake.
 func (p *EngineProvider) SetTokenValidator(v *tokenvalidator.Validator) {
@@ -1076,19 +1080,68 @@ func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 
 // RegistryProvider provides VCTM registry routes
 type RegistryProvider struct {
-	cfg        *registry.Config
+	cfg        *config.Config
+	rcfg       *registry.Config
 	logger     *zap.Logger
 	store      *registry.Store
 	fetcher    *registry.Fetcher
 	handler    *registry.Handler
 	httpClient *http.Client
 	cancel     context.CancelFunc
+
+	// Authentication (see registry.AuthMiddlewares). validator is nil when
+	// the deployment neither requires auth nor has anything to validate
+	// tokens with.
+	validator *tokenvalidator.Validator
+	tenants   middleware.TenantLookup
+	blacklist middleware.TokenBlacklistChecker
+
+	jwksRelay   *jwksRelay
+	rootAliases bool
 }
 
-// NewRegistryProvider creates a new registry route provider
-func NewRegistryProvider(cfg *registry.Config, logger *zap.Logger) (*RegistryProvider, error) {
+// registryTokenAudiences is the "aud" list the registry's token validator
+// accepts: the registry audience for AS-issued tokens and, when legacy HMAC
+// tokens are enabled, the RP ID (their audience, see UserService/
+// WebAuthnService). go-tokenauth cannot exempt legacy tokens from its audience
+// list, so a registry-only process must have server.rp_id set to the issuing
+// backend's RP ID (config.ValidateRegistryStandalone enforces it) - except on
+// the deprecated registry.yaml path, where legacy tokens bypass the audience
+// list altogether (config.Config.RegistryLegacyAudienceIndependent).
+func registryTokenAudiences(cfg *config.Config) []string {
+	auds := []string{config.RegistryAudience}
+	if cfg.AS.Legacy.Enabled && cfg.Server.RPID != "" {
+		auds = append(auds, cfg.Server.RPID)
+	}
+	return auds
+}
+
+// registryNeedsValidator reports whether a token validator must be built:
+// always when registry.require_auth is set, otherwise only when there is a
+// token source to recognise (an AS to fetch JWKS from, or a legacy HMAC
+// secret).
+func registryNeedsValidator(cfg *config.Config) bool {
+	return cfg.Registry.RequireAuth || cfg.AS.ExternalURL != "" ||
+		registryLegacyHMAC(cfg)
+}
+
+// registryLegacyHMAC reports whether the registry validates legacy HMAC
+// tokens: legacy tokens are enabled (as.legacy.enabled, see
+// config.Config.LegacyEnabled) and there is a shared secret to check them
+// with. HMAC tokens are never validated against an empty key.
+func registryLegacyHMAC(cfg *config.Config) bool {
+	return cfg.AS.Legacy.Enabled && cfg.JWT.Secret != ""
+}
+
+// NewRegistryProvider creates a new registry route provider. Registry
+// settings come from cfg.Registry; server address, CORS and logging are the
+// backend's, and request authentication uses the same go-tokenauth validator
+// as the other roles (built from as.* / jwt.*, even when as.enabled is false).
+func NewRegistryProvider(cfg *config.Config, logger *zap.Logger) (*RegistryProvider, error) {
+	rcfg := &cfg.Registry
+
 	// Create store and load cache
-	store := registry.NewStore(cfg.Cache.Path)
+	store := registry.NewStore(rcfg.Cache.Path)
 	if err := store.Load(); err != nil {
 		logger.Warn("Failed to load registry cache, starting fresh", zap.Error(err))
 	} else {
@@ -1100,49 +1153,149 @@ func NewRegistryProvider(cfg *registry.Config, logger *zap.Logger) (*RegistryPro
 	// Load local VCTM overrides (before remote fetching so they take priority).
 	// Clear any stale cached local entries first so removed override files
 	// don't persist through the cache.
-	if len(cfg.Source.LocalOverrides) > 0 {
+	if len(rcfg.Source.LocalOverrides) > 0 {
 		store.ClearLocal()
-		if err := registry.LoadLocalOverrides(store, cfg.Source.LocalOverrides, logger); err != nil {
+		if err := registry.LoadLocalOverrides(store, rcfg.Source.LocalOverrides, logger); err != nil {
 			return nil, fmt.Errorf("failed to load local VCTM overrides: %w", err)
 		}
 	}
 
-	// Create centralized HTTP client using config
-	httpClient := cfg.HTTPClient.NewHTTPClient(cfg.Source.Timeout)
+	// Create centralized HTTP client using the shared http_client config
+	httpClient := cfg.HTTPClient.NewHTTPClient(rcfg.Source.Timeout)
 
 	// Create handler with HTTP client option
-	handler := registry.NewHandler(store, &cfg.DynamicCache, &cfg.ImageEmbed, logger,
+	handler := registry.NewHandler(store, &rcfg.DynamicCache, &rcfg.ImageEmbed, logger,
 		registry.WithHTTPClient(httpClient))
 
-	return &RegistryProvider{
+	p := &RegistryProvider{
 		cfg:        cfg,
+		rcfg:       rcfg,
 		logger:     logger,
 		store:      store,
 		handler:    handler,
 		httpClient: httpClient,
-	}, nil
+	}
+
+	if registryNeedsValidator(cfg) {
+		if err := p.buildValidator(); err != nil {
+			return nil, err
+		}
+	}
+
+	return p, nil
 }
+
+// buildValidator builds the registry's go-tokenauth validator. The AS JWKS is
+// fetched from as.external_url through the guarded HTTP client and a loopback
+// relay (see jwksrelay.go), exactly as for the wallet-provider and the
+// standalone engine; without as.external_url only legacy HMAC tokens can be
+// recognised. go-tokenauth v0.5 refuses to validate without an audience list;
+// the registry's narrower rule (registry.AuthMiddlewares) is still enforced on
+// top of it.
+func (p *RegistryProvider) buildValidator() error {
+	cfg := p.cfg
+	hmac := registryLegacyHMAC(cfg)
+	if hmac {
+		if err := requireLegacyIssuer(cfg, "registry"); err != nil {
+			return err
+		}
+	}
+	tc := tokenvalidator.Config{
+		Audiences: registryTokenAudiences(cfg),
+		Legacy:    legacyValidatorConfig(cfg, hmac),
+	}
+	jwksSource := ""
+	if cfg.AS.ExternalURL != "" {
+		issuer, err := remoteASIssuer(cfg, "registry")
+		if err != nil {
+			return err
+		}
+		relay, err := newRemoteJWKSRelay(cfg)
+		if err != nil {
+			return err
+		}
+		p.jwksRelay = relay
+		tc.JWKSURL, tc.Issuer = relay.url, issuer
+		jwksSource = "as.external_url"
+	} else {
+		tc.Issuer = cfg.AS.Issuer
+		if tc.Issuer == "" {
+			tc.Issuer = cfg.JWT.Issuer
+		}
+	}
+	p.validator = tokenvalidator.New(tc)
+	p.logger.Info("Registry token validation configured",
+		zap.String("jwks_source", jwksSource),
+		zap.Bool("legacy_hmac", hmac),
+		zap.Bool("require_auth", p.rcfg.RequireAuth))
+	return nil
+}
+
+// SetTenantLookup lets a co-located backend supply its tenant store so tokens
+// of unknown or disabled tenants are rejected on the registry routes as they
+// are elsewhere. Without it any tenant_id claim is accepted.
+func (p *RegistryProvider) SetTenantLookup(t middleware.TenantLookup) { p.tenants = t }
+
+// SetTokenBlacklist lets a co-located backend supply its token blacklist so
+// tokens of revoked users are rejected on the registry routes too.
+func (p *RegistryProvider) SetTokenBlacklist(b middleware.TokenBlacklistChecker) { p.blacklist = b }
+
+// InProcessHandler returns a handler serving the registry routes under
+// /registry without authentication or rate limiting, for trusted in-process
+// callers (the co-located engine's VCTM client).
+func (p *RegistryProvider) InProcessHandler() http.Handler {
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	p.handler.RegisterRoutes(r.Group("/registry"))
+	return r
+}
+
+// SetRootAliases additionally serves /type-metadata and /credentials at the
+// server root, as the retired standalone registry binary did, so existing
+// go-wallet-registry clients keep working. Meant for registry-only processes.
+// /status is not aliased: the server's own /status health endpoint owns that
+// path; the registry status stays at /registry/status.
+func (p *RegistryProvider) SetRootAliases(on bool) { p.rootAliases = on }
 
 func (p *RegistryProvider) Transport() Transport { return TransportHTTP }
 func (p *RegistryProvider) Name() string         { return "registry" }
+
+// authConfig is the request-authentication configuration of the registry
+// routes. LegacyAudienceIndependent is set only by the deprecated registry
+// config path (see config.Config.RegistryLegacyAudienceIndependent).
+func (p *RegistryProvider) authConfig() registry.AuthConfig {
+	return registry.AuthConfig{
+		Config:                    p.cfg,
+		Validator:                 p.validator,
+		Tenants:                   p.tenants,
+		Blacklist:                 p.blacklist,
+		RequireAuth:               p.rcfg.RequireAuth,
+		LegacyAudienceIndependent: p.cfg.RegistryLegacyAudienceIndependent(),
+		Logger:                    p.logger,
+	}
+}
 
 func (p *RegistryProvider) RegisterRoutes(router *gin.Engine) {
 	// Registry routes with its own middleware group
 	group := router.Group("/registry")
 
-	// Add registry-specific JWT middleware
-	if p.cfg.JWT.RequireAuth {
-		group.Use(registry.JWTMiddleware(p.cfg.JWT, p.logger))
-	} else {
-		group.Use(registry.OptionalJWTMiddleware(p.cfg.JWT, p.logger))
-	}
+	// Shared go-tokenauth authentication (sets the authenticated flag and
+	// tenant id read by the rate limiter)
+	group.Use(registry.AuthMiddlewares(p.authConfig())...)
 
 	// Add rate limiting
-	rateLimiter := registry.NewRateLimiter(p.cfg.RateLimit)
+	rateLimiter := registry.NewRateLimiter(p.rcfg.RateLimit)
 	group.Use(registry.RateLimitMiddleware(rateLimiter))
 
 	// Register handler routes under /registry prefix
 	p.handler.RegisterRoutes(group)
+
+	if p.rootAliases {
+		root := router.Group("/")
+		root.Use(registry.AuthMiddlewares(p.authConfig())...)
+		root.Use(registry.RateLimitMiddleware(rateLimiter))
+		p.handler.RegisterRootAliases(root)
+	}
 }
 
 // Start starts the registry background fetcher
@@ -1150,7 +1303,10 @@ func (p *RegistryProvider) Start(ctx context.Context) error {
 	fetchCtx, cancel := context.WithCancel(ctx)
 	p.cancel = cancel
 
-	p.fetcher = registry.NewFetcher(p.cfg, p.store, p.logger, p.httpClient)
+	if p.validator != nil {
+		p.validator.Start(ctx)
+	}
+	p.fetcher = registry.NewFetcher(p.rcfg, p.store, p.logger, p.httpClient)
 	if err := p.fetcher.Start(fetchCtx); err != nil {
 		return fmt.Errorf("failed to start registry fetcher: %w", err)
 	}
@@ -1163,6 +1319,10 @@ func (p *RegistryProvider) Close() error {
 	if p.cancel != nil {
 		p.cancel()
 	}
+	if p.validator != nil {
+		p.validator.Stop()
+	}
+	_ = p.jwksRelay.Close()
 	if p.fetcher != nil {
 		p.fetcher.Stop()
 	}
@@ -1189,7 +1349,7 @@ func (p *RegistryProvider) CheckReady(ctx context.Context) error {
 		return fmt.Errorf("registry store not initialized")
 	}
 	// Store is file-based cache, check it's loaded
-	if p.store.Count() == 0 && !p.cfg.DynamicCache.Enabled {
+	if p.store.Count() == 0 && !p.rcfg.DynamicCache.Enabled {
 		// If dynamic cache is disabled and store is empty, that may be intentional
 		// Allow this state - the store is still functional
 		return nil

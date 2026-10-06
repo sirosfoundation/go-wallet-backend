@@ -35,6 +35,11 @@ type Config struct {
 	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
 	Presentation   PresentationConfig   `yaml:"presentation" envconfig:"PRESENTATION"`
 
+	// Registry configures the VCTM registry role (--mode=registry). It
+	// replaces the retired standalone registry configuration file
+	// (configs/registry.yaml, REGISTRY_* environment variables).
+	Registry RegistryConfig `yaml:"registry" envconfig:"REGISTRY"`
+
 	// asEnabledExplicit records whether as.enabled was explicitly present in
 	// the YAML file or environment (as opposed to defaulting to its bool
 	// zero-value, false) - set by Load(), consumed by EnableForRole() so it
@@ -48,7 +53,74 @@ type Config struct {
 	// even when the AS itself is disabled in this process (e.g. a standalone
 	// engine or registry mirroring the backend's as.legacy.enabled=false).
 	loaded bool
+
+	// registryExplicit records whether the `registry:` section (YAML) or any
+	// WALLET_REGISTRY_* environment variable was present; see
+	// RegistryExplicit and ApplyLegacyRegistryConfig.
+	registryExplicit bool
+
+	// jwtIssuerExplicit records whether jwt.issuer was set by the config file
+	// or WALLET_JWT_ISSUER (as opposed to the built-in default). The deprecated
+	// registry jwt.issuer only applies when it is false, so the shared JWT
+	// config stays a consistent (secret, issuer) pair.
+	jwtIssuerExplicit bool
+
+	// registryYAML is the decoded `registry:` mapping of the config file, used
+	// to tell keys the operator set explicitly from defaults.
+	registryYAML map[string]any
+
+	// registryLegacyTolerateNoJWKS is set by the deprecated registry.yaml
+	// alias when it enabled registry.require_auth from the old HMAC-only
+	// `jwt` block: such deployments have no as.external_url yet, and must
+	// keep starting (HMAC tokens only) until they migrate.
+	registryLegacyTolerateNoJWKS bool
+
+	// registryLegacyAudienceIndependent is set by the deprecated registry.yaml
+	// alias on a registry-only process that validates legacy HMAC tokens while
+	// server.rp_id is unset/default: the old schema has no rp_id, so legacy
+	// tokens are validated without an audience check (see
+	// RegistryLegacyAudienceIndependent).
+	registryLegacyAudienceIndependent bool
+
+	// loadWarnings are non-fatal findings from loading (see Warnings).
+	loadWarnings []string
 }
+
+// Warnings returns non-fatal findings collected while loading the
+// configuration, for the caller to log once a logger exists.
+func (c *Config) Warnings() []string { return c.loadWarnings }
+
+// retiredRegistryKeys are top-level keys of the retired standalone
+// registry.yaml layout that the backend configuration does not define.
+var retiredRegistryKeys = []string{"source", "sources", "cache", "dynamic_cache", "image_embed", "filter", "rate_limit"}
+
+// retiredRegistryLayoutWarning returns a warning when the config file looks
+// like the retired standalone registry.yaml (registry settings at top level
+// instead of under `registry:`), which would otherwise be silently ignored.
+func retiredRegistryLayoutWarning(data []byte) string {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return ""
+	}
+	if _, ok := raw["registry"]; ok {
+		return ""
+	}
+	var found []string
+	for _, k := range retiredRegistryKeys {
+		if _, ok := raw[k]; ok {
+			found = append(found, k)
+		}
+	}
+	if len(found) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("config file has top-level key(s) %s from the retired standalone registry.yaml layout; "+
+		"they are ignored - move them under a `registry:` section (see docs/REGISTRY_MIGRATION.md)", strings.Join(found, ", "))
+}
+
+// RegistryExplicit reports whether the registry section was explicitly
+// configured through the backend config file or WALLET_REGISTRY_* variables.
+func (c *Config) RegistryExplicit() bool { return c.registryExplicit }
 
 // ASConfig contains the new Authorization Server configuration.
 type ASConfig struct {
@@ -931,6 +1003,43 @@ func (t *TLSConfig) ListenAndServe(srv *http.Server) error {
 		return srv.ListenAndServeTLS(t.CertFile, t.KeyFile)
 	}
 	return srv.ListenAndServe()
+}
+
+// PrepareTLS loads and validates the certificate/key pair and applies the
+// MinVersion setting to srv.TLSConfig. It is a no-op when TLS is disabled.
+// Calling it before binding a listener lets a missing, unreadable, malformed
+// or mismatched certificate fail startup instead of surfacing from a serving
+// goroutine. Serve then needs no files.
+func (t *TLSConfig) PrepareTLS(srv *http.Server) error {
+	if !t.Enabled {
+		return nil
+	}
+	cert, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
+	if err != nil {
+		return fmt.Errorf("failed to load TLS certificate (cert_file=%q, key_file=%q): %w", t.CertFile, t.KeyFile, err)
+	}
+	if srv.TLSConfig == nil {
+		srv.TLSConfig = &tls.Config{}
+	}
+	srv.TLSConfig.MinVersion = t.TLSMinVersion()
+	srv.TLSConfig.Certificates = []tls.Certificate{cert}
+	return nil
+}
+
+// Serve serves srv on an already-bound listener, using TLS if t is enabled and
+// plain HTTP otherwise. Binding the listener separately (net.Listen) lets the
+// caller report bind failures synchronously instead of from a goroutine. The
+// certificate is loaded here only if PrepareTLS has not already done so.
+func (t *TLSConfig) Serve(srv *http.Server, ln net.Listener) error {
+	if t.Enabled {
+		if srv.TLSConfig == nil || len(srv.TLSConfig.Certificates) == 0 {
+			if err := t.PrepareTLS(srv); err != nil {
+				return err
+			}
+		}
+		return srv.ServeTLS(ln, "", "")
+	}
+	return srv.Serve(ln)
 }
 
 // CORSConfig contains CORS (Cross-Origin Resource Sharing) configuration
@@ -1867,6 +1976,23 @@ type RedisConfig struct {
 
 // Load loads configuration from file and environment variables
 func Load(configFile string) (*Config, error) {
+	return load(configFile, (*Config).loadSecretsFromFiles, (*Config).Validate)
+}
+
+// LoadRegistryOnly loads configuration for a process that runs only the
+// registry role. Backend-only requirements (storage, jwt.secret, rp_id, ...)
+// are not enforced; the registry section is validated separately by the
+// caller after any deprecated-alias overlay (see ValidateRegistry and
+// ValidateRegistryStandalone).
+func LoadRegistryOnly(configFile string) (*Config, error) {
+	// The legacy-audience check is deliberately not part of the load-time
+	// validation: the deprecated registry.yaml overlay (applied afterwards)
+	// can decide that it does not apply; ValidateRegistryStandalone runs it
+	// once the overlay is in place.
+	return load(configFile, (*Config).loadRegistrySecrets, (*Config).validateRegistryStandaloneServer)
+}
+
+func load(configFile string, loadSecrets, validate func(*Config) error) (*Config, error) {
 	// Start with defaults
 	cfg := defaultConfig()
 	cfg.loaded = true
@@ -1884,6 +2010,12 @@ func Load(configFile string) (*Config, error) {
 				return nil, fmt.Errorf("failed to parse config file: %w", err)
 			}
 			cfg.asEnabledExplicit = yamlHasASEnabledKey(data)
+			cfg.registryExplicit = yamlHasTopLevelKey(data, "registry")
+			cfg.registryYAML = yamlRegistrySection(data)
+			cfg.jwtIssuerExplicit = yamlHasNestedKey(data, "jwt", "issuer")
+			if w := retiredRegistryLayoutWarning(data); w != "" {
+				cfg.loadWarnings = append(cfg.loadWarnings, w)
+			}
 		}
 	}
 
@@ -1891,6 +2023,12 @@ func Load(configFile string) (*Config, error) {
 	// Since we removed `default:` tags, this only applies actual env vars
 	if _, ok := os.LookupEnv("WALLET_AS_ENABLED"); ok {
 		cfg.asEnabledExplicit = true
+	}
+	if _, ok := os.LookupEnv("WALLET_JWT_ISSUER"); ok {
+		cfg.jwtIssuerExplicit = true
+	}
+	if envHasPrefix("WALLET_REGISTRY_") {
+		cfg.registryExplicit = true
 	}
 	if err := envconfig.Process("WALLET", cfg); err != nil {
 		return nil, fmt.Errorf("failed to process environment variables: %w", err)
@@ -1904,7 +2042,7 @@ func Load(configFile string) (*Config, error) {
 	}
 
 	// Load secrets from files if configured
-	if err := cfg.loadSecretsFromFiles(); err != nil {
+	if err := loadSecrets(cfg); err != nil {
 		return nil, fmt.Errorf("failed to load secrets from files: %w", err)
 	}
 
@@ -1913,7 +2051,7 @@ func Load(configFile string) (*Config, error) {
 	cfg.applyASSecurityDefaults()
 
 	// Validate configuration
-	if err := cfg.Validate(); err != nil {
+	if err := validate(cfg); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 
@@ -1926,6 +2064,70 @@ func Load(configFile string) (*Config, error) {
 	cfg.Server.CORS.SetDefaults()
 
 	return cfg, nil
+}
+
+// yamlHasTopLevelKey reports whether the raw YAML has the given top-level key.
+func yamlHasTopLevelKey(data []byte, key string) bool {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return false
+	}
+	_, ok := raw[key]
+	return ok
+}
+
+// yamlHasNestedKey reports whether the raw YAML has section.key.
+func yamlHasNestedKey(data []byte, section, key string) bool {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return false
+	}
+	m, ok := raw[section].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, ok = m[key]
+	return ok
+}
+
+// yamlRegistrySection returns the raw `registry:` mapping of the YAML, or nil.
+func yamlRegistrySection(data []byte) map[string]any {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil
+	}
+	m, _ := raw["registry"].(map[string]any)
+	return m
+}
+
+// registryKeyExplicit reports whether the registry key at the given YAML path
+// (relative to `registry:`) was set in the config file, or via the matching
+// WALLET_REGISTRY_* environment variable.
+func (c *Config) registryKeyExplicit(yamlPath []string, envName string) bool {
+	if _, ok := os.LookupEnv(envName); ok {
+		return true
+	}
+	var cur any = c.registryYAML
+	for _, k := range yamlPath {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return false
+		}
+		if cur, ok = m[k]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// envHasPrefix reports whether any environment variable has the given prefix.
+func envHasPrefix(prefix string) bool {
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // yamlHasASEnabledKey reports whether the raw YAML explicitly sets an
@@ -2011,14 +2213,23 @@ func (c *Config) loadSecretsFromFiles() error {
 
 // readSecretFile reads a secret value from a file, trimming whitespace.
 // Returns an error if the file cannot be read or is empty.
+//
+// The returned errors deliberately do not name the file: they end up in
+// startup logs, and the configuration key the caller wraps them with already
+// says which secret is meant. (os.ReadFile errors carry the path, so the
+// underlying cause is unwrapped to the bare OS error.)
 func readSecretFile(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("failed to read file %s: %w", path, err)
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) {
+			err = pathErr.Err
+		}
+		return "", fmt.Errorf("failed to read secret file: %w", err)
 	}
 	secret := strings.TrimSpace(string(data))
 	if secret == "" {
-		return "", fmt.Errorf("file %s is empty", path)
+		return "", errors.New("secret file is empty")
 	}
 	return secret, nil
 }
@@ -2029,6 +2240,7 @@ func defaultConfig() *Config {
 	corsConfig.SetDefaults()
 
 	return &Config{
+		Registry: DefaultRegistryConfig(),
 		Server: ServerConfig{
 			Host:       "0.0.0.0",
 			Port:       8080,
