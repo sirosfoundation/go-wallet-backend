@@ -66,8 +66,21 @@ type TenantLookup interface {
 // legacytoken.SID) rather than growing that shared type/module for one
 // caller's claim.
 func TokenAuthMiddleware(cfg *config.Config, v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, users tokengate.UserLookup, logger *zap.Logger) gin.HandlerFunc {
+	return TokenAuthMiddlewareWithValidate(cfg, v.Validate, tenants, blacklist, users, logger)
+}
+
+// TokenAuthMiddlewareWithValidate is TokenAuthMiddleware with the token
+// validation step supplied by the caller (validate must return the same
+// *claims.Result a go-tokenauth Validator would, and an error to reject).
+// Every check after validation - user, refresh-token family, SID-AUTH-06
+// cut-off and tenant handling - is identical. It lets a caller route some
+// tokens through a different validation (the registry's audience-independent
+// legacy path) without duplicating the post-validation chain. users is
+// required here too: a process with no user database passes
+// tokengate.NoUserRecords explicitly rather than nil.
+func TokenAuthMiddlewareWithValidate(cfg *config.Config, validate func(ctx context.Context, rawToken string) (*claims.Result, error), tenants TenantLookup, blacklist TokenBlacklistChecker, users tokengate.UserLookup, logger *zap.Logger) gin.HandlerFunc {
 	if users == nil {
-		panic("middleware.TokenAuthMiddleware: users lookup is required (it enforces the SID-AUTH-06 token cut-off)")
+		panic("middleware.TokenAuthMiddleware: users lookup is required (it enforces the SID-AUTH-06 token cut-off); a process with no user database must pass tokengate.NoUserRecords explicitly")
 	}
 	gate := tokengate.New(users)
 	return func(c *gin.Context) {
@@ -83,7 +96,7 @@ func TokenAuthMiddleware(cfg *config.Config, v *validator.Validator, tenants Ten
 		// Validate via go-tokenauth (auto-detects new-style vs legacy HMAC).
 		// Per-jti revocation is already checked inside Validate itself (see
 		// this function's doc comment).
-		result, err := v.Validate(c.Request.Context(), rawToken)
+		result, err := validate(c.Request.Context(), rawToken)
 		if err != nil {
 			logAuthReject(logger, c, "token_validation_failed", zap.Error(err))
 			c.JSON(401, gin.H{"error": "Invalid token"})
