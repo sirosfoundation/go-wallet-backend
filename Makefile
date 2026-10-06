@@ -9,15 +9,11 @@ build: ## Build the server binary
 	@echo "Building server..."
 	@go build -o bin/server cmd/server/main.go
 
-build-registry: ## Build the registry server binary
-	@echo "Building registry server..."
-	@go build -o bin/registry cmd/registry/main.go
-
 build-admin: man ## Build the wallet-admin CLI tool (includes man page)
 	@echo "Building wallet-admin CLI..."
 	@go build -o bin/wallet-admin ./cmd/wallet-admin
 
-build-all: build build-registry build-admin ## Build all binaries
+build-all: build build-admin ## Build all binaries
 
 man: ## Copy man pages to bin directory
 	@echo "Copying man pages..."
@@ -33,9 +29,9 @@ run: build ## Build and run the server
 	@echo "Running server..."
 	@./bin/server
 
-run-registry: build-registry ## Build and run the registry server
-	@echo "Running registry server..."
-	@./bin/registry
+run-registry: build ## Build and run the server with only the registry role
+	@echo "Running registry role..."
+	@./bin/server --mode=registry --config configs/config.registry.yaml
 
 dev: ## Run with hot reload (requires air)
 	@echo "Running in development mode..."
@@ -83,7 +79,7 @@ docker-build: ## Build Docker image
 	@echo "Building Docker image..."
 	@docker build -t go-wallet-backend:latest .
 
-docker-build-registry: ## Build Docker image for registry server
+docker-build-registry: ## Build the go-wallet-registry helper image (main binary, --mode=registry)
 	@echo "Building registry Docker image..."
 	@docker build -f Dockerfile.registry -t go-wallet-registry:latest .
 

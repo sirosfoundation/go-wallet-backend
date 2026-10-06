@@ -82,3 +82,35 @@ jwt:
   expiry_hours: 24
   refresh_days: 7
   issuer: "wallet-backend"
+
+# VCTM registry role (--mode=registry, or a role list including "registry").
+# Replaces the retired standalone registry.yaml; see docs/REGISTRY_MIGRATION.md.
+# Server address, logging and CORS are the settings above. Authentication uses
+# the same as.* / jwt.* settings as the other roles.
+registry:
+  source:
+    url: "https://registry.siros.org/api/v1/schemas.json"
+    poll_interval: 5m
+    timeout: 30s
+  cache:
+    path: "data/vctm-cache.json"
+    max_age: 24h
+  dynamic_cache:
+    enabled: false  # fetches VCTMs by URL on demand; keep off unless allowed_hosts is set
+    default_ttl: 1h
+    max_ttl: 24h
+    min_ttl: 5m
+    timeout: 30s
+    allowed_hosts: []
+  filter:
+    include_patterns: []
+    exclude_patterns: []
+  rate_limit:
+    enabled: true
+    authenticated_rpm: 1000
+    unauthenticated_rpm: 100
+    burst_multiplier: 3
+  # true: all registry requests need a valid access token (audience
+  # "wallet-registry" for ES256 tokens; legacy HMAC tokens while
+  # as.legacy.enabled). false: unauthenticated access allowed.
+  require_auth: false

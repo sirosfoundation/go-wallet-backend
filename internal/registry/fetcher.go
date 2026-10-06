@@ -300,7 +300,7 @@ func (f *Fetcher) fetchFromSource(ctx context.Context, source RemoteSourceConfig
 		defer cancel()
 	}
 
-	fetchURL := source.resolveURL()
+	fetchURL := resolveSourceURL(&source)
 	f.logger.Info("fetching registry source", zap.String("url", fetchURL), zap.String("mode", string(source.Mode)))
 
 	body, err := f.fetchRaw(ctx, fetchURL)
@@ -336,10 +336,10 @@ func (f *Fetcher) fetchFromSource(ctx context.Context, source RemoteSourceConfig
 	return f.processLegacyResponse(ctx, source, body)
 }
 
-// resolveURL determines the actual fetch URL based on the Mode setting.
+// resolveSourceURL determines the actual fetch URL based on the Mode setting.
 // If the URL already points to a specific JSON file, it is used as-is.
 // Otherwise, the appropriate endpoint path is appended based on Mode.
-func (s *RemoteSourceConfig) resolveURL() string {
+func resolveSourceURL(s *RemoteSourceConfig) string {
 	u := s.URL
 	// If the URL already ends with a known endpoint file, use it directly.
 	if strings.HasSuffix(u, ".json") {
@@ -366,7 +366,7 @@ func (f *Fetcher) processTS11Response(ctx context.Context, source RemoteSourceCo
 	entries := make(map[string]*VCTMEntry)
 	var fetchedCount, filteredCount int
 
-	resolvedURL := source.resolveURL()
+	resolvedURL := resolveSourceURL(&source)
 	docs, skipped, err := ts11client.FetchTS11SchemasFromFirstPage(ctx, f.client, resolvedURL, body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch TS11 schemas: %w", err)
@@ -528,7 +528,7 @@ func (f *Fetcher) processRegistryResponse(ctx context.Context, source RemoteSour
 	}
 
 	f.logger.Info("fetched registry index",
-		zap.String("url", source.resolveURL()),
+		zap.String("url", resolveSourceURL(&source)),
 		zap.Int("credentials", len(resp.Credentials)))
 
 	entries := make(map[string]*VCTMEntry)
@@ -606,7 +606,7 @@ func (f *Fetcher) processRegistryResponse(ctx context.Context, source RemoteSour
 	}
 
 	f.logger.Info("registry fetch complete",
-		zap.String("url", source.resolveURL()),
+		zap.String("url", resolveSourceURL(&source)),
 		zap.Int("fetched", fetchedCount),
 		zap.Int("detail", detailCount),
 		zap.Int("stubs", stubCount),

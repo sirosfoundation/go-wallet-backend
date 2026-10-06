@@ -1,7 +1,11 @@
 package legacytoken
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
+	"strconv"
 	"testing"
 	"time"
 
@@ -128,5 +132,116 @@ func TestParseSID_UnverifiableTokens_ReturnErrUnparseable(t *testing.T) {
 		if sid, err := ParseSID(secret, tok); !errors.Is(err, ErrUnparseable) || sid != "" {
 			t.Errorf("%s: ParseSID() = (%q, %v), want (\"\", ErrUnparseable)", name, sid, err)
 		}
+	}
+}
+
+func hsToken(t *testing.T, method jwt.SigningMethod, secret string, c jwt.MapClaims) string {
+	t.Helper()
+	s, err := jwt.NewWithClaims(method, c).SignedString([]byte(secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestValidateAnyAudience(t *testing.T) {
+	const secret = "0123456789abcdef0123456789abcdef"
+	issuers := []string{"wallet-backend"}
+	good := func(mod func(jwt.MapClaims)) string {
+		c := jwt.MapClaims{"iss": "wallet-backend", "user_id": "u1", "did": "did:x", "tenant_id": "acme",
+			"jti": "j1", "exp": time.Now().Add(time.Hour).Unix()}
+		if mod != nil {
+			mod(c)
+		}
+		return hsToken(t, jwt.SigningMethodHS256, secret, c)
+	}
+
+	// Positive controls: a valid token is accepted whatever its audience.
+	for name, aud := range map[string]any{
+		"no aud": nil, "rp id": "wallet.example.org", "unrelated": "https://other", "list": []string{"a", "b"}, "empty": "",
+	} {
+		aud := aud
+		res, err := ValidateAnyAudience(secret, issuers, good(func(c jwt.MapClaims) {
+			if aud != nil {
+				c["aud"] = aud
+			}
+		}))
+		if err != nil {
+			t.Fatalf("%s: valid token rejected: %v", name, err)
+		}
+		if res.UserID != "u1" || res.DID != "did:x" || res.TenantID != "acme" || res.JTI != "j1" || res.Mode != "legacy" {
+			t.Errorf("%s: unexpected result %+v", name, res)
+		}
+	}
+
+	// Positive control for iat: a past iat is accepted.
+	if _, err := ValidateAnyAudience(secret, issuers, good(func(c jwt.MapClaims) { c["iat"] = time.Now().Add(-time.Minute).Unix() })); err != nil {
+		t.Fatalf("token with past iat rejected: %v", err)
+	}
+
+	// Negative cases (non-vacuous: each differs from the control in one thing).
+	expired := good(func(c jwt.MapClaims) { c["exp"] = time.Now().Add(-time.Hour).Unix() })
+	noExp := good(func(c jwt.MapClaims) { delete(c, "exp") })
+	badIss := good(func(c jwt.MapClaims) { c["iss"] = "someone-else" })
+	noIss := good(func(c jwt.MapClaims) { delete(c, "iss") })
+	notYet := good(func(c jwt.MapClaims) { c["nbf"] = time.Now().Add(time.Hour).Unix() })
+	futureIat := good(func(c jwt.MapClaims) { c["iat"] = time.Now().Add(time.Hour).Unix() })
+	wrongSecret := hsToken(t, jwt.SigningMethodHS256, "another-secret-another-secret-00000", jwt.MapClaims{
+		"iss": "wallet-backend", "exp": time.Now().Add(time.Hour).Unix()})
+	none, err := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{"iss": "wallet-backend", "exp": time.Now().Add(time.Hour).Unix()}).
+		SignedString(jwt.UnsafeAllowNoneSignatureType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, tok := range map[string]string{"expired": expired, "no exp": noExp, "bad issuer": badIss, "no issuer": noIss,
+		"nbf in future": notYet, "iat in future": futureIat, "wrong secret": wrongSecret, "alg none": none, "garbage": "x.y.z"} {
+		if _, err := ValidateAnyAudience(secret, issuers, tok); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if _, err := ValidateAnyAudience("", issuers, good(nil)); err == nil {
+		t.Error("empty secret accepted")
+	}
+	if _, err := ValidateAnyAudience(secret, nil, good(nil)); err == nil {
+		t.Error("no issuers accepted")
+	}
+	if _, err := ValidateAnyAudience(secret, []string{""}, good(func(c jwt.MapClaims) { delete(c, "iss") })); err == nil {
+		t.Error("empty configured issuer matched a missing iss")
+	}
+}
+
+func TestIsHMAC(t *testing.T) {
+	hs := hsToken(t, jwt.SigningMethodHS384, "s", jwt.MapClaims{"a": 1})
+	if !IsHMAC(hs) {
+		t.Error("HS384 not recognised")
+	}
+	none, _ := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{}).SignedString(jwt.UnsafeAllowNoneSignatureType)
+	for _, tok := range []string{none, "", "junk", "a.b.c"} {
+		if IsHMAC(tok) {
+			t.Errorf("%q treated as HMAC", tok)
+		}
+	}
+}
+
+// Algorithm-confusion: a token whose header claims RS256 (or none) but which
+// is MAC'd with the shared HMAC secret must be refused by both the router and
+// the validator.
+func TestAlgConfusionRefused(t *testing.T) {
+	const secret = "0123456789abcdef0123456789abcdef"
+	enc := base64.RawURLEncoding.EncodeToString
+	signing := enc([]byte(`{"alg":"RS256","typ":"JWT"}`)) + "." +
+		enc([]byte(`{"iss":"wallet-backend","exp":`+strconv.FormatInt(time.Now().Add(time.Hour).Unix(), 10)+`}`))
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(signing))
+	rs := signing + "." + enc(mac.Sum(nil))
+
+	if IsHMAC(rs) {
+		t.Error("RS256-header token routed as HMAC")
+	}
+	if _, err := ValidateAnyAudience(secret, []string{"wallet-backend"}, rs); err == nil {
+		t.Error("RS256-with-HMAC-secret token accepted by ValidateAnyAudience")
+	}
+	if _, err := ParseSID(secret, rs); err == nil {
+		t.Error("RS256-with-HMAC-secret token accepted by ParseSID")
 	}
 }
