@@ -89,3 +89,29 @@ func TestDeleteUser_CompareAndSetPassesAFreshTokenAfterAnEarlierAttemptsCutoff(t
 	_, gerr := store.Users().GetByID(ctx, uid)
 	assert.ErrorIs(t, gerr, storage.ErrNotFound)
 }
+
+// LogoutEverywhere advances the cut-off with the same compare-and-set: a
+// revocation landing between its check and its write is refused (401-class),
+// the newer cut-off stands and no session is dropped.
+func TestLogoutEverywhere_CompareAndSetRefusesRevocationLandingBeforeTheAdvance(t *testing.T) {
+	ctx := context.Background()
+	inner := memory.NewStore()
+	hs := &beforeAdvanceStore{Store: inner}
+	svc := NewUserService(hs, testConfig(), zap.NewNop())
+	cleaner := &scriptedCleaner{}
+	svc.SetSessionCleaner(cleaner)
+	uid := domain.NewUserID()
+	require.NoError(t, inner.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:key:" + uid.String()}))
+
+	independent := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	hs.beforeAdvance = func() {
+		require.NoError(t, inner.Users().InvalidateAuthBefore(ctx, uid, independent))
+	}
+
+	err := svc.LogoutEverywhere(tokengate.WithIssuedAt(ctx, time.Now().Add(-time.Minute)), uid)
+	require.ErrorIs(t, err, tokengate.ErrRevoked)
+	assert.Zero(t, cleaner.calls, "sessions must not be dropped")
+	cutoff, err := inner.Users().GetAuthCutoff(ctx, uid)
+	require.NoError(t, err)
+	assert.True(t, cutoff.Equal(independent), "the independent cut-off stands")
+}

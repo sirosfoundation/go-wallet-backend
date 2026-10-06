@@ -324,7 +324,17 @@ func (s *UserService) LogoutEverywhere(ctx context.Context, userID domain.UserID
 	// The cut-off first: if it fails nothing has changed, whereas dropping
 	// the sessions first would leave the already-issued tokens working while
 	// reporting an error.
-	if err := s.store.Users().InvalidateAuthBefore(ctx, userID, time.Now()); err != nil {
+	// The advance is a compare-and-set judged against the request's token
+	// (as in DeleteUser): the check above read the record, and a lifecycle
+	// event landing before this write would otherwise be overwritten by an
+	// old request that was admitted before it.
+	if err := s.store.Users().InvalidateAuthBeforeForToken(ctx, userID, time.Now(), requestIssuedAt(ctx)); err != nil {
+		if errors.Is(err, storage.ErrStaleWrite) {
+			return fmt.Errorf("%w: a lifecycle revocation landed during the logout", tokengate.ErrRevoked)
+		}
+		if errors.Is(err, storage.ErrNotFound) {
+			return ErrUserNotFound
+		}
 		return fmt.Errorf("failed to cut off issued tokens: %w", err)
 	}
 	if s.sessionCleaner != nil {
