@@ -234,3 +234,31 @@ func TestGenerateKeyAttestation_RefusesInstanceOfAnotherTenant(t *testing.T) {
 	_, err = svc.GenerateKeyAttestation(WithKeyAttestationTenant(base, "other"), jwks, "n", nil, "inst", "")
 	assert.NoError(t, err)
 }
+
+// A foreign instance is refused the same way whatever its lifecycle state:
+// ownership is judged before status, so the response does not tell a caller
+// that somebody else's instance is revoked.
+func TestGenerateKeyAttestation_ForeignInstanceDoesNotLeakLifecycleState(t *testing.T) {
+	base := context.Background()
+	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
+	owner, other := domain.NewUserID(), domain.NewUserID()
+	for _, inst := range []*domain.WalletInstance{
+		{ID: "revoked", TenantID: "t", UserID: &owner, Status: domain.InstanceStatusRevoked},
+		{ID: "weird", TenantID: "t", UserID: &owner, Status: domain.InstanceStatus("bogus")},
+		{ID: "unbound-revoked", TenantID: "t", Status: domain.InstanceStatusRevoked},
+		{ID: "othertenant-revoked", TenantID: "elsewhere", UserID: &other, Status: domain.InstanceStatusRevoked},
+	} {
+		require.NoError(t, instances.Upsert(base, inst))
+	}
+	jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "a", "y": "b"}}
+
+	intruder := WithKeyAttestationTenant(tokengate.WithSubject(base, other.String(), time.Now()), "t")
+	for _, id := range []string{"revoked", "weird", "unbound-revoked", "othertenant-revoked"} {
+		_, err := svc.GenerateKeyAttestation(intruder, jwks, "n", nil, id, "")
+		assert.ErrorIs(t, err, ErrKeyAttestationInstanceRefused, id)
+		assert.NotErrorIs(t, err, tokengate.ErrRevoked, "%s: the lifecycle state of a foreign instance must not leak", id)
+	}
+	// The owner still learns its own instance is revoked.
+	_, err := svc.GenerateKeyAttestation(WithKeyAttestationTenant(tokengate.WithSubject(base, owner.String(), time.Now()), "t"), jwks, "n", nil, "revoked", "")
+	assert.ErrorIs(t, err, tokengate.ErrRevoked)
+}

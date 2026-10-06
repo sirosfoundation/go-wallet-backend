@@ -456,11 +456,13 @@ func (s *WalletProviderService) refuseKeyAttestationInstance(ctx context.Context
 
 // refuseWalletInstance is the one ownership/status gate for a request that
 // names a wallet instance (key attestation minting, FIDO2 attestation
-// recording). A record that is not live (revoked, suspended, or of a status
-// this build does not recognize) is refused as a revoked token (401): fail
-// closed, nothing is changed. A record owned by a user other than the token's
-// subject is refused, as is an unbound one (when the token has a subject) and
-// one recorded in another tenant. An id the store does not know is not judged
+// recording). A record owned by a user other than the token's subject is
+// refused, as is an unbound one (when the token has a subject) and one
+// recorded in another tenant: ErrKeyAttestationInstanceRefused, whatever the
+// record's status, so a foreign instance's lifecycle state is not disclosed.
+// Only then is the status judged: a caller's own record that is not live
+// (revoked, suspended, or of a status this build does not recognize) is refused
+// as a revoked token (401): fail closed, nothing is changed. An id the store does not know is not judged
 // unless requireKnown is set, in which case it is refused like a foreign one;
 // a failed lookup refuses. On success the instance record is returned (nil for
 // an unknown id that is not judged).
@@ -475,9 +477,6 @@ func refuseWalletInstance(ctx context.Context, instances storage.WalletInstanceS
 		}
 		return nil, fmt.Errorf("recheck wallet instance: %w", err)
 	}
-	if !instance.Status.IsLive() {
-		return nil, fmt.Errorf("%w: wallet instance is not live", tokengate.ErrRevoked)
-	}
 	if tenantID, ok := ctx.Value(kaTenantKey{}).(domain.TenantID); ok && tenantID != "" && instance.TenantID != tenantID {
 		return nil, ErrKeyAttestationInstanceRefused
 	}
@@ -488,6 +487,13 @@ func refuseWalletInstance(ctx context.Context, instances storage.WalletInstanceS
 	// knows its id.
 	if subject := tokengate.SubjectFrom(ctx); subject != "" && (instance.UserID == nil || instance.UserID.String() != subject) {
 		return nil, ErrKeyAttestationInstanceRefused
+	}
+	// Status last: ownership first, so a record that is not the caller's is
+	// refused identically whatever its lifecycle state. Judging status first
+	// would let any caller probe a foreign instance and learn from the 401 that
+	// it is revoked.
+	if !instance.Status.IsLive() {
+		return nil, fmt.Errorf("%w: wallet instance is not live", tokengate.ErrRevoked)
 	}
 	return instance, nil
 }
