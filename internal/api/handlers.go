@@ -762,8 +762,9 @@ func (h *Handlers) GenerateKeyAttestation(c *gin.Context) {
 		return
 	}
 
+	kaTenantID, _ := h.getTenantID(c)
 	keyAttestation, err := h.services.WalletProvider.GenerateKeyAttestation(
-		c.Request.Context(),
+		service.WithKeyAttestationTenant(c.Request.Context(), kaTenantID),
 		req.JWKS,
 		req.OpenID4VCI.Nonce,
 		req.SecurityProperties.toService(),

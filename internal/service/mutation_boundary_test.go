@@ -14,6 +14,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -162,4 +163,54 @@ func TestGenerateKeyAttestation_RefusesNonLiveOrForeignInstance(t *testing.T) {
 	assert.ErrorIs(t, err, tokengate.ErrRevoked, "an unknown status fails closed")
 	_, err = svc.GenerateKeyAttestation(tokengate.WithSubject(base, other.String(), time.Now()), jwks, "n", nil, "live", "")
 	assert.ErrorIs(t, err, ErrKeyAttestationInstanceRefused)
+}
+
+// flipAfterGets reports a revoked status from the nth GetByID on, modelling an
+// instance revoked while the KA is being signed.
+type flipAfterGets struct {
+	storage.WalletInstanceStore
+	after, calls int
+}
+
+func (f *flipAfterGets) GetByID(ctx context.Context, id string) (*domain.WalletInstance, error) {
+	inst, err := f.WalletInstanceStore.GetByID(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	f.calls++
+	if f.calls > f.after {
+		cp := *inst
+		cp.Status = domain.InstanceStatusRevoked
+		return &cp, nil
+	}
+	return inst, nil
+}
+
+// An instance revoked between the pre-mint check and release withholds the KA.
+func TestGenerateKeyAttestation_InstanceRevokedWhileSigningIsRefused(t *testing.T) {
+	base := context.Background()
+	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
+	owner := domain.NewUserID()
+	require.NoError(t, instances.Upsert(base, &domain.WalletInstance{ID: "inst", TenantID: "t", UserID: &owner, Status: domain.InstanceStatusActive}))
+	// No security_properties: the pre-mint check is the only GetByID before
+	// the post-signing one, so after=1 flips exactly the last look.
+	svc.instances = &flipAfterGets{WalletInstanceStore: instances, after: 1}
+
+	ka, err := svc.GenerateKeyAttestation(tokengate.WithSubject(base, owner.String(), time.Now()),
+		[]map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "a", "y": "b"}}, "n", nil, "inst", "")
+	assert.ErrorIs(t, err, tokengate.ErrRevoked)
+	assert.Empty(t, ka, "no key attestation may be released")
+}
+
+// An instance recorded in another tenant is not accepted for the caller's.
+func TestGenerateKeyAttestation_RefusesInstanceOfAnotherTenant(t *testing.T) {
+	base := context.Background()
+	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
+	require.NoError(t, instances.Upsert(base, &domain.WalletInstance{ID: "inst", TenantID: "other", Status: domain.InstanceStatusActive}))
+	jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "a", "y": "b"}}
+
+	_, err := svc.GenerateKeyAttestation(WithKeyAttestationTenant(base, "acme"), jwks, "n", nil, "inst", "")
+	assert.ErrorIs(t, err, ErrKeyAttestationInstanceRefused)
+	_, err = svc.GenerateKeyAttestation(WithKeyAttestationTenant(base, "other"), jwks, "n", nil, "inst", "")
+	assert.NoError(t, err)
 }

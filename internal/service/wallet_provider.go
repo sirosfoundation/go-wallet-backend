@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -431,11 +432,21 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 // attestation is requested for belongs to another user.
 var ErrKeyAttestationInstanceRefused = errors.New("wallet instance not usable by this caller")
 
+type kaTenantKey struct{}
+
+// WithKeyAttestationTenant records the caller's tenant for
+// GenerateKeyAttestation. Instance records are keyed by thumbprint alone, so
+// without it an instance id of another tenant would be accepted. A context
+// without a tenant is not judged (internal callers).
+func WithKeyAttestationTenant(ctx context.Context, tenantID domain.TenantID) context.Context {
+	return context.WithValue(ctx, kaTenantKey{}, tenantID)
+}
+
 // refuseKeyAttestationInstance validates the wallet instance at the minting
 // boundary. A record that is not live (revoked, suspended, or of a status this
 // build does not recognize) is refused as a revoked token (401): fail closed,
 // nothing is changed. A record owned by a user other than the token's subject
-// is refused. An id the store does not know binds no lifecycle state and is
+// is refused, as is one recorded in another tenant. An id the store does not know binds no lifecycle state and is
 // not judged; a failed lookup refuses.
 func (s *WalletProviderService) refuseKeyAttestationInstance(ctx context.Context, walletInstanceID string) error {
 	if walletInstanceID == "" || s.instances == nil {
@@ -450,6 +461,9 @@ func (s *WalletProviderService) refuseKeyAttestationInstance(ctx context.Context
 	}
 	if !instance.Status.IsLive() {
 		return fmt.Errorf("%w: wallet instance is not live", tokengate.ErrRevoked)
+	}
+	if tenantID, ok := ctx.Value(kaTenantKey{}).(domain.TenantID); ok && tenantID != "" && instance.TenantID != tenantID {
+		return ErrKeyAttestationInstanceRefused
 	}
 	if subject := tokengate.SubjectFrom(ctx); subject != "" && instance.UserID != nil && instance.UserID.String() != subject {
 		return ErrKeyAttestationInstanceRefused
