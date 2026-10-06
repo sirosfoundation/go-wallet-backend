@@ -333,6 +333,13 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/status", h.GetStatus)
 }
 
+// RegisterRootAliases registers the endpoints that do not collide with the
+// server's own health endpoints (/type-metadata, /credentials) on r.
+func (h *Handler) RegisterRootAliases(r gin.IRouter) {
+	r.GET("/type-metadata", h.GetTypeMetadata)
+	r.GET("/credentials", h.ListCredentials)
+}
+
 // Close shuts down the handler's background goroutines.
 // It signals the saveWorker to perform a final save and exit.
 func (h *Handler) Close() {
