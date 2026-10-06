@@ -232,14 +232,15 @@ func (a *ASConfig) ExternalBaseURL() (*url.URL, error) {
 	return u, nil
 }
 
-// ASLegacyConfig controls the legacy all-in-one HMAC token sunset.
+// ASLegacyConfig controls the legacy all-in-one HMAC token path.
 type ASLegacyConfig struct {
 	// Enabled controls whether legacy HMAC tokens are accepted.
 	// Default: true (for backward compatibility)
 	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
 
-	// DeprecationHeader controls whether a Deprecation header is sent on
-	// legacy token responses.
+	// DeprecationHeader is intended to control whether a Deprecation header is
+	// sent on legacy token responses. It is currently not acted on: the
+	// middleware is not mounted, so no header is sent.
 	DeprecationHeader bool `yaml:"deprecation_header" envconfig:"DEPRECATION_HEADER"`
 
 	// SunsetDate is a deprecated setting. It is ignored: it has no effect, and

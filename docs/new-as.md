@@ -223,7 +223,7 @@ Existing clients (wallet-frontend, SDK clients) use an all-in-one token model:
 - Every API call sends `Authorization: Bearer <appToken>`
 - The same token serves as both session proof and access authorization
 
-These clients cannot be updated atomically. The new AS must support them during a sunset period while also supporting new-style session cookies + short-lived access tokens.
+These clients cannot be updated atomically. The new AS supports them (while `as.legacy.enabled` is true) alongside new-style session cookies + short-lived access tokens.
 
 ### Design: dual-mode authentication
 
@@ -263,25 +263,22 @@ Set-Cookie: __Host-session=<jti>; HttpOnly; Secure; SameSite=Strict; Path=/
 
 No token in the body. Client uses the session cookie and calls `POST /auth/token` for short-lived access tokens.
 
-### Expiry ramp-down
+### Legacy configuration
 
-Legacy token expiry is reduced over time to incentivize migration:
+The legacy path has no expiry ramp-down and no sunset schedule. Legacy tokens are signed with `jwt.secret` and use the ordinary `jwt.expiry_hours` / `jwt.refresh_days` lifetimes. The `as.legacy` block has these keys:
 
 ```yaml
 as:
   legacy:
-    enabled: true                    # kill switch
-    hmac_secret: "..."               # existing secret (or file path)
-    max_expiry: "24h"                # current value
-    deprecation_header: true         # send a Deprecation header
-    reduction_schedule:              # automated ramp-down
-      - { after: "2026-09-01", max: "12h" }
-      - { after: "2026-12-01", max: "4h" }
-      - { after: "2027-03-01", max: "1h" }
-      - { after: "2027-06-01", max: "15m" }
+    enabled: true             # default true; false turns the legacy AS off
+    deprecation_header: false # see below
 ```
 
-Legacy responses include a `Deprecation: true` header (when `deprecation_header` is set). There is no sunset date: the legacy AS is sunset by setting `as.legacy.enabled=false`, after clients have moved to session mode.
+- `as.legacy.enabled` is the only switch, and it is acted on (see below).
+- `as.legacy.deprecation_header` is parsed, but nothing currently sends the header: `DeprecationMiddleware` in `internal/as/deprecation.go` exists and is tested but is not mounted on any route, so setting it has no effect.
+- `as.legacy.sunset_date` is deprecated and ignored (see below).
+
+There is no `hmac_secret`, `max_expiry` or `reduction_schedule` key. The legacy HMAC secret is `jwt.secret`. The legacy AS is sunset only by setting `as.legacy.enabled=false`, after clients have moved to session mode.
 
 ### Disabling legacy: `as.legacy.enabled=false` (implemented)
 
@@ -319,9 +316,8 @@ An audience list (`as.audiences`) applies to new-style (ES256/JWKS) tokens only.
 
 ### Refresh token handling
 
-- **Legacy mode**: Continue issuing refresh tokens with same ramp-down on expiry
-- **New mode**: No refresh tokens — session cookie + `/auth/token` replaces this
-- **Bridge**: `POST /auth/token/refresh` accepts a legacy refresh token and issues a new legacy `appToken` at the current (reduced) expiry
+- **Legacy mode**: legacy refresh tokens are issued and refreshed through `/user/session/refresh`, with the `jwt.expiry_hours` / `jwt.refresh_days` lifetimes (no reduced expiry).
+- **New mode**: No refresh tokens. The session cookie plus `/auth/token` replaces this.
 
 ### Unified auth middleware
 
@@ -382,10 +378,10 @@ Backend service code sees the same context (`user_id`, `tenant_id`, `tac`) regar
 | Task | New/Modify | Description |
 |------|-----------|-------------|
 | 3.1 Client detection | New: `internal/as/compat.go` | Detect legacy vs new-style from `X-Token-Mode` header. |
-| 3.2 Legacy token issuer | New: `internal/as/legacy_token.go` | Issue HMAC all-in-one JWTs with configurable (ramping-down) expiry. |
+| 3.2 Legacy token issuer | New: `internal/as/legacy_token.go` | Issue HMAC all-in-one JWTs with the `jwt.expiry_hours` lifetime. |
 | 3.3 Dual-mode login response | New: `internal/as/passkey.go`, `internal/as/oidc.go` | Based on client mode, return `appToken` in body (legacy) or set session cookie (new). |
-| 3.4 Deprecation headers | New: `internal/as/deprecation.go` | Add a `Deprecation` header on legacy responses. |
-| 3.5 Refresh token compat | New: `internal/as/refresh.go` | `POST /auth/token/refresh` validates refresh token, issues new legacy token at current ramp-down expiry. |
+| 3.4 Deprecation headers | New: `internal/as/deprecation.go` | `DeprecationMiddleware` exists but is not mounted, so no `Deprecation` header is sent yet. |
+| 3.5 Refresh token compat | `/user/session/refresh` | Legacy refresh stays on the existing `/user/session/refresh` route; no `/auth/token/refresh` bridge route exists. |
 | 3.6 Unified auth middleware | Modify: `pkg/middleware/auth.go` | Single middleware accepting both session-cookie+access-token and legacy Bearer tokens. Sets identical context. |
 
 ### Phase 4: SPOCP policy authorization
@@ -477,7 +473,7 @@ type Config struct {
     Issuer         string        // Expected iss claim
     Audiences      []string      // Accepted aud values (this service's identifiers)
 
-    // Legacy token validation (sunset period)
+    // Legacy token validation (only while as.legacy.enabled)
     Legacy         LegacyConfig
 
     // Revocation
