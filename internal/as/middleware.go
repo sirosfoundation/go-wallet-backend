@@ -7,30 +7,18 @@ import (
 	"go.uber.org/zap"
 )
 
-// Context keys for session data.
-const (
-	ContextKeySession    = "as_session"
-	ContextKeyClientMode = "as_client_mode"
-)
-
-// ClientMode indicates whether the request is from a legacy or new-style client.
-type ClientMode string
-
-const (
-	ClientModeLegacy  ClientMode = "legacy"
-	ClientModeSession ClientMode = "session"
-)
+// ContextKeySession is the Gin context key holding the validated *Session.
+const ContextKeySession = "as_session"
 
 // SessionMiddleware validates the session cookie and sets the session in context.
 // If the session cookie is not present, it does NOT abort — downstream handlers
-// or the legacy middleware path may handle the request.
+// decide whether a session is required (see RequireSession).
 func SessionMiddleware(store SessionStore, insecureCookies bool, logger *zap.Logger) gin.HandlerFunc {
 	opts := CookieOptions{Insecure: insecureCookies}
 	return func(c *gin.Context) {
 		jti := GetSessionCookie(c, opts)
 		if jti == "" {
-			// No session cookie — mark as legacy mode and continue.
-			c.Set(ContextKeyClientMode, ClientModeLegacy)
+			// No session cookie: continue without a session.
 			c.Next()
 			return
 		}
@@ -58,7 +46,6 @@ func SessionMiddleware(store SessionStore, insecureCookies bool, logger *zap.Log
 		}
 
 		c.Set(ContextKeySession, session)
-		c.Set(ContextKeyClientMode, ClientModeSession)
 		c.Next()
 	}
 }
@@ -76,7 +63,7 @@ func RequireSession() gin.HandlerFunc {
 }
 
 // GetSession extracts the session from the Gin context.
-// Returns nil if not set (legacy client path).
+// Returns nil if not set (no session cookie).
 func GetSession(c *gin.Context) *Session {
 	v, exists := c.Get(ContextKeySession)
 	if !exists {
@@ -84,14 +71,4 @@ func GetSession(c *gin.Context) *Session {
 	}
 	session, _ := v.(*Session)
 	return session
-}
-
-// GetClientMode extracts the client mode from the Gin context.
-func GetClientMode(c *gin.Context) ClientMode {
-	v, exists := c.Get(ContextKeyClientMode)
-	if !exists {
-		return ClientModeLegacy
-	}
-	mode, _ := v.(ClientMode)
-	return mode
 }

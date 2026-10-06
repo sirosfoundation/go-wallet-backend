@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -63,15 +62,12 @@ func TestManager_Close(t *testing.T) {
 }
 
 func TestManager_WebSocketHandshake(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-			Issuer: "test-issuer",
-		},
-	}
+	cfg := &config.Config{}
 	logger := zap.NewNop()
 
 	m := NewManager(cfg, logger)
+	v, key := wsValidator(t)
+	m.SetTokenValidator(v)
 
 	// Create test server
 	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
@@ -86,14 +82,7 @@ func TestManager_WebSocketHandshake(t *testing.T) {
 	require.Equal(t, 101, resp.StatusCode)
 	defer func() { _ = ws.Close() }()
 
-	// Create valid JWT token
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":     "test-issuer",
-		"user_id": "test-user-123",
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
+	tokenString := wsES256(t, key, "test-user-123", time.Hour)
 
 	// Send handshake message
 	handshake := ClientMessage{
@@ -406,124 +395,6 @@ func TestClientMessage_JSON(t *testing.T) {
 	assert.NotNil(t, parsed.Response)
 	assert.Equal(t, msg.Response.Action, parsed.Response.Action)
 	assert.Equal(t, msg.Response.ProofJWT, parsed.Response.ProofJWT)
-}
-
-func TestManager_validateToken_InvalidSigningMethod(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-			Issuer: "test-issuer",
-		},
-	}
-	logger := zap.NewNop()
-
-	m := NewManager(cfg, logger)
-
-	// Create token with RS256 (not HMAC)
-	token := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{
-		"user_id": "test-user",
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, _ := token.SignedString(jwt.UnsafeAllowNoneSignatureType)
-
-	_, err := m.validateToken(tokenString)
-	assert.Error(t, err)
-}
-
-func TestManager_validateToken_ExpiredToken(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-			Issuer: "test-issuer",
-		},
-	}
-	logger := zap.NewNop()
-
-	m := NewManager(cfg, logger)
-
-	// Create expired token
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":     "test-issuer",
-		"user_id": "test-user",
-		"exp":     time.Now().Add(-time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	_, err = m.validateToken(tokenString)
-	assert.Error(t, err)
-}
-
-func TestManager_validateToken_MissingUserID(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-			Issuer: "test-issuer",
-		},
-	}
-	logger := zap.NewNop()
-
-	m := NewManager(cfg, logger)
-
-	// Create token without user_id
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss": "test-issuer",
-		"exp": time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	_, err = m.validateToken(tokenString)
-	assert.Error(t, err)
-}
-
-func TestManager_validateToken_ValidToken(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-			Issuer: "test-issuer",
-		},
-	}
-	logger := zap.NewNop()
-
-	m := NewManager(cfg, logger)
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":     "test-issuer",
-		"user_id": "test-user-123",
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	userID, err := m.validateToken(tokenString)
-	require.NoError(t, err)
-	assert.Equal(t, "test-user-123", userID)
-}
-
-func TestManager_validateToken_NbfSlightlyInFuture(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-			Issuer: "test-issuer",
-		},
-	}
-	logger := zap.NewNop()
-	m := NewManager(cfg, logger)
-
-	// Token with nbf 2 seconds in the future — within the 5s leeway
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":     "test-issuer",
-		"user_id": "test-user",
-		"nbf":     time.Now().Add(2 * time.Second).Unix(),
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	userID, err := m.validateToken(tokenString)
-	require.NoError(t, err)
-	assert.Equal(t, "test-user", userID)
 }
 
 func TestErrorVariables(t *testing.T) {

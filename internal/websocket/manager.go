@@ -9,14 +9,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 
 	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 
-	"github.com/sirosfoundation/go-wallet-backend/pkg/audience"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -88,7 +86,7 @@ type SigningRequest struct {
 type ClientMessage struct {
 	Type      string           `json:"type,omitempty"` // Message type (e.g., "auth")
 	MessageID string           `json:"message_id"`
-	AppToken  string           `json:"appToken,omitempty"` // Legacy: For handshake (deprecated)
+	AppToken  string           `json:"appToken,omitempty"` // Handshake token (historical field name; carries the AS access token)
 	Token     string           `json:"token,omitempty"`    // Auth token (preferred)
 	TenantID  string           `json:"tenantId,omitempty"` // Tenant ID for multi-tenant routing
 	Response  *SigningResponse `json:"response,omitempty"`
@@ -310,69 +308,36 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 }
 
 // SetTokenValidator makes the handshake validate tokens through the shared
-// go-tokenauth validator (ES256 via JWKS, HMAC only while legacy is enabled)
-// instead of the bare HMAC path. Call before serving connections.
+// go-tokenauth validator (AS-issued ES256/EdDSA session tokens via JWKS).
+// Call before serving connections; without a validator every handshake is
+// refused.
 func (m *Manager) SetTokenValidator(v *tokenvalidator.Validator) {
 	m.tokenValidator = v
 }
 
 func (m *Manager) validateToken(tokenString string) (string, error) {
-	if m.tokenValidator != nil {
-		result, err := m.tokenValidator.Validate(context.Background(), tokenString)
-		if err != nil {
-			return "", err
-		}
-		// The AS audience list (as.audiences) is already enforced by the
-		// validator. The keystore socket is a user-facing surface, so beyond
-		// that a new-style token must carry wallet-backend (as
-		// internal/server/providers.go requires); a registry-only token is
-		// refused. Legacy HMAC tokens (aud = RP ID) are exempt, exactly like
-		// middleware.RequireAudience (see audience.Allowed).
-		if !audience.Allowed(result, true, "wallet-backend") {
-			return "", errors.New("token audience not accepted")
-		}
-		// The keystore socket is per-user: an anonymous (identity-free)
-		// token has nothing to bind to.
-		if result.UserID == "" {
-			return "", errors.New("invalid token claims")
-		}
-		return result.UserID, nil
+	if m.tokenValidator == nil {
+		// No HMAC fallback exists any more: fail closed.
+		return "", errors.New("no token validator configured")
 	}
-
-	// No validator wired (AS disabled): HMAC is the only mechanism, unless the
-	// AS is enabled with as.legacy.enabled=false - then refuse (fail closed).
-	if !m.cfg.LegacyEnabled() {
-		return "", errors.New("legacy tokens are disabled")
-	}
-	if m.cfg.JWT.Secret == "" {
-		return "", errors.New("jwt secret not configured")
-	}
-	// Legacy HMAC tokens are all minted with iss = jwt.issuer; pin it. An empty
-	// jwt.issuer would disable the check (golang-jwt treats "" as "no
-	// expectation"), so fail closed.
-	if m.cfg.JWT.Issuer == "" {
-		return "", errors.New("jwt issuer not configured")
-	}
-	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, errors.New("unexpected signing method")
-		}
-		return []byte(m.cfg.JWT.Secret), nil
-	}, jwt.WithLeeway(config.JWTLeeway), jwt.WithIssuer(m.cfg.JWT.Issuer))
-
+	result, err := m.tokenValidator.Validate(context.Background(), tokenString)
 	if err != nil {
 		return "", err
 	}
-
-	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
-		userID, ok := claims["user_id"].(string)
-		if !ok {
-			return "", errors.New("invalid token claims")
-		}
-		return userID, nil
+	// The AS audience list (as.audiences) is already enforced by the
+	// validator. The keystore socket is a user-facing surface, so beyond
+	// that the token must carry wallet-backend (as
+	// internal/server/providers.go requires); a registry-only token is
+	// refused.
+	if !result.HasAudience("wallet-backend") {
+		return "", errors.New("token audience not accepted")
 	}
-
-	return "", errors.New("invalid token")
+	// The keystore socket is per-user: an anonymous (identity-free)
+	// token has nothing to bind to.
+	if result.UserID == "" {
+		return "", errors.New("invalid token claims")
+	}
+	return result.UserID, nil
 }
 
 // IsConnected checks if a user is currently connected

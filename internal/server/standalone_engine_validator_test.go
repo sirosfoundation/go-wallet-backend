@@ -47,22 +47,17 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 		require.NoError(t, err)
 		return raw
 	}()
+	// What the removed legacy AS issued: HS256 signed with jwt.secret, with
+	// jwt.issuer as iss and the RP ID as aud.
 	hm, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"user_id": "u", "tenant_id": "t", "iss": "legacy", "aud": "rp.example",
 		"exp": time.Now().Add(time.Hour).Unix(),
 	}).SignedString([]byte(secret))
 	require.NoError(t, err)
-	hmBad := func(claims jwt.MapClaims) string {
-		claims["user_id"], claims["tenant_id"], claims["exp"] = "u", "t", time.Now().Add(time.Hour).Unix()
-		raw, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
-		require.NoError(t, err)
-		return raw
-	}
 
-	base := func(legacy bool) *config.Config {
+	base := func() *config.Config {
 		c := &config.Config{JWT: config.JWTConfig{Secret: secret, Issuer: "legacy"}}
-		c.AS.Enabled = true // unloaded config: the switch is honoured with the AS on
-		c.AS.Legacy.Enabled = legacy
+		c.AS.Enabled = true
 		c.AS.Issuer = "as-issuer"
 		c.AS.Audiences = []string{"wallet-backend", "rp.example", "any-rp-id"}
 		c.AS.ExternalURL = srv.URL + "/"
@@ -71,8 +66,8 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 		return c
 	}
 
-	t.Run("legacy off: ES256 accepted, HMAC refused", func(t *testing.T) {
-		v, err := NewStandaloneEngineTokenValidator(base(false), zap.NewNop())
+	t.Run("ES256 accepted, HMAC refused", func(t *testing.T) {
+		v, err := NewStandaloneEngineTokenValidator(base(), zap.NewNop())
 		require.NoError(t, err)
 		require.NotNil(t, v)
 		defer func() { _ = v.Close() }()
@@ -81,35 +76,11 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 			return err == nil
 		}, 3*time.Second, 20*time.Millisecond)
 		_, err = v.Validate(context.Background(), hm)
-		assert.Error(t, err)
-	})
-
-	t.Run("legacy on: both accepted", func(t *testing.T) {
-		v, err := NewStandaloneEngineTokenValidator(base(true), zap.NewNop())
-		require.NoError(t, err)
-		defer func() { _ = v.Close() }()
-		_, err = v.Validate(context.Background(), hm)
-		assert.NoError(t, err)
-	})
-
-	t.Run("legacy on: issuer pinned to jwt.issuer, RP-ID audience accepted", func(t *testing.T) {
-		v, err := NewStandaloneEngineTokenValidator(base(true), zap.NewNop())
-		require.NoError(t, err)
-		defer func() { _ = v.Close() }()
-		// as.issuer differs from jwt.issuer here; the legacy issuer is jwt.issuer.
-		_, err = v.Validate(context.Background(), hmBad(jwt.MapClaims{"iss": "as-issuer"}))
-		assert.Error(t, err, "the AS issuer is not a legacy issuer")
-		_, err = v.Validate(context.Background(), hmBad(jwt.MapClaims{"iss": "someone-else"}))
-		assert.Error(t, err)
-		_, err = v.Validate(context.Background(), hmBad(jwt.MapClaims{}))
-		assert.Error(t, err, "missing iss")
-		res, err := v.Validate(context.Background(), hmBad(jwt.MapClaims{"iss": "legacy", "aud": "any-rp-id"}))
-		require.NoError(t, err, "aud (the RP ID) is in as.audiences")
-		assert.Equal(t, []string{"any-rp-id"}, res.Audience)
+		assert.Error(t, err, "an HMAC token signed with jwt.secret must be refused")
 	})
 
 	t.Run("plain-http external_url refused unless allow_http", func(t *testing.T) {
-		c := base(false)
+		c := base()
 		c.HTTPClient = config.HTTPClientConfig{}
 		v, err := NewStandaloneEngineTokenValidator(c, zap.NewNop())
 		assert.ErrorContains(t, err, "plain http")
@@ -119,7 +90,7 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 	})
 
 	t.Run("guarded client blocks a loopback JWKS host without allow_private_ips", func(t *testing.T) {
-		c := base(false)
+		c := base()
 		c.HTTPClient = config.HTTPClientConfig{AllowHTTP: true} // plaintext ok, private IPs not
 		v, err := NewStandaloneEngineTokenValidator(c, zap.NewNop())
 		require.NoError(t, err)
@@ -130,25 +101,17 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 	})
 
 	t.Run("invalid external_url", func(t *testing.T) {
-		c := base(false)
+		c := base()
 		c.AS.ExternalURL = "ftp://x"
 		_, err := asJWKSURL(c)
 		assert.Error(t, err)
 	})
 
-	t.Run("legacy off without external_url: refuse to start", func(t *testing.T) {
-		c := base(false)
+	t.Run("without external_url: refuse to start", func(t *testing.T) {
+		c := base()
 		c.AS.ExternalURL = ""
 		v, err := NewStandaloneEngineTokenValidator(c, zap.NewNop())
-		assert.Error(t, err)
-		assert.Nil(t, v)
-	})
-
-	t.Run("legacy on without external_url: HMAC fallback, no validator", func(t *testing.T) {
-		c := base(true)
-		c.AS.ExternalURL = ""
-		v, err := NewStandaloneEngineTokenValidator(c, zap.NewNop())
-		assert.NoError(t, err)
+		assert.ErrorContains(t, err, "as.external_url")
 		assert.Nil(t, v)
 	})
 }
@@ -156,7 +119,6 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 func TestRemoteASIssuerRefusesEmpty(t *testing.T) {
 	c := &config.Config{}
 	c.AS.ExternalURL = "https://as.example.com"
-	c.AS.Enabled = true // AS on + legacy off: the requireLegacyIssuer guard does not apply
 
 	v, err := NewStandaloneEngineTokenValidator(c, zap.NewNop())
 	assert.ErrorContains(t, err, "expected issuer is required")

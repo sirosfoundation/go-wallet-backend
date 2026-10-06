@@ -228,7 +228,7 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), time.Duration(h.cfg.Timeout)*time.Second)
 	defer cancel()
 
-	// Get tenant from context (set by AuthMiddleware from JWT)
+	// Get tenant from context (set by TokenAuthMiddleware from the token)
 	// Use safe type assertion to avoid panic from misconfigured middleware
 	tenantIDVal, exists := c.Get("tenant_id")
 	if !exists {

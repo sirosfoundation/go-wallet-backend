@@ -22,18 +22,12 @@ import (
 // ASModule is the top-level authorization server module that wires together
 // all AS components and registers routes.
 type ASModule struct {
-	KeyManager   *KeyManager
-	TokenIssuer  *TokenIssuer
-	LegacyIssuer *LegacyTokenIssuer
-	// LogoutSIDParser is a signature-only legacy HMAC parser used by
-	// LogoutHandler to find the refresh-token family of a pre-#402 session.
-	// Built whenever jwt.secret is set, regardless of as.legacy.enabled; it
-	// is never used to authenticate requests. Nil when no secret is set.
-	LogoutSIDParser *LegacyTokenIssuer
-	Sessions        SessionStore
-	Policy          PolicyEngine
-	PasskeyHandler  *PasskeyHandlers
-	OIDCHandler     *OIDCHandlers
+	KeyManager     *KeyManager
+	TokenIssuer    *TokenIssuer
+	Sessions       SessionStore
+	Policy         PolicyEngine
+	PasskeyHandler *PasskeyHandlers
+	OIDCHandler    *OIDCHandlers
 	// Blacklist checks whether a token has been revoked (via Logout/user
 	// deletion - see #382/#383). Used by the delegation-exchange path in
 	// TokenEndpointHandler so a revoked parent token can't be re-delegated
@@ -41,11 +35,6 @@ type ASModule struct {
 	Blacklist TokenBlacklistChecker
 	Logger    *zap.Logger
 	Config    *config.ASConfig
-	// FamilyRetention is how long LogoutHandler keeps a refresh-token
-	// family revocation marker (the longest configured access/refresh
-	// token lifetime plus a safety margin, #402).
-	FamilyRetention time.Duration
-
 	// store and validatorCache back the tenant-header and OIDC-gate
 	// middleware mounted on /auth/passkey/* (see RegisterRoutes). This is the
 	// only AS route group that operates on tenant-scoped data before the
@@ -109,34 +98,6 @@ func NewASModule(
 		return cfg.GetTokenTTL(aud)
 	})
 
-	// Legacy issuer (uses existing HMAC secret). Deliberately jwtCfg.Issuer,
-	// NOT the `issuer` var above: legacy appTokens are always minted by
-	// UserService/WebAuthnService's own generateToken with "iss":
-	// jwtCfg.Issuer, regardless of what cfg.AS.Issuer is separately
-	// configured as (the AS's own asymmetric tokenIssuer's identity). Using
-	// `issuer` here previously meant an operator who set cfg.AS.Issuer
-	// differently from cfg.JWT.Issuer got every legacy token rejected by
-	// this issuer, including - silently - LogoutHandler's legacy-token
-	// blacklisting fallback (#391 review, round 3).
-	var legacyIssuer *LegacyTokenIssuer
-	if cfg.Legacy.Enabled {
-		legacyIssuer = NewLegacyTokenIssuer(
-			[]byte(jwtCfg.Secret),
-			jwtCfg.Issuer,
-			time.Duration(jwtCfg.ExpiryHours)*time.Hour,
-		)
-	}
-
-	// Signature-only parser for LogoutHandler's pre-#402 family fallback,
-	// available even when legacy authentication is disabled (the refresh
-	// route is mounted on jwt.refresh_days, not as.legacy.enabled). With no
-	// jwt.secret there is nothing to verify against, so the fallback is
-	// unavailable (an empty HMAC key must never be used).
-	var logoutSIDParser *LegacyTokenIssuer
-	if jwtCfg.Secret != "" {
-		logoutSIDParser = NewLegacyTokenIssuer([]byte(jwtCfg.Secret), jwtCfg.Issuer, 0)
-	}
-
 	// Session store: MongoDB when the storage backend is MongoDB (sessions
 	// survive restarts and are shared across instances, #324), memory
 	// otherwise, unless as.session_store says which.
@@ -158,11 +119,12 @@ func NewASModule(
 	}
 
 	// Passkey handlers.
-	passkeyHandler := NewPasskeyHandlers(webauthnSvc, sessions, legacyIssuer, cfg, logger)
+	passkeyHandler := NewPasskeyHandlers(webauthnSvc, sessions, cfg, logger)
 
-	// OIDC handlers. The state-binding cookie (go-wallet-backend#385) reuses
-	// the JWT secret rather than requiring a new one; pkg/config.Config.Validate
-	// already requires it to be present and >=32 bytes.
+	// OIDC handlers. The state-binding cookie (go-wallet-backend#385) is keyed
+	// by jwt.secret (its only use now that legacy HMAC tokens are gone);
+	// pkg/config.Config.Validate already requires it to be present and >=32
+	// bytes.
 	oidcHandler := NewOIDCHandlers(store, sessions, cfg, []byte(jwtCfg.Secret), httpClient, logger)
 
 	// Shared cache of OIDC validators for the passkey gate (see
@@ -171,21 +133,18 @@ func NewASModule(
 	validatorCache := middleware.NewValidatorCache(httpClient, logger)
 
 	return &ASModule{
-		KeyManager:      km,
-		TokenIssuer:     tokenIssuer,
-		LegacyIssuer:    legacyIssuer,
-		LogoutSIDParser: logoutSIDParser,
-		Sessions:        sessions,
-		Policy:          policy,
-		PasskeyHandler:  passkeyHandler,
-		OIDCHandler:     oidcHandler,
-		Blacklist:       blacklist,
-		Logger:          logger,
-		Config:          cfg,
-		FamilyRetention: jwtCfg.FamilyRetention() + time.Hour,
-		store:           store,
-		validatorCache:  validatorCache,
-		cancel:          cancel,
+		KeyManager:     km,
+		TokenIssuer:    tokenIssuer,
+		Sessions:       sessions,
+		Policy:         policy,
+		PasskeyHandler: passkeyHandler,
+		OIDCHandler:    oidcHandler,
+		Blacklist:      blacklist,
+		Logger:         logger,
+		Config:         cfg,
+		store:          store,
+		validatorCache: validatorCache,
+		cancel:         cancel,
 	}, nil
 }
 
@@ -223,7 +182,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	{
 		// Registration routes (with OIDC registration gate).
 		registration := passkey.Group("")
-		registration.Use(m.gateLimitMiddleware(), legacyModeGate(m.Config.Legacy.Enabled), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeRegistration, m.Logger))
+		registration.Use(m.gateLimitMiddleware(), sessionModeGate(), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeRegistration, m.Logger))
 		{
 			registration.POST("/register/begin", m.PasskeyHandler.RegisterBegin)
 			registration.POST("/register/finish", m.PasskeyHandler.RegisterFinish)
@@ -231,7 +190,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 
 		// Login routes (with OIDC login gate).
 		login := passkey.Group("")
-		login.Use(m.gateLimitMiddleware(), legacyModeGate(m.Config.Legacy.Enabled), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeLogin, m.Logger))
+		login.Use(m.gateLimitMiddleware(), sessionModeGate(), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeLogin, m.Logger))
 		{
 			login.POST("/login/begin", m.PasskeyHandler.LoginBegin)
 			login.POST("/login/finish", m.PasskeyHandler.LoginFinish)
@@ -258,7 +217,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	})
 
 	// Logout (requires session cookie).
-	auth.DELETE("/session", LogoutHandler(m.Sessions, m.TokenIssuer, m.LegacyIssuer, m.LogoutSIDParser, m.Blacklist, m.FamilyRetention, m.Config.InsecureCookies, m.Logger))
+	auth.DELETE("/session", LogoutHandler(m.Sessions, m.TokenIssuer, m.Blacklist, m.Config.InsecureCookies, m.Logger))
 }
 
 // mongoDatabaseProvider is implemented by the MongoDB storage backend.
@@ -357,23 +316,6 @@ func (m *ASModule) Close() error {
 		return nil
 	}
 	return m.KeyManager.Close()
-}
-
-// legacyModeGate answers 410 legacy_tokens_disabled to legacy-mode clients (no
-// X-Token-Mode: session) when legacy is disabled. It sits before the OIDC gate
-// so those clients get this answer rather than an unrelated OIDC error;
-// session-mode requests pass through untouched.
-func legacyModeGate(enabled bool) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		if enabled || DetectClientMode(c) == ClientModeSession {
-			c.Next()
-			return
-		}
-		c.AbortWithStatusJSON(http.StatusGone, gin.H{
-			"error":   "legacy_tokens_disabled",
-			"message": "legacy HMAC session tokens are no longer issued; send X-Token-Mode: session",
-		})
-	}
 }
 
 // newPKCS11KeyManager builds a KeyManager from an HSM signer, refusing key

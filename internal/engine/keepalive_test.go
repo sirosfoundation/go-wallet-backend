@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,14 +36,7 @@ func dialAndHandshake(t *testing.T, cfg *config.Config) *HandshakeCompleteMessag
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ws.Close() })
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":       "test-issuer",
-		"user_id":   "test-user-123",
-		"tenant_id": "test-tenant",
-		"exp":       time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
+	tokenString := engineSessionToken(t, m, "test-user-123")
 
 	require.NoError(t, ws.WriteJSON(HandshakeMessage{
 		Message:  Message{Type: TypeHandshake},

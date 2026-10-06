@@ -462,7 +462,6 @@ storage:
   type: memory
 jwt:
   secret: test-secret-that-is-at-least-32-bytes-long
-  expiry_hours: 48
 `
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
 		t.Fatalf("Failed to write config file: %v", err)
@@ -483,8 +482,8 @@ jwt:
 	if cfg.Storage.Type != "memory" {
 		t.Errorf("Expected storage type 'memory', got %q", cfg.Storage.Type)
 	}
-	if cfg.JWT.ExpiryHours != 48 {
-		t.Errorf("Expected JWT expiry hours 48, got %d", cfg.JWT.ExpiryHours)
+	if cfg.JWT.Secret != "test-secret-that-is-at-least-32-bytes-long" {
+		t.Errorf("Expected JWT secret from YAML, got %q", cfg.JWT.Secret)
 	}
 }
 func TestTrustConfig_GetPDPURL(t *testing.T) {
@@ -2666,53 +2665,63 @@ func TestConfig_Validate_RejectsATrustCacheTTLThatOverflows(t *testing.T) {
 	}
 }
 
-func TestConfig_LegacyEnabled(t *testing.T) {
-	c := &Config{}
-	if !c.LegacyEnabled() {
-		t.Error("unloaded config with AS disabled: HMAC is the only mechanism")
+func writeLoadConfig(t *testing.T, yamlText string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "c.yaml")
+	if err := os.WriteFile(p, []byte(yamlText), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	c.AS.Enabled = true
-	if c.LegacyEnabled() {
-		t.Error("AS enabled, legacy off: must be disabled")
+	return p
+}
+
+const minimalLoadConfig = "server:\n  rp_id: localhost\n  rp_origin: http://localhost:8080\njwt:\n  secret: test-secret-that-is-at-least-32-bytes!\n"
+
+// The legacy AS was removed: a deployment that still asks for it
+// (as.legacy.enabled=true, in YAML or via the environment) must fail to start
+// with a clear error instead of silently running without the legacy tokens it
+// expects.
+func TestLoad_LegacyEnabledTrueIsRefused(t *testing.T) {
+	t.Run("yaml", func(t *testing.T) {
+		_, err := Load(writeLoadConfig(t, minimalLoadConfig+"as:\n  legacy:\n    enabled: true\n"))
+		if err == nil || !strings.Contains(err.Error(), "as.legacy.enabled=true") || !strings.Contains(err.Error(), "removed") {
+			t.Fatalf("as.legacy.enabled=true must be refused with a clear error, got %v", err)
+		}
+	})
+	t.Run("environment", func(t *testing.T) {
+		t.Setenv("WALLET_AS_LEGACY_ENABLED", "true")
+		_, err := Load(writeLoadConfig(t, minimalLoadConfig))
+		if err == nil || !strings.Contains(err.Error(), "as.legacy.enabled=true") {
+			t.Fatalf("WALLET_AS_LEGACY_ENABLED=true must be refused, got %v", err)
+		}
+	})
+}
+
+// as.legacy.enabled=false (the old sunset switch) and the other removed keys
+// still load, and are reported by DeprecatedSettings so the process warns.
+func TestLoad_RemovedLegacySettingsLoadAndAreReported(t *testing.T) {
+	cfg, err := Load(writeLoadConfig(t, minimalLoadConfig+"  expiry_hours: 48\n  refresh_days: 7\nas:\n  legacy:\n    enabled: false\n    deprecation_header: true\n    sunset_date: \"2027-10-01T00:00:00Z\"\n"))
+	if err != nil {
+		t.Fatalf("a config with the removed keys set to non-enabling values must load: %v", err)
 	}
-	c.AS.Legacy.Enabled = true
-	if !c.LegacyEnabled() {
-		t.Error("AS enabled, legacy on")
-	}
-	// Loaded configs follow as.legacy.enabled even when this process has no AS
-	// (standalone engine/registry mirroring the backend).
-	c = &Config{loaded: true}
-	if c.LegacyEnabled() {
-		t.Error("loaded config with as.legacy.enabled=false must be disabled")
-	}
-	c.AS.Legacy.Enabled = true
-	if !c.LegacyEnabled() {
-		t.Error("loaded config with as.legacy.enabled=true must be enabled")
+	got := strings.Join(cfg.DeprecatedSettings(), ",")
+	for _, want := range []string{"as.legacy.enabled", "as.legacy.deprecation_header", "as.legacy.sunset_date", "jwt.expiry_hours", "jwt.refresh_days"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("DeprecatedSettings() = %q, missing %s", got, want)
+		}
 	}
 }
 
-func TestLoad_LegacyEnabledDefaultsTrue(t *testing.T) {
-	dir := t.TempDir()
-	p := dir + "/c.yaml"
-	if err := os.WriteFile(p, []byte("server:\n  rp_id: localhost\n  rp_origin: http://localhost:8080\njwt:\n  secret: test-secret-that-is-at-least-32-bytes!\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(p)
+// A configuration that does not mention any removed key loads clean.
+func TestLoad_NoRemovedSettingsByDefault(t *testing.T) {
+	cfg, err := Load(writeLoadConfig(t, minimalLoadConfig))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cfg.LegacyEnabled() {
-		t.Error("as.legacy.enabled must default to true")
+	if got := cfg.DeprecatedSettings(); len(got) != 0 {
+		t.Errorf("DeprecatedSettings() on a default config = %v, want none", got)
 	}
-	if err := os.WriteFile(p, []byte("server:\n  rp_id: localhost\n  rp_origin: http://localhost:8080\njwt:\n  secret: test-secret-that-is-at-least-32-bytes!\nas:\n  legacy:\n    enabled: false\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err = Load(p)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.LegacyEnabled() {
-		t.Error("explicit as.legacy.enabled=false must disable legacy even with the AS disabled")
+	if cfg.AS.Legacy.Enabled != nil {
+		t.Error("as.legacy.enabled must be unset by default")
 	}
 }
 
@@ -2856,44 +2865,30 @@ func TestSSRFGuard_RefusesHTTPSToHTTPRedirect(t *testing.T) {
 	}
 }
 
-// Legacy HMAC tokens are pinned to jwt.issuer, so an empty one while legacy
-// is enabled would accept any token signed with the shared secret.
-func TestConfig_Validate_LegacyRequiresJWTIssuer(t *testing.T) {
-	t.Run("legacy on and empty issuer is rejected", func(t *testing.T) {
+// jwt.issuer is only the fallback for as.issuer now; an enabled AS needs one of
+// the two, and nothing else requires jwt.issuer.
+func TestConfig_Validate_JWTIssuerIsOnlyASIssuerFallback(t *testing.T) {
+	t.Run("empty jwt.issuer is fine when the AS is off", func(t *testing.T) {
 		cfg := validBaseConfig()
 		cfg.JWT.Issuer = ""
-		err := cfg.Validate()
-		if err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
-			t.Fatalf("expected jwt.issuer error, got %v", err)
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
 		}
 	})
-	t.Run("AS on, legacy on and empty jwt.issuer is rejected even with as.issuer", func(t *testing.T) {
+	t.Run("AS on needs as.issuer or jwt.issuer", func(t *testing.T) {
 		cfg := validBaseConfig()
 		cfg.JWT.Issuer = ""
 		cfg.AS.Enabled = true
-		cfg.AS.Issuer = "https://as.example.org"
-		cfg.AS.Legacy.Enabled = true
-		err := cfg.Validate()
-		if err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
-			t.Fatalf("expected jwt.issuer error, got %v", err)
-		}
-	})
-	t.Run("legacy off may omit it", func(t *testing.T) {
-		cfg := validBaseConfig()
-		cfg.JWT.Issuer = ""
-		cfg.AS.Enabled = true
-		cfg.AS.Issuer = "https://as.example.org"
-		cfg.AS.Legacy.Enabled = false
 		cfg.AS.Audiences = []string{"wallet-backend"}
 		cfg.AS.SigningKeyPath = filepath.Join(t.TempDir(), "as.key")
 		cfg.AS.RulesDir = t.TempDir()
-		if err := cfg.Validate(); err != nil {
-			t.Fatalf("legacy off with empty jwt.issuer must be valid: %v", err)
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "issuer is required") {
+			t.Fatalf("expected an issuer error, got %v", err)
 		}
-	})
-	t.Run("normal config", func(t *testing.T) {
-		if err := validBaseConfig().Validate(); err != nil {
-			t.Fatal(err)
+		cfg.AS.Issuer = "https://as.example.org"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("as.issuer alone must satisfy it: %v", err)
 		}
 	})
 }
@@ -2901,7 +2896,6 @@ func TestConfig_Validate_LegacyRequiresJWTIssuer(t *testing.T) {
 func TestConfig_Validate_ExternalURLRequiresExpectedIssuer(t *testing.T) {
 	cfg := validBaseConfig()
 	cfg.AS.ExternalURL = "https://as.example.com"
-	cfg.loaded = true // legacy disabled (as.legacy.enabled=false), so the legacy-issuer rule does not apply
 	cfg.JWT.Issuer = ""
 	cfg.AS.Issuer = ""
 	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "as.external_url requires an expected issuer") {
@@ -2967,113 +2961,28 @@ func TestASConfig_ExternalBaseURL(t *testing.T) {
 	}
 }
 
-func TestConfig_Validate_AS_LegacyRequiresRPIDAudience(t *testing.T) {
-	mk := func(legacy bool, audiences ...string) *Config {
-		cfg := validBaseConfig()
-		cfg.AS.Enabled = true
-		cfg.AS.ExternalURL = "https://wallet.example.com"
-		cfg.AS.Issuer = "https://as.example.com"
-		cfg.AS.SigningKeyPath = "/tmp/as-key.pem"
-		cfg.AS.RulesDir = "/tmp/rules"
-		cfg.AS.Audiences = audiences
-		cfg.AS.Legacy.Enabled = legacy
-		cfg.JWT.Issuer = "wallet-backend"
-		return cfg
-	}
-
-	// RP ID missing from the audiences: every legacy login token would be
-	// rejected at runtime, so this must fail at startup.
-	err := mk(true, "wallet-backend").Validate()
-	if err == nil || !strings.Contains(err.Error(), "as.audiences") {
-		t.Fatalf("legacy enabled without rp_id in as.audiences must be rejected, got %v", err)
-	}
-
-	if err := mk(true, "wallet-backend", "localhost").Validate(); err != nil {
-		t.Errorf("rp_id listed in as.audiences must be accepted: %v", err)
-	}
-
-	// With legacy tokens off the RP ID is irrelevant to the AS.
-	if err := mk(false, "wallet-backend").Validate(); err != nil {
-		t.Errorf("legacy disabled must not require rp_id in as.audiences: %v", err)
-	}
-}
-
-func TestJWTConfig_MaxTokenLifetime(t *testing.T) {
-	if got := (JWTConfig{RefreshDays: 7, ExpiryHours: 24}).MaxTokenLifetime(); got != 7*24*time.Hour {
-		t.Errorf("got %v", got)
-	}
-	if got := (JWTConfig{RefreshDays: 1, ExpiryHours: 720}).MaxTokenLifetime(); got != 720*time.Hour {
-		t.Errorf("got %v", got)
-	}
-	if got := (JWTConfig{ExpiryHours: 24}).MaxTokenLifetime(); got != 24*time.Hour {
-		t.Errorf("got %v", got)
-	}
-}
-
-// Retention must not shrink when jwt lifetimes are later lowered: tokens
-// minted under the earlier, longer configuration are still outstanding.
-func TestJWTConfig_FamilyRetention_NonShrinkingAcrossConfigChanges(t *testing.T) {
-	before := JWTConfig{RefreshDays: 180, ExpiryHours: 24}
-	after := JWTConfig{RefreshDays: 1, ExpiryHours: 1} // lifetimes reduced
-	if after.FamilyRetention() < before.MaxTokenLifetime() {
-		t.Errorf("retention %v under the reduced config is shorter than tokens minted before it (%v)",
-			after.FamilyRetention(), before.MaxTokenLifetime())
-	}
-	if got := (JWTConfig{RefreshDays: 400}).FamilyRetention(); got != 400*24*time.Hour {
-		t.Errorf("lifetime above the floor must win, got %v", got)
-	}
-}
-
-func TestConfig_Validate_AS_LegacyRequiresJWTIssuer(t *testing.T) {
-	mk := func(legacy bool, jwtIssuer string) *Config {
-		cfg := validBaseConfig()
-		cfg.AS.Enabled = true
-		cfg.AS.ExternalURL = "https://wallet.example.com"
-		cfg.AS.Issuer = "https://as.example.com"
-		cfg.AS.SigningKeyPath = "/tmp/as-key.pem"
-		cfg.AS.RulesDir = "/tmp/rules"
-		cfg.AS.Audiences = []string{"wallet-backend", "localhost"}
-		cfg.AS.Legacy.Enabled = legacy
-		cfg.JWT.Issuer = jwtIssuer
-		return cfg
-	}
-	err := mk(true, "").Validate()
-	if err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
-		t.Fatalf("legacy enabled with empty jwt.issuer must be rejected, got %v", err)
-	}
-	if err := mk(true, "wallet-backend").Validate(); err != nil {
-		t.Errorf("non-empty jwt.issuer must be accepted: %v", err)
-	}
-	if err := mk(false, "").Validate(); err != nil {
-		t.Errorf("legacy disabled must not require jwt.issuer: %v", err)
-	}
-}
-
 // The role flag alone (--mode=auth / --mode=all: Load -> EnableForRole ->
-// Validate) must yield a valid configuration, including the audience list
-// and, with legacy on, the RP ID.
+// Validate) must yield a valid configuration, including the audience list.
 func TestConfig_EnableForRole_DefaultsAudiencesAndValidates(t *testing.T) {
 	cfg := validBaseConfig()
 	cfg.JWT.Issuer = "wallet-backend"
 	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
 	cfg.Server.RPID = "wallet.example.com"
-	cfg.AS.Legacy.Enabled = true
 
 	cfg.EnableForRole()
-	if !containsString(cfg.AS.Audiences, "wallet-backend") || !containsString(cfg.AS.Audiences, "wallet.example.com") {
-		t.Fatalf("unexpected default audiences %v", cfg.AS.Audiences)
+	for _, a := range defaultASAudiences {
+		if !containsString(cfg.AS.Audiences, a) {
+			t.Fatalf("default audience %q missing from %v", a, cfg.AS.Audiences)
+		}
+	}
+	if containsString(cfg.AS.Audiences, "wallet.example.com") {
+		t.Errorf("the RP ID is not an audience any more (it was the legacy token audience): %v", cfg.AS.Audiences)
 	}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("role-defaulted config must validate: %v", err)
 	}
 
-	// Legacy off: RP ID not added. Explicit list: untouched.
-	off := validBaseConfig()
-	off.Server.RPID = "wallet.example.com"
-	off.EnableForRole()
-	if containsString(off.AS.Audiences, "wallet.example.com") {
-		t.Errorf("RP ID must not be added when legacy is off: %v", off.AS.Audiences)
-	}
+	// Explicit list: untouched.
 	ex := validBaseConfig()
 	ex.AS.Audiences = []string{"custom"}
 	ex.EnableForRole()
@@ -3084,7 +2993,7 @@ func TestConfig_EnableForRole_DefaultsAudiencesAndValidates(t *testing.T) {
 
 // chartShapedConfig mirrors what siros-id-stack's templates/04-wallet-backend.yaml
 // renders for backend.yaml: as.enabled true, NO as.audiences, no jwt.issuer,
-// legacy off. config.Load must keep accepting it (documented defaults apply
+// and the old as.legacy.enabled=false sunset switch. config.Load must keep accepting it (documented defaults apply
 // before Validate), otherwise chart-based deployments crash-loop on upgrade.
 const chartShapedConfig = `
 server:
@@ -3098,7 +3007,7 @@ server:
 as:
   enabled: true
   legacy:
-    enabled: %t
+    enabled: false
   signing_key_path: /as-cert/tls.key
   rules_dir: /as-rules
   default_max_tac: rwlid
@@ -3111,28 +3020,24 @@ jwt:
 `
 
 func TestLoad_ChartShapedConfig_AppliesASDefaults(t *testing.T) {
-	for _, legacy := range []bool{false, true} {
-		t.Run(fmt.Sprintf("legacy=%t", legacy), func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "backend.yaml")
-			if err := os.WriteFile(path, []byte(fmt.Sprintf(chartShapedConfig, legacy)), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			cfg, err := Load(path)
-			if err != nil {
-				t.Fatalf("chart-shaped config must load: %v", err)
-			}
-			for _, a := range defaultASAudiences {
-				if !containsString(cfg.AS.Audiences, a) {
-					t.Errorf("default audience %q missing from %v", a, cfg.AS.Audiences)
-				}
-			}
-			if got := containsString(cfg.AS.Audiences, "wallet.example.org"); got != legacy {
-				t.Errorf("rp_id in audiences = %t, want %t (%v)", got, legacy, cfg.AS.Audiences)
-			}
-			if cfg.JWT.Issuer != "wallet-backend" {
-				t.Errorf("jwt.issuer = %q", cfg.JWT.Issuer)
-			}
-		})
+	path := filepath.Join(t.TempDir(), "backend.yaml")
+	if err := os.WriteFile(path, []byte(chartShapedConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("chart-shaped config must load: %v", err)
+	}
+	for _, a := range defaultASAudiences {
+		if !containsString(cfg.AS.Audiences, a) {
+			t.Errorf("default audience %q missing from %v", a, cfg.AS.Audiences)
+		}
+	}
+	if cfg.JWT.Issuer != "wallet-backend" {
+		t.Errorf("jwt.issuer = %q", cfg.JWT.Issuer)
+	}
+	if got := cfg.DeprecatedSettings(); len(got) != 1 || !strings.Contains(got[0], "as.legacy.enabled") {
+		t.Errorf("DeprecatedSettings() = %v, want only as.legacy.enabled", got)
 	}
 }
 
@@ -3178,66 +3083,28 @@ func TestPKCS11SigningConfig_ResolvePIN(t *testing.T) {
 	}
 }
 
-// An empty jwt.issuer (e.g. blanked by the environment) with legacy on gets
-// the documented default instead of failing; Load and EnableForRole agree.
-func TestApplyASSecurityDefaults_JWTIssuerAndParity(t *testing.T) {
+// Load and EnableForRole must apply the same AS defaults.
+func TestApplyASSecurityDefaults_Parity(t *testing.T) {
 	mk := func() *Config {
 		c := validBaseConfig()
 		c.Server.RPID = "wallet.example.org"
 		c.AS = ASConfig{Enabled: true, SigningKeyPath: "/k", RulesDir: "/r", Issuer: "https://x"}
-		c.AS.Legacy.Enabled = true
 		return c
 	}
 	a := mk()
 	a.applyASSecurityDefaults()
-	if a.JWT.Issuer != "wallet-backend" {
-		t.Fatalf("jwt.issuer = %q", a.JWT.Issuer)
-	}
 	if err := a.Validate(); err != nil {
 		t.Fatal(err)
 	}
 	b := mk()
 	b.EnableForRole()
-	if fmt.Sprint(a.AS.Audiences) != fmt.Sprint(b.AS.Audiences) || a.JWT.Issuer != b.JWT.Issuer {
-		t.Errorf("Load and EnableForRole defaults differ: %v/%q vs %v/%q", a.AS.Audiences, a.JWT.Issuer, b.AS.Audiences, b.JWT.Issuer)
+	if fmt.Sprint(a.AS.Audiences) != fmt.Sprint(b.AS.Audiences) {
+		t.Errorf("Load and EnableForRole defaults differ: %v vs %v", a.AS.Audiences, b.AS.Audiences)
 	}
 	// AS disabled: untouched.
 	d := validBaseConfig()
 	d.applyASSecurityDefaults()
 	if len(d.AS.Audiences) != 0 {
 		t.Errorf("AS disabled must not get audiences: %v", d.AS.Audiences)
-	}
-}
-
-// as.legacy.sunset_date shipped in v0.10.0; it is now a no-op that must still
-// load and be reported by DeprecatedSettings so the process can warn.
-func TestLoad_DeprecatedSunsetDateStillLoads(t *testing.T) {
-	configPath := filepath.Join(t.TempDir(), "config.yaml")
-	content := `
-server:
-  host: localhost
-  port: 8080
-  rp_id: localhost
-  rp_origin: http://localhost:8080
-storage:
-  type: memory
-jwt:
-  secret: test-secret-that-is-at-least-32-bytes-long
-as:
-  legacy:
-    sunset_date: "2027-10-01T00:00:00Z"
-`
-	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := Load(configPath)
-	if err != nil {
-		t.Fatalf("a config that still sets as.legacy.sunset_date must load: %v", err)
-	}
-	if got := cfg.DeprecatedSettings(); len(got) != 1 || !strings.Contains(got[0], "as.legacy.sunset_date") {
-		t.Errorf("DeprecatedSettings() = %v, want as.legacy.sunset_date", got)
-	}
-	if got := (&Config{}).DeprecatedSettings(); len(got) != 0 {
-		t.Errorf("DeprecatedSettings() on a clean config = %v, want none", got)
 	}
 }

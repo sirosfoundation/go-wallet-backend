@@ -13,8 +13,7 @@ import (
 func TestLogLegacyStatus_OncePerProcess(t *testing.T) {
 	cases := map[string]config.ASConfig{
 		"backend without AS":          {},
-		"AS enabled, legacy on":       {Enabled: true, Legacy: config.ASLegacyConfig{Enabled: true}},
-		"AS enabled, legacy off":      {Enabled: true},
+		"AS enabled":                  {Enabled: true},
 		"standalone engine/wallet-pr": {Enabled: false},
 	}
 	for name, as := range cases {

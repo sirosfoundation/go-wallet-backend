@@ -50,7 +50,12 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to load backend configuration: %v", err)
 		}
-		if roles.Has(modes.RoleAuth) {
+		// The backend role serves protected routes and AS-issued session
+		// tokens are its only authentication mechanism (the legacy HMAC
+		// path was removed), so it turns the AS on exactly like the auth
+		// role does; an explicit as.enabled: false is still honoured and
+		// makes the backend refuse to start with a clear error.
+		if roles.Has(modes.RoleAuth) || roles.Has(modes.RoleBackend) {
 			backendCfg.EnableForRole()
 			// EnableForRole mutates the already-validated config (e.g.
 			// falling back to WalletProvider's signing key for AS), so
@@ -101,8 +106,8 @@ func main() {
 		zap.Strings("roles", roleStrings),
 	)
 
-	// Every process that loaded the backend config honours as.legacy.enabled,
-	// whatever its roles, so log the legacy status here exactly once.
+	// Every process that loaded the backend config logs that the legacy AS is
+	// gone and warns about leftover settings, whatever its roles, exactly once.
 	logLegacyStatus(backendCfg, logger)
 
 	// Security configuration validation for production environments
@@ -254,8 +259,8 @@ func main() {
 			provider.SetTokenValidator(backendProvider.TokenValidator())
 		}
 		// Standalone engine (no backend provider): build a JWKS-backed
-		// validator so session tokens work and as.legacy.enabled=false does not
-		// leave the handshake with no way to authenticate.
+		// validator so session tokens work (there is no HMAC fallback to
+		// authenticate the handshake otherwise).
 		if backendProvider == nil {
 			sv, err := server.NewStandaloneEngineTokenValidator(backendCfg, logger)
 			if err != nil {
@@ -268,8 +273,8 @@ func main() {
 		}
 		// Wire the same token blacklist the HTTP auth middlewares use, so a
 		// revoked token (or a deleted user's other tokens) is rejected
-		// during the WebSocket handshake too, on both the go-tokenauth and
-		// legacy HMAC paths - see EngineProvider.SetTokenBlacklist.
+		// during the WebSocket handshake too - see
+		// EngineProvider.SetTokenBlacklist.
 		if backendProvider != nil {
 			provider.SetTokenBlacklist(backendProvider.Services().TokenBlacklist)
 		}
@@ -377,9 +382,9 @@ func loadRegistryConfig(path string) (*registry.Config, error) {
 	return cfg, nil
 }
 
-// logLegacyStatus logs the legacy (HMAC) session-token status once for a
-// process that loaded the backend config; a nil config (registry-only) logs
-// nothing.
+// logLegacyStatus logs that the legacy HMAC AS was removed, and warns about
+// leftover settings, once for a process that loaded the backend config; a nil
+// config (registry-only) logs nothing.
 func logLegacyStatus(cfg *config.Config, logger *zap.Logger) {
 	if cfg == nil {
 		return

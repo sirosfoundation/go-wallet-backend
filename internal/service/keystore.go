@@ -86,7 +86,7 @@ func (s *KeystoreService) SignJwtPresentation(ctx context.Context, userID, nonce
 }
 
 // SetTokenValidator makes the keystore socket handshake use the shared
-// go-tokenauth validator (ES256 via JWKS; HMAC only while legacy is enabled).
+// go-tokenauth validator (AS-issued ES256/EdDSA session tokens via JWKS).
 func (s *KeystoreService) SetTokenValidator(v *tokenvalidator.Validator) {
 	s.wsManager.SetTokenValidator(v)
 }

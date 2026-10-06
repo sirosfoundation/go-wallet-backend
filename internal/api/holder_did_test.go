@@ -17,10 +17,10 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
-// legacyAuthContext mimics pkg/middleware.AuthMiddleware(WithBlacklist): a
-// legacy HMAC token sets both "did" and "user_id" in the gin context, with
-// did == domain.HolderDID(userID) (see UserService/WebAuthnService
-// generateToken).
+// legacyAuthContext mimics an authentication that sets both "did" and
+// "user_id" in the gin context, with did == domain.HolderDID(userID): what the
+// removed legacy HMAC tokens carried. Credentials stored under that did must
+// stay reachable via user_id alone.
 func legacyAuthContext(userID string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Set("user_id", userID)
@@ -41,7 +41,7 @@ func asAuthContext(userID string) gin.HandlerFunc {
 
 // TestGetHolderDID_ConsistentAcrossTokenTypes proves #384 is fixed: the same
 // physical user resolves to the same holder DID whether they authenticated
-// with a legacy token (which sets "did") or an AS-issued token (which only
+// with a token that sets "did" (as the removed legacy HMAC tokens did) or an AS-issued token (which only
 // ever sets "user_id").
 func TestGetHolderDID_ConsistentAcrossTokenTypes(t *testing.T) {
 	handlers, _ := setupTestHandlers(t)
@@ -149,7 +149,7 @@ func TestDeleteUser_UsesCanonicalHolderDID(t *testing.T) {
 	logger := zap.NewNop()
 	cfg := &config.Config{
 		Server: config.ServerConfig{RPID: "localhost", RPOrigin: "http://localhost:8080"},
-		JWT:    config.JWTConfig{Secret: "test-secret", ExpiryHours: 24, Issuer: "test-wallet"},
+		JWT:    config.JWTConfig{Secret: "test-secret", Issuer: "test-wallet"},
 	}
 	store := memory.NewStore()
 	const userID = "user-delete-me"

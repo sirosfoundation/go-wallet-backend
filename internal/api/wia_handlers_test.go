@@ -34,9 +34,8 @@ func setupWIATestHandlers(t *testing.T, wiaEnabled bool) (*Handlers, *gin.Engine
 			RPName:   "Test Wallet",
 		},
 		JWT: config.JWTConfig{
-			Secret:      "test-secret-that-is-at-least-32-bytes-long",
-			ExpiryHours: 24,
-			Issuer:      "test-wallet",
+			Secret: "test-secret-that-is-at-least-32-bytes-long",
+			Issuer: "test-wallet",
 		},
 	}
 	cfg.WalletProvider.WIA = config.WIAConfig{

@@ -216,225 +216,6 @@ func TestManager_ConnectionLimit_NoOvershootUnderConcurrency(t *testing.T) {
 		"activeConnections must never exceed maxConnections under concurrent requests")
 }
 
-func TestManager_validateToken_UserID(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-			Issuer: "test-issuer",
-		},
-	}
-	logger := zap.NewNop()
-	m := NewManager(cfg, logger)
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":       "test-issuer",
-		"user_id":   "test-user-123",
-		"tenant_id": "test-tenant",
-		"exp":       time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	userID, tenantID, tac, err := m.validateToken(context.Background(), tokenString)
-	require.NoError(t, err)
-	assert.Equal(t, "test-user-123", userID)
-	assert.Equal(t, "test-tenant", tenantID)
-	// Regression: the legacy HMAC path has no TAC concept at all - callers
-	// (handleFlowStart) must treat this as "not applicable", not "no
-	// permissions". See requiredTACForProtocol's doc comment.
-	assert.Equal(t, claims.TAC(""), tac)
-}
-
-func TestManager_validateToken_UUID(t *testing.T) {
-	// Test wallet-backend-server compatibility: token has "uuid" instead of "user_id"
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-			Issuer: "test-issuer",
-		},
-	}
-	logger := zap.NewNop()
-	m := NewManager(cfg, logger)
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":  "test-issuer",
-		"uuid": "uuid-user-456",
-		"v":    1, // wallet-backend-server includes version
-		"exp":  time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	userID, tenantID, _, err := m.validateToken(context.Background(), tokenString)
-	require.NoError(t, err)
-	assert.Equal(t, "uuid-user-456", userID)
-	assert.Empty(t, tenantID) // wallet-backend-server tokens don't have tenant_id
-}
-
-func TestManager_validateToken_UserIDTakesPrecedence(t *testing.T) {
-	// When both user_id and uuid are present, user_id should take precedence
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-			Issuer: "test-issuer",
-		},
-	}
-	logger := zap.NewNop()
-	m := NewManager(cfg, logger)
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":     "test-issuer",
-		"user_id": "native-user",
-		"uuid":    "compat-user",
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	userID, _, _, err := m.validateToken(context.Background(), tokenString)
-	require.NoError(t, err)
-	assert.Equal(t, "native-user", userID)
-}
-
-func TestManager_validateToken_MissingBothUserIDAndUUID(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-			Issuer: "test-issuer",
-		},
-	}
-	logger := zap.NewNop()
-	m := NewManager(cfg, logger)
-
-	// Create token without user_id or uuid
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":              "test-issuer",
-		"some_other_claim": "value",
-		"exp":              time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	_, _, _, err = m.validateToken(context.Background(), tokenString)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "missing user_id or uuid")
-}
-
-func TestManager_validateToken_InvalidSigningMethod(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-			Issuer: "test-issuer",
-		},
-	}
-	logger := zap.NewNop()
-	m := NewManager(cfg, logger)
-
-	// Create token with None signing method (not HMAC)
-	token := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{
-		"user_id": "test-user",
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, _ := token.SignedString(jwt.UnsafeAllowNoneSignatureType)
-
-	_, _, _, err := m.validateToken(context.Background(), tokenString)
-	assert.Error(t, err)
-}
-
-func TestManager_validateToken_ExpiredToken(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-			Issuer: "test-issuer",
-		},
-	}
-	logger := zap.NewNop()
-	m := NewManager(cfg, logger)
-
-	// Create expired token
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":     "test-issuer",
-		"user_id": "test-user",
-		"exp":     time.Now().Add(-time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	_, _, _, err = m.validateToken(context.Background(), tokenString)
-	assert.Error(t, err)
-}
-
-func TestManager_validateToken_WrongSecret(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "correct-secret",
-			Issuer: "test-issuer",
-		},
-	}
-	logger := zap.NewNop()
-	m := NewManager(cfg, logger)
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":     "test-issuer",
-		"user_id": "test-user",
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("wrong-secret"))
-	require.NoError(t, err)
-
-	_, _, _, err = m.validateToken(context.Background(), tokenString)
-	assert.Error(t, err)
-}
-
-func TestManager_validateToken_NbfSlightlyInFuture(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-			Issuer: "test-issuer",
-		},
-	}
-	logger := zap.NewNop()
-	m := NewManager(cfg, logger)
-
-	// Token with nbf 2 seconds in the future — within the 5s leeway
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":     "test-issuer",
-		"user_id": "test-user",
-		"nbf":     time.Now().Add(2 * time.Second).Unix(),
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	userID, _, _, err := m.validateToken(context.Background(), tokenString)
-	require.NoError(t, err)
-	assert.Equal(t, "test-user", userID)
-}
-
-func TestManager_validateToken_NbfBeyondLeeway(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-			Issuer: "test-issuer",
-		},
-	}
-	logger := zap.NewNop()
-	m := NewManager(cfg, logger)
-
-	// Token with nbf 10 seconds in the future — beyond the 5s leeway
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":     "test-issuer",
-		"user_id": "test-user",
-		"nbf":     time.Now().Add(10 * time.Second).Unix(),
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	_, _, _, err = m.validateToken(context.Background(), tokenString)
-	assert.Error(t, err)
-}
-
 // TestManager_validateToken_GoTokenauth_AllowsRegistryAudience is a
 // regression test for the engine transport audience restriction: the engine
 // transport, like the AuthZEN proxy, only needs a wallet-registry or
@@ -480,9 +261,8 @@ func TestManager_validateToken_GoTokenauth_RejectsOtherAudience(t *testing.T) {
 
 // fakeEngineBlacklist is a minimal TokenBlacklistChecker test double.
 type fakeEngineBlacklist struct {
-	revoked         map[string]bool
-	revokedUsers    map[string]bool
-	revokedFamilies map[string]bool
+	revoked      map[string]bool
+	revokedUsers map[string]bool
 }
 
 func (f *fakeEngineBlacklist) IsBlacklisted(ctx context.Context, jti string) bool {
@@ -491,10 +271,6 @@ func (f *fakeEngineBlacklist) IsBlacklisted(ctx context.Context, jti string) boo
 
 func (f *fakeEngineBlacklist) IsUserRevoked(ctx context.Context, userID string) bool {
 	return f.revokedUsers[userID]
-}
-
-func (f *fakeEngineBlacklist) IsFamilyRevoked(ctx context.Context, sid string) bool {
-	return f.revokedFamilies[sid]
 }
 
 // TestManager_validateToken_GoTokenauth_RevokedUserDenied proves the #391
@@ -520,143 +296,6 @@ func TestManager_validateToken_GoTokenauth_RevokedUserDenied(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// TestManager_validateToken_Legacy_RevokedJTIDenied and
-// TestManager_validateToken_Legacy_RevokedUserDenied prove the #391 review
-// fix (round 2): the legacy HMAC handshake path previously performed no
-// revocation check at all - a deleted user's (or explicitly logged-out)
-// legacy token could still establish an engine session.
-func TestManager_validateToken_Legacy_RevokedJTIDenied(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
-	m := NewManager(cfg, zap.NewNop())
-	m.SetTokenBlacklist(&fakeEngineBlacklist{revoked: map[string]bool{"jti-revoked": true}})
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":     "test-issuer",
-		"user_id": "test-user-123",
-		"jti":     "jti-revoked",
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	_, _, _, err = m.validateToken(context.Background(), tokenString)
-	assert.Error(t, err)
-}
-
-func TestManager_validateToken_Legacy_RevokedUserDenied(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
-	m := NewManager(cfg, zap.NewNop())
-	m.SetTokenBlacklist(&fakeEngineBlacklist{revokedUsers: map[string]bool{"test-user-123": true}})
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":     "test-issuer",
-		"user_id": "test-user-123",
-		"jti":     "jti-not-individually-blacklisted",
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	_, _, _, err = m.validateToken(context.Background(), tokenString)
-	assert.Error(t, err)
-}
-
-// TestManager_validateToken_Legacy_NonRevokedAllowed is the sanity check
-// for the two tests above: the same blacklist wiring still allows a
-// non-revoked legacy token through.
-func TestManager_validateToken_Legacy_NonRevokedAllowed(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
-	m := NewManager(cfg, zap.NewNop())
-	m.SetTokenBlacklist(&fakeEngineBlacklist{
-		revoked:      map[string]bool{"some-other-jti": true},
-		revokedUsers: map[string]bool{"some-other-user": true},
-	})
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":     "test-issuer",
-		"user_id": "test-user-123",
-		"jti":     "jti-fine",
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	userID, _, _, err := m.validateToken(context.Background(), tokenString)
-	require.NoError(t, err)
-	assert.Equal(t, "test-user-123", userID)
-}
-
-// TestManager_validateToken_Legacy_RevokedFamilyDenied is a regression test
-// for a Copilot review finding on #414: an access token carrying a "sid"
-// claim (the refresh-token family/session id - see
-// service.WebAuthnService.generateToken's doc comment) must be rejected
-// once that family has been revoked (TokenBlacklist.RevokeFamily, what
-// api.Handlers.Logout calls), even though this token's own jti was never
-// individually blacklisted - otherwise an access token from an earlier
-// rotation of an already-logged-out session could still establish a NEW
-// engine WebSocket session.
-func TestManager_validateToken_Legacy_RevokedFamilyDenied(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
-	m := NewManager(cfg, zap.NewNop())
-	m.SetTokenBlacklist(&fakeEngineBlacklist{revokedFamilies: map[string]bool{"sid-revoked-1": true}})
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id": "test-user-123",
-		"jti":     "jti-not-individually-blacklisted",
-		"sid":     "sid-revoked-1",
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	_, _, _, err = m.validateToken(context.Background(), tokenString)
-	assert.Error(t, err)
-}
-
-// TestManager_validateToken_GoTokenauth_ModeLegacy_RevokedFamilyDenied is a
-// regression test for the same #414 finding, on the go-tokenauth path: it
-// "auto-detects new-style vs legacy" tokens, so a WebAuthnService-issued
-// legacy HMAC token can reach this branch too whenever the AS is enabled
-// (m.tokenValidator set) - go-tokenauth's shared *claims.Result has no
-// "sid" field at all, so validateToken must re-parse the raw token itself
-// (legacyTokenSID) to still catch a revoked family here.
-func TestManager_validateToken_GoTokenauth_ModeLegacy_RevokedFamilyDenied(t *testing.T) {
-	secret := "test-secret-legacy-mode"
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: secret}}
-	m := NewManager(cfg, zap.NewNop())
-	v := tokenvalidator.New(tokenvalidator.Config{
-		Audiences: []string{"wallet.example.com"},
-		Legacy: tokenvalidator.LegacyConfig{
-			Enabled:    true,
-			HMACSecret: []byte(secret),
-			Issuers:    []string{"test-legacy-issuer"},
-		},
-	})
-	m.SetTokenValidator(v)
-	m.SetTokenBlacklist(&fakeEngineBlacklist{revokedFamilies: map[string]bool{"sid-revoked-2": true}})
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id":   "test-user-123",
-		"tenant_id": "test-tenant",
-		"jti":       "jti-not-individually-blacklisted-2",
-		"sid":       "sid-revoked-2",
-		"iss":       "test-legacy-issuer",
-		"aud":       "wallet.example.com",
-		"exp":       time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte(secret))
-	require.NoError(t, err)
-
-	_, _, _, err = m.validateToken(context.Background(), tokenString)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "revoked", "must be rejected by the family check, not the audience check")
-}
-
-// ===== handleFlowStart TAC enforcement tests =====
-
-// stubFlowHandler is a minimal FlowHandler that succeeds immediately,
-// for tests that only care whether handleFlowStart's TAC gate let the
-// flow reach a handler at all, not what the handler itself does.
 type stubFlowHandler struct{}
 
 func (stubFlowHandler) Execute(ctx context.Context, msg *FlowStartMessage) error { return nil }
@@ -747,9 +386,9 @@ func TestManager_handleFlowStart_AllowsSufficientTAC(t *testing.T) {
 }
 
 // TestManager_handleFlowStart_NoOpWhenTACEmpty is a regression test: an
-// empty session.TAC means "not applicable" (legacy auth, no TAC concept at
-// all - see Manager.validateToken), not "no permissions". A legacy-
-// authenticated session must not be blocked from starting any flow.
+// empty session.TAC means "not applicable" (the token carries no TAC claim -
+// see Manager.validateToken), not "no permissions". Such a session must not
+// be blocked from starting any flow.
 func TestManager_handleFlowStart_NoOpWhenTACEmpty(t *testing.T) {
 	m := newManagerWithStubOID4VCIHandler(t)
 
@@ -1032,8 +671,8 @@ func TestBaseHandler_CompleteWithRefreshToken(t *testing.T) {
 }
 
 // dialAndHandshakeAsUser dials m's HandleConnection over a real WebSocket
-// connection, completes the handshake for userID with a legacy HMAC token
-// (mirroring TestManager_validateToken_UserID), and waits for the session to
+// connection, completes the handshake for userID with an AS session token
+// (see engineSessionToken), and waits for the session to
 // be registered in m.sessions before returning. This exercises the same
 // path a real client goes through, not a synthetic Session built by hand.
 // (Named distinctly from keepalive_test.go's dialAndHandshake, which always
@@ -1041,13 +680,7 @@ func TestBaseHandler_CompleteWithRefreshToken(t *testing.T) {
 func dialAndHandshakeAsUser(t *testing.T, m *Manager, wsURL, userID string) *websocket.Conn {
 	t.Helper()
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":     "test-issuer",
-		"user_id": userID,
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte(m.cfg.JWT.Secret))
-	require.NoError(t, err)
+	tokenString := engineSessionToken(t, m, userID)
 
 	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	require.NoError(t, err)
@@ -1370,8 +1003,7 @@ func TestManager_RegisterSession_RejectsRevokedUser_WithoutBlacklistFeature(t *t
 // already-established session AND reject a brand new handshake attempt
 // for that user, entirely independent of the optional
 // security.token_blacklist feature - which this test never configures at
-// all (no SetTokenBlacklist call, legacy HMAC auth path, m.blacklist is
-// nil throughout).
+// all (no SetTokenBlacklist call; m.blacklist is nil throughout).
 func TestManager_DeleteByUser_WorksWithoutTokenBlacklistFeature(t *testing.T) {
 	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
@@ -1396,13 +1028,7 @@ func TestManager_DeleteByUser_WorksWithoutTokenBlacklistFeature(t *testing.T) {
 
 	// A brand new handshake attempt for the same (now-revoked) user must
 	// also be rejected - not just the already-open session closed.
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"iss":     "test-issuer",
-		"user_id": userID,
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte(m.cfg.JWT.Secret))
-	require.NoError(t, err)
+	tokenString := engineSessionToken(t, m, userID)
 
 	ws2, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	require.NoError(t, err)
@@ -1417,93 +1043,85 @@ func TestManager_DeleteByUser_WorksWithoutTokenBlacklistFeature(t *testing.T) {
 	assert.Equal(t, TypeError, msg.Type, "a new handshake for a revoked user must be rejected, not completed")
 }
 
-func TestManager_validateToken_GoTokenauth_ModeLegacy_UndeterminableSIDFailsClosed(t *testing.T) {
-	validatorSecret := "test-secret-legacy-mode"
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "a-different-secret"}}
-	m := NewManager(cfg, zap.NewNop())
-	m.SetTokenValidator(tokenvalidator.New(tokenvalidator.Config{
-		Audiences: []string{"wallet.example.com"},
-		Legacy:    tokenvalidator.LegacyConfig{Enabled: true, HMACSecret: []byte(validatorSecret), Issuers: []string{"test-legacy-issuer"}},
-	}))
-	m.SetTokenBlacklist(&fakeEngineBlacklist{})
+// engineKeys remembers the signing key of the validator engineSessionToken
+// installs on a Manager, so repeated calls for one Manager sign with the key
+// its validator trusts.
+var engineKeys sync.Map // *Manager -> *ecdsa.PrivateKey
 
-	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id": "u", "tenant_id": "t", "jti": "j", "sid": "s",
-		"iss": "test-legacy-issuer", "aud": "wallet.example.com", "exp": time.Now().Add(time.Hour).Unix(),
+// engineSessionToken returns an AS-style ES256 session token for userID,
+// installing a go-tokenauth validator (backed by a local JWKS server) on m the
+// first time it is called for that Manager. Handshakes authenticate through
+// the validator only: there is no HMAC fallback.
+func engineSessionToken(t *testing.T, m *Manager, userID string) string {
+	t.Helper()
+	_, key, issuer := ensureEngineValidator(t, m)
+	return signEngineToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   gojosejwt.Claims{Audience: gojosejwt.Audience{"wallet-backend"}, Subject: userID},
+		TenantID: "test-tenant",
+		TAC:      "rwl",
+		ACR:      "urn:siros:acr:passkey",
 	})
-	tokenString, err := tok.SignedString([]byte(validatorSecret))
-	require.NoError(t, err)
-
-	_, _, _, err = m.validateToken(context.Background(), tokenString)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "cannot determine token family")
 }
 
-// A token accepted within go-tokenauth's clock-skew leeway (expired 2s ago)
-// must still have its revoked-family check applied.
-func TestManager_validateToken_GoTokenauth_ModeLegacy_RevokedFamilyDenied_InsideSkewWindow(t *testing.T) {
-	secret := "test-secret-legacy-mode"
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: secret}}
-	m := NewManager(cfg, zap.NewNop())
-	m.SetTokenValidator(tokenvalidator.New(tokenvalidator.Config{
-		Audiences: []string{"wallet.example.com"},
-		Legacy:    tokenvalidator.LegacyConfig{Enabled: true, HMACSecret: []byte(secret), Issuers: []string{"test-legacy-issuer"}},
-	}))
-	bl := &fakeEngineBlacklist{revokedFamilies: map[string]bool{}}
-	m.SetTokenBlacklist(bl)
-
-	tok := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id": "u", "tenant_id": "t", "jti": "j", "sid": "sid-skew",
-		"iss": "test-legacy-issuer", "aud": "wallet.example.com", "exp": time.Now().Add(-2 * time.Second).Unix(),
-	})
-	tokenString, err := tok.SignedString([]byte(secret))
-	require.NoError(t, err)
-
-	_, _, _, err = m.validateToken(context.Background(), tokenString)
-	require.NoError(t, err, "precondition: skew-window token accepted before revocation")
-	bl.revokedFamilies["sid-skew"] = true
-	_, _, _, err = m.validateToken(context.Background(), tokenString)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "revoked")
+func ensureEngineValidator(t *testing.T, m *Manager) (*tokenvalidator.Validator, *ecdsa.PrivateKey, string) {
+	t.Helper()
+	if k, ok := engineKeys.Load(m); ok {
+		return m.tokenValidator, k.(*ecdsa.PrivateKey), "test-issuer"
+	}
+	v, key, issuer := setupEngineTokenValidatorTest(t)
+	m.SetTokenValidator(v)
+	engineKeys.Store(m, key)
+	t.Cleanup(func() { engineKeys.Delete(m) })
+	return v, key, issuer
 }
 
-// A done context must fail closed in validateToken (never read as "family
-// not revoked"), on both the legacy-HMAC and go-tokenauth ModeLegacy paths.
+// With no token validator wired the handshake has no way to authenticate, and
+// there is no HMAC fallback: every token is refused (fail closed).
+func TestManager_validateToken_NoValidatorFailsClosed(t *testing.T) {
+	m := NewManager(&config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}, zap.NewNop())
+
+	hmacToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss": "test-issuer", "user_id": "u", "tenant_id": "t", "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte("test-secret"))
+	require.NoError(t, err)
+
+	_, _, _, err = m.validateToken(context.Background(), hmacToken)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no token validator")
+}
+
+// An HS256 token signed with jwt.secret - what the removed legacy AS issued -
+// is refused even when a validator is wired.
+func TestManager_validateToken_HMACTokenRefused(t *testing.T) {
+	m := NewManager(&config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}, zap.NewNop())
+	v, _, issuer := setupEngineTokenValidatorTest(t)
+	m.SetTokenValidator(v)
+
+	hmacToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss": issuer, "aud": "wallet-backend", "user_id": "u", "tenant_id": "t",
+		"exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte("test-secret"))
+	require.NoError(t, err)
+
+	_, _, _, err = m.validateToken(context.Background(), hmacToken)
+	require.Error(t, err)
+}
+
+// A done context fails closed in validateToken (never read as "not revoked").
 func TestManager_validateToken_CancelledContextFailsClosed(t *testing.T) {
-	secret := "test-secret-legacy-mode"
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: secret}}
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id": "test-user-123",
-		"iss":     "test-legacy-issuer",
-		"aud":     "wallet.example.com",
-		"sid":     "sid-live",
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte(secret))
-	require.NoError(t, err)
+	m := NewManager(&config.Config{}, zap.NewNop())
+	token := engineSessionToken(t, m, "test-user-123")
+	m.SetTokenBlacklist(&fakeEngineBlacklist{})
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-
-	plain := NewManager(cfg, zap.NewNop())
-	plain.SetTokenBlacklist(&fakeEngineBlacklist{})
-	_, _, _, err = plain.validateToken(ctx, tokenString)
-	require.ErrorIs(t, err, context.Canceled)
-
-	withValidator := NewManager(cfg, zap.NewNop())
-	withValidator.SetTokenValidator(tokenvalidator.New(tokenvalidator.Config{
-		Audiences: []string{"wallet.example.com"},
-		Legacy: tokenvalidator.LegacyConfig{
-			Enabled:    true,
-			HMACSecret: []byte(secret),
-			Issuers:    []string{"test-legacy-issuer"},
-		},
-	}))
-	withValidator.SetTokenBlacklist(&fakeEngineBlacklist{})
-	_, _, _, err = withValidator.validateToken(ctx, tokenString)
+	_, _, _, err := m.validateToken(ctx, token)
 	require.ErrorIs(t, err, context.Canceled)
 
 	// Sanity: the same token is accepted with a live context.
-	_, _, _, err = withValidator.validateToken(context.Background(), tokenString)
+	uid, tenantID, tac, err := m.validateToken(context.Background(), token)
 	require.NoError(t, err)
+	assert.Equal(t, "test-user-123", uid)
+	assert.Equal(t, "test-tenant", tenantID)
+	assert.Equal(t, claims.TAC("rwl"), tac)
 }

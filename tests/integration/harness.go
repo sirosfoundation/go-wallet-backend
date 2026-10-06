@@ -3,6 +3,9 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,7 +17,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
 
+	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
+
 	"github.com/sirosfoundation/go-wallet-backend/internal/api"
+	"github.com/sirosfoundation/go-wallet-backend/internal/as"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/health"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
@@ -43,7 +49,21 @@ type TestHarness struct {
 
 	// Readiness manager for /readyz tests
 	Readiness *health.ReadinessManager
+
+	// tokenIssuer mints the AS session access tokens CreateTestUser hands
+	// out; validator is the go-tokenauth validator (backed by a local JWKS
+	// server) that the harness's protected routes use - the same shape as
+	// production, where AS-issued ES256 tokens are the only credential.
+	tokenIssuer *as.TokenIssuer
+	validator   *tokenvalidator.Validator
 }
+
+// harnessAudience is the audience the harness's tokens carry and its
+// protected routes require, like production's "wallet-backend".
+const harnessAudience = "wallet-backend"
+
+// harnessIssuer is the iss of the harness's AS tokens (jwt.issuer fallback).
+const harnessIssuer = "test-wallet-backend"
 
 // TestHarnessOption configures the test harness
 type TestHarnessOption func(*TestHarness)
@@ -70,10 +90,8 @@ func defaultTestConfig() *config.Config {
 			Type: "memory",
 		},
 		JWT: config.JWTConfig{
-			Secret:      "test-secret-key-for-integration-tests",
-			ExpiryHours: 24,
-			RefreshDays: 7,
-			Issuer:      "test-wallet-backend",
+			Secret: "test-secret-key-for-integration-tests",
+			Issuer: "test-wallet-backend",
 		},
 	}
 }
@@ -115,10 +133,13 @@ func NewTestHarness(t *testing.T, opts ...TestHarnessOption) *TestHarness {
 	// Create handlers (using "test" role for integration tests)
 	handlers := api.NewHandlers(h.Services, h.Config, logger, []string{"test"})
 
+	// AS token issuance + validation, as in production (no HMAC tokens exist)
+	h.setupTokenAuth()
+
 	// Setup router
 	h.Router = gin.New()
 	h.Router.Use(gin.Recovery())
-	setupRoutes(h.Router, handlers, h.Config, h.Storage, h.Readiness, logger)
+	setupRoutes(h.Router, handlers, h, logger)
 
 	// Create test server
 	h.Server = httptest.NewServer(h.Router)
@@ -132,10 +153,61 @@ func NewTestHarness(t *testing.T, opts ...TestHarnessOption) *TestHarness {
 	return h
 }
 
+// setupTokenAuth builds an AS token issuer (in-memory ES256 key) and a
+// go-tokenauth validator that fetches that key from a local JWKS server, and
+// waits until the validator has loaded it.
+func (h *TestHarness) setupTokenAuth() {
+	h.T.Helper()
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		h.T.Fatalf("generate AS key: %v", err)
+	}
+	km, err := as.NewKeyManagerFromSigner(key)
+	if err != nil {
+		h.T.Fatalf("key manager: %v", err)
+	}
+	h.tokenIssuer = as.NewTokenIssuer(km, harnessIssuer, func(string) time.Duration { return 5 * time.Minute })
+
+	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(km.JWKS())
+	}))
+	h.T.Cleanup(jwksSrv.Close)
+
+	h.validator = tokenvalidator.New(tokenvalidator.Config{
+		JWKSURL:   jwksSrv.URL,
+		Issuer:    harnessIssuer,
+		Audiences: []string{harnessAudience},
+	})
+	h.validator.Start(context.Background())
+	h.T.Cleanup(h.validator.Stop)
+
+	probe, err := h.tokenIssuer.Issue("probe", harnessAudience, "default", "r", "urn:siros:acr:passkey")
+	if err != nil {
+		h.T.Fatalf("probe token: %v", err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		if _, err := h.validator.Validate(context.Background(), probe); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			h.T.Fatal("token validator did not load the JWKS in time")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // setupRoutes configures all API routes (mirrors the main server setup)
-func setupRoutes(r *gin.Engine, h *api.Handlers, cfg *config.Config, store storage.Store, readiness *health.ReadinessManager, logger *zap.Logger) {
-	// Create auth middleware
-	auth := middleware.AuthMiddleware(cfg, store, logger)
+func setupRoutes(r *gin.Engine, h *api.Handlers, th *TestHarness, logger *zap.Logger) {
+	cfg, store, readiness := th.Config, th.Storage, th.Readiness
+
+	// Auth middleware: AS session tokens only
+	auth := gin.HandlersChain{
+		middleware.TokenAuthMiddleware(th.validator, store.Tenants(), th.Services.TokenBlacklist, logger),
+		middleware.RequireAudience(harnessAudience),
+	}
 
 	// Health/status (public)
 	r.GET("/status", h.Status)
@@ -151,15 +223,24 @@ func setupRoutes(r *gin.Engine, h *api.Handlers, cfg *config.Config, store stora
 		c.JSON(http.StatusOK, status)
 	})
 
-	// WebAuthn routes (public - for registration/login)
-	r.POST("/user/register-webauthn-begin", h.StartWebAuthnRegistration)
-	r.POST("/user/register-webauthn-finish", h.FinishWebAuthnRegistration)
-	r.POST("/user/login-webauthn-begin", h.StartWebAuthnLogin)
-	r.POST("/user/login-webauthn-finish", h.FinishWebAuthnLogin)
+	// WebAuthn routes (public - for registration/login): the AS passkey
+	// handlers, wired like ASModule.RegisterRoutes does (tenant header
+	// middleware in front). They create an AS session and set the session
+	// cookie; the body carries no token.
+	passkeyHandlers := as.NewPasskeyHandlers(th.Services.WebAuthn, as.NewMemorySessionStore(),
+		&config.ASConfig{DefaultMaxTAC: "rwl", SessionTTL: time.Hour, InsecureCookies: true}, logger)
+	passkey := r.Group("/auth/passkey")
+	passkey.Use(middleware.TenantHeaderMiddleware(store))
+	{
+		passkey.POST("/register/begin", passkeyHandlers.RegisterBegin)
+		passkey.POST("/register/finish", passkeyHandlers.RegisterFinish)
+		passkey.POST("/login/begin", passkeyHandlers.LoginBegin)
+		passkey.POST("/login/finish", passkeyHandlers.LoginFinish)
+	}
 
 	// Session routes (authenticated)
 	session := r.Group("/user/session")
-	session.Use(auth)
+	session.Use(auth...)
 	{
 		session.GET("/account-info", h.GetAccountInfo)
 		session.GET("/private-data", h.GetPrivateData)
@@ -176,7 +257,7 @@ func setupRoutes(r *gin.Engine, h *api.Handlers, cfg *config.Config, store stora
 
 	// Storage routes (authenticated) — gated like production
 	storage := r.Group("/storage")
-	storage.Use(auth)
+	storage.Use(auth...)
 	{
 		// Credentials (gated behind feature flag, matching providers.go)
 		if cfg.Features.CredentialStorageEnabled {
@@ -403,7 +484,7 @@ type TestUser struct {
 	PrivateData []byte
 }
 
-// CreateTestUser creates a user directly in storage and generates a valid JWT token.
+// CreateTestUser creates a user directly in storage and issues a valid AS session access token.
 // This bypasses WebAuthn authentication for testing authenticated endpoints.
 func (h *TestHarness) CreateTestUser(displayName string) *TestUser {
 	h.T.Helper()
@@ -432,10 +513,10 @@ func (h *TestHarness) CreateTestUser(displayName string) *TestUser {
 		h.T.Fatalf("Failed to create test user: %v", err)
 	}
 
-	// Generate token using UserService (default tenant for test users)
-	token, err := h.Services.User.GenerateTokenForUser(user, domain.DefaultTenantID)
+	// Issue an AS session access token (default tenant for test users)
+	token, err := h.tokenIssuer.Issue(userID.String(), harnessAudience, string(domain.DefaultTenantID), "rwlidk", "urn:siros:acr:passkey")
 	if err != nil {
-		h.T.Fatalf("Failed to generate token for test user: %v", err)
+		h.T.Fatalf("Failed to issue token for test user: %v", err)
 	}
 
 	return &TestUser{
@@ -493,10 +574,10 @@ func (h *TestHarness) CreateTestUserWithCredentials(displayName string) *TestUse
 		h.T.Fatalf("Failed to create test user with credentials: %v", err)
 	}
 
-	// Generate token using UserService (default tenant for test users)
-	token, err := h.Services.User.GenerateTokenForUser(user, domain.DefaultTenantID)
+	// Issue an AS session access token (default tenant for test users)
+	token, err := h.tokenIssuer.Issue(userID.String(), harnessAudience, string(domain.DefaultTenantID), "rwlidk", "urn:siros:acr:passkey")
 	if err != nil {
-		h.T.Fatalf("Failed to generate token for test user: %v", err)
+		h.T.Fatalf("Failed to issue token for test user: %v", err)
 	}
 
 	return &TestUser{
