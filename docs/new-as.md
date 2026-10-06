@@ -285,7 +285,7 @@ Legacy responses include a `Deprecation: true` header (when `deprecation_header`
 
 ### Disabling legacy: `as.legacy.enabled=false` (implemented)
 
-The only switch is configuration. `as.legacy.enabled` defaults to `true`, so existing deployments are unchanged. Sunsetting the legacy AS is done only by flipping it to `false`, and clients must have moved to session mode first. The former `as.legacy.sunset_date` setting (env `WALLET_AS_LEGACY_SUNSET_DATE`) no longer has any effect; a config that still sets it loads, and a warning is logged at startup. With `as.legacy.enabled=false`:
+The only switch is configuration. `as.legacy.enabled` defaults to `true`, so existing deployments are unchanged. Sunsetting the legacy AS is done only by flipping it to `false`, and clients must have moved to session mode first. The `as.legacy.sunset_date` setting (env `WALLET_AS_LEGACY_SUNSET_DATE`) is deprecated and ignored; a config that still sets it loads, and a warning is logged at startup saying so. With `as.legacy.enabled=false`:
 
 - HMAC tokens are refused everywhere: `TokenAuthMiddleware`, the engine handshake (including the standalone-engine HMAC fallback), the no-AS `AuthMiddlewareWithBlacklist` path, and the keystore websocket. No legacy issuer is created.
 - Legacy issuance answers `410 legacy_tokens_disabled`: `/user/{register,login}-webauthn-*` and `/user/session/refresh` (whether or not this process runs the AS) and legacy-mode (`X-Token-Mode` absent) `/auth/passkey/{login,register}/*`. These 410s sit before any OIDC gate, so legacy-mode requests get `legacy_tokens_disabled` rather than an OIDC error. Session-mode clients are unaffected.

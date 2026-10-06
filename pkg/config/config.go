@@ -242,11 +242,11 @@ type ASLegacyConfig struct {
 	// legacy token responses.
 	DeprecationHeader bool `yaml:"deprecation_header" envconfig:"DEPRECATION_HEADER"`
 
-	// SunsetDate is a removed setting kept for one release so that existing
-	// configs still load. It is ignored (a warning is logged at startup).
-	// Sunsetting the legacy AS is done only by as.legacy.enabled=false.
+	// SunsetDate is a deprecated setting. It is ignored: it has no effect, and
+	// a config that still sets it loads but logs a startup warning. Sunsetting
+	// the legacy AS is done only by as.legacy.enabled=false.
 	//
-	// Deprecated: no effect; remove it from the configuration.
+	// Deprecated: ignored; remove it from the configuration.
 	SunsetDate string `yaml:"sunset_date" envconfig:"SUNSET_DATE"`
 }
 
