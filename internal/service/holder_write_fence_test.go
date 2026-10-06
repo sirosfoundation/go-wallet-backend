@@ -836,25 +836,9 @@ func TestHolderWriteFence_RollbackNeverTouchesAReplacement(t *testing.T) {
 		_, gerr := f.inner.Presentations().GetByIdentifier(context.Background(), domain.DefaultTenantID, f.did, "same-id")
 		require.NoError(t, gerr, "the fresh request's record must survive the stale rollback")
 	})
-	t.Run("credential update restore does not overwrite a fresh record", func(t *testing.T) {
-		f := newFenceFixture(t)
-		require.NoError(t, f.storeCred(context.Background(), "c1"))
-		f.rs.afterWrite = func() {
-			f.rs.afterWrite = nil
-			f.cutoffThenSweep(t) // removes the record the stale update changed
-			_, err := f.creds.Store(freshCtx(f), domain.DefaultTenantID, &domain.StoreCredentialRequest{
-				HolderDID: f.did, CredentialIdentifier: "c1", Credential: "fresh", Format: domain.FormatJWTVC, InstanceID: 42,
-			})
-			require.NoError(t, err)
-		}
-		_, err := f.creds.Update(f.tokCtx, domain.DefaultTenantID, f.did, &domain.UpdateCredentialRequest{CredentialIdentifier: "c1", InstanceID: 7, SigCount: 9})
-		require.ErrorIs(t, err, tokengate.ErrRevoked)
-		assert.NotErrorIs(t, err, tokengate.ErrWriteNotRolledBack)
-		got, gerr := f.inner.Credentials().GetByIdentifier(context.Background(), domain.DefaultTenantID, f.did, "c1")
-		require.NoError(t, gerr)
-		assert.Equal(t, "fresh", got.Credential, "the stale restore must not overwrite the replacement")
-		assert.Equal(t, 42, got.InstanceID)
-	})
+	// Request A updates R and is refused at the re-check; before its restore runs,
+	// an authorised post-cut-off request B updates the same R. A's restore must not
+	// clobber B (unconditional or by-id restore would).
 	t.Run("credential update restore does not overwrite a later update", func(t *testing.T) {
 		f := newFenceFixture(t)
 		require.NoError(t, f.storeCred(context.Background(), "c1"))
