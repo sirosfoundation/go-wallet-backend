@@ -774,6 +774,10 @@ func (h *Handlers) GenerateKeyAttestation(c *gin.Context) {
 		if abortIfTokenRevoked(c, err) {
 			return
 		}
+		if errors.Is(err, service.ErrKeyAttestationInstanceRefused) {
+			c.JSON(403, gin.H{"error": "FORBIDDEN", "message": "wallet instance not usable by this caller"})
+			return
+		}
 		h.logger.Error("Failed to generate key attestation", zap.Error(err))
 		c.JSON(400, gin.H{
 			"error":   "UNSUPPORTED",

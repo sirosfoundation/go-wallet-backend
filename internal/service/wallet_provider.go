@@ -297,6 +297,12 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
 		return "", err
 	}
+	// The user-wide cut-off says nothing about the instance the KA is bound
+	// to: a fresh token from another live instance must not obtain a KA for a
+	// revoked one (or another user's).
+	if err := s.refuseKeyAttestationInstance(ctx, walletInstanceID); err != nil {
+		return "", err
+	}
 	start := time.Now()
 	defer func() { kaGenerationDuration.Observe(time.Since(start).Seconds()) }()
 
@@ -413,9 +419,42 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
 		return "", err
 	}
+	if err := s.refuseKeyAttestationInstance(ctx, walletInstanceID); err != nil {
+		return "", err
+	}
 
 	kaGeneratedTotal.Inc()
 	return tokenString, nil
+}
+
+// ErrKeyAttestationInstanceRefused is returned when the wallet instance a key
+// attestation is requested for belongs to another user.
+var ErrKeyAttestationInstanceRefused = errors.New("wallet instance not usable by this caller")
+
+// refuseKeyAttestationInstance validates the wallet instance at the minting
+// boundary. A record that is not live (revoked, suspended, or of a status this
+// build does not recognize) is refused as a revoked token (401): fail closed,
+// nothing is changed. A record owned by a user other than the token's subject
+// is refused. An id the store does not know binds no lifecycle state and is
+// not judged; a failed lookup refuses.
+func (s *WalletProviderService) refuseKeyAttestationInstance(ctx context.Context, walletInstanceID string) error {
+	if walletInstanceID == "" || s.instances == nil {
+		return nil
+	}
+	instance, err := s.instances.GetByID(ctx, walletInstanceID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("recheck wallet instance: %w", err)
+	}
+	if !instance.Status.IsLive() {
+		return fmt.Errorf("%w: wallet instance is not live", tokengate.ErrRevoked)
+	}
+	if subject := tokengate.SubjectFrom(ctx); subject != "" && instance.UserID != nil && instance.UserID.String() != subject {
+		return ErrKeyAttestationInstanceRefused
+	}
+	return nil
 }
 
 // nativeAttestationSources are the WalletInstance.AttestationSource values

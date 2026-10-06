@@ -132,3 +132,34 @@ func TestProxyService_Execute_CutoffBetweenEarlyCheckAndDispatchIsRefused(t *tes
 	assert.Zero(t, hits.Load(), "the outbound request must not be made")
 	assert.Equal(t, 2, users.reads, "the early and the pre-dispatch check must both read the cut-off")
 }
+
+// The user-wide cut-off is not the instance's state: a token that is fresh
+// for its user can name a revoked instance (or another user's) and must not
+// obtain a KA for it, including a revoked native-attested one that
+// keyAttestationTrustsBatch would otherwise treat as trusted.
+func TestGenerateKeyAttestation_RefusesNonLiveOrForeignInstance(t *testing.T) {
+	base := context.Background()
+	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
+	owner, other := domain.NewUserID(), domain.NewUserID()
+	for _, inst := range []*domain.WalletInstance{
+		{ID: "live", TenantID: "t", UserID: &owner, Status: domain.InstanceStatusActive},
+		{ID: "revoked", TenantID: "t", UserID: &owner, Status: domain.InstanceStatusActive, AttestationSource: "ios_app_attest"},
+		{ID: "weird", TenantID: "t", UserID: &owner, Status: domain.InstanceStatus("bogus")},
+	} {
+		require.NoError(t, instances.Upsert(base, inst))
+	}
+	require.NoError(t, instances.UpdateStatus(base, "revoked", "t", domain.InstanceStatusRevoked, "stolen"))
+
+	jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "a", "y": "b"}}
+	ctx := tokengate.WithSubject(base, owner.String(), time.Now())
+
+	ka, err := svc.GenerateKeyAttestation(ctx, jwks, "n", nil, "live", "")
+	require.NoError(t, err)
+	assert.NotEmpty(t, ka)
+	_, err = svc.GenerateKeyAttestation(ctx, jwks, "n", &SecurityProperties{KeyStorage: []string{"iso_18045_high"}}, "revoked", "")
+	assert.ErrorIs(t, err, tokengate.ErrRevoked)
+	_, err = svc.GenerateKeyAttestation(ctx, jwks, "n", nil, "weird", "")
+	assert.ErrorIs(t, err, tokengate.ErrRevoked, "an unknown status fails closed")
+	_, err = svc.GenerateKeyAttestation(tokengate.WithSubject(base, other.String(), time.Now()), jwks, "n", nil, "live", "")
+	assert.ErrorIs(t, err, ErrKeyAttestationInstanceRefused)
+}

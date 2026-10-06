@@ -135,6 +135,13 @@ func WithSubject(ctx context.Context, userID string, issuedAt time.Time) context
 	return context.WithValue(WithIssuedAt(ctx, issuedAt), subjectKey{}, userID)
 }
 
+// SubjectFrom returns the user id recorded by WithSubject, or "" for a context
+// without one.
+func SubjectFrom(ctx context.Context) string {
+	userID, _ := ctx.Value(subjectKey{}).(string)
+	return userID
+}
+
 // RefuseNow reads the token's user cut-off at the mutation boundary and judges
 // the request's token against it. It is the recheck for a write that loads no
 // user: it cannot make the write atomic with a revocation, but it takes the
