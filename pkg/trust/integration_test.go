@@ -186,12 +186,15 @@ func TestIntegration_EvaluateIssuer_WithCredentialType(t *testing.T) {
 	if capturedReq.Resource.Type != "x5c" {
 		t.Errorf("Resource.Type = %q, want x5c", capturedReq.Resource.Type)
 	}
-	// Verify credential_type is propagated in the AuthZEN context
+	// Verify credential type is propagated in the AuthZEN context. go-trust
+	// only lets the plural "credential_types" list through its context
+	// sanitizer; the singular "credential_type" is dropped server-side.
 	if capturedReq.Context == nil {
-		t.Fatal("Context is nil, expected credential_type")
+		t.Fatal("Context is nil, expected credential_types")
 	}
-	if ct, ok := capturedReq.Context["credential_type"]; !ok || ct != "eu.europa.ec.eudi.pid.1" {
-		t.Errorf("Context[credential_type] = %v, want eu.europa.ec.eudi.pid.1", ct)
+	cts, ok := capturedReq.Context["credential_types"].([]interface{})
+	if !ok || len(cts) != 1 || cts[0] != "eu.europa.ec.eudi.pid.1" {
+		t.Errorf("Context[credential_types] = %v, want [eu.europa.ec.eudi.pid.1]", capturedReq.Context["credential_types"])
 	}
 }
 
