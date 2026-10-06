@@ -182,6 +182,107 @@ func TestTokenBlacklist_Disabled_NoOps(t *testing.T) {
 	}
 }
 
+// TestTokenBlacklist_RevokeFamily_AndIsFamilyRevoked is a regression test
+// for #402: revoking a refresh-token family/session id (sid) must make
+// IsFamilyRevoked report it as revoked, and a different sid must be
+// unaffected.
+func TestTokenBlacklist_RevokeFamily_AndIsFamilyRevoked(t *testing.T) {
+	ctx := context.Background()
+	b := newTestBlacklist(t)
+
+	if b.IsFamilyRevoked(ctx, "sid-1") {
+		t.Error("expected sid-1 not to be revoked before RevokeFamily")
+	}
+
+	if err := b.RevokeFamily(ctx, "sid-1", time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("RevokeFamily: %v", err)
+	}
+
+	if !b.IsFamilyRevoked(ctx, "sid-1") {
+		t.Error("expected sid-1 to be revoked after RevokeFamily")
+	}
+	if b.IsFamilyRevoked(ctx, "sid-2") {
+		t.Error("expected an unrelated sid-2 to remain unaffected")
+	}
+
+	// Empty sid is always a no-op in both directions, exactly like an empty
+	// jti/userID elsewhere in this type.
+	if err := b.RevokeFamily(ctx, "", time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("RevokeFamily(\"\"): %v", err)
+	}
+	if b.IsFamilyRevoked(ctx, "") {
+		t.Error("expected an empty sid to never be reported as revoked")
+	}
+}
+
+// TestTokenBlacklist_RevokeFamily_ExpiresLikeAJTIEntry proves a family
+// revocation's own retention window is honored: once its expiry has
+// passed, IsFamilyRevoked must stop reporting it as revoked - unlike
+// RevokeUser/IsUserRevoked, which are permanent (see RevokeFamily's doc
+// comment for why a session revocation doesn't need to be).
+func TestTokenBlacklist_RevokeFamily_ExpiresLikeAJTIEntry(t *testing.T) {
+	ctx := context.Background()
+	b := newTestBlacklist(t)
+
+	if err := b.RevokeFamily(ctx, "sid-already-expired", time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("RevokeFamily: %v", err)
+	}
+
+	if b.IsFamilyRevoked(ctx, "sid-already-expired") {
+		t.Error("expected a family revocation past its own expiry to no longer be reported as revoked")
+	}
+}
+
+// TestTokenBlacklist_RevokeFamily_NotGatedByEnabled is a regression test for
+// #402, mirroring ConsumeOnce's own "not gated by config.Enabled" test and
+// doc comment: revoking a session's refresh-token family on logout is a
+// correctness property of session termination itself, not the general
+// operator-opt-in revocation feature Add/IsBlacklisted/RevokeUser implement
+// - making it conditional on that same toggle would leave the checked-in
+// default configuration (TokenBlacklist disabled) unable to revoke a
+// session's refresh tokens on logout at all.
+func TestTokenBlacklist_RevokeFamily_NotGatedByEnabled(t *testing.T) {
+	ctx := context.Background()
+	b := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop())
+
+	if err := b.RevokeFamily(ctx, "sid-disabled-feature", time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("RevokeFamily (disabled feature): %v", err)
+	}
+	if !b.IsFamilyRevoked(ctx, "sid-disabled-feature") {
+		t.Error("expected family revocation to work even when the general blacklist feature is disabled")
+	}
+}
+
+// TestTokenBlacklist_Cleanup_SweepsExpiredFamilyRevocations proves cleanup()
+// also sweeps expired family-revocation entries (unlike userRevocations,
+// which are permanent - see cleanup's and RevokeFamily's doc comments for
+// why the two behave differently).
+func TestTokenBlacklist_Cleanup_SweepsExpiredFamilyRevocations(t *testing.T) {
+	ctx := context.Background()
+	b := newTestBlacklist(t)
+
+	if err := b.RevokeFamily(ctx, "sid-expired", time.Now().Add(-time.Minute)); err != nil {
+		t.Fatalf("RevokeFamily: %v", err)
+	}
+	if err := b.RevokeFamily(ctx, "sid-live", time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("RevokeFamily: %v", err)
+	}
+
+	b.cleanup()
+
+	b.mu.RLock()
+	_, expiredStillPresent := b.families["sid-expired"]
+	_, liveStillPresent := b.families["sid-live"]
+	b.mu.RUnlock()
+
+	if expiredStillPresent {
+		t.Error("expected the expired family revocation to be removed by cleanup")
+	}
+	if !liveStillPresent {
+		t.Error("expected the still-live family revocation to survive cleanup")
+	}
+}
+
 // TestTokenBlacklist_Cleanup_RemovesExpiredJTIsButNotUserRevocations
 // exercises cleanup() directly (it otherwise only ever runs on a real
 // ticker via Start/cleanupLoop, which no test invokes): the per-jti expiry
@@ -276,4 +377,39 @@ func TestTokenBlacklist_StartStop_Disabled(t *testing.T) {
 	b := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop())
 	b.Start()
 	b.Stop()
+}
+
+// TestRevokeFamily_NeverShortensExistingMarker is the regression test for a
+// #414 review finding: re-revoking a family with a smaller retention (e.g.
+// after the configured retention dropped) must not shorten the marker,
+// while a later expiry must extend it.
+func TestRevokeFamily_NeverShortensExistingMarker(t *testing.T) {
+	b := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop())
+	ctx := context.Background()
+	long := time.Now().Add(400 * 24 * time.Hour)
+	short := time.Now().Add(365 * 24 * time.Hour)
+	longer := time.Now().Add(500 * 24 * time.Hour)
+
+	if err := b.RevokeFamily(ctx, "sid-x", long); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.RevokeFamily(ctx, "sid-x", short); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.RLock()
+	got := b.families["sid-x"]
+	b.mu.RUnlock()
+	if !got.Equal(long) {
+		t.Errorf("re-revoke with a shorter expiry changed the marker: got %v, want %v", got, long)
+	}
+
+	if err := b.RevokeFamily(ctx, "sid-x", longer); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.RLock()
+	got = b.families["sid-x"]
+	b.mu.RUnlock()
+	if !got.Equal(longer) {
+		t.Errorf("re-revoke with a longer expiry must extend: got %v, want %v", got, longer)
+	}
 }

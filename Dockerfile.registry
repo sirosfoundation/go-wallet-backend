@@ -1,28 +1,33 @@
+# Helper image for registry-only deployments.
+#
+# The registry is a role of the main go-wallet-backend binary; this image is
+# the same server binary with `--mode=registry` as its fixed entrypoint
+# argument and a registry-only default config. It is kept, under the name
+# sirosfoundation/go-wallet-registry, for a transition period so existing
+# deployments keep working. New deployments can use the main image with
+# `--mode=registry` (or any role combination) instead.
+
 # Build stage
 FROM golang:1.27-alpine AS builder
 
 WORKDIR /app
 
-# Install git for fetching dependencies
 RUN apk add --no-cache git ca-certificates
 
-# Build arguments for versioning
 ARG VERSION=dev
 ARG COMMIT=unknown
 
-# Copy local module files and download dependencies
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy the rest of the local source
 COPY . .
 
-# Build the registry server
+# Build the main server binary (the registry role is part of it)
 RUN CGO_ENABLED=0 GOOS=linux go build \
-    -ldflags="-s -w" \
-    -o registry cmd/registry/main.go
+    -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
+    -o server cmd/server/main.go
 
-# Create data directory for cache - will be copied with correct ownership
+# Data directory for the VCTM cache - copied with correct ownership
 RUN mkdir -p /app/data
 
 # Runtime stage
@@ -30,20 +35,20 @@ FROM gcr.io/distroless/static-debian12
 
 WORKDIR /app
 
-# Copy binary from builder
-COPY --from=builder /app/registry /app/registry
-COPY --from=builder /app/configs/registry.yaml /app/configs/registry.yaml
-COPY --from=builder /app/configs/registry.production.yaml /app/configs/registry.production.yaml
+COPY --from=builder /app/server /app/server
+COPY --from=builder /app/configs/config.registry.yaml /app/configs/config.registry.yaml
 
-# Copy data directory with nonroot ownership (65532 is the nonroot user in distroless)
-# This ensures the directory exists with correct permissions before volume mount
+# 65532 is the nonroot user in distroless; the directory must exist with the
+# right permissions before a volume is mounted over it.
 COPY --from=builder --chown=65532:65532 /app/data /app/data
 
 USER nonroot:nonroot
 
-# Expose port (default registry port)
+# Default registry port (server.registry_port)
 EXPOSE 8097
 
-# Run with production config by default
-ENTRYPOINT ["/app/registry"]
-CMD ["-config", "/app/configs/registry.production.yaml"]
+# --mode=registry is part of the entrypoint so that deployments which override
+# the container args (for example to point at another config file) still start
+# the registry role. Extra flags are appended: `--config <backend-style file>`.
+ENTRYPOINT ["/app/server", "--mode=registry"]
+CMD ["--config", "/app/configs/config.registry.yaml"]
