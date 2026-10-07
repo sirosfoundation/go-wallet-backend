@@ -3296,3 +3296,44 @@ func TestNewOwnASHTTPClient_PlaintextOnlyToTrustedHosts(t *testing.T) {
 		t.Error("IsTrustedIdPHost")
 	}
 }
+
+// A deployer injects the HSM's PKCS#11 module path (and slot, label, PIN file)
+// with environment variables, with no signing key in the config file: the
+// module itself, its libraries and its own config are mounted separately.
+func TestLoad_AS_PKCS11_FromEnv(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	configYAML := []byte(`
+server:
+  host: localhost
+  port: 8080
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+storage:
+  type: memory
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+`)
+	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	t.Setenv("WALLET_AS_SIGNING_KEY_PKCS11_MODULE_PATH", "/opt/vendor/libvendor-pkcs11.so")
+	t.Setenv("WALLET_AS_SIGNING_KEY_PKCS11_SLOT_ID", "7")
+	t.Setenv("WALLET_AS_SIGNING_KEY_PKCS11_KEY_LABEL", "as-signing")
+	t.Setenv("WALLET_AS_SIGNING_KEY_PKCS11_PIN_PATH", "/run/secrets/hsm-pin")
+	t.Setenv("WALLET_AS_SIGNING_KEY_PKCS11_POOL_SIZE", "3")
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	p := cfg.AS.SigningKeyPKCS11
+	if p == nil {
+		t.Fatal("AS.SigningKeyPKCS11 stayed nil although the PKCS#11 env vars were set")
+	}
+	if p.ModulePath != "/opt/vendor/libvendor-pkcs11.so" || p.SlotID != 7 || p.KeyLabel != "as-signing" ||
+		p.PINPath != "/run/secrets/hsm-pin" || p.PoolSize != 3 {
+		t.Errorf("unexpected PKCS#11 config from env: %+v", p)
+	}
+}

@@ -21,6 +21,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/logging"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
 var (
@@ -104,10 +105,13 @@ func main() {
 		}
 	}
 
+	checkPKCS11Support(backendCfg, logger)
+
 	logger.Info("Starting Wallet Backend",
 		zap.String("version", version),
 		zap.String("commit", commit),
 		zap.Strings("roles", roleStrings),
+		zap.Bool("pkcs11_supported", signing.PKCS11Supported),
 	)
 
 	// Every process that loaded the backend config honours as.legacy.enabled,

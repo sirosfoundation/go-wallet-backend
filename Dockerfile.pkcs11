@@ -6,9 +6,14 @@
 # (CGO, glibc) so the server can dlopen an HSM vendor module.
 #
 # Targets:
-#   runtime  (default, last)  production image; NO PKCS#11 module included -
-#                             mount or COPY your HSM vendor's module (and set
-#                             as.signing_key_pkcs11.module_path to its path).
+#   runtime  (default, last)  production image; NO PKCS#11 module included.
+#                             The deployer injects the vendor's module (and the
+#                             libraries and config it needs) on a volume, and
+#                             its path via as.signing_key_pkcs11.module_path or
+#                             WALLET_AS_SIGNING_KEY_PKCS11_MODULE_PATH; module
+#                             config is passed as files + the module's own env
+#                             vars. See docs/new-as.md and
+#                             docker-compose.hsm.example.yml.
 #   softhsm                   DEVELOPMENT ONLY: adds SoftHSM2 and an entrypoint
 #                             that provisions a software token with a fresh
 #                             P-256 key, for local testing. Never use in prod.
@@ -36,7 +41,7 @@ COPY . .
 
 RUN CGO_ENABLED=1 GOOS=linux go build -tags pkcs11 \
     -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
-    -o server cmd/server/main.go
+    -o server ./cmd/server
 
 # Shared runtime base
 FROM debian:bookworm-slim AS base
