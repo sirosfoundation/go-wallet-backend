@@ -49,23 +49,20 @@ type StructInfo struct {
 
 // FieldInfo holds parsed field metadata.
 type FieldInfo struct {
-	GoName     string
-	GoType     string
-	YAMLTag    string
-	EnvTag     string
-	Doc        string
-	InlineDoc  string // trailing comment (e.g., `// Admin API bind address`)
-	TypeName   string // resolved struct type name, if embedded struct
-	Omitempty  bool
-	WalletOnly bool // docs:"wallet-only": omitted from the registry server's reference
+	GoName    string
+	GoType    string
+	YAMLTag   string
+	EnvTag    string
+	Doc       string
+	InlineDoc string // trailing comment (e.g., `// Admin API bind address`)
+	TypeName  string // resolved struct type name, if embedded struct
+	Omitempty bool
 }
 
 // Registry of all parsed struct types, keyed by pkg.TypeName.
 type Registry struct {
 	types map[string]*StructInfo
 	fset  *token.FileSet
-	// OmitWalletOnly drops fields tagged docs:"wallet-only" from the output.
-	OmitWalletOnly bool
 }
 
 func NewRegistry() *Registry {
@@ -131,7 +128,6 @@ func (r *Registry) extractStructs(file *ast.File, pkgName string) {
 					tag := strings.Trim(field.Tag.Value, "`")
 					fi.YAMLTag = extractTag(tag, "yaml")
 					fi.EnvTag = extractTag(tag, "envconfig")
-					fi.WalletOnly = extractTag(tag, "docs") == "wallet-only"
 					fi.Omitempty = strings.Contains(fi.YAMLTag, ",omitempty")
 					fi.YAMLTag = strings.Split(fi.YAMLTag, ",")[0]
 				}
@@ -356,9 +352,6 @@ func flattenStruct(reg *Registry, info *StructInfo, pathPrefix, envPrefix string
 	}
 	var docs []FieldDoc
 	for _, f := range info.Fields {
-		if f.WalletOnly && reg.OmitWalletOnly {
-			continue
-		}
 		yamlKey := f.YAMLTag
 		if yamlKey == "" {
 			yamlKey = strings.ToLower(f.GoName)

@@ -426,10 +426,10 @@ type HTTPClientConfig struct {
 	// Accept: application/jwt, application/json and needs no retry.
 	// Unknown values are rejected at startup.
 	// Env: WALLET_HTTP_CLIENT_METADATA_TYPE
-	// Only the wallet server builds an issuer-metadata resolver; the registry
-	// server shares this struct but never reads the field (docs:"wallet-only"
-	// keeps it out of the registry reference).
-	MetadataType string `yaml:"metadata_type" envconfig:"METADATA_TYPE" docs:"wallet-only"`
+	// Read only by the issuer-metadata resolvers, which the backend role (for
+	// AuthZEN proxy URL resolution) and the engine role build. The registry
+	// role builds no resolver and ignores the field.
+	MetadataType string `yaml:"metadata_type" envconfig:"METADATA_TYPE"`
 
 	// TrustedIdPHosts lists hostnames of operator-configured OIDC identity
 	// providers that may resolve to private/loopback/link-local addresses.
