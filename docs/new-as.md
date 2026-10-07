@@ -333,6 +333,40 @@ token type.
 
 `as.signing_key_pkcs11` (`module_path`, `slot_id`, `key_label`, `pin` or `pin_path`, `pool_size`) uses the existing PKCS#11 signer and needs a binary built with `-tags pkcs11`; it is mutually exclusive with `as.signing_key_path`, is never inherited from the wallet provider, and supports ECDSA P-256/P-384 keys only (RSA is rejected because the AS signs access tokens only with ES256, ES384 or EdDSA, an AS-key restriction rather than a signer limitation; Ed25519 is unavailable over PKCS#11 because the PKCS#11 pool cannot handle `CKK_EC_EDWARDS` keys, so use `as.signing_key_path` for Ed25519). `kid` is the JWK thumbprint, as for file keys. Rotation is operational: re-issue and restart.
 
+#### Docker images and trying it locally
+
+The default image (`Dockerfile`) is a static, CGO-free binary on distroless: it has no libc and no PKCS#11 module, so `as.signing_key_pkcs11` (and the wallet-provider PKCS#11 key) **fail closed** there with `PKCS#11 support not compiled in (build with -tags pkcs11)`. Use the PKCS#11 image variant instead:
+
+| Image | Built from | Use |
+|---|---|---|
+| `ghcr.io/sirosfoundation/go-wallet-backend` | `Dockerfile` | default; no HSM support |
+| `ghcr.io/sirosfoundation/go-wallet-backend-pkcs11` | `Dockerfile.pkcs11` (target `runtime`) | production with an HSM: glibc, `CGO_ENABLED=1`, `-tags pkcs11`. It contains **no** PKCS#11 module: mount or `COPY` your HSM vendor's module and point `module_path` at it |
+| local only, `--target softhsm` | `Dockerfile.pkcs11` | **development only**: adds SoftHSM2 and provisions a software token with a fresh P-256 key |
+
+To try the HSM-backed key locally with SoftHSM, no HSM needed:
+
+```sh
+docker compose -f docker-compose.softhsm.yml up --build
+curl -s localhost:8080/auth/.well-known/jwks.json   # the kid is the thumbprint of the key in the token
+```
+
+The entrypoint (`scripts/softhsm-entrypoint.sh`) initialises the token on first start, imports a generated key (the PEM is deleted afterwards), looks up the slot id (SoftHSM renumbers it), renders `configs/config.pkcs11-softhsm.yaml` and starts the server. The token lives in the `softhsm` volume, so the `kid` is stable across restarts; `docker compose -f docker-compose.softhsm.yml down -v` makes a new key. The default PINs are for development only (`SOFTHSM_USER_PIN`, `SOFTHSM_SO_PIN`). `make docker-build-pkcs11` and `make docker-build-softhsm` build the images locally.
+
+#### Using a real HSM (module, module config and module path are injected)
+
+The `runtime` image deliberately ships no PKCS#11 module. A real HSM comes with its own module, its own libraries and its own configuration; the deployer supplies all three, and nothing is baked into the image:
+
+| What | How it is injected |
+|---|---|
+| The module (`.so`) and any libraries it needs | a read-only volume, for example `-v /opt/vendor/hsm:/opt/vendor:ro`; if the module needs libraries the image lacks, set `LD_LIBRARY_PATH` (for example `/opt/vendor`) |
+| The path to the module | `as.signing_key_pkcs11.module_path`, or the environment variable `WALLET_AS_SIGNING_KEY_PKCS11_MODULE_PATH` |
+| Slot, key label, PIN file, pool size | `slot_id`, `key_label`, `pin_path`, `pool_size`, or `WALLET_AS_SIGNING_KEY_PKCS11_SLOT_ID` / `_KEY_LABEL` / `_PIN_PATH` / `_POOL_SIZE`. Use `pin_path` with a mounted secret rather than an inline `pin` |
+| The module's own configuration | whatever the vendor's module reads: a config file on a mounted volume plus the environment variable that points to it (for example `SOFTHSM2_CONF`, `YUBIHSM_PKCS11_CONF`, `ChrystokiConfigurationPath`, `PKCS11_PROXY_SOCKET`). The module is loaded into the server process, so it sees the container's environment as is |
+
+The server runs as uid/gid 65532, so mounted files and any device or socket the module uses must be readable by that user. The same variables work for the wallet-provider key (`wallet_provider.pkcs11`, `WALLET_WALLET_PROVIDER_PKCS11_*`). `docker-compose.hsm.example.yml` shows the shape. This is tested with the plain `runtime` image by mounting SoftHSM's module, its libraries and its config as if they were a vendor's, using only the variables above (no signing key in the config file).
+
+If the module cannot be loaded the server stops with `pkcs11pool: failed to load module: <path>`; it never falls back to a file key for the AS. If an HSM key is configured but the binary is the default distroless build, startup stops with a message naming the `go-wallet-backend-pkcs11` image (no stack trace); a configured `wallet_provider.pkcs11` that cannot be used is logged at error level at startup, together with whether `wallet_provider.private_key_path` is the fallback.
+
 ### Rollout checklist for deployments upgrading to this release
 
 1. **Clients first**: wallet-frontend, the SDK wrappers and any custom client

@@ -28,3 +28,19 @@ func TestDockerfileLinkerSymbolsExist(t *testing.T) {
 		}
 	}
 }
+
+// package main in cmd/server spans several files (pkcs11_check.go, ...), so
+// building the single file cmd/server/main.go fails with "undefined: ...".
+// Every server image and the Makefile must build the package directory.
+func TestServerBuildsPackageNotSingleFile(t *testing.T) {
+	re := regexp.MustCompile(`go build[^\n]*?(?:\\\n[^\n]*?)*cmd/server/main\.go`)
+	for _, f := range []string{"../../Dockerfile", "../../Dockerfile.registry", "../../Dockerfile.pkcs11", "../../Makefile"} {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if re.Match(data) {
+			t.Errorf("%s builds cmd/server/main.go; build ./cmd/server so sibling files compile", f)
+		}
+	}
+}
