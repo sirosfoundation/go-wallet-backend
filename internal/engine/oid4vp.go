@@ -2453,7 +2453,10 @@ func checkTransactionDataEntry(i int, td TransactionData, dcqlIDs map[string]boo
 		return newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: credential_ids must be a non-empty array", i)
 	}
 	if dcqlIDs == nil {
-		return nil
+		// Fail closed: without a readable DCQL credential set there is nothing
+		// to bind credential_ids to, and accepting them would let a verifier
+		// name credentials the query never asked for.
+		return newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: transaction_data requires a dcql_query with at least one credential for credential_ids to reference", i)
 	}
 	for _, id := range td.CredentialIDs {
 		if !dcqlIDs[id] {
