@@ -201,7 +201,7 @@ func TestValidateTransactionData_RefusesClientThatDidNotDeclareSupport(t *testin
 		"lookalike (version)": {Features: []string{"transaction_data.v2"}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			authReq := &AuthorizationRequest{TransactionDataRaw: owfRaw(t)}
+			authReq := &AuthorizationRequest{TransactionDataRaw: owfRaw(t), DCQLQuery: payDCQL}
 			err := validateTransactionData(authReq, msg)
 			require.Error(t, err)
 			var tdErr *transactionDataError
@@ -213,7 +213,7 @@ func TestValidateTransactionData_RefusesClientThatDidNotDeclareSupport(t *testin
 }
 
 func TestValidateTransactionData_AcceptsDeclaringClient(t *testing.T) {
-	authReq := &AuthorizationRequest{TransactionDataRaw: owfRaw(t)}
+	authReq := &AuthorizationRequest{TransactionDataRaw: owfRaw(t), DCQLQuery: payDCQL}
 	require.NoError(t, validateTransactionData(authReq, tdClient))
 	require.Len(t, authReq.TransactionData, 1)
 }
@@ -238,6 +238,10 @@ func TestValidateTransactionData_StructuralErrorsKeepGenericCode(t *testing.T) {
 
 // --- Step 1: structural validation, raw and payload carried to the client ---
 
+// payDCQL is a DCQL query naming the credential ids the transaction_data
+// fixtures reference.
+var payDCQL = json.RawMessage(`{"credentials":[{"id":"pay"},{"id":"age"}]}`)
+
 func entry(t *testing.T, jsonText string) string {
 	t.Helper()
 	return base64.RawURLEncoding.EncodeToString([]byte(jsonText))
@@ -246,7 +250,7 @@ func entry(t *testing.T, jsonText string) string {
 func TestValidateTransactionData_AcceptsTS12TypesForDeclaringClient(t *testing.T) {
 	for _, v := range loadTDVectors(t) {
 		t.Run(v.Name, func(t *testing.T) {
-			authReq := &AuthorizationRequest{TransactionDataRaw: rawArray(t, v.Raw)}
+			authReq := &AuthorizationRequest{TransactionDataRaw: rawArray(t, v.Raw), DCQLQuery: payDCQL}
 			require.NoError(t, validateTransactionData(authReq, tdClient))
 			require.Len(t, authReq.TransactionData, 1)
 			got := authReq.TransactionData[0]
@@ -315,7 +319,7 @@ func TestValidateTransactionData_GateComesBeforeStructuralChecks(t *testing.T) {
 // must be byte-for-byte what it was before.
 func TestSignRequestParams_WireCarriesRawPayloadAndResponseMode(t *testing.T) {
 	v := loadTDVectors(t)[2] // pretty_printed
-	authReq := &AuthorizationRequest{TransactionDataRaw: rawArray(t, v.Raw)}
+	authReq := &AuthorizationRequest{TransactionDataRaw: rawArray(t, v.Raw), DCQLQuery: payDCQL}
 	require.NoError(t, validateTransactionData(authReq, tdClient))
 
 	b, err := json.Marshal(SignRequestParams{
@@ -588,7 +592,7 @@ func TestRequestVPSignature_CarriesTransactionDataAndResponseMode(t *testing.T) 
 	v := loadTDVectors(t)[1]
 	authReq := &AuthorizationRequest{
 		Nonce: "n", ClientID: "verifier.example.com", ResponseMode: ResponseModeDirectPost,
-		TransactionDataRaw: rawArray(t, v.Raw),
+		TransactionDataRaw: rawArray(t, v.Raw), DCQLQuery: payDCQL,
 	}
 	require.NoError(t, validateTransactionData(authReq, tdClient))
 
@@ -605,4 +609,25 @@ func TestRequestVPSignature_OmitsBothForAPresentationWithoutTransactionData(t *t
 	m := signRequestFor(t, authReq)
 	assert.Empty(t, m.Params.ResponseMode, "response_mode is only sent with transaction data")
 	assert.Empty(t, m.Params.TransactionData)
+}
+
+// OID4VP defaults an omitted response_mode to direct_post. The key binding JWT
+// of a transaction-data presentation must carry that effective mode, not the
+// empty string the request left out.
+func TestRequestVPSignature_OmittedResponseModeIsSignedAsDirectPost(t *testing.T) {
+	v := loadTDVectors(t)[1]
+	authReq := &AuthorizationRequest{
+		Nonce: "n", ClientID: "verifier.example.com", // no ResponseMode
+		TransactionDataRaw: rawArray(t, v.Raw), DCQLQuery: payDCQL,
+	}
+	require.NoError(t, validateTransactionData(authReq, tdClient))
+
+	m := signRequestFor(t, authReq)
+	assert.Equal(t, ResponseModeDirectPost, m.Params.ResponseMode)
+}
+
+func TestEffectiveResponseMode(t *testing.T) {
+	assert.Equal(t, ResponseModeDirectPost, effectiveResponseMode(&AuthorizationRequest{}))
+	assert.Equal(t, ResponseModeDirectPostJWT, effectiveResponseMode(&AuthorizationRequest{ResponseMode: ResponseModeDirectPostJWT}))
+	assert.Equal(t, ResponseModeFragment, effectiveResponseMode(&AuthorizationRequest{ResponseMode: ResponseModeFragment}))
 }

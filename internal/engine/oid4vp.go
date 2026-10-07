@@ -1800,7 +1800,7 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 	// presentation. Sent only with transaction data, so every other
 	// presentation's sign request is unchanged.
 	if len(authReq.TransactionData) > 0 {
-		params.ResponseMode = authReq.ResponseMode
+		params.ResponseMode = effectiveResponseMode(authReq)
 	}
 	resp, err := h.RequestSign(ctx, SignActionSignPresentation, params)
 	if err != nil {
@@ -1812,6 +1812,17 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 	}
 
 	return resp.VPToken, nil
+}
+
+// effectiveResponseMode returns the request's response_mode, which OID4VP
+// defaults to direct_post when the parameter is omitted. Request validation,
+// submission and the response_mode a transaction-data key binding JWT carries
+// must all see the same value.
+func effectiveResponseMode(authReq *AuthorizationRequest) string {
+	if authReq.ResponseMode == "" {
+		return ResponseModeDirectPost
+	}
+	return authReq.ResponseMode
 }
 
 // computeVerifierJWKThumbprint returns the verifier JWK thumbprint for direct_post.jwt,
@@ -1898,10 +1909,7 @@ func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *Authorizati
 	}
 
 	// Determine response mode
-	responseMode := authReq.ResponseMode
-	if responseMode == "" {
-		responseMode = ResponseModeDirectPost
-	}
+	responseMode := effectiveResponseMode(authReq)
 
 	switch responseMode {
 	case ResponseModeDirectPost:
@@ -2189,10 +2197,7 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 	}
 
 	// OID4VP §5: redirect_uri MUST NOT be present when response_mode is direct_post or direct_post.jwt
-	responseMode := authReq.ResponseMode
-	if responseMode == "" {
-		responseMode = ResponseModeDirectPost
-	}
+	responseMode := effectiveResponseMode(authReq)
 	isDirectPost := responseMode == ResponseModeDirectPost || responseMode == ResponseModeDirectPostJWT
 	if isDirectPost && authReq.RedirectURI != "" {
 		return errors.New("redirect_uri must not be present with direct_post response mode")
