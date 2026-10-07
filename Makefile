@@ -7,7 +7,7 @@ help: ## Show this help
 
 build: ## Build the server binary
 	@echo "Building server..."
-	@go build -o bin/server cmd/server/main.go
+	@go build -o bin/server ./cmd/server
 
 build-admin: man ## Build the wallet-admin CLI tool (includes man page)
 	@echo "Building wallet-admin CLI..."
