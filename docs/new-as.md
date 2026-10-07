@@ -304,6 +304,27 @@ An audience list (`as.audiences`) applies to new-style (ES256/JWKS) tokens only.
 
 `as.signing_key_pkcs11` (`module_path`, `slot_id`, `key_label`, `pin` or `pin_path`, `pool_size`) uses the existing PKCS#11 signer and needs a binary built with `-tags pkcs11`; it is mutually exclusive with `as.signing_key_path`, is never inherited from the wallet provider, and supports ECDSA P-256/P-384 keys only (RSA is rejected because the AS signs access tokens only with ES256, ES384 or EdDSA, an AS-key restriction rather than a signer limitation; Ed25519 is unavailable over PKCS#11 because the PKCS#11 pool cannot handle `CKK_EC_EDWARDS` keys, so use `as.signing_key_path` for Ed25519). `kid` is the JWK thumbprint, as for file keys. Rotation is operational: re-issue and restart.
 
+#### Docker images and trying it locally
+
+The default image (`Dockerfile`) is a static, CGO-free binary on distroless: it has no libc and no PKCS#11 module, so `as.signing_key_pkcs11` (and the wallet-provider PKCS#11 key) **fail closed** there with `PKCS#11 support not compiled in (build with -tags pkcs11)`. Use the PKCS#11 image variant instead:
+
+| Image | Built from | Use |
+|---|---|---|
+| `ghcr.io/sirosfoundation/go-wallet-backend` | `Dockerfile` | default; no HSM support |
+| `ghcr.io/sirosfoundation/go-wallet-backend-pkcs11` | `Dockerfile.pkcs11` (target `runtime`) | production with an HSM: glibc, `CGO_ENABLED=1`, `-tags pkcs11`. It contains **no** PKCS#11 module: mount or `COPY` your HSM vendor's module and point `module_path` at it |
+| local only, `--target softhsm` | `Dockerfile.pkcs11` | **development only**: adds SoftHSM2 and provisions a software token with a fresh P-256 key |
+
+To try the HSM-backed key locally with SoftHSM, no HSM needed:
+
+```sh
+docker compose -f docker-compose.softhsm.yml up --build
+curl -s localhost:8080/auth/.well-known/jwks.json   # the kid is the thumbprint of the key in the token
+```
+
+The entrypoint (`scripts/softhsm-entrypoint.sh`) initialises the token on first start, imports a generated key (the PEM is deleted afterwards), looks up the slot id (SoftHSM renumbers it), renders `configs/config.pkcs11-softhsm.yaml` and starts the server. The token lives in the `softhsm` volume, so the `kid` is stable across restarts; `docker compose -f docker-compose.softhsm.yml down -v` makes a new key. The default PINs are for development only (`SOFTHSM_USER_PIN`, `SOFTHSM_SO_PIN`). `make docker-build-pkcs11` and `make docker-build-softhsm` build the images locally.
+
+If the module cannot be loaded the server stops with `pkcs11pool: failed to load module: <path>`; it never falls back to a file key for the AS.
+
 ### Go-live checklist for removing the legacy path
 
 0. **Precondition: all clients are moved to session mode BEFORE any backend turns legacy off** (siros-sdk-kotlin#235, siros-sdk-swift#179, wallet-frontend#322; go-siros-cli is intentionally out of scope).

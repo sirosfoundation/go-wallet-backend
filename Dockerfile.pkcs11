@@ -1,0 +1,79 @@
+# PKCS#11-capable image of go-wallet-backend.
+#
+# The default Dockerfile builds a static, CGO-free binary for distroless, which
+# cannot load a PKCS#11 module: `as.signing_key_pkcs11` and the wallet-provider
+# PKCS#11 key fail closed there. This image is built with `-tags pkcs11`
+# (CGO, glibc) so the server can dlopen an HSM vendor module.
+#
+# Targets:
+#   runtime  (default, last)  production image; NO PKCS#11 module included -
+#                             mount or COPY your HSM vendor's module (and set
+#                             as.signing_key_pkcs11.module_path to its path).
+#   softhsm                   DEVELOPMENT ONLY: adds SoftHSM2 and an entrypoint
+#                             that provisions a software token with a fresh
+#                             P-256 key, for local testing. Never use in prod.
+#
+#   docker build -f Dockerfile.pkcs11 -t go-wallet-backend:pkcs11 .
+#   docker build -f Dockerfile.pkcs11 --target softhsm -t go-wallet-backend:softhsm .
+# See docs/new-as.md ("HSM-backed signing key") and docker-compose.softhsm.yml.
+
+# Build stage: glibc + libltdl, which the PKCS#11 bindings need to dlopen modules
+FROM golang:1.27-bookworm AS builder
+
+WORKDIR /app
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libltdl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG VERSION=dev
+ARG COMMIT=unknown
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=1 GOOS=linux go build -tags pkcs11 \
+    -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
+    -o server cmd/server/main.go
+
+# Shared runtime base
+FROM debian:bookworm-slim AS base
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates libltdl7 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 65532 nonroot \
+    && useradd --uid 65532 --gid 65532 --no-create-home --shell /usr/sbin/nologin nonroot
+
+WORKDIR /app
+
+COPY --from=builder /app/server /app/server
+COPY --from=builder /app/configs /app/configs
+COPY --from=builder /app/rules /app/rules
+
+EXPOSE 8080
+
+# Development target: SoftHSM2 token provisioned at start-up
+FROM base AS softhsm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends softhsm2 openssl \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /softhsm \
+    && chown nonroot:nonroot /softhsm
+
+COPY scripts/softhsm-entrypoint.sh /usr/local/bin/softhsm-entrypoint
+COPY configs/config.pkcs11-softhsm.yaml /app/configs/config.pkcs11-softhsm.yaml
+
+ENV SOFTHSM_DIR=/softhsm
+USER 65532:65532
+ENTRYPOINT ["/usr/local/bin/softhsm-entrypoint"]
+CMD ["--config", "/app/configs/config.pkcs11-softhsm.yaml"]
+
+# Production target (default: must stay last)
+FROM base AS runtime
+
+USER 65532:65532
+ENTRYPOINT ["/app/server"]

@@ -1,6 +1,6 @@
 # Go Wallet Backend
 
-.PHONY: help build run test clean docker-build docker-run man install-man gen-config-docs
+.PHONY: help build run test clean docker-build docker-build-pkcs11 docker-build-softhsm docker-run man install-man gen-config-docs
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
@@ -78,6 +78,13 @@ clean: ## Clean build artifacts
 docker-build: ## Build Docker image
 	@echo "Building Docker image..."
 	@docker build -t go-wallet-backend:latest .
+
+docker-build-pkcs11: ## Build the PKCS#11-capable image (CGO, -tags pkcs11; mount your HSM module)
+	@echo "Building PKCS#11 Docker image..."
+	@docker build -f Dockerfile.pkcs11 -t go-wallet-backend:pkcs11 .
+
+docker-build-softhsm: ## Build the DEV-ONLY SoftHSM image (see docker-compose.softhsm.yml)
+	@docker build -f Dockerfile.pkcs11 --target softhsm -t go-wallet-backend:softhsm .
 
 docker-build-registry: ## Build the go-wallet-registry helper image (main binary, --mode=registry)
 	@echo "Building registry Docker image..."

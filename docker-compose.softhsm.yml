@@ -1,0 +1,21 @@
+# DEVELOPMENT ONLY: try the Authorization Server with an HSM-backed signing key
+# locally, using a SoftHSM2 software token. Not for production.
+#
+#   docker compose -f docker-compose.softhsm.yml up --build
+#   curl -s localhost:8080/auth/.well-known/jwks.json     # kid = thumbprint of the HSM key
+#
+# The token (and its key) persist in the "softhsm" volume; remove it
+# (docker compose -f docker-compose.softhsm.yml down -v) to get a new key.
+services:
+  wallet-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.pkcs11
+      target: softhsm
+    ports:
+      - "8080:8080"
+    volumes:
+      - softhsm:/softhsm
+
+volumes:
+  softhsm:
