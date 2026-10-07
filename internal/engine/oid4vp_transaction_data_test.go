@@ -27,6 +27,9 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
+// payDCQL is a DCQL query with the credential "pay" that the test entries are bound to.
+var payDCQL = json.RawMessage(`{"credentials":[{"id":"pay","format":"dc+sd-jwt","meta":{"vct_values":["x"]}}]}`)
+
 // tdClient is a client that declared FeatureTransactionDataV1.
 var tdClient = &FlowStartMessage{Features: []string{FeatureTransactionDataV1}}
 
@@ -212,7 +215,7 @@ func TestValidateTransactionData_RefusesClientThatDidNotDeclareSupport(t *testin
 		"lookalike (version)": {Features: []string{"transaction_data.v2"}},
 	} {
 		t.Run(name, func(t *testing.T) {
-			authReq := &AuthorizationRequest{TransactionDataRaw: owfRaw(t)}
+			authReq := &AuthorizationRequest{TransactionDataRaw: owfRaw(t), DCQLQuery: payDCQL}
 			err := validateTransactionData(authReq, msg)
 			require.Error(t, err)
 			var tdErr *transactionDataError
@@ -224,7 +227,7 @@ func TestValidateTransactionData_RefusesClientThatDidNotDeclareSupport(t *testin
 }
 
 func TestValidateTransactionData_AcceptsDeclaringClient(t *testing.T) {
-	authReq := &AuthorizationRequest{TransactionDataRaw: owfRaw(t)}
+	authReq := &AuthorizationRequest{TransactionDataRaw: owfRaw(t), DCQLQuery: payDCQL}
 	require.NoError(t, validateTransactionData(authReq, tdClient))
 	require.Len(t, authReq.TransactionData, 1)
 }
@@ -257,7 +260,7 @@ func entry(t *testing.T, jsonText string) string {
 func TestValidateTransactionData_AcceptsTS12TypesForDeclaringClient(t *testing.T) {
 	for _, v := range loadTDVectors(t) {
 		t.Run(v.Name, func(t *testing.T) {
-			authReq := &AuthorizationRequest{TransactionDataRaw: rawArray(t, v.Raw)}
+			authReq := &AuthorizationRequest{TransactionDataRaw: rawArray(t, v.Raw), DCQLQuery: payDCQL}
 			require.NoError(t, validateTransactionData(authReq, tdClient))
 			require.Len(t, authReq.TransactionData, 1)
 			got := authReq.TransactionData[0]
@@ -286,13 +289,14 @@ func TestValidateTransactionData_StructuralChecks(t *testing.T) {
 		dcql  json.RawMessage
 		want  string
 	}{
-		"missing type":              {`{"credential_ids":["pay"]}`, dcql, "missing type"},
-		"no credential_ids":         {`{"type":"x"}`, dcql, "credential_ids must be a non-empty array"},
-		"empty credential_ids":      {`{"type":"x","credential_ids":[]}`, dcql, "credential_ids must be a non-empty array"},
-		"id not in dcql":            {`{"type":"x","credential_ids":["nope"]}`, dcql, `"nope"`},
-		"one of several unknown":    {`{"type":"x","credential_ids":["pay","nope"]}`, dcql, `"nope"`},
-		"no dcql: nothing to check": {`{"type":"x","credential_ids":["anything"]}`, nil, ""},
-		"id in dcql":                {`{"type":"x","credential_ids":["age"]}`, dcql, ""},
+		"missing type":           {`{"credential_ids":["pay"]}`, dcql, "missing type"},
+		"no credential_ids":      {`{"type":"x"}`, dcql, "credential_ids must be a non-empty array"},
+		"empty credential_ids":   {`{"type":"x","credential_ids":[]}`, dcql, "credential_ids must be a non-empty array"},
+		"id not in dcql":         {`{"type":"x","credential_ids":["nope"]}`, dcql, `"nope"`},
+		"one of several unknown": {`{"type":"x","credential_ids":["pay","nope"]}`, dcql, `"nope"`},
+		"no dcql: refused, nothing for credential_ids to name": {`{"type":"x","credential_ids":["anything"]}`, nil, "no dcql_query"},
+		"unreadable dcql: refused":                             {`{"type":"x","credential_ids":["anything"]}`, json.RawMessage(`{"credentials":[]}`), "no dcql_query"},
+		"id in dcql":                                           {`{"type":"x","credential_ids":["age"]}`, dcql, ""},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -326,7 +330,7 @@ func TestValidateTransactionData_GateComesBeforeStructuralChecks(t *testing.T) {
 // must be byte-for-byte what it was before.
 func TestSignRequestParams_WireCarriesRawPayloadAndResponseMode(t *testing.T) {
 	v := loadTDVectors(t)[2] // pretty_printed
-	authReq := &AuthorizationRequest{TransactionDataRaw: rawArray(t, v.Raw)}
+	authReq := &AuthorizationRequest{TransactionDataRaw: rawArray(t, v.Raw), DCQLQuery: payDCQL}
 	require.NoError(t, validateTransactionData(authReq, tdClient))
 
 	b, err := json.Marshal(SignRequestParams{
@@ -721,7 +725,7 @@ func TestRequestVPSignature_CarriesTransactionDataAndResponseMode(t *testing.T) 
 	v := loadTDVectors(t)[1]
 	authReq := &AuthorizationRequest{
 		Nonce: "n", ClientID: "verifier.example.com", ResponseMode: ResponseModeDirectPost,
-		TransactionDataRaw: rawArray(t, v.Raw),
+		TransactionDataRaw: rawArray(t, v.Raw), DCQLQuery: payDCQL,
 	}
 	require.NoError(t, validateTransactionData(authReq, tdClient))
 
@@ -738,4 +742,67 @@ func TestRequestVPSignature_OmitsBothForAPresentationWithoutTransactionData(t *t
 	m := signRequestFor(t, authReq)
 	assert.Empty(t, m.Params.ResponseMode, "response_mode is only sent with transaction data")
 	assert.Empty(t, m.Params.TransactionData)
+}
+
+// --- response_mode: the sign request carries the mode the engine really uses ---
+
+func TestEffectiveResponseMode(t *testing.T) {
+	cases := map[string]string{
+		"":                        ResponseModeDirectPost, // a request naming none is answered as direct_post
+		ResponseModeDirectPost:    ResponseModeDirectPost,
+		ResponseModeDirectPostJWT: ResponseModeDirectPostJWT,
+		ResponseModeQuery:         ResponseModeQuery,
+		ResponseModeFragment:      ResponseModeFragment,
+	}
+	for in, want := range cases {
+		assert.Equal(t, want, effectiveResponseMode(&AuthorizationRequest{ResponseMode: in}), "response_mode %q", in)
+	}
+}
+
+// A valid request may omit response_mode. The engine answers it as direct_post,
+// so the wallet must be told direct_post: an empty value in the sign request
+// would make the key binding JWT carry no response_mode, or be refused.
+func TestRequestVPSignature_SendsTheEffectiveResponseMode(t *testing.T) {
+	v := loadTDVectors(t)[1]
+	for name, tc := range map[string]struct{ requested, sent string }{
+		"absent defaults to direct_post": {"", ResponseModeDirectPost},
+		"direct_post.jwt kept":           {ResponseModeDirectPostJWT, ResponseModeDirectPostJWT},
+		"fragment kept":                  {ResponseModeFragment, ResponseModeFragment},
+	} {
+		t.Run(name, func(t *testing.T) {
+			authReq := &AuthorizationRequest{
+				Nonce: "n", ClientID: "verifier.example.com", ResponseMode: tc.requested,
+				TransactionDataRaw: rawArray(t, v.Raw), DCQLQuery: payDCQL,
+			}
+			require.NoError(t, validateTransactionData(authReq, tdClient))
+			assert.Equal(t, tc.sent, signRequestFor(t, authReq).Params.ResponseMode)
+		})
+	}
+}
+
+// --- transaction_data needs a DCQL query to bind to ---
+
+// credential_ids name credentials of the DCQL query. With no query there is
+// nothing for them to name; the request must be refused, not waved through
+// with the binding skipped.
+func TestValidateAuthorizationRequest_TransactionDataWithoutDCQLIsRefused(t *testing.T) {
+	for name, dcql := range map[string]json.RawMessage{
+		"no dcql_query":               nil,
+		"a query with no credentials": json.RawMessage(`{"credentials":[]}`),
+		"an unreadable query":         json.RawMessage(`[1,2,3]`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			authReq := &AuthorizationRequest{
+				Nonce: "abc", ResponseMode: ResponseModeDirectPost, ResponseURI: "https://verifier.example.com/response",
+				ClientID: "https://verifier.example.com", ClientIDScheme: ClientIDSchemeRedirectURI,
+				TransactionDataRaw: owfRaw(t), DCQLQuery: dcql,
+			}
+			err := (&OID4VPHandler{}).validateAuthorizationRequest(authReq, tdClient)
+			var tdErr *transactionDataError
+			require.True(t, errors.As(err, &tdErr), "got %v", err)
+			assert.Equal(t, ErrCodeInvalidMessage, tdErr.code, "the verifier's fault, not a missing client feature")
+			assert.Contains(t, err.Error(), "no dcql_query")
+			assert.Empty(t, authReq.TransactionData, "nothing may be forwarded")
+		})
+	}
 }

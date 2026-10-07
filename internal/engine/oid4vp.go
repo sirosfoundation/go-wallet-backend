@@ -1816,7 +1816,7 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 	// presentation. Sent only with transaction data, so every other
 	// presentation's sign request is unchanged.
 	if len(authReq.TransactionData) > 0 {
-		params.ResponseMode = authReq.ResponseMode
+		params.ResponseMode = effectiveResponseMode(authReq)
 	}
 	resp, err := h.RequestSign(ctx, SignActionSignPresentation, params)
 	if err != nil {
@@ -1828,6 +1828,18 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 	}
 
 	return resp.VPToken, nil
+}
+
+// effectiveResponseMode is the response_mode this engine actually answers the
+// request with: the request's own, or direct_post when it names none. The sign
+// request must carry this value, not the raw (possibly empty) member: EC TS12
+// puts response_mode in the key binding JWT, and an empty one would make the
+// wallet either refuse or bind a mode the response is not sent in.
+func effectiveResponseMode(authReq *AuthorizationRequest) string {
+	if authReq.ResponseMode == "" {
+		return ResponseModeDirectPost
+	}
+	return authReq.ResponseMode
 }
 
 // computeVerifierJWKThumbprint returns the verifier JWK thumbprint for direct_post.jwt,
@@ -1914,10 +1926,7 @@ func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *Authorizati
 	}
 
 	// Determine response mode
-	responseMode := authReq.ResponseMode
-	if responseMode == "" {
-		responseMode = ResponseModeDirectPost
-	}
+	responseMode := effectiveResponseMode(authReq)
 
 	switch responseMode {
 	case ResponseModeDirectPost:
@@ -2200,10 +2209,7 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 	}
 
 	// OID4VP §5: redirect_uri MUST NOT be present when response_mode is direct_post or direct_post.jwt
-	responseMode := authReq.ResponseMode
-	if responseMode == "" {
-		responseMode = ResponseModeDirectPost
-	}
+	responseMode := effectiveResponseMode(authReq)
 	isDirectPost := responseMode == ResponseModeDirectPost || responseMode == ResponseModeDirectPostJWT
 	if isDirectPost && authReq.RedirectURI != "" {
 		return errors.New("redirect_uri must not be present with direct_post response mode")
@@ -2458,8 +2464,12 @@ func checkTransactionDataEntry(i int, td TransactionData, dcqlIDs map[string]boo
 	if len(td.CredentialIDs) == 0 {
 		return newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: credential_ids must be a non-empty array", i)
 	}
+	// credential_ids name credentials of the request's DCQL query (OID4VP 1.0).
+	// With no readable query there is nothing they could name, and accepting
+	// them anyway would skip the binding the wallet relies on to know which
+	// credential answers which transaction.
 	if dcqlIDs == nil {
-		return nil
+		return newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: the request has no dcql_query whose credentials credential_ids could name", i)
 	}
 	for _, id := range td.CredentialIDs {
 		if !dcqlIDs[id] {
