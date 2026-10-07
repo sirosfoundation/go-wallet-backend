@@ -1516,7 +1516,7 @@ func TestValidateTransactionData_Valid(t *testing.T) {
 	encoded := base64.RawURLEncoding.EncodeToString(tdJSON)
 	raw, _ := json.Marshal([]string{encoded})
 
-	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
+	authReq := &AuthorizationRequest{TransactionDataRaw: raw, DCQLQuery: payDCQL}
 	err := validateTransactionData(authReq, tdClient)
 	assert.NoError(t, err)
 	require.Len(t, authReq.TransactionData, 1)
@@ -1550,7 +1550,7 @@ func TestValidateTransactionData_EngineDoesNotJudgeTheType(t *testing.T) {
 	encoded := base64.RawURLEncoding.EncodeToString(tdJSON)
 	raw, _ := json.Marshal([]string{encoded})
 
-	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
+	authReq := &AuthorizationRequest{TransactionDataRaw: raw, DCQLQuery: payDCQL}
 	require.NoError(t, validateTransactionData(authReq, tdClient))
 	require.Len(t, authReq.TransactionData, 1)
 }
@@ -2330,6 +2330,7 @@ func TestValidateAuthorizationRequest_WithTransactionData(t *testing.T) {
 		ClientID:           "https://verifier.example.com",
 		ClientIDScheme:     ClientIDSchemeRedirectURI,
 		TransactionDataRaw: raw,
+		DCQLQuery:          payDCQL,
 	}
 	err := h.validateAuthorizationRequest(authReq, tdClient)
 	assert.NoError(t, err)
