@@ -403,6 +403,32 @@ type HTTPClientConfig struct {
 	// which is what every check in the codebase actually consults.
 	// Env: WALLET_HTTP_CLIENT_ALLOW_HTTP
 	AllowHTTP bool `yaml:"allow_http" envconfig:"ALLOW_HTTP"`
+
+	// MetadataType selects which representation of OpenID4VCI issuer metadata
+	// the wallet requests and accepts (OpenID4VCI 12.2.2). One of:
+	// "prefer-signed" (default), "require-signed", "prefer-unsigned",
+	// "require-unsigned", "any". Each request carries one Accept value. A
+	// compliant issuer answers 406 when it cannot serve it.
+	// prefer-signed asks for application/jwt, and after a 406 (and only a 406;
+	// every other status is terminal) retries once with application/json;
+	// prefer-unsigned is the mirror image. A signed
+	// response that is present but fails verification is always an error and
+	// never triggers the fallback. require-signed asks only for application/jwt
+	// and rejects unsigned metadata; require-unsigned asks only for
+	// application/json and rejects application/jwt; neither falls back. any
+	// sends one request accepting both and takes what the issuer serves.
+	// The prefer-* modes retry the other form only after an HTTP 406. An issuer
+	// that answers a different 4xx (400, 415, ...) to an Accept header it
+	// cannot satisfy is not negotiating, so the wallet does not retry; serve
+	// such issuers with "any", which sends a single request with
+	// Accept: application/jwt, application/json and needs no retry.
+	// Unknown values are rejected at startup.
+	// Env: WALLET_HTTP_CLIENT_METADATA_TYPE
+	// Read only by the issuer-metadata resolvers, which the backend role (for
+	// AuthZEN proxy URL resolution) and the engine role build. The registry
+	// role builds no resolver and ignores the field.
+	MetadataType string `yaml:"metadata_type" envconfig:"METADATA_TYPE"`
+
 	// TrustedIdPHosts lists hostnames of operator-configured OIDC identity
 	// providers that may resolve to private/loopback/link-local addresses.
 	// It applies only to the client NewIdPHTTPClient builds (the AS's OIDC
@@ -2193,7 +2219,8 @@ func defaultConfig() *Config {
 			},
 		},
 		HTTPClient: HTTPClientConfig{
-			Timeout: 30, // 30 seconds default
+			Timeout:      30,                            // 30 seconds default
+			MetadataType: DefaultHTTPClientMetadataType, // signed first, unsigned on 406
 			// AllowPrivateIPs defaults to false — SSRF protection blocks private/loopback IPs.
 			// Set allow_private_ips: true in config when issuers are on internal networks.
 		},
@@ -2261,6 +2288,30 @@ func (c ServerConfig) validateTrustedProxies() error {
 		}
 	}
 	return nil
+}
+
+// DefaultHTTPClientMetadataType is the default http_client.metadata_type.
+//
+// HTTPClientMetadataTypes and DefaultHTTPClientMetadataType mirror
+// issuermetadata.MetadataType. They are duplicated here (not imported)
+// because pkg/issuermetadata imports pkg/config for the SSRF-guarded HTTP
+// client, and an import in the other direction would be a cycle. A test in
+// pkg/issuermetadata keeps the two in sync.
+const DefaultHTTPClientMetadataType = "prefer-signed"
+
+// HTTPClientMetadataTypes lists the valid http_client.metadata_type values.
+var HTTPClientMetadataTypes = []string{"any", "prefer-signed", "require-signed", "prefer-unsigned", "require-unsigned"}
+
+func isValidHTTPClientMetadataType(s string) bool {
+	if s == "" {
+		return true
+	}
+	for _, v := range HTTPClientMetadataTypes {
+		if s == v {
+			return true
+		}
+	}
+	return false
 }
 
 // Validate validates the configuration
@@ -2528,6 +2579,10 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("wallet_provider.attestation.status_list.maintenance_period_seconds (%d) is below the 31-day (%d) minimum CS-04 §7.2.2 requires to still be remaining at presentation",
 				c.WalletProvider.Attestation.StatusList.MaintenancePeriodSeconds, StatusListRefMinMaintenanceSeconds)
 		}
+	}
+
+	if !isValidHTTPClientMetadataType(c.HTTPClient.MetadataType) {
+		return fmt.Errorf("http_client.metadata_type: unknown value %q (want one of %s)", c.HTTPClient.MetadataType, strings.Join(HTTPClientMetadataTypes, ", "))
 	}
 
 	if err := c.Presentation.DCQLConsentCheck.validate(); err != nil {
