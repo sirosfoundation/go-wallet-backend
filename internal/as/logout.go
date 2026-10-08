@@ -27,10 +27,19 @@ import (
 // all: without that check, any caller with a valid session of their own
 // could submit a stranger's token in the Authorization header and get it
 // revoked as a denial-of-service (#391 review, round 2). issuer/
+// sidParser is a signature-only legacy HMAC parser used solely to read the
+// presented bearer's sid and user_id for the pre-#402 family fallback. It is
+// independent of legacyIssuer (which exists only when as.legacy.enabled), because
+// /user/session/refresh stays mounted whenever jwt.refresh_days > 0 and can
+// rotate a pre-#402 session's refresh token even with legacy authentication
+// disabled; it never authenticates anything. nil falls back to legacyIssuer.
 // legacyIssuer/blacklist may be nil (steps they'd perform are then
 // skipped); a missing, mismatched, expired, or unparseable bearer token is
 // never an error - the session is still revoked either way.
-func LogoutHandler(store SessionStore, issuer *TokenIssuer, legacyIssuer *LegacyTokenIssuer, blacklist TokenBlacklistChecker, insecureCookies bool, logger *zap.Logger) gin.HandlerFunc {
+func LogoutHandler(store SessionStore, issuer *TokenIssuer, legacyIssuer, sidParser *LegacyTokenIssuer, blacklist TokenBlacklistChecker, familyRetention time.Duration, insecureCookies bool, logger *zap.Logger) gin.HandlerFunc {
+	if sidParser == nil {
+		sidParser = legacyIssuer
+	}
 	opts := CookieOptions{Insecure: insecureCookies}
 	return func(c *gin.Context) {
 		sessionID := GetSessionCookie(c, opts)
@@ -59,9 +68,68 @@ func LogoutHandler(store SessionStore, issuer *TokenIssuer, legacyIssuer *Legacy
 			}
 		}
 
+		// Revoke the refresh-token family minted alongside this session at
+		// login (#402): without it the paired refresh token stays usable
+		// after AS logout. A failure here must not be reported as a clean
+		// logout, so it surfaces as 500 (the session itself is already
+		// revoked; the cookie is kept so the retry can work).
+		//
+		// The presented legacy bearer's own sid is revoked too: a session
+		// created before #402 has an empty FamilyID, and once its refresh
+		// token is rotated the replacement pair carries a freshly generated
+		// sid that only the replacement JWTs know about.
+		var bearerSID string
+		if blacklist != nil && sessErr == nil && session != nil && sidParser != nil {
+			if bearerToken := extractBearerToken(c); bearerToken != "" {
+				if uid, sid, ok := sidParser.ParseSIDUnverifiedClaims(bearerToken); ok && uid == session.UserID {
+					bearerSID = sid
+				}
+			}
+		}
+		familyErr := revokeSessionFamily(c.Request.Context(), session, sessErr, bearerSID, blacklist, familyRetention, logger)
+
+		if familyErr != nil {
+			// Keep the cookie: it is the client's only credential for the
+			// idempotent retry that can still revoke the family. (The
+			// session itself is already revoked.)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke refresh token"})
+			return
+		}
 		ClearSessionCookie(c, opts)
 		c.Status(http.StatusNoContent)
 	}
+}
+
+// revokeSessionFamily revokes session.FamilyID via blacklist. It is a no-op
+// when the session has no family (not paired with a legacy refresh token)
+// or no blacklist is wired. A session lookup error or a failing RevokeFamily
+// is returned so the caller can fail closed.
+func revokeSessionFamily(ctx context.Context, session *Session, sessErr error, extraSID string, blacklist TokenBlacklistChecker, retention time.Duration, logger *zap.Logger) error {
+	if blacklist == nil {
+		return nil
+	}
+	if sessErr != nil {
+		logger.Error("logout: session lookup failed, cannot revoke refresh-token family", zap.Error(sessErr))
+		return sessErr
+	}
+	if session == nil {
+		return nil
+	}
+	sids := []string{session.FamilyID}
+	if extraSID != "" && extraSID != session.FamilyID {
+		sids = append(sids, extraSID)
+	}
+	for _, sid := range sids {
+		if sid == "" {
+			continue
+		}
+		if err := blacklist.RevokeFamily(ctx, sid, time.Now().Add(retention)); err != nil {
+			logger.Error("logout: failed to revoke refresh-token family",
+				zap.String("sid", sid), zap.Error(err))
+			return err
+		}
+	}
+	return nil
 }
 
 // blacklistOwnBearerToken parses bearerToken - trying the asymmetric issuer

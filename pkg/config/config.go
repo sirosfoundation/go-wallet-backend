@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -15,6 +16,8 @@ import (
 
 	"github.com/kelseyhightower/envconfig"
 	"gopkg.in/yaml.v3"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 )
 
 // Config represents the application configuration
@@ -34,6 +37,11 @@ type Config struct {
 	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
 	Presentation   PresentationConfig   `yaml:"presentation" envconfig:"PRESENTATION"`
 
+	// Registry configures the VCTM registry role (--mode=registry). It
+	// replaces the retired standalone registry configuration file
+	// (configs/registry.yaml, REGISTRY_* environment variables).
+	Registry RegistryConfig `yaml:"registry" envconfig:"REGISTRY"`
+
 	// asEnabledExplicit records whether as.enabled was explicitly present in
 	// the YAML file or environment (as opposed to defaulting to its bool
 	// zero-value, false) - set by Load(), consumed by EnableForRole() so it
@@ -41,7 +49,74 @@ type Config struct {
 	// never configured". Unexported: never (un)marshaled, so it can't leak
 	// into YAML output or be set by config files/env itself.
 	asEnabledExplicit bool
+
+	// registryExplicit records whether the `registry:` section (YAML) or any
+	// WALLET_REGISTRY_* environment variable was present; see
+	// RegistryExplicit and ApplyLegacyRegistryConfig.
+	registryExplicit bool
+
+	// jwtIssuerExplicit records whether jwt.issuer was set by the config file
+	// or WALLET_JWT_ISSUER (as opposed to the built-in default). The deprecated
+	// registry jwt.issuer only applies when it is false, so the shared JWT
+	// config stays a consistent (secret, issuer) pair.
+	jwtIssuerExplicit bool
+
+	// registryYAML is the decoded `registry:` mapping of the config file, used
+	// to tell keys the operator set explicitly from defaults.
+	registryYAML map[string]any
+
+	// registryLegacyTolerateNoJWKS is set by the deprecated registry.yaml
+	// alias when it enabled registry.require_auth from the old HMAC-only
+	// `jwt` block: such deployments have no as.external_url yet, and must
+	// keep starting (HMAC tokens only) until they migrate.
+	registryLegacyTolerateNoJWKS bool
+
+	// registryLegacyAudienceIndependent is set by the deprecated registry.yaml
+	// alias on a registry-only process that validates legacy HMAC tokens while
+	// server.rp_id is unset/default: the old schema has no rp_id, so legacy
+	// tokens are validated without an audience check (see
+	// RegistryLegacyAudienceIndependent).
+	registryLegacyAudienceIndependent bool
+
+	// loadWarnings are non-fatal findings from loading (see Warnings).
+	loadWarnings []string
 }
+
+// Warnings returns non-fatal findings collected while loading the
+// configuration, for the caller to log once a logger exists.
+func (c *Config) Warnings() []string { return c.loadWarnings }
+
+// retiredRegistryKeys are top-level keys of the retired standalone
+// registry.yaml layout that the backend configuration does not define.
+var retiredRegistryKeys = []string{"source", "sources", "cache", "dynamic_cache", "image_embed", "filter", "rate_limit"}
+
+// retiredRegistryLayoutWarning returns a warning when the config file looks
+// like the retired standalone registry.yaml (registry settings at top level
+// instead of under `registry:`), which would otherwise be silently ignored.
+func retiredRegistryLayoutWarning(data []byte) string {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return ""
+	}
+	if _, ok := raw["registry"]; ok {
+		return ""
+	}
+	var found []string
+	for _, k := range retiredRegistryKeys {
+		if _, ok := raw[k]; ok {
+			found = append(found, k)
+		}
+	}
+	if len(found) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("config file has top-level key(s) %s from the retired standalone registry.yaml layout; "+
+		"they are ignored - move them under a `registry:` section (see docs/REGISTRY_MIGRATION.md)", strings.Join(found, ", "))
+}
+
+// RegistryExplicit reports whether the registry section was explicitly
+// configured through the backend config file or WALLET_REGISTRY_* variables.
+func (c *Config) RegistryExplicit() bool { return c.registryExplicit }
 
 // ASConfig contains the new Authorization Server configuration.
 type ASConfig struct {
@@ -70,8 +145,21 @@ type ASConfig struct {
 
 	// Audiences lists the accepted audience values for token validation.
 	// Tokens must contain at least one of these in their "aud" claim.
-	// When empty, audience validation is skipped.
+	// Required when AS is enabled, but an empty list is filled with the
+	// documented defaults ("wallet-backend", "wallet-engine",
+	// "wallet-registry", plus server.rp_id while as.legacy.enabled is true)
+	// before validation, so configs that never set it keep working.
+	// Validate() rejects an empty list only if that defaulting was skipped.
+	// go-tokenauth v0.5.0 made this mandatory at the validator level too
+	// (both its validation paths now refuse to validate at all when their
+	// own configured Audiences is empty, closing a fail-open
+	// audience-confusion gap - a deployment upgraded past that version
+	// with no audiences configured would otherwise reject every request
+	// silently at runtime instead of failing to start).
 	// Documented values: "wallet-backend", "wallet-engine", "wallet-registry".
+	// When as.legacy.enabled is true an explicitly configured list must ALSO
+	// include server.rp_id: legacy (HMAC) tokens carry the RP ID as their
+	// audience, and Validate() rejects a configuration that omits it.
 	Audiences []string `yaml:"audiences" envconfig:"AUDIENCES"`
 
 	// RulesDir is the path to a directory containing SPOCP policy rule files.
@@ -197,6 +285,40 @@ func (c *Config) EnableForRole() {
 	c.AS.SetDefaults()
 	if c.AS.Issuer == "" {
 		c.AS.Issuer = c.JWT.Issuer
+	}
+	c.applyASSecurityDefaults()
+}
+
+// defaultASAudiences is the documented default for as.audiences.
+var defaultASAudiences = []string{"wallet-backend", "wallet-engine", "wallet-registry"}
+
+// defaultJWTIssuer is the documented default for jwt.issuer (see defaultConfig).
+const defaultJWTIssuer = "wallet-backend"
+
+// applyASSecurityDefaults fills in the documented defaults for the settings
+// Validate() makes mandatory whenever the AS is enabled, so that existing
+// deployments that never set them (e.g. the siros-id-stack chart renders
+// `as.enabled: true` with no `audiences`) keep starting. It is a no-op when
+// the AS is disabled, and never overrides an explicitly configured value.
+//
+// Shared by Load() (which must run it BEFORE Validate()) and EnableForRole()
+// so both paths produce an identical result.
+//
+//   - as.audiences empty: the documented default set, plus server.rp_id while
+//     legacy (HMAC) tokens are enabled (they carry the RP ID as "aud").
+//   - jwt.issuer empty while legacy tokens are enabled: "wallet-backend".
+func (c *Config) applyASSecurityDefaults() {
+	if !c.AS.Enabled {
+		return
+	}
+	if len(c.AS.Audiences) == 0 {
+		c.AS.Audiences = append([]string(nil), defaultASAudiences...)
+		if c.AS.Legacy.Enabled && c.Server.RPID != "" && !containsString(c.AS.Audiences, c.Server.RPID) {
+			c.AS.Audiences = append(c.AS.Audiences, c.Server.RPID)
+		}
+	}
+	if c.AS.Legacy.Enabled && c.JWT.Issuer == "" {
+		c.JWT.Issuer = defaultJWTIssuer
 	}
 }
 
@@ -405,6 +527,32 @@ type HTTPClientConfig struct {
 	// which is what every check in the codebase actually consults.
 	// Env: WALLET_HTTP_CLIENT_ALLOW_HTTP
 	AllowHTTP bool `yaml:"allow_http" envconfig:"ALLOW_HTTP"`
+
+	// MetadataType selects which representation of OpenID4VCI issuer metadata
+	// the wallet requests and accepts (OpenID4VCI 12.2.2). One of:
+	// "prefer-signed" (default), "require-signed", "prefer-unsigned",
+	// "require-unsigned", "any". Each request carries one Accept value. A
+	// compliant issuer answers 406 when it cannot serve it.
+	// prefer-signed asks for application/jwt, and after a 406 (and only a 406;
+	// every other status is terminal) retries once with application/json;
+	// prefer-unsigned is the mirror image. A signed
+	// response that is present but fails verification is always an error and
+	// never triggers the fallback. require-signed asks only for application/jwt
+	// and rejects unsigned metadata; require-unsigned asks only for
+	// application/json and rejects application/jwt; neither falls back. any
+	// sends one request accepting both and takes what the issuer serves.
+	// The prefer-* modes retry the other form only after an HTTP 406. An issuer
+	// that answers a different 4xx (400, 415, ...) to an Accept header it
+	// cannot satisfy is not negotiating, so the wallet does not retry; serve
+	// such issuers with "any", which sends a single request with
+	// Accept: application/jwt, application/json and needs no retry.
+	// Unknown values are rejected at startup.
+	// Env: WALLET_HTTP_CLIENT_METADATA_TYPE
+	// Read only by the issuer-metadata resolvers, which the backend role (for
+	// AuthZEN proxy URL resolution) and the engine role build. The registry
+	// role builds no resolver and ignores the field.
+	MetadataType string `yaml:"metadata_type" envconfig:"METADATA_TYPE"`
+
 	// TrustedIdPHosts lists hostnames of operator-configured OIDC identity
 	// providers that may resolve to private/loopback/link-local addresses.
 	// It applies only to the client NewIdPHTTPClient builds (the AS's OIDC
@@ -922,6 +1070,43 @@ func (t *TLSConfig) ListenAndServe(srv *http.Server) error {
 	return srv.ListenAndServe()
 }
 
+// PrepareTLS loads and validates the certificate/key pair and applies the
+// MinVersion setting to srv.TLSConfig. It is a no-op when TLS is disabled.
+// Calling it before binding a listener lets a missing, unreadable, malformed
+// or mismatched certificate fail startup instead of surfacing from a serving
+// goroutine. Serve then needs no files.
+func (t *TLSConfig) PrepareTLS(srv *http.Server) error {
+	if !t.Enabled {
+		return nil
+	}
+	cert, err := tls.LoadX509KeyPair(t.CertFile, t.KeyFile)
+	if err != nil {
+		return fmt.Errorf("failed to load TLS certificate (cert_file=%q, key_file=%q): %w", t.CertFile, t.KeyFile, err)
+	}
+	if srv.TLSConfig == nil {
+		srv.TLSConfig = &tls.Config{}
+	}
+	srv.TLSConfig.MinVersion = t.TLSMinVersion()
+	srv.TLSConfig.Certificates = []tls.Certificate{cert}
+	return nil
+}
+
+// Serve serves srv on an already-bound listener, using TLS if t is enabled and
+// plain HTTP otherwise. Binding the listener separately (net.Listen) lets the
+// caller report bind failures synchronously instead of from a goroutine. The
+// certificate is loaded here only if PrepareTLS has not already done so.
+func (t *TLSConfig) Serve(srv *http.Server, ln net.Listener) error {
+	if t.Enabled {
+		if srv.TLSConfig == nil || len(srv.TLSConfig.Certificates) == 0 {
+			if err := t.PrepareTLS(srv); err != nil {
+				return err
+			}
+		}
+		return srv.ServeTLS(ln, "", "")
+	}
+	return srv.Serve(ln)
+}
+
 // CORSConfig contains CORS (Cross-Origin Resource Sharing) configuration
 type CORSConfig struct {
 	// AllowedOrigins is a list of origins that may access the resource.
@@ -1073,7 +1258,45 @@ type JWTConfig struct {
 	SecretPath  string `yaml:"secret_path" envconfig:"SECRET_PATH"` // Path to file containing JWT secret
 	ExpiryHours int    `yaml:"expiry_hours" envconfig:"EXPIRY_HOURS"`
 	RefreshDays int    `yaml:"refresh_days" envconfig:"REFRESH_DAYS"`
-	Issuer      string `yaml:"issuer" envconfig:"ISSUER"`
+	// Issuer is the "iss" claim of legacy (HMAC) tokens. Required (non-empty) when as.legacy.enabled is true: legacy tokens are issued and validated with it. Defaults to "wallet-backend"; if it is blanked while as.legacy.enabled is true, that default is re-applied before validation.
+	Issuer string `yaml:"issuer" envconfig:"ISSUER"`
+}
+
+// MaxTokenLifetime returns the longer of the configured access-token
+// (ExpiryHours) and refresh-token (RefreshDays) lifetimes. A refresh-token
+// family revocation marker must be retained at least this long, since
+// nothing enforces that the refresh token outlives the access token.
+func (c JWTConfig) MaxTokenLifetime() time.Duration {
+	refresh := time.Duration(c.RefreshDays) * 24 * time.Hour
+	access := time.Duration(c.ExpiryHours) * time.Hour
+	if refresh > access {
+		return refresh
+	}
+	return access
+}
+
+// MinFamilyRetention is the floor for how long a refresh-token family
+// revocation marker is kept (365 days).
+//
+// The marker must outlive every token of the family, but the only bound
+// available at logout is the CURRENT configuration, while tokens may have
+// been minted under an earlier, longer one (e.g. jwt.refresh_days lowered
+// after deployment). A retention derived from the current lifetimes alone
+// could therefore expire early and un-revoke older tokens. The floor makes
+// retention non-shrinking across configuration changes for any earlier
+// configuration with token lifetimes up to a year; markers are tiny and
+// swept afterwards, so the cost is negligible. Configurations that ever
+// issued tokens beyond a year are covered by MaxTokenLifetime taking the
+// larger value.
+const MinFamilyRetention = 365 * 24 * time.Hour
+
+// FamilyRetention returns how long to keep a refresh-token family
+// revocation marker: the longer of MaxTokenLifetime and MinFamilyRetention.
+func (c JWTConfig) FamilyRetention() time.Duration {
+	if m := c.MaxTokenLifetime(); m > MinFamilyRetention {
+		return m
+	}
+	return MinFamilyRetention
 }
 
 // JWTLeeway is the clock-skew tolerance applied when validating JWT time claims
@@ -1790,6 +2013,23 @@ type RedisConfig struct {
 
 // Load loads configuration from file and environment variables
 func Load(configFile string) (*Config, error) {
+	return load(configFile, (*Config).loadSecretsFromFiles, (*Config).Validate)
+}
+
+// LoadRegistryOnly loads configuration for a process that runs only the
+// registry role. Backend-only requirements (storage, jwt.secret, rp_id, ...)
+// are not enforced; the registry section is validated separately by the
+// caller after any deprecated-alias overlay (see ValidateRegistry and
+// ValidateRegistryStandalone).
+func LoadRegistryOnly(configFile string) (*Config, error) {
+	// The legacy-audience check is deliberately not part of the load-time
+	// validation: the deprecated registry.yaml overlay (applied afterwards)
+	// can decide that it does not apply; ValidateRegistryStandalone runs it
+	// once the overlay is in place.
+	return load(configFile, (*Config).loadRegistrySecrets, (*Config).validateRegistryStandaloneServer)
+}
+
+func load(configFile string, loadSecrets, validate func(*Config) error) (*Config, error) {
 	// Start with defaults
 	cfg := defaultConfig()
 
@@ -1806,6 +2046,12 @@ func Load(configFile string) (*Config, error) {
 				return nil, fmt.Errorf("failed to parse config file: %w", err)
 			}
 			cfg.asEnabledExplicit = yamlHasASEnabledKey(data)
+			cfg.registryExplicit = yamlHasTopLevelKey(data, "registry")
+			cfg.registryYAML = yamlRegistrySection(data)
+			cfg.jwtIssuerExplicit = yamlHasNestedKey(data, "jwt", "issuer")
+			if w := retiredRegistryLayoutWarning(data); w != "" {
+				cfg.loadWarnings = append(cfg.loadWarnings, w)
+			}
 		}
 	}
 
@@ -1814,17 +2060,27 @@ func Load(configFile string) (*Config, error) {
 	if _, ok := os.LookupEnv("WALLET_AS_ENABLED"); ok {
 		cfg.asEnabledExplicit = true
 	}
+	if _, ok := os.LookupEnv("WALLET_JWT_ISSUER"); ok {
+		cfg.jwtIssuerExplicit = true
+	}
+	if envHasPrefix("WALLET_REGISTRY_") {
+		cfg.registryExplicit = true
+	}
 	if err := envconfig.Process("WALLET", cfg); err != nil {
 		return nil, fmt.Errorf("failed to process environment variables: %w", err)
 	}
 
 	// Load secrets from files if configured
-	if err := cfg.loadSecretsFromFiles(); err != nil {
+	if err := loadSecrets(cfg); err != nil {
 		return nil, fmt.Errorf("failed to load secrets from files: %w", err)
 	}
 
+	// Apply the documented AS defaults before validating: Validate() makes
+	// them mandatory, and configs written before that must keep loading.
+	cfg.applyASSecurityDefaults()
+
 	// Validate configuration
-	if err := cfg.Validate(); err != nil {
+	if err := validate(cfg); err != nil {
 		return nil, fmt.Errorf("invalid configuration: %w", err)
 	}
 
@@ -1837,6 +2093,70 @@ func Load(configFile string) (*Config, error) {
 	cfg.Server.CORS.SetDefaults()
 
 	return cfg, nil
+}
+
+// yamlHasTopLevelKey reports whether the raw YAML has the given top-level key.
+func yamlHasTopLevelKey(data []byte, key string) bool {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return false
+	}
+	_, ok := raw[key]
+	return ok
+}
+
+// yamlHasNestedKey reports whether the raw YAML has section.key.
+func yamlHasNestedKey(data []byte, section, key string) bool {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return false
+	}
+	m, ok := raw[section].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, ok = m[key]
+	return ok
+}
+
+// yamlRegistrySection returns the raw `registry:` mapping of the YAML, or nil.
+func yamlRegistrySection(data []byte) map[string]any {
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil
+	}
+	m, _ := raw["registry"].(map[string]any)
+	return m
+}
+
+// registryKeyExplicit reports whether the registry key at the given YAML path
+// (relative to `registry:`) was set in the config file, or via the matching
+// WALLET_REGISTRY_* environment variable.
+func (c *Config) registryKeyExplicit(yamlPath []string, envName string) bool {
+	if _, ok := os.LookupEnv(envName); ok {
+		return true
+	}
+	var cur any = c.registryYAML
+	for _, k := range yamlPath {
+		m, ok := cur.(map[string]any)
+		if !ok {
+			return false
+		}
+		if cur, ok = m[k]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// envHasPrefix reports whether any environment variable has the given prefix.
+func envHasPrefix(prefix string) bool {
+	for _, kv := range os.Environ() {
+		if strings.HasPrefix(kv, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // yamlHasASEnabledKey reports whether the raw YAML explicitly sets an
@@ -1917,14 +2237,23 @@ func (c *Config) loadSecretsFromFiles() error {
 
 // readSecretFile reads a secret value from a file, trimming whitespace.
 // Returns an error if the file cannot be read or is empty.
+//
+// The returned errors deliberately do not name the file: they end up in
+// startup logs, and the configuration key the caller wraps them with already
+// says which secret is meant. (os.ReadFile errors carry the path, so the
+// underlying cause is unwrapped to the bare OS error.)
 func readSecretFile(path string) (string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("failed to read file %s: %w", path, err)
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) {
+			err = pathErr.Err
+		}
+		return "", fmt.Errorf("failed to read secret file: %w", err)
 	}
 	secret := strings.TrimSpace(string(data))
 	if secret == "" {
-		return "", fmt.Errorf("file %s is empty", path)
+		return "", errors.New("secret file is empty")
 	}
 	return secret, nil
 }
@@ -1935,6 +2264,7 @@ func defaultConfig() *Config {
 	corsConfig.SetDefaults()
 
 	return &Config{
+		Registry: DefaultRegistryConfig(),
 		Server: ServerConfig{
 			Host:       "0.0.0.0",
 			Port:       8080,
@@ -1968,7 +2298,7 @@ func defaultConfig() *Config {
 		JWT: JWTConfig{
 			ExpiryHours: 24,
 			RefreshDays: 7,
-			Issuer:      "wallet-backend",
+			Issuer:      defaultJWTIssuer,
 		},
 		Trust: TrustConfig{
 			Timeout: 30, // seconds
@@ -2012,7 +2342,8 @@ func defaultConfig() *Config {
 			},
 		},
 		HTTPClient: HTTPClientConfig{
-			Timeout: 30, // 30 seconds default
+			Timeout:      30,                                              // 30 seconds default
+			MetadataType: string(issuermetadata.MetadataTypePreferSigned), // signed first, unsigned on 406
 			// AllowPrivateIPs defaults to false — SSRF protection blocks private/loopback IPs.
 			// Set allow_private_ips: true in config when issuers are on internal networks.
 		},
@@ -2236,6 +2567,36 @@ func (c *Config) Validate() error {
 		if c.AS.Issuer == "" {
 			return fmt.Errorf("as: issuer is required (set as.issuer or jwt.issuer)")
 		}
+		// Required as of the go-tokenauth v0.5.0 dependency bump: an empty
+		// Audiences list used to mean "skip audience validation" both here
+		// and in go-tokenauth's own Validator, but go-tokenauth v0.5.0
+		// made it a hard configuration error there instead (closing a
+		// fail-open audience-confusion gap) - every request would
+		// otherwise start being silently rejected at runtime the moment
+		// this dependency is upgraded, for any deployment that previously
+		// relied on the old "empty means accept any audience" behavior.
+		// Failing fast here, at startup, is far preferable to that.
+		if len(c.AS.Audiences) == 0 {
+			return fmt.Errorf("as: audiences is required when AS is enabled (see Config.AS.Audiences's doc comment)")
+		}
+		// Legacy (HMAC) tokens carry "aud": Server.RPID (see
+		// UserService/WebAuthnService.generateToken), and go-tokenauth v0.5
+		// validates that against AS.Audiences. If the RP ID is not among
+		// them, every legacy login token is rejected on its next protected
+		// request - a failure that only shows up at runtime, so refuse it here.
+		// Legacy tokens are minted with "iss": jwt.issuer and validated
+		// against Legacy.Issuers=[jwt.issuer]; an empty value would mint
+		// tokens with an empty iss and turn go-tokenauth's mandatory issuer
+		// check into a no-op, so require it (as.issuer does not help: it is
+		// not the legacy issuer).
+		if c.AS.Legacy.Enabled && c.JWT.Issuer == "" {
+			return fmt.Errorf("as: legacy tokens are enabled but jwt.issuer is empty; legacy tokens are issued and validated with jwt.issuer, so set it or disable as.legacy.enabled")
+		}
+		if c.AS.Legacy.Enabled && !containsString(c.AS.Audiences, c.Server.RPID) {
+			return fmt.Errorf("as: legacy tokens are enabled but server.rp_id %q is not listed in as.audiences; "+
+				"legacy tokens carry the RP ID as their audience, so add it to as.audiences or disable as.legacy.enabled",
+				c.Server.RPID)
+		}
 	}
 
 	// Validate WIA configuration
@@ -2317,6 +2678,10 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("wallet_provider.attestation.status_list.maintenance_period_seconds (%d) is below the 31-day (%d) minimum CS-04 §7.2.2 requires to still be remaining at presentation",
 				c.WalletProvider.Attestation.StatusList.MaintenancePeriodSeconds, StatusListRefMinMaintenanceSeconds)
 		}
+	}
+
+	if _, err := issuermetadata.ParseMetadataType(c.HTTPClient.MetadataType); err != nil {
+		return fmt.Errorf("http_client.metadata_type: %w", err)
 	}
 
 	if err := c.Presentation.StatusCheck.validate(); err != nil {
@@ -2496,4 +2861,13 @@ func (c AuditConfig) validateIdentityEvents() error {
 		}
 	}
 	return nil
+}
+
+func containsString(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }

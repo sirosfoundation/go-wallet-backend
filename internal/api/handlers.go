@@ -16,6 +16,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/legacytoken"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/taggedbinary"
 )
@@ -886,7 +887,37 @@ func ttlForTokenAuthResult(cfg *config.Config, result *tokenauthclaims.Result) t
 	return maxConfiguredASTokenTTL(cfg)
 }
 
-// Logout invalidates the current session by blacklisting the JWT
+// familyRetention returns how long a Logout-triggered RevokeFamily entry
+// must be kept (see TokenBlacklist.RevokeFamily's own doc comment for why
+// it, unlike RevokeUser, is swept once this elapses): long enough that no
+// access or refresh token which could still legitimately carry the revoked
+// sid can possibly still be unexpired. Every token minted for a given sid
+// (WebAuthnService.generateToken/generateRefreshToken/RefreshAccessToken)
+// is minted no later than the moment of revocation itself - IsFamilyRevoked
+// is checked before minting any further token for that sid.
+//
+// Uses the MAX of both configured lifetimes, not just the refresh token's
+// (Copilot review on #414): nothing in config.Config.Validate enforces
+// JWT.RefreshDays outliving JWT.ExpiryHours, so an unusual but valid
+// configuration (e.g. a short-lived refresh token paired with a
+// long-lived access token) would otherwise let the marker expire while an
+// access token from an earlier rotation - its own jti never individually
+// blacklisted - was still unexpired and usable again.
+func familyRetention(cfg *config.Config) time.Duration {
+	return cfg.JWT.FamilyRetention()
+}
+
+// Logout invalidates the current session by blacklisting the JWT and, when
+// it carries one, revoking its whole refresh-token family (#402) - so a
+// refresh token issued alongside it (or produced by any rotation of it)
+// stops working immediately too, rather than remaining valid until it
+// naturally expires or is itself used.
+//
+// If the family revocation fails the handler fails closed with a 500 (the
+// refresh token is still usable, so a clean logout must not be reported).
+// The access-token jti is blacklisted only AFTER the family revocation
+// succeeds, so a failed attempt leaves the token usable (the auth
+// middleware still accepts it) and the client can simply retry.
 func (h *Handlers) Logout(c *gin.Context) {
 	// When authenticated via go-tokenauth (pkg/middleware.TokenAuthMiddleware
 	// - the path taken whenever AS is enabled), the raw token may be
@@ -897,6 +928,48 @@ func (h *Handlers) Logout(c *gin.Context) {
 	// re-parsing.
 	if v, exists := c.Get("tokenauth_result"); exists {
 		if result, ok := v.(*tokenauthclaims.Result); ok && result != nil {
+			// Refresh-token family revocation (#402), legacy-mode tokens
+			// only: go-tokenauth "auto-detects new-style vs legacy" (see
+			// TokenAuthMiddleware's doc comment), so a WebAuthnService-
+			// issued legacy HMAC token can be authenticated through this
+			// tokenauth_result path instead of the legacy branch below
+			// whenever the AS is enabled - without this, a session logged
+			// out through that deployment mode would never actually have
+			// its refresh-token family revoked. New-style AS-issued tokens
+			// (ModeSession) have no sid/refresh-token-family concept in
+			// this codebase, so only ModeLegacy is handled here.
+			if result.Mode == tokenauthclaims.ModeLegacy && h.services.TokenBlacklist != nil {
+				rawToken, _ := c.Get("token")
+				rawTokenStr, _ := rawToken.(string)
+				sid, sidErr := legacytoken.ParseSID(h.cfg.JWT.Secret, rawTokenStr)
+				if sidErr != nil {
+					// Fail closed: without the sid the refresh-token family
+					// cannot be revoked, so do not report a clean logout.
+					h.logger.Error("Logout: cannot determine refresh-token family", zap.Error(sidErr))
+					c.JSON(500, gin.H{"error": "Failed to revoke session"})
+					return
+				}
+				if sid != "" {
+					expiry := time.Now().Add(familyRetention(h.cfg) + time.Hour)
+					if err := h.services.TokenBlacklist.RevokeFamily(c.Request.Context(), sid, expiry); err != nil {
+						// Fail closed, like the sid-parse failure above: the
+						// refresh token is still usable, so do not report a
+						// clean logout. The client may retry (idempotent).
+						h.logger.Error("Logout: failed to revoke refresh-token family",
+							zap.String("sid", sid), zap.Error(err))
+						c.JSON(500, gin.H{"error": "Failed to revoke session"})
+						return
+					}
+					h.logger.Info("User logged out, refresh-token family revoked",
+						zap.String("sid", sid),
+					)
+				}
+			}
+
+			// Blacklist the access-token jti only AFTER the family has been
+			// revoked: if revocation failed above we returned 500 without
+			// touching the jti, so the same token still passes the auth
+			// middleware and the client can retry.
 			if result.JTI != "" && h.services.TokenBlacklist != nil {
 				expiry := time.Now().Add(ttlForTokenAuthResult(h.cfg, result) + time.Minute)
 				if err := h.services.TokenBlacklist.Add(c.Request.Context(), result.JTI, expiry); err != nil {
@@ -907,6 +980,7 @@ func (h *Handlers) Logout(c *gin.Context) {
 					)
 				}
 			}
+
 			c.JSON(200, gin.H{"message": "Logged out successfully"})
 			return
 		}
@@ -920,13 +994,31 @@ func (h *Handlers) Logout(c *gin.Context) {
 		return
 	}
 
-	// Parse the token to get claims (we need jti and exp)
+	// Parse the token to get claims (we need jti, exp, and sid)
 	token, _ := jwt.Parse(tokenString.(string), func(token *jwt.Token) (interface{}, error) {
 		return []byte(h.cfg.JWT.Secret), nil
 	})
 
 	if token != nil && token.Claims != nil {
 		if claims, ok := token.Claims.(jwt.MapClaims); ok {
+			// Refresh-token family revocation (#402) - see this function's
+			// own doc comment.
+			if sid, _ := claims["sid"].(string); sid != "" && h.services.TokenBlacklist != nil {
+				familyExpiry := time.Now().Add(familyRetention(h.cfg) + time.Hour)
+				if err := h.services.TokenBlacklist.RevokeFamily(c.Request.Context(), sid, familyExpiry); err != nil {
+					// Fail closed: see the tokenauth path above.
+					h.logger.Error("Logout: failed to revoke refresh-token family",
+						zap.String("sid", sid), zap.Error(err))
+					c.JSON(500, gin.H{"error": "Failed to revoke session"})
+					return
+				}
+				h.logger.Info("User logged out, refresh-token family revoked",
+					zap.String("sid", sid),
+				)
+			}
+
+			// Blacklist the jti only after the family revocation succeeded -
+			// see the tokenauth path above.
 			jti, _ := claims["jti"].(string)
 			if jti != "" && h.services.TokenBlacklist != nil {
 				// Get expiry time for blacklist entry

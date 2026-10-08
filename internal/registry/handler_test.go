@@ -563,3 +563,15 @@ func TestHandler_GetStatus_LastUpdatedFormat(t *testing.T) {
 	_, err = time.Parse(http.TimeFormat, lastUpdated)
 	require.NoError(t, err, "last_updated should be in HTTP time format")
 }
+
+func TestHandler_RegisterRootAliases(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	h := NewHandler(NewStore(""), nil, nil, zap.NewNop())
+	r := gin.New()
+	h.RegisterRootAliases(r)
+	for path, want := range map[string]int{"/credentials": http.StatusOK, "/type-metadata": http.StatusBadRequest, "/status": http.StatusNotFound} {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		assert.Equal(t, want, w.Code, path)
+	}
+}

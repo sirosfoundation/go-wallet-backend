@@ -270,7 +270,11 @@ func (e *Evaluator) toAuthZENRequest(req *trust.EvaluationRequest) (*gotrust.Eva
 		if ctx == nil {
 			ctx = make(map[string]interface{})
 		}
-		ctx["credential_type"] = req.CredentialType
+		// go-trust (>= v0.22) sanitizes inbound context against an allowlist
+		// that contains "credential_types" (plural, a list) but not the
+		// singular "credential_type", so the singular key is silently dropped
+		// and never reaches the registries.
+		ctx["credential_types"] = []string{req.CredentialType}
 	}
 	if ctx != nil {
 		authzenReq.Context = ctx
