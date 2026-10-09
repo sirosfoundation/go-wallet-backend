@@ -1,0 +1,131 @@
+# DEVELOPMENT ONLY: config for the SoftHSM image (Dockerfile.pkcs11 --target softhsm).
+# The __SOFTHSM_*__ placeholders are filled in by scripts/softhsm-entrypoint.sh.
+# Based on config.yaml (in-memory storage, localhost); only the as: block is added.
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+  # Per-service bind addresses (default to 'host' if not specified)
+  # admin_host: "127.0.0.1"    # Bind admin API to localhost only
+  admin_port: 8081
+  # engine_host: "0.0.0.0"     # Bind engine to all interfaces
+  engine_port: 8082
+  # registry_host: "127.0.0.1" # Bind registry to localhost only
+  registry_port: 8097
+  rp_id: "localhost"
+  rp_origin: "http://localhost:8080"
+  # rp_origins allows multiple WebAuthn RP origins (e.g. for native app wrappers).
+  # When set, these are combined with rp_origin (if present) and deduplicated.
+  # Use rp_origins alone or together with rp_origin; at least one must be set.
+  # rp_origins:
+  #   - "http://localhost:8080"
+  #   - "android:apk-key-hash:abc123def456"
+  rp_name: "Wallet Backend"
+  base_url: "http://localhost:8080"
+
+  # CORS configuration
+  cors:
+    # Allowed origins (use ["*"] for development, specific origins for production)
+    allowed_origins:
+      - "*"
+    # HTTP methods allowed
+    allowed_methods:
+      - "GET"
+      - "POST"
+      - "PUT"
+      - "DELETE"
+      - "OPTIONS"
+    # Request headers allowed
+    allowed_headers:
+      - "Authorization"
+      - "Content-Type"
+      - "X-Tenant-ID"
+      - "If-None-Match"
+      - "X-Private-Data-If-Match"
+      - "X-Private-Data-If-None-Match"
+      - "Upgrade"
+      - "Connection"
+      - "Sec-WebSocket-Key"
+      - "Sec-WebSocket-Version"
+      - "Sec-WebSocket-Protocol"
+    # Response headers exposed to browser
+    exposed_headers:
+      - "X-Private-Data-ETag"
+    # Allow credentials (cannot be true with allowed_origins: ["*"])
+    allow_credentials: false
+    # Preflight cache duration in seconds
+    max_age: 43200
+
+  # External URLs for split-mode deployment
+  # (optional - defaults to localhost with respective ports)
+  # external_urls:
+  #   backend_url: "https://backend.example.com"
+  #   engine_url: "wss://engine.example.com"
+  #   registry_url: "https://registry.example.com"
+  #   admin_url: "https://admin.example.com"
+
+storage:
+  type: "memory"  # Options: memory, sqlite, mongodb
+  
+  sqlite:
+    path: "wallet.db"
+  
+  mongodb:
+    uri: "mongodb://localhost:27017"
+    database: "wallet"
+    timeout: 10
+
+logging:
+  level: "info"  # Options: debug, info, warn, error
+  format: "json" # Options: json, text
+
+jwt:
+  secret: "change-this-secret-in-production"
+  expiry_hours: 24
+  refresh_days: 7
+  issuer: "wallet-backend"
+
+# VCTM registry role (--mode=registry, or a role list including "registry").
+# Replaces the retired standalone registry.yaml; see docs/REGISTRY_MIGRATION.md.
+# Server address, logging and CORS are the settings above. Authentication uses
+# the same as.* / jwt.* settings as the other roles.
+registry:
+  source:
+    url: "https://registry.siros.org/api/v1/schemas.json"
+    poll_interval: 5m
+    timeout: 30s
+  cache:
+    path: "data/vctm-cache.json"
+    max_age: 24h
+  dynamic_cache:
+    enabled: false  # fetches VCTMs by URL on demand; keep off unless allowed_hosts is set
+    default_ttl: 1h
+    max_ttl: 24h
+    min_ttl: 5m
+    timeout: 30s
+    allowed_hosts: []
+  filter:
+    include_patterns: []
+    exclude_patterns: []
+  rate_limit:
+    enabled: true
+    authenticated_rpm: 1000
+    unauthenticated_rpm: 100
+    burst_multiplier: 3
+  # true: all registry requests need a valid access token (audience
+  # "wallet-registry" for ES256 tokens; legacy HMAC tokens while
+  # as.legacy.enabled). false: unauthenticated access allowed.
+  require_auth: false
+
+# Authorization Server with its access-token signing key in a PKCS#11 token.
+# For a real HSM replace module_path with the vendor's module, set slot_id and
+# key_label to the token's, and use pin_path (a mounted secret) for the PIN.
+as:
+  enabled: true
+  rules_dir: "/app/rules"   # baseline SPOCP policy shipped in the image
+  signing_key_pkcs11:
+    module_path: "__SOFTHSM_MODULE__"
+    slot_id: __SOFTHSM_SLOT_ID__
+    key_label: "__SOFTHSM_KEY_LABEL__"
+    pin_path: "__SOFTHSM_PIN_FILE__"
+    pool_size: 2

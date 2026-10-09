@@ -351,7 +351,7 @@ the shared token validator (the AS itself is *not* run, keep `as.enabled` false)
 
 | Setting | Why |
 |---------|-----|
-| `as.external_url` | JWKS is fetched from `<as.external_url>/auth/.well-known/jwks.json` (no override) |
+| `as.external_url` | JWKS is fetched from `<as.external_url>/auth/.well-known/jwks.json` (no override); in split mode set it to the AS's in-cluster URL (see [Split mode](#split-mode-as-jwks)) |
 | `as.issuer` (or `jwt.issuer`) | expected `iss` |
 | `jwt.secret` / `jwt.secret_path` (>= 32 bytes) | only while `as.legacy.enabled` is true (legacy HMAC tokens); set `as.legacy.enabled: false` to drop it |
 
@@ -442,6 +442,7 @@ legacy enabled it must include `server.rp_id`.
 - [ ] Configure CORS origins
 - [ ] Set `server.trusted_proxies` to your load balancer's addresses (or `["none"]` without one). Unset, every peer is trusted for `X-Forwarded-For`, so a direct caller can pick its own client IP and dodge the per-IP OIDC gate rate limit
 - [ ] Set up monitoring and logging
+- [ ] If running a standalone engine (`--mode=engine`, no backend) with `as.external_url`, read [Token revocation limits](#token-revocation-limits)
 - [ ] Configure health checks
 - [ ] Set resource limits
 - [ ] Enable autoscaling
@@ -579,6 +580,25 @@ same replica (session affinity) and accept that a restart forgets revocations.
 The AS session store itself is shared when it is MongoDB-backed, so sessions
 and the recorded refresh-token family survive across replicas; only the
 revocation markers are process-local.
+
+### Token revocation limits
+
+Token revocation (logout, revoked user) is enforced through an in-process token blacklist, so it only takes effect in the process that holds it (single-replica limitation, tracked in issues #407 and #415). A shared revocation source is not implemented.
+
+<a id="split-mode-as-jwks"></a>
+**Split mode: reaching the AS for its signing keys.** The standalone engine, a registry-only process and an isolated wallet-provider fetch the AS keys from `<as.external_url>/auth/.well-known/jwks.json`. In a split-pod deployment just set `as.external_url` to the AS's in-cluster URL (`http` or `https`). The JWKS is fetched by go-tokenauth without SSRF filtering or a plaintext check, because it is infrastructure-internal traffic between components of the same cluster; do not point `as.external_url` at anything outside your own infrastructure. Example (engine and registry pods):
+
+```yaml
+as:
+  external_url: http://backend.wallet.svc:8080
+```
+
+**Standalone engine (`--mode=engine`, no backend provider):** when `as.external_url` is set, the engine accepts AS-signed ES256 session tokens, but it has no revocation checker and no token blacklist is wired into it. Consequence: after a logout or user revocation at the backend, a token **stays valid at the standalone engine until it expires**; a new WebSocket handshake with it is still accepted. The engine logs a warning at startup when it is built this way.
+
+Mitigations:
+
+- Use short access token TTLs, so the exposure window is bounded by the TTL.
+- Co-host the engine with the backend (the default all-in-one mode), which shares the token blacklist.
 
 ### Database Scaling
 

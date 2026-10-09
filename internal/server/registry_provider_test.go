@@ -90,6 +90,8 @@ func registryTestConfig(t *testing.T) *config.Config {
 	cfg.Registry.Cache.Path = filepath.Join(t.TempDir(), "cache.json")
 	cfg.Registry.Source.URL = "http://127.0.0.1:1/unreachable.json"
 	cfg.Registry.DynamicCache.Enabled = false
+	// The test AS listens on plain http; the guarded JWKS fetch needs both.
+	cfg.HTTPClient.AllowHTTP, cfg.HTTPClient.AllowPrivateIPs = true, true
 	return cfg
 }
 
@@ -182,32 +184,44 @@ func TestRegistryNeedsValidator(t *testing.T) {
 	assert.True(t, registryNeedsValidator(c))
 }
 
-func TestBuildTokenValidatorHelpers(t *testing.T) {
-	c := baseRegistryConfig(t)
-	c.AS.ExternalURL = "https://as.example.org"
-	assert.Equal(t, "https://as.example.org/auth/.well-known/jwks.json", tokenJWKSURL(c))
-
-	c.JWT.Issuer = "jwt-iss"
-	assert.Equal(t, "jwt-iss", tokenIssuer(c))
-	c.AS.Issuer = "as-iss"
-	assert.Equal(t, "as-iss", tokenIssuer(c))
+// The registry's validator is built through the same guarded path as the other
+// roles; this pins the legacy HMAC settings it derives from the config.
+func TestRegistryProvider_BuildValidatorLegacy(t *testing.T) {
+	c := registryTestConfig(t)
+	c.Registry.RequireAuth = true
+	c.AS.Legacy.Enabled = true
+	c.Server.RPID = regTestRPID
 
 	// Legacy HMAC is never validated against an empty key.
-	c.AS.Legacy.Enabled = true
 	c.JWT.Secret = ""
-	assert.Equal(t, []string{"jwt-iss"}, legacyValidatorConfig(c).Issuers)
-	c.JWT.Issuer = ""
-	assert.Nil(t, legacyValidatorConfig(c).Issuers)
-	c.JWT.Issuer = "wallet-backend"
-	v := buildTokenValidator(c, []string{regTestRPID}, nil)
-	_, err := v.Validate(context.Background(), regHMAC(t))
+	p, err := NewRegistryProvider(c, zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.Close() })
+	_, err = p.validator.Validate(context.Background(), regHMAC(t))
 	assert.Error(t, err)
 
+	// An empty jwt.issuer with a secret would accept any issuer: refused.
 	c.JWT.Secret = regTestSecret
-	v = buildTokenValidator(c, []string{regTestRPID}, nil)
-	c.AS.Issuer = ""
-	_, err = v.Validate(context.Background(), regHMAC(t))
+	c.JWT.Issuer = ""
+	_, err = NewRegistryProvider(c, zap.NewNop())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "jwt.issuer")
+
+	c.JWT.Issuer = "wallet-backend"
+	p2, err := NewRegistryProvider(c, zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p2.Close() })
+	_, err = p2.validator.Validate(context.Background(), regHMAC(t))
 	assert.NoError(t, err)
+
+	// as.legacy.enabled=false refuses HMAC even with a secret.
+	c.AS.Legacy.Enabled = false
+	c.AS.ExternalURL = "http://127.0.0.1:1"
+	p3, err := NewRegistryProvider(c, zap.NewNop())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p3.Close() })
+	_, err = p3.validator.Validate(context.Background(), regHMAC(t))
+	assert.Error(t, err)
 }
 
 func TestRegistryProvider_RootAliases(t *testing.T) {
