@@ -591,8 +591,7 @@ func TestAuthMiddlewareWithBlacklist_RefusesHMACWhenLegacyDisabled(t *testing.T)
 	}
 }
 
-// A loaded config (as Load() builds it) with as.legacy.enabled=false and the
-// AS disabled in this process must still refuse HMAC on the no-AS path.
+// A loaded config with legacy off refuses HMAC even with the AS disabled.
 func TestAuthMiddlewareWithBlacklist_LoadedConfigLegacyOff(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	dir := t.TempDir()
@@ -641,9 +640,7 @@ func TestAuthMiddlewareWithBlacklist_LegacyIssuerPinned(t *testing.T) {
 		return s
 	}
 	cfg := &config.Config{JWT: config.JWTConfig{Secret: secret, Issuer: "wallet-backend"}}
-	// The token is refused at the issuer check, before any store lookup, so a
-	// nil store is fine for the rejection cases; the accepted case is covered
-	// by the other tests with a real store.
+	// Refused at the issuer check, before any store lookup, so a nil store is fine.
 	if code := serve(cfg, mint(map[string]any{"user_id": "u", "tenant_id": "default"})); code != 401 {
 		t.Errorf("missing iss: got %d want 401", code)
 	}

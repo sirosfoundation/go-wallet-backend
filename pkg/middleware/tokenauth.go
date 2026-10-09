@@ -21,9 +21,8 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/legacytoken"
 )
 
-// LegacyIssuanceGate refuses (410) requests to endpoints that mint legacy
-// HMAC session tokens when legacy is disabled (as.legacy.enabled=false). The
-// response tells clients to use the session-mode flow (X-Token-Mode: session).
+// LegacyIssuanceGate answers 410 on endpoints that mint legacy HMAC tokens when
+// legacy is disabled, pointing clients at X-Token-Mode: session.
 func LegacyIssuanceGate(enabled bool) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if enabled {

@@ -883,20 +883,15 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 		return result.UserID, result.TenantID, result.TAC, nil
 	}
 
-	// Legacy path: direct HMAC validation, only while legacy is enabled. This
-	// applies whether or not a validator is wired (a standalone engine has
-	// none); with as.legacy.enabled=false no HMAC token is accepted.
+	// Legacy path: direct HMAC validation, only while legacy is enabled.
 	if !m.cfg.LegacyEnabled() {
 		return "", "", "", errors.New("legacy tokens are disabled")
 	}
 
-	// Unlike the go-tokenauth branch
-	// above, nothing else in this path ever checks revocation at all, so
-	// both checks below are needed, not just the user-level one (#391
-	// review, round 2).
-	// Legacy HMAC tokens are all minted with iss = jwt.issuer; pin it. An empty
-	// jwt.issuer would disable the check (golang-jwt treats "" as "no
-	// expectation"), so fail closed.
+	// Nothing else on this path checks revocation, so both checks below are
+	// needed.
+	// Pin iss = jwt.issuer; an empty value would disable the check
+	// (golang-jwt), so fail closed.
 	if m.cfg.JWT.Issuer == "" {
 		return "", "", "", errors.New("jwt issuer not configured")
 	}

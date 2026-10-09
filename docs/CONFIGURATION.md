@@ -109,7 +109,7 @@ Environment prefix: `WALLET_JWT`
 | `jwt.secret_path` | `WALLET_JWT_SECRET_PATH` | string | Path to file containing JWT secret |
 | `jwt.expiry_hours` | `WALLET_JWT_EXPIRY_HOURS` | integer |  |
 | `jwt.refresh_days` | `WALLET_JWT_REFRESH_DAYS` | integer |  |
-| `jwt.issuer` | `WALLET_JWT_ISSUER` | string | Issuer is the "iss" of legacy HMAC session tokens, and the only issuer the validators accept on them. Default: "wallet-backend". It may be empty only when legacy tokens are disabled (as.legacy.enabled=false); with legacy enabled, an empty value is refused at validation and when the validators are built. |
+| `jwt.issuer` | `WALLET_JWT_ISSUER` | string | Issuer is the "iss" of legacy HMAC session tokens, and the only issuer accepted on them. Default: "wallet-backend". May be empty only when as.legacy.enabled=false. |
 
 ## as
 
@@ -134,9 +134,9 @@ Environment prefix: `WALLET_AS`
 | `as.session_store` | `WALLET_AS_SESSION_STORE` | string | SessionStore selects where AS sessions (the cookie-bound server-side sessions that mint access tokens) are kept: "mongodb", "memory" or "auto". "auto" (the default when empty) means "mongodb" when the storage backend is MongoDB and "memory" otherwise. Memory sessions are lost on restart and are not shared between instances; use "mongodb" for high availability. |
 | `as.default_max_tac` | `WALLET_AS_DEFAULT_MAX_TAC` | string | DefaultMaxTAC is the default maximum TAC for sessions created via passkey auth. Admin sessions (e.g. via OIDC) may get a different MaxTAC per policy. Default: "rwl" (read, write, list) |
 | `as.legacy.enabled` | `WALLET_AS_LEGACY_ENABLED` | boolean | Enabled controls whether legacy HMAC tokens are accepted. Default: true (for backward compatibility) |
-| `as.legacy.deprecation_header` | `WALLET_AS_LEGACY_DEPRECATION_HEADER` | boolean | DeprecationHeader is intended to control whether a Deprecation header is sent on legacy token responses. It is currently not acted on: the middleware is not mounted, so no header is sent. |
-| `as.legacy.sunset_date` | `WALLET_AS_LEGACY_SUNSET_DATE` | string | SunsetDate is a deprecated setting. It is ignored: it has no effect, and a config that still sets it loads but logs a startup warning. Sunsetting the legacy AS is done only by as.legacy.enabled=false.  Deprecated: ignored; remove it from the configuration. |
-| `as.external_url` | `WALLET_AS_EXTERNAL_URL` | string | ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com"). Used to construct OIDC redirect URIs and, in an isolated wallet-provider or standalone engine, to locate the AS JWKS. Must be an absolute http(s) URL without a query or fragment (an empty "?" or "#" is rejected too); a path prefix is allowed.  Standalone engine (--mode=engine, no backend) limitation: setting this lets the engine accept AS-signed session tokens, but a standalone engine has no revocation source. After a logout or user revocation a token therefore stays valid at the standalone engine until it expires. Mitigate with short access token TTLs, or co-host the engine with the backend, which shares the token blacklist. |
+| `as.legacy.deprecation_header` | `WALLET_AS_LEGACY_DEPRECATION_HEADER` | boolean | DeprecationHeader is not acted on: the middleware is not mounted. |
+| `as.legacy.sunset_date` | `WALLET_AS_LEGACY_SUNSET_DATE` | string | SunsetDate is ignored (a startup warning is logged); sunset the legacy AS with as.legacy.enabled=false.  Deprecated: ignored; remove it from the configuration. |
+| `as.external_url` | `WALLET_AS_EXTERNAL_URL` | string | ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com"). Used for OIDC redirect URIs and, in an isolated wallet-provider or standalone engine, to locate the AS JWKS. Must be an absolute http(s) URL without a query or fragment; a path prefix is allowed.  A standalone engine (--mode=engine) has no revocation source: a token stays valid there until it expires, even after logout. Use short access token TTLs, or co-host the engine with the backend. |
 | `as.insecure_cookies` | `WALLET_AS_INSECURE_COOKIES` | boolean | InsecureCookies disables the __Host- prefix and Secure flag on session cookies. Required for local development over HTTP. NEVER enable in production. |
 
 ## wallet_provider

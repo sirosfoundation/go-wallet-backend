@@ -84,10 +84,8 @@ func SID(secret, rawToken string) string {
 // algorithm, i.e. whether it is a legacy token rather than a new-style
 // asymmetric one. Nothing about the token is trusted by this; it only routes.
 func IsHMAC(rawToken string) bool {
-	// go-jose parses the compact JWS (no signature verification) and accepts
-	// it only if its header alg is in the list, so a parse error covers both
-	// malformed tokens and any non-HMAC algorithm. Every token routed here is
-	// signature-verified (HS* only) later.
+	// Parsing only (no verification): an error covers malformed tokens and any
+	// non-HMAC alg. Every token routed here is verified (HS* only) later.
 	_, err := jose.ParseSigned(rawToken, []jose.SignatureAlgorithm{jose.HS256, jose.HS384, jose.HS512})
 	return err == nil
 }

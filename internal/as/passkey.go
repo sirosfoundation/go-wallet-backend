@@ -53,10 +53,9 @@ func NewPasskeyHandlers(
 	}
 }
 
-// refuseDisabledLegacy answers 410 and returns true when the request comes from
-// a legacy client (no X-Token-Mode: session) and legacy is disabled
-// (as.legacy.enabled=false): HMAC tokens are neither validated nor issued, so
-// the flow is refused up front instead of minting an unusable token.
+// refuseDisabledLegacy answers 410 and returns true for a legacy-mode client
+// (no X-Token-Mode: session) when legacy is disabled, rather than minting an
+// unusable token.
 func (h *PasskeyHandlers) refuseDisabledLegacy(c *gin.Context) bool {
 	if DetectClientMode(c) == ClientModeSession || h.cfg.Legacy.Enabled {
 		return false

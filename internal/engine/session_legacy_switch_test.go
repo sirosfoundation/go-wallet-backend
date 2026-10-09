@@ -34,8 +34,7 @@ func legacySwitchCfg(asEnabled, legacy bool) *config.Config {
 	return cfg
 }
 
-// Standalone engine mode wires no validator: the HMAC fallback must still
-// honour as.legacy.enabled=false.
+// Without a validator the HMAC fallback honours as.legacy.enabled=false.
 func TestManager_validateToken_StandaloneFallbackHonoursLegacySwitch(t *testing.T) {
 	tok := legacySwitchToken(t, "rp.example.com")
 
@@ -49,8 +48,7 @@ func TestManager_validateToken_StandaloneFallbackHonoursLegacySwitch(t *testing.
 	assert.Equal(t, "u", uid)
 }
 
-// With a validator, legacy HMAC tokens (aud = RP ID) are not subject to the
-// engine audience restriction or the AS audience list while legacy is on.
+// Legacy HMAC tokens (aud = RP ID) are exempt from audience restrictions.
 func TestManager_validateToken_LegacyExemptFromAudience(t *testing.T) {
 	cfg := legacySwitchCfg(true, true)
 	cfg.AS.Audiences = []string{"wallet-backend"}

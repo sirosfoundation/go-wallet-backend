@@ -309,9 +309,8 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 	}
 }
 
-// SetTokenValidator makes the handshake validate tokens through the shared
-// go-tokenauth validator (ES256 via JWKS, HMAC only while legacy is enabled)
-// instead of the bare HMAC path. Call before serving connections.
+// SetTokenValidator makes the handshake use the shared validator instead of the
+// bare HMAC path. Call before serving connections.
 func (m *Manager) SetTokenValidator(v *tokenvalidator.Validator) {
 	m.tokenValidator = v
 }
@@ -322,34 +321,28 @@ func (m *Manager) validateToken(tokenString string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		// The AS audience list (as.audiences) is already enforced by the
-		// validator. The keystore socket is a user-facing surface, so beyond
-		// that a new-style token must carry wallet-backend (as
-		// internal/server/providers.go requires); a registry-only token is
-		// refused. Legacy HMAC tokens (aud = RP ID) are exempt, exactly like
-		// middleware.RequireAudience (see audience.Allowed).
+		// User-facing surface: beyond as.audiences, a new-style token must carry
+		// wallet-backend (registry-only tokens are refused). Legacy HMAC tokens
+		// are exempt, as in middleware.RequireAudience.
 		if !audience.Allowed(result, true, "wallet-backend") {
 			return "", errors.New("token audience not accepted")
 		}
-		// The keystore socket is per-user: an anonymous (identity-free)
-		// token has nothing to bind to.
+		// Per-user socket: an identity-free token has nothing to bind to.
 		if result.UserID == "" {
 			return "", errors.New("invalid token claims")
 		}
 		return result.UserID, nil
 	}
 
-	// No validator wired (AS disabled): HMAC is the only mechanism, unless the
-	// AS is enabled with as.legacy.enabled=false - then refuse (fail closed).
+	// No validator (AS disabled): HMAC only, and refused when legacy is off.
 	if !m.cfg.LegacyEnabled() {
 		return "", errors.New("legacy tokens are disabled")
 	}
 	if m.cfg.JWT.Secret == "" {
 		return "", errors.New("jwt secret not configured")
 	}
-	// Legacy HMAC tokens are all minted with iss = jwt.issuer; pin it. An empty
-	// jwt.issuer would disable the check (golang-jwt treats "" as "no
-	// expectation"), so fail closed.
+	// Pin iss = jwt.issuer; an empty value would disable the check
+	// (golang-jwt), so fail closed.
 	if m.cfg.JWT.Issuer == "" {
 		return "", errors.New("jwt issuer not configured")
 	}

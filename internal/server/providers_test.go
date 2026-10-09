@@ -1776,10 +1776,8 @@ func TestRequireSessionAuthMechanism(t *testing.T) {
 	}
 }
 
-// Every service.Services may open its own wallet-provider PKCS#11 signer
-// (HSM session pool). The combined backend role with the AS enabled must
-// therefore construct exactly two (auth + storage), never a third, unmanaged
-// one for the AS module that nothing would Stop().
+// The combined backend role with the AS enabled builds exactly two Services
+// (auth + storage); a third would leak a wallet-provider HSM signer.
 func TestNewBackendProvider_ASEnabled_DoesNotBuildExtraServices(t *testing.T) {
 	keyPath, _ := writeTestECKeyAndCert(t, t.TempDir(), "as-signing")
 
@@ -1868,10 +1866,8 @@ func TestBackendProvider_Close_ClosesBothSignerPools(t *testing.T) {
 	}
 }
 
-// With legacy HMAC tokens enabled, an empty jwt.issuer would leave the
-// accepted legacy issuer list empty and accept any token signed with the
-// shared secret. Every validator constructor refuses it; with legacy off the
-// issuer may be empty.
+// Every validator constructor refuses an empty jwt.issuer while legacy is on
+// (it would accept any token signed with the shared secret).
 func TestConstructors_RefuseLegacyWithEmptyJWTIssuer(t *testing.T) {
 	legacyOn := func() *config.Config {
 		return &config.Config{JWT: config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"}}

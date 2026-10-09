@@ -214,7 +214,7 @@ func TestRegistryProvider_BuildValidatorLegacy(t *testing.T) {
 	_, err = p2.validator.Validate(context.Background(), regHMAC(t))
 	assert.NoError(t, err)
 
-	// as.legacy.enabled=false (as #429 defines it) refuses HMAC even with a secret.
+	// as.legacy.enabled=false refuses HMAC even with a secret.
 	c.AS.Legacy.Enabled = false
 	c.AS.ExternalURL = "http://127.0.0.1:1"
 	p3, err := NewRegistryProvider(c, zap.NewNop())

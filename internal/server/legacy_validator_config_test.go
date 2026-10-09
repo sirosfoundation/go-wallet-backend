@@ -14,9 +14,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
-// legacyValidatorConfig is the one place all three go-tokenauth validator
-// constructors get their legacy settings from, so this is what pins the
-// accepted legacy issuer for each of them.
+// legacyValidatorConfig pins the accepted legacy issuer for every constructor.
 func TestLegacyValidatorConfig_PinsJWTIssuer(t *testing.T) {
 	const secret = "0123456789abcdef0123456789abcdef"
 	cfg := &config.Config{JWT: config.JWTConfig{Secret: secret, Issuer: "jwt-issuer"}}

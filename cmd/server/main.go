@@ -114,8 +114,7 @@ func main() {
 		zap.Bool("pkcs11_supported", signing.PKCS11Supported),
 	)
 
-	// Every process that loaded the backend config honours as.legacy.enabled,
-	// whatever its roles, so log the legacy status here exactly once.
+	// Once per process, whatever its roles.
 	logLegacyStatus(backendCfg, logger)
 
 	// Security configuration validation for production environments
@@ -290,9 +289,7 @@ func main() {
 		if backendProvider != nil && backendProvider.TokenValidator() != nil {
 			provider.SetTokenValidator(backendProvider.TokenValidator())
 		}
-		// Standalone engine (no backend provider): build a JWKS-backed
-		// validator so session tokens work and as.legacy.enabled=false does not
-		// leave the handshake with no way to authenticate.
+		// Standalone engine: needs its own JWKS-backed validator.
 		if backendProvider == nil {
 			sv, err := server.NewStandaloneEngineTokenValidator(backendCfg, logger)
 			if err != nil {
@@ -452,9 +449,8 @@ func loggingConfig(backendCfg, registryCfg *config.Config) *logging.Config {
 	return &logging.Config{Level: src.Logging.Level, Format: src.Logging.Format}
 }
 
-// logLegacyStatus logs the legacy (HMAC) session-token status once for a
-// process that loaded the backend config; a nil config (registry-only) logs
-// nothing.
+// logLegacyStatus logs the legacy-token status; a nil config (registry-only)
+// logs nothing.
 func logLegacyStatus(cfg *config.Config, logger *zap.Logger) {
 	if cfg == nil {
 		return

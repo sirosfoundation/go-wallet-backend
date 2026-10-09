@@ -76,8 +76,7 @@ func TestAuthProvider_legacyIssuanceGate(t *testing.T) {
 	assert.Equal(t, 200, status(c))
 }
 
-// With the AS disabled but legacy disabled (loaded config semantics), the
-// /user/* issuance routes must still answer 410 - and before the OIDC gate.
+// The issuance gate applies even with the AS disabled in this process.
 func TestAuthProvider_legacyIssuanceGate_NoASStillGated(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cfg := &config.Config{}
@@ -92,9 +91,8 @@ func TestAuthProvider_legacyIssuanceGate_NoASStillGated(t *testing.T) {
 	assert.False(t, reached)
 }
 
-// With legacy disabled, every /user/* route that mints HS256 tokens answers
-// 410 - before the OIDC gate - and this must not depend on the AS being
-// enabled in this process.
+// With legacy disabled, every /user/* route minting HS256 tokens answers 410
+// before the OIDC gate.
 func TestAuthProvider_UserRoutes_410BeforeOIDCGate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
@@ -127,8 +125,7 @@ func TestAuthProvider_UserRoutes_410BeforeOIDCGate(t *testing.T) {
 	}
 }
 
-// Providers must not log the legacy status themselves: cmd/server/main.go
-// logs it once per process for every role combination.
+// Providers must not log the legacy status; cmd/server/main.go does, once.
 func TestProviders_DoNotLogLegacyStatus(t *testing.T) {
 	core, logs := observer.New(zap.DebugLevel)
 	p, err := NewWalletProviderProvider(walletProviderASConfig(t, "", true), zap.New(core))
