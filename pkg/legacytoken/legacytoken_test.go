@@ -1,7 +1,10 @@
 package legacytoken
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
@@ -215,8 +218,18 @@ func TestIsHMAC(t *testing.T) {
 	if !IsHMAC(hs) {
 		t.Error("HS384 not recognised")
 	}
+	for _, m := range []jwt.SigningMethod{jwt.SigningMethodHS256, jwt.SigningMethodHS512} {
+		if !IsHMAC(hsToken(t, m, "s", jwt.MapClaims{"a": 1})) {
+			t.Errorf("%s not recognised", m.Alg())
+		}
+	}
+	ek, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	es, err := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{"a": 1}).SignedString(ek)
+	if err != nil {
+		t.Fatal(err)
+	}
 	none, _ := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{}).SignedString(jwt.UnsafeAllowNoneSignatureType)
-	for _, tok := range []string{none, "", "junk", "a.b.c"} {
+	for _, tok := range []string{es, none, "", "junk", "a.b.c"} {
 		if IsHMAC(tok) {
 			t.Errorf("%q treated as HMAC", tok)
 		}
