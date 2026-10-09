@@ -3165,8 +3165,7 @@ func TestApplyASSecurityDefaults_Parity(t *testing.T) {
 	}
 }
 
-// as.legacy.sunset_date shipped in v0.10.0; it is now a no-op that must still
-// load and be reported by DeprecatedSettings so the process can warn.
+// The ignored sunset_date must still load and be reported by DeprecatedSettings.
 func TestLoad_DeprecatedSunsetDateStillLoads(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	content := `
@@ -3198,9 +3197,7 @@ as:
 	}
 }
 
-// A deployer injects the HSM's PKCS#11 module path (and slot, label, PIN file)
-// with environment variables, with no signing key in the config file: the
-// module itself, its libraries and its own config are mounted separately.
+// The PKCS#11 key can be configured entirely by environment variables.
 func TestLoad_AS_PKCS11_FromEnv(t *testing.T) {
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "config.yaml")

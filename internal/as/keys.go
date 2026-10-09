@@ -152,10 +152,8 @@ func parsePrivateKey(block *pem.Block) (crypto.Signer, error) {
 	}
 }
 
-// newSigningKey creates a SigningKey from a crypto.Signer, auto-detecting the
-// algorithm from the signer's public key (so HSM-backed signers whose concrete
-// type is not *ecdsa.PrivateKey work too). The kid is the RFC 7638 JWK
-// thumbprint of the public key.
+// newSigningKey creates a SigningKey from a crypto.Signer, detecting the
+// algorithm from its public key. The kid is the RFC 7638 thumbprint.
 func newSigningKey(signer crypto.Signer) (*SigningKey, error) {
 	if signer == nil {
 		return nil, fmt.Errorf("nil signer")
@@ -226,11 +224,8 @@ func (km *KeyManager) Close() error {
 	return first
 }
 
-// joseKey returns the value to hand to jose.NewSigner: go-jose's standard
-// crypto.Signer adapter, which hashes the signing input and converts the DER
-// ECDSA signatures that crypto.Signer implementations (HSMs) return into the
-// JWS r||s encoding. The kid is added to the protected header by the caller
-// through jose.SignerOptions.
+// joseKey adapts the signer for jose.NewSigner; cryptosigner converts the DER
+// ECDSA signatures HSMs return into JWS r||s.
 func (sk *SigningKey) joseKey() interface{} {
 	return cryptosigner.Opaque(sk.Signer)
 }

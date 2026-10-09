@@ -46,9 +46,8 @@ type AuthProvider struct {
 }
 
 // NewAuthProvider creates a new auth route provider
-// newServices constructs the service aggregate. It is a variable so tests can
-// count constructions: every Services may own an HSM-backed wallet-provider
-// signer, so the backend role must build exactly one.
+// newServices is a variable so tests can count constructions: each Services may
+// own an HSM-backed wallet-provider signer, so the backend role builds one.
 var newServices = service.NewServices
 
 func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logger, roles []string) *AuthProvider {
@@ -273,11 +272,9 @@ func NewStorageProvider(cfg *config.Config, store backend.Backend, logger *zap.L
 	}
 }
 
-// Close releases what the storage provider's own Services aggregate owns. That
-// is only the wallet-provider signer (a PKCS#11 session pool when an HSM is
-// configured): the aggregate is never Start()-ed, and its TokenBlacklist is
-// replaced by the auth provider's, which AuthProvider.Close already stops, so
-// calling services.Stop() here would stop that shared blacklist a second time.
+// Close releases the wallet-provider signer (a PKCS#11 session pool with an
+// HSM). It does not call services.Stop(): the blacklist is the auth provider's,
+// which AuthProvider.Close already stops.
 func (p *StorageProvider) Close() error {
 	if p.services != nil && p.services.WalletProvider != nil {
 		p.services.WalletProvider.Close()
@@ -620,23 +617,16 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		return nil, fmt.Errorf("failed to initialize AuthZEN proxy: %w", err)
 	}
 
-	// Auth provider is constructed before the AS module and storage provider
-	// below so its Services.TokenBlacklist (created, and Start()-ed, right
-	// here) can be handed to both of them instead of each building its own,
-	// unshared instance - see #382/#383: a token blacklisted via Logout or
-	// DeleteUser (both served by authProvider.handlers) must be honored by
-	// every request path in this process, not only the one that happened to
-	// construct the blacklist it was written to.
+	// Built first so its TokenBlacklist is shared by the AS module and storage
+	// provider (#382/#383).
 	authProvider := NewAuthProvider(cfg, store, logger, roles)
 
 	// Initialize AS module when enabled.
 	var asModule *as.ASModule
 	var tv *tokenvalidator.Validator
 	if cfg.AS.Enabled {
-		// Reuse the auth provider's Services rather than building a second,
-		// unmanaged one: a separate NewServices would open its own
-		// wallet-provider PKCS#11 signer (HSM session pool) that nothing
-		// would ever stop. authProvider.Close() owns this object's lifetime.
+		// Reuse the auth provider's Services: a second NewServices would open
+		// another PKCS#11 signer nothing stops. authProvider.Close() owns it.
 		services := authProvider.services
 		asModule, err = as.NewASModule(
 			context.Background(),
@@ -667,8 +657,6 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		if issuer == "" {
 			issuer = cfg.JWT.Issuer
 		}
-		// The validator fetches the AS JWKS from as.external_url, like every
-		// other role.
 		jwksURL, urlErr := asJWKSURL(cfg)
 		if urlErr != nil {
 			_ = asModule.Close()
@@ -1308,11 +1296,9 @@ func newAuditEmitter(cfg *config.Config, logger *zap.Logger) *audit.Emitter {
 	return audit.NewFromConfig(cfg, logger)
 }
 
-// asJWKSURL returns <as.external_url>/auth/.well-known/jwks.json, built with
-// JoinPath so a trailing slash in as.external_url is harmless. go-tokenauth's
-// validator fetches it itself. The AS is infrastructure-internal (typically a
-// cluster-internal URL), so http and https are both accepted and no SSRF
-// policy is applied to this fetch.
+// asJWKSURL returns <as.external_url>/auth/.well-known/jwks.json. The AS is
+// infrastructure-internal, so http and https are accepted and no SSRF policy
+// applies to this fetch.
 func asJWKSURL(cfg *config.Config) (string, error) {
 	u, err := cfg.AS.ExternalBaseURL()
 	if err != nil {

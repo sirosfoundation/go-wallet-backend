@@ -107,10 +107,9 @@ type ASConfig struct {
 	// used to sign access tokens. Mutually exclusive with SigningKeyPKCS11.
 	SigningKeyPath string `yaml:"signing_key_path" envconfig:"SIGNING_KEY_PATH"`
 
-	// SigningKeyPKCS11 configures an HSM-backed (PKCS#11) AS signing key
-	// (ECDSA P-256/P-384 only). The AS signs access tokens only with ES256, ES384 or
-	// EdDSA, so RSA keys are rejected as an AS-key restriction (not a signer limitation); Ed25519 is
-	// unsupported because the PKCS#11 pool cannot handle CKK_EC_EDWARDS keys. Requires a binary built with
+	// SigningKeyPKCS11 configures an HSM-backed (PKCS#11) AS signing key.
+	// ECDSA P-256/P-384 only: RSA is not an AS algorithm and the PKCS#11 pool
+	// cannot handle Ed25519 (CKK_EC_EDWARDS). Requires a binary built with
 	// -tags pkcs11. module_path, key_label and pin or pin_path are required.
 	// Mutually exclusive with SigningKeyPath.
 	SigningKeyPKCS11 *PKCS11SigningConfig `yaml:"signing_key_pkcs11,omitempty" envconfig:"SIGNING_KEY_PKCS11"`
@@ -169,17 +168,13 @@ type ASConfig struct {
 	Legacy ASLegacyConfig `yaml:"legacy" envconfig:"LEGACY"`
 
 	// ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com").
-	// Used to construct OIDC redirect URIs and, in an isolated wallet-provider
-	// or standalone engine, to locate the AS JWKS. Must be an absolute http(s)
-	// URL without a query or fragment (an empty "?" or "#" is rejected too); a
-	// path prefix is allowed.
+	// Used for OIDC redirect URIs and, in an isolated wallet-provider or
+	// standalone engine, to locate the AS JWKS. Must be an absolute http(s) URL
+	// without a query or fragment; a path prefix is allowed.
 	//
-	// Standalone engine (--mode=engine, no backend) limitation: setting this
-	// lets the engine accept AS-signed session tokens, but a standalone engine
-	// has no revocation source. After a logout or user revocation a token
-	// therefore stays valid at the standalone engine until it expires. Mitigate
-	// with short access token TTLs, or co-host the engine with the backend,
-	// which shares the token blacklist.
+	// A standalone engine (--mode=engine) has no revocation source: a token
+	// stays valid there until it expires, even after logout. Use short access
+	// token TTLs, or co-host the engine with the backend.
 	ExternalURL string `yaml:"external_url" envconfig:"EXTERNAL_URL"`
 
 	// InsecureCookies disables the __Host- prefix and Secure flag on session cookies.
@@ -187,12 +182,9 @@ type ASConfig struct {
 	InsecureCookies bool `yaml:"insecure_cookies" envconfig:"INSECURE_COOKIES"`
 }
 
-// ExternalBaseURL parses and validates ExternalURL and returns it as a URL
-// whose path has no trailing slash, ready for JoinPath. It rejects anything
-// that is not an absolute http(s) URL with a host, and any query or fragment,
-// including an empty "?" or "#" delimiter that url.Parse would otherwise drop
-// silently. Callers must derive endpoint URLs from the returned fields (for
-// example with JoinPath), never by appending to the raw string.
+// ExternalBaseURL validates ExternalURL (absolute http(s), no query or
+// fragment, including an empty "?" or "#" that url.Parse would drop) and
+// returns it without a trailing slash. Derive endpoints with JoinPath.
 func (a *ASConfig) ExternalBaseURL() (*url.URL, error) {
 	raw := a.ExternalURL
 	u, err := url.Parse(raw)
@@ -324,19 +316,11 @@ func (c *Config) EnableForRole() {
 		return
 	}
 	c.AS.Enabled = true
-	// Auto-enable can only inherit the wallet provider's signing key when
-	// the wallet provider is purely file-based - never when PKCS11 is
-	// configured for it, even if PrivateKeyPath is ALSO set as a runtime
-	// fallback (WalletProviderService tries PKCS11 first, independently of
-	// whether a file key is also configured). Inheriting the file path
-	// there would silently sign AS tokens with the weaker on-disk key while
-	// the wallet provider itself actually signs WIA/KA with the HSM key -
-	// a real, silent security downgrade, not just an unsupported
-	// configuration. The AS must be given its own as.signing_key_pkcs11 (it is
-	// deliberately not inherited from the wallet provider), so this leaves
-	// SigningKeyPath empty in that case; Validate() then rejects with a
-	// clear, actionable error rather than silently limping along with AS
-	// enabled on the wrong key.
+	// Inherit the wallet provider's key only when it is purely file-based. With
+	// PKCS11 configured (even alongside a fallback file key) inheriting the
+	// file would silently sign AS tokens with a weaker on-disk key while WIA/KA
+	// use the HSM. The AS must be given its own as.signing_key_pkcs11, so
+	// SigningKeyPath stays empty and Validate() rejects it.
 	walletProviderUsesPKCS11 := c.WalletProvider.PKCS11 != nil && c.WalletProvider.PKCS11.ModulePath != ""
 	if c.AS.SigningKeyPath == "" && c.AS.SigningKeyPKCS11 == nil && !walletProviderUsesPKCS11 {
 		c.AS.SigningKeyPath = c.WalletProvider.PrivateKeyPath
@@ -1267,10 +1251,9 @@ type PKCS11SigningConfig struct {
 	PoolSize   int    `yaml:"pool_size" envconfig:"POOL_SIZE"` // Session pool size (default 4)
 }
 
-// ResolvePIN returns the PKCS#11 PIN, reading PINPath when set (the file
-// takes precedence over the inline PIN). It is called lazily by the code that
-// opens the HSM, not by Load, so processes that never touch the HSM do not
-// need the file. Errors do not name the file (see readSecretFile).
+// ResolvePIN returns the PIN, from PINPath when set (it wins over the inline
+// PIN). Called by the code that opens the HSM, not Load, so other processes do
+// not need the file. Errors do not name the file.
 func (p *PKCS11SigningConfig) ResolvePIN() (string, error) {
 	if p.PINPath == "" {
 		return p.PIN, nil
@@ -2026,9 +2009,8 @@ func load(configFile string, loadSecrets, validate func(*Config) error) (*Config
 		return nil, fmt.Errorf("failed to process environment variables: %w", err)
 	}
 
-	// envconfig allocates nil pointer-to-struct fields while walking them, so
-	// an AS that only sets signing_key_path would otherwise look as if it also
-	// configured an (empty) PKCS#11 key and trip the mutual-exclusion check.
+	// envconfig allocates nil struct pointers, which would otherwise trip the
+	// mutual-exclusion check for an AS that only sets signing_key_path.
 	if p := cfg.AS.SigningKeyPKCS11; p != nil && *p == (PKCS11SigningConfig{}) {
 		cfg.AS.SigningKeyPKCS11 = nil
 	}
@@ -2170,10 +2152,8 @@ func (c *Config) loadSecretsFromFiles() error {
 		}
 	}
 
-	// as.signing_key_pkcs11.pin_path is deliberately NOT read here: only the
-	// process that builds the AS signer needs the PIN, and a standalone
-	// engine/validator (as.external_url) may share this configuration without
-	// having the file. The AS reads it via PKCS11SigningConfig.ResolvePIN.
+	// as.signing_key_pkcs11.pin_path is read lazily via ResolvePIN: processes
+	// sharing this config without the AS need not have the file.
 
 	// Load Play Integrity decryption/verification keys from file
 	natCfg := &c.WalletProvider.Attestation.NativeAttestation
@@ -2482,10 +2462,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("jwt secret must be at least 32 bytes for HMAC-SHA256 security")
 	}
 
-	// A remote AS JWKS (as.external_url) is validated against as.issuer or
-	// jwt.issuer; with both empty the issuer of JWKS-signed tokens would be
-	// unrestricted. Role-independent: external_url is only meaningful with an
-	// issuer, whichever role consumes it.
+	// A remote AS JWKS is validated against as.issuer or jwt.issuer; both
+	// empty would leave the issuer unrestricted.
 	if c.AS.ExternalURL != "" && c.AS.Issuer == "" && c.JWT.Issuer == "" {
 		return fmt.Errorf("as.external_url requires an expected issuer to validate AS tokens; set as.issuer or jwt.issuer")
 	}

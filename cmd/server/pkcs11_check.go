@@ -9,9 +9,8 @@ import (
 )
 
 // pkcs11Problems lists configured HSM keys this binary cannot use because it
-// was built without PKCS#11 support (for example the default distroless
-// image). fatal entries would stop startup anyway; warn entries would
-// otherwise degrade silently.
+// was built without PKCS#11 support. fatal entries would stop startup anyway;
+// warn entries would otherwise degrade silently.
 func pkcs11Problems(cfg *config.Config, supported bool) (fatal, warn []string) {
 	if cfg == nil || supported {
 		return nil, nil
@@ -29,9 +28,8 @@ func pkcs11Problems(cfg *config.Config, supported bool) (fatal, warn []string) {
 	return fatal, warn
 }
 
-// checkPKCS11Support turns pkcs11Problems into clear startup messages: a
-// fatal error without a stack trace for an AS key that cannot work, and loud
-// errors for settings that would otherwise be silently ignored.
+// checkPKCS11Support turns pkcs11Problems into startup messages (fatal without
+// a stack trace, or loud errors).
 func checkPKCS11Support(cfg *config.Config, logger *zap.Logger) {
 	fatal, warn := pkcs11Problems(cfg, signing.PKCS11Supported)
 	for _, w := range warn {

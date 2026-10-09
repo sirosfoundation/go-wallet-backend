@@ -76,12 +76,9 @@ func NewASModule(
 	if err != nil {
 		return nil, err
 	}
-	// The module owns a child context for its background goroutines (session
-	// cleanup) so Close, or a failed construction, can stop them even when
-	// the caller passed a never-cancelled context.
+	// Child context so Close or a failed construction can stop the goroutines.
 	ctx, cancel := context.WithCancel(ctx)
-	// Release HSM sessions and stop background goroutines on every later
-	// failure so a retried init cannot leak either.
+	// Release HSM sessions and goroutines on any later failure.
 	defer func() {
 		if err != nil {
 			cancel()
@@ -260,18 +257,16 @@ func newMemorySessionStoreWithCleanup(ctx context.Context) *MemorySessionStore {
 	return sessions
 }
 
-// newConfiguredKeyManager builds the KeyManager from either the PEM signing key
-// file or the PKCS#11 (HSM) key. Exactly one must be configured; anything else
-// is refused (config validation checks this too, this keeps the module safe
-// when constructed directly).
+// newConfiguredKeyManager builds the KeyManager from the PEM key file or the
+// PKCS#11 key; exactly one must be configured.
 func newConfiguredKeyManager(cfg *config.ASConfig) (*KeyManager, error) {
 	switch {
 	case cfg.SigningKeyPath != "" && cfg.SigningKeyPKCS11 != nil:
 		return nil, fmt.Errorf("as: signing_key_path and signing_key_pkcs11 are mutually exclusive")
 	case cfg.SigningKeyPKCS11 != nil:
 		p := cfg.SigningKeyPKCS11
-		// The PIN file is read here, not in config.Load, so standalone
-		// engines/validators sharing this config need not have it.
+		// Read here, not in config.Load: standalone engines sharing the config
+		// need not have the file.
 		pin, err := p.ResolvePIN()
 		if err != nil {
 			return nil, fmt.Errorf("as: signing_key_pkcs11: %w", err)

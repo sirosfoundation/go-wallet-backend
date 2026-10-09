@@ -446,8 +446,7 @@ func pkceCodeChallengeS256(codeVerifier string) string {
 // redirectURI returns the OIDC callback URI from config.
 // Using a configured value prevents Host header injection attacks.
 func (h *OIDCHandlers) redirectURI() string {
-	// config.Validate already rejected a malformed external_url; an empty
-	// result here makes the OIDC flow fail rather than redirect somewhere odd.
+	// Validate rejected a malformed external_url; empty fails the flow.
 	u, err := h.cfg.ExternalBaseURL()
 	if err != nil {
 		return ""
