@@ -364,15 +364,11 @@ func main() {
 	defer shutdownCancel()
 
 	// Shutdown order matters:
-	//  1. Drain the engine: the WMP adapter and the WebSocket manager refuse
-	//     new RPC/SSE requests, sessions and upgrades (503). A WebSocket
-	//     accepted just before this is refused at session registration, so
-	//     nothing can register after step 2 clears the session maps.
-	//  2. Close the engine: ends live sessions (terminating their long-lived
-	//     SSE handlers and closing hijacked WebSocket connections, which
-	//     http.Server.Shutdown does not do).
-	//  3. Shut the HTTP/WebSocket listeners down within the timeout; with the
-	//     streams already ended it no longer waits on them.
+	//  1. Drain the engine: WMP and WebSocket refuse new requests, sessions and
+	//     upgrades (503), so nothing can register after step 2 clears the session maps.
+	//  2. Close the engine: ends live sessions, including the SSE handlers and hijacked
+	//     WebSocket connections that http.Server.Shutdown does not end.
+	//  3. Shut the listeners down within the timeout.
 	if engineProvider != nil {
 		engineProvider.Drain()
 		engineProvider.Close()

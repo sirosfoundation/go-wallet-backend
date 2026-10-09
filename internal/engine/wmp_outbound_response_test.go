@@ -78,9 +78,8 @@ func pendingChildStart(t *testing.T, a *WMPAdapter, sid string) (json.RawMessage
 	}
 }
 
-// The stock go-wmp HTTPS+SSE client sends only its construction-time headers
-// and a response envelope has no params.wmp.session_id, so the acknowledgement
-// of a server-initiated sign flow.start carries no session identity at all.
+// The stock go-wmp client sends only construction-time headers and a response has no
+// params.wmp.session_id, so the ack of a server-initiated sign flow.start carries no session identity.
 func TestWMP_OutboundResponse_RealClientAcksChildFlowStartWithoutSessionHeader(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)

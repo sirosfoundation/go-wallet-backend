@@ -109,25 +109,23 @@ type Session struct {
 	// requireTACIfEnforced does for HTTP routes.
 	TAC claims.TAC
 	// TACEnforced: the session was created by a modern token, so its TAC is
-	// authoritative even when empty (no permissions). False only for legacy
-	// tokens, which have no TAC concept.
+	// authoritative even when empty. False only for legacy tokens.
 	TACEnforced bool
 
-	// onSuperseded, when set before registration, is called (without any
-	// manager lock held) after a later registerSession for the same user
-	// replaces this session. The WMP adapter uses it to invalidate the
-	// session's resume state (token, peer) so it cannot be resumed.
+	// onSuperseded, when set before registration, runs (without any manager lock)
+	// after a later registerSession for the same user replaces this session; the
+	// WMP adapter uses it to invalidate the session's resume state.
 	onSuperseded func()
 	transport    SessionTransport
 	transportMu  sync.RWMutex // guards transport reassignment during session resume
 	flows        map[string]*Flow
 	flowsMu      sync.RWMutex
-	// closed is set by endSession under flowsMu, before it scans flows. Every
-	// path that publishes a flow into flows checks it under the same lock, so
-	// a flow is either visible to endSession's cancellation scan or refused.
+	// closed is set by endSession under flowsMu before it scans flows; every
+	// path that publishes a flow checks it under the same lock, so a flow is
+	// either seen by the cancellation scan or refused.
 	closed bool
-	// testHookBeforePublish, when set (tests only), runs in the WMP FlowStart
-	// after the handler is built and before it is published.
+	// testHookBeforePublish (tests only) runs in the WMP FlowStart between building
+	// the handler and publishing it.
 	testHookBeforePublish func()
 	logger                *zap.Logger
 
@@ -136,13 +134,11 @@ type Session struct {
 	signCh   chan *SignResponseMessage
 	matchCh  chan *MatchResponseMessage
 	closeCh  chan struct{}
-	// stash parks client responses that arrived on the shared channels above
-	// but belong to a different concurrent flow/request than the waiter that
-	// read them, so no flow can consume (and lose) another flow's input.
+	// stash parks responses read off the shared channels by a waiter they were
+	// not meant for, so no flow loses another flow's input.
 	stash responseStash
-	// closeOnce makes endSession idempotent: the transport-specific read
-	// loop (handleSession) and the WMP adapter's session teardown can both
-	// end the same session.
+	// closeOnce makes endSession idempotent (the read loop and the WMP adapter
+	// can both end the same session).
 	closeOnce sync.Once
 
 	// notifications holds ephemeral, TTL-bounded OID4VCI §10 notification
@@ -177,9 +173,8 @@ type Flow struct {
 	mu   sync.RWMutex
 }
 
-// userKey identifies the one live session a user may hold per tenant.
-// Users can belong to several tenants, so keying by UserID alone would let
-// a connection in one tenant tear down the same user's session in another.
+// userKey identifies the one live session a user may hold per tenant;
+// keying by UserID alone would let one tenant tear down another's session.
 type userKey struct {
 	TenantID string
 	UserID   string
@@ -189,10 +184,8 @@ type userKey struct {
 // (matches pkg/middleware/tokenauth.go).
 const defaultTenant = "default"
 
-// normalizeTenant maps a missing tenant claim to the default tenant. It is
-// the single normalisation shared by WebSocket and WMP session creation, the
-// (tenant, user) index, session ownership checks and the persisted store, so
-// the same tokenless-tenant user always resolves to the same tenant.
+// normalizeTenant maps a missing tenant claim to the default tenant; the
+// single normalisation used by every session, index and store path.
 func normalizeTenant(t string) string {
 	if t == "" {
 		return defaultTenant
@@ -214,13 +207,10 @@ type Manager struct {
 	sessionsMu sync.RWMutex
 	sessions   map[string]*Session  // sessionID -> session (active connections only)
 	userIndex  map[userKey]*Session // (tenant, user) -> session (last connection wins)
-	// draining is set (under sessionsMu) by Drain/Close and never cleared:
-	// no connection may register once it is set, so a WebSocket accepted
-	// just before shutdown cannot slip in after Close has cleared the maps.
+	// draining is set under sessionsMu by Drain/Close and never cleared: no
+	// connection may register once it is set.
 	draining bool
-	// beforeRegisterHook, if set, runs in handleNewConnection immediately
-	// before registerSession. Tests use it to hold a connection in the
-	// accepted-but-unregistered window while shutdown begins.
+	// beforeRegisterHook (tests only) runs just before registerSession.
 	beforeRegisterHook func()
 
 	flowHandlers map[Protocol]FlowHandlerFactory
@@ -348,8 +338,7 @@ func (m *Manager) RegisterFlowHandler(protocol Protocol, factory FlowHandlerFact
 
 // HandleConnection handles a new WebSocket connection
 func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
-	// Refuse upgrades once shutdown has begun. registerSession re-checks
-	// under the lock for connections accepted before this point.
+	// Refuse upgrades once shutdown has begun; registerSession re-checks under the lock.
 	if m.isDraining() {
 		http.Error(w, "server is shutting down", http.StatusServiceUnavailable)
 		return
@@ -542,10 +531,8 @@ func (s *Session) pingLoop() {
 	}
 }
 
-// endSession signals every goroutine blocked on this session (closeCh) and
-// cancels all active flows. It is idempotent and shared by all transports, so
-// a WMP session torn down by the adapter (client close, idle expiry, account
-// revocation, shutdown) stops its flows exactly like a WebSocket disconnect.
+// endSession signals every goroutine blocked on the session (closeCh) and
+// cancels all active flows. Idempotent and shared by all transports.
 func (s *Session) endSession() {
 	s.closeOnce.Do(func() {
 		if s.closeCh != nil {
@@ -562,8 +549,7 @@ func (s *Session) endSession() {
 	})
 }
 
-// currentTransport returns the session's transport under transportMu (the
-// transport is swapped on WMP session resume).
+// currentTransport returns the transport under transportMu (swapped on WMP resume).
 func (s *Session) currentTransport() SessionTransport {
 	s.transportMu.RLock()
 	defer s.transportMu.RUnlock()
@@ -723,8 +709,7 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	// Manager.validateToken - not "no permissions"), mirroring
 	// requireTACIfEnforced's identical conditional enforcement for HTTP
 	// routes (internal/server/providers.go).
-	// A modern token (session.TACEnforced) is always checked, even with an
-	// empty TAC, which means "no permissions".
+	// A modern token is always checked, even with an empty TAC ("no permissions").
 	if session.TACEnforced || session.TAC != "" {
 		if required, ok := requiredTACForProtocol[msg.Protocol]; ok && !session.TAC.HasAll(required) {
 			_ = session.SendFlowError(flowID, "", ErrCodeForbidden, "insufficient permissions for protocol: "+string(msg.Protocol))
@@ -841,10 +826,8 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 func (m *Manager) registerSession(session *Session) bool {
 	m.sessionsMu.Lock()
 
-	// Drain gate: Close/Drain flip draining under this same lock, so a
-	// registration is either ordered before it (and closed by Close's
-	// sweep) or sees the flag here and is refused. It can never land after
-	// Close has cleared the maps.
+	// Drain gate: Close/Drain flip draining under this lock, so a registration
+	// is either closed by Close's sweep or refused here.
 	if m.draining {
 		m.sessionsMu.Unlock()
 		session.closeWithReason("server shutting down")
@@ -857,9 +840,8 @@ func (m *Manager) registerSession(session *Session) bool {
 			return false
 		}
 	}
-	// A superseded session's onSuperseded hook runs after sessionsMu is
-	// released: it takes the owning adapter's lock, and adapters take their
-	// lock before consulting the manager (isCurrentSession).
+	// onSuperseded runs after sessionsMu is released: it takes the adapter's lock,
+	// and adapters take their lock before consulting the manager.
 	var superseded *Session
 	defer func() {
 		m.sessionsMu.Unlock()
@@ -868,9 +850,8 @@ func (m *Manager) registerSession(session *Session) bool {
 		}
 	}()
 
-	// Close the existing session for this (tenant, user) pair (skip for
-	// anonymous sessions). The same user's sessions in other tenants are
-	// independent and left alone.
+	// Close the existing session for this (tenant, user); other tenants are untouched.
+	// Skipped for anonymous sessions.
 	if session.UserID != "" {
 		if existing, ok := m.userIndex[session.userKey()]; ok {
 			superseded = existing
@@ -906,12 +887,8 @@ func (m *Manager) registerSession(session *Session) bool {
 	return true
 }
 
-// isCurrentSession reports whether session is still the registered session
-// (and, for an identified user, still the user's current one): a later
-// registerSession for the same user supersedes it and closes its transport.
-// Callers publishing a freshly registered session use it to fail a create
-// that lost that race instead of reporting success for a session that is
-// already being torn down.
+// isCurrentSession reports whether session is still the registered (and, for an
+// identified user, current) one, so a create that lost a supersede race fails.
 func (m *Manager) isCurrentSession(session *Session) bool {
 	m.sessionsMu.RLock()
 	defer m.sessionsMu.RUnlock()
@@ -965,9 +942,8 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 	return
 }
 
-// validateTokenID is validateToken that also returns the token's jti (empty
-// if the token carries none). The WMP adapter binds sessions to it so
-// anonymous callers (UserID == "") cannot address each other's sessions.
+// validateTokenID is validateToken that also returns the token's jti, to which
+// the WMP adapter binds anonymous sessions.
 func (m *Manager) validateTokenID(ctx context.Context, tokenString string) (userID, tenantID string, tac claims.TAC, jti string, err error) {
 	id, err := m.validateTokenAuth(ctx, tokenString)
 	return id.UserID, id.TenantID, id.TAC, id.JTI, err
@@ -978,10 +954,8 @@ type tokenIdentity struct {
 	UserID, TenantID string
 	TAC              claims.TAC
 	JTI              string
-	// EnforceTAC reports whether the token's TAC is authoritative: true for
-	// every modern (go-tokenauth session-mode) token, including one whose TAC
-	// is empty - that means "no permissions", not "not applicable". Only a
-	// genuine legacy token (HMAC all-in-one, no TAC concept) is false.
+	// EnforceTAC: true for every modern token, even with an empty TAC ("no
+	// permissions"); false only for legacy tokens, which have no TAC concept.
 	EnforceTAC bool
 }
 
@@ -1294,14 +1268,9 @@ func (m *Manager) CloseUserSessions(userID string, reason string) int {
 // the ping goroutine - see handleSession/handleNewConnection) runs
 // unchanged rather than being duplicated here.
 //
-// Deliberately does NOT take the transport's sendMu: per gorilla/websocket's own
-// concurrency contract, WriteControl (unlike WriteJSON/WriteMessage, which
-// s.Send serializes via sendMu) may be called concurrently with any other
-// write. Taking sendMu here would let a backpressured client - whose peer
-// never reads, and whose write deadline was cleared after upgrade, see
-// handleNewConnection - block this call, and therefore account deletion,
-// indefinitely on an in-flight s.Send. WriteControl's own deadline bounds
-// this call regardless of whether it succeeds, and Close is unconditional.
+// Deliberately does NOT take sendMu: WriteControl may run concurrently with
+// other writes, and taking it would let a backpressured client block this
+// call (and account deletion) indefinitely. WriteControl's deadline bounds it.
 func (s *Session) closeWithReason(reason string) {
 	t := s.currentTransport()
 	if wst, ok := t.(*wsTransport); ok {
@@ -1311,15 +1280,13 @@ func (s *Session) closeWithReason(reason string) {
 			time.Now().Add(time.Second),
 		)
 	}
-	// Non-WebSocket transports (WMP) have no close frame to carry a
-	// reason; closing the transport is sufficient to end the session.
+	// Non-WebSocket transports (WMP) have no close frame; closing ends the session.
 	_ = t.Close()
 }
 
-// Drain stops the manager accepting new connections and sessions: further
-// WebSocket upgrades get 503 and any in-flight handshake is refused at
-// registration. Existing sessions are left running; Close ends them. It is
-// idempotent.
+// Drain stops accepting new connections and sessions (upgrades get 503,
+// in-flight handshakes are refused). Existing sessions run; Close ends them.
+// Idempotent.
 func (m *Manager) Drain() {
 	m.sessionsMu.Lock()
 	m.draining = true
@@ -1363,10 +1330,8 @@ func (m *Manager) IsHealthy() bool {
 
 // Send sends a message to the client
 //
-// The read lock is held for the whole send, not just the pointer copy: a
-// concurrent WMP session resume swaps (and closes) the transport under the
-// write lock, so it waits for in-flight sends instead of closing the old
-// transport between the copy and SendJSON and losing the notification.
+// The read lock is held for the whole send: a WMP resume swaps (and closes)
+// the transport under the write lock, so it must wait for in-flight sends.
 func (s *Session) Send(msg interface{}) error {
 	s.transportMu.RLock()
 	defer s.transportMu.RUnlock()
@@ -1750,10 +1715,9 @@ const (
 	maxStashedResponses         = 64
 )
 
-// responseStash holds client responses read off the session's shared
-// channels by a waiter they were not meant for. Each waiter drains its own
-// entries first (takeAction/takeSign/takeMatch), so concurrent flows on one
-// session behave as if each had a private queue. The zero value is ready.
+// responseStash holds responses read by a waiter they were not meant for.
+// Each waiter drains its own entries first, so flows behave as if each had a
+// private queue. The zero value is ready.
 type responseStash struct {
 	mu      sync.Mutex
 	actions map[string][]*FlowActionMessage // by flow ID
@@ -1781,13 +1745,10 @@ func (r *responseStash) broadcastLocked() {
 	r.wake = make(chan struct{})
 }
 
-// stashAction parks an action for another flow, unless that flow no longer
-// exists (nothing would ever consume it).
+// stashAction parks an action for another flow unless that flow is gone.
 func (s *Session) stashAction(a *FlowActionMessage) {
-	// The read lock is held through the insertion: removeFlow takes the write
-	// lock before dropFlow cleans the stash, so a removal either happens
-	// before this check (nothing is stashed) or waits for the insertion and
-	// its dropFlow then clears the entry. Lock order is flowsMu -> stash.mu.
+	// Read lock held through insertion: removeFlow takes the write lock before
+	// dropFlow cleans the stash. Lock order: flowsMu -> stash.mu.
 	s.flowsMu.RLock()
 	defer s.flowsMu.RUnlock()
 	if _, ok := s.flows[a.FlowID]; !ok {
@@ -1814,10 +1775,8 @@ func (r *responseStash) totalActionsLocked() int {
 	return n
 }
 
-// dropFlow discards everything parked for flowID - queued actions and the
-// sign/match responses addressed to it; called on flow teardown so a finished
-// flow's leftovers cannot linger for the life of the session (and, for the
-// bounded sign/match maps, eventually fill them).
+// dropFlow discards everything parked for flowID, so a finished flow's
+// leftovers cannot fill the bounded maps.
 func (r *responseStash) dropFlow(flowID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1834,14 +1793,11 @@ func (r *responseStash) dropFlow(flowID string) {
 	}
 }
 
-// removeFlow unregisters flow (if flowID still maps to it) and clears what
-// was parked for it: actions and sign/match responses. The cleanup only runs
-// when this flow instance is the registered one, so a stale flow's teardown
-// cannot purge the entries of a replacement that reuses the same ID.
+// removeFlow unregisters flow (if flowID still maps to it) and clears what was
+// parked for it, so a stale flow cannot purge a replacement's entries.
 func (s *Session) removeFlow(flowID string, flow *Flow) {
-	// flowsMu stays held through dropFlow: a replacement flow reusing flowID
-	// registers under the same lock, so its stashed actions cannot be deleted
-	// by this (stale) flow's cleanup. Lock order is flowsMu -> stash.mu.
+	// flowsMu stays held through dropFlow so a replacement reusing flowID
+	// cannot lose its stash. Lock order: flowsMu -> stash.mu.
 	s.flowsMu.Lock()
 	defer s.flowsMu.Unlock()
 	if s.flows[flowID] == flow {
@@ -1850,9 +1806,8 @@ func (s *Session) removeFlow(flowID string, flow *Flow) {
 	}
 }
 
-// takeAction removes and returns the oldest parked action for flowID that is
-// one of expected (any, if expected is empty). Parked actions for the flow
-// that are not expected are dropped, as WaitForAction always did.
+// takeAction removes and returns the oldest parked action for flowID in
+// expected (any if empty); unexpected parked actions are dropped.
 func (r *responseStash) takeAction(flowID string, expected []string) *FlowActionMessage {
 	r.mu.Lock()
 	defer r.mu.Unlock()

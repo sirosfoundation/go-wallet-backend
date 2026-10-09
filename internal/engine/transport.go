@@ -7,9 +7,8 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-// SessionTransport abstracts the underlying communication channel for a session.
-// WebSocket and WMP (see wmpSessionTransport) implement this interface, allowing the engine
-// to be transport-agnostic.
+// SessionTransport abstracts the communication channel for a session
+// (WebSocket or WMP), keeping the engine transport-agnostic.
 type SessionTransport interface {
 	// SendJSON marshals and sends a message to the client.
 	SendJSON(msg interface{}) error

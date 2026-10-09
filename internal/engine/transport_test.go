@@ -10,11 +10,7 @@ import (
 )
 
 // --- wsTransport ---
-//
-// wsTestServer (defined in match_test.go) spins up a real WebSocket server
-// and returns a connected client *websocket.Conn, which is what wsTransport
-// wraps in production — so these tests exercise ReadMessage/Close against an
-// actual connection rather than a mock.
+// wsTestServer (match_test.go) provides a real WebSocket connection, as in production.
 
 func TestWSTransport_ReadMessage(t *testing.T) {
 	want := []byte(`{"hello":"world"}`)
@@ -31,13 +27,10 @@ func TestWSTransport_ReadMessage(t *testing.T) {
 	assert.Equal(t, want, data)
 }
 
-// TestWSTransport_ReadMessage_AfterClose verifies ReadMessage surfaces an
-// error once the underlying connection has been closed by the peer, rather
-// than blocking forever or returning stale data.
+// TestWSTransport_ReadMessage_AfterClose verifies ReadMessage errors after the peer closes.
 func TestWSTransport_ReadMessage_AfterClose(t *testing.T) {
 	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
-		// Close immediately; the client's blocking ReadMessage must return
-		// an error rather than hang.
+		// Close immediately; the client's ReadMessage must return an error.
 		srvConn.Close()
 	})
 	defer cleanup()
@@ -48,14 +41,11 @@ func TestWSTransport_ReadMessage_AfterClose(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// TestWSTransport_Close verifies Close closes the underlying connection: a
-// subsequent read on the same transport must fail rather than block.
+// TestWSTransport_Close verifies a read after Close fails rather than blocks.
 func TestWSTransport_Close(t *testing.T) {
 	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
 		defer srvConn.Close()
-		// Keep the server side alive long enough to observe the client-side
-		// close; the assertion is entirely about the client's own
-		// wsTransport, not what the server sees.
+		// Keep the server side alive; the assertion is about the client's wsTransport.
 		_, _, _ = srvConn.ReadMessage()
 	})
 	defer cleanup()

@@ -369,8 +369,7 @@ type EngineProvider struct {
 	manager          *wsengine.Manager
 	wmpAdapter       *wsengine.WMPAdapter
 
-	// wmpAffinityWarnOnce makes the multi-replica affinity warning fire once
-	// per provider even if RegisterRoutes is called more than once.
+	// wmpAffinityWarnOnce makes the affinity warning fire once per provider.
 	wmpAffinityWarnOnce sync.Once
 }
 
@@ -481,7 +480,7 @@ func (p *EngineProvider) SetTokenBlacklist(b wsengine.TokenBlacklistChecker) {
 	p.manager.SetTokenBlacklist(b)
 }
 
-// wmpAffinityWarning is the message logged when the WMP routes are mounted.
+// wmpAffinityWarning is logged when the WMP routes are mounted.
 const wmpAffinityWarning = "WMP session state is process-local: with more than one engine replica, " +
 	"the load balancer must keep each client on one replica. The only identifier present on every WMP request " +
 	"(session.create, RPC POSTs, SSE GET and responses to server-initiated requests) is the Authorization bearer token, " +
@@ -492,8 +491,7 @@ const wmpAffinityWarning = "WMP session state is process-local: with more than o
 	"The Redis session store does not share this state. Shared WMP session state is tracked in " +
 	"https://github.com/sirosfoundation/go-wallet-backend/issues/432"
 
-// warnWMPSessionAffinity logs, once, the multi-replica deployment requirement
-// that follows from WMP session state being held in process memory (#432).
+// warnWMPSessionAffinity logs once that WMP session state is process-local (#432).
 func (p *EngineProvider) warnWMPSessionAffinity() {
 	p.wmpAffinityWarnOnce.Do(func() {
 		if p.logger == nil {
@@ -515,33 +513,30 @@ func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
 		p.manager.HandleConnection(c.Writer, c.Request)
 	})
 
-	// WMP JSON-RPC endpoints — same engine, same auth, same security posture.
-	// POST /api/v2/wallet/rpc — JSON-RPC 2.0 request/response (auth via Authorization: Bearer)
+	// WMP endpoints share the engine's auth (Authorization: Bearer) and security posture.
+	// POST /api/v2/wallet/rpc: JSON-RPC 2.0 request/response.
 	router.POST(wsengine.WMPRPCPath, func(c *gin.Context) {
 		p.wmpAdapter.HandleWMPRPC(c.Writer, c.Request)
 	})
-	// GET /api/v2/wallet/events — SSE stream of WMP notifications (auth via Authorization: Bearer)
-	// The stream outlives the server's WriteTimeout; the handler itself arms a
-	// fresh bounded write deadline around every write/flush.
+	// GET /api/v2/wallet/events: SSE stream of notifications. It outlives the server's
+	// WriteTimeout; the handler arms its own write deadline around every write.
 	router.GET(wsengine.WMPEventsPath, func(c *gin.Context) {
 		p.wmpAdapter.HandleWMPEvents(c.Writer, c.Request)
 	})
-	// GET /api/v2/wallet/rpc/events — the same stream at the URL go-wmp's
-	// HTTPS+SSE client derives from the advertised rpc endpoint (base + "/events").
+	// GET /api/v2/wallet/rpc/events: the same stream at the URL go-wmp's client derives
+	// (rpc endpoint + "/events").
 	router.GET(wsengine.WMPClientEventsPath, func(c *gin.Context) {
 		p.wmpAdapter.HandleWMPEvents(c.Writer, c.Request)
 	})
-	// GET /.well-known/wmp-configuration — public capability discovery, no auth
-	// (a client needs this before it has a token to authenticate an RPC/SSE call with).
+	// GET /.well-known/wmp-configuration: public discovery, no auth (needed before a token exists).
 	router.GET("/.well-known/wmp-configuration", func(c *gin.Context) {
 		p.wmpAdapter.HandleWMPConfiguration(c.Writer, c.Request)
 	})
 }
 
-// Close shuts down the WMP adapter and the engine manager
-// Drain is the first shutdown step: the WMP adapter and the WebSocket
-// manager stop accepting new requests, sessions and upgrades (503) while the
-// listeners are still up. Idempotent; Close implies it.
+// Drain is the first shutdown step: the WMP adapter and WebSocket manager refuse new
+// requests, sessions and upgrades (503) while listeners are still up. Idempotent;
+// Close implies it.
 func (p *EngineProvider) Drain() {
 	if p.wmpAdapter != nil {
 		p.wmpAdapter.Drain()
@@ -553,11 +548,8 @@ func (p *EngineProvider) Drain() {
 
 func (p *EngineProvider) Close() {
 	p.Drain()
-	// Stop the WMP adapter first: it starts draining (new RPC/SSE requests
-	// get 503 and session.create is refused) before its live sessions are
-	// closed and its cleanup goroutine stopped, so nothing can register a
-	// session behind the cleanup. Then close the manager (which closes the
-	// remaining sessions' transports).
+	// Close the WMP adapter first so nothing can register a session behind its cleanup,
+	// then the manager (which closes the remaining transports).
 	if p.wmpAdapter != nil {
 		p.wmpAdapter.Close()
 	}
@@ -1306,13 +1298,10 @@ func newAuditEmitter(cfg *config.Config, logger *zap.Logger) *audit.Emitter {
 	return audit.NewFromConfig(cfg, logger)
 }
 
-// configureWMPExternalURL sets the public base URL for the WMP discovery
-// document from server.external_urls.engine_url (normally a ws:// or wss://
-// URL, mapped to https by SetExternalURL; plaintext only for loopback). The WMP routes are mounted on
-// the engine router/port only, so as.external_url (the AS origin) is
-// deliberately NOT used as a fallback: it can point at a host that does not
-// serve them. Unset/invalid leaves /.well-known/wmp-configuration failing
-// closed (503).
+// configureWMPExternalURL sets the WMP discovery base URL from
+// server.external_urls.engine_url (ws/wss mapped to https by SetExternalURL). The WMP
+// routes are on the engine port only, so as.external_url is deliberately not a
+// fallback. Unset or invalid leaves discovery failing closed (503).
 func configureWMPExternalURL(adapter *wsengine.WMPAdapter, cfg *config.Config, logger *zap.Logger) {
 	engineURL := cfg.Server.ExternalURLs.EngineURL
 	if engineURL == "" {

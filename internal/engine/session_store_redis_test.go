@@ -104,12 +104,9 @@ func (h *cmdRecorder) record(c redis.Cmder) {
 	}
 }
 
-// The pointer compare-and-delete must be a single atomic Redis operation. A
-// separate GET followed by DEL leaves a window in which another replica can
-// repoint the key to a live replacement that the DEL then removes. That
-// interleaving cannot be forced deterministically against miniredis, so this
-// asserts the structural property instead: the only commands that touch the
-// pointer during Delete are the script (eval/evalsha), never a bare GET/DEL.
+// The pointer compare-and-delete must be one atomic operation. The race cannot
+// be forced against miniredis, so assert structurally: only the script
+// (eval/evalsha), never a bare GET/DEL, touches the pointer during Delete.
 func TestRedisSessionStore_DeletePointerUsesSingleAtomicScript(t *testing.T) {
 	store, _ := newTestRedisStore(t)
 	ctx := context.Background()
@@ -212,8 +209,7 @@ func TestRedisSessionStore_UpdateExtendsUserSetExpiry(t *testing.T) {
 	assert.InDelta(t, (2 * time.Hour).Seconds(), mr.TTL(store.userSetKey("u1")).Seconds(), 5)
 }
 
-// seedLegacySession writes a session exactly as the previous release did: the
-// session key, an unescaped `user:<userID>` pointer and a raw-tenant set; no
+// seedLegacySession writes a session as the previous release did: no
 // tenant-scoped pointer and no userall index.
 func seedLegacySession(t *testing.T, store *RedisSessionStore, s *SessionData, ttl time.Duration) {
 	t.Helper()
@@ -408,9 +404,8 @@ func TestRedisSessionStore_DeleteUserSetIfEmptyKeepsNonEmptySet(t *testing.T) {
 	assert.True(t, mr.Exists(store.userSetKey("u1")))
 }
 
-// Stress: Puts race DeleteByUser. Whatever interleaving happens, no session
-// key may exist that is not a member of its user's set (every live session
-// stays discoverable), and a final DeleteByUser leaves nothing.
+// Stress: Puts race DeleteByUser. No session key may exist outside its
+// user's set, and a final DeleteByUser leaves nothing.
 func TestRedisSessionStore_ConcurrentPutDeleteByUserNoOrphans(t *testing.T) {
 	store, mr := newTestRedisStore(t)
 	ctx := context.Background()
@@ -457,10 +452,8 @@ func TestRedisSessionStore_ConcurrentPutDeleteByUserNoOrphans(t *testing.T) {
 	assert.False(t, mr.Exists(store.userSetKey("u1")))
 }
 
-// The tenant-scoped pointer lives in a namespace disjoint from the legacy
-// `user:<userID>` pointer and is injectively encoded: legacy user "default:u"
-// and new (tenant "default", user "u") must never share a key or see each
-// other's sessions, in either direction and across all operations.
+// Legacy user "default:u" and new (tenant "default", user "u") must never
+// share a key or see each other's sessions, across all operations.
 func TestRedisSessionStore_LegacyAndScopedKeysDoNotCollide(t *testing.T) {
 	store, _ := newTestRedisStore(t)
 	ctx := context.Background()
@@ -504,8 +497,7 @@ func TestRedisSessionStore_CollidingLegacyPointerNeverCrossesUsers(t *testing.T)
 	store, mr := newTestRedisStore(t)
 	ctx := context.Background()
 
-	// Session of user "u" in tenant "default", but pointed at by the legacy
-	// key of user "default:u"-style collisions: forge the pointer.
+	// Forge a legacy pointer naming another user's session.
 	require.NoError(t, store.Put(ctx, redisSess("victim", "default", "u", time.Hour)))
 	require.NoError(t, store.client.Set(ctx, store.legacyUserKey("x"), "victim", time.Hour).Err())
 

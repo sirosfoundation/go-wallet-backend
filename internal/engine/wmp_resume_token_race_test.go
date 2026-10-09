@@ -60,10 +60,7 @@ func TestWMP_SessionCreateFailsWhenPeerRemovedBeforeToken(t *testing.T) {
 	assert.Empty(t, a.resumptionTokens, "no token may survive for the closed session")
 }
 
-// A create that is superseded by a second create for the same user between
-// manager registration and peer publication must fail rather than return a
-// session (and resumption token) that is already torn down. The hook
-// interleaves the two creates deterministically.
+// A create superseded by a second create for the same user between manager registration and peer publication must fail, not return a torn-down session and token. The hook interleaves the two creates.
 func TestWMP_SessionCreateFailsWhenSupersededBeforePublication(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -102,10 +99,7 @@ func TestWMP_SessionCreateFailsWhenSupersededBeforePublication(t *testing.T) {
 	assert.Len(t, a.resumptionTokens, 1, "no token may exist for the superseded session")
 }
 
-// A resume that already captured the old peer must fail, and clean up what it
-// built, when a create for the same user supersedes the session before the
-// resume publishes its replacement. dropHook=true removes the supersede
-// invalidation so the manager-currency recheck is exercised on its own.
+// A resume that captured the old peer must fail and clean up when a create supersedes the session before the resume publishes. dropHook=true removes the supersede invalidation to exercise the manager-currency recheck alone.
 func testWMPResumeSupersededBeforePublication(t *testing.T, dropHook bool) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)

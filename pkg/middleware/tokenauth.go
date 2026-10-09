@@ -306,9 +306,8 @@ func extractBearer(c *gin.Context) string {
 	return ExtractBearerToken(c.Request)
 }
 
-// ExtractBearerToken returns the bearer token from the request's
-// Authorization header, or "" if it is absent or malformed. The scheme is
-// matched case-insensitively and the token is trimmed.
+// ExtractBearerToken returns the bearer token from the Authorization header, or ""
+// if absent or malformed. The scheme is case-insensitive.
 func ExtractBearerToken(r *http.Request) string {
 	auth := r.Header.Get("Authorization")
 	if auth == "" {

@@ -32,9 +32,7 @@ func TestDiscoverIssuer_Success(t *testing.T) {
 	}
 }
 
-// TestDiscoverIssuer_TrailingSlashNormalized exercises the
-// oidc.NormalizeIssuerURL call inside fetchIssuerMetadata: a bare trailing
-// slash on the issuer URL must not change the constructed well-known path.
+// TestDiscoverIssuer_TrailingSlashNormalized: a bare trailing slash must not change the well-known path.
 func TestDiscoverIssuer_TrailingSlashNormalized(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/.well-known/openid-credential-issuer" {
@@ -134,9 +132,7 @@ func TestDiscoverIssuer_IACASuccess(t *testing.T) {
 }
 
 func TestDiscoverIssuer_DefaultClient(t *testing.T) {
-	// nil httpClient should not panic; DiscoverIssuer falls back to a
-	// default client internally. Use an unroutable address so this fails
-	// fast rather than actually hitting the network.
+	// A nil httpClient must not panic; use an unroutable address to fail fast.
 	result := DiscoverIssuer(t.Context(), "http://127.0.0.1:0", nil)
 	if result.Error == nil {
 		t.Fatal("expected an error connecting to an unroutable address")

@@ -33,10 +33,8 @@ type tdVector struct {
 	Hashes       map[string]string `json:"hashes"`
 }
 
-// loadTDVectors reads the shared golden vectors. The hashes in the file were
-// computed with Python's hashlib over the ASCII bytes of `raw`, so agreement
-// with Go's crypto here is agreement between two independent implementations,
-// not a function checking itself.
+// loadTDVectors reads the shared golden vectors. Their hashes were computed with
+// Python's hashlib, so agreement with Go is between independent implementations.
 func loadTDVectors(t *testing.T) []tdVector {
 	t.Helper()
 	b, err := os.ReadFile("testdata/ts12/transaction_data_vectors.json")
@@ -78,8 +76,7 @@ func rawArray(t *testing.T, entries ...string) json.RawMessage {
 
 // --- Golden vectors ---
 
-// The vector file itself must be internally consistent: raw decodes to json,
-// and every hash is what Go computes over raw as received.
+// The vector file must be consistent: raw decodes to json and every hash matches Go's over raw.
 func TestTransactionDataVectors_Consistent(t *testing.T) {
 	for _, v := range loadTDVectors(t) {
 		t.Run(v.Name, func(t *testing.T) {
@@ -93,9 +90,8 @@ func TestTransactionDataVectors_Consistent(t *testing.T) {
 	}
 }
 
-// decodeTransactionData must hand back each entry exactly as the verifier sent
-// it. This is what a presentation has to hash, and it is the property a
-// decode-then-re-encode design cannot have.
+// decodeTransactionData must return each entry exactly as sent, which a
+// decode-then-re-encode design cannot.
 func TestDecodeTransactionData_PreservesRawStringExactly(t *testing.T) {
 	for _, v := range loadTDVectors(t) {
 		t.Run(v.Name, func(t *testing.T) {
@@ -108,11 +104,9 @@ func TestDecodeTransactionData_PreservesRawStringExactly(t *testing.T) {
 	}
 }
 
-// Documents why the raw string is carried and not re-derived: re-serializing
-// the decoded object (the only thing a client gets today) does not reproduce
-// the hash for any non-canonical entry. sorted_compact is the control: the one
-// shape a re-serializer happens to reproduce, which shows the comparison can
-// pass and is not vacuously failing.
+// Re-serializing the decoded object does not reproduce the hash for any
+// non-canonical entry, which is why raw is carried. sorted_compact is the control:
+// the one shape a re-serializer reproduces, so the comparison can pass.
 func TestTransactionDataReserializationDoesNotReproduceHash(t *testing.T) {
 	for _, v := range loadTDVectors(t) {
 		t.Run(v.Name, func(t *testing.T) {
@@ -159,8 +153,7 @@ func TestHashAlgList_Unmarshal(t *testing.T) {
 	}
 }
 
-// A verifier following the specification sends the array. Before the fix this
-// failed to unmarshal and the whole request was rejected as invalid JSON.
+// A spec-conformant verifier sends the array; it must unmarshal.
 func TestDecodeTransactionData_AcceptsHashAlgArrayAndString(t *testing.T) {
 	byName := map[string]tdVector{}
 	for _, v := range loadTDVectors(t) {
@@ -218,8 +211,7 @@ func TestValidateTransactionData_AcceptsDeclaringClient(t *testing.T) {
 	require.Len(t, authReq.TransactionData, 1)
 }
 
-// Behaviour for requests WITHOUT transaction_data must be untouched for every
-// client, declaring or not: this is the backward-compatibility guarantee.
+// Requests WITHOUT transaction_data must behave the same for every client.
 func TestValidateTransactionData_NoTransactionDataIsUnaffectedByDeclaration(t *testing.T) {
 	for name, msg := range map[string]*FlowStartMessage{"nil": nil, "none": {}, "declared": tdClient} {
 		t.Run(name, func(t *testing.T) {
@@ -238,8 +230,7 @@ func TestValidateTransactionData_StructuralErrorsKeepGenericCode(t *testing.T) {
 
 // --- Step 1: structural validation, raw and payload carried to the client ---
 
-// payDCQL is a DCQL query naming the credential ids the transaction_data
-// fixtures reference.
+// payDCQL names the credential ids the transaction_data fixtures reference.
 var payDCQL = json.RawMessage(`{"credentials":[{"id":"pay"},{"id":"age"}]}`)
 
 func entry(t *testing.T, jsonText string) string {
@@ -262,8 +253,7 @@ func TestValidateTransactionData_AcceptsTS12TypesForDeclaringClient(t *testing.T
 	}
 }
 
-// A verifier controls the JSON it encodes, so it can put a `raw` member in it.
-// Raw must still be the string that was received, not whatever the JSON says.
+// A verifier can put a `raw` member in its JSON; Raw must still be the received string.
 func TestDecodeTransactionData_RawMemberInVerifierJSONIsIgnored(t *testing.T) {
 	enc := entry(t, `{"type":"x","credential_ids":["c"],"raw":"AAAA-attacker-chosen"}`)
 	entries, err := decodeTransactionData(rawArray(t, enc))
@@ -306,8 +296,7 @@ func TestValidateTransactionData_StructuralChecks(t *testing.T) {
 	}
 }
 
-// A client that did not declare the feature is refused before any structural
-// check, so the answer for it is always "update the wallet".
+// A client that did not declare the feature is refused before any structural check.
 func TestValidateTransactionData_GateComesBeforeStructuralChecks(t *testing.T) {
 	authReq := &AuthorizationRequest{TransactionDataRaw: rawArray(t, entry(t, `{"credential_ids":[]}`))}
 	err := validateTransactionData(authReq, nil)
@@ -316,9 +305,8 @@ func TestValidateTransactionData_GateComesBeforeStructuralChecks(t *testing.T) {
 	assert.Equal(t, ErrCodeUnsupportedTransactionData, tdErr.code)
 }
 
-// What a client receives. The sign_request must carry raw and payload for each
-// entry and the response_mode, and a presentation without transaction data
-// must be byte-for-byte what it was before.
+// The sign_request must carry raw, payload and response_mode; a presentation
+// without transaction data is unchanged.
 func TestSignRequestParams_WireCarriesRawPayloadAndResponseMode(t *testing.T) {
 	v := loadTDVectors(t)[2] // pretty_printed
 	authReq := &AuthorizationRequest{TransactionDataRaw: rawArray(t, v.Raw), DCQLQuery: payDCQL}
@@ -344,8 +332,7 @@ func TestSignRequestParams_WireCarriesRawPayloadAndResponseMode(t *testing.T) {
 	assert.Equal(t, "urn:eudi:sca:payment:1", wire.TransactionData[0].Type)
 	assert.JSONEq(t, `{"transaction_id":"tx-0001","payee":{"name":"Shop AB","id":"SE1234567890"},"amount":"49.99","currency":"EUR","execution_date":"2026-10-06"}`, string(wire.TransactionData[0].Payload))
 
-	// The raw string the client receives is still the hash input: it matches
-	// the independent vector, even though the object was decoded in between.
+	// The raw string the client receives matches the independent vector.
 	assert.Equal(t, v.Hashes["sha-256"], hashOf(t, "sha-256", wire.TransactionData[0].Raw))
 }
 
@@ -360,8 +347,7 @@ func TestFlowStartMessage_Supports(t *testing.T) {
 	assert.False(t, nilMsg.Supports(FeatureTransactionDataV1))
 	assert.False(t, (&FlowStartMessage{}).Supports(FeatureTransactionDataV1))
 	assert.True(t, tdClient.Supports(FeatureTransactionDataV1))
-	// An unknown declared feature is ignored rather than rejected, so a newer
-	// client can talk to this engine.
+	// An unknown declared feature is ignored, so newer clients work.
 	assert.True(t, (&FlowStartMessage{Features: []string{"future_thing", FeatureTransactionDataV1}}).Supports(FeatureTransactionDataV1))
 }
 
@@ -371,7 +357,7 @@ func TestFlowStartMessage_FeaturesWireName(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(`{"type":"flow_start","protocol":"oid4vp","features":["transaction_data.v1"]}`), &m))
 	assert.True(t, m.Supports(FeatureTransactionDataV1))
 
-	// Existing clients send no `features`: still decodes, supports nothing.
+	// Clients sending no `features` still decode and support nothing.
 	var old FlowStartMessage
 	require.NoError(t, json.Unmarshal([]byte(`{"type":"flow_start","protocol":"oid4vp"}`), &old))
 	assert.False(t, old.Supports(FeatureTransactionDataV1))
@@ -379,9 +365,8 @@ func TestFlowStartMessage_FeaturesWireName(t *testing.T) {
 
 // --- Verifier is told ---
 
-// The gate is only useful if both ends hear about it: the verifier gets
-// invalid_transaction_data so its session ends now, and the client gets the
-// distinct error code so it can tell the user to update.
+// Both ends hear of the refusal: the verifier gets invalid_transaction_data and the
+// client the distinct error code.
 func TestFailTransactionData_NotifiesVerifierAndClient(t *testing.T) {
 	var form url.Values
 	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -472,11 +457,9 @@ func TestParseRequestFromURL_InvalidTransactionDataJSON(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid transaction_data")
 }
 
-// End to end through Execute: a verifier that sends transaction_data in an
-// inline URL to a client that never declared support must be refused, the
-// verifier told, and the client given the distinct error. This is the wiring
-// the unit tests above cannot show: parse -> validate -> typed error ->
-// failTransactionData, instead of the generic invalid-request path.
+// End to end through Execute: inline-URL transaction_data to a client without
+// support is refused, the verifier told, and the client given the distinct error
+// (parse -> validate -> typed error -> failTransactionData).
 func TestExecute_InlineTransactionData_RefusedForClientThatDidNotDeclare(t *testing.T) {
 	var form url.Values
 	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -517,10 +500,8 @@ func TestExecute_InlineTransactionData_RefusedForClientThatDidNotDeclare(t *test
 	q.Set("dcql_query", `{"credentials":[{"id":"pay","format":"dc+sd-jwt","meta":{"vct_values":["x"]}}]}`)
 	q.Set("transaction_data", string(owfRaw(t)))
 
-	// A client from before the feature: no Features in its flow_start.
-	// Execute continuing past validation is exactly the failure this guards
-	// against; with this minimal handler that surfaces as a panic further on,
-	// which is reported as a plain test failure instead of aborting the package.
+	// A client without Features in its flow_start. Execute continuing past validation
+	// would panic with this minimal handler, reported as a test failure.
 	var err error
 	func() {
 		defer func() {
@@ -549,9 +530,8 @@ func TestExecute_InlineTransactionData_RefusedForClientThatDidNotDeclare(t *test
 	}
 }
 
-// requestVPSignature is where the sign_request is assembled, so this is the
-// check that the client really receives raw, payload and response_mode, and
-// that a presentation with no transaction data sends neither.
+// requestVPSignature assembles the sign_request: the client gets raw, payload and
+// response_mode, and a presentation without transaction data sends neither.
 func signRequestFor(t *testing.T, authReq *AuthorizationRequest) SignRequestMessage {
 	t.Helper()
 	got := make(chan SignRequestMessage, 1)
@@ -613,9 +593,7 @@ func TestRequestVPSignature_OmitsBothForAPresentationWithoutTransactionData(t *t
 	assert.Empty(t, m.Params.TransactionData)
 }
 
-// OID4VP defaults an omitted response_mode to direct_post. The key binding JWT
-// of a transaction-data presentation must carry that effective mode, not the
-// empty string the request left out.
+// An omitted response_mode defaults to direct_post, and the KB-JWT must carry it.
 func TestRequestVPSignature_OmittedResponseModeIsSignedAsDirectPost(t *testing.T) {
 	v := loadTDVectors(t)[1]
 	authReq := &AuthorizationRequest{

@@ -14,9 +14,8 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
-// EngineProvider.Close must stop the WMP adapter's cleanup goroutine. The test
-// observes this adapter's own lifecycle signals, so it is independent of any
-// other goroutines in the process.
+// EngineProvider.Close must stop the WMP adapter's cleanup goroutine, observed via
+// the adapter's own lifecycle signals.
 func TestEngineProvider_Close_StopsWMPAdapter(t *testing.T) {
 	logger := zap.NewNop()
 	cfg := &config.Config{}
@@ -39,8 +38,7 @@ func TestEngineProvider_Close_StopsWMPAdapter(t *testing.T) {
 	}
 }
 
-// Closing the provider drains the WMP routes before sessions are closed: new
-// RPC and SSE requests are refused with 503.
+// Closing the provider drains the WMP routes first: new RPC and SSE requests get 503.
 func TestEngineProvider_Close_RejectsNewWMPRequests(t *testing.T) {
 	logger := zap.NewNop()
 	cfg := &config.Config{}

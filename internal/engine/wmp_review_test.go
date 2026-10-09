@@ -20,10 +20,8 @@ import (
 	"go.uber.org/zap"
 )
 
-// revokeOnSecondCheck reports a user as not revoked on the first IsUserRevoked
-// call (the token validation) and revoked on every later call (the
-// registerSession re-check), simulating a revocation landing in the window
-// between the two.
+// revokeOnSecondCheck reports not-revoked on the first IsUserRevoked call (token
+// validation) and revoked afterwards (the registerSession re-check).
 type revokeOnSecondCheck struct{ calls atomic.Int32 }
 
 func (r *revokeOnSecondCheck) IsBlacklisted(context.Context, string) bool   { return false }
@@ -260,8 +258,7 @@ func TestWMP_Resume_TransfersChildFlows(t *testing.T) {
 	}
 }
 
-// TestWMP_Resume_DoesNotTearDownSession runs many resumes to catch the old
-// peer's Serve cleanup unregistering the engine session.
+// Many resumes must not let the old peer's Serve cleanup unregister the engine session.
 func TestWMP_Resume_DoesNotTearDownSession(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -713,9 +710,7 @@ func TestWMP_FlowStart_HugeTimeoutIsCapped(t *testing.T) {
 	var r wmp.Response
 	require.NoError(t, json.Unmarshal(resp, &r))
 	require.Nil(t, r.Error)
-	// The flow must still be running (a wrapped-negative timeout would have
-	// expired its context immediately, but blockingHandler only exits on
-	// release or ctx.Done, so check the flow is still registered).
+	// The flow must still be registered (blockingHandler only exits on release or ctx.Done).
 	time.Sleep(50 * time.Millisecond)
 	a.mu.RLock()
 	sess := a.peers[sid].session
@@ -773,10 +768,7 @@ func TestWMP_Resume_RejectedWhenUserRevokedAtCommit(t *testing.T) {
 	defer cleanupWMP(a, m)
 	sid, token, _ := createSessionFull(t, a, "victim", "t", nil)
 
-	// Revocation lands after the token was validated by the HTTP layer
-	// (HandleRPC takes the already-validated caller) but before the resume
-	// commits: the revoked mark is set while the session-closing scan of
-	// RevokeUser has not (yet) reached this session.
+	// Revocation lands after token validation but before the resume commits, before RevokeUser's scan reaches this session.
 	m.revokedUsersMu.Lock()
 	m.revokedUsers["victim"] = struct{}{}
 	m.revokedUsersMu.Unlock()
@@ -811,9 +803,7 @@ func TestManager_UserRevoked(t *testing.T) {
 	assert.True(t, m.userRevoked("v"), "blacklist consulted")
 }
 
-// A concurrent wmp.flow.cancel can only see fully-constructed flows: the
-// flow becomes visible in session.flows with its Handler already set. Run
-// with -race.
+// A concurrent wmp.flow.cancel only sees flows whose Handler is already set. Run with -race.
 func TestWMP_FlowStart_HandlerSetBeforeFlowVisible(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -965,9 +955,7 @@ func TestWMP_Resume_AfterFullRevocationIsSessionNotFound(t *testing.T) {
 	assert.Equal(t, wmp.ErrSessionNotFound, rpcErrCode(t, resp))
 }
 
-// A sign/match send blocks in Peer.Call until the client acknowledges the
-// sub-flow start, while holding Session.Send's read lock. A resume must abort
-// that call instead of waiting out the call timeout for the write lock.
+// A resume must abort a sign/match Call blocked on the client's ack (holding Session.Send's read lock) rather than wait out the call timeout.
 func TestWMP_Resume_DoesNotWaitForUnacknowledgedCall(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -1190,9 +1178,8 @@ func (h *countingHandler) Execute(context.Context, *FlowStartMessage) error {
 }
 func (h *countingHandler) Cancel() { h.cancels.Add(1) }
 
-// endSession landing between handler construction and publication must make
-// FlowStart refuse the flow: nothing is registered, the handler is cancelled
-// and never executed, and the client gets an error.
+// endSession between handler construction and publication makes FlowStart refuse the
+// flow: nothing is registered, the handler is cancelled and never executed, and the client gets an error.
 func TestWMP_FlowStart_EndSessionBetweenBuildAndPublish(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)

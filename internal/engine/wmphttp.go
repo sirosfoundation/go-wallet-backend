@@ -21,14 +21,11 @@ import (
 
 // maxWMPRPCBodyBytes is the maximum allowed body size for WMP JSON-RPC requests.
 // JSON-RPC messages are small; 256KB is generous for any flow action payload.
-// Public paths of the WMP endpoints, as mounted by the server router and
-// advertised by the /.well-known/wmp-configuration discovery document.
+// Public paths of the WMP endpoints, advertised by the discovery document.
 //
-// go-wmp's HTTPS+SSE client (httpsse.NewClientTransport) takes ONE base URL,
-// POSTs JSON-RPC to it and opens the SSE stream at base + "/events". So the
-// RPC path doubles as that base and the stream is ALSO served at
-// WMPRPCPath + "/events" (WMPClientEventsPath), which is the events endpoint
-// the discovery document advertises. WMPEventsPath remains as the original
+// go-wmp's HTTPS+SSE client takes ONE base URL, POSTs JSON-RPC to it and
+// opens SSE at base + "/events", so the stream is also served at
+// WMPRPCPath + "/events" (WMPClientEventsPath). WMPEventsPath remains as an
 // alias for existing clients.
 const (
 	WMPRPCPath          = "/api/v2/wallet/rpc"
@@ -38,11 +35,9 @@ const (
 
 const maxWMPRPCBodyBytes = 256 * 1024
 
-// wmpSSEWriteTimeout bounds every individual SSE write/flush. The stream as a
-// whole is long-lived (it outlives the http.Server WriteTimeout), but a
-// client that stops reading must not be able to pin the handler in a blocked
-// socket write indefinitely - closing the event buffer cannot interrupt one.
-// It is a variable so tests can shorten it.
+// wmpSSEWriteTimeout bounds each SSE write/flush: the stream outlives the
+// http.Server WriteTimeout, but a non-reading client must not pin the handler
+// in a blocked socket write. A variable so tests can shorten it.
 var wmpSSEWriteTimeout = 15 * time.Second
 
 // wmpSSEHeartbeatInterval is how often an idle SSE stream emits a comment
@@ -106,13 +101,8 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Dispatch. HandleRPC's own protocol-level errors are already returned as
-	// (bytes, nil) — a marshaled JSON-RPC error envelope. A non-nil err here
-	// means something failed before an envelope could even be built (e.g.
-	// ws.peer.HandleRequestSync's own internal parse failure); respond with
-	// a JSON-RPC error envelope here too rather than plain text, so the
-	// caller (a JSON-RPC client expecting a JSON-RPC response body) doesn't
-	// fail trying to parse it.
+	// Dispatch. A non-nil err means failure before an envelope could be built;
+	// still answer with a JSON-RPC error envelope, not plain text.
 	resp, err := a.HandleRPCAs(r.Context(), sessionID, caller, body)
 	if err != nil {
 		a.logger.Error("WMP RPC dispatch failed", zap.Error(err))
@@ -192,10 +182,8 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Same user and tenant is not enough: the stream carries the flow
-	// notifications of a session that may have been created with broader
-	// privileges than this token holds. The presented token must grant every
-	// capability the session was created with.
+	// Same user and tenant is not enough: the token must grant every capability
+	// the session was created with.
 	if !a.tokenCoversSession(sessionID, id.TAC, id.EnforceTAC) {
 		a.logger.Warn("WMP SSE rejected - token lacks the session's capabilities",
 			zap.String("request_tac", string(id.TAC)))
@@ -217,12 +205,9 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// A new connection supersedes any previous one for this session: the
-	// old stream's context is cancelled so its handler exits. A stale
-	// connection (unclean mobile/network drop that the server has not yet
-	// noticed) must never lock the client out. Ownership and capability
-	// checks above have already passed, so only an authorized caller can
-	// supersede. Replay is cursor-driven, so nothing is lost.
+	// A new connection supersedes any previous one (cancelling its context) so a
+	// stale connection never locks the client out; ownership and capability
+	// checks above already passed. Replay is cursor-driven, so nothing is lost.
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
 	stream := buf.acquire(cancel)
@@ -233,12 +218,9 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no") // nginx
 
-	// Each write+flush gets its own fresh deadline (replacing the
-	// connection-wide WriteTimeout, which would cut the stream off); a
-	// writer without deadline support falls back to the server's own.
-	// SetWriteDeadline is persistent, so the deadline is cleared after every
-	// successful flush: an idle healthy stream must not expire before the
-	// next event, while a write to a non-reading client is still bounded.
+	// Each write+flush gets a fresh deadline (the connection-wide WriteTimeout
+	// would cut the stream off); the deadline is cleared after each flush so an
+	// idle healthy stream does not expire.
 	rc := http.NewResponseController(w)
 	armWrite := func() { _ = rc.SetWriteDeadline(time.Now().Add(wmpSSEWriteTimeout)) }
 	clearWrite := func() { _ = rc.SetWriteDeadline(time.Time{}) }
@@ -248,14 +230,10 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	clearWrite()
 
-	// Events are appended to the session's buffer as they are emitted (see
-	// pumpEvents), whether or not a client is connected, and IDs are durable
-	// across reconnects and wmp.session.resume. Replay is driven solely by
-	// the client's Last-Event-ID cursor: the server keeps no delivery state,
-	// because a successful Flush only hands bytes to the connection or a
-	// proxy and does not prove the client parsed the frame. Without a cursor
-	// every retained event is replayed; duplicates are possible and clients
-	// dedupe by the monotonic event ID.
+	// Events are buffered as emitted (see pumpEvents) with IDs durable across
+	// reconnects and resume. Replay is driven solely by Last-Event-ID: a
+	// successful Flush does not prove the client parsed the frame. Without a
+	// cursor every retained event is replayed; clients dedupe by event ID.
 	var cursor int64
 	if lastEventID := r.Header.Get("Last-Event-ID"); lastEventID != "" {
 		if id, err := strconv.ParseInt(lastEventID, 10, 64); err == nil {
@@ -303,15 +281,10 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// SetExternalURL sets the public base URL (scheme://host[:port][/prefix])
-// under which the WMP endpoints are reachable; the discovery document
-// advertises absolute URLs built from it. Only https URLs with a host and no
-// query or fragment are accepted: discovery advertises security mode "tls",
-// so a plaintext public endpoint would make clients send bearer tokens and
-// WMP payloads unencrypted. As a development exception plain http is accepted
-// for loopback hosts only (localhost, 127.0.0.0/8, ::1). A WebSocket URL -
-// which is what server.external_urls.engine_url holds - is mapped to the HTTP
-// URL of the same host: wss:// to https://, ws:// to http:// (loopback only).
+// SetExternalURL sets the public base URL of the WMP endpoints. Only https
+// URLs with a host and no query or fragment are accepted (discovery
+// advertises security mode "tls"); plain http only for loopback. A ws:// or
+// wss:// URL (engine_url) maps to http:// (loopback only) or https://.
 func (a *WMPAdapter) SetExternalURL(raw string) error {
 	u, err := url.Parse(strings.TrimRight(raw, "/"))
 	if err == nil {
@@ -344,11 +317,9 @@ func isLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// legacySessionEffectiveTAC is the permission set a session created by a
-// legacy token (no TAC concept) is treated as holding: every permission
-// authorizeProtocol gates on, since the legacy RPC path allows all of them.
-// A modern token must cover this to stream such a session, so a modern token
-// with an empty TAC (no permissions) cannot read it.
+// legacySessionEffectiveTAC is what a legacy-token session is treated as
+// holding: every permission authorizeProtocol gates on. A modern token must
+// cover it, so an empty-TAC token cannot read such a session.
 func legacySessionEffectiveTAC() claims.TAC {
 	var b []byte
 	for _, perm := range requiredTACForProtocol {
@@ -362,12 +333,9 @@ func legacySessionEffectiveTAC() claims.TAC {
 	return claims.TAC(b)
 }
 
-// tokenCoversSession reports whether a token with the given TAC (and
-// provenance) may observe the session: every capability the session holds
-// must be granted by the token. A session created by a modern token holds its
-// TAC (possibly empty). A session created by a legacy token holds
-// legacySessionEffectiveTAC, which a legacy token trivially covers (it has no
-// TAC concept) but a modern token must grant explicitly.
+// tokenCoversSession reports whether the token may observe the session: it
+// must grant every capability the session holds (legacy-created sessions hold
+// legacySessionEffectiveTAC, which a legacy token trivially covers).
 func (a *WMPAdapter) tokenCoversSession(sessionID string, tac claims.TAC, enforce bool) bool {
 	a.mu.RLock()
 	ws, ok := a.peers[sessionID]
@@ -386,15 +354,9 @@ func (a *WMPAdapter) tokenCoversSession(sessionID string, tac claims.TAC, enforc
 	return legacySessionEffectiveTAC().IsSubsetOf(tac)
 }
 
-// HandleWMPConfiguration serves the /.well-known/wmp-configuration discovery endpoint.
-// This allows WMP clients to discover server capabilities without establishing a session.
-// The document is the go-wmp library's own WellKnownConfig type, so it always
-// matches the schema wmp.DiscoverConfig expects.
-//
-// The endpoints are absolute https URLs derived from the configured external
-// URL (SetExternalURL), because go-wmp's client rejects relative ones. Without
-// a usable external URL the endpoint fails closed with 503 rather than
-// advertising something no client can consume.
+// HandleWMPConfiguration serves /.well-known/wmp-configuration using go-wmp's
+// WellKnownConfig. Endpoints are absolute https URLs from SetExternalURL
+// (go-wmp rejects relative ones); without one it fails closed with 503.
 func (a *WMPAdapter) HandleWMPConfiguration(w http.ResponseWriter, _ *http.Request) {
 	a.mu.RLock()
 	base := a.externalURL

@@ -78,16 +78,12 @@ type Config struct {
 	// HTTPClient is the HTTP client used for outbound requests.
 	// The caller is responsible for configuring timeouts, TLS settings,
 	// and SSRF protections (e.g. blocking private IP ranges).
-	// If nil, New builds an SSRF-guarded client (see pkg/config
-	// HTTPClientConfig.NewHTTPClient) that refuses private, loopback,
-	// link-local and cloud-metadata addresses; it never falls back to
-	// http.DefaultClient.
+	// If nil, New builds an SSRF-guarded client (config.HTTPClientConfig.NewHTTPClient)
+	// that refuses private, loopback, link-local and metadata addresses.
 	HTTPClient *http.Client
 
-	// UnsafeAllowPrivateAddressesForTesting lets the guarded client that New
-	// builds when HTTPClient is nil connect to private and loopback addresses
-	// (e.g. httptest servers). It has no effect when HTTPClient is set.
-	// For testing only; do not set in production.
+	// UnsafeAllowPrivateAddressesForTesting lets the client New builds (when HTTPClient
+	// is nil) reach private and loopback addresses. Testing only.
 	UnsafeAllowPrivateAddressesForTesting bool
 
 	// AllowHTTP permits non-TLS issuer URLs.
@@ -224,8 +220,7 @@ type cachedEntry struct {
 }
 
 // maxResponseBodyBytes is the maximum HTTP response body size (10 MB).
-// defaultHTTPTimeout is the timeout of the guarded client New builds when
-// Config.HTTPClient is nil.
+// defaultHTTPTimeout is the timeout of the client New builds.
 const defaultHTTPTimeout = 30 * time.Second
 
 const maxResponseBodyBytes = 10 * 1024 * 1024
@@ -277,9 +272,7 @@ func New(cfg Config) (*Resolver, error) {
 
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		// Never fall back to http.DefaultClient: issuer URLs are
-		// caller-controlled, so the default client must refuse private,
-		// loopback and metadata addresses.
+		// Never http.DefaultClient: issuer URLs are caller-controlled.
 		httpClient = config.HTTPClientConfig{
 			AllowHTTP:       cfg.AllowHTTP,
 			AllowPrivateIPs: cfg.UnsafeAllowPrivateAddressesForTesting,

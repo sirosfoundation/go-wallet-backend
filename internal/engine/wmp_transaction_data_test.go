@@ -15,9 +15,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
-// featureCapture is a flow handler that records the FlowStartMessage the
-// engine hands it, so a test can see which features the engine believes this
-// client declared.
+// featureCapture records the FlowStartMessage the engine hands it, to see which features the engine believes the client declared.
 type featureCapture struct{ got chan *FlowStartMessage }
 
 func (h featureCapture) Execute(_ context.Context, msg *FlowStartMessage) error {
@@ -76,9 +74,7 @@ func TestWMP_FlowStart_DeclaresTransactionDataWhenOffered(t *testing.T) {
 	assert.True(t, msg.Supports(FeatureTransactionDataV1))
 }
 
-// The core of the gate over WMP. Negotiation falls back to every server
-// capability when a client offers none; none of that may read as the client
-// supporting transaction_data.
+// Negotiation falls back to every server capability when a client offers none; that must not read as transaction_data support.
 func TestWMP_FlowStart_DoesNotDeclareWhenNotOffered(t *testing.T) {
 	cases := map[string]string{
 		"offered nothing at all":     "",
@@ -99,9 +95,7 @@ func TestWMP_FlowStart_DoesNotDeclareWhenNotOffered(t *testing.T) {
 	}
 }
 
-// WMP defines the capability at session level. A `features` member a client
-// puts in the flow params unmarshals into FlowStartMessage, and it must not
-// stand in for the capability.
+// A `features` member in flow params unmarshals into FlowStartMessage but must not stand in for the session-level capability.
 func TestWMP_FlowStart_FeaturesInFlowParamsCannotForgeTheCapability(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)

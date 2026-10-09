@@ -50,12 +50,8 @@ func wmpRequest(id string, method string, params interface{}) []byte {
 	return data
 }
 
-// wmpNotification builds a true JSON-RPC 2.0 Notification: no "id" field at
-// all, unlike wmpRequest (which always sets one). go-wmp's peer only treats
-// a message this way - e.g. MethodCredentialNotification's own param
-// validation never produces a synchronous error for it (go-wmp#26/#27) -
-// when the wire shape actually omits "id". Building a "notification" via
-// wmpRequest would silently test a Request instead.
+// wmpNotification builds an id-less JSON-RPC notification; go-wmp only treats
+// that wire shape as one (go-wmp#26/#27), unlike wmpRequest, which sets an id.
 func wmpNotification(method string, params interface{}) []byte {
 	p, _ := json.Marshal(params)
 	req := map[string]interface{}{
@@ -148,9 +144,7 @@ func TestWMP_SessionCreate_EmptyToken(t *testing.T) {
 	assert.Equal(t, wmp.ErrNotAuthorized, rpcResp.Error.Code)
 }
 
-// TestWMP_SessionCreate_NonBearerAuthType is a regression test: a client
-// declaring an auth type other than "bearer" (e.g. "dpop") must not have its
-// token silently treated as a bearer token.
+// TestWMP_SessionCreate_NonBearerAuthType: a non-bearer auth type must not be treated as bearer.
 func TestWMP_SessionCreate_NonBearerAuthType(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -170,9 +164,7 @@ func TestWMP_SessionCreate_NonBearerAuthType(t *testing.T) {
 	assert.Equal(t, wmp.ErrNotAuthorized, rpcResp.Error.Code)
 }
 
-// TestWMP_SessionCreate_UnsupportedVersion is a regression test for version
-// negotiation: a client requesting a WMP protocol version this server does
-// not implement must be rejected rather than silently proceeding.
+// TestWMP_SessionCreate_UnsupportedVersion: an unimplemented protocol version is rejected.
 func TestWMP_SessionCreate_UnsupportedVersion(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -192,10 +184,7 @@ func TestWMP_SessionCreate_UnsupportedVersion(t *testing.T) {
 	assert.Equal(t, wmp.ErrVersionNotSupported, rpcResp.Error.Code)
 }
 
-// TestWMP_SessionCreate_MLSNotSupported is a regression test: this server
-// only implements the TLS security mode (no MLS layer), so a client
-// requesting "mls" must be rejected rather than accepted and silently
-// downgraded.
+// TestWMP_SessionCreate_MLSNotSupported: only the TLS mode is implemented, so "mls" is rejected.
 func TestWMP_SessionCreate_MLSNotSupported(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -215,9 +204,7 @@ func TestWMP_SessionCreate_MLSNotSupported(t *testing.T) {
 	assert.Equal(t, wmp.ErrInvalidParams, rpcResp.Error.Code)
 }
 
-// TestWMP_SessionCreate_InvalidParams covers the case where the top-level
-// JSON-RPC envelope is valid but "params" does not decode into
-// SessionCreateParams (e.g. a JSON string instead of an object).
+// TestWMP_SessionCreate_InvalidParams: params that do not decode into SessionCreateParams.
 func TestWMP_SessionCreate_InvalidParams(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -240,8 +227,7 @@ func TestWMP_SessionCreate_InvalidParams(t *testing.T) {
 	assert.Equal(t, wmp.ErrInvalidParams, rpcResp.Error.Code)
 }
 
-// TestWMP_HandleSessionCreate_MalformedBody covers a body that isn't valid
-// JSON at all: HandleRPC's decode step answers with a JSON-RPC parse error.
+// TestWMP_HandleSessionCreate_MalformedBody: invalid JSON yields a JSON-RPC parse error.
 func TestWMP_HandleSessionCreate_MalformedBody(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -255,10 +241,7 @@ func TestWMP_HandleSessionCreate_MalformedBody(t *testing.T) {
 	assert.Equal(t, wmp.ErrParseError, rpcResp.Error.Code)
 }
 
-// TestWMP_SessionCreate_TTLCapped is a regression test: a client requesting
-// a TTL longer than maxSessionTTL must have it capped, not honored verbatim
-// (an unbounded client-chosen TTL would let a session outlive any reasonable
-// idle/lifetime policy).
+// TestWMP_SessionCreate_TTLCapped: a TTL above maxSessionTTL is capped.
 func TestWMP_SessionCreate_TTLCapped(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -288,8 +271,7 @@ func TestWMP_SessionCreate_TTLCapped(t *testing.T) {
 		"TTL beyond maxSessionTTL should be capped, not honored verbatim")
 }
 
-// TestWMP_SessionCreate_TTLWithinLimit covers the companion branch: a TTL
-// under the cap is honored as requested.
+// TestWMP_SessionCreate_TTLWithinLimit: a TTL under the cap is honored.
 func TestWMP_SessionCreate_TTLWithinLimit(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -318,10 +300,7 @@ func TestWMP_SessionCreate_TTLWithinLimit(t *testing.T) {
 	assert.WithinDuration(t, time.Now().Add(60*time.Second), ws.expiresAt, 3*time.Second)
 }
 
-// TestWMP_SessionCreate_CapabilitiesOffered is a regression test for
-// capability negotiation: when the client offers a restricted set of
-// capabilities, the server must intersect with its own supported set rather
-// than always advertising everything it supports.
+// TestWMP_SessionCreate_CapabilitiesOffered: capabilities are intersected with the client's offer.
 func TestWMP_SessionCreate_CapabilitiesOffered(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -349,8 +328,7 @@ func TestWMP_SessionCreate_CapabilitiesOffered(t *testing.T) {
 
 // --- HandleRPC: session.resume ---
 
-// createWMPSessionWithToken is like createWMPSession but also returns the
-// resumption token, needed by the resume tests below.
+// createWMPSessionWithToken is createWMPSession plus the resumption token.
 func createWMPSessionWithToken(t *testing.T, a *WMPAdapter, userID, tenantID string) (sessionID, resumptionToken string) {
 	t.Helper()
 	body := wmpRequest("1", "wmp.session.create", wmp.SessionCreateParams{
@@ -397,9 +375,7 @@ func TestWMP_SessionResume_Success(t *testing.T) {
 	assert.NotEqual(t, token, result.ResumptionToken, "resumption token should rotate")
 }
 
-// TestWMP_SessionResume_IdentityMismatch is a regression test for a session
-// hijack: possession of a valid resumption token alone must not be enough
-// to resume another user's session.
+// TestWMP_SessionResume_IdentityMismatch: a resumption token alone must not resume another user's session.
 func TestWMP_SessionResume_IdentityMismatch(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -412,8 +388,7 @@ func TestWMP_SessionResume_IdentityMismatch(t *testing.T) {
 		ResumptionToken: token,
 	})
 
-	// Attacker: valid bearer token for a *different* user, but has somehow
-	// obtained user-1's resumption token and session ID.
+	// Attacker: bearer token for another user plus user-1's resumption token and session ID.
 	resp, err := a.HandleRPC(context.Background(), "", "user-2", "tenant-a", body)
 	require.NoError(t, err)
 
@@ -466,14 +441,9 @@ func TestWMP_SessionResume_InvalidToken(t *testing.T) {
 	assert.Equal(t, wmp.ErrSessionNotFound, rpcResp.Error.Code)
 }
 
-// TestWMP_CloseSessionIfCurrent_SkipsSupersededSession is a regression test
-// for a race in resume: the peer.Serve goroutine started by
-// handleSessionCreate/handleSessionResume runs a's cleanup when Serve
-// returns, which happens whenever the *old* transport is closed — including
-// when a resume closes it deliberately to install a *new* wmpSession for the
-// same ID. The old goroutine's cleanup must be a no-op once superseded,
-// rather than deleting the new session out from under the client that just
-// resumed it.
+// TestWMP_CloseSessionIfCurrent_SkipsSupersededSession: the old transport's Serve
+// goroutine runs cleanup after a resume installed a new wmpSession; that cleanup
+// must not delete the new session.
 func TestWMP_CloseSessionIfCurrent_SkipsSupersededSession(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -497,8 +467,7 @@ func TestWMP_CloseSessionIfCurrent_SkipsSupersededSession(t *testing.T) {
 	a.peers[sessionID] = currentWS
 	a.mu.Unlock()
 
-	// Simulate the pre-resume goroutine's Serve() returning and running its
-	// deferred cleanup *after* a resume has already installed currentWS.
+	// Old goroutine's deferred cleanup runs after a resume installed currentWS.
 	a.closeSessionIfCurrent(sessionID, staleWS)
 
 	a.mu.RLock()
@@ -517,11 +486,8 @@ func TestWMP_CloseSessionIfCurrent_SkipsSupersededSession(t *testing.T) {
 
 // --- replayActiveFlowProgress ---
 
-// TestWMP_ReplayActiveFlowProgress_NotifiesActiveFlowsSkipsEmpty is a
-// regression test for post-resume state recovery (spec §6.2.1): every flow
-// with a non-empty State must get a fresh flow.progress notification so the
-// client can rebuild its UI, while flows that haven't reached a state yet
-// (empty State) must be skipped rather than sending a bogus empty step.
+// TestWMP_ReplayActiveFlowProgress_NotifiesActiveFlowsSkipsEmpty: after resume
+// (spec §6.2.1) flows with a non-empty State get flow.progress; empty ones are skipped.
 func TestWMP_ReplayActiveFlowProgress_NotifiesActiveFlowsSkipsEmpty(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -564,9 +530,7 @@ func TestWMP_ReplayActiveFlowProgress_NotifiesActiveFlowsSkipsEmpty(t *testing.T
 	}
 }
 
-// TestWMP_ReplayActiveFlowProgress_UnknownSession covers the early-return
-// guard when the session no longer exists (e.g. closed concurrently with the
-// resume) — must not panic on a nil peer/session.
+// TestWMP_ReplayActiveFlowProgress_UnknownSession: a missing session must not panic.
 func TestWMP_ReplayActiveFlowProgress_UnknownSession(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -608,9 +572,7 @@ func TestWMP_HandleRPC_UnknownSession(t *testing.T) {
 
 // --- cleanupExpired ---
 
-// TestWMP_CleanupExpired_RemovesExpiredToken covers the resumption-token
-// sweep: a token past its expiresAt must be removed, while a session that is
-// otherwise healthy must survive the same pass.
+// TestWMP_CleanupExpired_RemovesExpiredToken: expired tokens are swept; healthy sessions survive.
 func TestWMP_CleanupExpired_RemovesExpiredToken(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -632,9 +594,7 @@ func TestWMP_CleanupExpired_RemovesExpiredToken(t *testing.T) {
 	assert.NoError(t, err, "the session itself should not be affected by an unrelated token expiring")
 }
 
-// TestWMP_CleanupExpired_ClosesIdleSession covers the idle-timeout sweep: a
-// session whose lastActivity is older than wmpSessionIdleTimeout must be
-// closed.
+// TestWMP_CleanupExpired_ClosesIdleSession: sessions idle past wmpSessionIdleTimeout are closed.
 func TestWMP_CleanupExpired_ClosesIdleSession(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -651,9 +611,7 @@ func TestWMP_CleanupExpired_ClosesIdleSession(t *testing.T) {
 	assert.Error(t, err, "an idle session past wmpSessionIdleTimeout should have been closed")
 }
 
-// TestWMP_CleanupExpired_ClosesTTLExpiredSession covers the TTL sweep: a
-// session past its absolute expiresAt deadline must be closed even though it
-// is not idle.
+// TestWMP_CleanupExpired_ClosesTTLExpiredSession: sessions past expiresAt are closed even if not idle.
 func TestWMP_CleanupExpired_ClosesTTLExpiredSession(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -671,9 +629,7 @@ func TestWMP_CleanupExpired_ClosesTTLExpiredSession(t *testing.T) {
 	assert.Error(t, err, "a TTL-expired session should have been closed even though it is not idle")
 }
 
-// TestWMP_CleanupExpired_KeepsHealthySession is the negative-space companion
-// to the two tests above: a session that is neither idle nor TTL-expired
-// must survive a cleanup pass untouched.
+// TestWMP_CleanupExpired_KeepsHealthySession: a session neither idle nor expired survives.
 func TestWMP_CleanupExpired_KeepsHealthySession(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -800,9 +756,7 @@ func TestWMP_FlowAction_SignResponse(t *testing.T) {
 	require.NoError(t, json.Unmarshal(resp, &startResp))
 	assert.Nil(t, startResp.Error)
 
-	// Read the sign sub-flow start request from the SSE channel.
-	// The WMP adapter translates RequestSign into a Peer.Call(wmp.flow.start)
-	// which appears on the events channel as a JSON-RPC request.
+	// The adapter turns RequestSign into a Peer.Call(wmp.flow.start) seen on the events channel.
 	eventsCh, err := a.Events(sessionID)
 	require.NoError(t, err)
 
@@ -836,9 +790,7 @@ func TestWMP_FlowAction_SignResponse(t *testing.T) {
 	require.NotEmpty(t, childFlowID)
 	require.NotNil(t, rpcRequestID)
 
-	// Simulate client responding to the sub-flow start request with a result,
-	// then sending flow.complete for the child flow.
-	// First, respond to the JSON-RPC Call with a FlowStartResult.
+	// Respond to the Call with a FlowStartResult, then send flow.complete for the child flow.
 	startResult := wmp.FlowStartResult{
 		WMP:      wmp.Metadata{Version: wmp.Version, SessionID: sessionID},
 		FlowID:   childFlowID,
@@ -861,9 +813,7 @@ func TestWMP_FlowAction_SignResponse(t *testing.T) {
 	// Small delay for Peer.Call to unblock and RequestSign to start waiting on signCh.
 	time.Sleep(100 * time.Millisecond)
 
-	// Now send flow.complete for the child sign sub-flow as a JSON-RPC notification.
-	// The Peer's Serve loop will receive this and call FlowComplete on the handler,
-	// which routes the result to signCh with the correct messageID.
+	// Send flow.complete for the child sign sub-flow; FlowComplete routes it to signCh by messageID.
 	completeResult, _ := json.Marshal(map[string]string{
 		"proof_jwt": "eyJ.test.proof",
 	})
@@ -958,11 +908,8 @@ func TestWMP_FlowAction_UnknownFlow(t *testing.T) {
 	assert.Equal(t, wmp.ErrFlowError, rpcResp.Error.Code)
 }
 
-// TestWMP_FlowAction_ActionChannelBackpressure_WaitsBriefly is a regression
-// test: a momentarily-full actionCh must not be rejected instantly. A brief
-// wait gives a legitimate single in-flight action somewhere to land once the
-// channel drains, instead of forcing the client to recover only via the
-// server-side timeout.
+// TestWMP_FlowAction_ActionChannelBackpressure_WaitsBriefly: a momentarily-full
+// actionCh must wait briefly rather than reject instantly.
 func TestWMP_FlowAction_ActionChannelBackpressure_WaitsBriefly(t *testing.T) {
 	session := &Session{
 		ID:       "sess-1",
@@ -975,8 +922,7 @@ func TestWMP_FlowAction_ActionChannelBackpressure_WaitsBriefly(t *testing.T) {
 	// Fill the channel to capacity.
 	session.actionCh <- &FlowActionMessage{}
 
-	// Drain one slot shortly after FlowAction starts waiting — well within
-	// flowActionSendWait, so this must succeed rather than reject instantly.
+	// Drain one slot within flowActionSendWait; the action must succeed.
 	go func() {
 		time.Sleep(50 * time.Millisecond)
 		<-session.actionCh
@@ -1015,9 +961,7 @@ func TestWMP_SessionClose(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// TestWMP_SessionClose_RPC covers the wmp.session.close RPC method (the
-// client-initiated counterpart to a.CloseSession above): the handler must
-// tear down the WMP session in response to the client's own close request.
+// TestWMP_SessionClose_RPC: wmp.session.close tears down the session.
 func TestWMP_SessionClose_RPC(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -1040,9 +984,7 @@ func TestWMP_SessionClose_RPC(t *testing.T) {
 	assert.Error(t, err, "session should be torn down after wmp.session.close")
 }
 
-// TestWMP_SessionClose_NilParams covers SessionClose being invoked with nil
-// params directly (the "reason" defaults to "unknown" rather than the
-// handler dereferencing a nil pointer).
+// TestWMP_SessionClose_NilParams: nil params default the reason to "unknown" without a nil dereference.
 func TestWMP_SessionClose_NilParams(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -1061,9 +1003,7 @@ func TestWMP_SessionClose_NilParams(t *testing.T) {
 
 // --- FlowCancel ---
 
-// TestWMP_FlowCancel_UnknownFlow covers wmp.flow.cancel for a flow that is
-// not (or no longer) in the session's flow map. Per spec §6.2 this must
-// report the flow as already terminal rather than a generic flow error.
+// TestWMP_FlowCancel_UnknownFlow: cancelling an unknown flow reports it already terminal (spec §6.2).
 func TestWMP_FlowCancel_UnknownFlow(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -1084,9 +1024,7 @@ func TestWMP_FlowCancel_UnknownFlow(t *testing.T) {
 	assert.Equal(t, wmp.ErrFlowError, rpcResp.Error.Code)
 }
 
-// TestWMP_FlowCancel_Success covers wmp.flow.cancel for an active flow:
-// the RPC must succeed and the flow's Handler.Cancel() must actually be
-// invoked (not just a status echoed back without doing anything).
+// TestWMP_FlowCancel_Success: the RPC succeeds and invokes Handler.Cancel().
 func TestWMP_FlowCancel_Success(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -1136,8 +1074,7 @@ func TestWMP_FlowCancel_Success(t *testing.T) {
 
 // --- CapabilityList ---
 
-// TestWMP_CapabilityList_Success covers wmp.capability.list echoing back the
-// capabilities/security negotiated at session.create time.
+// TestWMP_CapabilityList_Success: echoes the capabilities negotiated at session.create.
 func TestWMP_CapabilityList_Success(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -1160,10 +1097,8 @@ func TestWMP_CapabilityList_Success(t *testing.T) {
 	assert.Equal(t, "tls", result.Security.Mode)
 }
 
-// TestWMP_CapabilityList_SessionNotFound covers the handler's own defensive
-// session lookup. HandleRPC already gates on session existence before
-// dispatching, so this exercises the handler directly for a sessionID that
-// was never registered (e.g. a lookup racing a concurrent close).
+// TestWMP_CapabilityList_SessionNotFound: the handler's own lookup for an unregistered session
+// (HandleRPC normally gates this).
 func TestWMP_CapabilityList_SessionNotFound(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -1179,20 +1114,10 @@ func TestWMP_CapabilityList_SessionNotFound(t *testing.T) {
 
 // --- CredentialNotification ---
 
-// TestWMP_CredentialNotification_MissingID covers wmp.credential.notification
-// being routed through to the engine's dispatchCredentialNotification. It is
-// a fire-and-forget notification method (no JSON-RPC error is returned to
-// the caller even on rejection); the outcome instead arrives as a
-// notification_ack message on the session's event stream. This also
-// exercises wmpSessionTransport.SendJSON's default/fallback branch, since
-// NotificationAckMessage has no dedicated WMP notification mapping.
-//
-// Must be sent as a true id-less JSON-RPC Notification, not a Request: only
-// then does go-wmp's own peer-level param validation let a rejected message
-// still reach this package's handler at all (go-wmp#26/#27) - a Request
-// with the same invalid params is correctly rejected by go-wmp itself
-// before ever reaching dispatchCredentialNotification, with the standard
-// synchronous -32602 rather than this async notification_ack path.
+// TestWMP_CredentialNotification_MissingID: wmp.credential.notification reaches
+// dispatchCredentialNotification; a rejection arrives as a notification_ack event
+// (not a JSON-RPC error), which also covers SendJSON's fallback branch. It must be sent as an
+// id-less Notification: go-wmp rejects an invalid Request itself with -32602 (go-wmp#26/#27).
 func TestWMP_CredentialNotification_MissingID(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -1341,9 +1266,8 @@ func readSSEUntil(t *testing.T, br *bufio.Reader, want string) {
 	}
 }
 
-// TestWMP_HTTPEndpoint_Events_NewConnectionSupersedesStale: a second GET
-// while a first (never-closing, stale) stream is open succeeds, the first
-// stream ends, and the second replays from its own cursor without loss.
+// Events_NewConnectionSupersedesStale: a second GET supersedes a stale open stream,
+// ends the first, and replays from its own cursor without loss.
 func TestWMP_HTTPEndpoint_Events_NewConnectionSupersedesStale(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -1413,10 +1337,8 @@ func TestWMP_HTTPEndpoint_Events_Heartbeat(t *testing.T) {
 	readSSEUntil(t, bufio.NewReader(resp.Body), ": keepalive")
 }
 
-// TestWMPEventBuffer_AppendReplayAndAcquire covers the wmpEventBuffer
-// mechanics directly: durable IDs across "reconnects" (append calls),
-// replay filtering by Last-Event-ID, and single-active-connection
-// enforcement — the building blocks behind message replay on resume.
+// TestWMPEventBuffer_AppendReplayAndAcquire: durable IDs, Last-Event-ID replay
+// filtering, and single-active-connection enforcement.
 func TestWMPEventBuffer_AppendReplayAndAcquire(t *testing.T) {
 	buf := &wmpEventBuffer{}
 
@@ -1503,14 +1425,8 @@ func TestWMP_MessageTranslation_Progress(t *testing.T) {
 	}
 }
 
-// TestWMP_FlowAction_MatchResponse_FullPipeline exercises
-// wmpSessionTransport.SendJSON's *MatchRequestMessage branch end-to-end: a
-// flow handler calls Session.RequestMatch, which the transport turns into a
-// nested "match" sub-flow (wmp.flow.start Call), and the client's eventual
-// wmp.flow.complete for that child flow must be routed back to the
-// original handler via matchCh. This mirrors TestWMP_FlowAction_SignResponse
-// but for the match sub-flow, which no other test in this file drives
-// end-to-end.
+// TestWMP_FlowAction_MatchResponse_FullPipeline: RequestMatch becomes a "match"
+// sub-flow Call, and the client's flow.complete for it is routed back via matchCh.
 func TestWMP_FlowAction_MatchResponse_FullPipeline(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -1612,10 +1528,7 @@ func TestWMP_FlowAction_MatchResponse_FullPipeline(t *testing.T) {
 	}
 }
 
-// TestWmpSessionTransport_SendJSON_FlowError exercises the *FlowErrorMessage
-// branch of wmpSessionTransport.SendJSON directly: it must translate the
-// engine error into a wmp.flow.error notification with the mapped WMP error
-// code.
+// TestWmpSessionTransport_SendJSON_FlowError: a FlowErrorMessage becomes wmp.flow.error with the mapped code.
 func TestWmpSessionTransport_SendJSON_FlowError(t *testing.T) {
 	ct := wmp.NewChannelTransport(5, 5)
 	handler := &wmpEngineHandler{sessionID: "sess-err"}
@@ -1645,13 +1558,9 @@ func TestWmpSessionTransport_SendJSON_FlowError(t *testing.T) {
 	}
 }
 
-// TestWmpSessionTransport_SendJSON_SignRequest_FieldParity exercises the
-// *SignRequestMessage branch of wmpSessionTransport.SendJSON: every field on
-// the engine's SignRequestParams (the WebSocket wire shape) must survive the
-// translation into the WMP wire shape, openid4x.SignSubFlowParams, or a
-// WMP-only client silently loses data the native WebSocket client gets (e.g.
-// the sign_client_auth DPoP parameters, credential/transaction-data
-// selection, and verifier-session binding).
+// TestWmpSessionTransport_SendJSON_SignRequest_FieldParity: every SignRequestParams
+// field (DPoP params, selection, verifier-session binding) must survive the
+// translation to openid4x.SignSubFlowParams.
 func TestWmpSessionTransport_SendJSON_SignRequest_FieldParity(t *testing.T) {
 	ct := wmp.NewChannelTransport(5, 5)
 	handler := &wmpEngineHandler{sessionID: "sess-sign"}
@@ -1760,10 +1669,7 @@ func TestWmpSessionTransport_SendJSON_SignRequest_FieldParity(t *testing.T) {
 	require.Len(t, params.TransactionData, 1)
 	assert.Equal(t, in.Params.TransactionData[0].Type, params.TransactionData[0].Type)
 	assert.Equal(t, in.Params.TransactionData[0].CredentialIDs, params.TransactionData[0].CredentialIDs)
-	// What the wallet needs to bind the presentation correctly: the string it
-	// must hash, the payload it validates and shows, the hash algorithm list
-	// and the response mode. Losing any of them over WMP while the WebSocket
-	// client gets them would be the parity bug this test exists to catch.
+	// The wallet needs the string to hash, the payload, the hash algorithms and the response mode.
 	assert.Equal(t, in.Params.TransactionData[0].Raw, params.TransactionData[0].Raw)
 	assert.JSONEq(t, string(in.Params.TransactionData[0].Payload), string(params.TransactionData[0].Payload))
 	assert.Equal(t, openid4x.HashAlgs{"sha-256", "sha-384"}, params.TransactionData[0].TransactionDataHashesAlg)
@@ -1773,8 +1679,7 @@ func TestWmpSessionTransport_SendJSON_SignRequest_FieldParity(t *testing.T) {
 	assert.Equal(t, in.Params.CredentialsToInclude[0].DisclosedClaims, params.CredentialsToInclude[0].DisclosedClaims)
 }
 
-// TestWmpSessionTransport_ReadMessage covers ReadMessage's delegation to the
-// underlying ChannelTransport.
+// TestWmpSessionTransport_ReadMessage: delegates to the ChannelTransport.
 func TestWmpSessionTransport_ReadMessage(t *testing.T) {
 	ct := wmp.NewChannelTransport(1, 1)
 	transport := newWMPSessionTransport(nil, ct)
@@ -1809,11 +1714,8 @@ func TestWMP_MapErrorCode(t *testing.T) {
 	}
 }
 
-// TestWmpResponseBytes_MarshalFailureFallsBackToInternalError covers the
-// fallback in wmpResponseBytes when wmp.NewResponse fails to marshal the
-// result (e.g. a value json.Marshal cannot encode): the function must
-// degrade to an internal-error JSON-RPC response rather than propagating
-// the marshal error or panicking.
+// TestWmpResponseBytes_MarshalFailureFallsBackToInternalError: a result that
+// cannot be marshaled degrades to an internal-error response.
 func TestWmpResponseBytes_MarshalFailureFallsBackToInternalError(t *testing.T) {
 	resp, err := wmpResponseBytes(json.RawMessage(`"1"`), make(chan int))
 	require.NoError(t, err)
@@ -1913,10 +1815,7 @@ func (h *actionFlowHandler) Execute(ctx context.Context, msg *FlowStartMessage) 
 
 func (h *actionFlowHandler) Cancel() {}
 
-// cancellableFlowHandler blocks in Execute until Cancel() is invoked (or the
-// test times out), so tests can verify that wmp.flow.cancel actually
-// triggers the flow handler's Cancel() rather than just acknowledging the
-// request without doing anything.
+// cancellableFlowHandler blocks in Execute until Cancel() is invoked or the test times out.
 type cancellableFlowHandler struct {
 	flow      *Flow
 	cancelled chan struct{}
@@ -1929,8 +1828,7 @@ func (h *cancellableFlowHandler) Execute(ctx context.Context, msg *FlowStartMess
 	return nil
 }
 
-// Cancel is idempotent, like real handlers' (context cancel): session
-// teardown cancels active flows again after an explicit wmp.flow.cancel.
+// Cancel is idempotent: session teardown cancels active flows again.
 func (h *cancellableFlowHandler) Cancel() {
 	h.once.Do(func() {
 		close(h.cancelled)
@@ -1938,8 +1836,7 @@ func (h *cancellableFlowHandler) Cancel() {
 	})
 }
 
-// matchFlowHandler requests a DCQL credential match and reports what it
-// received, mirroring signFlowHandler above but for the match sub-flow.
+// matchFlowHandler requests a DCQL match and reports what it received.
 type matchFlowHandler struct {
 	flow          *Flow
 	matchReceived chan *MatchResponseMessage
@@ -1961,15 +1858,8 @@ func (h *matchFlowHandler) Execute(ctx context.Context, msg *FlowStartMessage) e
 
 func (h *matchFlowHandler) Cancel() {}
 
-// ---------------------------------------------------------------------------
-// FlowAction: sign_response / match_response / generic action branches
-//
-// These tests construct a wmpEngineHandler directly (as
-// TestWMP_FlowAction_ActionChannelBackpressure_WaitsBriefly does above)
-// rather than going through the full session.create + flow.start dance,
-// since FlowAction only needs a Session with a registered flow and the
-// relevant channel to exercise its routing logic.
-// ---------------------------------------------------------------------------
+// FlowAction branches: handlers are built directly, since FlowAction only needs a
+// Session with a registered flow and the relevant channel.
 
 func TestWMP_FlowAction_SignResponse_MessageIDFromStructDecode(t *testing.T) {
 	session := &Session{
@@ -2003,13 +1893,9 @@ func TestWMP_FlowAction_SignResponse_MessageIDFromStructDecode(t *testing.T) {
 	}
 }
 
-// TestWMP_FlowAction_SignResponse_MessageIDFallbackWhenAbsent exercises the
-// "extract message_id from raw params" fallback path (params present, but
-// with no message_id key so the struct decode leaves MessageID empty).
-// Because SignResponseMessage embeds Message anonymously, message_id is
-// already promoted into the struct-level JSON decode; this test documents
-// that the fallback is exercised but — given that embedding — cannot
-// actually recover anything the struct decode missed.
+// TestWMP_FlowAction_SignResponse_MessageIDFallbackWhenAbsent: exercises the
+// raw-params fallback; message_id is already promoted by the embedded Message,
+// so the fallback recovers nothing extra.
 func TestWMP_FlowAction_SignResponse_MessageIDFallbackWhenAbsent(t *testing.T) {
 	session := &Session{
 		flows:  map[string]*Flow{"flow-1": {ID: "flow-1"}},
@@ -2140,11 +2026,8 @@ func TestWMP_FlowAction_MatchResponse_InvalidParamsJSON(t *testing.T) {
 	assert.Equal(t, wmp.ErrInvalidParams, rpcErr.Code)
 }
 
-// TestWMP_FlowAction_SpecActionTranslation covers the generic/default branch
-// with spec-compliant action names (per specToEngineAction) that must be
-// translated to the engine's internal action vocabulary before being
-// delivered on actionCh, as well as an already-engine-native name that
-// passes through untranslated.
+// TestWMP_FlowAction_SpecActionTranslation: spec action names (specToEngineAction)
+// are translated to engine names; engine-native names pass through.
 func TestWMP_FlowAction_SpecActionTranslation(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -2187,10 +2070,7 @@ func TestWMP_FlowAction_SpecActionTranslation(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// FlowStart: validation, limits, and error branches not covered by
-// TestWMP_FlowStart_UnknownProtocol / TestWMP_FlowStart_WithMockHandler above.
-// ---------------------------------------------------------------------------
+// FlowStart: validation, limit and error branches.
 
 func TestWMP_FlowStart_FlowIDTooLong(t *testing.T) {
 	a, m := testWMPAdapter()
@@ -2266,9 +2146,7 @@ func TestWMP_FlowStart_InvalidParamsJSON(t *testing.T) {
 
 	sessionID := createWMPSession(t, a)
 
-	// A JSON string is syntactically valid JSON but cannot be unmarshaled
-	// into the FlowStartMessage struct, exercising the "invalid flow
-	// params" branch distinctly from a session/protocol-level rejection.
+	// A JSON string is valid JSON but does not unmarshal into FlowStartMessage ("invalid flow params").
 	body := wmpRequest("2", "wmp.flow.start", wmp.FlowStartParams{
 		WMP:      wmp.Metadata{Version: wmp.Version, SessionID: sessionID},
 		FlowType: "invalid_params_test",
@@ -2328,10 +2206,7 @@ func TestWMP_FlowStart_HandlerFactoryError(t *testing.T) {
 	assert.False(t, exists, "flow must be de-registered when the handler factory fails")
 }
 
-// TestWMP_FlowStart_CustomTimeoutAppliedToContext verifies that a
-// client-supplied timeout (well under defaultFlowTimeout) is actually
-// applied to the flow's execution context, rather than the 5-minute
-// server default silently winning.
+// TestWMP_FlowStart_CustomTimeoutAppliedToContext: a client timeout is applied to the flow context.
 func TestWMP_FlowStart_CustomTimeoutAppliedToContext(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -2366,9 +2241,7 @@ func TestWMP_FlowStart_CustomTimeoutAppliedToContext(t *testing.T) {
 	}
 }
 
-// deadlineCapturingFlowHandler reports the deadline of the context it's
-// executed with, so tests can verify FlowStart applied the client-supplied
-// timeout rather than the server default.
+// deadlineCapturingFlowHandler reports the deadline of its execution context.
 type deadlineCapturingFlowHandler struct {
 	flow      *Flow
 	deadlines chan time.Time
@@ -2384,9 +2257,7 @@ func (h *deadlineCapturingFlowHandler) Execute(ctx context.Context, msg *FlowSta
 
 func (h *deadlineCapturingFlowHandler) Cancel() {}
 
-// ---------------------------------------------------------------------------
 // FlowComplete: child-flow result routing.
-// ---------------------------------------------------------------------------
 
 func TestWMP_FlowComplete_MatchRouting(t *testing.T) {
 	session := &Session{matchCh: make(chan *MatchResponseMessage, 1)}
@@ -2420,10 +2291,7 @@ func TestWMP_FlowComplete_MatchRouting(t *testing.T) {
 	assert.False(t, stillTracked, "child flow should have been popped by FlowComplete")
 }
 
-// TestWMP_FlowComplete_UnknownChildFlow_NoOp verifies that a flow.complete
-// notification for a flow ID that was never registered via
-// registerChildFlow (e.g. a top-level flow's own completion, which is
-// handled elsewhere) is silently ignored rather than delivered anywhere.
+// TestWMP_FlowComplete_UnknownChildFlow_NoOp: flow.complete for an unregistered child flow is ignored.
 func TestWMP_FlowComplete_UnknownChildFlow_NoOp(t *testing.T) {
 	session := &Session{
 		signCh:  make(chan *SignResponseMessage, 1),
@@ -2451,12 +2319,8 @@ func TestWMP_FlowComplete_UnknownChildFlow_NoOp(t *testing.T) {
 	}
 }
 
-// TestWMP_FlowComplete_MalformedResultStillRoutes verifies that a
-// flow.complete whose Result can't be decoded into the expected message
-// type doesn't block delivery: the error is swallowed and a (partially
-// zero-valued) response is still routed with the correct FlowID/MessageID
-// so a blocked RequestSign/RequestMatch call doesn't hang forever on a
-// malformed payload.
+// TestWMP_FlowComplete_MalformedResultStillRoutes: an undecodable Result is still
+// routed with the FlowID/MessageID so RequestSign/RequestMatch does not hang.
 func TestWMP_FlowComplete_MalformedResultStillRoutes(t *testing.T) {
 	session := &Session{signCh: make(chan *SignResponseMessage, 1)}
 	handler := &wmpEngineHandler{
@@ -2481,13 +2345,7 @@ func TestWMP_FlowComplete_MalformedResultStillRoutes(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------------------
-// HandleWMPRPC / HandleWMPEvents / HandleWMPConfiguration: additional HTTP
-// handler coverage (session ownership, oversized bodies, notifications,
-// discovery endpoint, and streaming). Appended by a coverage pass targeting
-// wmphttp.go; see wmphttp_test-adjacent comments below for a note on one
-// branch that appears unreachable through the public API.
-// ---------------------------------------------------------------------------
+// HandleWMPRPC / HandleWMPEvents / HandleWMPConfiguration: HTTP handler coverage.
 
 func TestWMP_HTTPEndpoint_RPC_InvalidToken(t *testing.T) {
 	a, m := testWMPAdapter()
@@ -2503,11 +2361,8 @@ func TestWMP_HTTPEndpoint_RPC_InvalidToken(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
-// TestWMP_HTTPEndpoint_RPC_SessionOwnershipMismatch is a regression test: a
-// caller authenticated as a different user must not be able to target
-// another user's session by simply supplying its Wmp-Session-Id — the
-// handler must respond as if the session doesn't exist (404), not leak its
-// existence via a 403 or similar.
+// TestWMP_HTTPEndpoint_RPC_SessionOwnershipMismatch: another user's session ID must
+// answer 404, not leak existence via 403.
 func TestWMP_HTTPEndpoint_RPC_SessionOwnershipMismatch(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -2528,9 +2383,7 @@ func TestWMP_HTTPEndpoint_RPC_SessionOwnershipMismatch(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, w.Code)
 }
 
-// TestWMP_HTTPEndpoint_RPC_OversizedBody verifies that a request body larger
-// than maxWMPRPCBodyBytes is rejected with 413 (http.MaxBytesReader) rather
-// than read into memory unbounded or silently truncated into a parse error.
+// TestWMP_HTTPEndpoint_RPC_OversizedBody: a body over maxWMPRPCBodyBytes gets 413.
 func TestWMP_HTTPEndpoint_RPC_OversizedBody(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -2548,22 +2401,9 @@ func TestWMP_HTTPEndpoint_RPC_OversizedBody(t *testing.T) {
 	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
 }
 
-// TestWMP_HTTPEndpoint_RPC_Notification_Accepted verifies that a JSON-RPC
-// notification (no "id" field) gets a 202 with no body, per JSON-RPC
-// semantics — even though the underlying dispatch fails (unknown flow),
-// notifications never produce an error response.
-//
-// Note: HandleWMPRPC has an error-envelope fallback path for when
-// a.HandleRPC itself returns a non-nil error (as opposed to a marshaled
-// JSON-RPC error response with a nil error, which is the normal way
-// protocol-level failures are surfaced). Tracing HandleRPC and the
-// go-wmp Peer.HandleRequestSync it delegates to, every internal failure
-// (decode errors, dispatch errors) is already converted into a marshaled
-// (bytes, nil) response before it reaches HandleWMPRPC; HandleRequestSync
-// only returns a non-nil error if json.Marshal of its own response struct
-// fails, which isn't reachable through any input this HTTP endpoint accepts.
-// That fallback branch is defensive dead code from the caller's perspective;
-// no test constructs it.
+// TestWMP_HTTPEndpoint_RPC_Notification_Accepted: an id-less notification gets 202
+// with no body even though dispatch fails. HandleWMPRPC's error-envelope fallback
+// (HandleRPC returning a non-nil error) is unreachable through this endpoint.
 func TestWMP_HTTPEndpoint_RPC_Notification_Accepted(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -2628,10 +2468,7 @@ func TestWMP_HTTPEndpoint_Events_InvalidToken(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 }
 
-// TestWMP_HTTPEndpoint_Events_StreamsEvent exercises the full success path
-// of HandleWMPEvents over a real HTTP connection: it starts a flow that
-// sends a progress notification and verifies that notification actually
-// arrives over the SSE stream.
+// TestWMP_HTTPEndpoint_Events_StreamsEvent: a flow's progress notification arrives over SSE.
 func TestWMP_HTTPEndpoint_Events_StreamsEvent(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -2659,8 +2496,7 @@ func TestWMP_HTTPEndpoint_Events_StreamsEvent(t *testing.T) {
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	// Start a flow while the SSE connection is live so its progress
-	// notification is delivered over the stream we're reading.
+	// Start a flow while the SSE connection is live.
 	body := wmpRequest("2", "wmp.flow.start", wmp.FlowStartParams{
 		WMP:      wmp.Metadata{Version: wmp.Version, SessionID: sessionID},
 		FlowType: "stream_test",
@@ -2745,8 +2581,7 @@ func TestWMP_HTTPEndpoint_Configuration(t *testing.T) {
 	assert.Equal(t, "https://wallet.example.com/api/v2/wallet/rpc/events", cfg.Endpoints["events"])
 }
 
-// Without a usable external URL the discovery document cannot advertise
-// absolute endpoints, so it fails closed instead of misleading clients.
+// Without a usable external URL, discovery fails closed.
 func TestWMP_HTTPEndpoint_Configuration_NoExternalURL_FailsClosed(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -2763,9 +2598,8 @@ func TestWMP_HTTPEndpoint_Configuration_NoExternalURL_FailsClosed(t *testing.T) 
 	assert.True(t, a.HasExternalURL())
 }
 
-// The discovery document must be consumable by the library's own client: its
-// endpoints feed httpsse.NewClientTransport, which POSTs to the advertised
-// rpc URL and derives the SSE URL as rpc + "/events".
+// The discovery document must work with the bundled client: it POSTs to the rpc URL
+// and derives the SSE URL as rpc + "/events".
 func TestWMP_HTTPEndpoint_Configuration_DiscoverConfigRoundTrip(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)

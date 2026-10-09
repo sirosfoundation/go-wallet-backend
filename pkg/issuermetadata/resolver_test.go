@@ -1247,9 +1247,8 @@ func TestResolve_TrustEvaluatorError(t *testing.T) {
 	}
 }
 
-// The credential_issuer claim is compared as an identifier: a root slash on
-// either the requested or the declared side must not cause a rejection, while
-// a path difference (including a trailing slash on a path) still does.
+// credential_issuer is compared as an identifier: a root slash on either side is
+// ignored, a path difference is not.
 func TestResolve_CredentialIssuerRootSlashSymmetric(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -1318,18 +1317,15 @@ func TestValidateIssuerClaims_RootSlashAndQuery(t *testing.T) {
 	}
 }
 
-// TestNew_DefaultClientIsSSRFGuarded verifies that a nil Config.HTTPClient
-// yields a guarded client rather than http.DefaultClient: a loopback issuer
-// must be refused unless the test-only option is set.
+// TestNew_DefaultClientIsSSRFGuarded: a nil HTTPClient yields a guarded client, so a
+// loopback issuer is refused unless the test-only option is set.
 func TestNew_DefaultClientIsSSRFGuarded(t *testing.T) {
 	var hits atomic.Int32
 	var srv *httptest.Server
 	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		hits.Add(1)
 		w.Header().Set("Content-Type", "application/json")
-		// Valid metadata: if the server is reached, Resolve succeeds, so a
-		// refusal can only come from the guard, not from a later parse or
-		// validation failure.
+		// Valid metadata, so a refusal can only come from the guard.
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"credential_issuer": srv.URL})
 	}))
 	defer srv.Close()
@@ -1352,8 +1348,7 @@ func TestNew_DefaultClientIsSSRFGuarded(t *testing.T) {
 		t.Fatalf("error is not the SSRF refusal: %v", err)
 	}
 
-	// Positive control: the same server is reachable, and Resolve succeeds,
-	// when the test-only opt-out is set.
+	// Positive control: succeeds with the test-only opt-out.
 	open, err := New(Config{AllowHTTP: true, UnsafeAllowPrivateAddressesForTesting: true})
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
@@ -1386,8 +1381,7 @@ func TestResolve_FallbackOnByDefault(t *testing.T) {
 	}
 }
 
-// pkg/config cannot import this package (import cycle), so it keeps its own
-// copy of the metadata_type values; this keeps the copy honest.
+// pkg/config keeps its own copy of the metadata_type values (import cycle); this keeps it in sync.
 func TestConfigMetadataTypesMatchResolver(t *testing.T) {
 	if config.DefaultHTTPClientMetadataType != string(MetadataTypePreferSigned) {
 		t.Errorf("config default %q != resolver default %q", config.DefaultHTTPClientMetadataType, MetadataTypePreferSigned)

@@ -14,8 +14,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
-// Mounting the WMP routes warns, exactly once, that WMP session state is
-// process-local and multi-replica deployments need session-ID affinity (#432).
+// Mounting the WMP routes warns exactly once that session state is process-local (#432).
 func TestEngineProvider_RegisterRoutes_WarnsAboutWMPSessionAffinity(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	core, logs := observer.New(zapcore.WarnLevel)

@@ -95,9 +95,7 @@ func TestWMP_SessionClose_StaleHandlerAfterResume(t *testing.T) {
 	assert.True(t, ok, "stale handler must not close the resumed session")
 }
 
-// Stress: expiry sweeps race with resumes and touches under -race. Whatever
-// interleaving occurs, a resume that succeeded must leave a consistent
-// adapter (at most one peer for the session, event buffer only if present).
+// Stress under -race: expiry sweeps race with resumes and touches; a successful resume must leave a consistent adapter (at most one peer, event buffer only if present).
 func TestWMP_CleanupExpired_StressWithResume(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)

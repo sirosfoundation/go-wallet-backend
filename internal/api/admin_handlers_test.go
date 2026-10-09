@@ -33,11 +33,8 @@ func setupAdminTestHandlers(t *testing.T) (*AdminHandlers, *gin.Engine) {
 	return handlers, router
 }
 
-// errStore wraps a storage.Store so tests can inject failures on specific
-// sub-store methods that are otherwise unreachable through the in-memory
-// store (which never fails on its own). Only the sub-stores actually needed
-// by a given test are set; everything else delegates to the embedded real
-// store.
+// errStore wraps a storage.Store to inject failures on specific sub-store methods;
+// unset sub-stores delegate to the embedded real store.
 type errStore struct {
 	storage.Store
 	tenants         *errTenantStore

@@ -89,9 +89,7 @@ func TestWMP_Resume_GraceTokenNotUsableByOtherUser(t *testing.T) {
 	require.Nil(t, rpcErr, "owner's retry must survive a rejected foreign attempt")
 }
 
-// Two resumes racing on the same token must not both succeed beyond the
-// single permitted retry: three attempts with A yield at most two successes
-// in sequence, and a third is rejected.
+// Two resumes racing on one token: at most the single permitted retry succeeds; a third is rejected.
 func TestWMP_Resume_OldTokenAtMostTwiceTotal(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)

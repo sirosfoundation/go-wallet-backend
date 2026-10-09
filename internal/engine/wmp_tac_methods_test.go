@@ -20,9 +20,7 @@ import (
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 )
 
-// tacMethodFixture starts an OID4VCI (issuance) flow in a session created with
-// a broad TAC, so the per-method tests can drive it with a reduced ("r") token
-// that lacks the issuance permission.
+// tacMethodFixture starts an issuance flow in a session created with a broad TAC, to be driven with a reduced ("r") token lacking issuance permission.
 type tacMethodFixture struct {
 	a       *WMPAdapter
 	m       *Manager
@@ -340,10 +338,7 @@ func TestWMP_HTTP_ModernEmptyTAC_Refused(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, sw.Code)
 }
 
-// A session created by a legacy token has effective permissions defined by
-// what the legacy RPC path allows. A modern token with an empty TAC (no
-// permissions) must not stream it; a modern token covering those
-// permissions, and a legacy token, may.
+// A legacy-token session's permissions are what the legacy RPC path allows: a modern empty-TAC token must not stream it; a covering modern token or a legacy token may.
 func TestWMP_SSE_LegacySessionRequiresEffectivePermissionsFromModernToken(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)

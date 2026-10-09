@@ -1540,10 +1540,9 @@ func TestValidateTransactionData_InvalidJSON(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid JSON")
 }
 
-// The engine does not judge whether a type is supported: that depends on the
-// type metadata of the attestation the entry is bound to, which the wallet
-// resolves. A well-formed entry of any type goes to a client that declared
-// the feature, and the client refuses what it cannot handle.
+// The engine does not judge whether a type is supported (that needs the type
+// metadata): a well-formed entry of any type goes to a declaring client, which
+// refuses what it cannot handle.
 func TestValidateTransactionData_EngineDoesNotJudgeTheType(t *testing.T) {
 	td := TransactionData{Type: "some_type_the_engine_has_never_heard_of", CredentialIDs: []string{"pay"}}
 	tdJSON, _ := json.Marshal(td)

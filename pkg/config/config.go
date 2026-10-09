@@ -1056,7 +1056,7 @@ type ExternalURLsConfig struct {
 	// BackendURL is the external URL for the backend service (for engine → backend calls)
 	BackendURL string `yaml:"backend_url" envconfig:"BACKEND_URL"`
 
-	// EngineURL is the external URL for the engine service (for WebSocket connections). WMP discovery requires wss:// (or https://); ws:// and http:// are accepted only for loopback hosts. WMP session state is process-local: with more than one engine replica, the load balancer in front of this URL must keep each client on one replica, keyed on a hash of the Authorization header (the only identifier carried by every WMP request, including session.create and responses to server-initiated requests; Wmp-Session-Id and the session_id query parameter are secondary hints present only on some requests; a refreshed token may move to another replica, where the session is lost: resume does not work there because the resumption token is process-local too, so the client must create a new session), otherwise a request reaching another replica gets session not found (404); the Redis session store does not share this state (see issue 432)
+	// EngineURL is the external URL for the engine service (for WebSocket connections). WMP discovery requires wss:// (or https://); ws:// and http:// are accepted only for loopback hosts. WMP session state is process-local: with more than one engine replica, the load balancer must keep each client on one replica, keyed on a hash of the Authorization header (the only identifier on every WMP request), otherwise a request reaching another replica gets session not found (404). A refreshed token may land on another replica, where the session and its process-local resumption token are lost, so the client must create a new session. The Redis session store does not share this state (see issue 432)
 	EngineURL string `yaml:"engine_url" envconfig:"ENGINE_URL"`
 
 	// RegistryURL is the external URL for the registry service (for VCTM lookups)
@@ -2291,15 +2291,11 @@ func (c ServerConfig) validateTrustedProxies() error {
 }
 
 // DefaultHTTPClientMetadataType is the default http_client.metadata_type.
-//
-// HTTPClientMetadataTypes and DefaultHTTPClientMetadataType mirror
-// issuermetadata.MetadataType. They are duplicated here (not imported)
-// because pkg/issuermetadata imports pkg/config for the SSRF-guarded HTTP
-// client, and an import in the other direction would be a cycle. A test in
-// pkg/issuermetadata keeps the two in sync.
 const DefaultHTTPClientMetadataType = "prefer-signed"
 
-// HTTPClientMetadataTypes lists the valid http_client.metadata_type values.
+// HTTPClientMetadataTypes lists the valid http_client.metadata_type values. It mirrors
+// issuermetadata.MetadataType, duplicated to avoid an import cycle; a test in
+// pkg/issuermetadata keeps them in sync.
 var HTTPClientMetadataTypes = []string{"any", "prefer-signed", "require-signed", "prefer-unsigned", "require-unsigned"}
 
 func isValidHTTPClientMetadataType(s string) bool {

@@ -14,9 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// deadlineWriter is a ResponseWriter whose Write blocks like a socket with a
-// non-reading peer: it only returns once the write deadline set via
-// http.ResponseController has passed.
+// deadlineWriter's Write blocks like a socket with a non-reading peer until the write deadline passes.
 type deadlineWriter struct {
 	hdr       http.Header
 	mu        sync.Mutex
@@ -194,9 +192,7 @@ func (f *flushFailWriter) FlushError() error {
 	return nil
 }
 
-// A reconnect without Last-Event-ID must replay every retained event, even
-// ones written to an earlier connection: a flush only hands bytes to the
-// connection or proxy, so the server cannot know the client parsed them.
+// A reconnect without Last-Event-ID must replay every retained event: a flush does not prove the client parsed it.
 func TestWMP_SSE_NoCursorReplaysRetainedEvents(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
@@ -277,9 +273,7 @@ func (r *recordingWriter) state() (last time.Time, n, written int) {
 	return last, n, r.written
 }
 
-// While the stream is idle after a successful flush no write deadline may be
-// left armed (SetWriteDeadline is persistent), both after the initial flush
-// and after an event flush.
+// No write deadline may stay armed (SetWriteDeadline is persistent) after the initial or an event flush.
 func TestWMP_SSE_DeadlineClearedAfterSuccessfulFlush(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)

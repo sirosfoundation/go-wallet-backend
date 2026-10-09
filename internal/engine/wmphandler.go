@@ -19,10 +19,7 @@ import (
 	"go.uber.org/zap"
 )
 
-// specToEngineAction maps WMP spec action names to engine-internal action names.
-// The WMP specification (wmp-openid4x) defines canonical action names for
-// OpenID4VCI/VP flows. The engine uses its own action vocabulary internally.
-// This map ensures WMP clients can use spec-compliant action names.
+// specToEngineAction maps WMP spec action names to engine action names.
 var specToEngineAction = map[string]string{
 	openid4x.ActionAcceptOffer:       ActionConsent,
 	openid4x.ActionProvideTxCode:     ActionProvidePin,
@@ -63,10 +60,9 @@ type WMPAdapter struct {
 	loopDone    chan struct{} // closed when cleanupLoop has exited
 }
 
-// maxWMPSessionsPerToken bounds how many live WMP sessions one bearer token
-// may hold. Anonymous tokens are not indexed by user in the engine (and every
-// user-less session would otherwise be unaccounted), so without this a single
-// token could create sessions without limit.
+// maxWMPSessionsPerToken bounds live WMP sessions per bearer token. Anonymous
+// tokens are not indexed by user, so without it one token could create unlimited
+// sessions.
 const maxWMPSessionsPerToken = 10
 
 // wmpSlot is one reserved unit of the global (Manager.activeConnections) and
@@ -123,44 +119,36 @@ func (a *WMPAdapter) reserveSlot(key string) *wmpSlot {
 	return &wmpSlot{a: a, key: key}
 }
 
-// maxWMPBufferedEvents bounds how many past SSE events are retained per
-// session for Last-Event-ID replay on reconnect (including across a
-// wmp.session.resume, which installs a brand new ChannelTransport whose own
-// buffer starts empty).
+// maxWMPBufferedEvents bounds the SSE events retained per session for Last-
+// Event-ID replay (also across wmp.session.resume).
 const maxWMPBufferedEvents = 200
 
-// wmpBufferedEvent is one retained SSE frame, tagged with a session-durable
-// sequence number (not reset per HTTP connection, unlike the previous
-// per-connection counter).
+// wmpBufferedEvent is one retained SSE frame with a session-durable sequence
+// number.
 type wmpBufferedEvent struct {
 	ID   int64
 	Data []byte
 }
 
-// wmpEventBuffer retains recent outbound SSE events for a session so a
-// reconnecting client (including after wmp.session.resume, or a plain SSE
-// drop during e.g. an OAuth redirect) can replay what it missed via
-// Last-Event-ID, instead of silently losing progress/sign_request/
-// flow_complete notifications emitted while disconnected.
+// wmpEventBuffer retains recent outbound SSE events so a reconnecting client
+// (after a resume or an SSE drop) can replay them via Last-Event-ID.
 //
-// Events are appended at emission time by the session's pump goroutine (see
-// pumpEvents), not when an SSE handler happens to consume them, so
-// notifications emitted while no client is connected - or in the window of
-// a resume - are retained.
+// Events are appended by the session's pump goroutine (see pumpEvents) at
+// emission time, so notifications emitted while no client is connected are
+// retained.
 type wmpEventBuffer struct {
 	mu     sync.Mutex
 	events []wmpBufferedEvent
 	nextID int64
 
-	// wake is closed (and replaced) on every append so SSE handlers can
-	// block until there is something new; done is closed when the session
-	// ends so they can terminate.
+	// wake is closed and replaced on every append; done is closed when the
+	// session ends.
 	wake     chan struct{}
 	done     chan struct{}
 	doneOnce sync.Once
 
-	// active is the cancel function of the currently-streaming SSE
-	// connection, if any. A new connection supersedes it (see acquire).
+	// active is the currently streaming SSE connection; a new one supersedes it
+	// (see acquire).
 	active *wmpStream
 }
 
@@ -169,8 +157,7 @@ type wmpStream struct {
 	cancel context.CancelFunc
 }
 
-// ensure lazily initialises the signalling channels (so the zero value is
-// usable). Callers must hold b.mu.
+// ensure lazily initialises the signalling channels. Callers must hold b.mu.
 func (b *wmpEventBuffer) ensure() {
 	if b.wake == nil {
 		b.wake = make(chan struct{})
@@ -180,13 +167,10 @@ func (b *wmpEventBuffer) ensure() {
 	}
 }
 
-// acquire registers a new SSE connection and supersedes any previous one by
-// cancelling its context so its handler exits. A stale connection (e.g. an
-// unclean mobile disconnect whose context is not yet cancelled) therefore can
-// never block a reconnect. The buffer is replay-only and cursor-driven, so
-// the superseded handler losing its stream drops nothing: the new connection
-// replays from its own Last-Event-ID. Callers must call release with the
-// returned stream when the connection ends.
+// acquire registers a new SSE connection and cancels any previous one, so a
+// stale connection cannot block a reconnect. Nothing is lost: replay is cursor-
+// driven from the new connection's Last-Event-ID. Callers must release the
+// returned stream.
 func (b *wmpEventBuffer) acquire(cancel context.CancelFunc) *wmpStream {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -198,8 +182,7 @@ func (b *wmpEventBuffer) acquire(cancel context.CancelFunc) *wmpStream {
 	return s
 }
 
-// release clears the active connection if s is still the registered one (a
-// release from an already-superseded connection must not clear a newer one).
+// release clears the active connection only if s is still the registered one.
 func (b *wmpEventBuffer) release(s *wmpStream) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -257,9 +240,8 @@ func (b *wmpEventBuffer) close() {
 	b.doneOnce.Do(func() { close(done) })
 }
 
-// replaySince returns buffered events with an ID greater than lastEventID.
-// Returns nil if lastEventID doesn't parse (e.g. empty, or a stale ID from
-// before this buffer existed) — replay is best-effort, not required.
+// replaySince returns buffered events after lastEventID, or nil if it does not
+// parse (replay is best-effort).
 func (b *wmpEventBuffer) replaySince(lastEventID string) []wmpBufferedEvent {
 	lastID, err := strconv.ParseInt(lastEventID, 10, 64)
 	if err != nil {
@@ -276,11 +258,8 @@ func (b *wmpEventBuffer) pendingCount() int {
 	return len(b.events)
 }
 
-// missedSince counts the events a client that last received lastReceivedID
-// has not seen. When the client supplies no (parseable) cursor every retained
-// event counts, since the server keeps no delivery state and will replay them
-// all; a cursor older than the retained window likewise counts everything
-// retained (older events are evicted and cannot be replayed).
+// missedSince counts the events a client that last received lastReceivedID has
+// not seen. A missing or too-old cursor counts every retained event.
 func (b *wmpEventBuffer) missedSince(lastReceivedID string) int {
 	cursor, err := strconv.ParseInt(lastReceivedID, 10, 64)
 	b.mu.Lock()
@@ -297,16 +276,14 @@ func (b *wmpEventBuffer) missedSince(lastReceivedID string) int {
 	return n
 }
 
-// pumpEvents moves a session transport's outbound notifications into the
-// session's event buffer as they are emitted. It exits when ctx (the
-// wmpSession's context) is cancelled, after draining whatever is still
-// queued, and then closes done.
+// pumpEvents moves a transport's outbound notifications into buf as they are
+// emitted, until ctx is cancelled (after draining the queue), then closes done.
 func pumpEvents(ctx context.Context, ct *wmp.ChannelTransport, buf *wmpEventBuffer, done chan<- struct{}, onOut func([]byte)) {
 	defer close(done)
 	out := ct.Out()
 	emit := func(data []byte) {
-		// Track before the event becomes visible to the client, so a
-		// response can never arrive ahead of its registration.
+		// Track before the event is visible so a response cannot precede its
+		// registration.
 		if onOut != nil {
 			onOut(data)
 		}
@@ -329,42 +306,36 @@ func pumpEvents(ctx context.Context, ct *wmp.ChannelTransport, buf *wmpEventBuff
 	}
 }
 
-// resumptionEntry holds a resumption token's session binding and expiry.
+// resumptionEntry binds a resumption token to a session.
 //
-// A resume rotates the token. If the response carrying the new token is lost,
-// the client still holds the old one, so a consumed token is kept for a short
-// grace window (resumptionGraceWindow) linked to its successor and may be
-// presented exactly once more, but only while the successor has not itself
-// been used. Using either token of a pair retires both, so at most one
-// resume ever succeeds per rotation and a used chain cannot be replayed.
+// A resume rotates the token. To survive a lost response, a consumed token stays
+// redeemable once more for resumptionGraceWindow, but only while its successor
+// is unused. Using either token retires both, so at most one resume succeeds per
+// rotation.
 type resumptionEntry struct {
 	sessionID string
 	expiresAt time.Time
 
-	// used marks a token that a resume already consumed. A used token is
-	// only redeemable while its successor is still outstanding and the
-	// grace window (expiresAt) has not elapsed.
+	// used marks a token a resume already consumed; it is redeemable only while
+	// its successor is outstanding and expiresAt has not passed.
 	used        bool
 	successor   string // token issued by the resume that consumed this one
 	predecessor string // token whose resume issued this one
 }
 
-// resumptionGraceWindow bounds how long a consumed token stays redeemable
-// after a resume, to recover from a lost resume response.
+// resumptionGraceWindow bounds how long a consumed token stays redeemable (lost
+// resume response).
 const resumptionGraceWindow = 2 * time.Minute
 
-// wmpSessionIdleTimeout is the maximum time a WMP session can be idle
-// (no RPC activity) before being automatically closed.
+// wmpSessionIdleTimeout closes a WMP session after this much inactivity.
 const wmpSessionIdleTimeout = 10 * time.Minute
 
-// resumptionTokenTTL is the lifetime of a resumption token. After this
-// duration the token is invalid and the client must create a new session.
+// resumptionTokenTTL is the lifetime of a resumption token.
 const resumptionTokenTTL = 10 * time.Minute
 
-// capSeconds converts a client-supplied number of seconds to a Duration,
-// capped at limit. The cap is applied to the integer BEFORE multiplying, so
-// values near MaxInt cannot overflow time.Duration into a negative (and thus
-// uncapped) value. Non-positive input yields 0 ("not set").
+// capSeconds converts client-supplied seconds to a Duration capped at limit. The
+// cap is applied before multiplying so values near MaxInt cannot overflow. Non-
+// positive input yields 0.
 func capSeconds(seconds int, limit time.Duration) time.Duration {
 	if seconds <= 0 {
 		return 0
@@ -386,21 +357,14 @@ const defaultFlowTimeout = 5 * time.Minute
 // maxSessionTTL caps the TTL a client may request for a session.
 const maxSessionTTL = 24 * time.Hour
 
-// flowActionSendWait bounds how long FlowAction blocks trying to enqueue a
-// response onto a full sign/match/action channel before rejecting with
-// ErrRateLimited. A legitimate single in-flight sign_response/match_response
-// (the common case: at most one outstanding request per flow) can land in a
-// momentarily-full channel and would otherwise have no way to recover short
-// of waiting out the engine's own server-side timeout; a brief wait here
-// gives room to drain without changing the channel's bounded depth.
+// flowActionSendWait bounds how long FlowAction waits to enqueue onto a full
+// response channel before returning ErrRateLimited, giving a legitimate in-
+// flight response room to drain.
 const flowActionSendWait = 3 * time.Second
 
-// childFlowStartTimeout bounds the wmp.flow.start Call() used to kick off a
-// nested sign/match sub-flow. This blocks the engine goroutine that
-// requested the signature/match until the client acks the child flow.start
-// (not until the actual result arrives, which comes later via
-// flow.complete) — an unresponsive client must not be able to stall it
-// indefinitely.
+// childFlowStartTimeout bounds the wmp.flow.start Call() for a nested sign/match
+// sub-flow, so an unresponsive client cannot stall the requesting engine
+// goroutine (it waits for the ack, not the result).
 const childFlowStartTimeout = 30 * time.Second
 
 // wmpSession associates a wmp.Peer with its channel transport and engine session.
@@ -413,19 +377,17 @@ type wmpSession struct {
 	pumpDone     chan struct{} // closed once the event pump has drained and exited
 	lastActivity time.Time
 	capabilities wmp.Capabilities // negotiated capabilities for resume echo
-	// offered is what the client OFFERED in wmp.session.create, as received.
-	// Feature gating reads this, never capabilities: negotiation falls back to
-	// every server capability when the client offers none (see the session
-	// create handler), which would read as support the client never claimed.
+	// offered is what the client offered in wmp.session.create. Feature gating
+	// reads this, never capabilities, which falls back to all server
+	// capabilities when none are offered.
 	offered   wmp.Capabilities
 	security  wmp.SecurityMode // negotiated security mode for resume echo
 	expiresAt time.Time        // absolute session deadline from TTL
-	// ownerTokenID is the jti of the token the session was created with. It
-	// is compared for sessions with no user identity (anonymous tokens all
-	// have UserID == ""), which user/tenant alone cannot tell apart.
+	// ownerTokenID is the creating token's jti; it tells anonymous sessions
+	// (UserID == "") apart.
 	ownerTokenID string
-	// slot is the session budget reserved at creation; released once, by
-	// teardown. Shared (not re-reserved) across resumes of the same session.
+	// slot is the session budget reserved at creation, released once by teardown
+	// and shared across resumes.
 	slot *wmpSlot
 }
 
@@ -434,15 +396,12 @@ type wmpCaller struct {
 	UserID   string
 	TenantID string
 	TokenID  string // jti; may be empty
-	// TAC is the token-authorized-capabilities of THIS request's token. It
-	// bounds what the request may do, independent of the TAC captured when
-	// the session was created, so a session cannot be driven with more
-	// privilege than the token presented now. Empty means legacy auth.
+	// TAC is this request's token-authorized-capabilities. It bounds the request
+	// independently of the session's creation-time TAC. Empty means legacy auth.
 	TAC claims.TAC
-	// EnforceTAC is the token's provenance: true for a modern token, whose
-	// TAC is authoritative even when empty (no permissions); false only for a
-	// genuine legacy token, which has no TAC concept. A non-empty TAC is
-	// always enforced.
+	// EnforceTAC is true for a modern token, whose TAC is authoritative even
+	// when empty; false only for a legacy token. A non-empty TAC is always
+	// enforced.
 	EnforceTAC bool
 }
 
@@ -466,10 +425,8 @@ func requestTACInfo(ctx context.Context) wmpTACInfo {
 	return t
 }
 
-// NewWMPAdapter creates an adapter that bridges WMP JSON-RPC to the engine.
-// bearerToken extracts the bearer credential from an HTTP request ("" when
-// absent or malformed); it is injected because the engine cannot import
-// pkg/middleware (which depends on the engine through the service layer).
+// NewWMPAdapter creates an adapter bridging WMP JSON-RPC to the engine.
+// bearerToken is injected because the engine cannot import pkg/middleware.
 func NewWMPAdapter(manager *Manager, logger *zap.Logger, bearerToken func(*http.Request) string) *WMPAdapter {
 	a := &WMPAdapter{
 		bearerToken:      bearerToken,
@@ -495,10 +452,8 @@ func (a *WMPAdapter) CleanupStarted() <-chan struct{} { return a.loopStarted }
 // goroutine has exited.
 func (a *WMPAdapter) CleanupStopped() <-chan struct{} { return a.loopDone }
 
-// Drain marks the adapter as draining: from now on the HTTP handlers answer
-// 503 and session.create / session.resume are refused. It is idempotent and
-// is the first step of Close, but can be called earlier to stop accepting
-// work while the HTTP listener is still up.
+// Drain refuses new work: HTTP handlers answer 503 and session.create/resume are
+// rejected. Idempotent; the first step of Close.
 func (a *WMPAdapter) Drain() {
 	a.mu.Lock()
 	a.draining = true
@@ -515,17 +470,15 @@ func (a *WMPAdapter) isDraining() bool {
 // Close stops the cleanup loop and waits for it to exit. Safe to call more
 // than once. Live sessions are closed when the engine Manager is closed.
 func (a *WMPAdapter) Close() {
-	// Refuse new requests and sessions before anything is torn down, so a
-	// session.create racing with shutdown cannot register a session after
-	// the snapshot below and leak it.
+	// Refuse new work first so a racing session.create cannot register after the
+	// snapshot below.
 	a.Drain()
 	a.stopOnce.Do(func() { close(a.stopCh) })
 	if a.loopDone != nil {
 		<-a.loopDone
 	}
-	// End every live session. This closes each session's event buffer, which
-	// terminates any SSE handler streaming from it; without it a graceful
-	// HTTP shutdown waits out its whole timeout on those long-lived streams.
+	// End every live session so SSE handlers terminate; otherwise graceful
+	// shutdown waits out its timeout.
 	a.mu.RLock()
 	ids := make([]string, 0, len(a.peers))
 	for sid := range a.peers {
@@ -562,7 +515,6 @@ func (a *WMPAdapter) cleanupExpired() {
 	now := time.Now()
 
 	a.mu.Lock()
-	// Remove expired resumption tokens.
 	for token, entry := range a.resumptionTokens {
 		if now.After(entry.expiresAt) {
 			delete(a.resumptionTokens, token)
@@ -575,9 +527,9 @@ func (a *WMPAdapter) cleanupExpired() {
 		}
 	}
 
-	// Collect idle or TTL-expired sessions to close. The scanned *wmpSession
-	// is kept (not just its ID): a resume may replace the peer after this
-	// scan, and the stale decision must not close the replacement.
+	// Keep the scanned *wmpSession, not just its ID: a resume may replace the
+	// peer after the scan, and the stale decision must not close the
+	// replacement.
 	type expiredEntry struct {
 		sid string
 		ws  *wmpSession
@@ -595,8 +547,8 @@ func (a *WMPAdapter) cleanupExpired() {
 	}
 
 	for _, e := range expiredSessions {
-		// Re-check idleness/TTL at close time under the lock: the session
-		// may have been touched since the scan.
+		// Re-check under the lock: the session may have been touched since the
+		// scan.
 		if a.closeSessionIf(e.sid, e.ws, func(ws *wmpSession) bool {
 			return wmpSessionExpiredLocked(ws, time.Now())
 		}) {
@@ -621,11 +573,8 @@ func wmpSessionExpiredLocked(ws *wmpSession, now time.Time) bool {
 	return !ws.expiresAt.IsZero() && now.After(ws.expiresAt)
 }
 
-// verifySessionOwnership checks that the session belongs to the authenticated user.
-// Returns false if the session doesn't exist or the user/tenant don't match.
-// For sessions without a user identity (anonymous tokens) the token's jti
-// must also match the one the session was created with, and such sessions
-// are never addressable by a caller whose token carries no jti.
+// verifySessionOwnership reports whether the session belongs to the caller (see
+// ownsSession).
 func (a *WMPAdapter) verifySessionOwnership(sessionID string, caller wmpCaller) bool {
 	a.mu.RLock()
 	ws, ok := a.peers[sessionID]
@@ -636,9 +585,8 @@ func (a *WMPAdapter) verifySessionOwnership(sessionID string, caller wmpCaller) 
 	return ownsSession(ws, caller)
 }
 
-// sameIdentity reports whether a validated token identity is the caller's:
-// same user, same (normalised) tenant and, for an anonymous token (no user),
-// the same jti. Compared on validated claims, never on token strings.
+// sameIdentity reports whether a validated token identity is the caller's: same
+// user, same normalised tenant and, for an anonymous token, same jti.
 func sameIdentity(id tokenIdentity, caller wmpCaller) bool {
 	if id.UserID != caller.UserID || normalizeTenant(id.TenantID) != normalizeTenant(caller.TenantID) {
 		return false
@@ -653,9 +601,8 @@ func ownsSession(ws *wmpSession, caller wmpCaller) bool {
 	if ws.session.UserID != caller.UserID {
 		return false
 	}
-	// Exact tenant equality after normalisation. An empty tenant claim must
-	// not act as a wildcard: the HTTP middleware maps a missing tenant_id to
-	// the default tenant, so both sides are compared in that form.
+	// Compare normalised tenants: an empty claim must not act as a wildcard (the
+	// middleware maps a missing tenant_id to the default).
 	if normalizeTenant(ws.session.TenantID) != normalizeTenant(caller.TenantID) {
 		return false
 	}
@@ -676,13 +623,9 @@ func (a *WMPAdapter) touchSession(sessionID string) {
 	a.mu.Unlock()
 }
 
-// HandleRPC handles a single JSON-RPC request in-process.
-// It is HandleRPCAs for a caller with no token ID.
-//
-// HandleRPC is an in-process entry with no HTTP layer: for session.create the
-// identity is taken from the request's own params.auth credential (there is no
-// separate Authorization header to disagree with). It is not reachable from
-// the network; HandleWMPRPC always uses HandleRPCAs with the validated header.
+// HandleRPC handles one JSON-RPC request in-process (not network-reachable). For
+// session.create the identity comes from params.auth; otherwise it is
+// HandleRPCAs for a caller with no token ID.
 func (a *WMPAdapter) HandleRPC(ctx context.Context, sessionID, userID, tenantID string, body []byte) ([]byte, error) {
 	if msg, err := wmp.DecodeMessage(body); err == nil && msg.Method == wmp.MethodSessionCreate {
 		var params wmp.SessionCreateParams
@@ -695,16 +638,12 @@ func (a *WMPAdapter) HandleRPC(ctx context.Context, sessionID, userID, tenantID 
 	return a.HandleRPCAs(ctx, sessionID, wmpCaller{UserID: userID, TenantID: tenantID}, body)
 }
 
-// HandleRPCAs handles a single JSON-RPC request. The sessionID is extracted
-// from the request's Wmp-Session-Id header by the HTTP handler and passed
-// here; empty for session.create. caller is the identity validated from the
-// caller's bearer token by the HTTP layer (HandleWMPRPC); it is required to
-// authorize wmp.session.resume against the session being resumed — see
-// handleSessionResume.
+// HandleRPCAs handles one JSON-RPC request. sessionID comes from the Wmp-
+// Session-Id header (empty for session.create); caller is the identity validated
+// from the bearer token, needed to authorize wmp.session.resume.
 func (a *WMPAdapter) HandleRPCAs(ctx context.Context, sessionID string, caller wmpCaller, body []byte) ([]byte, error) {
-	// Decode with go-wmp's decoder so the JSON-RPC envelope (jsonrpc == "2.0",
-	// size and depth limits, no trailing data) is enforced for session.create
-	// and session.resume exactly as it is for every other method.
+	// Decode with go-wmp's decoder so the envelope limits are enforced for
+	// session.create/resume like every other method.
 	msg, err := wmp.DecodeMessage(body)
 	if err != nil {
 		return wmpErrorBytes(nil, wmp.ErrParseError, nil)
@@ -717,10 +656,8 @@ func (a *WMPAdapter) HandleRPCAs(ctx context.Context, sessionID string, caller w
 		return a.handleSessionResume(ctx, caller, msg)
 	}
 
-	// A response carries no session identity of its own: go-wmp's HTTPS+SSE
-	// client sets only the headers it was configured with at construction
-	// (before session.create), and a response has no params.wmp.session_id.
-	// Route it by the server-initiated request ID it answers.
+	// A response carries no session identity; route it by the server-initiated
+	// request ID it answers.
 	if msg.IsResponse() {
 		return a.routeResponse(ctx, sessionID, caller, msg, body)
 	}
@@ -739,17 +676,14 @@ func (a *WMPAdapter) HandleRPCAs(ctx context.Context, sessionID string, caller w
 		return wmpErrorBytes(nil, wmp.ErrSessionNotFound, nil)
 	}
 
-	// Update activity timestamp for idle timeout tracking.
 	a.touchSession(sessionID)
 
 	return ws.peer.HandleRequestSync(context.WithValue(ctx, wmpCallerTACKey{}, wmpTACInfo{TAC: caller.TAC, Enforce: caller.EnforceTAC || caller.TAC != ""}), body)
 }
 
-// Events returns a channel of the session's outbound notifications, as the
-// SSE stream would deliver them, starting with the events still retained in
-// the session's buffer (bounded ring) and then live ones. It is a convenience subscription; the HTTP SSE
-// handler reads the event buffer directly. The channel is closed when the
-// session ends.
+// Events returns the session's outbound notifications (retained events, then
+// live ones) on a channel closed when the session ends. A convenience
+// subscription; the SSE handler reads the buffer directly.
 func (a *WMPAdapter) Events(sessionID string) (<-chan []byte, error) {
 	a.mu.RLock()
 	_, ok := a.peers[sessionID]
@@ -783,9 +717,8 @@ func (a *WMPAdapter) Events(sessionID string) (<-chan []byte, error) {
 	return out, nil
 }
 
-// getOrCreateEventBuffer returns the persistent SSE replay buffer for
-// sessionID, creating it if this is the first time it's requested. Unlike
-// wmpSession, this buffer is not replaced on resume.
+// getOrCreateEventBuffer returns the session's persistent SSE replay buffer,
+// which is not replaced on resume.
 func (a *WMPAdapter) getOrCreateEventBuffer(sessionID string) *wmpEventBuffer {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -811,9 +744,8 @@ func (a *WMPAdapter) CloseSession(sessionID string) {
 	}
 }
 
-// dropSessionStateLocked removes the session's event buffer (waking and
-// terminating any SSE handler streaming from it) and resumption tokens.
-// Callers must hold a.mu.
+// dropSessionStateLocked removes the session's event buffer (terminating SSE
+// handlers), resumption tokens and outbound entries. Callers must hold a.mu.
 func (a *WMPAdapter) dropSessionStateLocked(sessionID string) {
 	if buf, ok := a.eventBufs[sessionID]; ok {
 		buf.close()
@@ -831,9 +763,8 @@ func (a *WMPAdapter) dropSessionStateLocked(sessionID string) {
 	}
 }
 
-// teardown ends a wmpSession that has been removed from a.peers: it stops the
-// peer, closes the transport, and ends the engine session the same way a
-// WebSocket disconnect does (closeCh closed, active flows cancelled).
+// teardown ends a wmpSession already removed from a.peers, as a WebSocket
+// disconnect would.
 func (a *WMPAdapter) teardown(ws *wmpSession) {
 	ws.cancel()
 	_ = ws.transport.Close()
@@ -842,14 +773,9 @@ func (a *WMPAdapter) teardown(ws *wmpSession) {
 	ws.slot.release()
 }
 
-// closeSessionIfCurrent tears down sessionID's peer.Serve goroutine cleanup,
-// but only if ws is still the active wmpSession for that ID. It is used by
-// the deferred cleanup in the goroutine started by handleSessionCreate/
-// handleSessionResume: peer.Serve returning (e.g. because a resume closed
-// this peer's transport) does not by itself mean the session as a whole
-// should be torn down — a resume may have already installed a new
-// wmpSession for the same ID, and that replacement must not be destroyed by
-// the outgoing goroutine's own cleanup.
+// closeSessionIfCurrent tears down sessionID only if ws is still its active
+// wmpSession. peer.Serve returning (e.g. a resume closed this transport) must
+// not destroy the replacement the resume installed.
 func (a *WMPAdapter) closeSessionIfCurrent(sessionID string, ws *wmpSession) {
 	a.closeSessionIf(sessionID, ws, nil)
 }
@@ -873,9 +799,9 @@ func (a *WMPAdapter) closeSessionIf(sessionID string, ws *wmpSession, pred func(
 	return true
 }
 
-// closeSessionIfHandler closes sessionID only if h is the handler of the
-// currently installed peer, so a close request delivered on a connection a
-// resume has since replaced cannot terminate the resumed session.
+// closeSessionIfHandler closes sessionID only if h is the installed peer's
+// handler, so a close arriving on a connection a resume replaced cannot end the
+// resumed session.
 func (a *WMPAdapter) closeSessionIfHandler(sessionID string, h *wmpEngineHandler) {
 	a.mu.RLock()
 	ws, ok := a.peers[sessionID]
@@ -886,12 +812,9 @@ func (a *WMPAdapter) closeSessionIfHandler(sessionID string, h *wmpEngineHandler
 	a.closeSessionIf(sessionID, ws, func(cur *wmpSession) bool { return cur.handler == h })
 }
 
-// supersedeSession invalidates the adapter state of a session that the
-// manager replaced with a newer one for the same user: the peer entry,
-// resumption tokens and event buffer are removed atomically so the old
-// session can no longer be resumed, then it is torn down. A no-op when the
-// session was never published (create handles that itself) or the entry now
-// belongs to a different engine session.
+// supersedeSession drops the adapter state (peer, tokens, buffer) of a session
+// the manager replaced for the same user, then tears it down. No-op if it was
+// never published or now belongs to another engine session.
 func (a *WMPAdapter) supersedeSession(sessionID string, session *Session) {
 	a.mu.Lock()
 	ws, ok := a.peers[sessionID]
@@ -921,10 +844,8 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, caller wmpCaller, 
 		})
 	}
 
-	// Security mode validation: this server supports TLS only (no MLS layer),
-	// which is also the only mode it advertises. An omitted mode means the
-	// transport default (tls); anything else is rejected per spec §2.1 rather
-	// than echoed back as if negotiated.
+	// This server supports TLS only; an omitted mode means tls. Anything else is
+	// rejected (spec §2.1), not echoed.
 	switch params.Security.Mode {
 	case "":
 		params.Security.Mode = "tls"
@@ -935,12 +856,9 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, caller wmpCaller, 
 		})
 	}
 
-	// The HTTP-validated caller is the sole authority for who owns the
-	// session. A credential in params.auth is optional; when present it must
-	// resolve to the SAME identity as the caller (same user, tenant and, for
-	// an anonymous token, same jti). A mismatch is refused with the same
-	// error as an invalid token so the response does not reveal whether a
-	// different token is valid.
+	// The HTTP-validated caller owns the session. params.auth is optional but
+	// must resolve to the same identity; a mismatch gets the invalid-token error
+	// so it does not reveal whether another token is valid.
 	if params.Auth != nil && params.Auth.Token != "" {
 		if params.Auth.Type != "" && params.Auth.Type != "bearer" {
 			return wmpErrorBytes(req.ID, wmp.ErrNotAuthorized, map[string]string{
@@ -963,9 +881,7 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, caller wmpCaller, 
 	tenantID := normalizeTenant(caller.TenantID)
 	tac, enforceTAC := caller.TAC, caller.EnforceTAC
 
-	// A session without a user identity (anonymous token) can only be told
-	// apart from other anonymous sessions by its token's jti; without one
-	// there is nothing to bind ownership to, so fail closed.
+	// Anonymous sessions are told apart only by jti; without one, fail closed.
 	if userID == "" && tokenID == "" {
 		return wmpErrorBytes(req.ID, wmp.ErrNotAuthorized, map[string]string{
 			"reason": "anonymous token without jti cannot own a session",
@@ -993,20 +909,16 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, caller wmpCaller, 
 		expiresAt = time.Now().Add(ttl)
 	}
 
-	// Create the channel transport for this session.
 	ct := wmp.NewChannelTransport(50, 200)
 
-	// Create the WMP handler that bridges flow methods to the engine.
 	handler := &wmpEngineHandler{
 		adapter:   a,
 		sessionID: sessionID,
 	}
 
-	// Create the peer with the channel transport.
 	peer := wmp.NewPeer(ct, handler, wmp.WithLogger(slog.Default()))
 
-	// Create the engine session with a translating transport that converts
-	// engine message types to WMP JSON-RPC notifications via the peer.
+	// Engine transport that translates engine messages to WMP notifications.
 	wmpTransport := newWMPSessionTransport(peer, ct)
 	wmpTransport.handler = handler
 
@@ -1026,14 +938,12 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, caller wmpCaller, 
 		notifications: newNotificationContextStore(),
 	}
 
-	// Store handler's session reference (needed for FlowStart/FlowAction).
 	handler.session = session
 	session.onSuperseded = func() { a.supersedeSession(sessionID, session) }
 
-	// Register with engine manager. A false result means the user was
-	// revoked between token validation and now (registerSession has already
-	// closed the transport): refuse, as the WebSocket handshake does, rather
-	// than storing a dead session and reporting success.
+	// Register with the engine manager. False means the user was revoked since
+	// token validation (the transport is already closed): refuse, as the
+	// WebSocket handshake does.
 	if !a.manager.registerSession(session) {
 		slot.release()
 		a.logger.Warn("WMP session.create rejected: user revoked between token validation and session registration")
@@ -1055,8 +965,7 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, caller wmpCaller, 
 		}
 	}
 
-	// Store the WMP session. All fields are set before it is published in
-	// a.peers so concurrent readers never see a half-initialised session.
+	// Fully initialise before publishing in a.peers.
 	sessionCtx, cancel := context.WithCancel(context.Background())
 	ws := &wmpSession{
 		peer:         peer,
@@ -1081,8 +990,7 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, caller wmpCaller, 
 
 	a.mu.Lock()
 	if a.draining {
-		// Shutdown began after the request was admitted: nothing will ever
-		// close this session, so refuse it instead of publishing it.
+		// Shutdown began after admission: nothing would close this session.
 		a.mu.Unlock()
 		a.teardown(ws)
 		return wmpErrorBytes(req.ID, wmp.ErrRateLimited, map[string]string{
@@ -1090,9 +998,8 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, caller wmpCaller, 
 		})
 	}
 	// A concurrent create for the same user may have superseded this session
-	// (closing its transport) after registerSession but before this point.
-	// Checking under a.mu, which also guards publication, means a superseded
-	// create fails instead of publishing a peer that is about to be torn down.
+	// after registerSession. Checking under a.mu (which guards publication)
+	// makes a superseded create fail instead of publishing a doomed peer.
 	if !a.manager.isCurrentSession(session) {
 		a.mu.Unlock()
 		a.teardown(ws)
@@ -1108,8 +1015,7 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, caller wmpCaller, 
 	// Buffer notifications as they are emitted (see pumpEvents).
 	go pumpEvents(sessionCtx, ct, buf, ws.pumpDone, func(data []byte) { a.trackOutbound(sessionID, data) })
 
-	// Start the peer's read loop in a goroutine (for processing responses
-	// to outbound Call() requests, if any).
+	// Serve the peer's read loop (responses to outbound Call()s).
 	go func() {
 		_ = peer.Serve(sessionCtx)
 		a.closeSessionIfCurrent(sessionID, ws)
@@ -1118,10 +1024,9 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, caller wmpCaller, 
 	if a.beforeCreateToken != nil {
 		a.beforeCreateToken(sessionID)
 	}
-	// Issue the token only while this exact peer is still installed: a
-	// revocation, replacement or close in the window since publication must
-	// fail the create rather than report success for a nonexistent session.
-	// This also surfaces a crypto/rand failure instead of an empty token.
+	// Issue the token only while this peer is still installed, so a revocation,
+	// replacement or close since publication fails the create. Also surfaces a
+	// crypto/rand failure.
 	token, ok := a.issueResumptionTokenIfCurrent(sessionID, ws)
 	if !ok {
 		a.logger.Warn("WMP session.create: session closed or token unavailable during creation", zap.String("session_id", sessionID))
@@ -1144,25 +1049,22 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, caller wmpCaller, 
 	return wmpResponseBytes(req.ID, result)
 }
 
-// issueResumptionTokenIfCurrent issues a token (spec §4.5.2: >=128 bits of entropy, rotated on each resume) for sessionID only if ws is
-// still the installed peer, atomically with respect to CloseSession and
-// closeSessionIfCurrent (which remove the peer and its tokens under a.mu).
+// issueResumptionTokenIfCurrent issues a token (spec §4.5.2: >=128 bits, rotated
+// on resume) for sessionID only if ws is still the installed peer, atomically
+// with CloseSession.
 func (a *WMPAdapter) issueResumptionTokenIfCurrent(sessionID string, ws *wmpSession) (string, bool) {
 	return a.issueResumptionToken(sessionID, ws, "")
 }
 
-// issueRotatedResumptionToken is issueResumptionTokenIfCurrent for a resume:
-// the new token is linked to the token the resume consumed (prev) so that the
-// pair retire together (see resumptionEntry).
+// issueRotatedResumptionToken is issueResumptionTokenIfCurrent for a resume;
+// prev links the rotation pair (see resumptionEntry).
 func (a *WMPAdapter) issueRotatedResumptionToken(sessionID string, ws *wmpSession, prev string) (string, bool) {
 	return a.issueResumptionToken(sessionID, ws, prev)
 }
 
-// usableResumptionTokenLocked returns the entry for token if it can be
-// redeemed now: it exists and is unexpired, and if it was already consumed by
-// a resume, its successor is still outstanding (the client never used it, so
-// the resume response was presumably lost). Expired entries are dropped.
-// Caller holds a.mu.
+// usableResumptionTokenLocked returns token's entry if redeemable: unexpired
+// and, if already consumed, its successor is still unused (the resume response
+// was presumably lost). Expired entries are dropped. Caller holds a.mu.
 func (a *WMPAdapter) usableResumptionTokenLocked(token string) (*resumptionEntry, bool) {
 	entry, ok := a.resumptionTokens[token]
 	if !ok {
@@ -1181,11 +1083,10 @@ func (a *WMPAdapter) usableResumptionTokenLocked(token string) (*resumptionEntry
 	return entry, true
 }
 
-// consumeResumptionTokenLocked redeems token. A fresh token is kept for the
-// grace window, marked used, so a lost response can be retried once; a token
-// that was already used is deleted outright. In both cases the other token of
-// its rotation pair is retired, so the pair yields exactly one resume.
-// Caller holds a.mu and has just seen usableResumptionTokenLocked succeed.
+// consumeResumptionTokenLocked redeems token: a fresh one is marked used and
+// kept for the grace window, a used one is deleted; either way its rotation
+// partner is retired so a pair yields one resume. Caller holds a.mu after
+// usableResumptionTokenLocked succeeded.
 func (a *WMPAdapter) consumeResumptionTokenLocked(token string) {
 	entry, ok := a.resumptionTokens[token]
 	if !ok {
@@ -1211,7 +1112,6 @@ func (a *WMPAdapter) consumeResumptionTokenLocked(token string) {
 func (a *WMPAdapter) issueResumptionToken(sessionID string, ws *wmpSession, prev string) (string, bool) {
 	b := make([]byte, 32) // 256 bits
 	if _, err := rand.Read(b); err != nil {
-		// Should never happen with crypto/rand
 		a.logger.Error("failed to generate resumption token", zap.Error(err))
 		return "", ws == nil
 	}
@@ -1233,14 +1133,12 @@ func (a *WMPAdapter) issueResumptionToken(sessionID string, ws *wmpSession, prev
 	return token, true
 }
 
-// serverCapabilities builds the capability map from registered flow handlers.
-// This avoids hardcoding and ensures the advertised capabilities reflect the
-// actual server configuration (spec §4.2.1).
+// serverCapabilities builds the capability map from registered flow handlers
+// (spec §4.2.1).
 func (a *WMPAdapter) serverCapabilities() wmp.Capabilities {
 	caps := wmp.Capabilities{
 		"sign": json.RawMessage(`{"proof_types": ["jwt"]}`),
 	}
-	// Derive supported flow types from registered handlers.
 	a.manager.handlersMu.RLock()
 	flowTypes := make([]string, 0, len(a.manager.flowHandlers))
 	for p := range a.manager.flowHandlers {
@@ -1270,8 +1168,7 @@ func (a *WMPAdapter) replayActiveFlowProgress(sessionID string, peer *wmp.Peer) 
 	defer ws.session.flowsMu.RUnlock()
 
 	for _, flow := range ws.session.flows {
-		// State is written under flow.mu (BaseHandler.Progress); flowsMu only
-		// protects the map itself.
+		// State is written under flow.mu; flowsMu only guards the map.
 		flow.mu.RLock()
 		state := flow.State
 		flow.mu.RUnlock()
@@ -1289,16 +1186,13 @@ func (a *WMPAdapter) replayActiveFlowProgress(sessionID string, peer *wmp.Peer) 
 	}
 }
 
-// handleSessionResume validates a resumption token, rotates it, and reconnects
+// handleSessionResume validates a resumption token, rotates it and reconnects
 // the client to the existing engine session with a new transport/peer.
 //
-// caller is the bearer-authenticated identity from the HTTP layer.
-// Possession of a resumption token alone is not sufficient to resume a
-// session — without also checking that the caller's identity matches the
-// session's owner, any authenticated user who obtains another user's
-// resumption token (e.g. via a leaked SSE reconnect URL) could take over
-// their session. The token is consumed only after every check has passed, so
-// a rejected attempt with a stolen token cannot burn the owner's token.
+// The token alone is not enough: caller must own the session, or anyone who
+// obtains another user's token (e.g. a leaked SSE reconnect URL) could take it
+// over. The token is consumed only after every check passes, so a rejected
+// attempt cannot burn the owner's token.
 func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, msg *wmp.Message) ([]byte, error) {
 	req := msg.AsRequest()
 
@@ -1320,8 +1214,7 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 		})
 	}
 
-	// Look the token up without consuming it: it must exist, be unexpired
-	// and be bound to the session named in the request.
+	// Look the token up without consuming it.
 	a.mu.Lock()
 	entry, validToken := a.usableResumptionTokenLocked(params.ResumptionToken)
 	var oldWS *wmpSession
@@ -1337,18 +1230,15 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 		return wmpErrorBytes(req.ID, wmp.ErrSessionNotFound, nil)
 	}
 
-	// Reject resume attempts where the bearer-authenticated caller doesn't
-	// own the session — a valid resumption token is not sufficient on its
-	// own (see doc comment above).
+	// The caller must own the session (see doc comment).
 	if !ownsSession(oldWS, caller) {
 		return wmpErrorBytes(req.ID, wmp.ErrNotAuthorized, map[string]string{
 			"reason": "resumption token does not belong to the authenticated caller",
 		})
 	}
 
-	// Build the replacement connection state. Negotiated state (capabilities,
-	// security, TTL deadline, owner binding) and outstanding sub-flow
-	// correlation carry over from the session being resumed.
+	// Build the replacement connection state; negotiated state and sub-flow
+	// correlation carry over.
 	ct := wmp.NewChannelTransport(50, 200)
 	handler := &wmpEngineHandler{
 		adapter:   a,
@@ -1377,27 +1267,24 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 		slot:         oldWS.slot,
 	}
 
-	// Atomically consume the token and install the replacement, but only if
-	// the session being resumed is still the current one. The replacement is
-	// published BEFORE the old peer is cancelled below, so the old peer's
-	// Serve goroutine (whose cleanup only acts if it is still current) can
-	// never tear down the resumed session.
+	// Atomically consume the token and install the replacement if the resumed
+	// session is still current. Publishing BEFORE cancelling the old peer keeps
+	// the old Serve cleanup (which acts only if current) from tearing down the
+	// resumed session.
 	if a.beforeResumePublish != nil {
 		a.beforeResumePublish(params.SessionID)
 	}
 	a.mu.Lock()
 	_, tokenStillValid := a.usableResumptionTokenLocked(params.ResumptionToken)
-	// A create for the same user may have superseded the session being
-	// resumed after the lookup above; publishing then would leave it active
-	// here but absent from the manager next to its replacement.
+	// A create for the same user may have superseded the session since the
+	// lookup.
 	superseded := !a.manager.isCurrentSession(oldWS.session)
 	if !tokenStillValid || a.peers[params.SessionID] != oldWS || a.draining || superseded {
 		a.mu.Unlock()
 		cancel()
 		_ = ct.Close()
 		if superseded {
-			// The session is gone from the manager: end the adapter side
-			// too (peer, tokens, buffer) rather than leave it resumable.
+			// Gone from the manager: end the adapter side too.
 			a.closeSessionIfCurrent(params.SessionID, oldWS)
 		}
 		return invalidToken()
@@ -1410,19 +1297,16 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 		buf = a.getOrCreateEventBuffer(params.SessionID)
 	}
 
-	// Abort any blocking sign/match Call still holding Session.Send's read
-	// lock on the old transport (the client may have disconnected without
-	// acknowledging it); otherwise the write lock below would wait out the
-	// call timeout. Queued notifications are unaffected.
+	// Abort a blocking sign/match Call still holding Session.Send's read lock on
+	// the old transport (the client may have vanished), so the write lock below
+	// does not wait out the call timeout.
 	prevTransport := oldWS.session.currentTransport()
 	if old, ok := prevTransport.(*wmpSessionTransport); ok {
 		old.retire()
 	}
 
-	// Rewire the engine session's transport to the new peer/channel. The
-	// write lock waits for in-flight Session.Send calls (which hold the read
-	// lock for the whole send), so nothing is written to the old transport
-	// after this point.
+	// Rewire to the new transport; the write lock waits for in-flight Send
+	// calls, so nothing is written to the old one afterwards.
 	oldWS.session.transportMu.Lock()
 	oldWS.session.transport = wmpTransport
 	oldWS.session.transportMu.Unlock()
@@ -1431,20 +1315,15 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 		old.handOff(wmpTransport)
 	}
 
-	// Retire the old connection and wait for its pump to move everything it
-	// had queued into the event buffer, before the new pump starts, so
-	// replayed events keep their emission order.
+	// Retire the old connection and wait for its pump to flush into the buffer
+	// before the new pump starts, preserving event order.
 	oldWS.cancel()
 	_ = oldWS.transport.Close()
 	<-oldWS.pumpDone
 
-	// Re-check revocation now that the replacement transport is installed.
-	// The caller's token was validated before this point; an account
-	// revocation that closed the OLD transport (and finished its scan of live
-	// sessions) before the swap above would otherwise leave this resumed
-	// session open. Revocation marks the user before it closes sessions, so
-	// either the mark is visible here, or the closing scan runs after the swap
-	// and closes the new transport.
+	// Re-check revocation now the replacement is installed. Revocation marks the
+	// user before closing sessions, so either the mark is visible here or the
+	// closing scan runs after the swap and closes the new transport.
 	if a.manager.userRevoked(caller.UserID) {
 		a.logger.Warn("WMP session.resume rejected: user revoked", zap.String("session_id", params.SessionID))
 		a.closeSessionIfCurrent(params.SessionID, ws)
@@ -1459,11 +1338,8 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 		a.closeSessionIfCurrent(params.SessionID, ws)
 	}()
 
-	// Issue a new rotated token, but only while this exact peer is still the
-	// installed one: CloseSession removes the peer and its tokens under a.mu,
-	// so checking and issuing under the same lock gives close and resume a
-	// single linearization point (no token for a session that no longer
-	// exists, and no "resumed: true" for it either).
+	// Issue a rotated token only while this peer is still installed; checking
+	// and issuing under a.mu gives close and resume one linearization point.
 	newToken, stillCurrent := a.issueRotatedResumptionToken(params.SessionID, ws, params.ResumptionToken)
 	if !stillCurrent {
 		a.logger.Warn("WMP session.resume: session closed or superseded during resume", zap.String("session_id", params.SessionID))
@@ -1471,10 +1347,9 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 		return invalidToken()
 	}
 
-	// Echo the negotiated capabilities and security from the original session
-	// per spec §4.5.1 / §4.5.3. MissedMessages is the number of events after
-	// the client's last_received_id (or, with no cursor, not yet written to
-	// any SSE connection) that the SSE event buffer can replay.
+	// Echo negotiated capabilities and security (spec §4.5.1/§4.5.3).
+	// MissedMessages counts the events the buffer can replay after
+	// last_received_id.
 	result := wmp.SessionResumeResult{
 		WMP: wmp.Metadata{
 			Version:   wmp.Version,
@@ -1487,8 +1362,7 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 		Security:        ws.security,
 	}
 
-	// Per spec §6.2.1, re-send the latest flow.progress for each active flow
-	// so the client can recover flow state after reconnection.
+	// Re-send the latest flow.progress per active flow (spec §6.2.1).
 	go a.replayActiveFlowProgress(params.SessionID, peer)
 
 	return wmpResponseBytes(req.ID, result)
@@ -1498,21 +1372,18 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 // wmpEngineHandler — bridges WMP Handler interface to the engine
 // ---------------------------------------------------------------------------
 
-// wmpEngineHandler implements wmp.Handler. It handles flow lifecycle methods
-// directly (FlowStart, FlowAction) and delegates session cleanup to the adapter.
-// No AsyncFlowProfile is used — the engine's own goroutine-per-flow model
-// drives flow execution, and WMP flow.action calls are routed to the engine
-// session's channels (actionCh, signCh, matchCh).
+// wmpEngineHandler implements wmp.Handler: flow methods go to the engine
+// session's channels (actionCh, signCh, matchCh), session cleanup to the
+// adapter. No AsyncFlowProfile; the engine runs a goroutine per flow.
 type wmpEngineHandler struct {
 	wmp.BaseHandler
 	adapter   *WMPAdapter
 	sessionID string
 	session   *Session
 
-	// children holds outstanding sub-flow correlation state. It is shared
-	// (by pointer) between a session's successive connections' handlers, so
-	// resuming needs no transfer step that a losing concurrent resume could
-	// corrupt. Lazily created; see table().
+	// children holds sub-flow correlation state, shared by pointer across a
+	// session's successive handlers so a resume needs no transfer step. Lazily
+	// created; see table().
 	childOnce sync.Once
 	children  *childFlowTable
 }
@@ -1532,9 +1403,8 @@ func (h *wmpEngineHandler) table() *childFlowTable {
 	return h.children
 }
 
-// childFlowInfo tracks a nested sub-flow (sign or match) so that when
-// the client sends wmp.flow.complete for the child, we can route the
-// result back to the appropriate engine channel.
+// childFlowInfo tracks a nested sign/match sub-flow so its flow.complete can be
+// routed to the engine channel.
 type childFlowInfo struct {
 	parentFlowID string
 	messageID    string
@@ -1566,10 +1436,8 @@ func (h *wmpEngineHandler) peekChildFlow(childFlowID string) (childFlowInfo, boo
 	return *info, true
 }
 
-// purgeChildFlows drops every child mapping owned by parentFlowID. It runs
-// when the parent flow is torn down (completion, timeout, cancellation), so a
-// child that never completed cannot leave its entry behind for the session's
-// lifetime.
+// purgeChildFlows drops every child mapping of parentFlowID when the parent is
+// torn down, so unfinished children do not linger.
 func (h *wmpEngineHandler) purgeChildFlows(parentFlowID string) {
 	t := h.table()
 	t.mu.Lock()
@@ -1612,16 +1480,14 @@ func (h *wmpEngineHandler) logger() *zap.Logger {
 	return h.adapter.logger
 }
 
-// authorizeProtocol enforces the TAC permission the given flow protocol
-// requires (see requiredTACForProtocol) for the CURRENT request. It applies
-// to every state-changing method, not only FlowStart: a token lacking the
-// "i"/"r" permission must not be able to drive, cancel or complete an
-// existing flow of that protocol just because it belongs to the same user.
+// authorizeProtocol enforces the TAC permission the flow protocol requires (see
+// requiredTACForProtocol) for the CURRENT request, on every state-changing
+// method, so a token lacking "i"/"r" cannot drive an existing flow of that
+// protocol.
 //
-// Both the TAC captured at session creation and the current request's TAC
-// must grant the permission. A TAC is skipped only for a genuine legacy token
-// (no TAC concept); a modern token with an empty TAC has no permissions and
-// is refused.
+// Both the session's creation-time TAC and the current request's TAC must grant
+// it. A TAC is skipped only for a legacy token; a modern token with an empty TAC
+// has no permissions.
 func (h *wmpEngineHandler) authorizeProtocol(ctx context.Context, protocol Protocol, logger *zap.Logger) *wmp.RPCError {
 	required, ok := requiredTACForProtocol[protocol]
 	if !ok {
@@ -1644,8 +1510,7 @@ func (h *wmpEngineHandler) authorizeProtocol(ctx context.Context, protocol Proto
 }
 
 // authorizeFlow looks up the flow and enforces its protocol's TAC permission.
-// The returned flow is nil when it is not registered (no authorization
-// decision is made then; callers report their own not-found error).
+// The flow is nil when not registered (callers report their own not-found).
 func (h *wmpEngineHandler) authorizeFlow(ctx context.Context, flowID string) (flow *Flow, rpcErr *wmp.RPCError) {
 	h.session.flowsMu.RLock()
 	flow = h.session.flows[flowID]
@@ -1656,11 +1521,9 @@ func (h *wmpEngineHandler) authorizeFlow(ctx context.Context, flowID string) (fl
 	return flow, h.authorizeProtocol(ctx, flow.Protocol, h.logger().With(zap.String("flow_id", flowID)))
 }
 
-// declaredFeatures maps the capabilities this session's client offered to the
-// engine's feature declarations (FlowStartMessage.Features), so a WMP client is
-// held to the same rule as a WebSocket one: transaction_data is only sent to a
-// client that said it can handle it. A session that offered nothing declares
-// nothing.
+// declaredFeatures maps the capabilities the client offered to engine feature
+// declarations (FlowStartMessage.Features), so transaction_data goes only to a
+// client that can handle it, as on WebSocket.
 func (h *wmpEngineHandler) declaredFeatures() []string {
 	h.adapter.mu.RLock()
 	ws, ok := h.adapter.peers[h.sessionID]
@@ -1693,7 +1556,6 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 		zap.String("protocol", string(protocol)),
 	)
 
-	// Get handler factory.
 	h.adapter.manager.handlersMu.RLock()
 	factory, ok := h.adapter.manager.flowHandlers[protocol]
 	h.adapter.manager.handlersMu.RUnlock()
@@ -1703,18 +1565,12 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 		})
 	}
 
-	// TAC check, mirroring the WebSocket path (Manager.handleFlowStart): only
-	// enforced when the session actually has a TAC to check (empty means
-	// legacy auth, which has no TAC concept), so a token without "i" cannot
-	// start issuance nor one without "r" a presentation.
-	// Both the TAC captured at session creation AND the current request's
-	// TAC must grant the flow, so a reduced-permission token cannot drive a
-	// session created with a broader one.
+	// TAC check, mirroring the WebSocket path (Manager.handleFlowStart); see
+	// authorizeProtocol.
 	if rpcErr := h.authorizeProtocol(ctx, protocol, logger); rpcErr != nil {
 		return nil, rpcErr
 	}
 
-	// Parse WMP params into engine FlowStartMessage.
 	var startMsg FlowStartMessage
 	if params.Params != nil {
 		if err := json.Unmarshal(params.Params, &startMsg); err != nil {
@@ -1726,15 +1582,13 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 	}
 	startMsg.FlowID = flowID
 	startMsg.Protocol = protocol
-	// Declared features come from what the session OFFERED, not from the flow
-	// params: WMP defines the capability at session level, and a `features`
-	// member a client slipped into the params must not stand in for it.
+	// Declared features come from what the session offered, not from flow
+	// params, so a client cannot slip in a `features` member.
 	startMsg.Features = h.declaredFeatures()
 
 	// checkSlot rejects a duplicate client-supplied flow_id (which would
-	// overwrite a live flow's map entry, bypassing the limit, and let either
-	// flow's completion delete the other's registration) and enforces the
-	// concurrent-flow limit. Callers hold flowsMu.
+	// overwrite a live flow, bypassing the limit) and enforces the concurrent-
+	// flow limit. Callers hold flowsMu.
 	checkSlot := func() *wmp.RPCError {
 		if h.session.closed {
 			return wmp.NewRPCError(wmp.ErrFlowError, map[string]string{"reason": "session closed"})
@@ -1756,10 +1610,8 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 		return nil, rpcErr
 	}
 
-	// Build the flow and its handler BEFORE the flow becomes visible in
-	// session.flows: a concurrent wmp.flow.cancel/action (or session
-	// teardown) must never observe a registered flow whose Handler is not yet
-	// set - it would report "cancelled" and then let the handler run anyway.
+	// Build the flow and its handler BEFORE publishing it in session.flows, so a
+	// concurrent cancel/action or teardown never sees a flow with no Handler.
 	flow := &Flow{
 		ID:        flowID,
 		Protocol:  protocol,
@@ -1797,9 +1649,8 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 		flowTimeout = clientTimeout
 	}
 
-	// Launch the engine flow goroutine. The engine handler calls
-	// Session.SendProgress, Session.RequestSign, etc., which go through
-	// the wmpSessionTransport and are converted to WMP notifications.
+	// Launch the engine flow goroutine; its output goes through
+	// wmpSessionTransport.
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
@@ -1831,15 +1682,9 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 	}, nil
 }
 
-// FlowAction handles wmp.flow.action — routes actions to engine session channels.
-//
-// The engine's flow handlers block on session channels waiting for client input:
-//   - Session.WaitForAction reads from actionCh (for consent, trust_result, etc.)
-//   - Session.RequestSign waits on signCh (for proof JWT responses)
-//   - Session.RequestMatch waits on matchCh (for DCQL match responses)
-//
-// This method converts WMP flow.action params into engine message types and
-// delivers them to the appropriate channel.
+// FlowAction handles wmp.flow.action, routing the action to the session channel
+// the engine's handlers block on: actionCh (consent etc.), signCh (proofs),
+// matchCh (DCQL matches).
 func (h *wmpEngineHandler) FlowAction(ctx context.Context, params *wmp.FlowActionParams) (*wmp.FlowActionResult, error) {
 	flowID := params.FlowID
 
@@ -1854,12 +1699,9 @@ func (h *wmpEngineHandler) FlowAction(ctx context.Context, params *wmp.FlowActio
 		})
 	}
 
-	// Translate spec action names to engine-internal names.
-	// This allows WMP clients to use spec-compliant action names
-	// (e.g. "accept_offer") while the engine expects its own vocabulary
-	// (e.g. "consent"). Engine-native names are also accepted for
-	// backwards compatibility and for engine extensions (sign_response,
-	// match_response, trust_result) that have no spec equivalent.
+	// Translate spec action names to engine names. Engine-native names are also
+	// accepted, including extensions with no spec equivalent (sign_response,
+	// match_response, trust_result).
 	action := params.Action
 	if engineAction, ok := specToEngineAction[action]; ok {
 		action = engineAction
@@ -1986,18 +1828,16 @@ func (h *wmpEngineHandler) FlowCancel(ctx context.Context, params *wmp.FlowCance
 	}, nil
 }
 
-// FlowComplete handles wmp.flow.complete notifications. For child sub-flows
-// (sign/match), this routes the result back to the engine session's signCh
-// or matchCh so the blocking RequestSign/RequestMatch calls can complete.
+// FlowComplete handles wmp.flow.complete. For child sub-flows (sign/match) it
+// routes the result to signCh/matchCh to unblock RequestSign/RequestMatch.
 //
-// The child mapping is claimed before delivery (so concurrent duplicates
-// cannot both deliver) but restored if delivery fails, so a momentarily full
-// channel does not lose the only result and strand the parent flow: delivery
-// waits up to flowActionSendWait (as FlowAction does) before giving up.
+// The child mapping is claimed before delivery (so duplicates cannot both
+// deliver) and restored if delivery fails, so a momentarily full channel does
+// not lose the only result. Delivery waits up to flowActionSendWait.
 func (h *wmpEngineHandler) FlowComplete(ctx context.Context, params *wmp.FlowCompleteParams) {
-	// A child result drives its parent flow, so the request's token must be
-	// authorised for the PARENT's protocol. Checked before the mapping is
-	// claimed so a denied caller cannot consume it.
+	// A child result drives its parent, so the token must be authorised for the
+	// PARENT's protocol. Checked before claiming the mapping so a denied caller
+	// cannot consume it.
 	if pending, ok := h.peekChildFlow(params.FlowID); ok {
 		if _, rpcErr := h.authorizeFlow(ctx, pending.parentFlowID); rpcErr != nil {
 			return
@@ -2055,11 +1895,9 @@ func (h *wmpEngineHandler) FlowComplete(ctx context.Context, params *wmp.FlowCom
 	}
 }
 
-// FlowError handles wmp.flow.error notifications. For a server-created child
-// sub-flow (sign/match) it consumes the child mapping and fails the parent
-// RequestSign/RequestMatch immediately instead of letting it wait out its
-// timeout. Errors for any other flow are not child-flow failures and are
-// ignored here.
+// FlowError handles wmp.flow.error. For a child sub-flow it consumes the mapping
+// and fails the parent RequestSign/RequestMatch immediately; other flows are
+// ignored.
 func (h *wmpEngineHandler) FlowError(ctx context.Context, params *wmp.FlowErrorParams) {
 	if pending, ok := h.peekChildFlow(params.FlowID); ok {
 		if _, rpcErr := h.authorizeFlow(ctx, pending.parentFlowID); rpcErr != nil {
@@ -2121,12 +1959,10 @@ func (h *wmpEngineHandler) CapabilityList(_ context.Context, _ *wmp.CapabilityLi
 	}, nil
 }
 
-// CredentialNotification handles wmp.credential.notification from the client.
-// It routes the OID4VCI §10 credential lifecycle event to the engine's
-// notification forwarding logic (same path as WebSocket credential_notification).
+// CredentialNotification routes a wmp.credential.notification (OID4VCI §10) to
+// the engine's notification forwarding.
 func (h *wmpEngineHandler) CredentialNotification(ctx context.Context, params *wmp.CredentialNotificationParams) {
-	// Credential notifications are an OID4VCI lifecycle event: they need the
-	// issuance permission, whether or not the flow is still registered.
+	// Needs the issuance permission whether or not the flow is still registered.
 	if rpcErr := h.authorizeProtocol(ctx, ProtocolOID4VCI, h.logger().With(zap.String("flow_id", params.FlowID))); rpcErr != nil {
 		_ = h.session.SendNotificationAck(params.FlowID, params.NotificationID, "rejected", "insufficient permissions")
 		return
@@ -2147,26 +1983,24 @@ func (h *wmpEngineHandler) CredentialNotification(ctx context.Context, params *w
 // wmpSessionTransport — translates engine messages to WMP JSON-RPC
 // ---------------------------------------------------------------------------
 
-// wmpSessionTransport implements engine SessionTransport. It intercepts
-// outgoing engine messages (FlowProgressMessage, SignRequestMessage, etc.)
-// and converts them to WMP JSON-RPC notifications sent via Peer.Notify.
-// For sign/match requests, it starts nested sub-flows per the WMP spec.
+// wmpSessionTransport implements SessionTransport, converting outgoing engine
+// messages to WMP notifications via Peer.Notify. Sign/match requests start
+// nested sub-flows.
 type wmpSessionTransport struct {
 	peer    *wmp.Peer
 	ct      *wmp.ChannelTransport
 	handler *wmpEngineHandler
 
-	// retireCtx is cancelled by retire when a session resume supersedes this
-	// transport. Blocking Peer.Call sends (sign/match sub-flow starts) derive
-	// their context from it so an unacknowledged call cannot keep
-	// Session.Send's read lock - and therefore the resume's write lock -
-	// held for the full call timeout.
+	// retireCtx is cancelled by retire when a resume supersedes this transport.
+	// Blocking Peer.Call sends derive from it, so an unacknowledged call cannot
+	// hold Session.Send's read lock (and the resume's write lock) for the full
+	// timeout.
 	retireCtx    context.Context
 	retireCancel context.CancelFunc
 
-	// successor is the transport that replaced this one on session.resume.
-	// handedOff is closed once it is set; a child-flow start that was in
-	// flight when this transport retired waits on it to be reissued there.
+	// successor is the transport that replaced this one on resume; handedOff
+	// closes once it is set, so an in-flight child-flow start can be reissued
+	// there.
 	successor   *wmpSessionTransport
 	handedOff   chan struct{}
 	handoffOnce sync.Once
@@ -2177,9 +2011,8 @@ func newWMPSessionTransport(peer *wmp.Peer, ct *wmp.ChannelTransport) *wmpSessio
 	return &wmpSessionTransport{peer: peer, ct: ct, retireCtx: ctx, retireCancel: cancel, handedOff: make(chan struct{})}
 }
 
-// handOff records next as the transport that replaced t. Called by
-// session.resume after the engine session's transport has been swapped, so
-// child-flow starts interrupted by retire() can be reissued on next.
+// handOff records next as the transport that replaced t, so child-flow starts
+// interrupted by retire() can be reissued on it.
 func (t *wmpSessionTransport) handOff(next *wmpSessionTransport) {
 	t.handoffOnce.Do(func() {
 		t.successor = next
@@ -2189,13 +2022,11 @@ func (t *wmpSessionTransport) handOff(next *wmpSessionTransport) {
 	})
 }
 
-// startChildFlow sends the wmp.flow.start for a sign/match sub-flow and waits
-// for the client's acknowledgement. If the transport is retired by a
-// session.resume while the acknowledgement is pending, the request is NOT
-// reported as a failure (which would make Session.Send fail and end the
-// parent flow before RequestSign/RequestMatch starts waiting for the result,
-// even though the child-flow table survives the resume). Instead it is
-// reissued, under the same child flow ID, on the replacement transport.
+// startChildFlow sends wmp.flow.start for a sign/match sub-flow and waits for
+// the ack. If a resume retires the transport meanwhile, the start is reissued
+// under the same child flow ID on the replacement, rather than failing
+// Session.Send and ending the parent flow (the child-flow table survives the
+// resume).
 func (t *wmpSessionTransport) startChildFlow(childFlowID, flowType string, params json.RawMessage) error {
 	callCtx, cancel := context.WithTimeout(t.callContext(), childFlowStartTimeout)
 	defer cancel()
@@ -2213,8 +2044,8 @@ func (t *wmpSessionTransport) startChildFlow(childFlowID, flowType string, param
 	return err
 }
 
-// startChildFlowOrForget is startChildFlow, dropping the child mapping when
-// the start fails outright so a failed start leaves nothing behind.
+// startChildFlowOrForget is startChildFlow, dropping the child mapping if the
+// start fails.
 func (t *wmpSessionTransport) startChildFlowOrForget(childFlowID, flowType string, params json.RawMessage) error {
 	if err := t.startChildFlow(childFlowID, flowType, params); err != nil {
 		t.handler.popChildFlow(childFlowID)
@@ -2223,9 +2054,9 @@ func (t *wmpSessionTransport) startChildFlowOrForget(childFlowID, flowType strin
 	return nil
 }
 
-// reissueChildFlow waits for the replacement transport and starts the child
-// flow there. On failure the child mapping is dropped and the parent's
-// sign/match wait is left to its own timeout or session end.
+// reissueChildFlow starts the child flow on the replacement transport once
+// available. On failure the mapping is dropped and the parent's wait is left to
+// its own timeout.
 func (t *wmpSessionTransport) reissueChildFlow(childFlowID, flowType string, params json.RawMessage) {
 	timer := time.NewTimer(childFlowStartTimeout)
 	defer timer.Stop()
@@ -2250,9 +2081,8 @@ func (t *wmpSessionTransport) reissueChildFlow(childFlowID, flowType string, par
 	}
 }
 
-// retire aborts any in-flight blocking Call on this transport without closing
-// the underlying channel, so queued notifications are still drained into the
-// event buffer by the resume. Safe to call more than once.
+// retire aborts in-flight blocking Calls without closing the channel, so queued
+// notifications still drain into the event buffer. Idempotent.
 func (t *wmpSessionTransport) retire() {
 	if t.retireCancel != nil {
 		t.retireCancel()
@@ -2267,10 +2097,7 @@ func (t *wmpSessionTransport) callContext() context.Context {
 	return context.Background()
 }
 
-// SendJSON intercepts engine message structs and translates them to WMP
-// JSON-RPC notifications. The peer writes to the ChannelTransport, which
-// feeds the SSE event stream.
-// wmpMeta returns a Metadata with version and session ID pre-filled.
+// wmpMeta returns Metadata with version and session ID filled in.
 func (t *wmpSessionTransport) wmpMeta() wmp.Metadata {
 	return wmp.Metadata{
 		Version:   wmp.Version,
@@ -2278,6 +2105,8 @@ func (t *wmpSessionTransport) wmpMeta() wmp.Metadata {
 	}
 }
 
+// SendJSON translates engine message structs to WMP JSON-RPC notifications
+// written via the peer to the ChannelTransport (the SSE event stream).
 func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 	ctx := context.Background()
 
@@ -2302,8 +2131,8 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		})
 
 	case *FlowErrorMessage:
-		// Carry Error.Details (e.g. OID4VP's redirect_uri) in Data so the
-		// WMP client sees what a WebSocket client would.
+		// Carry Error.Details (e.g. OID4VP's redirect_uri) in Data, as on
+		// WebSocket.
 		var data json.RawMessage
 		if len(m.Error.Details) > 0 {
 			b, err := json.Marshal(m.Error.Details)
@@ -2321,9 +2150,8 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		})
 
 	case *SignRequestMessage:
-		// Start a nested sign sub-flow per WMP spec. The client handles
-		// the flow.start, performs the signing, then sends flow.complete
-		// with the proof. FlowComplete routes the result to signCh.
+		// Start a nested sign sub-flow; FlowComplete routes the client's result
+		// to signCh.
 		childFlowID := uuid.New().String()
 		t.handler.registerChildFlow(childFlowID, m.FlowID, m.MessageID, "sign")
 
@@ -2374,10 +2202,8 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		return t.startChildFlowOrForget(childFlowID, "match", paramsJSON)
 
 	default:
-		// Fallback for engine messages with no dedicated WMP method
-		// (PushMessage, credential-notification acks, ...): wrap the legacy
-		// object in a wmp.message.deliver notification so every event on
-		// the stream is valid JSON-RPC.
+		// No dedicated WMP method (PushMessage, notification acks, ...): wrap in
+		// wmp.message.deliver so every stream event is valid JSON-RPC.
 		data, err := json.Marshal(msg)
 		if err != nil {
 			return err
@@ -2395,10 +2221,8 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 	}
 }
 
-// convertTransactionData converts the engine's TransactionData (sent over
-// the native WebSocket transport) to its WMP wire equivalent. The two types
-// are field-for-field identical; this only exists so the two transports
-// don't share a Go type across the engine/wmp package boundary.
+// convertTransactionData converts the engine's TransactionData to its field-for-
+// field identical WMP wire type, so the transports share no Go type.
 func convertTransactionData(in []TransactionData) []openid4x.TransactionData {
 	if in == nil {
 		return nil
@@ -2412,10 +2236,8 @@ func convertTransactionData(in []TransactionData) []openid4x.TransactionData {
 			CredentialIDs:            td.CredentialIDs,
 			TransactionDataHashesAlg: openid4x.HashAlgs(td.TransactionDataHashesAlg),
 		}
-		// Params and HashAlgorithm are deprecated in go-wmp (TS12 types use
-		// Payload and the hash algorithm list) but are still copied: a pre-TS12
-		// entry carries its members there, and dropping them would give a WMP
-		// client less than a WebSocket client gets.
+		// Params and HashAlgorithm are deprecated in go-wmp but still copied:
+		// pre-TS12 entries carry their members there.
 		out[i].Params = td.Params               //nolint:staticcheck // deprecated, kept for pre-TS12 entries
 		out[i].HashAlgorithm = td.HashAlgorithm //nolint:staticcheck // deprecated, kept for pre-TS12 entries
 	}
@@ -2465,8 +2287,8 @@ func mapErrorCode(code ErrorCode) int {
 	case ErrCodeInternalError:
 		return wmp.ErrInternalError
 	default:
-		// Most engine errors map to the generic flow error with details
-		// carried in the message field.
+		// Most engine errors map to the generic flow error; details travel in
+		// the message.
 		return wmp.ErrFlowError
 	}
 }
@@ -2489,8 +2311,7 @@ func wmpResponseBytes(id json.RawMessage, result interface{}) ([]byte, error) {
 }
 
 // wmpOutboundRequestTTL bounds how long a tracked server-initiated request ID
-// stays routable: the Call() timeout plus slack. Entries are also removed when
-// answered and when their session closes.
+// stays routable (Call() timeout plus slack).
 const wmpOutboundRequestTTL = childFlowStartTimeout + 30*time.Second
 
 // outboundRequest is a server->client JSON-RPC request awaiting its response.
@@ -2499,9 +2320,8 @@ type outboundRequest struct {
 	expiresAt time.Time
 }
 
-// trackOutbound records the ID of a server-initiated request (a message with
-// both an id and a method) emitted on the session's transport, so the client's
-// response envelope can be routed back to the session without a session header.
+// trackOutbound records the ID of a server-initiated request so the client's
+// response can be routed to the session without a session header.
 func (a *WMPAdapter) trackOutbound(sessionID string, data []byte) {
 	var env struct {
 		ID     json.RawMessage `json:"id"`
@@ -2518,13 +2338,12 @@ func (a *WMPAdapter) trackOutbound(sessionID string, data []byte) {
 	a.outbound[string(env.ID)] = outboundRequest{sessionID: sessionID, expiresAt: time.Now().Add(wmpOutboundRequestTTL)}
 }
 
-// routeResponse delivers a client response to the session that has the
-// matching outstanding server-initiated request. With a session ID (header or
-// metadata) the session is the one named, already ownership-checked by the
-// HTTP layer; the matching tracked ID, if any, is consumed. Without one the
-// session is found via the request ID, and the caller must own it. IDs are
-// one-shot; unknown, expired, already-answered, or foreign IDs are rejected
-// identically so nothing is revealed about other users' requests.
+// routeResponse delivers a client response to the session with the matching
+// outstanding server-initiated request. With a session ID (already ownership-
+// checked) the matching tracked ID is consumed; without one the session is found
+// via the request ID and the caller must own it. IDs are one-shot; unknown,
+// expired, answered or foreign IDs are rejected identically so nothing leaks
+// about other users' requests.
 func (a *WMPAdapter) routeResponse(ctx context.Context, sessionID string, caller wmpCaller, msg *wmp.Message, body []byte) ([]byte, error) {
 	key := string(msg.ID)
 	var ws *wmpSession
@@ -2542,8 +2361,8 @@ func (a *WMPAdapter) routeResponse(ctx context.Context, sessionID string, caller
 		ws = a.peers[sessionID]
 	} else if tracked {
 		if cand, ok := a.peers[o.sessionID]; ok && ownsSession(cand, caller) {
-			// Consume only for the owner: a foreign token must not be able to
-			// burn another user's pending ID.
+			// Consume only for the owner so a foreign token cannot burn another
+			// user's pending ID.
 			delete(a.outbound, key)
 			ws = cand
 			sessionID = o.sessionID

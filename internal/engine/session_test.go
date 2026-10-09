@@ -1396,11 +1396,8 @@ func TestManager_DeleteByUser_WorksWithoutTokenBlacklistFeature(t *testing.T) {
 	assert.Equal(t, TypeError, msg.Type, "a new handshake for a revoked user must be rejected, not completed")
 }
 
-// TestHandleNewConnection_TACEnforcementByProvenance drives the real WebSocket
-// handshake and flow_start: a modern token with an empty TAC means "no
-// permissions" and must be refused for a protocol that needs one, a legacy
-// token (no TAC concept) is unaffected, and a modern token with a sufficient
-// TAC works as before.
+// TestHandleNewConnection_TACEnforcementByProvenance: a modern token with an
+// empty TAC is refused for a protocol needing one; legacy tokens are unaffected.
 func TestHandleNewConnection_TACEnforcementByProvenance(t *testing.T) {
 	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
 	m := newManagerWithStubOID4VCIHandler(t)
@@ -1625,9 +1622,8 @@ func handshakeNoWait(t *testing.T, m *Manager, wsURL, userID string) *websocket.
 	return ws
 }
 
-// A connection accepted and authenticated before Close, but not yet
-// registered when Close runs, must not survive: it is refused at
-// registration instead of landing in the freshly cleared maps.
+// A connection authenticated before Close but not yet registered must be
+// refused at registration, not land in the cleared maps.
 func TestManager_Close_ConnectionBetweenCloseAndRegisterDoesNotSurvive(t *testing.T) {
 	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
 	m := NewManager(cfg, zap.NewNop())
@@ -1716,8 +1712,7 @@ func TestManager_RegisterSession_RacingClose_NoLeak(t *testing.T) {
 		close(start)
 		wg.Wait()
 
-		// Anything that registered before Close was swept; after Close
-		// returned nothing may remain, and nothing may register later.
+		// Registered before Close: swept; after: refused.
 		m.sessionsMu.Lock()
 		leftover := len(m.sessions)
 		m.sessionsMu.Unlock()
