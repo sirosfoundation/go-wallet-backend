@@ -3,6 +3,7 @@ package middleware
 import (
 	"math"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
@@ -181,6 +182,16 @@ func AuthRateLimitMiddleware(rl *AuthRateLimiter) gin.HandlerFunc {
 // AuthRateLimitMiddlewareWithIdentifier returns a middleware that uses a custom identifier extractor
 // This allows callers to define how to identify rate limit subjects
 func AuthRateLimitMiddlewareWithIdentifier(rl *AuthRateLimiter, extractID func(*gin.Context) string) gin.HandlerFunc {
+	return AuthRateLimitMiddlewareWithResponse(rl, extractID, gin.H{
+		"error":   "rate_limit_exceeded",
+		"message": "Too many authentication attempts. Please try again later.",
+	})
+}
+
+// AuthRateLimitMiddlewareWithResponse is AuthRateLimitMiddlewareWithIdentifier
+// with a caller-chosen 429 body, for endpoints whose clients expect their own
+// error vocabulary. The response carries a Retry-After header (the lockout).
+func AuthRateLimitMiddlewareWithResponse(rl *AuthRateLimiter, extractID func(*gin.Context) string, body gin.H) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !rl.config.Enabled {
 			c.Next()
@@ -193,10 +204,8 @@ func AuthRateLimitMiddlewareWithIdentifier(rl *AuthRateLimiter, extractID func(*
 		}
 
 		if !rl.Allow(identifier) {
-			c.JSON(http.StatusTooManyRequests, gin.H{
-				"error":   "rate_limit_exceeded",
-				"message": "Too many authentication attempts. Please try again later.",
-			})
+			c.Header("Retry-After", strconv.Itoa(rl.config.LockoutSeconds))
+			c.JSON(http.StatusTooManyRequests, body)
 			c.Abort()
 			return
 		}
