@@ -34,14 +34,8 @@ func oidcStateCookieName(insecure bool) string {
 	return oidcStateCookieSecure
 }
 
-// signOIDCState computes an HMAC-SHA256 over the OIDC `state` value, keyed
-// by the AS's JWT secret (already validated to be >=32 bytes - see
-// pkg/config.Config.Validate). The "oidc-state-cookie:" prefix domain-
-// separates this from the legacy HMAC-signed JWTs that also use this
-// secret (internal/as/legacy_token.go): a JWT signing input always
-// contains base64 segments joined by ".", which this message never does,
-// so there's no plausible cross-protocol confusion even before accounting
-// for the prefix.
+// signOIDCState computes an HMAC-SHA256 over the OIDC `state`, keyed by jwt.secret (>=32 bytes,
+// see Config.Validate). The "oidc-state-cookie:" prefix domain-separates the MAC input.
 func signOIDCState(secret []byte, state string) string {
 	mac := hmac.New(sha256.New, secret)
 	mac.Write([]byte("oidc-state-cookie:" + state))

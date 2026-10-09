@@ -49,38 +49,14 @@ type Config struct {
 	// never configured". Unexported: never (un)marshaled, so it can't leak
 	// into YAML output or be set by config files/env itself.
 	asEnabledExplicit bool
-
-	// loaded is set by Load(): AS.Legacy.Enabled is then authoritative even
-	// when the AS itself is disabled in this process.
-	loaded bool
-
 	// registryExplicit records whether the `registry:` section (YAML) or any
 	// WALLET_REGISTRY_* environment variable was present; see
 	// RegistryExplicit and ApplyLegacyRegistryConfig.
 	registryExplicit bool
 
-	// jwtIssuerExplicit records whether jwt.issuer was set by the config file
-	// or WALLET_JWT_ISSUER (as opposed to the built-in default). The deprecated
-	// registry jwt.issuer only applies when it is false, so the shared JWT
-	// config stays a consistent (secret, issuer) pair.
-	jwtIssuerExplicit bool
-
 	// registryYAML is the decoded `registry:` mapping of the config file, used
 	// to tell keys the operator set explicitly from defaults.
 	registryYAML map[string]any
-
-	// registryLegacyTolerateNoJWKS is set by the deprecated registry.yaml
-	// alias when it enabled registry.require_auth from the old HMAC-only
-	// `jwt` block: such deployments have no as.external_url yet, and must
-	// keep starting (HMAC tokens only) until they migrate.
-	registryLegacyTolerateNoJWKS bool
-
-	// registryLegacyAudienceIndependent is set by the deprecated registry.yaml
-	// alias on a registry-only process that validates legacy HMAC tokens while
-	// server.rp_id is unset/default: the old schema has no rp_id, so legacy
-	// tokens are validated without an audience check (see
-	// RegistryLegacyAudienceIndependent).
-	registryLegacyAudienceIndependent bool
 
 	// loadWarnings are non-fatal findings from loading (see Warnings).
 	loadWarnings []string
@@ -154,8 +130,7 @@ type ASConfig struct {
 	// Tokens must contain at least one of these in their "aud" claim.
 	// Required when AS is enabled, but an empty list is filled with the
 	// documented defaults ("wallet-backend", "wallet-engine",
-	// "wallet-registry", plus server.rp_id while as.legacy.enabled is true)
-	// before validation, so configs that never set it keep working.
+	// "wallet-registry") before validation, so configs that never set it keep working.
 	// Validate() rejects an empty list only if that defaulting was skipped.
 	// go-tokenauth v0.5.0 made this mandatory at the validator level too
 	// (both its validation paths now refuse to validate at all when their
@@ -164,9 +139,6 @@ type ASConfig struct {
 	// with no audiences configured would otherwise reject every request
 	// silently at runtime instead of failing to start).
 	// Documented values: "wallet-backend", "wallet-engine", "wallet-registry".
-	// When as.legacy.enabled is true an explicitly configured list must ALSO
-	// include server.rp_id: legacy (HMAC) tokens carry the RP ID as their
-	// audience, and Validate() rejects a configuration that omits it.
 	Audiences []string `yaml:"audiences" envconfig:"AUDIENCES"`
 
 	// RulesDir is the path to a directory containing SPOCP policy rule files.
@@ -189,7 +161,8 @@ type ASConfig struct {
 	// Default: "rwl" (read, write, list)
 	DefaultMaxTAC string `yaml:"default_max_tac" envconfig:"DEFAULT_MAX_TAC"`
 
-	// Legacy contains configuration for legacy (HMAC) token compatibility.
+	// Legacy holds the removed as.legacy.* settings; they are still parsed so an existing
+	// configuration gets a clear startup message. See ASLegacyConfig.
 	Legacy ASLegacyConfig `yaml:"legacy" envconfig:"LEGACY"`
 
 	// ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com").
@@ -224,39 +197,55 @@ func (a *ASConfig) ExternalBaseURL() (*url.URL, error) {
 	return u, nil
 }
 
-// ASLegacyConfig controls the legacy all-in-one HMAC token path.
+// ASLegacyConfig holds the REMOVED as.legacy.* settings, still readable so a leftover configuration
+// is reported rather than silently misread.
+//
+// enabled: true makes Validate() fail (this binary cannot issue or validate legacy tokens);
+// enabled: false, deprecation_header and sunset_date are ignored and reported by DeprecatedSettings.
+//
+// Deprecated: remove the whole as.legacy section; it will be dropped from
+// the configuration schema in a later release.
 type ASLegacyConfig struct {
-	// Enabled controls whether legacy HMAC tokens are accepted.
-	// Default: true (for backward compatibility)
-	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+	// REMOVED. true makes startup fail; false is ignored with a startup warning. A pointer so
+	// that unset and explicit false differ.
+	Enabled *bool `yaml:"enabled" envconfig:"ENABLED"`
 
-	// DeprecationHeader is not acted on: the middleware is not mounted.
+	// REMOVED and ignored (startup warning).
 	DeprecationHeader bool `yaml:"deprecation_header" envconfig:"DEPRECATION_HEADER"`
 
-	// SunsetDate is ignored (a startup warning is logged); sunset the legacy AS
-	// with as.legacy.enabled=false.
-	//
-	// Deprecated: ignored; remove it from the configuration.
+	// REMOVED and ignored (startup warning).
 	SunsetDate string `yaml:"sunset_date" envconfig:"SUNSET_DATE"`
 }
 
-// DeprecatedSettings names the ignored settings that are still set.
+// rejectLegacyASEnabled refuses as.legacy.enabled=true; shared by Validate and ValidateRegistry so every role behaves the same.
+func (c *Config) rejectLegacyASEnabled() error {
+	if c.AS.Legacy.Enabled != nil && *c.AS.Legacy.Enabled {
+		return fmt.Errorf("as.legacy.enabled=true (or WALLET_AS_LEGACY_ENABLED=true) is no longer supported: the legacy HMAC authorization server (HS256 appTokens, /user/*-webauthn-*, jwt.refresh_days refresh tokens) has been removed. " +
+			"Remove the as.legacy section (or set it to false), enable the AS (as.enabled=true) and migrate clients to X-Token-Mode: session; see docs/new-as.md")
+	}
+	return nil
+}
+
+// DeprecatedSettings returns the names of present settings that no longer have any effect, for a
+// startup warning. (as.legacy.enabled=true is refused by Validate instead.)
 func (c *Config) DeprecatedSettings() []string {
 	var out []string
+	if c.AS.Legacy.Enabled != nil && !*c.AS.Legacy.Enabled {
+		out = append(out, "as.legacy.enabled (WALLET_AS_LEGACY_ENABLED)")
+	}
+	if c.AS.Legacy.DeprecationHeader {
+		out = append(out, "as.legacy.deprecation_header (WALLET_AS_LEGACY_DEPRECATION_HEADER)")
+	}
 	if c.AS.Legacy.SunsetDate != "" {
 		out = append(out, "as.legacy.sunset_date (WALLET_AS_LEGACY_SUNSET_DATE)")
 	}
-	return out
-}
-
-// LegacyEnabled reports whether legacy (HMAC) session tokens are permitted. It
-// follows as.legacy.enabled; for a Config that did not come through Load() a
-// disabled AS means HMAC is the only mechanism and stays enabled.
-func (c *Config) LegacyEnabled() bool {
-	if c.loaded {
-		return c.AS.Legacy.Enabled
+	if c.JWT.ExpiryHours != 0 {
+		out = append(out, "jwt.expiry_hours (WALLET_JWT_EXPIRY_HOURS)")
 	}
-	return !c.AS.Enabled || c.AS.Legacy.Enabled
+	if c.JWT.RefreshDays != 0 {
+		out = append(out, "jwt.refresh_days (WALLET_JWT_REFRESH_DAYS)")
+	}
+	return out
 }
 
 // SetDefaults sets default values for AS configuration.
@@ -347,37 +336,24 @@ const defaultJWTIssuer = "wallet-backend"
 // Shared by Load() (which must run it BEFORE Validate()) and EnableForRole()
 // so both paths produce an identical result.
 //
-//   - as.audiences empty: the documented default set, plus server.rp_id while
-//     legacy (HMAC) tokens are enabled (they carry the RP ID as "aud").
-//   - jwt.issuer empty while legacy tokens are enabled: "wallet-backend".
+//   - as.audiences empty: the documented default set.
 func (c *Config) applyASSecurityDefaults() {
 	if !c.AS.Enabled {
 		return
 	}
 	if len(c.AS.Audiences) == 0 {
 		c.AS.Audiences = append([]string(nil), defaultASAudiences...)
-		if c.AS.Legacy.Enabled && c.Server.RPID != "" && !containsString(c.AS.Audiences, c.Server.RPID) {
-			c.AS.Audiences = append(c.AS.Audiences, c.Server.RPID)
-		}
-	}
-	if c.AS.Legacy.Enabled && c.JWT.Issuer == "" {
-		c.JWT.Issuer = defaultJWTIssuer
 	}
 }
 
-// SessionAudiences returns the audiences a validator is built with: as.audiences
-// when set, else the defaults (plus server.rp_id while legacy is enabled).
-// Load() fills as.audiences only when the AS runs, but a standalone engine also
-// needs a non-empty list.
+// SessionAudiences returns the audiences a validator must be built with: as.audiences, else the
+// documented defaults. Load() fills as.audiences only when the AS is enabled; a standalone engine
+// still needs a non-empty list because go-tokenauth refuses to validate without one.
 func (c *Config) SessionAudiences() []string {
 	if len(c.AS.Audiences) > 0 {
 		return c.AS.Audiences
 	}
-	auds := append([]string(nil), defaultASAudiences...)
-	if c.LegacyEnabled() && c.Server.RPID != "" && !containsString(auds, c.Server.RPID) {
-		auds = append(auds, c.Server.RPID)
-	}
-	return auds
+	return append([]string(nil), defaultASAudiences...)
 }
 
 // GetTokenTTL returns the TTL for a given audience, falling back to the default.
@@ -1188,53 +1164,28 @@ type LoggingConfig struct {
 	Format string `yaml:"format" envconfig:"FORMAT"` // json, text
 }
 
-// JWTConfig contains JWT configuration
+// JWTConfig contains the jwt.* settings. Session tokens are signed by the AS's asymmetric key, so only
+// Secret (keys the OIDC state-binding cookie HMAC) and Issuer (fallback for as.issuer) matter;
+// ExpiryHours and RefreshDays are removed no-ops (see Config.DeprecatedSettings).
 type JWTConfig struct {
-	Secret      string `yaml:"secret" envconfig:"SECRET"`
-	SecretPath  string `yaml:"secret_path" envconfig:"SECRET_PATH"` // Path to file containing JWT secret
-	ExpiryHours int    `yaml:"expiry_hours" envconfig:"EXPIRY_HOURS"`
-	RefreshDays int    `yaml:"refresh_days" envconfig:"REFRESH_DAYS"`
-	// Issuer is the "iss" of legacy HMAC session tokens, and the only issuer
-	// accepted on them. Default: "wallet-backend". May be empty only when
-	// as.legacy.enabled=false.
+	// Secret is a server-side secret of at least 32 bytes. It keys the HMAC that binds the OIDC
+	// state parameter to the browser (state-binding cookie). Required.
+	Secret string `yaml:"secret" envconfig:"SECRET"`
+	// SecretPath is the path to a file containing the secret (alternative to Secret).
+	SecretPath string `yaml:"secret_path" envconfig:"SECRET_PATH"`
+
+	// REMOVED and ignored (startup warning). AS token lifetimes are as.default_token_ttl / as.audience_ttls.
+	//
+	// Deprecated: no effect.
+	ExpiryHours int `yaml:"expiry_hours" envconfig:"EXPIRY_HOURS"`
+	// REMOVED and ignored (startup warning). AS sessions live as.session_ttl.
+	//
+	// Deprecated: no effect.
+	RefreshDays int `yaml:"refresh_days" envconfig:"REFRESH_DAYS"`
+
+	// Issuer is the fallback for as.issuer (the "iss" of AS-issued access
+	// tokens). Default: "wallet-backend".
 	Issuer string `yaml:"issuer" envconfig:"ISSUER"`
-}
-
-// MaxTokenLifetime returns the longer of the configured access-token
-// (ExpiryHours) and refresh-token (RefreshDays) lifetimes. A refresh-token
-// family revocation marker must be retained at least this long, since
-// nothing enforces that the refresh token outlives the access token.
-func (c JWTConfig) MaxTokenLifetime() time.Duration {
-	refresh := time.Duration(c.RefreshDays) * 24 * time.Hour
-	access := time.Duration(c.ExpiryHours) * time.Hour
-	if refresh > access {
-		return refresh
-	}
-	return access
-}
-
-// MinFamilyRetention is the floor for how long a refresh-token family
-// revocation marker is kept (365 days).
-//
-// The marker must outlive every token of the family, but the only bound
-// available at logout is the CURRENT configuration, while tokens may have
-// been minted under an earlier, longer one (e.g. jwt.refresh_days lowered
-// after deployment). A retention derived from the current lifetimes alone
-// could therefore expire early and un-revoke older tokens. The floor makes
-// retention non-shrinking across configuration changes for any earlier
-// configuration with token lifetimes up to a year; markers are tiny and
-// swept afterwards, so the cost is negligible. Configurations that ever
-// issued tokens beyond a year are covered by MaxTokenLifetime taking the
-// larger value.
-const MinFamilyRetention = 365 * 24 * time.Hour
-
-// FamilyRetention returns how long to keep a refresh-token family
-// revocation marker: the longer of MaxTokenLifetime and MinFamilyRetention.
-func (c JWTConfig) FamilyRetention() time.Duration {
-	if m := c.MaxTokenLifetime(); m > MinFamilyRetention {
-		return m
-	}
-	return MinFamilyRetention
 }
 
 // JWTLeeway is the clock-skew tolerance applied when validating JWT time claims
@@ -1983,17 +1934,14 @@ func Load(configFile string) (*Config, error) {
 // caller after any deprecated-alias overlay (see ValidateRegistry and
 // ValidateRegistryStandalone).
 func LoadRegistryOnly(configFile string) (*Config, error) {
-	// The legacy-audience check is deliberately not part of the load-time
-	// validation: the deprecated registry.yaml overlay (applied afterwards)
-	// can decide that it does not apply; ValidateRegistryStandalone runs it
-	// once the overlay is in place.
-	return load(configFile, (*Config).loadRegistrySecrets, (*Config).validateRegistryStandaloneServer)
+	// No secret files are read: the registry validates AS tokens through the JWKS (a deprecated
+	// registry.yaml jwt secret is ignored).
+	return load(configFile, func(*Config) error { return nil }, (*Config).validateRegistryStandaloneServer)
 }
 
 func load(configFile string, loadSecrets, validate func(*Config) error) (*Config, error) {
 	// Start with defaults
 	cfg := defaultConfig()
-	cfg.loaded = true
 
 	// Load from YAML file if provided (overrides defaults)
 	if configFile != "" {
@@ -2010,7 +1958,6 @@ func load(configFile string, loadSecrets, validate func(*Config) error) (*Config
 			cfg.asEnabledExplicit = yamlHasASEnabledKey(data)
 			cfg.registryExplicit = yamlHasTopLevelKey(data, "registry")
 			cfg.registryYAML = yamlRegistrySection(data)
-			cfg.jwtIssuerExplicit = yamlHasNestedKey(data, "jwt", "issuer")
 			if w := retiredRegistryLayoutWarning(data); w != "" {
 				cfg.loadWarnings = append(cfg.loadWarnings, w)
 			}
@@ -2021,9 +1968,6 @@ func load(configFile string, loadSecrets, validate func(*Config) error) (*Config
 	// Since we removed `default:` tags, this only applies actual env vars
 	if _, ok := os.LookupEnv("WALLET_AS_ENABLED"); ok {
 		cfg.asEnabledExplicit = true
-	}
-	if _, ok := os.LookupEnv("WALLET_JWT_ISSUER"); ok {
-		cfg.jwtIssuerExplicit = true
 	}
 	if envHasPrefix("WALLET_REGISTRY_") {
 		cfg.registryExplicit = true
@@ -2267,9 +2211,7 @@ func defaultConfig() *Config {
 			Format: "json",
 		},
 		JWT: JWTConfig{
-			ExpiryHours: 24,
-			RefreshDays: 7,
-			Issuer:      defaultJWTIssuer,
+			Issuer: defaultJWTIssuer,
 		},
 		Trust: TrustConfig{
 			Timeout: 30, // seconds
@@ -2326,10 +2268,6 @@ func defaultConfig() *Config {
 		Presentation: PresentationConfig{DCQLConsentCheck: DCQLConsentCheckWarn},
 		AS: ASConfig{
 			DefaultTokenTTL: 2 * time.Minute,
-			Legacy: ASLegacyConfig{
-				Enabled:           true,  // Legacy tokens accepted by default
-				DeprecationHeader: false, // No deprecation headers until explicitly enabled
-			},
 		},
 		WalletProvider: WalletProviderConfig{
 			WIA: WIAConfig{
@@ -2478,15 +2416,16 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("mongodb.cert_path is required when mongodb.key_path is set")
 	}
 
+	if err := c.rejectLegacyASEnabled(); err != nil {
+		return err
+	}
+
+	// jwt.secret keys the OIDC state-binding cookie HMAC (see JWTConfig).
 	if c.JWT.Secret == "" {
-		return fmt.Errorf("jwt secret is required")
+		return fmt.Errorf("jwt secret is required (it keys the OIDC state-binding cookie)")
 	}
 	if len(c.JWT.Secret) < 32 {
 		return fmt.Errorf("jwt secret must be at least 32 bytes for HMAC-SHA256 security")
-	}
-	// Legacy HMAC tokens are pinned to jwt.issuer; empty would accept any iss.
-	if c.LegacyEnabled() && c.JWT.Issuer == "" {
-		return fmt.Errorf("jwt.issuer is required while legacy session tokens are enabled (as.legacy.enabled=true); set jwt.issuer or disable legacy tokens")
 	}
 
 	// A remote AS JWKS is validated against as.issuer or jwt.issuer; both
@@ -2576,24 +2515,6 @@ func (c *Config) Validate() error {
 		// Failing fast here, at startup, is far preferable to that.
 		if len(c.AS.Audiences) == 0 {
 			return fmt.Errorf("as: audiences is required when AS is enabled (see Config.AS.Audiences's doc comment)")
-		}
-		// Legacy (HMAC) tokens carry "aud": Server.RPID (see
-		// UserService/WebAuthnService.generateToken), and go-tokenauth v0.5
-		// validates that against AS.Audiences. If the RP ID is not among
-		// them, every legacy login token is rejected on its next protected
-		// request - a failure that only shows up at runtime, so refuse it here.
-		// Legacy tokens are minted with "iss": jwt.issuer and validated
-		// against Legacy.Issuers=[jwt.issuer]; an empty value would mint
-		// tokens with an empty iss and turn go-tokenauth's mandatory issuer
-		// check into a no-op, so require it (as.issuer does not help: it is
-		// not the legacy issuer).
-		if c.AS.Legacy.Enabled && c.JWT.Issuer == "" {
-			return fmt.Errorf("as: legacy tokens are enabled but jwt.issuer is empty; legacy tokens are issued and validated with jwt.issuer, so set it or disable as.legacy.enabled")
-		}
-		if c.AS.Legacy.Enabled && !containsString(c.AS.Audiences, c.Server.RPID) {
-			return fmt.Errorf("as: legacy tokens are enabled but server.rp_id %q is not listed in as.audiences; "+
-				"legacy tokens carry the RP ID as their audience, so add it to as.audiences or disable as.legacy.enabled",
-				c.Server.RPID)
 		}
 	}
 

@@ -16,19 +16,12 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/audience"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/legacytoken"
 )
 
-// LegacyIssuanceGate answers 410 on endpoints that mint legacy HMAC tokens when
-// legacy is disabled, pointing clients at X-Token-Mode: session.
-func LegacyIssuanceGate(enabled bool) gin.HandlerFunc {
+// LegacyEndpointRemoved answers 410 Gone for endpoints that only minted legacy HMAC session tokens
+// (/user/*-webauthn-* login/registration and /user/session/refresh), telling old clients how to migrate.
+func LegacyEndpointRemoved() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if enabled {
-			c.Next()
-			return
-		}
 		c.AbortWithStatusJSON(410, gin.H{
 			"error":   "legacy_tokens_disabled",
 			"message": "legacy HMAC session tokens are no longer issued; use the /auth/passkey endpoints with X-Token-Mode: session",
@@ -42,8 +35,8 @@ type TenantLookup interface {
 }
 
 // TokenAuthMiddleware validates Bearer tokens using a go-tokenauth validator
-// and populates the Gin context with the same keys that legacy AuthMiddleware
-// sets, so existing handlers work unchanged.
+// (AS-issued asymmetric session tokens) and populates the Gin context with
+// the keys that the handlers expect.
 //
 // Context keys set on success:
 //
@@ -55,36 +48,11 @@ type TenantLookup interface {
 //	"token"          (string)           — raw Bearer token
 //	"tokenauth_result" (*claims.Result) — full validation result
 //
-// blacklist, when non-nil, is checked for user-level revocation
-// (IsUserRevoked) after a token validates - see #391 review: per-jti
-// revocation is already enforced *inside* v.Validate itself (the
-// go-tokenauth Validator's own Revocation checker, wired in
-// internal/server/providers.go to the same blacklist), but that checker's
-// interface only takes a jti, not a user_id, so DeleteUser's user-level
-// RevokeUser (#383) would otherwise never be consulted for tokens
-// validated through this path - only for tokens validated through the
-// legacy AuthMiddlewareWithBlacklist.
+// blacklist, when non-nil, is checked for user-level revocation (IsUserRevoked) after validation:
+// the validator's own Revocation checker only sees a jti, so RevokeUser would otherwise never apply.
 //
-// cfg is used only to re-parse a legacy-mode token (result.Mode ==
-// ModeLegacy) far enough to read its "sid" (refresh-token family) claim for
-// the same family-revocation check (#402) - go-tokenauth's *claims.Result
-// is shared with AS-issued tokens and deliberately doesn't expose a
-// wallet-backend-specific claim like "sid", so this re-parses the same
-// legacy HMAC token go-tokenauth already validated (see
-// legacytoken.SID) rather than growing that shared type/module for one
-// caller's claim.
-func TokenAuthMiddleware(cfg *config.Config, v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
-	return TokenAuthMiddlewareWithValidate(cfg, v.Validate, tenants, blacklist, logger)
-}
-
-// TokenAuthMiddlewareWithValidate is TokenAuthMiddleware with the token
-// validation step supplied by the caller (validate must return the same
-// *claims.Result a go-tokenauth Validator would, and an error to reject).
-// Every check after validation - user, refresh-token family and tenant
-// handling - is identical. It lets a caller route some tokens through a
-// different validation (the registry's audience-independent legacy path)
-// without duplicating the post-validation chain.
-func TokenAuthMiddlewareWithValidate(cfg *config.Config, validate func(ctx context.Context, rawToken string) (*claims.Result, error), tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
+// HMAC (legacy) bearer tokens fail validation and get a 401.
+func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Extract Bearer token
 		rawToken := extractBearer(c)
@@ -95,10 +63,8 @@ func TokenAuthMiddlewareWithValidate(cfg *config.Config, validate func(ctx conte
 			return
 		}
 
-		// Validate via go-tokenauth (auto-detects new-style vs legacy HMAC).
-		// Per-jti revocation is already checked inside Validate itself (see
-		// this function's doc comment).
-		result, err := validate(c.Request.Context(), rawToken)
+		// Validate via go-tokenauth (per-jti revocation happens inside Validate).
+		result, err := v.Validate(c.Request.Context(), rawToken)
 		if err != nil {
 			logAuthReject(logger, c, "token_validation_failed", zap.Error(err))
 			c.JSON(401, gin.H{"error": "Invalid token"})
@@ -117,36 +83,6 @@ func TokenAuthMiddlewareWithValidate(cfg *config.Config, validate func(ctx conte
 			c.JSON(401, gin.H{"error": "Token has been revoked"})
 			c.Abort()
 			return
-		}
-
-		// Refresh-token family revocation (#402), legacy-mode tokens only:
-		// go-tokenauth "auto-detects new-style vs legacy" (this function's
-		// own doc comment above), so a WebAuthnService-issued legacy HMAC
-		// token can reach this middleware instead of
-		// AuthMiddlewareWithBlacklist whenever the AS is enabled - and
-		// without this check, revoking its family on logout would be
-		// silently ineffective for exactly that deployment mode. New-style
-		// AS-issued tokens (ModeSession) have no sid/family concept at all;
-		// only ModeLegacy is checked.
-		if blacklist != nil && result.Mode == claims.ModeLegacy {
-			// Fail closed: the token was already accepted above, so an
-			// unverifiable re-parse means we cannot tell which family it
-			// belongs to - reject rather than skip the check.
-			sid, sidErr := legacytoken.ParseSID(cfg.JWT.Secret, rawToken)
-			if sidErr != nil {
-				logger.Warn("Cannot determine refresh-token family for legacy token", zap.Error(sidErr))
-				c.JSON(401, gin.H{"error": "Invalid token"})
-				c.Abort()
-				return
-			}
-			if sid != "" && blacklist.IsFamilyRevoked(c.Request.Context(), sid) {
-				logger.Warn("Token for revoked refresh-token family used",
-					zap.String("sid", sid),
-				)
-				c.JSON(401, gin.H{"error": "Token has been revoked"})
-				c.Abort()
-				return
-			}
 		}
 
 		// Tenant validation: look up and check enabled
@@ -263,31 +199,12 @@ func MustHaveTAC(required string) gin.HandlerFunc {
 // user-facing routes should reject a "wallet-registry"-only token even
 // though the deployment as a whole accepts that audience for other
 // purposes.
-//
-// LEGACY TOKEN EXEMPTION: RequireAudience admits ModeLegacy (HMAC login)
-// tokens regardless of their audience (see audience.Allowed). That is correct
-// for every group guarded today, but a group that must be restricted to a
-// NARROWER audience (one ordinary login tokens must not reach) cannot use
-// this function: it would silently admit them. Such a group must opt in to
-// strictness by using RequireAudienceStrict instead.
 func RequireAudience(allowed ...string) gin.HandlerFunc {
-	return requireAudience(true, allowed)
-}
-
-// RequireAudienceStrict is RequireAudience without the ModeLegacy exemption:
-// the token's audience must match one of allowed, whatever its mode. Use it
-// for any future route group restricted to a narrower audience than the
-// deployment-wide AS.Audiences.
-func RequireAudienceStrict(allowed ...string) gin.HandlerFunc {
-	return requireAudience(false, allowed)
-}
-
-func requireAudience(admitLegacy bool, allowed []string) gin.HandlerFunc {
 	if len(allowed) == 0 {
 		// allowed is fixed at route-registration time, not per-request, so
 		// this is always a programming error, never a runtime condition -
-		// panic here (once, at startup) rather than have the match loop
-		// below silently 403 every request forever.
+		// panic here (once, at startup) rather than have the match below
+		// silently 403 every request forever.
 		panic("middleware: RequireAudience called with no allowed audiences")
 	}
 	return func(c *gin.Context) {
@@ -304,8 +221,7 @@ func requireAudience(admitLegacy bool, allowed []string) gin.HandlerFunc {
 			return
 		}
 
-		// Legacy-token exemption is decided by admitLegacy (see audience.Allowed).
-		if !audience.Allowed(result, admitLegacy, allowed...) {
+		if !result.HasAudience(allowed...) {
 			c.JSON(403, gin.H{"error": "Token audience not permitted for this endpoint"})
 			c.Abort()
 			return

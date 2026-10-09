@@ -19,16 +19,12 @@ const leakProbe = "secret.token.value"
 func TestAuthRejectionsAreLogged(t *testing.T) {
 	v, _, _ := setupTokenAuthTest(t)
 	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{}}
-	cfg := createTestConfig("test-secret")
-	store := createTestStore()
-
 	type mw func(*zap.Logger) gin.HandlerFunc
 	middlewares := map[string]mw{
 		"tokenauth": func(l *zap.Logger) gin.HandlerFunc {
-			return TokenAuthMiddleware(testTokenAuthConfig(), v, tenants, nil, l)
+			return TokenAuthMiddleware(v, tenants, nil, l)
 		},
-		"legacy": func(l *zap.Logger) gin.HandlerFunc { return AuthMiddlewareWithBlacklist(cfg, store, nil, l) },
-		"admin":  func(l *zap.Logger) gin.HandlerFunc { return AdminAuthMiddleware("admin-secret", l) },
+		"admin": func(l *zap.Logger) gin.HandlerFunc { return AdminAuthMiddleware("admin-secret", l) },
 	}
 
 	cases := []struct {
@@ -37,22 +33,18 @@ func TestAuthRejectionsAreLogged(t *testing.T) {
 	}{
 		{"missing header", "", map[string]string{
 			"tokenauth": "missing_or_malformed_bearer_token",
-			"legacy":    "missing_authorization_header",
 			"admin":     "missing_authorization_header",
 		}},
 		{"wrong scheme", "Basic " + leakProbe, map[string]string{
 			"tokenauth": "missing_or_malformed_bearer_token",
-			"legacy":    "malformed_authorization_header",
 			"admin":     "malformed_authorization_header",
 		}},
 		{"empty token", "Bearer ", map[string]string{
 			"tokenauth": "missing_or_malformed_bearer_token",
-			"legacy":    "empty_bearer_token",
 			"admin":     "empty_bearer_token",
 		}},
 		{"invalid token", "Bearer " + leakProbe, map[string]string{
 			"tokenauth": "token_validation_failed",
-			"legacy":    "invalid_token",
 			"admin":     "invalid_admin_token",
 		}},
 	}

@@ -4,7 +4,32 @@ import (
 	"encoding/base64"
 	"net/http"
 	"testing"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
 )
+
+// TestLegacyHMACTokenRejected: an HS256 appToken signed with jwt.secret gets 401 on protected routes
+// while the AS session token works.
+func TestLegacyHMACTokenRejected(t *testing.T) {
+	h := NewTestHarness(t)
+	user := h.CreateTestUser("Legacy Token User")
+
+	hmacToken, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": user.UUID.String(), "did": user.DID, "tenant_id": "default",
+		"iss": h.Config.JWT.Issuer, "aud": h.Config.Server.RPID,
+		"jti": "legacy-jti", "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte(h.Config.JWT.Secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, path := range []string{"/user/session/account-info", "/user/session/private-data"} {
+		resp := h.WithAuth(hmacToken).GET(path)
+		resp.Status(http.StatusUnauthorized)
+	}
+	h.AuthGET(user, "/user/session/account-info").Status(http.StatusOK)
+}
 
 // TestAccountInfo tests the /user/session/account-info endpoint
 func TestAccountInfo(t *testing.T) {

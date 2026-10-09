@@ -22,9 +22,6 @@ type TokenBlacklistChecker interface {
 	IsBlacklisted(ctx context.Context, jti string) bool
 	IsUserRevoked(ctx context.Context, userID string) bool
 	Add(ctx context.Context, jti string, expiry time.Time) error
-	// RevokeFamily revokes a whole refresh-token family (#402); used by
-	// LogoutHandler with the family id recorded on the AS session at login.
-	RevokeFamily(ctx context.Context, sid string, expiry time.Time) error
 }
 
 // tokenDeps groups the shared dependencies for token issuance handlers.

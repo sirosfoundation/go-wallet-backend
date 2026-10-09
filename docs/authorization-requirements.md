@@ -135,7 +135,7 @@ above, not in any transport-specific message parsing.
 
 ## Legacy tokens
 
-Deployments without the AS enabled (`cfg.AS.Enabled: false`, legacy HMAC
-tokens) have no `tac`/`acr`/multi-`aud` concept at all - none of the checks
-above apply there. This reference only describes the new-style AS token
-model.
+The legacy HMAC all-in-one tokens (deployments with `as.enabled: false`) no
+longer exist: the backend only accepts AS-issued tokens, so every check above
+applies to every authenticated request. See
+[new-as.md](new-as.md#removal-of-the-legacy-as).

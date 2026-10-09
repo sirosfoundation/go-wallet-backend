@@ -14,7 +14,7 @@ func TestWebAuthnRequestResponseFormats(t *testing.T) {
 	h := NewTestHarness(t)
 
 	// Begin registration to get a valid challenge
-	beginResp := h.POST("/user/register-webauthn-begin", map[string]interface{}{})
+	beginResp := h.POST("/auth/passkey/register/begin", map[string]interface{}{})
 	beginResp.Status(http.StatusOK)
 
 	var beginResult BeginRegistrationResponse
@@ -78,7 +78,7 @@ func TestWebAuthnRequestResponseFormats(t *testing.T) {
 			},
 		}
 
-		finishResp := h.POST("/user/register-webauthn-finish", finishReq)
+		finishResp := h.POST("/auth/passkey/register/finish", finishReq)
 
 		// We should NOT get:
 		// - 500 (internal server error) - indicates format parsing failed
@@ -100,7 +100,7 @@ func TestWebAuthnLoginRequestFormat(t *testing.T) {
 	h := NewTestHarness(t)
 
 	// Begin login
-	beginResp := h.POST("/user/login-webauthn-begin", map[string]interface{}{})
+	beginResp := h.POST("/auth/passkey/login/begin", map[string]interface{}{})
 	beginResp.Status(http.StatusOK)
 
 	var beginResult map[string]interface{}
@@ -152,7 +152,7 @@ func TestWebAuthnLoginRequestFormat(t *testing.T) {
 			},
 		}
 
-		finishResp := h.POST("/user/login-webauthn-finish", finishReq)
+		finishResp := h.POST("/auth/passkey/login/finish", finishReq)
 
 		switch status := finishResp.Response.StatusCode; status {
 		case http.StatusInternalServerError:

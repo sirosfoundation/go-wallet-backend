@@ -59,12 +59,12 @@ func contextInjector(tenant *domain.Tenant, oidcResult *oidc.ValidationResult) g
 func newTestPasskeyHandlers(webauthn WebAuthnProvider) (*PasskeyHandlers, *MemorySessionStore) {
 	gin.SetMode(gin.TestMode)
 	store := NewMemorySessionStore()
-	cfg := &config.ASConfig{Legacy: config.ASLegacyConfig{Enabled: true},
+	cfg := &config.ASConfig{
 		DefaultMaxTAC:   "rwl",
 		SessionTTL:      24 * time.Hour,
 		InsecureCookies: true,
 	}
-	return NewPasskeyHandlers(webauthn, store, nil, cfg, zap.NewNop()), store
+	return NewPasskeyHandlers(webauthn, store, cfg, zap.NewNop()), store
 }
 
 func gatedTenant(bindIdentity bool, regOP *domain.OIDCProviderConfig) *domain.Tenant {

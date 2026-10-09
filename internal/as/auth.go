@@ -8,15 +8,13 @@ import (
 	"go.uber.org/zap"
 )
 
-// AuthContext is the unified authentication context set by UnifiedAuthMiddleware.
-// Downstream handlers see the same fields regardless of auth method.
+// AuthContext is the authentication context set by SessionAuthMiddleware.
 type AuthContext struct {
 	UserID   string
 	DID      string
 	TenantID string
 	TAC      TAC
 	ACR      string
-	Mode     ClientMode
 }
 
 const authContextKey = "as_auth_context"
@@ -82,77 +80,36 @@ func authenticateSession(
 		TenantID: claims.TenantID,
 		TAC:      claims.TAC,
 		ACR:      claims.ACR,
-		Mode:     ClientModeSession,
 	}, ""
 }
 
-// UnifiedAuthMiddleware validates both legacy bearer tokens and new-style
-// session-based access tokens. It sets a unified AuthContext for downstream use.
-//
-// Flow:
-//  1. Check for session cookie → new-style: validate asymmetric access token
-//  2. No cookie, has Bearer token → try HMAC validation (legacy)
-//  3. Neither → 401
-func UnifiedAuthMiddleware(
+// SessionAuthMiddleware validates a session cookie together with the
+// asymmetric access token presented as the Bearer credential, and sets the
+// AuthContext for downstream use. A request without a session cookie, or with
+// a token that does not belong to the session, is refused with 401.
+func SessionAuthMiddleware(
 	store SessionStore,
 	tokenIssuer *TokenIssuer,
-	legacyIssuer *LegacyTokenIssuer,
 	audiences []string,
 	insecureCookies bool,
 	logger *zap.Logger,
 ) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Path 1: Session cookie present → new-style auth
 		authCtx, errMsg := authenticateSession(c, store, tokenIssuer, audiences, insecureCookies)
 		if errMsg != "" {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": errMsg})
 			return
 		}
-		if authCtx != nil {
-			c.Set(authContextKey, authCtx)
-			c.Set(ContextKeyClientMode, ClientModeSession)
-			logger.Debug("new-style auth",
-				zap.String("user_id", authCtx.UserID),
-				zap.String("tenant_id", authCtx.TenantID),
-			)
-			c.Next()
-			return
-		}
-
-		// Path 2: No session cookie, try legacy Bearer token
-		bearerToken := extractBearerToken(c)
-		if bearerToken == "" {
+		if authCtx == nil {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"error": "authentication required",
 			})
 			return
 		}
-
-		if legacyIssuer == nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": "legacy authentication disabled",
-			})
-			return
-		}
-
-		claims, err := legacyIssuer.Validate(bearerToken, audiences...)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": "invalid token",
-			})
-			return
-		}
-
-		c.Set(authContextKey, &AuthContext{
-			UserID:   claims.UserID,
-			DID:      claims.DID,
-			TenantID: claims.TenantID,
-			Mode:     ClientModeLegacy,
-		})
-		c.Set(ContextKeyClientMode, ClientModeLegacy)
-		logger.Debug("legacy auth",
-			zap.String("user_id", claims.UserID),
-			zap.String("tenant_id", claims.TenantID),
+		c.Set(authContextKey, authCtx)
+		logger.Debug("session auth",
+			zap.String("user_id", authCtx.UserID),
+			zap.String("tenant_id", authCtx.TenantID),
 		)
 		c.Next()
 	}

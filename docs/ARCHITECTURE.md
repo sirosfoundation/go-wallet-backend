@@ -65,7 +65,7 @@ Fully abstracted storage with multiple implementations:
 
 Business logic and orchestration:
 
-- **UserService**: User registration, authentication, JWT management
+- **UserService**: User registration and account management (tokens are issued by the AS, `internal/as`)
 - **KeystoreService**: Key management, signing operations
 - **IssuanceService** [TODO]: OpenID4VCI credential issuance
 - **VerificationService** [TODO]: OpenID4VP presentation verification
@@ -85,7 +85,7 @@ HTTP handlers using Gin framework:
 
 HTTP middleware:
 
-- **AuthMiddleware**: JWT authentication
+- **TokenAuthMiddleware**: validates AS-issued asymmetric session tokens (go-tokenauth, JWKS); HMAC tokens are never accepted
 - **Logger**: Request logging
 - **RateLimit** [TODO]: Rate limiting
 - **CORS**: Cross-origin resource sharing
@@ -119,16 +119,17 @@ config file and its own HMAC-only JWT validation) was retired in favour of:
   are validated (`config.LoadRegistryOnly`).
 - **Shared authentication.** Registry routes use the same go-tokenauth
   validator as the other roles (`pkg/middleware.TokenAuthMiddleware` when
-  `registry.require_auth` is true). The validator is built in one place
-  (`internal/server/tokenvalidator.go: buildTokenValidator`) from
-  `as.external_url` (JWKS is always `<as.external_url>/auth/.well-known/jwks.json`,
-  there is no override), `as.issuer` (falling back to `jwt.issuer`),
-  `as.legacy.enabled` and `jwt.secret`. It does not matter whether `as.enabled`
-  is true: a registry-only process does not run the authorization server but
-  validates the tokens it issues.
-- **Audience rule.** New-style (ES256) tokens must carry the `wallet-registry`
-  audience. Legacy HMAC tokens are never rejected on audience grounds while
-  `as.legacy.enabled` is true (and are rejected outright when it is false).
+  `registry.require_auth` is true). The validator is built by
+  `RegistryProvider.buildValidator` (`internal/server/providers.go`) the same
+  way as for the standalone engine and the wallet-provider: the JWKS is fetched
+  from `<as.external_url>/auth/.well-known/jwks.json` (no override) through the
+  guarded `http_client` and a loopback relay, the expected issuer is `as.issuer`
+  (falling back to `jwt.issuer`). It does not matter whether `as.enabled` is
+  true: a registry-only process does not run the authorization server but
+  validates the tokens it issues. There is no HMAC path: the legacy HMAC
+  authorization server was removed, and a deprecated registry.yaml `jwt` secret
+  is ignored with a warning (see REGISTRY_MIGRATION.md).
+- **Audience rule.** Tokens must carry the `wallet-registry` audience.
 - **Tenant and rate limiting.** The token's `tenant_id` claim is put into the
   Gin context (`tenant_id`) exactly as before and keys the authenticated rate
   limit. With `registry.require_auth: false` (default) unauthenticated access is
@@ -163,7 +164,7 @@ Client Request
 
 All application state is stored externally:
 
-- User sessions: JWT tokens (stateless) or Redis
+- User sessions: AS sessions (MongoDB-backed when shared across replicas) and short-lived asymmetric access tokens
 - WebAuthn challenges: Shared storage (MongoDB/Redis)
 - Credentials: Shared database
 
@@ -210,11 +211,11 @@ WALLET_STORAGE_MONGODB_URI=mongodb://cluster:27017
 ### Authentication
 
 1. **WebAuthn**: Hardware security keys
-2. **JWT**: Stateless session management
+2. **AS session tokens**: cookie-bound AS session + short-lived ES256/ES384/EdDSA access tokens from `/auth/token` (the legacy HMAC token flow was removed, see [new-as.md](new-as.md#removal-of-the-legacy-as))
 
 ### Authorization
 
-- JWT claims include user_id and did
+- Access token claims include `sub` (user), `tenant_id` and `tac` (permissions)
 - Middleware validates tokens
 - Handlers check permissions
 

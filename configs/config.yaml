@@ -76,10 +76,23 @@ logging:
   format: "json" # Options: json, text
 
 jwt:
+  # Server secret (>= 32 bytes). It signs no tokens any more: it keys the HMAC
+  # that binds the OIDC `state` parameter to the browser. Tokens are issued by
+  # the Authorization Server below.
   secret: "change-this-secret-in-production"
-  expiry_hours: 24
-  refresh_days: 7
+  # Fallback for as.issuer (the "iss" of AS-issued access tokens)
   issuer: "wallet-backend"
+
+# Authorization Server. AS-issued session tokens (ES256 access tokens from
+# POST /auth/token, validated through the AS JWKS) are the ONLY authentication
+# mechanism: the legacy HMAC token flow (as.legacy.*, jwt.expiry_hours,
+# jwt.refresh_days, /user/*-webauthn-*) was removed. The backend role enables
+# the AS automatically; it needs a signing key and the policy rules.
+#   openssl ecparam -name prime256v1 -genkey -noout -out as-signing-key.pem
+as:
+  enabled: true
+  signing_key_path: "configs/as-signing-key.pem"
+  rules_dir: "rules"
 
 # VCTM registry role (--mode=registry, or a role list including "registry").
 # Replaces the retired standalone registry.yaml; see docs/REGISTRY_MIGRATION.md.
@@ -108,7 +121,7 @@ registry:
     authenticated_rpm: 1000
     unauthenticated_rpm: 100
     burst_multiplier: 3
-  # true: all registry requests need a valid access token (audience
-  # "wallet-registry" for ES256 tokens; legacy HMAC tokens while
-  # as.legacy.enabled). false: unauthenticated access allowed.
+  # true: all registry requests need a valid AS-issued access token
+  # (ES256, audience "wallet-registry", validated through the JWKS at
+  # as.external_url). false: unauthenticated access allowed.
   require_auth: false

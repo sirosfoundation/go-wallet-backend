@@ -2,7 +2,7 @@ package registry
 
 import (
 	"context"
-	"errors"
+	"slices"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -12,9 +12,7 @@ import (
 	"github.com/sirosfoundation/go-tokenauth/validator"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/audience"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/legacytoken"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
@@ -23,12 +21,6 @@ import (
 // registry only adds the audience rule and the context keys its rate limiter
 // reads (AuthenticatedKey, TenantIDKey).
 type AuthConfig struct {
-	// Config supplies jwt.secret, used to read the refresh-token family (sid)
-	// of legacy tokens for family revocation. When nil, legacy tokens cannot
-	// be tied to a family and are rejected whenever a Blacklist is set (fail
-	// closed).
-	Config *config.Config
-
 	// Validator validates Bearer tokens. May be nil only when RequireAuth is
 	// false, in which case every request is treated as unauthenticated.
 	Validator *validator.Validator
@@ -46,33 +38,7 @@ type AuthConfig struct {
 	// unauthenticated.
 	RequireAuth bool
 
-	// LegacyAudienceIndependent validates legacy HMAC tokens without checking
-	// their "aud" claim (see legacytoken.ValidateAnyAudience): issuer
-	// (Config.JWT.Issuer), expiry and signature (Config.JWT.Secret) are still
-	// enforced, and the revocation/tenant checks below apply unchanged.
-	// Asymmetric tokens still go through Validator with its audience list.
-	// Set only for the deprecated registry.yaml compatibility path, which has
-	// no server.rp_id to give the validator; never for the new config shape.
-	LegacyAudienceIndependent bool
-
 	Logger *zap.Logger
-}
-
-// validateFunc returns the token validation step: the go-tokenauth validator,
-// except that, with LegacyAudienceIndependent, HMAC tokens are validated by
-// legacytoken.ValidateAnyAudience and never reach the validator (so there is
-// no fallback that could re-introduce an audience check or skip the issuer
-// check).
-func (cfg AuthConfig) validateFunc() func(context.Context, string) (*claims.Result, error) {
-	return func(ctx context.Context, raw string) (*claims.Result, error) {
-		if cfg.LegacyAudienceIndependent && legacytoken.IsHMAC(raw) {
-			if cfg.Config == nil {
-				return nil, errors.New("registry: no configuration for legacy token validation")
-			}
-			return legacytoken.ValidateAnyAudience(cfg.Config.JWT.Secret, []string{cfg.Config.JWT.Issuer}, raw)
-		}
-		return cfg.Validator.Validate(ctx, raw)
-	}
 }
 
 // anyTenant accepts every tenant id; used when there is no tenant store.
@@ -85,10 +51,8 @@ func (anyTenant) GetByID(_ context.Context, id domain.TenantID) (*domain.Tenant,
 // AuthMiddlewares returns the authentication middleware chain for the
 // registry routes.
 //
-// Audience rule: new-style (asymmetric) tokens must carry the
-// "wallet-registry" audience; legacy HMAC tokens are never rejected on
-// audience grounds (whether they are accepted at all is decided by
-// as.legacy.enabled in the validator).
+// Audience rule: tokens must carry the "wallet-registry" audience; only AS-issued ES256 tokens
+// validated through the AS JWKS are accepted.
 //
 // After a successful validation the context has AuthenticatedKey=true and,
 // when the token has a tenant_id claim, TenantIDKey set to it.
@@ -106,11 +70,7 @@ func AuthMiddlewares(cfg AuthConfig) []gin.HandlerFunc {
 	if tenants == nil {
 		tenants = anyTenant{}
 	}
-	mwCfg := cfg.Config
-	if mwCfg == nil {
-		mwCfg = &config.Config{}
-	}
-	strict := middleware.TokenAuthMiddlewareWithValidate(mwCfg, cfg.validateFunc(), tenants, cfg.Blacklist, logger)
+	strict := middleware.TokenAuthMiddleware(cfg.Validator, tenants, cfg.Blacklist, logger)
 	return []gin.HandlerFunc{
 		strict,
 		func(c *gin.Context) {
@@ -135,30 +95,12 @@ func AuthMiddlewares(cfg AuthConfig) []gin.HandlerFunc {
 
 // acceptedInOptionalMode applies the same tenant and revocation checks as the
 // strict chain; a failure downgrades the request to unauthenticated.
-func acceptedInOptionalMode(c *gin.Context, cfg AuthConfig, res *claims.Result, rawToken string, logger *zap.Logger) bool {
+func acceptedInOptionalMode(c *gin.Context, cfg AuthConfig, res *claims.Result, logger *zap.Logger) bool {
 	ctx := c.Request.Context()
 	if cfg.Blacklist != nil {
 		if (res.JTI != "" && cfg.Blacklist.IsBlacklisted(ctx, res.JTI)) || cfg.Blacklist.IsUserRevoked(ctx, res.UserID) {
 			logger.Debug("registry token revoked, continuing unauthenticated")
 			return false
-		}
-		// Refresh-token family revocation, legacy tokens only (as in
-		// TokenAuthMiddleware). Fail closed: if the family cannot be
-		// determined the token is not treated as authenticated.
-		if res.Mode == claims.ModeLegacy {
-			secret := ""
-			if cfg.Config != nil {
-				secret = cfg.Config.JWT.Secret
-			}
-			sid, err := legacytoken.ParseSID(secret, rawToken)
-			if err != nil {
-				logger.Debug("cannot determine refresh-token family of legacy registry token, continuing unauthenticated", zap.Error(err))
-				return false
-			}
-			if sid != "" && cfg.Blacklist.IsFamilyRevoked(ctx, sid) {
-				logger.Debug("registry token family revoked, continuing unauthenticated")
-				return false
-			}
 		}
 	}
 	if cfg.Tenants != nil {
@@ -186,7 +128,7 @@ func resultFrom(c *gin.Context) *claims.Result {
 
 // audienceAllowed implements the registry audience rule.
 func audienceAllowed(res *claims.Result) bool {
-	return audience.Allowed(res, true, config.RegistryAudience)
+	return slices.Contains(res.Audience, config.RegistryAudience)
 }
 
 func markAuthenticated(c *gin.Context, res *claims.Result) {
@@ -204,7 +146,6 @@ func markAuthenticated(c *gin.Context, res *claims.Result) {
 // optionalAuth recognises valid tokens but never rejects a request.
 func optionalAuth(cfg AuthConfig, logger *zap.Logger) gin.HandlerFunc {
 	v := cfg.Validator
-	validate := cfg.validateFunc()
 	return func(c *gin.Context) {
 		c.Set(string(AuthenticatedKey), false)
 
@@ -219,7 +160,7 @@ func optionalAuth(cfg AuthConfig, logger *zap.Logger) gin.HandlerFunc {
 			return
 		}
 		rawToken := strings.TrimSpace(parts[1])
-		res, err := validate(c.Request.Context(), rawToken)
+		res, err := v.Validate(c.Request.Context(), rawToken)
 		if err != nil {
 			logger.Debug("registry token validation failed, continuing unauthenticated", zap.Error(err))
 			c.Next()
@@ -231,7 +172,7 @@ func optionalAuth(cfg AuthConfig, logger *zap.Logger) gin.HandlerFunc {
 			c.Next()
 			return
 		}
-		if !acceptedInOptionalMode(c, cfg, res, rawToken, logger) {
+		if !acceptedInOptionalMode(c, cfg, res, logger) {
 			c.Next()
 			return
 		}

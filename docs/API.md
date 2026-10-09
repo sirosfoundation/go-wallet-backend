@@ -21,11 +21,26 @@ See [openapi-admin.yaml](./openapi-admin.yaml) for the complete OpenAPI 3.0 spec
 
 ## Authentication
 
-Most endpoints require a JWT token in the `Authorization` header:
+Most endpoints require an access token issued by the Authorization Server in the `Authorization` header:
 
 ```
 Authorization: Bearer <token>
 ```
+
+Access tokens are short-lived, asymmetrically signed (ES256/ES384/EdDSA) JWTs. A client obtains one
+by authenticating with a passkey (or OIDC) in **session mode** and then calling the token endpoint:
+
+1. `POST /auth/passkey/login/begin` and `POST /auth/passkey/login/finish` (registration:
+   `/auth/passkey/register/{begin,finish}`) with the header `X-Token-Mode: session`. The
+   finish step sets the `__Host-session` cookie; the body carries no token.
+2. `POST /auth/token` (with the session cookie) returns an access token for a given
+   audience; keys are published at `/auth/.well-known/jwks.json`.
+3. `DELETE /auth/session` ends the session.
+
+The legacy HS256 `appToken` flow (`/user/register-webauthn-*`, `/user/login-webauthn-*`,
+`/user/session/refresh`, requests without `X-Token-Mode: session`) was removed and answers
+`410 {"error":"legacy_tokens_disabled"}`; HS256 bearer tokens are rejected with 401. See
+[new-as.md](new-as.md#removal-of-the-legacy-as).
 
 ## Endpoints
 
@@ -52,55 +67,18 @@ Health check endpoint.
 Removed. Password authentication no longer exists; both endpoints return
 HTTP 410 Gone. Use the WebAuthn endpoints below.
 
-#### POST /user/webauthn/register/start
+#### POST /auth/passkey/register/begin and POST /auth/passkey/register/finish
 
-Start WebAuthn registration (passwordless).
+Passwordless WebAuthn registration. Send `X-Token-Mode: session` (and `X-Tenant-ID` for a tenant).
+`begin` returns `{"challengeId", "createOptions": {"publicKey": {...}}}`; `finish` takes
+`{"challengeId", "credential": {...}, "displayName", "privateData"}` and, on success, creates an
+AS session (cookie) and returns `{"uuid", "displayName", "tenantId", "tenantDisplayName"}`.
 
-**Request:**
-```json
-{
-  "username": "alice",
-  "display_name": "Alice Smith"
-}
-```
+#### POST /auth/passkey/login/begin and POST /auth/passkey/login/finish
 
-**Response:**
-```json
-{
-  "options": {
-    "publicKey": {
-      "challenge": "...",
-      "rp": {...},
-      "user": {...},
-      "pubKeyCredParams": [...]
-    }
-  }
-}
-```
-
-#### POST /user/webauthn/register/finish
-
-Finish WebAuthn registration.
-
-**Request:**
-```json
-{
-  "credential": {
-    "id": "...",
-    "rawId": "...",
-    "response": {...},
-    "type": "public-key"
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "user_id": "550e8400-e29b-41d4-a716-446655440000",
-  "did": "did:key:..."
-}
-```
+Same shape for login: `begin` returns `{"challengeId", "getOptions": {"publicKey": {...}}}`;
+`finish` takes `{"challengeId", "credential": {...}}`, sets the session cookie and returns the same
+body as registration.
 
 ---
 

@@ -229,14 +229,16 @@ make dev
 
 **Note:** Password-based authentication has been deprecated. All user authentication uses WebAuthn (passkeys/hardware security keys).
 
-- `POST /webauthn/register/start` - Start WebAuthn registration
-- `POST /webauthn/register/finish` - Finish WebAuthn registration  
-- `POST /webauthn/login/start` - Start WebAuthn login
-- `POST /webauthn/login/finish` - Finish WebAuthn login
+- `POST /auth/passkey/register/begin` - Start WebAuthn registration (send `X-Token-Mode: session`)
+- `POST /auth/passkey/register/finish` - Finish WebAuthn registration (sets the session cookie)
+- `POST /auth/passkey/login/begin` - Start WebAuthn login
+- `POST /auth/passkey/login/finish` - Finish WebAuthn login (sets the session cookie)
+- `POST /auth/token` - Exchange the session for a short-lived access token
+- `DELETE /auth/session` - Log out
 
-**Deprecated endpoints (return HTTP 410 Gone):**
-- `POST /user/register` - Use WebAuthn registration instead
-- `POST /user/login` - Use WebAuthn login instead
+**Removed endpoints (return HTTP 410 Gone):**
+- `POST /user/register`, `POST /user/login` - password authentication
+- `POST /user/{register,login}-webauthn-*`, `POST /user/session/refresh` - the legacy HMAC `appToken` flow (see [docs/new-as.md](docs/new-as.md#removal-of-the-legacy-as))
 
 #### Storage (Authenticated)
 - `GET /storage/vc` - Get all credentials
@@ -399,7 +401,7 @@ The application is designed to run on:
 
 ## Security
 
-- **Authentication**: JWT-based with WebAuthn support
+- **Authentication**: AS-issued asymmetric session tokens (WebAuthn/OIDC login, JWKS-validated); the legacy HMAC token flow was removed
 - **Encryption**: All sensitive data encrypted at rest
 - **HTTPS**: TLS 1.3 recommended for production
 - **CORS**: Configurable cross-origin policies

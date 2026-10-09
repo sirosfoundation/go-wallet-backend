@@ -25,8 +25,7 @@ the backend config and protected by the shared go-tokenauth validator
 | `filter.*` | `registry.filter.*` |
 | `rate_limit.*` | `registry.rate_limit.*` |
 | `jwt.require_auth` | `registry.require_auth` (`WALLET_REGISTRY_REQUIRE_AUTH`); a value set explicitly in the new configuration wins |
-| `jwt.secret`, `jwt.secret_path` | top-level `jwt.secret` / `jwt.secret_path` (legacy HMAC only, see below). Registry-only processes only: the old values are used when no `jwt.secret` is already configured, and the old `secret_path` is read only while `as.legacy.enabled` is true; in a combined process they are ignored |
-| `jwt.issuer` | top-level `jwt.issuer` (the expected `iss` of legacy HMAC tokens; registry-only processes only, ignored in a combined process). `as.issuer` is separate: it is the expected `iss` of asymmetric (AS-issued) tokens and falls back to `jwt.issuer` when unset, so set it explicitly if AS-issued tokens use a different issuer |
+| `jwt.secret`, `jwt.secret_path`, `jwt.issuer` | **ignored, with a loud `DEPRECATED ... IGNORED` startup warning.** They configured HMAC (HS256) token validation, and the legacy HMAC authorization server was removed, so there is nothing left to validate with them (the secret file is not even read, so a missing one does not fail startup). The registry validates AS-issued tokens only: set `as.external_url` and `as.issuer` (falls back to the backend's `jwt.issuer`) instead |
 | `server.host`, `server.port` | `server.registry_host`, `server.registry_port` when the registry runs alone; ignored in a combined process, which uses the backend's own listen settings |
 | `server.cors`, `server.tls`, `server.served_by_header` | `server.cors`, `server.tls`, `server.served_by_header` (registry-only processes only; ignored in a combined process) |
 | `logging.*` | `logging.*` (registry-only processes only) |
@@ -45,46 +44,41 @@ to move them under `registry:`.
 
 ## Authentication changes
 
-The registry no longer validates HMAC JWTs on its own. With
+The registry no longer validates HMAC JWTs on its own, and no HMAC token is
+accepted at all any more (the legacy HMAC authorization server was removed). With
 `registry.require_auth: true` it uses the go-tokenauth validator like the other
 roles, also when the process does not run the authorization server:
 
-- new-style (ES256/ES384/EdDSA) tokens are verified against
-  `<as.external_url>/auth/.well-known/jwks.json` (no override) and must carry
-  the `wallet-registry` audience;
-- legacy HMAC tokens are accepted while `as.legacy.enabled` is true, are checked
-  against `jwt.secret` (>= 32 bytes) and are never rejected because of the
-  audience list;
-- legacy validation also needs `server.rp_id` set to the RP ID of the backend
-  that issued the tokens (their `aud` claim; go-tokenauth applies the audience
-  list to legacy tokens too, so the registry cannot exempt them). A registry-only
-  process using the new configuration refuses to start with the default
-  `localhost` while legacy HMAC validation is enabled (the deprecated alias is
-  exempt, see below);
-- `as.external_url`, `as.issuer` (or `jwt.issuer`) and, while legacy is enabled,
-  `jwt.secret`/`jwt.secret_path` must be set; startup names the missing ones.
+- ES256/ES384/EdDSA access tokens are verified against
+  `<as.external_url>/auth/.well-known/jwks.json` (no override; fetched through
+  the guarded `http_client`, so plain `http` needs `http_client.allow_http`) and
+  must carry the `wallet-registry` audience;
+- `as.external_url` and `as.issuer` (or `jwt.issuer`) must be set; startup
+  names the missing ones. `jwt.secret` is not needed.
 
-Deprecated alias and `server.rp_id`: the old registry schema has no `rp_id`. A
-registry-only process started from the deprecated `registry.yaml` / `REGISTRY_*`
-alias that has a shared HMAC secret (`jwt.secret` mapped from the old `jwt`
-block or set in the backend config), `as.legacy.enabled` and no explicit
-`server.rp_id` therefore keeps starting for this release. On that path legacy
-HMAC tokens are validated **without an audience (`aud`) check**; everything else
-is still enforced: HMAC signature with `jwt.secret`, `iss` equal to
-`jwt.issuer`, a present and unexpired `exp` (5s leeway), and the jti, user and
-refresh-token-family revocation checks and tenant checks (invalid tokens are
-401; with `require_auth: false` they are treated as unauthenticated). New-style
-(asymmetric) tokens keep their `wallet-registry` audience rule. A `DEPRECATED`
-warning is logged at startup. Setting `server.rp_id` (`WALLET_SERVER_RP_ID`) to
-the issuing backend's RP ID switches the process to the strict new behaviour
-(audience checked); the new configuration shape requires it and fails startup
-otherwise. This compatibility path is removed together with the deprecated
-configuration.
+With `require_auth: false` the registry still recognises valid tokens when
+`as.external_url` is set (they raise the rate limit); anything else, including
+HMAC tokens, is served as unauthenticated.
 
-Deployments that migrate through the deprecated alias with the old HMAC-only
-`jwt.require_auth: true` and no `as.external_url` keep starting (with a warning)
-and continue to accept HMAC tokens; set `as.external_url` to accept AS-issued
-tokens. Old registry secrets shorter than 32 bytes are no longer accepted; this is checked whenever legacy HMAC validation would use the secret (`as.legacy.enabled`), also with `require_auth: false`. The missing-`as.external_url` tolerance for the alias only applies while `as.legacy.enabled` is true.
+### What a deployment with an old registry.yaml gets
+
+The same rule as for the rest of the backend applies: a setting that *requests*
+the removed legacy AS fails startup, a leftover that merely *configured* it is
+ignored with a warning.
+
+- `as.legacy.enabled=true` (or `WALLET_AS_LEGACY_ENABLED=true`) is refused,
+  exactly as by the backend (`as.legacy.enabled=false`, and the other
+  `as.legacy.*` settings, are accepted and ignored with a warning).
+- The deprecated registry `jwt` block (`secret`, `secret_path`, `issuer`) is
+  **ignored with a loud warning**: HMAC tokens signed with that secret are
+  rejected (401 with `require_auth`, otherwise served as unauthenticated). There
+  is no audience-independent compatibility path and no `server.rp_id`
+  requirement any more.
+- `jwt.require_auth: true` still maps to `registry.require_auth`, but without
+  `as.external_url` the registry has no way to authenticate anyone, so startup
+  **fails** (naming `as.external_url`) instead of starting in a state where every
+  request is refused or, worse, unauthenticated. Set `as.external_url` and
+  migrate clients to AS-issued session tokens.
 
 ## Example
 
@@ -107,7 +101,7 @@ registry:
   require_auth: true
 as:
   external_url: https://wallet.example.org
-jwt: {secret_path: /run/secrets/jwt, issuer: wallet-backend}
+  issuer: wallet-backend   # expected "iss" of the AS-issued tokens
 ```
 
 or, combined, put the `registry:` block into the existing backend config and
@@ -141,8 +135,8 @@ registry.
 
 ## Secrets in registry-only mode
 
-A registry-only process only reads `jwt.secret_path`, and only while
-`as.legacy.enabled` is true. Backend-only secret paths (admin token, MongoDB
-password, wallet-provider PIN/keys) are not read and need not be mounted. The
-deprecated `jwt.secret_path` of an old registry file is only read when the
-registry runs alone; in a combined process the backend's `jwt.*` is used.
+A registry-only process reads no secret files: it validates tokens through the
+AS JWKS and needs no `jwt.secret` / `jwt.secret_path`. Backend-only secret paths
+(admin token, MongoDB password, wallet-provider PIN/keys) are not read either
+and need not be mounted. The `jwt.secret_path` of an old registry file is never
+read.

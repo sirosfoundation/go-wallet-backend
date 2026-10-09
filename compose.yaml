@@ -8,6 +8,9 @@ services:
       - "8002:8080"
     volumes:
       - "./configs/config.yaml:/app/configs/config.yaml"
+      # AS signing key (see the `as:` section of config.yaml; generate with
+      #   openssl ecparam -name prime256v1 -genkey -noout -out configs/as-signing-key.pem)
+      - "./configs/as-signing-key.pem:/app/configs/as-signing-key.pem:ro"
     # Note: healthcheck is not configured because the distroless runtime image
     # doesn't have curl, wget, or a shell. A proper healthcheck would require
     # building a custom health binary into the image.

@@ -40,8 +40,7 @@ type AuthProvider struct {
 	roles          []string
 	tokenValidator *tokenvalidator.Validator
 	wiaRateLimiter *middleware.AuthRateLimiter
-	// gateRateLimiter is shared by the /user/* gates and the AS passkey gates,
-	// so both draw from the same per-IP and per-tenant buckets (#65).
+	// gateRateLimiter feeds the AS module's passkey OIDC gates (per-IP and per-tenant buckets).
 	gateRateLimiter *middleware.OIDCGateRateLimiter
 }
 
@@ -72,24 +71,15 @@ func (p *AuthProvider) Name() string         { return "auth" }
 // Services returns the auth provider's service aggregate.
 func (p *AuthProvider) Services() *service.Services { return p.services }
 
-// legacyIssuanceGate answers 410 on the /user/* routes that mint HS256 tokens
-// when as.legacy.enabled=false. It must precede any OIDC gate.
-func (p *AuthProvider) legacyIssuanceGate() gin.HandlerFunc {
-	return middleware.LegacyIssuanceGate(p.cfg.LegacyEnabled())
-}
-
-// LogLegacyTokenStatus logs whether legacy (HMAC) tokens are enabled. It is
-// called once per process from cmd/server/main.go; providers must not call it.
+// LogLegacyTokenStatus logs the legacy AS removal and warns about settings that no longer have
+// effect (Config.DeprecatedSettings). Call it once per process from cmd/server;
+// as.legacy.enabled=true never gets this far (Config.Validate refuses it).
 func LogLegacyTokenStatus(cfg *config.Config, logger *zap.Logger) {
 	for _, name := range cfg.DeprecatedSettings() {
-		logger.Warn("Deprecated configuration setting is ignored and has no effect; sunsetting the legacy AS is done only by as.legacy.enabled=false",
+		logger.Warn("Ignoring removed configuration setting: the legacy HMAC authorization server no longer exists; remove this setting",
 			zap.String("setting", name))
 	}
-	if cfg.LegacyEnabled() {
-		logger.Info("Legacy HMAC session tokens are enabled (as.legacy.enabled=true)")
-		return
-	}
-	logger.Warn("Legacy HMAC session tokens are DISABLED (as.legacy.enabled=false): HMAC validation is refused and legacy issuance answers 410")
+	logger.Info("The legacy HMAC authorization server has been removed: only AS-issued session tokens (X-Token-Mode: session) are accepted; legacy clients get 410 legacy_tokens_disabled")
 }
 
 // Close stops background workers in the auth provider.
@@ -99,71 +89,19 @@ func (p *AuthProvider) Close() error {
 }
 
 func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
-	// Create HTTP client and OIDC validator cache for gate middleware
-	httpClient := p.cfg.HTTPClient.NewHTTPClient(0)
-	validatorCache := middleware.NewValidatorCache(httpClient, p.logger)
-	gateLimit := p.gateRateLimiter.Middleware()
-
 	// Public auth routes (no authentication required)
 	public := router.Group("/")
 	{
-		// Base user group with tenant middleware
-		userBase := public.Group("/user")
-		userBase.Use(middleware.TenantHeaderMiddleware(p.store))
-
-		// Registration routes (with OIDC registration gate)
-		registration := userBase.Group("")
-		registration.Use(
-			middleware.NoCacheMiddleware(),
-			gateLimit,
-			p.legacyIssuanceGate(),
-			middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeRegistration, p.logger),
-		)
+		// The removed login/registration/refresh endpoints answer 410 legacy_tokens_disabled for one
+		// release, pointing at /auth/passkey/* with X-Token-Mode: session.
+		removed := public.Group("/user")
+		removed.Use(middleware.NoCacheMiddleware(), middleware.LegacyEndpointRemoved())
 		{
-			registration.POST("/register-webauthn-begin", p.handlers.StartWebAuthnRegistration)
-			registration.POST("/register-webauthn-finish", p.handlers.FinishWebAuthnRegistration)
-		}
-
-		// Login routes (with OIDC login gate)
-		login := userBase.Group("")
-		login.Use(
-			middleware.NoCacheMiddleware(),
-			gateLimit,
-			p.legacyIssuanceGate(),
-			middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeLogin, p.logger),
-		)
-		{
-			login.POST("/login-webauthn-begin", p.handlers.StartWebAuthnLogin)
-			login.POST("/login-webauthn-finish", p.handlers.FinishWebAuthnLogin)
-		}
-
-		// Refresh route: exchanges a still-valid refresh token for a new
-		// access token (and a rotated refresh token). Deliberately NOT behind
-		// authMiddleware()/TokenAuthMiddleware - the entire point of a
-		// refresh token is to obtain a new access token once the old one has
-		// expired, so requiring a currently-valid access token here would be
-		// self-defeating. No OIDC gate either: possessing the long-lived
-		// refresh token (itself a signed, type-checked JWT - see
-		// WebAuthnService.RefreshAccessToken) is the credential. This handler
-		// existed since refresh tokens were added but, like Logout before
-		// #391, was never actually mounted on any route (#392).
-		//
-		// Only mounted when refresh tokens are actually enabled
-		// (JWT.RefreshDays > 0): with the route always present, a deployment
-		// that has them turned off (the checked-in default) would still
-		// answer every call with a 5xx-class status from
-		// WebAuthnService.RefreshAccessToken's ErrRefreshDisabled, which
-		// looks like a server malfunction to callers/monitoring for what is
-		// actually an expected, admin-controlled config choice (Copilot
-		// review on #400 - a 503 fallback still counted as "still a 5xx").
-		// Omitting the route entirely instead answers with gin's ordinary
-		// 404, indistinguishable from any other unsupported endpoint.
-		if p.cfg.JWT.RefreshDays > 0 {
-			refresh := userBase.Group("/session")
-			refresh.Use(middleware.NoCacheMiddleware(), p.legacyIssuanceGate())
-			{
-				refresh.POST("/refresh", p.handlers.RefreshToken)
-			}
+			removed.POST("/register-webauthn-begin")
+			removed.POST("/register-webauthn-finish")
+			removed.POST("/login-webauthn-begin")
+			removed.POST("/login-webauthn-finish")
+			removed.POST("/session/refresh")
 		}
 
 		// Public tenant configuration (for OIDC gate discovery)
@@ -190,21 +128,17 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	)
 	// These are general user-facing routes, not the narrow-purpose calls
 	// (trust evaluation, engine transport) an identity-free anonymous token
-	// is scoped to - reject a wallet-registry-only token here. Only
-	// enforced under go-tokenauth; legacy AuthMiddleware never populates
-	// tokenauth_result (see RequireAudience's doc comment).
-	if p.tokenValidator != nil {
-		protected.Use(middleware.RequireAudience("wallet-backend"))
-	}
+	// is scoped to - reject a wallet-registry-only token here.
+	protected.Use(middleware.RequireAudience("wallet-backend"))
 	{
 		// User session routes (authenticated)
 		session := protected.Group("/user/session")
 		{
-			session.GET("/account-info", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.GetAccountInfo)
-			session.POST("/settings", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.UpdateSettings)
-			session.GET("/private-data", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.GetPrivateData)
-			session.POST("/private-data", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.UpdatePrivateData)
-			session.DELETE("/", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteUser)
+			session.GET("/account-info", middleware.MustHaveTAC("r"), p.handlers.GetAccountInfo)
+			session.POST("/settings", middleware.MustHaveTAC("w"), p.handlers.UpdateSettings)
+			session.GET("/private-data", middleware.MustHaveTAC("r"), p.handlers.GetPrivateData)
+			session.POST("/private-data", middleware.MustHaveTAC("w"), p.handlers.UpdatePrivateData)
+			session.DELETE("/", middleware.MustHaveTAC("d"), p.handlers.DeleteUser)
 			// Logout: blacklists the caller's own current token (see
 			// api.Handlers.Logout / #382). This handler existed since the
 			// blacklist itself was added but was never actually registered
@@ -214,54 +148,54 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 			// satisfied): revoking your own already-presented token isn't a
 			// read/write/list/insert/delete on any object, just proof you
 			// hold a valid token at all.
-			session.POST("/logout", requireTACIfEnforced(p.tokenValidator, ""), p.handlers.Logout)
+			session.POST("/logout", middleware.MustHaveTAC(""), p.handlers.Logout)
 
 			// WebAuthn credential management
-			session.POST("/webauthn/register-begin", requireTACIfEnforced(p.tokenValidator, "i"), p.handlers.StartAddWebAuthnCredential)
-			session.POST("/webauthn/register-finish", requireTACIfEnforced(p.tokenValidator, "i"), p.handlers.FinishAddWebAuthnCredential)
-			session.POST("/webauthn/credential/:id/rename", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.RenameWebAuthnCredential)
-			session.POST("/webauthn/credential/:id/delete", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteWebAuthnCredential)
+			session.POST("/webauthn/register-begin", middleware.MustHaveTAC("i"), p.handlers.StartAddWebAuthnCredential)
+			session.POST("/webauthn/register-finish", middleware.MustHaveTAC("i"), p.handlers.FinishAddWebAuthnCredential)
+			session.POST("/webauthn/credential/:id/rename", middleware.MustHaveTAC("w"), p.handlers.RenameWebAuthnCredential)
+			session.POST("/webauthn/credential/:id/delete", middleware.MustHaveTAC("d"), p.handlers.DeleteWebAuthnCredential)
 		}
-		protected.DELETE("/user/session", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteUser)
+		protected.DELETE("/user/session", middleware.MustHaveTAC("d"), p.handlers.DeleteUser)
 
 		// Issuer routes
 		issuerGroup := protected.Group("/issuer")
 		{
-			issuerGroup.GET("/all", requireTACIfEnforced(p.tokenValidator, "l"), p.handlers.GetAllIssuers)
-			issuerGroup.GET("/:id/metadata", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.GetIssuerMetadata)
+			issuerGroup.GET("/all", middleware.MustHaveTAC("l"), p.handlers.GetAllIssuers)
+			issuerGroup.GET("/:id/metadata", middleware.MustHaveTAC("r"), p.handlers.GetIssuerMetadata)
 		}
 
 		// Verifier routes
 		verifierGroup := protected.Group("/verifier")
 		{
-			verifierGroup.GET("/all", requireTACIfEnforced(p.tokenValidator, "l"), p.handlers.GetAllVerifiers)
+			verifierGroup.GET("/all", middleware.MustHaveTAC("l"), p.handlers.GetAllVerifiers)
 		}
 
 		// Helper routes
-		protected.POST("/helper/get-cert", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.GetCertificate)
+		protected.POST("/helper/get-cert", middleware.MustHaveTAC("r"), p.handlers.GetCertificate)
 
 		// Proxy routes (can be disabled via features.proxy_enabled)
 		if p.cfg.Features.ProxyEnabled {
-			protected.POST("/proxy", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.ProxyRequest)
+			protected.POST("/proxy", middleware.MustHaveTAC("r"), p.handlers.ProxyRequest)
 		}
 
 		// Keystore routes
 		keystoreGroup := protected.Group("/keystore")
 		{
-			keystoreGroup.GET("/status", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.KeystoreStatus)
+			keystoreGroup.GET("/status", middleware.MustHaveTAC("r"), p.handlers.KeystoreStatus)
 		}
 
 		// Wallet provider routes
 		walletProvider := protected.Group("/wallet-provider")
 		{
-			walletProvider.POST("/key-attestation/generate", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.GenerateKeyAttestation)
+			walletProvider.POST("/key-attestation/generate", middleware.MustHaveTAC("w"), p.handlers.GenerateKeyAttestation)
 			if p.cfg.WalletProvider.WIA.Enabled && p.services.WIA != nil {
 				wiaLimit := middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier)
-				walletProvider.POST("/wia/challenge", wiaLimit, requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.WIAChallenge)
-				walletProvider.POST("/wia/generate", wiaLimit, requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.WIAGenerate)
+				walletProvider.POST("/wia/challenge", wiaLimit, middleware.MustHaveTAC("w"), p.handlers.WIAChallenge)
+				walletProvider.POST("/wia/generate", wiaLimit, middleware.MustHaveTAC("w"), p.handlers.WIAGenerate)
 			}
 			if p.services.FIDO2Attestation != nil && p.services.FIDO2Attestation.IsEnabled() {
-				walletProvider.POST("/fido2-attestation/register", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.FIDO2AttestationRegister)
+				walletProvider.POST("/fido2-attestation/register", middleware.MustHaveTAC("w"), p.handlers.FIDO2AttestationRegister)
 			}
 		}
 	}
@@ -281,32 +215,23 @@ func wiaCallerIdentifier(c *gin.Context) string {
 	return ""
 }
 
-// authMiddleware returns the appropriate auth middleware: go-tokenauth when
-// a validator is available (AS enabled), legacy HMAC AuthMiddleware otherwise.
+// authMiddleware returns the go-tokenauth middleware validating AS-issued
+// session tokens. See sessionAuthMiddleware for the no-validator case.
 func (p *AuthProvider) authMiddleware() gin.HandlerFunc {
-	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.cfg, p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger)
-	}
-	// AuthMiddlewareWithBlacklist, not the bare AuthMiddleware wrapper: the
-	// latter hardcodes a nil blacklist, which is exactly what left Logout's
-	// blacklist writes (see api.Handlers.Logout) never actually checked by
-	// anything (#382).
-	return middleware.AuthMiddlewareWithBlacklist(p.cfg, p.store, p.services.TokenBlacklist, p.logger)
+	return sessionAuthMiddleware(p.tokenValidator, p.store, p.services.TokenBlacklist, p.logger)
 }
 
-// requireTACIfEnforced returns MustHaveTAC(required) when tv is non-nil (the
-// go-tokenauth path is active, so tokenauth_result - and therefore a TAC to
-// check - is actually populated). When tv is nil, the legacy HMAC
-// AuthMiddleware path is in effect instead, which has no TAC concept at all
-// (see AuthMiddleware) - MustHaveTAC would 401 every request there since it
-// never finds tokenauth_result, so this no-ops instead of enforcing.
-// Mirrors RequireAudience's own identical conditional application, for the
-// same reason.
-func requireTACIfEnforced(tv *tokenvalidator.Validator, required string) gin.HandlerFunc {
+// sessionAuthMiddleware builds the auth middleware shared by every provider. Without a validator
+// every protected request gets 401 (fail closed); constructors refuse to start in that state
+// (requireSessionAuthMechanism), so this only guards a directly built provider.
+func sessionAuthMiddleware(tv *tokenvalidator.Validator, store backend.Backend, blacklist *service.TokenBlacklist, logger *zap.Logger) gin.HandlerFunc {
 	if tv == nil {
-		return func(c *gin.Context) { c.Next() }
+		return func(c *gin.Context) {
+			logger.Error("no token validator configured; refusing protected request", zap.String("path", c.FullPath()))
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+		}
 	}
-	return middleware.MustHaveTAC(required)
+	return middleware.TokenAuthMiddleware(tv, store.Tenants(), blacklist, logger)
 }
 
 // =============================================================================
@@ -359,32 +284,23 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 	// Credential storage is a general user-facing route, not one of the
 	// narrow purposes (trust evaluation, engine transport) an anonymous
 	// token is scoped to - reject a wallet-registry-only token here.
-	if p.tokenValidator != nil {
-		protected.Use(middleware.RequireAudience("wallet-backend"))
-	}
+	protected.Use(middleware.RequireAudience("wallet-backend"))
 	{
 		// Credential storage (gated)
 		if p.cfg.Features.CredentialStorageEnabled {
-			protected.GET("/vc", requireTACIfEnforced(p.tokenValidator, "l"), p.handlers.GetAllCredentials)
-			protected.POST("/vc", requireTACIfEnforced(p.tokenValidator, "i"), p.handlers.StoreCredential)
-			protected.POST("/vc/update", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.UpdateCredential)
-			protected.GET("/vc/:credential_identifier", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.GetCredentialByIdentifier)
-			protected.DELETE("/vc/:credential_identifier", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteCredential)
+			protected.GET("/vc", middleware.MustHaveTAC("l"), p.handlers.GetAllCredentials)
+			protected.POST("/vc", middleware.MustHaveTAC("i"), p.handlers.StoreCredential)
+			protected.POST("/vc/update", middleware.MustHaveTAC("w"), p.handlers.UpdateCredential)
+			protected.GET("/vc/:credential_identifier", middleware.MustHaveTAC("r"), p.handlers.GetCredentialByIdentifier)
+			protected.DELETE("/vc/:credential_identifier", middleware.MustHaveTAC("d"), p.handlers.DeleteCredential)
 		}
 	}
 }
 
-// authMiddleware returns the appropriate auth middleware for storage routes.
+// authMiddleware returns the auth middleware for storage routes. Under BackendProvider,
+// p.services.TokenBlacklist is replaced by the AuthProvider's instance so revocation applies here too.
 func (p *StorageProvider) authMiddleware() gin.HandlerFunc {
-	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.cfg, p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger)
-	}
-	// See AuthProvider.authMiddleware's comment - same fix (#382). When this
-	// provider is combined with an AuthProvider under BackendProvider,
-	// p.services.TokenBlacklist is overwritten to share that AuthProvider's
-	// instance, so a token blacklisted via Logout/DeleteUser is honored here
-	// too, not just on /user/session routes.
-	return middleware.AuthMiddlewareWithBlacklist(p.cfg, p.store, p.services.TokenBlacklist, p.logger)
+	return sessionAuthMiddleware(p.tokenValidator, p.store, p.services.TokenBlacklist, p.logger)
 }
 
 // =============================================================================
@@ -494,38 +410,15 @@ type StandaloneValidator struct {
 // Close stops the background JWKS refresh.
 func (v StandaloneValidator) Close() error { v.Stop(); return nil }
 
-// legacyValidatorConfig builds the legacy (HMAC) validator settings. The
-// accepted issuer is pinned to jwt.issuer (what legacy tokens carry, and which
-// may differ from as.issuer) because the validator's top-level Issuer gates only
-// asymmetric tokens. Exactly one issuer: go-tokenauth enforces Issuers[0]
-// strictly. Callers must have passed requireLegacyIssuer first.
-func legacyValidatorConfig(cfg *config.Config, enabled bool) tokenvalidator.LegacyConfig {
-	lc := tokenvalidator.LegacyConfig{
-		Enabled:    enabled,
-		HMACSecret: []byte(cfg.JWT.Secret),
-	}
-	if cfg.JWT.Issuer != "" {
-		lc.Issuers = []string{cfg.JWT.Issuer}
-	}
-	return lc
-}
-
-// NewStandaloneEngineTokenValidator builds the validator for an engine without
-// a backend (--mode=engine). The JWKS comes from as.external_url; without it
-// legacy HMAC must be enabled or startup fails. Returns (nil, nil) when no
-// validator is needed.
+// NewStandaloneEngineTokenValidator builds the token validator for an engine running without a backend
+// provider (--mode=engine). The JWKS comes from as.external_url; without it every connection would be
+// rejected, so it returns an error and startup fails.
 //
-// Limitation: a standalone engine has no revocation source (tracked in #407 and
-// #415), so a token stays valid until it expires even after logout.
+// A standalone engine has no revocation source (shared blacklist tracked in #407 and #415): a token
+// stays valid until it expires, even after logout or user revocation. A warning is logged.
 func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (*StandaloneValidator, error) {
-	if err := requireLegacyIssuer(cfg, "standalone engine"); err != nil {
-		return nil, err
-	}
 	if cfg.AS.ExternalURL == "" {
-		if !cfg.LegacyEnabled() {
-			return nil, fmt.Errorf("standalone engine with as.legacy.enabled=false needs as.external_url to fetch the AS JWKS; refusing to start with no way to authenticate connections")
-		}
-		return nil, nil
+		return nil, fmt.Errorf("standalone engine needs as.external_url to fetch the AS JWKS; refusing to start with no way to authenticate connections (legacy HMAC tokens no longer exist)")
 	}
 	issuer, err := remoteASIssuer(cfg, "standalone engine")
 	if err != nil {
@@ -536,17 +429,14 @@ func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (
 		return nil, err
 	}
 	v := tokenvalidator.New(tokenvalidator.Config{
-		JWKSURL: jwksURL,
-		Issuer:  issuer,
-		// Legacy tokens carry aud = RP ID, which config validation requires in
-		// as.audiences while legacy is enabled.
+		JWKSURL:   jwksURL,
+		Issuer:    issuer,
 		Audiences: cfg.SessionAudiences(),
-		Legacy:    legacyValidatorConfig(cfg, cfg.LegacyEnabled()),
 	})
 	v.Start(context.Background())
 	logger.Warn("Standalone engine has no token revocation source: AS session tokens stay valid at this engine until they expire, even after logout or user revocation. Mitigate with short access token TTLs, or co-host the engine with the backend (shared blacklist).",
 		zap.String("jwks_source", "as.external_url"))
-	logger.Info("Standalone engine token validator started", zap.Bool("legacy_enabled", cfg.LegacyEnabled()))
+	logger.Info("Standalone engine token validator started")
 	return &StandaloneValidator{Validator: v}, nil
 }
 
@@ -555,19 +445,13 @@ func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (
 func (p *EngineProvider) SetRegistryHandler(h http.Handler) { p.manager.SetRegistryHandler(h) }
 
 // SetTokenValidator passes the go-tokenauth validator to the WebSocket engine
-// so it can validate both new-style and legacy tokens during the handshake.
+// so it can validate AS-issued session tokens during the handshake.
 func (p *EngineProvider) SetTokenValidator(v *tokenvalidator.Validator) {
 	p.manager.SetTokenValidator(v)
 }
 
-// SetTokenBlacklist passes a token blacklist to the WebSocket engine so its
-// handshake honors revocation (both per-jti and per-user) the same way the
-// HTTP auth middlewares do - see wsengine.TokenBlacklistChecker's doc
-// comment for exactly what this covers versus what a shared
-// *tokenvalidator.Validator (see SetTokenValidator) already checks on its
-// own (#391 review, round 2: the engine's own token validation was found to
-// bypass revocation entirely on the legacy path, and user-level revocation
-// even on the go-tokenauth path).
+// SetTokenBlacklist passes a token blacklist to the WebSocket engine so its handshake honors per-jti
+// and per-user revocation like the HTTP middlewares (see wsengine.TokenBlacklistChecker).
 func (p *EngineProvider) SetTokenBlacklist(b wsengine.TokenBlacklistChecker) {
 	p.manager.SetTokenBlacklist(b)
 }
@@ -599,9 +483,8 @@ func (p *EngineProvider) CheckReady(ctx context.Context) error {
 	return nil
 }
 
-// blacklistRevocationChecker adapts *service.TokenBlacklist to go-tokenauth's
-// revocation.Checker so Logout/DeleteUser revocation (#382/#383) is honored by
-// the Validator path.
+// blacklistRevocationChecker adapts *service.TokenBlacklist to go-tokenauth's revocation.Checker
+// (IsRevoked vs IsBlacklisted), so Logout/DeleteUser revocation applies to AS-issued tokens.
 type blacklistRevocationChecker struct {
 	blacklist *service.TokenBlacklist
 }
@@ -629,29 +512,17 @@ type BackendProvider struct {
 	logger           *zap.Logger
 }
 
-// requireSessionAuthMechanism refuses to start a role whose protected routes
-// would all return 401: as.enabled=false builds no JWKS validator and
-// as.legacy.enabled=false refuses the HMAC fallback.
+// requireSessionAuthMechanism refuses to start a role serving protected routes when the AS is not
+// enabled: session tokens are the only authentication, so every request would return 401.
 func requireSessionAuthMechanism(cfg *config.Config, role string) error {
-	if !cfg.AS.Enabled && !cfg.LegacyEnabled() {
-		return fmt.Errorf("%s role serves protected routes but as.enabled=false and as.legacy.enabled=false leave no way to authenticate session tokens; enable the AS (as.enabled=true) or set as.legacy.enabled=true", role)
-	}
-	return requireLegacyIssuer(cfg, role)
-}
-
-// requireLegacyIssuer fails closed when legacy HMAC tokens are enabled and
-// jwt.issuer is empty: the validator would accept any token signed with the
-// shared secret whatever its iss. Checked before any resource is opened.
-func requireLegacyIssuer(cfg *config.Config, role string) error {
-	if cfg.LegacyEnabled() && cfg.JWT.Issuer == "" {
-		return fmt.Errorf("%s: jwt.issuer must not be empty while legacy HMAC session tokens are enabled (as.legacy.enabled): without it any token signed with jwt.secret would be accepted regardless of iss; set jwt.issuer or disable legacy tokens", role)
+	if !cfg.AS.Enabled {
+		return fmt.Errorf("%s role serves protected routes but as.enabled=false: the legacy HMAC token path was removed, so AS-issued session tokens are the only way to authenticate; set as.enabled=true (or add the auth role)", role)
 	}
 	return nil
 }
 
-// remoteASIssuer returns the expected remote-AS issuer (as.issuer, else
-// jwt.issuer) and refuses an empty one, which would leave JWKS-signed tokens'
-// issuer unrestricted.
+// remoteASIssuer returns the expected issuer for remote-AS tokens (as.issuer, else jwt.issuer) and
+// refuses an empty value, which would leave the issuer of JWKS-signed tokens unrestricted.
 func remoteASIssuer(cfg *config.Config, role string) (string, error) {
 	issuer := cfg.AS.Issuer
 	if issuer == "" {
@@ -766,9 +637,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 			JWKSURL:   jwksURL,
 			Issuer:    issuer,
 			Audiences: cfg.AS.Audiences,
-			Legacy:    legacyValidatorConfig(cfg, cfg.AS.Legacy.Enabled),
-			// The validator has its own validation path, so the shared
-			// blacklist must be wired in here (#382/#383).
+			// Same blacklist as the rest of the process: the Validator has its own validation path that would not consult it.
 			Revocation: blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist},
 		})
 		tv.Start(context.Background())
@@ -780,7 +649,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 
 	authProvider.tokenValidator = tv
 	if tv != nil {
-		// The keystore websocket handshake uses the same validator.
+		// The keystore websocket handshake uses the same JWKS validator as the HTTP routes.
 		authProvider.services.Keystore.SetTokenValidator(tv)
 	}
 	storageProvider := NewStorageProvider(cfg, store, logger, roles)
@@ -839,28 +708,19 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 		protected.Use(p.authMiddleware())
 		// Trust-evaluation calls are identity-free by design (see
 		// handleAnonymousTokenRequest) and only need a wallet-registry or
-		// wallet-backend audience - never require a broader one. Only
-		// enforced under go-tokenauth (tokenValidator != nil); the legacy
-		// AuthMiddleware path never populates tokenauth_result, so
-		// RequireAudience would 401 every legacy token if applied there.
-		if p.tokenValidator != nil {
-			protected.Use(middleware.RequireAudience("wallet-registry", "wallet-backend"))
-		}
+		// wallet-backend audience - never require a broader one.
+		protected.Use(middleware.RequireAudience("wallet-registry", "wallet-backend"))
 		v1 := protected.Group("/v1")
 		{
-			v1.POST("/evaluate", requireTACIfEnforced(p.tokenValidator, "r"), p.authzenHandler.Evaluate)
-			v1.POST("/resolve", requireTACIfEnforced(p.tokenValidator, "r"), p.authzenHandler.Resolve)
+			v1.POST("/evaluate", middleware.MustHaveTAC("r"), p.authzenHandler.Evaluate)
+			v1.POST("/resolve", middleware.MustHaveTAC("r"), p.authzenHandler.Resolve)
 		}
 	}
 }
 
-// authMiddleware returns the appropriate auth middleware for backend routes.
+// authMiddleware returns the auth middleware for backend routes.
 func (p *BackendProvider) authMiddleware() gin.HandlerFunc {
-	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.cfg, p.tokenValidator, p.store.Tenants(), p.Services().TokenBlacklist, p.logger)
-	}
-	// See AuthProvider.authMiddleware's comment - same fix (#382).
-	return middleware.AuthMiddlewareWithBlacklist(p.cfg, p.store, p.Services().TokenBlacklist, p.logger)
+	return sessionAuthMiddleware(p.tokenValidator, p.store, p.Services().TokenBlacklist, p.logger)
 }
 
 // Close shuts down the backend provider
@@ -1039,41 +899,21 @@ type RegistryProvider struct {
 	rootAliases bool
 }
 
-// registryTokenAudiences is the "aud" list the registry's token validator
-// accepts: the registry audience for AS-issued tokens and, when legacy HMAC
-// tokens are enabled, the RP ID (their audience, see UserService/
-// WebAuthnService). go-tokenauth cannot exempt legacy tokens from its audience
-// list, so a registry-only process must have server.rp_id set to the issuing
-// backend's RP ID (config.ValidateRegistryStandalone enforces it) - except on
-// the deprecated registry.yaml path, where legacy tokens bypass the audience
-// list altogether (config.Config.RegistryLegacyAudienceIndependent).
-func registryTokenAudiences(cfg *config.Config) []string {
-	auds := []string{config.RegistryAudience}
-	if cfg.AS.Legacy.Enabled && cfg.Server.RPID != "" {
-		auds = append(auds, cfg.Server.RPID)
-	}
-	return auds
+// registryTokenAudiences is the "aud" list the registry's validator accepts.
+func registryTokenAudiences() []string {
+	return []string{config.RegistryAudience}
 }
 
-// registryNeedsValidator reports whether a token validator must be built:
-// always when registry.require_auth is set, otherwise only when there is a
-// token source to recognise (an AS to fetch JWKS from, or a legacy HMAC
-// secret).
+// registryNeedsValidator reports whether a token validator must be built: whenever as.external_url is
+// set, and always with registry.require_auth (NewRegistryProvider then fails closed without a JWKS source).
 func registryNeedsValidator(cfg *config.Config) bool {
-	return cfg.Registry.RequireAuth || cfg.AS.ExternalURL != "" ||
-		registryLegacyHMAC(cfg)
-}
-
-// registryLegacyHMAC reports whether the registry validates legacy HMAC tokens:
-// legacy is enabled and there is a secret (never validate against an empty key).
-func registryLegacyHMAC(cfg *config.Config) bool {
-	return cfg.AS.Legacy.Enabled && cfg.JWT.Secret != ""
+	return cfg.Registry.RequireAuth || cfg.AS.ExternalURL != ""
 }
 
 // NewRegistryProvider creates a new registry route provider. Registry
 // settings come from cfg.Registry; server address, CORS and logging are the
 // backend's, and request authentication uses the same go-tokenauth validator
-// as the other roles (built from as.* / jwt.*, even when as.enabled is false).
+// as the other roles (built from as.*, even when as.enabled is false).
 func NewRegistryProvider(cfg *config.Config, logger *zap.Logger) (*RegistryProvider, error) {
 	rcfg := &cfg.Registry
 
@@ -1122,43 +962,30 @@ func NewRegistryProvider(cfg *config.Config, logger *zap.Logger) (*RegistryProvi
 	return p, nil
 }
 
-// buildValidator builds the registry's validator. Without as.external_url only
-// legacy HMAC tokens can be recognised. go-tokenauth requires an audience list;
-// the registry's narrower rule (registry.AuthMiddlewares) still applies on top.
+// buildValidator builds the registry's go-tokenauth validator, fetching the AS JWKS from
+// as.external_url. Without it there is nothing to validate tokens with, which is an error (a deprecated
+// registry.yaml HMAC secret is ignored, see config.ApplyLegacyRegistryConfig). The audience list
+// matches registry.AuthMiddlewares.
 func (p *RegistryProvider) buildValidator() error {
 	cfg := p.cfg
-	hmac := registryLegacyHMAC(cfg)
-	if hmac {
-		if err := requireLegacyIssuer(cfg, "registry"); err != nil {
-			return err
-		}
+	if cfg.AS.ExternalURL == "" {
+		return fmt.Errorf("registry.require_auth is true but as.external_url is not set: the registry validates only AS-issued tokens through the AS JWKS (HMAC tokens are no longer accepted); set as.external_url")
 	}
-	tc := tokenvalidator.Config{
-		Audiences: registryTokenAudiences(cfg),
-		Legacy:    legacyValidatorConfig(cfg, hmac),
+	issuer, err := remoteASIssuer(cfg, "registry")
+	if err != nil {
+		return err
 	}
-	jwksSource := ""
-	if cfg.AS.ExternalURL != "" {
-		issuer, err := remoteASIssuer(cfg, "registry")
-		if err != nil {
-			return err
-		}
-		jwksURL, err := asJWKSURL(cfg)
-		if err != nil {
-			return err
-		}
-		tc.JWKSURL, tc.Issuer = jwksURL, issuer
-		jwksSource = "as.external_url"
-	} else {
-		tc.Issuer = cfg.AS.Issuer
-		if tc.Issuer == "" {
-			tc.Issuer = cfg.JWT.Issuer
-		}
+	jwksURL, err := asJWKSURL(cfg)
+	if err != nil {
+		return err
 	}
-	p.validator = tokenvalidator.New(tc)
+	p.validator = tokenvalidator.New(tokenvalidator.Config{
+		JWKSURL:   jwksURL,
+		Issuer:    issuer,
+		Audiences: registryTokenAudiences(),
+	})
 	p.logger.Info("Registry token validation configured",
-		zap.String("jwks_source", jwksSource),
-		zap.Bool("legacy_hmac", hmac),
+		zap.String("jwks_source", "as.external_url"),
 		zap.Bool("require_auth", p.rcfg.RequireAuth))
 	return nil
 }
@@ -1193,17 +1020,14 @@ func (p *RegistryProvider) Transport() Transport { return TransportHTTP }
 func (p *RegistryProvider) Name() string         { return "registry" }
 
 // authConfig is the request-authentication configuration of the registry
-// routes. LegacyAudienceIndependent is set only by the deprecated registry
-// config path (see config.Config.RegistryLegacyAudienceIndependent).
+// routes.
 func (p *RegistryProvider) authConfig() registry.AuthConfig {
 	return registry.AuthConfig{
-		Config:                    p.cfg,
-		Validator:                 p.validator,
-		Tenants:                   p.tenants,
-		Blacklist:                 p.blacklist,
-		RequireAuth:               p.rcfg.RequireAuth,
-		LegacyAudienceIndependent: p.cfg.RegistryLegacyAudienceIndependent(),
-		Logger:                    p.logger,
+		Validator:   p.validator,
+		Tenants:     p.tenants,
+		Blacklist:   p.blacklist,
+		RequireAuth: p.rcfg.RequireAuth,
+		Logger:      p.logger,
 	}
 }
 
@@ -1308,9 +1132,6 @@ type WalletProviderProvider struct {
 
 // NewWalletProviderProvider creates a new isolated wallet-provider.
 func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletProviderProvider, error) {
-	if err := requireSessionAuthMechanism(cfg, "wallet-provider"); err != nil {
-		return nil, err
-	}
 	store, err := backend.New(context.Background(), cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create backend: %w", err)
@@ -1329,44 +1150,35 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 
 	handlers := api.NewHandlers(services, cfg, logger, []string{"wallet-provider"})
 
-	// Build a go-tokenauth validator when AS is enabled, matching the
-	// co-hosted AuthProvider path (see authMiddleware()). Without this,
-	// isolated wallet-provider deployments would reject valid AS-issued
-	// access tokens — only legacy HMAC JWTs would work.
+	// Build the validator for AS-issued session tokens from the JWKS at as.external_url (as.enabled
+	// is not needed); without it fail startup, as in NewStandaloneEngineTokenValidator.
 	var tv *tokenvalidator.Validator
-	//
-	// Without as.external_url there is no JWKS: fall back to HMAC-only
-	// (nil validator) if legacy is enabled, else fail startup.
-	if cfg.AS.Enabled && cfg.AS.ExternalURL == "" {
-		if !cfg.LegacyEnabled() {
-			services.Stop()
-			_ = store.Close()
-			return nil, fmt.Errorf("wallet-provider with as.enabled=true and as.legacy.enabled=false needs as.external_url to fetch the AS JWKS; refusing to start with no way to authenticate session tokens")
-		}
-		logger.Warn("wallet-provider: as.external_url is not set; ES256 session tokens cannot be validated, using legacy HMAC validation only")
-	} else if cfg.AS.Enabled {
-		issuer, issuerErr := remoteASIssuer(cfg, "wallet-provider")
-		if issuerErr != nil {
-			services.Stop()
-			_ = store.Close()
-			return nil, issuerErr
-		}
-		jwksURL, urlErr := asJWKSURL(cfg)
-		if urlErr != nil {
-			services.Stop()
-			_ = store.Close()
-			return nil, urlErr
-		}
-		tv = tokenvalidator.New(tokenvalidator.Config{
-			JWKSURL:   jwksURL,
-			Issuer:    issuer,
-			Audiences: cfg.AS.Audiences,
-			Legacy:    legacyValidatorConfig(cfg, cfg.AS.Legacy.Enabled),
-			// Own blacklist: never co-hosted with BackendProvider (see cmd/server).
-			Revocation: blacklistRevocationChecker{blacklist: services.TokenBlacklist},
-		})
-		tv.Start(context.Background())
+	if cfg.AS.ExternalURL == "" {
+		services.Stop()
+		_ = store.Close()
+		return nil, fmt.Errorf("wallet-provider needs as.external_url to fetch the AS JWKS; refusing to start with no way to authenticate session tokens (legacy HMAC tokens no longer exist)")
 	}
+	issuer, issuerErr := remoteASIssuer(cfg, "wallet-provider")
+	if issuerErr != nil {
+		services.Stop()
+		_ = store.Close()
+		return nil, issuerErr
+	}
+	jwksURL, urlErr := asJWKSURL(cfg)
+	if urlErr != nil {
+		services.Stop()
+		_ = store.Close()
+		return nil, urlErr
+	}
+	tv = tokenvalidator.New(tokenvalidator.Config{
+		JWKSURL:   jwksURL,
+		Issuer:    issuer,
+		Audiences: cfg.SessionAudiences(),
+		// Same wiring as NewBackendProvider; this provider's own TokenBlacklist is used as-is (it is never
+		// co-hosted with BackendProvider).
+		Revocation: blacklistRevocationChecker{blacklist: services.TokenBlacklist},
+	})
+	tv.Start(context.Background())
 
 	return &WalletProviderProvider{
 		cfg:            cfg,
@@ -1382,18 +1194,10 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 func (p *WalletProviderProvider) Transport() Transport { return TransportWalletProvider }
 func (p *WalletProviderProvider) Name() string         { return "wallet-provider" }
 
-// authMiddleware returns the appropriate auth middleware: go-tokenauth when a
-// validator is available (AS enabled), legacy HMAC AuthMiddleware otherwise —
-// mirrors AuthProvider.authMiddleware().
+// authMiddleware returns the auth middleware for the wallet-provider routes. This provider never runs
+// co-hosted with BackendProvider, so its own Services.TokenBlacklist is used as-is.
 func (p *WalletProviderProvider) authMiddleware() gin.HandlerFunc {
-	if p.tokenValidator != nil {
-		return middleware.TokenAuthMiddleware(p.cfg, p.tokenValidator, p.store.Tenants(), p.services.TokenBlacklist, p.logger)
-	}
-	// See AuthProvider.authMiddleware's comment - same fix (#382). This
-	// provider never runs co-hosted with BackendProvider (see cmd/server -
-	// it's only ever constructed standalone), so its own Services.
-	// TokenBlacklist is fine used as-is.
-	return middleware.AuthMiddlewareWithBlacklist(p.cfg, p.store, p.services.TokenBlacklist, p.logger)
+	return sessionAuthMiddleware(p.tokenValidator, p.store, p.services.TokenBlacklist, p.logger)
 }
 
 func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
@@ -1403,18 +1207,16 @@ func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
 	// Key attestation / WIA are general user-facing routes, not one of the
 	// narrow purposes an anonymous token is scoped to - reject a
 	// wallet-registry-only token here.
-	if p.tokenValidator != nil {
-		wp.Use(middleware.RequireAudience("wallet-backend"))
-	}
+	wp.Use(middleware.RequireAudience("wallet-backend"))
 	{
-		wp.POST("/key-attestation/generate", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.GenerateKeyAttestation)
+		wp.POST("/key-attestation/generate", middleware.MustHaveTAC("w"), p.handlers.GenerateKeyAttestation)
 		if p.cfg.WalletProvider.WIA.Enabled && p.services.WIA != nil {
 			wiaLimit := middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier)
-			wp.POST("/wia/challenge", wiaLimit, requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.WIAChallenge)
-			wp.POST("/wia/generate", wiaLimit, requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.WIAGenerate)
+			wp.POST("/wia/challenge", wiaLimit, middleware.MustHaveTAC("w"), p.handlers.WIAChallenge)
+			wp.POST("/wia/generate", wiaLimit, middleware.MustHaveTAC("w"), p.handlers.WIAGenerate)
 		}
 		if p.services.FIDO2Attestation != nil && p.services.FIDO2Attestation.IsEnabled() {
-			wp.POST("/fido2-attestation/register", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.FIDO2AttestationRegister)
+			wp.POST("/fido2-attestation/register", middleware.MustHaveTAC("w"), p.handlers.FIDO2AttestationRegister)
 		}
 	}
 

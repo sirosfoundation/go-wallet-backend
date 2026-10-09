@@ -2,13 +2,10 @@ package service
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"fmt"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
@@ -136,69 +133,6 @@ func (s *UserService) Register(ctx context.Context, req *domain.RegisterRequest)
 // GetUserByID retrieves a user by ID
 func (s *UserService) GetUserByID(ctx context.Context, id domain.UserID) (*domain.User, error) {
 	return s.store.Users().GetByID(ctx, id)
-}
-
-// ValidateToken validates a JWT token and returns the user ID
-func (s *UserService) ValidateToken(tokenString string) (domain.UserID, error) {
-	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-		}
-		return []byte(s.cfg.JWT.Secret), nil
-	})
-
-	if err != nil {
-		return domain.UserID{}, err
-	}
-
-	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
-		userID, ok := claims["user_id"].(string)
-		if !ok {
-			return domain.UserID{}, errors.New("invalid token claims")
-		}
-		return domain.UserIDFromString(userID), nil
-	}
-
-	return domain.UserID{}, errors.New("invalid token")
-}
-
-func (s *UserService) generateToken(user *domain.User, tenantID domain.TenantID) (string, error) {
-	// Default to "default" tenant for backward compatibility
-	tid := string(tenantID)
-	if tid == "" {
-		tid = string(domain.DefaultTenantID)
-	}
-
-	now := time.Now()
-	jti := generateJTI() // Generate unique token ID
-
-	claims := jwt.MapClaims{
-		"user_id":   user.UUID.String(),
-		"did":       user.DID,
-		"tenant_id": tid,
-		"iss":       s.cfg.JWT.Issuer,
-		"aud":       s.cfg.Server.RPID,                                                // Audience: the RP ID
-		"exp":       now.Add(time.Duration(s.cfg.JWT.ExpiryHours) * time.Hour).Unix(), // Expiry
-		"iat":       now.Unix(),
-		"nbf":       now.Unix(), // Not Before: token valid from now
-		"jti":       jti,        // JWT ID: unique identifier for revocation
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString([]byte(s.cfg.JWT.Secret))
-}
-
-// generateJTI generates a unique JWT ID
-func generateJTI() string {
-	b := make([]byte, 16)
-	_, _ = rand.Read(b)
-	return base64.RawURLEncoding.EncodeToString(b)
-}
-
-// GenerateTokenForUser generates a JWT token for a user (used after WebAuthn auth)
-// The tenantID is included in the JWT claims for tenant-scoped authorization
-func (s *UserService) GenerateTokenForUser(user *domain.User, tenantID domain.TenantID) (string, error) {
-	return s.generateToken(user, tenantID)
 }
 
 // GetPrivateData retrieves user's private data

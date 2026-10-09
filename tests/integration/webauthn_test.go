@@ -52,7 +52,7 @@ type AuthenticatorSelectionCriteria struct {
 func TestWebAuthnRegistrationBegin(t *testing.T) {
 	h := NewTestHarness(t)
 
-	resp := h.POST("/user/register-webauthn-begin", map[string]interface{}{})
+	resp := h.POST("/auth/passkey/register/begin", map[string]interface{}{})
 	resp.Status(http.StatusOK)
 
 	var result BeginRegistrationResponse
@@ -121,7 +121,7 @@ func TestWebAuthnRegistrationBegin(t *testing.T) {
 func TestWebAuthnRegistrationBeginWithDisplayName(t *testing.T) {
 	h := NewTestHarness(t)
 
-	resp := h.POST("/user/register-webauthn-begin", map[string]interface{}{
+	resp := h.POST("/auth/passkey/register/begin", map[string]interface{}{
 		"display_name": "Test User",
 	})
 	resp.Status(http.StatusOK)
@@ -141,7 +141,7 @@ func TestWebAuthnRegistrationBeginWithDisplayName(t *testing.T) {
 func TestWebAuthnResponseFormat(t *testing.T) {
 	h := NewTestHarness(t)
 
-	resp := h.POST("/user/register-webauthn-begin", map[string]interface{}{})
+	resp := h.POST("/auth/passkey/register/begin", map[string]interface{}{})
 	resp.Status(http.StatusOK)
 
 	// Parse raw JSON to validate structure
@@ -204,7 +204,7 @@ type PublicKeyCredentialRequestOptions struct {
 func TestWebAuthnLoginBegin(t *testing.T) {
 	h := NewTestHarness(t)
 
-	resp := h.POST("/user/login-webauthn-begin", map[string]interface{}{})
+	resp := h.POST("/auth/passkey/login/begin", map[string]interface{}{})
 	resp.Status(http.StatusOK)
 
 	var result BeginLoginResponse

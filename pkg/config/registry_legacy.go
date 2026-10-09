@@ -60,10 +60,10 @@ func newLegacyRegistryFile() *legacyRegistryFile {
 //     explicitly in the new `registry:` section (or WALLET_REGISTRY_*) wins,
 //     while keys it leaves unset are still filled from the deprecated
 //     configuration. A warning names every key where both set a value, and
-//     the new value was kept. The old `jwt` block is not used for
-//     validation any more: jwt.require_auth becomes registry.require_auth, and
-//     jwt.secret / jwt.secret_path / jwt.issuer keep validating legacy HMAC
-//     tokens by mapping to the backend's jwt.* when those are unset.
+//     the new value was kept. Of the old `jwt` block only jwt.require_auth is used
+//     (-> registry.require_auth); jwt.secret / jwt.secret_path / jwt.issuer are IGNORED with a
+//     loud warning (the secret file is never read). Without as.external_url, ValidateRegistry
+//     fails startup when require_auth is set.
 //
 // standalone is true when the registry role runs without any backend role; the
 // old server, logging, CORS, TLS and http_client settings then map onto the
@@ -126,46 +126,19 @@ func (c *Config) ApplyLegacyRegistryConfig(path string, standalone bool) ([]stri
 			"configuration set "+strings.Join(conflicts, ", ")+": the new `registry:` values take precedence")
 	}
 
-	// jwt block: auth is now the shared go-tokenauth validator.
+	// jwt block: only jwt.require_auth is kept (-> registry.require_auth; ValidateRegistry then
+	// needs as.external_url). The HMAC secret has nothing left to validate and is IGNORED, loudly.
 	if f.JWT.RequireAuth && !c.registryKeyExplicit([]string{"require_auth"}, "WALLET_REGISTRY_REQUIRE_AUTH") {
 		c.Registry.RequireAuth = true
-		if c.AS.ExternalURL == "" {
-			c.registryLegacyTolerateNoJWKS = true
-			warnings = append(warnings, "deprecated registry jwt.require_auth=true is mapped to registry.require_auth, "+
-				"but as.external_url is not set: only legacy HMAC tokens can be validated until you set as.external_url "+
-				"(new-style tokens are validated against <as.external_url>/auth/.well-known/jwks.json)")
-		}
+		warnings = append(warnings, "deprecated registry jwt.require_auth=true is mapped to registry.require_auth; "+
+			"it needs as.external_url (the AS JWKS) and as.issuer, or startup fails")
 	}
-	// The old secret file is only read when it is going to be used: the
-	// registry runs alone, legacy HMAC validation is enabled and no shared
-	// secret has been loaded already (the new jwt.secret / jwt.secret_path
-	// wins). Otherwise a missing file must not fail startup.
-	secret := f.JWT.Secret
-	if standalone && f.JWT.SecretPath != "" && c.AS.Legacy.Enabled && c.JWT.Secret == "" {
-		s, err := readSecretFile(f.JWT.SecretPath)
-		if err != nil {
-			return warnings, fmt.Errorf("registry jwt.secret_path: %w", err)
-		}
-		secret = s
-	}
-	if secret != "" || f.JWT.SecretPath != "" || f.JWT.Issuer != "wallet-backend" {
-		if standalone {
-			if secret != "" && c.JWT.Secret == "" {
-				c.JWT.Secret = secret
-			}
-			// Like the secret, an explicitly configured shared jwt.issuer
-			// (file or WALLET_JWT_ISSUER) wins; otherwise the new secret
-			// would be paired with the old issuer and the shared config's
-			// HMAC tokens would be rejected.
-			if f.JWT.Issuer != "" && f.JWT.Issuer != "wallet-backend" && !c.jwtIssuerExplicit {
-				c.JWT.Issuer = f.JWT.Issuer
-			}
-			warnings = append(warnings, "deprecated registry `jwt` block: secret and issuer are mapped to the backend jwt.secret / jwt.issuer "+
-				"(legacy HMAC validation); the block itself is no longer used")
-		} else {
-			warnings = append(warnings, "deprecated registry `jwt` block is ignored: tokens are validated with the backend's "+
-				"as.* / jwt.* configuration")
-		}
+	if f.JWT.Secret != "" || f.JWT.SecretPath != "" || f.JWT.Issuer != "wallet-backend" {
+		warnings = append(warnings, "DEPRECATED registry `jwt` block (secret, secret_path, issuer) is IGNORED: HMAC (HS256) tokens are "+
+			"no longer accepted because the legacy HMAC authorization server was removed. The registry validates only AS-issued "+
+			"ES256 tokens, through the JWKS at <as.external_url>/auth/.well-known/jwks.json with audience \"wallet-registry\"; "+
+			"clients still sending HMAC tokens are rejected (401 with registry.require_auth, otherwise served as unauthenticated). "+
+			"Set as.external_url and as.issuer and migrate clients (see docs/REGISTRY_MIGRATION.md)")
 	}
 
 	if standalone {
@@ -192,19 +165,6 @@ func (c *Config) ApplyLegacyRegistryConfig(path string, standalone bool) ([]stri
 		if !reflect.DeepEqual(f.HTTPClient, def.HTTPClient) {
 			c.HTTPClient = f.HTTPClient
 		}
-	}
-	// The old schema has no rp_id, so a registry-only process cannot give
-	// go-tokenauth the audience (the issuing backend's RP ID) its mandatory
-	// audience list needs for legacy HMAC tokens. Keep such deployments
-	// working for this release by validating legacy tokens without an
-	// audience check; the new configuration shape requires server.rp_id.
-	if standalone && c.AS.Legacy.Enabled && c.JWT.Secret != "" && (c.Server.RPID == "" || c.Server.RPID == "localhost") {
-		c.registryLegacyAudienceIndependent = true
-		warnings = append(warnings, "DEPRECATED: the deprecated registry configuration has no server.rp_id, so legacy HMAC tokens "+
-			"are validated WITHOUT an audience (\"aud\") check on this path (signature, jwt.issuer, expiry and revocation are still enforced); "+
-			"new-style tokens are unaffected. The new configuration requires server.rp_id (WALLET_SERVER_RP_ID) set to the RP ID of "+
-			"the backend that issues the legacy tokens, and then checks their audience; this compatibility path will be removed with "+
-			"the deprecated configuration")
 	}
 	return warnings, nil
 }

@@ -25,7 +25,6 @@ type sessionDoc struct {
 	MaxTAC    string    `bson:"max_tac"`
 	CreatedAt time.Time `bson:"created_at"`
 	ExpiresAt time.Time `bson:"expires_at"`
-	FamilyID  string    `bson:"family_id,omitempty"`
 	Revoked   bool      `bson:"revoked"`
 }
 
@@ -74,7 +73,6 @@ func (s *MongoSessionStore) Create(ctx context.Context, session *Session) error 
 		MaxTAC:    string(session.MaxTAC),
 		CreatedAt: session.CreatedAt,
 		ExpiresAt: session.ExpiresAt,
-		FamilyID:  session.FamilyID,
 		Revoked:   session.Revoked,
 	}
 	if _, err := s.coll.InsertOne(ctx, doc); err != nil {
@@ -105,7 +103,6 @@ func (s *MongoSessionStore) Get(ctx context.Context, jti string) (*Session, erro
 		MaxTAC:    TAC(doc.MaxTAC),
 		CreatedAt: doc.CreatedAt,
 		ExpiresAt: doc.ExpiresAt,
-		FamilyID:  doc.FamilyID,
 		Revoked:   doc.Revoked,
 	}, nil
 }

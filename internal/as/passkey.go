@@ -24,47 +24,28 @@ type WebAuthnProvider interface {
 	FinishRegistration(ctx context.Context, req *service.FinishRegistrationRequest) (*service.FinishRegistrationResponse, error)
 }
 
-// PasskeyHandlers provides the new AS wrappers around the existing WebAuthnService.
-// On successful authentication, they create an AS session and set the session cookie.
-// For legacy clients (no X-Token-Mode: session header), the existing response format
-// is preserved.
+// PasskeyHandlers wraps WebAuthnService: on success they create an AS session and set its cookie;
+// the body carries no token (see /auth/token). Routes require X-Token-Mode: session (sessionModeGate).
 type PasskeyHandlers struct {
-	webauthn     WebAuthnProvider
-	sessions     SessionStore
-	legacyIssuer *LegacyTokenIssuer
-	cfg          *config.ASConfig
-	logger       *zap.Logger
+	webauthn WebAuthnProvider
+	sessions SessionStore
+	cfg      *config.ASConfig
+	logger   *zap.Logger
 }
 
 // NewPasskeyHandlers creates passkey auth handlers for the AS.
 func NewPasskeyHandlers(
 	webauthn WebAuthnProvider,
 	sessions SessionStore,
-	legacyIssuer *LegacyTokenIssuer,
 	cfg *config.ASConfig,
 	logger *zap.Logger,
 ) *PasskeyHandlers {
 	return &PasskeyHandlers{
-		webauthn:     webauthn,
-		sessions:     sessions,
-		legacyIssuer: legacyIssuer,
-		cfg:          cfg,
-		logger:       logger,
+		webauthn: webauthn,
+		sessions: sessions,
+		cfg:      cfg,
+		logger:   logger,
 	}
-}
-
-// refuseDisabledLegacy answers 410 and returns true for a legacy-mode client
-// (no X-Token-Mode: session) when legacy is disabled, rather than minting an
-// unusable token.
-func (h *PasskeyHandlers) refuseDisabledLegacy(c *gin.Context) bool {
-	if DetectClientMode(c) == ClientModeSession || h.cfg.Legacy.Enabled {
-		return false
-	}
-	c.AbortWithStatusJSON(http.StatusGone, gin.H{
-		"error":   "legacy_tokens_disabled",
-		"message": "legacy HMAC session tokens are no longer issued; send X-Token-Mode: session",
-	})
-	return true
 }
 
 // LoginBegin handles POST /auth/passkey/login/begin.
@@ -87,9 +68,6 @@ func (h *PasskeyHandlers) LoginBegin(c *gin.Context) {
 // this request (see RegisterRoutes' OIDCGateMiddleware), is passed through so
 // FinishLogin can verify it against the credential's actual tenant.
 func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
-	if h.refuseDisabledLegacy(c) {
-		return
-	}
 	var req service.FinishLoginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
@@ -151,15 +129,6 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 		ExpiresAt: now.Add(h.cfg.SessionTTL),
 	}
 
-	// Only legacy-mode clients receive the appToken/refresh token pair, so
-	// only they have a refresh-token family for AS logout to revoke (#402).
-	// Session-mode clients never get those tokens; recording a family for
-	// them would just leave a long-lived revocation marker for nothing.
-	mode := DetectClientMode(c)
-	if mode == ClientModeLegacy {
-		session.FamilyID = resp.SID
-	}
-
 	if err := h.sessions.Create(c.Request.Context(), session); err != nil {
 		h.logger.Error("failed to create session", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": errInternalError})
@@ -172,24 +141,17 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 		Insecure: h.cfg.InsecureCookies,
 	})
 
-	// Determine response format based on client mode.
-	if mode == ClientModeSession {
-		// New-style client: no token in body.
-		c.JSON(http.StatusOK, gin.H{
-			"uuid":              resp.UUID,
-			"displayName":       resp.DisplayName,
-			"tenantId":          resp.TenantID,
-			"tenantDisplayName": resp.TenantDisplayName,
-		})
-	} else {
-		// Legacy client: return existing response format (appToken included).
-		c.JSON(http.StatusOK, resp)
-	}
+	// No token in the body: the client obtains access tokens from /auth/token.
+	c.JSON(http.StatusOK, gin.H{
+		"uuid":              resp.UUID,
+		"displayName":       resp.DisplayName,
+		"tenantId":          resp.TenantID,
+		"tenantDisplayName": resp.TenantDisplayName,
+	})
 
 	h.logger.Info("passkey login success",
 		zap.String("user_id", resp.UUID),
 		zap.String("tenant_id", resp.TenantID),
-		zap.String("client_mode", string(mode)),
 	)
 }
 
@@ -240,9 +202,6 @@ func requestTenantID(c *gin.Context) domain.TenantID {
 // RegisterFinish handles POST /auth/passkey/register/finish.
 // Creates a session on successful registration (auto-login).
 func (h *PasskeyHandlers) RegisterFinish(c *gin.Context) {
-	if h.refuseDisabledLegacy(c) {
-		return
-	}
 	var req service.FinishRegistrationRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request"})
@@ -356,17 +315,12 @@ func (h *PasskeyHandlers) RegisterFinish(c *gin.Context) {
 		Insecure: h.cfg.InsecureCookies,
 	})
 
-	mode := DetectClientMode(c)
-	if mode == ClientModeSession {
-		c.JSON(http.StatusOK, gin.H{
-			"uuid":              resp.UUID,
-			"displayName":       resp.DisplayName,
-			"tenantId":          resp.TenantID,
-			"tenantDisplayName": resp.TenantDisplayName,
-		})
-	} else {
-		c.JSON(http.StatusOK, resp)
-	}
+	c.JSON(http.StatusOK, gin.H{
+		"uuid":              resp.UUID,
+		"displayName":       resp.DisplayName,
+		"tenantId":          resp.TenantID,
+		"tenantDisplayName": resp.TenantDisplayName,
+	})
 
 	h.logger.Info("passkey registration success",
 		zap.String("user_id", resp.UUID),

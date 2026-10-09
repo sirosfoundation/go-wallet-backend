@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
@@ -65,7 +66,6 @@ func TestNewASModule_WiresBlacklistAndRegistersRoutes(t *testing.T) {
 		SigningKeyPath: keyPath,
 		Issuer:         "https://as.example.com",
 		ExternalURL:    "https://as.example.com",
-		Legacy:         config.ASLegacyConfig{Enabled: true},
 	}
 	cfg.SetDefaults()
 	jwtCfg := &config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"}
@@ -144,89 +144,35 @@ func TestNewASModule_WiresBlacklistAndRegistersRoutes(t *testing.T) {
 	}
 }
 
-// TestNewASModule_LegacyIssuerUsesJWTIssuerNotASIssuer proves the #391
-// review fix (round 3): m.LegacyIssuer must validate legacy appTokens
-// against jwtCfg.Issuer, not cfg.Issuer (the AS's own, separately
-// configurable, asymmetric-token issuer identity) - a real legacy appToken
-// (as minted by UserService/WebAuthnService's generateToken) always
-// carries "iss": jwtCfg.Issuer, never cfg.Issuer. This test deliberately
-// configures the two differently, mirroring the deployment shape the
-// review flagged.
-func TestNewASModule_LegacyIssuerUsesJWTIssuerNotASIssuer(t *testing.T) {
-	dir := t.TempDir()
-	keyPath := writeTestSigningKey(t, dir)
-
-	cfg := &config.ASConfig{
-		SigningKeyPath: keyPath,
-		Issuer:         "https://as.example.com", // deliberately different from jwtCfg.Issuer below
-		ExternalURL:    "https://as.example.com",
-		Legacy:         config.ASLegacyConfig{Enabled: true},
-	}
-	cfg.SetDefaults()
-	jwtCfg := &config.JWTConfig{
-		Secret:      "test-secret-that-is-at-least-32-bytes!",
-		Issuer:      "test-wallet-backend-issuer",
-		ExpiryHours: 24,
-	}
-
-	store := memory.NewStore()
-	m, err := NewASModule(context.Background(), cfg, jwtCfg, nil, store, nil, nil, zap.NewNop())
-	if err != nil {
-		t.Fatalf("NewASModule() error = %v", err)
-	}
-	if m.LegacyIssuer == nil {
-		t.Fatal("expected LegacyIssuer to be constructed (Legacy.Enabled=true)")
-	}
-
-	// Simulate a real legacy appToken exactly as UserService/WebAuthnService
-	// mint one: signed with the same secret, "iss" = jwtCfg.Issuer.
-	legacyAppTokenIssuer := NewLegacyTokenIssuer([]byte(jwtCfg.Secret), jwtCfg.Issuer, time.Hour)
-	appToken, err := legacyAppTokenIssuer.Issue("user-1", "did:key:user-1", "tenant-1", "test-rp")
-	if err != nil {
-		t.Fatalf("Issue: %v", err)
-	}
-
-	if _, err := m.LegacyIssuer.Validate(appToken); err != nil {
-		t.Errorf("expected a real legacy appToken (iss=jwtCfg.Issuer) to validate against m.LegacyIssuer, got: %v", err)
-	}
-}
-
-// TestNewASModule_LogoutSIDParserIndependentOfLegacyEnabled proves legacy
-// authentication stays disabled (LegacyIssuer nil, so the auth middleware
-// rejects legacy bearers) while the signature-only logout parser still
-// exists; and that without jwt.secret the fallback is unavailable.
-func TestNewASModule_LogoutSIDParserIndependentOfLegacyEnabled(t *testing.T) {
+// A legacy HMAC token (HS256, jwt.secret, jwt.issuer) must not authenticate through the
+// session auth middleware of a real ASModule, with or without the session cookie.
+func TestNewASModule_LegacyHMACBearerRejected(t *testing.T) {
 	dir := t.TempDir()
 	keyPath := writeTestSigningKey(t, dir)
 	cfg := &config.ASConfig{
 		SigningKeyPath: keyPath,
 		Issuer:         "https://as.example.com",
 		ExternalURL:    "https://as.example.com",
-		Legacy:         config.ASLegacyConfig{Enabled: false},
 	}
 	cfg.SetDefaults()
-	jwtCfg := &config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer", ExpiryHours: 1}
+	jwtCfg := &config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"}
 
 	m, err := NewASModule(context.Background(), cfg, jwtCfg, nil, memory.NewStore(), nil, nil, zap.NewNop())
 	if err != nil {
 		t.Fatalf("NewASModule() error = %v", err)
 	}
-	if m.LegacyIssuer != nil {
-		t.Fatal("legacy authentication must stay disabled")
-	}
-	if m.LogoutSIDParser == nil {
-		t.Fatal("expected a logout sid parser even with legacy disabled")
-	}
 
-	// Legacy bearer is still rejected for authentication.
-	gin.SetMode(gin.TestMode)
-	legacy := NewLegacyTokenIssuer([]byte(jwtCfg.Secret), jwtCfg.Issuer, time.Hour)
-	tok, err := legacy.Issue("user-1", "did:key:u", "t", "rp")
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss": jwtCfg.Issuer, "aud": "rp", "sub": "user-1", "user_id": "user-1",
+		"tenant_id": "t", "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte(jwtCfg.Secret))
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(m.Sessions, m.TokenIssuer, m.LegacyIssuer, []string{"rp"}, true, zap.NewNop()))
+	router.Use(SessionAuthMiddleware(m.Sessions, m.TokenIssuer, []string{"rp"}, true, zap.NewNop()))
 	router.GET("/x", func(c *gin.Context) { c.Status(http.StatusOK) })
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/x", nil)
@@ -234,14 +180,5 @@ func TestNewASModule_LogoutSIDParserIndependentOfLegacyEnabled(t *testing.T) {
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("legacy bearer must be rejected for authentication, got %d", w.Code)
-	}
-
-	// No secret: fallback unavailable.
-	m2, err := NewASModule(context.Background(), cfg, &config.JWTConfig{Issuer: "test-issuer"}, nil, memory.NewStore(), nil, nil, zap.NewNop())
-	if err != nil {
-		t.Fatalf("NewASModule() error = %v", err)
-	}
-	if m2.LogoutSIDParser != nil {
-		t.Error("no jwt.secret must mean no logout sid parser")
 	}
 }

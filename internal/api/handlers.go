@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
 	tokenauthclaims "github.com/sirosfoundation/go-tokenauth/claims"
 	"go.uber.org/zap"
 
@@ -16,8 +15,6 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/legacytoken"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/taggedbinary"
 )
 
@@ -87,291 +84,11 @@ func (h *Handlers) Status(c *gin.Context) {
 	})
 }
 
-// WebAuthn handlers
-
-// StartWebAuthnRegistration begins the WebAuthn registration process
-// Tenant is taken from X-Tenant-ID header (set by TenantHeaderMiddleware)
-func (h *Handlers) StartWebAuthnRegistration(c *gin.Context) {
-	if h.services.WebAuthn == nil {
-		c.JSON(503, gin.H{"error": "WebAuthn not available"})
-		return
-	}
-
-	var req service.BeginRegistrationRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		// Allow empty body - all fields are optional
-		req = service.BeginRegistrationRequest{}
-	}
-
-	// Get tenant from header (set by TenantHeaderMiddleware for this unauthenticated endpoint)
-	tenantID, _ := h.getTenantID(c)
-	req.TenantID = string(tenantID)
-
-	resp, err := h.services.WebAuthn.BeginRegistration(c.Request.Context(), &req)
-	if err != nil {
-		h.logger.Error("Failed to start WebAuthn registration", zap.Error(err))
-		if errors.Is(err, service.ErrTenantNotFound) {
-			c.JSON(404, gin.H{"error": "Tenant not found"})
-			return
-		}
-		if errors.Is(err, service.ErrInviteRequired) {
-			c.JSON(403, gin.H{"error": "invite_required"})
-			return
-		}
-		if errors.Is(err, service.ErrInvalidInvite) {
-			c.JSON(403, gin.H{"error": "invite_invalid"})
-			return
-		}
-		c.JSON(500, gin.H{"error": "Failed to start registration"})
-		return
-	}
-
-	c.JSON(200, resp)
-}
-
-// FinishWebAuthnRegistration completes the WebAuthn registration process
-func (h *Handlers) FinishWebAuthnRegistration(c *gin.Context) {
-	if h.services.WebAuthn == nil {
-		c.JSON(503, gin.H{"error": "WebAuthn not available"})
-		return
-	}
-
-	var req service.FinishRegistrationRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
-
-	// SECURITY: the tenant that actually governs this registration is
-	// whichever tenant BeginRegistration recorded on the challenge - not
-	// necessarily this request's current tenant context. Without this, a
-	// caller could begin under tenant A and finish the very same challenge
-	// under tenant B: the bind_identity check below would then run against
-	// B's policy (and B's OIDC issuer) while the registration is still
-	// written under A regardless of what B required, or vice versa. This
-	// mirrors StartWebAuthnRegistration's tenant source and the /auth/passkey
-	// path's RegisterFinish fix (issue #374); see #395.
-	tenantIDForCheck, _ := h.getTenantID(c)
-	req.ExpectedTenantID = string(tenantIDForCheck)
-
-	// SECURITY: Check if identity binding is required for this tenant
-	// This must be validated BEFORE checking oidcResult to prevent bypass
-	tenantVal, tenantExists := c.Get("tenant")
-	var tenant *domain.Tenant
-	if tenantExists {
-		tenant, _ = tenantVal.(*domain.Tenant)
-	}
-
-	// If bind_identity is configured, we MUST have both tenant and OIDC result
-	if tenant != nil && tenant.OIDCGate.BindIdentity {
-		// bind_identity requires registration mode - enforce binding
-		oidcResult, hasResult := middleware.GetOIDCGateResultGin(c)
-		if !hasResult {
-			h.logger.Error("bind_identity enabled but no OIDC result in context",
-				zap.String("tenant_id", string(tenant.ID)))
-			c.JSON(500, gin.H{"error": "OIDC gate state inconsistent"})
-			return
-		}
-
-		// SECURITY: Verify issuer matches tenant's configured RegistrationOP
-		regOP := tenant.OIDCGate.GetRegistrationOP()
-		if regOP == nil {
-			h.logger.Error("bind_identity enabled but no RegistrationOP configured",
-				zap.String("tenant_id", string(tenant.ID)))
-			c.JSON(500, gin.H{"error": "OIDC gate misconfigured"})
-			return
-		}
-		if oidcResult.Issuer != regOP.Issuer {
-			h.logger.Warn("OIDC issuer mismatch during registration binding",
-				zap.String("tenant_id", string(tenant.ID)),
-				zap.String("expected_issuer", regOP.Issuer),
-				zap.String("actual_issuer", oidcResult.Issuer))
-			c.JSON(401, gin.H{
-				"error": "OIDC issuer mismatch",
-				"code":  "oidc_issuer_mismatch",
-			})
-			return
-		}
-
-		// Get email from claims if available
-		var email string
-		if emailClaim, ok := oidcResult.Claims["email"].(string); ok {
-			email = emailClaim
-		}
-		req.OIDCGateBinding = &service.OIDCGateBinding{
-			Issuer:      oidcResult.Issuer,
-			Subject:     oidcResult.Subject,
-			Email:       email,
-			BindingType: "registration",
-		}
-		h.logger.Debug("OIDC identity binding prepared for registration",
-			zap.String("issuer", oidcResult.Issuer),
-			zap.String("subject", oidcResult.Subject))
-	}
-
-	resp, err := h.services.WebAuthn.FinishRegistration(c.Request.Context(), &req)
-	if err != nil {
-		h.logger.Error("Failed to finish WebAuthn registration", zap.Error(err))
-		switch {
-		case errors.Is(err, service.ErrChallengeNotFound):
-			c.JSON(404, gin.H{"error": "Challenge not found"})
-		case errors.Is(err, service.ErrChallengeExpired):
-			c.JSON(410, gin.H{"error": "Challenge expired"})
-		case errors.Is(err, service.ErrVerificationFailed):
-			c.JSON(400, gin.H{"error": "Verification failed"})
-		case errors.Is(err, service.ErrAAGUIDBlacklisted):
-			c.JSON(403, gin.H{"error": "Authenticator not allowed"})
-		case errors.Is(err, service.ErrTenantMismatch):
-			c.JSON(403, gin.H{"error": "tenant mismatch"})
-		default:
-			c.JSON(500, gin.H{"error": "Failed to complete registration"})
-		}
-		return
-	}
-
-	// Set private data ETag header if available
-	if len(resp.PrivateData) > 0 {
-		c.Header("X-Private-Data-ETag", domain.ComputePrivateDataETag(resp.PrivateData))
-	}
-
-	c.JSON(200, resp)
-}
-
-// StartWebAuthnLogin begins the WebAuthn login process
-func (h *Handlers) StartWebAuthnLogin(c *gin.Context) {
-	if h.services.WebAuthn == nil {
-		c.JSON(503, gin.H{"error": "WebAuthn not available"})
-		return
-	}
-
-	resp, err := h.services.WebAuthn.BeginLogin(c.Request.Context())
-	if err != nil {
-		h.logger.Error("Failed to start WebAuthn login", zap.Error(err))
-		c.JSON(500, gin.H{"error": "Failed to start login"})
-		return
-	}
-
-	c.JSON(200, resp)
-}
-
-// FinishWebAuthnLogin completes the WebAuthn login process
-func (h *Handlers) FinishWebAuthnLogin(c *gin.Context) {
-	if h.services.WebAuthn == nil {
-		c.JSON(503, gin.H{"error": "WebAuthn not available"})
-		return
-	}
-
-	var req service.FinishLoginRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Check if OIDC gate authentication result is present
-	// Note: For login, we can't get tenant ID from request - it's determined
-	// from the credential. Builds Issuer/Subject/Email/Audience/Claims the
-	// same way internal/as.PasskeyHandlers.LoginFinish does - shared to
-	// avoid duplicating this tenant-aware binding construction between the
-	// two login paths (see middleware.BuildLoginOIDCGateBinding's doc
-	// comment, and #386/#408/#409).
-	if binding := middleware.BuildLoginOIDCGateBinding(c); binding != nil {
-		req.OIDCGateBinding = binding
-	}
-
-	resp, err := h.services.WebAuthn.FinishLogin(c.Request.Context(), &req)
-	if err != nil {
-		h.logger.Error("Failed to finish WebAuthn login", zap.Error(err))
-
-		switch {
-		case errors.Is(err, service.ErrChallengeNotFound):
-			c.JSON(404, gin.H{"error": "Challenge not found"})
-		case errors.Is(err, service.ErrChallengeExpired):
-			c.JSON(410, gin.H{"error": "Challenge expired"})
-		case errors.Is(err, service.ErrUserNotFound):
-			c.JSON(404, gin.H{"error": "User not found"})
-		case errors.Is(err, service.ErrCredentialNotFound):
-			c.JSON(404, gin.H{"error": "Credential not found"})
-		case errors.Is(err, service.ErrVerificationFailed):
-			c.JSON(401, gin.H{"error": "Authentication failed"})
-		case errors.Is(err, service.ErrTenantAccessDenied):
-			c.JSON(403, gin.H{"error": "Tenant user must use tenant-scoped login endpoint"})
-		case errors.Is(err, service.ErrIdentityNotBound):
-			c.JSON(403, gin.H{"error": "No enterprise identity bound for this wallet"})
-		case errors.Is(err, service.ErrIdentityBindingMismatch):
-			c.JSON(403, gin.H{"error": "Enterprise identity does not match registered identity"})
-		case errors.Is(err, service.ErrOIDCGateRequired):
-			c.JSON(401, gin.H{
-				"error": "OIDC gate authentication required",
-				"code":  "oidc_gate_required",
-			})
-		default:
-			c.JSON(500, gin.H{"error": "Failed to complete login"})
-		}
-		return
-	}
-
-	// Set private data ETag header if available
-	if len(resp.PrivateData) > 0 {
-		c.Header("X-Private-Data-ETag", domain.ComputePrivateDataETag(resp.PrivateData))
-	}
-
-	c.JSON(200, resp)
-}
-
-// RefreshToken exchanges a valid refresh token for a new access token
-func (h *Handlers) RefreshToken(c *gin.Context) {
-	if h.services.WebAuthn == nil {
-		c.JSON(503, gin.H{"error": "WebAuthn not available"})
-		return
-	}
-
-	var req service.RefreshTokenRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(400, gin.H{"error": err.Error()})
-		return
-	}
-
-	resp, err := h.services.WebAuthn.RefreshAccessToken(c.Request.Context(), &req)
-	if err != nil {
-		h.logger.Warn("Token refresh failed", zap.Error(err))
-		switch {
-		case errors.Is(err, service.ErrInvalidRefreshToken):
-			c.JSON(401, gin.H{"error": "Invalid or expired refresh token"})
-		case errors.Is(err, service.ErrRefreshDisabled):
-			// Config-driven, expected state (JWT.RefreshDays <= 0) - not a
-			// server malfunction, so it must not surface as any 5xx (a 503
-			// still reads as a server failure to callers/monitoring -
-			// Copilot review on #400, second round). The route itself is
-			// now only mounted when refresh tokens are enabled
-			// (internal/server/providers.go), so this case is unreachable
-			// via HTTP in practice; it's kept as defense in depth for any
-			// other caller of RefreshAccessToken, mapped the same way a
-			// missing route would answer.
-			c.JSON(404, gin.H{"error": "Token refresh is disabled"})
-		default:
-			c.JSON(500, gin.H{"error": "Failed to refresh token"})
-		}
-		return
-	}
-
-	c.JSON(200, resp)
-}
-
 // Storage handlers - Credentials
 
-// getHolderDID retrieves the canonical holder DID for the authenticated
-// caller. It is always derived from user_id via domain.HolderDID, never
-// trusted from the token's own "did" claim: legacy HMAC tokens carry both
-// "did" and "user_id" (with did == domain.HolderDID(user_id) - see
-// UserService.generateToken / WebAuthnService.generateToken), but AS-issued
-// tokens (internal/as/token.go) carry only "sub"/user_id and no "did" claim
-// at all. Preferring "did" when present used to give the same physical user
-// two different holder identities depending on which token type
-// authenticated the request, making their previously stored credentials
-// invisible under the other (#384). Deriving from user_id alone, always,
-// keeps both token types resolving to the same identity - and reproduces
-// the exact value legacy tokens' own "did" claim already carried, so
-// existing stored credentials stay reachable.
+// getHolderDID returns the holder DID for the caller, always derived from user_id via
+// domain.HolderDID. AS-issued tokens carry no "did" claim, and trusting one would give
+// a user two holder identities.
 func (h *Handlers) getHolderDID(c *gin.Context) (string, bool) {
 	userID, exists := c.Get("user_id")
 	if !exists {
@@ -383,7 +100,7 @@ func (h *Handlers) getHolderDID(c *gin.Context) (string, bool) {
 // getTenantID retrieves the tenant ID from context.
 // For authenticated requests, this comes from the JWT token (security boundary).
 // For unauthenticated requests, this comes from X-Tenant-ID header.
-// Handles both string (from JWT via AuthMiddleware) and domain.TenantID types.
+// Handles both string (from the JWT via TokenAuthMiddleware) and domain.TenantID types.
 func (h *Handlers) getTenantID(c *gin.Context) (domain.TenantID, bool) {
 	tenantID, exists := c.Get("tenant_id")
 	if !exists {
@@ -391,7 +108,7 @@ func (h *Handlers) getTenantID(c *gin.Context) (domain.TenantID, bool) {
 		return domain.DefaultTenantID, true
 	}
 
-	// Handle string type (from JWT via AuthMiddleware)
+	// Handle string type (from the JWT via TokenAuthMiddleware)
 	if tidStr, ok := tenantID.(string); ok {
 		return domain.TenantID(tidStr), true
 	}
@@ -859,10 +576,7 @@ func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 // to issue an access token for, across DefaultTokenTTL and every
 // per-audience override in AudienceTTLs - used by Logout to size a
 // blacklist entry for an AS-issued token whose actual expiry isn't exposed
-// by go-tokenauth's validation result. Falls back to DefaultTokenTTL alone
-// (2m by default - see config.ASConfig.SetDefaults) if AS isn't configured
-// at all, which is harmless: an AS-disabled deployment never reaches this
-// code path (see Logout's tokenauth_result branch).
+// by go-tokenauth's validation result.
 func maxConfiguredASTokenTTL(cfg *config.Config) time.Duration {
 	longest := cfg.AS.DefaultTokenTTL
 	for _, ttl := range cfg.AS.AudienceTTLs {
@@ -873,171 +587,23 @@ func maxConfiguredASTokenTTL(cfg *config.Config) time.Duration {
 	return longest
 }
 
-// ttlForTokenAuthResult returns the lifetime to size a logout blacklist
-// entry for, given the mode go-tokenauth validated the token as. Its own
-// Validator "auto-detects new-style vs legacy" (see TokenAuthMiddleware's
-// doc comment), so tokenauth_result is populated for both kinds of token,
-// not just AS-issued ones, and each has its own, very different, configured
-// lifetime - see maxConfiguredASTokenTTL's doc comment and #391 review,
-// round 3.
-func ttlForTokenAuthResult(cfg *config.Config, result *tokenauthclaims.Result) time.Duration {
-	if result.Mode == tokenauthclaims.ModeLegacy {
-		return time.Duration(cfg.JWT.ExpiryHours) * time.Hour
-	}
-	return maxConfiguredASTokenTTL(cfg)
-}
-
-// familyRetention returns how long a Logout-triggered RevokeFamily entry
-// must be kept (see TokenBlacklist.RevokeFamily's own doc comment for why
-// it, unlike RevokeUser, is swept once this elapses): long enough that no
-// access or refresh token which could still legitimately carry the revoked
-// sid can possibly still be unexpired. Every token minted for a given sid
-// (WebAuthnService.generateToken/generateRefreshToken/RefreshAccessToken)
-// is minted no later than the moment of revocation itself - IsFamilyRevoked
-// is checked before minting any further token for that sid.
-//
-// Uses the MAX of both configured lifetimes, not just the refresh token's
-// (Copilot review on #414): nothing in config.Config.Validate enforces
-// JWT.RefreshDays outliving JWT.ExpiryHours, so an unusual but valid
-// configuration (e.g. a short-lived refresh token paired with a
-// long-lived access token) would otherwise let the marker expire while an
-// access token from an earlier rotation - its own jti never individually
-// blacklisted - was still unexpired and usable again.
-func familyRetention(cfg *config.Config) time.Duration {
-	return cfg.JWT.FamilyRetention()
-}
-
-// Logout invalidates the current session by blacklisting the JWT and, when
-// it carries one, revoking its whole refresh-token family (#402) - so a
-// refresh token issued alongside it (or produced by any rotation of it)
-// stops working immediately too, rather than remaining valid until it
-// naturally expires or is itself used.
-//
-// If the family revocation fails the handler fails closed with a 500 (the
-// refresh token is still usable, so a clean logout must not be reported).
-// The access-token jti is blacklisted only AFTER the family revocation
-// succeeds, so a failed attempt leaves the token usable (the auth
-// middleware still accepts it) and the client can simply retry.
+// Logout blacklists the jti of the access token TokenAuthMiddleware already validated.
 func (h *Handlers) Logout(c *gin.Context) {
-	// When authenticated via go-tokenauth (pkg/middleware.TokenAuthMiddleware
-	// - the path taken whenever AS is enabled), the raw token may be
-	// ES256/EdDSA-signed and the legacy HMAC re-parse below silently fails
-	// to extract its claims, so the jti never reaches the blacklist at all
-	// (#391 review). TokenAuthMiddleware already validated the token and
-	// left the result in context; use its jti directly instead of
-	// re-parsing.
-	if v, exists := c.Get("tokenauth_result"); exists {
-		if result, ok := v.(*tokenauthclaims.Result); ok && result != nil {
-			// Refresh-token family revocation (#402), legacy-mode tokens
-			// only: go-tokenauth "auto-detects new-style vs legacy" (see
-			// TokenAuthMiddleware's doc comment), so a WebAuthnService-
-			// issued legacy HMAC token can be authenticated through this
-			// tokenauth_result path instead of the legacy branch below
-			// whenever the AS is enabled - without this, a session logged
-			// out through that deployment mode would never actually have
-			// its refresh-token family revoked. New-style AS-issued tokens
-			// (ModeSession) have no sid/refresh-token-family concept in
-			// this codebase, so only ModeLegacy is handled here.
-			if result.Mode == tokenauthclaims.ModeLegacy && h.services.TokenBlacklist != nil {
-				rawToken, _ := c.Get("token")
-				rawTokenStr, _ := rawToken.(string)
-				sid, sidErr := legacytoken.ParseSID(h.cfg.JWT.Secret, rawTokenStr)
-				if sidErr != nil {
-					// Fail closed: without the sid the refresh-token family
-					// cannot be revoked, so do not report a clean logout.
-					h.logger.Error("Logout: cannot determine refresh-token family", zap.Error(sidErr))
-					c.JSON(500, gin.H{"error": "Failed to revoke session"})
-					return
-				}
-				if sid != "" {
-					expiry := time.Now().Add(familyRetention(h.cfg) + time.Hour)
-					if err := h.services.TokenBlacklist.RevokeFamily(c.Request.Context(), sid, expiry); err != nil {
-						// Fail closed, like the sid-parse failure above: the
-						// refresh token is still usable, so do not report a
-						// clean logout. The client may retry (idempotent).
-						h.logger.Error("Logout: failed to revoke refresh-token family",
-							zap.String("sid", sid), zap.Error(err))
-						c.JSON(500, gin.H{"error": "Failed to revoke session"})
-						return
-					}
-					h.logger.Info("User logged out, refresh-token family revoked",
-						zap.String("sid", sid),
-					)
-				}
-			}
-
-			// Blacklist the access-token jti only AFTER the family has been
-			// revoked: if revocation failed above we returned 500 without
-			// touching the jti, so the same token still passes the auth
-			// middleware and the client can retry.
-			if result.JTI != "" && h.services.TokenBlacklist != nil {
-				expiry := time.Now().Add(ttlForTokenAuthResult(h.cfg, result) + time.Minute)
-				if err := h.services.TokenBlacklist.Add(c.Request.Context(), result.JTI, expiry); err != nil {
-					h.logger.Warn("Failed to blacklist token", zap.Error(err))
-				} else {
-					h.logger.Info("User logged out, token blacklisted",
-						zap.String("jti", result.JTI),
-					)
-				}
-			}
-
-			c.JSON(200, gin.H{"message": "Logged out successfully"})
-			return
-		}
-	}
-
-	// Legacy HMAC path: get the token from context (set by auth middleware)
-	tokenString, exists := c.Get("token")
+	v, exists := c.Get("tokenauth_result")
 	if !exists {
-		// No token? Already logged out effectively
+		// No validated token in the context: nothing to revoke.
 		c.Status(200)
 		return
 	}
-
-	// Parse the token to get claims (we need jti, exp, and sid)
-	token, _ := jwt.Parse(tokenString.(string), func(token *jwt.Token) (interface{}, error) {
-		return []byte(h.cfg.JWT.Secret), nil
-	})
-
-	if token != nil && token.Claims != nil {
-		if claims, ok := token.Claims.(jwt.MapClaims); ok {
-			// Refresh-token family revocation (#402) - see this function's
-			// own doc comment.
-			if sid, _ := claims["sid"].(string); sid != "" && h.services.TokenBlacklist != nil {
-				familyExpiry := time.Now().Add(familyRetention(h.cfg) + time.Hour)
-				if err := h.services.TokenBlacklist.RevokeFamily(c.Request.Context(), sid, familyExpiry); err != nil {
-					// Fail closed: see the tokenauth path above.
-					h.logger.Error("Logout: failed to revoke refresh-token family",
-						zap.String("sid", sid), zap.Error(err))
-					c.JSON(500, gin.H{"error": "Failed to revoke session"})
-					return
-				}
-				h.logger.Info("User logged out, refresh-token family revoked",
-					zap.String("sid", sid),
+	if result, ok := v.(*tokenauthclaims.Result); ok && result != nil {
+		if result.JTI != "" && h.services.TokenBlacklist != nil {
+			expiry := time.Now().Add(maxConfiguredASTokenTTL(h.cfg) + time.Minute)
+			if err := h.services.TokenBlacklist.Add(c.Request.Context(), result.JTI, expiry); err != nil {
+				h.logger.Warn("Failed to blacklist token", zap.Error(err))
+			} else {
+				h.logger.Info("User logged out, token blacklisted",
+					zap.String("jti", result.JTI),
 				)
-			}
-
-			// Blacklist the jti only after the family revocation succeeded -
-			// see the tokenauth path above.
-			jti, _ := claims["jti"].(string)
-			if jti != "" && h.services.TokenBlacklist != nil {
-				// Get expiry time for blacklist entry
-				var expiry time.Time
-				if exp, ok := claims["exp"].(float64); ok {
-					expiry = time.Unix(int64(exp), 0)
-				} else {
-					// Default to 24 hours if no expiry (shouldn't happen)
-					expiry = time.Now().Add(24 * time.Hour)
-				}
-
-				// Add to blacklist
-				if err := h.services.TokenBlacklist.Add(c.Request.Context(), jti, expiry); err != nil {
-					h.logger.Warn("Failed to blacklist token", zap.Error(err))
-				} else {
-					h.logger.Info("User logged out, token blacklisted",
-						zap.String("jti", jti),
-					)
-				}
 			}
 		}
 	}

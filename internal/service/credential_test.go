@@ -15,8 +15,7 @@ func setupCredentialService(t *testing.T) *CredentialService {
 	logger := zap.NewNop()
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
-			Secret:      "test-secret",
-			ExpiryHours: 24,
+			Secret: "test-secret",
 		},
 	}
 	store := memory.NewStore()
