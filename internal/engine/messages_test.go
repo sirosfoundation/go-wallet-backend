@@ -986,8 +986,6 @@ func TestMatchErrorCodeUserFacingMessage(t *testing.T) {
 	}{
 		{ErrCodeMatchTimeout, "Credential matching timed out"},
 		{ErrCodeMatchError, "Credential matching failed"},
-		{ErrCodeCredentialRevoked, "A credential you selected is no longer valid (revoked or suspended)"},
-		{ErrCodeCredentialStatusUndetermined, "A selected credential could not be confirmed as valid"},
 	}
 
 	for _, tt := range tests {

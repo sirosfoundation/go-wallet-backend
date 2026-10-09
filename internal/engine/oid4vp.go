@@ -25,7 +25,6 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/statuslist"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
@@ -33,24 +32,10 @@ import (
 type OID4VPHandler struct {
 	BaseHandler
 	httpClient *http.Client
-	// statusChecker is nil when presentation.status_check is off.
-	statusChecker *statuslist.Checker
-	statusMode    config.StatusCheckMode
-	// statusBudget is the total time one presentation's status checks may
-	// take (presentation.status_check_budget_seconds; <=0 means
-	// defaultStatusCheckBudget). statusNow is the budget clock (nil: time.Now).
-	statusBudget time.Duration
-	statusNow    func() time.Time
 }
 
 // NewOID4VPHandler creates a new OID4VP flow handler
 func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
-	httpClient := cfg.HTTPClient.NewHTTPClient(0)
-	var checker *statuslist.Checker
-	mode := cfg.Presentation.StatusCheck.Effective()
-	if mode != config.StatusCheckOff {
-		checker = sharedStatusChecker(cfg, trustSvc)
-	}
 	return &OID4VPHandler{
 		BaseHandler: BaseHandler{
 			Flow:       flow,
@@ -61,10 +46,7 @@ func NewOID4VPHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustS
 			Verifiers:  verifiers,
 			TrustCache: trustCache,
 		},
-		httpClient:    httpClient,
-		statusChecker: checker,
-		statusMode:    mode,
-		statusBudget:  time.Duration(cfg.Presentation.StatusCheckBudgetSeconds) * time.Second,
+		httpClient: cfg.HTTPClient.NewHTTPClient(0),
 	}, nil
 }
 
@@ -231,35 +213,6 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	if err != nil {
 		h.Logger.Debug("VP signature failed", zap.Error(err))
 		_ = h.Error(StepSubmittingResponse, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
-		return err
-	}
-
-	return h.presentOrRefuse(ctx, authReq, vpToken)
-}
-
-// presentOrRefuse gates the vp_token on the credential status check and, if
-// it passes, submits it to the verifier and completes the flow.
-//
-// The gate refuses a credential that is positively known not to be valid
-// (strict mode: also one whose status cannot be established). The vp_token is
-// the first point at which the backend sees credential content (it never
-// holds the credentials), and nothing has been sent to the verifier yet. On
-// refusal the verifier gets the generic access_denied and skips
-// submitResponse; the wallet gets CREDENTIAL_REVOKED for a confirmed revocation and
-// CREDENTIAL_STATUS_UNDETERMINED when (strict mode) no status was established.
-func (h *OID4VPHandler) presentOrRefuse(ctx context.Context, authReq *AuthorizationRequest, vpToken string) error {
-	if err := h.checkPresentationStatus(ctx, vpToken); err != nil {
-		h.Logger.Warn("presentation refused by credential status check", zap.Error(err))
-		redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)
-		details := map[string]interface{}{}
-		if redirectURI != "" {
-			details["redirect_uri"] = redirectURI
-		}
-		code := ErrCodeCredentialStatusUndetermined
-		if errors.Is(err, statuslist.ErrRevoked) {
-			code = ErrCodeCredentialRevoked
-		}
-		_ = h.ErrorWithDetails(StepSubmittingResponse, code, code.UserFacingMessage(), details)
 		return err
 	}
 
