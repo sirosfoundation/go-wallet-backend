@@ -515,9 +515,18 @@ type SignRequestParams struct {
 	// session rather than the verifier's static identity. Empty for
 	// non-ZK presentations.
 	VerifierSessionID string `json:"verifier_session_id,omitempty"`
-	// TransactionData carries TS12 transaction data from the verifier's OID4VP request.
-	// The frontend must hash each item and include transaction_data_hashes in the KB-JWT.
+	// TransactionData carries the verifier's OID4VP transaction_data (EC TS12
+	// payment SCA), one entry per element of the request's array and in its
+	// order. Sent only to a client that declared FeatureTransactionDataV1.
+	// The client binds the presentation to it by hashing each entry's Raw
+	// string (never the decoded members) into the KB-JWT's
+	// transaction_data_hashes, and takes what it shows the user from Raw too,
+	// treating the decoded members as an aid.
 	TransactionData []TransactionData `json:"transaction_data,omitempty"`
+	// ResponseMode is the verifier request's response_mode. Set only together
+	// with TransactionData: EC TS12 requires it in the key binding JWT of an
+	// SCA presentation.
+	ResponseMode string `json:"response_mode,omitempty"`
 	// ReissuanceKid, when set (a renewal request - credential re-issuance/
 	// renewal plan, Phase 1 Slice 2), asks the client to sign this
 	// generate_proof request with the EXISTING keypair identified by this

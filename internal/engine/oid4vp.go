@@ -90,7 +90,18 @@ const (
 // TransactionData represents a single transaction data object from
 // the verifier's OID4VP authorization request (TS12/SCA per OID4VP draft §7.4).
 type TransactionData struct {
-	Type          string                 `json:"type"`
+	Type string `json:"type"`
+	// Raw is the entry exactly as the verifier sent it: the base64url string
+	// from the request's transaction_data array. It is the only valid input to
+	// the transaction_data_hashes a presentation carries (OID4VP 1.0
+	// Appendix B hashes the string as received, without decoding it first), and
+	// the only thing a client may trust: the other members are what the engine
+	// decoded from it. Always set by decodeTransactionData from the received
+	// string, never from the decoded JSON.
+	Raw string `json:"raw,omitempty"`
+	// Payload is the decoded entry's `payload` object (EC TS12 Section 4.2), for
+	// the client's validation and display. Never hash it.
+	Payload       json.RawMessage        `json:"payload,omitempty"`
 	Params        map[string]interface{} `json:"params,omitempty"`
 	CredentialIDs []string               `json:"credential_ids,omitempty"`
 	HashAlgorithm string                 `json:"hash_alg,omitempty"`
@@ -1792,7 +1803,7 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 
 	verifierJwkThumbprint := h.computeVerifierJWKThumbprint(authReq)
 
-	resp, err := h.RequestSign(ctx, SignActionSignPresentation, SignRequestParams{
+	params := SignRequestParams{
 		Audience:              audience,
 		Nonce:                 authReq.Nonce,
 		CredentialsToInclude:  credRefs,
@@ -1800,7 +1811,14 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 		VerifierJwkThumbprint: verifierJwkThumbprint,
 		VerifierSessionID:     authReq.VerifierSessionID,
 		TransactionData:       authReq.TransactionData,
-	})
+	}
+	// EC TS12 puts the request's response_mode in the key binding JWT of an SCA
+	// presentation. Sent only with transaction data, so every other
+	// presentation's sign request is unchanged.
+	if len(authReq.TransactionData) > 0 {
+		params.ResponseMode = effectiveResponseMode(authReq)
+	}
+	resp, err := h.RequestSign(ctx, SignActionSignPresentation, params)
 	if err != nil {
 		return "", err
 	}
@@ -1810,6 +1828,18 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 	}
 
 	return resp.VPToken, nil
+}
+
+// effectiveResponseMode is the response_mode this engine actually answers the
+// request with: the request's own, or direct_post when it names none. The sign
+// request must carry this value, not the raw (possibly empty) member: EC TS12
+// puts response_mode in the key binding JWT, and an empty one would make the
+// wallet either refuse or bind a mode the response is not sent in.
+func effectiveResponseMode(authReq *AuthorizationRequest) string {
+	if authReq.ResponseMode == "" {
+		return ResponseModeDirectPost
+	}
+	return authReq.ResponseMode
 }
 
 // computeVerifierJWKThumbprint returns the verifier JWK thumbprint for direct_post.jwt,
@@ -1896,10 +1926,7 @@ func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *Authorizati
 	}
 
 	// Determine response mode
-	responseMode := authReq.ResponseMode
-	if responseMode == "" {
-		responseMode = ResponseModeDirectPost
-	}
+	responseMode := effectiveResponseMode(authReq)
 
 	switch responseMode {
 	case ResponseModeDirectPost:
@@ -2182,10 +2209,7 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 	}
 
 	// OID4VP §5: redirect_uri MUST NOT be present when response_mode is direct_post or direct_post.jwt
-	responseMode := authReq.ResponseMode
-	if responseMode == "" {
-		responseMode = ResponseModeDirectPost
-	}
+	responseMode := effectiveResponseMode(authReq)
 	isDirectPost := responseMode == ResponseModeDirectPost || responseMode == ResponseModeDirectPostJWT
 	if isDirectPost && authReq.RedirectURI != "" {
 		return errors.New("redirect_uri must not be present with direct_post response mode")
@@ -2386,6 +2410,9 @@ func decodeTransactionData(raw json.RawMessage) ([]decodedTransactionData, error
 		if err := json.Unmarshal(decoded, &td); err != nil {
 			return nil, newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: invalid JSON: %w", i, err)
 		}
+		// The verifier controls the decoded JSON, so a `raw` member in it would
+		// land in td.Raw. Overwrite it: Raw is what was received, nothing else.
+		td.Raw = encoded
 		out = append(out, decodedTransactionData{Raw: encoded, Data: td})
 	}
 	return out, nil
@@ -2413,16 +2440,65 @@ func validateTransactionData(authReq *AuthorizationRequest, msg *FlowStartMessag
 		return newTransactionDataError(ErrCodeUnsupportedTransactionData,
 			"request carries transaction_data but the client did not declare %q", FeatureTransactionDataV1)
 	}
-	knownTypes := map[string]bool{
-		"owf_payment_initiation": true,
-	}
-	for _, e := range entries {
-		if !knownTypes[e.Data.Type] {
-			return newTransactionDataError(ErrCodeUnsupportedTransactionData, "unsupported transaction_data type: %q", e.Data.Type)
+	dcqlIDs := dcqlCredentialIDs(authReq.DCQLQuery)
+	for i, e := range entries {
+		if err := checkTransactionDataEntry(i, e.Data, dcqlIDs); err != nil {
+			return err
 		}
 		authReq.TransactionData = append(authReq.TransactionData, e.Data)
 	}
 	return nil
+}
+
+// checkTransactionDataEntry is the structural check OID4VP 1.0 puts on an
+// entry: a type, and a non-empty list of credential_ids each naming a
+// credential in the request's DCQL query. It does not decide whether the type
+// is supported. That depends on the type metadata of the attestation the
+// entry is bound to, which the wallet resolves, so the engine passes every
+// well-formed entry to a client that declared FeatureTransactionDataV1 and the
+// client refuses what it cannot handle.
+func checkTransactionDataEntry(i int, td TransactionData, dcqlIDs map[string]bool) error {
+	if td.Type == "" {
+		return newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: missing type", i)
+	}
+	if len(td.CredentialIDs) == 0 {
+		return newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: credential_ids must be a non-empty array", i)
+	}
+	// credential_ids name credentials of the request's DCQL query (OID4VP 1.0).
+	// With no readable query there is nothing they could name, and accepting
+	// them anyway would skip the binding the wallet relies on to know which
+	// credential answers which transaction.
+	if dcqlIDs == nil {
+		return newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: the request has no dcql_query whose credentials credential_ids could name", i)
+	}
+	for _, id := range td.CredentialIDs {
+		if !dcqlIDs[id] {
+			return newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: credential_ids references %q, which is not a credential in dcql_query", i, id)
+		}
+	}
+	return nil
+}
+
+// dcqlCredentialIDs returns the credential query ids of a DCQL query, or nil
+// when there is no query or it cannot be read (so there is nothing to check
+// against; other validation reports an unreadable query).
+func dcqlCredentialIDs(dcql json.RawMessage) map[string]bool {
+	if len(dcql) == 0 {
+		return nil
+	}
+	var q struct {
+		Credentials []struct {
+			ID string `json:"id"`
+		} `json:"credentials"`
+	}
+	if err := json.Unmarshal(dcql, &q); err != nil || len(q.Credentials) == 0 {
+		return nil
+	}
+	ids := make(map[string]bool, len(q.Credentials))
+	for _, c := range q.Credentials {
+		ids[c.ID] = true
+	}
+	return ids
 }
 
 // failTransactionData ends the flow for a transaction_data problem. The
