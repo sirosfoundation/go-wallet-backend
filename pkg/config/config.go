@@ -36,6 +36,7 @@ type Config struct {
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
 	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
 	Presentation   PresentationConfig   `yaml:"presentation" envconfig:"PRESENTATION"`
+	StatusCheck    StatusCheckConfig    `yaml:"status_check" envconfig:"STATUS_CHECK"`
 
 	// Registry configures the VCTM registry role (--mode=registry). It
 	// replaces the retired standalone registry configuration file
@@ -378,6 +379,70 @@ type PresentationConfig struct {
 	// contents of the resulting vp_token. Unknown values fail at startup.
 	// Env: WALLET_PRESENTATION_DCQL_CONSENT_CHECK
 	DCQLConsentCheck DCQLConsentCheckMode `yaml:"dcql_consent_check" envconfig:"DCQL_CONSENT_CHECK"`
+}
+
+// Limits of the verified status list API (StatusCheckConfig).
+const (
+	// DefaultStatusMaxListsPerRequest is the default cap on lists per request.
+	DefaultStatusMaxListsPerRequest = 20
+	// DefaultStatusRequestTimeoutSeconds is the default per-request deadline.
+	DefaultStatusRequestTimeoutSeconds = 8
+	// MaxStatusRequestTimeoutSeconds is the largest accepted per-request
+	// deadline (the HTTP WriteTimeout is 15 s).
+	MaxStatusRequestTimeoutSeconds = 12
+	// DefaultStatusMaxListBytes is the default cap on one compressed `lst` (2 MiB).
+	DefaultStatusMaxListBytes = 2 << 20
+)
+
+// StatusCheckConfig configures the verified Token Status List API
+// (POST /status/v1/lists) and its verifier; see
+// docs/adr/013-status-checking-outside-the-engine.md.
+type StatusCheckConfig struct {
+	// Enabled turns the API on; when false the route answers 503
+	// STATUS_NOT_SUPPORTED. Default: true. Env: WALLET_STATUS_CHECK_ENABLED
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// StatusListSignerFallback: when go-trust errors on the `status-list-signer`
+	// evaluation and this is true (default), ask once more as
+	// `credential-issuer`; when false the list is undetermined
+	// (trust_unavailable). A genuine negative never falls back.
+	// Env: WALLET_STATUS_CHECK_STATUS_LIST_SIGNER_FALLBACK
+	StatusListSignerFallback bool `yaml:"status_list_signer_fallback" envconfig:"STATUS_LIST_SIGNER_FALLBACK"`
+
+	// StatusListMinEntries rejects a list with fewer entries once inflated
+	// (bytes*8/bits) as undetermined (list_too_small). Default 0: no minimum,
+	// as the draft sets none; set e.g. 131072 only if every status issuer you
+	// rely on publishes at least that. Must not be negative.
+	// Env: WALLET_STATUS_CHECK_STATUS_LIST_MIN_ENTRIES
+	StatusListMinEntries int `yaml:"status_list_min_entries" envconfig:"STATUS_LIST_MIN_ENTRIES"`
+
+	// StatusListMaxConcurrentLoads bounds concurrent list fetch-and-inflate
+	// loads across all requests; each can hold up to 36 MiB, which the cache
+	// limit does not cover. A request waiting for a slot gives up at its
+	// deadline (budget_exhausted). 0 (default) means 8. Must not be negative.
+	// Env: WALLET_STATUS_CHECK_STATUS_LIST_MAX_CONCURRENT_LOADS
+	StatusListMaxConcurrentLoads int `yaml:"status_list_max_concurrent_loads" envconfig:"STATUS_LIST_MAX_CONCURRENT_LOADS"`
+
+	// MaxListsPerRequest caps the lists per request (over it: 400
+	// TOO_MANY_URIS). Clients should ask for 1-3 to limit what the server
+	// learns. 0 (default) means 20.
+	// Env: WALLET_STATUS_CHECK_MAX_LISTS_PER_REQUEST
+	MaxListsPerRequest int `yaml:"max_lists_per_request" envconfig:"MAX_LISTS_PER_REQUEST"`
+
+	// RequestTimeoutSeconds is the deadline of one request, covering all its
+	// lists; unfinished lists are undetermined (budget_exhausted). Must stay
+	// under the 15 s HTTP write timeout. 0 (default) means 8; at most 12.
+	// Env: WALLET_STATUS_CHECK_REQUEST_TIMEOUT_SECONDS
+	RequestTimeoutSeconds int `yaml:"request_timeout_seconds" envconfig:"REQUEST_TIMEOUT_SECONDS"`
+
+	// MaxListBytes caps one returned compressed `lst`; a larger list is
+	// undetermined (too_large). 0 (default) means 2097152 (2 MiB). Must not be
+	// negative.
+	// Env: WALLET_STATUS_CHECK_MAX_LIST_BYTES
+	MaxListBytes int `yaml:"max_list_bytes" envconfig:"MAX_LIST_BYTES"`
+
+	// RateLimit caps API requests per authenticated caller (user, else tenant) per window.
+	RateLimit AuthRateLimitConfig `yaml:"rate_limit" envconfig:"RATE_LIMIT"`
 }
 
 // HTTPClientConfig contains HTTP client configuration for outbound requests
@@ -2231,6 +2296,19 @@ func defaultConfig() *Config {
 			Timeout:         30,
 		},
 		Presentation: PresentationConfig{DCQLConsentCheck: DCQLConsentCheckWarn},
+		StatusCheck: StatusCheckConfig{
+			Enabled:                  true,
+			StatusListSignerFallback: true,
+			MaxListsPerRequest:       DefaultStatusMaxListsPerRequest,
+			RequestTimeoutSeconds:    DefaultStatusRequestTimeoutSeconds,
+			MaxListBytes:             DefaultStatusMaxListBytes,
+			RateLimit: AuthRateLimitConfig{
+				Enabled:        true,
+				MaxAttempts:    60,
+				WindowSeconds:  60,
+				LockoutSeconds: 60,
+			},
+		},
 		AS: ASConfig{
 			DefaultTokenTTL: 2 * time.Minute,
 			Legacy: ASLegacyConfig{
@@ -2565,6 +2643,9 @@ func (c *Config) Validate() error {
 	if err := c.Presentation.DCQLConsentCheck.validate(); err != nil {
 		return err
 	}
+	if err := c.StatusCheck.validate(); err != nil {
+		return err
+	}
 
 	// Validate audit configuration — without this, cfg.Audit.Enabled=true
 	// with a missing issuer/key_path/key_id silently disables the SET audit
@@ -2731,4 +2812,24 @@ func containsString(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// validate rejects status_check values that would misbehave at runtime.
+func (c StatusCheckConfig) validate() error {
+	if c.StatusListMinEntries < 0 {
+		return fmt.Errorf("invalid status_check.status_list_min_entries %d: must not be negative", c.StatusListMinEntries)
+	}
+	if c.StatusListMaxConcurrentLoads < 0 {
+		return fmt.Errorf("invalid status_check.status_list_max_concurrent_loads %d: must not be negative", c.StatusListMaxConcurrentLoads)
+	}
+	if c.MaxListsPerRequest < 0 {
+		return fmt.Errorf("invalid status_check.max_lists_per_request %d: must not be negative", c.MaxListsPerRequest)
+	}
+	if c.RequestTimeoutSeconds < 0 || c.RequestTimeoutSeconds > MaxStatusRequestTimeoutSeconds {
+		return fmt.Errorf("invalid status_check.request_timeout_seconds %d: must be between 0 and %d (the HTTP write timeout is 15 s)", c.RequestTimeoutSeconds, MaxStatusRequestTimeoutSeconds)
+	}
+	if c.MaxListBytes < 0 {
+		return fmt.Errorf("invalid status_check.max_list_bytes %d: must not be negative", c.MaxListBytes)
+	}
+	return nil
 }

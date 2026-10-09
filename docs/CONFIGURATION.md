@@ -23,6 +23,7 @@ Environment variables use the prefix `WALLET_` (the registry role's settings are
 - [authzen_proxy](#authzen_proxy)
 - [audit](#audit)
 - [presentation](#presentation)
+- [status_check](#status_check)
 - [registry](#registry)
 
 ---
@@ -292,6 +293,24 @@ Environment prefix: `WALLET_PRESENTATION`
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
 | `presentation.dcql_consent_check` | `WALLET_PRESENTATION_DCQL_CONSENT_CHECK` | DCQLConsentCheckMode | DCQLConsentCheck compares the user's consent (selected credential query ids and disclosed claims) with the DCQL query the backend sent to the client, before any signing. The frontend is not trusted to have honoured the query. Values: `off` (no check); `warn` (default: log a warning with the reason class and query id, never refuse; claim-path matching can disagree with a real verifier's notion of a path, so a deployer opts into enforcement); `enforce` (refuse with PRESENTATION_ERROR and answer the verifier access_denied, without signing). Nothing about claim names or values is logged. Not enforced: credential_sets satisfaction (only that no query outside every option is selected), `values` constraints, and the contents of the resulting vp_token. Unknown values fail at startup. Env: WALLET_PRESENTATION_DCQL_CONSENT_CHECK |
+
+## status_check
+
+Environment prefix: `WALLET_STATUS_CHECK`
+
+| YAML Key | Env Variable | Type | Description |
+|----------|-------------|------|-------------|
+| `status_check.enabled` | `WALLET_STATUS_CHECK_ENABLED` | boolean | Enabled turns the API on; when false the route answers 503 STATUS_NOT_SUPPORTED. Default: true. Env: WALLET_STATUS_CHECK_ENABLED |
+| `status_check.status_list_signer_fallback` | `WALLET_STATUS_CHECK_STATUS_LIST_SIGNER_FALLBACK` | boolean | StatusListSignerFallback: when go-trust errors on the `status-list-signer` evaluation and this is true (default), ask once more as `credential-issuer`; when false the list is undetermined (trust_unavailable). A genuine negative never falls back. Env: WALLET_STATUS_CHECK_STATUS_LIST_SIGNER_FALLBACK |
+| `status_check.status_list_min_entries` | `WALLET_STATUS_CHECK_STATUS_LIST_MIN_ENTRIES` | integer | StatusListMinEntries rejects a list with fewer entries once inflated (bytes*8/bits) as undetermined (list_too_small). Default 0: no minimum, as the draft sets none; set e.g. 131072 only if every status issuer you rely on publishes at least that. Must not be negative. Env: WALLET_STATUS_CHECK_STATUS_LIST_MIN_ENTRIES |
+| `status_check.status_list_max_concurrent_loads` | `WALLET_STATUS_CHECK_STATUS_LIST_MAX_CONCURRENT_LOADS` | integer | StatusListMaxConcurrentLoads bounds concurrent list fetch-and-inflate loads across all requests; each can hold up to 36 MiB, which the cache limit does not cover. A request waiting for a slot gives up at its deadline (budget_exhausted). 0 (default) means 8. Must not be negative. Env: WALLET_STATUS_CHECK_STATUS_LIST_MAX_CONCURRENT_LOADS |
+| `status_check.max_lists_per_request` | `WALLET_STATUS_CHECK_MAX_LISTS_PER_REQUEST` | integer | MaxListsPerRequest caps the lists per request (over it: 400 TOO_MANY_URIS). Clients should ask for 1-3 to limit what the server learns. 0 (default) means 20. Env: WALLET_STATUS_CHECK_MAX_LISTS_PER_REQUEST |
+| `status_check.request_timeout_seconds` | `WALLET_STATUS_CHECK_REQUEST_TIMEOUT_SECONDS` | integer | RequestTimeoutSeconds is the deadline of one request, covering all its lists; unfinished lists are undetermined (budget_exhausted). Must stay under the 15 s HTTP write timeout. 0 (default) means 8; at most 12. Env: WALLET_STATUS_CHECK_REQUEST_TIMEOUT_SECONDS |
+| `status_check.max_list_bytes` | `WALLET_STATUS_CHECK_MAX_LIST_BYTES` | integer | MaxListBytes caps one returned compressed `lst`; a larger list is undetermined (too_large). 0 (default) means 2097152 (2 MiB). Must not be negative. Env: WALLET_STATUS_CHECK_MAX_LIST_BYTES |
+| `status_check.rate_limit.enabled` | `WALLET_STATUS_CHECK_RATE_LIMIT_ENABLED` | boolean | Enabled controls whether rate limiting is active |
+| `status_check.rate_limit.max_attempts` | `WALLET_STATUS_CHECK_RATE_LIMIT_MAX_ATTEMPTS` | integer | MaxAttempts is the maximum number of login/registration attempts per window Default: 10 |
+| `status_check.rate_limit.window_seconds` | `WALLET_STATUS_CHECK_RATE_LIMIT_WINDOW_SECONDS` | integer | WindowSeconds is the time window for rate limiting (in seconds) Default: 60 (1 minute) |
+| `status_check.rate_limit.lockout_seconds` | `WALLET_STATUS_CHECK_RATE_LIMIT_LOCKOUT_SECONDS` | integer | LockoutSeconds is how long to lock out after exceeding the limit Default: 300 (5 minutes) |
 
 ## registry
 

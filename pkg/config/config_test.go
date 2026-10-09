@@ -3014,3 +3014,91 @@ func TestApplyASSecurityDefaults_JWTIssuerAndParity(t *testing.T) {
 		t.Errorf("AS disabled must not get audiences: %v", d.AS.Audiences)
 	}
 }
+
+func TestDefaultConfig_StatusCheck(t *testing.T) {
+	sc := defaultConfig().StatusCheck
+	if !sc.Enabled || !sc.StatusListSignerFallback {
+		t.Errorf("enabled/fallback must default to true: %+v", sc)
+	}
+	if sc.MaxListsPerRequest != 20 {
+		t.Errorf("max_lists_per_request default = %d, want 20", sc.MaxListsPerRequest)
+	}
+	if sc.RequestTimeoutSeconds != DefaultStatusRequestTimeoutSeconds || sc.RequestTimeoutSeconds >= 15 {
+		t.Errorf("request_timeout_seconds default = %d, must be well under the 15 s write timeout", sc.RequestTimeoutSeconds)
+	}
+	if sc.MaxListBytes != 2<<20 {
+		t.Errorf("max_list_bytes default = %d, want 2 MiB", sc.MaxListBytes)
+	}
+	if sc.StatusListMinEntries != 0 {
+		t.Error("status_list_min_entries must default to 0 (the draft sets no minimum)")
+	}
+	if !sc.RateLimit.Enabled || sc.RateLimit.MaxAttempts <= 0 {
+		t.Errorf("rate limit must default on: %+v", sc.RateLimit)
+	}
+}
+
+func TestConfig_Validate_StatusCheck(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*StatusCheckConfig)
+		want   string // "" = valid
+	}{
+		{"zero value", func(*StatusCheckConfig) {}, ""},
+		{"negative min entries", func(c *StatusCheckConfig) { c.StatusListMinEntries = -1 }, "status_list_min_entries"},
+		{"min entries", func(c *StatusCheckConfig) { c.StatusListMinEntries = 131072 }, ""},
+		{"negative loads", func(c *StatusCheckConfig) { c.StatusListMaxConcurrentLoads = -1 }, "status_list_max_concurrent_loads"},
+		{"loads", func(c *StatusCheckConfig) { c.StatusListMaxConcurrentLoads = 4 }, ""},
+		{"negative cap", func(c *StatusCheckConfig) { c.MaxListsPerRequest = -1 }, "max_lists_per_request"},
+		{"negative timeout", func(c *StatusCheckConfig) { c.RequestTimeoutSeconds = -1 }, "request_timeout_seconds"},
+		{"timeout over write timeout", func(c *StatusCheckConfig) { c.RequestTimeoutSeconds = MaxStatusRequestTimeoutSeconds + 1 }, "request_timeout_seconds"},
+		{"max timeout", func(c *StatusCheckConfig) { c.RequestTimeoutSeconds = MaxStatusRequestTimeoutSeconds }, ""},
+		{"negative size", func(c *StatusCheckConfig) { c.MaxListBytes = -1 }, "max_list_bytes"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validBaseConfig()
+			tc.mutate(&cfg.StatusCheck)
+			err := cfg.Validate()
+			switch {
+			case tc.want == "" && err != nil:
+				t.Fatalf("unexpected error: %v", err)
+			case tc.want != "" && (err == nil || !strings.Contains(err.Error(), "status_check."+tc.want)):
+				t.Fatalf("err = %v, want one naming status_check.%s", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_StatusCheckSection checks that yaml and env values override the defaults.
+func TestLoad_StatusCheckSection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	yaml := `
+server:
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+status_check:
+  enabled: false
+  status_list_signer_fallback: false
+  status_list_min_entries: 7
+  status_list_max_concurrent_loads: 3
+  max_lists_per_request: 5
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WALLET_STATUS_CHECK_REQUEST_TIMEOUT_SECONDS", "6")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := cfg.StatusCheck
+	if sc.Enabled || sc.StatusListSignerFallback || sc.StatusListMinEntries != 7 || sc.StatusListMaxConcurrentLoads != 3 ||
+		sc.MaxListsPerRequest != 5 || sc.RequestTimeoutSeconds != 6 {
+		t.Fatalf("status_check = %+v", sc)
+	}
+	// Defaults survive a partial section.
+	if sc.MaxListBytes != DefaultStatusMaxListBytes || !sc.RateLimit.Enabled {
+		t.Fatalf("defaults lost: %+v", sc)
+	}
+}

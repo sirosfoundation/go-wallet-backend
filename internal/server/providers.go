@@ -40,6 +40,9 @@ type AuthProvider struct {
 	roles          []string
 	tokenValidator *tokenvalidator.Validator
 	wiaRateLimiter *middleware.AuthRateLimiter
+	// statusRateLimiter limits the status list API per caller (user, else tenant);
+	// it holds counters only.
+	statusRateLimiter *middleware.AuthRateLimiter
 	// gateRateLimiter is shared by the /user/* gates and the AS passkey gates,
 	// so both draw from the same per-IP and per-tenant buckets (#65).
 	gateRateLimiter *middleware.OIDCGateRateLimiter
@@ -59,6 +62,8 @@ func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logg
 		roles:           roles,
 		wiaRateLimiter:  middleware.NewAuthRateLimiter(cfg.WalletProvider.WIA.RateLimit, logger.Named("wia")),
 		gateRateLimiter: middleware.NewOIDCGateRateLimiter(cfg.Security.OIDCGateRateLimit, logger),
+
+		statusRateLimiter: middleware.NewAuthRateLimiter(cfg.StatusCheck.RateLimit, logger.Named("status")),
 	}
 }
 
@@ -155,6 +160,22 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		public.GET("/helper/auth-check", p.handlers.AuthCheck)
 		public.POST("/helper/auth-check", p.handlers.AuthCheck)
 	}
+
+	// Verified status list API. Not in the protected group, whose
+	// NoCacheMiddleware would override this response's own Cache-Control.
+	// Always registered: when disabled the handler answers 503 STATUS_NOT_SUPPORTED.
+	statusGroup := router.Group("/status/v1")
+	statusGroup.Use(p.authMiddleware())
+	if p.tokenValidator != nil {
+		statusGroup.Use(middleware.RequireAudience("wallet-backend"))
+	}
+	statusGroup.POST("/lists",
+		middleware.AuthRateLimitMiddlewareWithResponse(p.statusRateLimiter, wiaCallerIdentifier, gin.H{
+			"error":   "RATE_LIMIT_EXCEEDED",
+			"message": "Too many status list requests, please retry later",
+		}),
+		requireTACIfEnforced(p.tokenValidator, "r"),
+		p.handlers.StatusLists)
 
 	// Protected auth routes (session management)
 	protected := router.Group("/")
