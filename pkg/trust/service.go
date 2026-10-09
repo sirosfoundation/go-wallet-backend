@@ -113,12 +113,10 @@ type TrustInfo struct {
 	Framework    string   `json:"framework,omitempty"`
 	Reason       string   `json:"reason,omitempty"`
 	Certificates []string `json:"certificates,omitempty"`
-	// Action names the AuthZEN action whose positive decision produced this
-	// result; set only by EvaluateStatusListSigner.
+	// Action is the AuthZEN action that produced a positive result (EvaluateStatusListSigner only).
 	Action string `json:"action,omitempty"`
-	// EvaluationFailed is true when no decision could be had (transport or
-	// evaluation error), as opposed to the PDP answering "no". Trusted is
-	// false in both cases; callers must use this field, not Reason text.
+	// EvaluationFailed means no decision could be had, as opposed to the PDP
+	// answering "no". Callers must use this, not Reason text.
 	EvaluationFailed bool `json:"evaluation_failed,omitempty"`
 }
 
@@ -302,64 +300,44 @@ func (s *Service) EvaluateFIDO2Attestation(ctx context.Context, aaguid string, x
 	})
 }
 
-// StatusListSignerAction is the AuthZEN action.name sent when evaluating the
-// signer of a Token Status List (draft-ietf-oauth-status-list). It is distinct
-// from credential-issuer on purpose: being trusted to issue credentials is not
-// the same as being trusted to publish their revocation status, and an
-// external status service signs with its own key.
+// StatusListSignerAction is the AuthZEN action.name used for the signer of a
+// Token Status List. It is distinct from credential-issuer because issuing
+// credentials and publishing their status are different trust decisions.
 //
-// The go-trust deployment MUST define a policy with exactly this name.
-// go-trust's PolicyManager.GetPolicy falls back to the DEFAULT policy for an
-// unknown action.name, so without it the signer is silently judged by the
-// default policy. See docs/adr/012-trust-evaluation-architecture.md
-// ("AuthZEN actions used by go-wallet-backend").
+// The go-trust deployment must define a policy with exactly this name:
+// go-trust falls back to its DEFAULT policy for an unknown action.name. See
+// docs/adr/012-trust-evaluation-architecture.md.
 const StatusListSignerAction = "status-list-signer"
 
 // FrameworkNone is TrustInfo.Framework when no PDP endpoint is configured.
 const FrameworkNone = "none"
 
-// StatusListSignerFallbackAction is the second action tried when the
-// status-list-signer evaluation errors (and the fallback is enabled).
+// StatusListSignerFallbackAction is tried when the status-list-signer
+// evaluation errors and the fallback is enabled.
 const StatusListSignerFallbackAction = string(RoleCredentialIssuer)
 
-// evalFailedReasonPrefix starts TrustInfo.Reason (human-readable only) when
-// the evaluation itself failed; TrustInfo.EvaluationFailed is the signal.
+// evalFailedReasonPrefix starts TrustInfo.Reason when the evaluation failed.
 const evalFailedReasonPrefix = "Trust evaluation failed"
 
-// statusEvalFailedClass is the only description of a failed status-list
-// signer evaluation that is logged: the raw error and PDP reason may carry
-// token-controlled text.
+// statusEvalFailedClass is all that is logged of a failed redacted evaluation
+// (the raw error may carry token-controlled text).
 const statusEvalFailedClass = "evaluation_failed"
 
-// EvaluateStatusListSigner asks the trust endpoint whether keyMaterial (the
-// x5c chain or jwk from a status list's header) may sign status lists for
-// subject (the list's iss claim, else the origin of the list URI).
+// EvaluateStatusListSigner asks the trust endpoint whether keyMaterial (x5c or
+// jwk from a status list header) may sign status lists for subject. The
+// endpoint is resolved like EvaluateIssuer's.
 //
-// The first call sends action.name "status-list-signer" (Role is left empty so
-// the explicit action is used, as for EvaluateFIDO2Attestation). Its outcome:
+// The first call uses action "status-list-signer":
 //
-//   - positive: trusted, no further call;
-//   - genuine negative: FINAL, the signer is untrusted and no second call is
-//     made ("deny is deny");
-//   - no PDP configured (Framework "none"): untrusted, no second call (it
-//     could not differ);
-//   - error (transport or evaluation failure): if fallbackOnError, a second
-//     call is made as the credential-issuer role via EvaluateIssuer, with the
-//     same subject, key material, endpoint and tenant, and the signer is
-//     trusted if that is positive. A negative there is a negative; an error
-//     there leaves the first error. With fallbackOnError false, the error
-//     stands and no second call is made.
+//   - positive: trusted;
+//   - genuine negative: final, no second call ("deny is deny");
+//   - no PDP (Framework FrameworkNone): untrusted, no second call;
+//   - error: with fallbackOnError, a second call as the credential-issuer role
+//     decides (a negative there is a negative; an error there leaves the first
+//     error); without it the error stands.
 //
-// TrustInfo.Action names the action that produced a positive result, so
-// callers can tell a status-list-signer decision from a fallback one. A
-// negative and an error remain distinguishable through
-// TrustInfo.EvaluationFailed (true for an error); the no-PDP case is
-// identified by Framework == FrameworkNone. Callers must never classify an
-// outcome from the human-readable Reason text.
-//
-// The endpoint is resolved like EvaluateIssuer's (session override, then the
-// per-flow issuer PDP URL, then the global PDP URL): a status list signer is an
-// issuer-side entity, and no separate status-list PDP setting exists.
+// TrustInfo.Action says which action produced a positive result;
+// EvaluationFailed distinguishes an error from a negative.
 func (s *Service) EvaluateStatusListSigner(ctx context.Context, subject string, trustEndpoint string, keyMaterial *KeyMaterial, fallbackOnError bool) (*TrustInfo, error) {
 	endpoint := s.resolveIssuerEndpoint(trustEndpoint)
 	first, err := s.evaluate(ctx, subject, endpoint, RoleAny, evaluateOptions{
@@ -433,9 +411,8 @@ type evaluateOptions struct {
 	// EvaluationRequest.Context (see EvaluateVerifierWithContext's doc
 	// comment for why this exists).
 	evalContext map[string]interface{}
-	// redact keeps the subject, evaluator errors and PDP reasons out of this
-	// call's log lines (they are token-controlled); only an error class is
-	// logged.
+	// redact keeps the subject, errors and PDP reasons (token-controlled) out
+	// of log lines; only an error class is logged.
 	redact bool
 }
 
@@ -549,8 +526,7 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 	}
 
 	if resp.Failed {
-		// The evaluator reports a PDP/build failure in-band (no Go error):
-		// that is a failed evaluation, not a denial.
+		// In-band PDP/build failure: a failed evaluation, not a denial.
 		if opts.redact {
 			s.logger.Warn("Trust evaluation failed", zap.String("error_class", statusEvalFailedClass))
 		} else {

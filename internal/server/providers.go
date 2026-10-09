@@ -40,8 +40,8 @@ type AuthProvider struct {
 	roles          []string
 	tokenValidator *tokenvalidator.Validator
 	wiaRateLimiter *middleware.AuthRateLimiter
-	// statusRateLimiter keys the verified status list API per caller (user,
-	// else tenant); it holds counters only, never the lists asked for.
+	// statusRateLimiter limits the status list API per caller (user, else tenant);
+	// it holds counters only.
 	statusRateLimiter *middleware.AuthRateLimiter
 	// gateRateLimiter is shared by the /user/* gates and the AS passkey gates,
 	// so both draw from the same per-IP and per-tenant buckets (#65).
@@ -161,13 +161,9 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		public.POST("/helper/auth-check", p.handlers.AuthCheck)
 	}
 
-	// Verified Token Status List API. Deliberately NOT in the protected group
-	// below: that group applies NoCacheMiddleware, while this response is
-	// cacheable by the caller (private, max-age) and sets its own
-	// Cache-Control. Authenticated callers only (an identity-free anonymous
-	// token is rejected by RequireAudience), rate limited per caller like the
-	// WIA endpoints. Always registered: with status_check.enabled=false the
-	// handler answers 503 STATUS_NOT_SUPPORTED.
+	// Verified status list API. Not in the protected group, whose
+	// NoCacheMiddleware would override this response's own Cache-Control.
+	// Always registered: when disabled the handler answers 503 STATUS_NOT_SUPPORTED.
 	statusGroup := router.Group("/status/v1")
 	statusGroup.Use(p.authMiddleware())
 	if p.tokenValidator != nil {

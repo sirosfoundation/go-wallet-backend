@@ -130,9 +130,8 @@ type EvaluationResponse struct {
 	TrustMetadata interface{}
 	// Chain contains the validated certificate chain, if applicable.
 	Chain []*x509.Certificate
-	// Failed is true when no decision could be had (PDP unreachable, error
-	// response, request could not be built). Decision is then false, but it
-	// is not a denial: callers must not treat it as one.
+	// Failed means no decision could be had (PDP unreachable, error response,
+	// unbuildable request); Decision is false but is not a denial.
 	Failed bool
 }
 
@@ -320,7 +319,7 @@ func (m *EvaluatorManager) Evaluate(ctx context.Context, req *EvaluationRequest)
 	return &EvaluationResponse{
 		Decision: false,
 		Reason:   "no evaluator available for resource type: " + string(keyType),
-		// No evaluator could even be asked: no decision, not a denial.
+		// No evaluator could be asked.
 		Failed: true,
 	}, nil
 }

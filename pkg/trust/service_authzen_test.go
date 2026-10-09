@@ -16,8 +16,7 @@ import (
 )
 
 // These tests drive EvaluateStatusListSigner through the real AuthZEN adapter
-// against an httptest PDP, so they cover the in-band failure reporting that a
-// fake evaluator returning Go errors cannot.
+// against an httptest PDP, covering in-band failure reporting.
 func authzenService(t *testing.T, url string) *trust.Service {
 	t.Helper()
 	cfg := &config.Config{Trust: config.TrustConfig{Timeout: 5, PDPURL: url}}

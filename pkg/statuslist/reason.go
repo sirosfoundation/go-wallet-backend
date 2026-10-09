@@ -5,14 +5,12 @@ import (
 	"errors"
 )
 
-// Reason names why a status list could not be used. It is the stable,
-// machine-readable classification of a failure that the verified status list
-// API reports (see Classify). None of the reasons means "the credential is
-// valid"; every one of them means the list is undetermined.
+// Reason is the stable, machine-readable classification of a status list
+// failure (see Classify). Every reason means the list is undetermined, never
+// that the credential is valid.
 type Reason string
 
-// The reasons. Anything an error does not name explicitly is ReasonMalformed
-// (the token was fetched but is not an acceptable Status List Token).
+// The reasons. An unclassified error is ReasonMalformed.
 const (
 	ReasonFetchFailed          Reason = "fetch_failed"
 	ReasonUnsupportedMediaType Reason = "unsupported_media_type"
@@ -29,8 +27,7 @@ const (
 	ReasonURINotAllowed        Reason = "uri_not_allowed"
 )
 
-// classifiedError carries a Reason while keeping the original message and
-// chain, so existing error text and errors.Is checks are unaffected.
+// classifiedError carries a Reason and keeps the original message and chain.
 type classifiedError struct {
 	reason Reason
 	err    error
@@ -44,9 +41,8 @@ func classify(reason Reason, err error) error {
 	return &classifiedError{reason: reason, err: err}
 }
 
-// Classify maps an error from loading a status list to its Reason. A context
-// cancellation or deadline is ReasonBudgetExhausted (the caller's time ran
-// out, nothing about the list is known).
+// Classify maps an error from loading a status list to its Reason; a context
+// cancellation or deadline is ReasonBudgetExhausted.
 func Classify(err error) Reason {
 	var ce *classifiedError
 	switch {

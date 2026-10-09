@@ -17,26 +17,18 @@ import (
 )
 
 // StatusService answers "what does this Token Status List say, and can the
-// backend vouch for it?" for clients that check credential status in the
-// background (POST /status/v1/lists). It does NOT answer "is this credential
-// valid": clients take the returned list and read their own index locally, so
-// the backend never learns which credential, or which index, is asked about.
+// backend vouch for it?" (POST /status/v1/lists; see
+// docs/adr/013-status-checking-outside-the-engine.md). Clients read their own
+// index locally, so the backend never learns which credential is asked about.
 //
-// The engine does not check status at presentation time (see
-// docs/adr/013-status-checking-outside-the-engine.md).
+// Fail-closed: a list is "verified" only if fetched, verified and its signer
+// accepted by the trust service (go-trust); everything else is "undetermined"
+// with a Reason. No outcome ever says a credential is valid.
 //
-// Outcomes are fail-closed. A list is "verified" only when it was fetched, its
-// signature, typ, sub and temporal claims verified, and its signer key
-// accepted by the trust service (go-trust). Everything else is "undetermined"
-// with a Reason; no outcome ever says a credential is valid.
-//
-// Privacy. The list URIs a user asks for reveal which issuers and credentials
-// that user holds. So this service never logs a URI (it logs counts, outcomes
-// and durations only), never emits audit events about lists, never persists
-// which lists were requested and never associates a URI with a user: it is
-// not even handed the user. Its only state is the Checker's in-process cache,
-// keyed by tenant and URI, which holds public data only. Errors from the
-// Checker contain URIs and are therefore never logged or returned.
+// Privacy: the requested URIs reveal what a user holds, so this service never
+// logs a URI or the Checker's errors (they contain URIs), emits no audit
+// events, persists nothing and is not handed the user. Its only state is the
+// Checker's in-process cache of public data.
 type StatusService struct {
 	lister       StatusLister
 	logger       *zap.Logger
@@ -53,24 +45,19 @@ type StatusLister interface {
 
 // Request-validation errors of StatusService.Lists.
 var (
-	// ErrStatusInvalidRequest is returned for an empty request or an item
-	// without a uri or with an unusable etag.
+	// ErrStatusInvalidRequest: empty request, or an item without a uri or with a bad etag.
 	ErrStatusInvalidRequest = errors.New("invalid status list request")
-	// ErrStatusTooManyLists is returned when a request names more lists than
-	// the configured cap.
+	// ErrStatusTooManyLists: more lists than the configured cap.
 	ErrStatusTooManyLists = errors.New("too many status lists in one request")
 )
 
 // Per-item states of a status list result.
 const (
-	// StatusStateVerified means the list is verified and trusted; Lst and
-	// Bits are set.
+	// StatusStateVerified: the list is verified and trusted; Lst and Bits are set.
 	StatusStateVerified = "verified"
-	// StatusStateUndetermined means the backend cannot vouch for the list;
-	// Reason says why. It is never to be read as "valid".
+	// StatusStateUndetermined: the backend cannot vouch for the list (see Reason).
 	StatusStateUndetermined = "undetermined"
-	// StatusStateNotModified means the caller's etag is still current; the
-	// list is verified and trusted but not repeated.
+	// StatusStateNotModified: the caller's etag is current; the list is not repeated.
 	StatusStateNotModified = "not_modified"
 )
 
@@ -92,31 +79,26 @@ type StatusListResult struct {
 	State string `json:"state"`
 	// Reason is set only when State is undetermined.
 	Reason string `json:"reason,omitempty"`
-	// Bits and Lst (base64url, no padding, of the zlib-compressed list,
-	// byte-identical to the signed token's `lst`) are set only when State is
-	// verified.
+	// Bits and Lst (unpadded base64url of the signed token's compressed `lst`)
+	// are set only when verified.
 	Bits *int   `json:"bits,omitempty"`
 	Lst  string `json:"lst,omitempty"`
-	// IssuedAt, ExpiresAt and TTL are the token's iat, exp and ttl claims
-	// (unix seconds; exp and ttl only when the token has them); verified only.
+	// IssuedAt, ExpiresAt and TTL are the token's iat, exp and ttl (unix
+	// seconds; exp and ttl only if present); verified only.
 	IssuedAt  *int64 `json:"iat,omitempty"`
 	ExpiresAt *int64 `json:"exp,omitempty"`
 	TTL       *int64 `json:"ttl,omitempty"`
-	// FreshUntil (JSON expires_at) is when the backend stops treating this
-	// version as fresh: clients refresh at a randomized time before it.
+	// FreshUntil (JSON expires_at) is when this version stops being fresh.
 	FreshUntil *int64 `json:"expires_at,omitempty"`
 	// ETag identifies this version of the list (verified and not_modified).
 	ETag string `json:"etag,omitempty"`
-	// SignerTrust is the trust action that accepted the list's signer
-	// ("status-list-signer", or "credential-issuer" via the fallback).
+	// SignerTrust is the trust action that accepted the signer.
 	SignerTrust string `json:"signer_trust,omitempty"`
 }
 
 // NewStatusService returns the service for cfg, or nil when
-// status_check.enabled is false (the route then answers 503
-// STATUS_NOT_SUPPORTED). trustSvc is the go-trust backed trust service that
-// decides which signer keys may publish status lists; without a PDP every
-// list is undetermined (trust_unavailable).
+// status_check.enabled is false. Without a PDP in trustSvc every list is
+// undetermined (trust_unavailable).
 func NewStatusService(cfg *config.Config, trustSvc *trust.Service, logger *zap.Logger) *StatusService {
 	sc := cfg.StatusCheck
 	if !sc.Enabled {
@@ -155,17 +137,13 @@ func NewStatusServiceWithLister(l StatusLister, sc config.StatusCheckConfig, log
 // MaxLists is the cap on lists per request.
 func (s *StatusService) MaxLists() int { return s.maxLists }
 
-// statusSignerTrust adapts the go-trust backed trust service to
-// statuslist.SignerTrustAction. The call is EvaluateStatusListSigner:
-// action.name "status-list-signer" first; a negative there is final, and only
-// an error falls back (when status_check.status_list_signer_fallback is on) to
-// the credential-issuer role; resource type x5c or jwk, issuer PDP endpoint.
-// The go-trust deployment must define a policy named status-list-signer (else
-// go-trust applies its default policy; see docs/adr/012). The tenant travels
-// in ctx (trust.ContextWithTenant) and is applied by the PDP client's
-// TenantTransport. "No PDP configured" and "evaluation failed" come back from
-// the trust service as untrusted, so they are turned into errors here to keep
-// them apart from a genuine negative decision.
+// statusSignerTrust adapts the trust service to statuslist.SignerTrustAction
+// via EvaluateStatusListSigner: action "status-list-signer" first; a negative
+// is final, and only an error falls back to the credential-issuer role (when
+// status_list_signer_fallback is on). The go-trust deployment should define a
+// status-list-signer policy (docs/adr/012). "No PDP" and "evaluation failed"
+// come back as untrusted, so they are turned into errors to keep them apart
+// from a genuine negative.
 func statusSignerTrust(svc *trust.Service, fallbackOnError bool) statuslist.SignerTrustAction {
 	return func(ctx context.Context, subject string, km *trust.KeyMaterial) (bool, string, error) {
 		if svc == nil {
@@ -188,15 +166,10 @@ func statusSignerTrust(svc *trust.Service, fallbackOnError bool) statuslist.Sign
 	}
 }
 
-// Lists returns one result per distinct uri in reqs, in first-occurrence
-// order (a repeated uri is collapsed; its first etag counts). Partial failure
-// is not an error: each list stands on its own. It returns an error only for
-// a malformed request (ErrStatusInvalidRequest) or one over the cap
-// (ErrStatusTooManyLists).
-//
-// tenantID scopes the signer trust decision and the cache; it is the only
-// caller context the service receives. No user identifier is passed in, so
-// none can be logged or stored next to a uri.
+// Lists returns one result per distinct uri in reqs, in first-occurrence order
+// (a repeated uri keeps its first etag). Per-list failures are not errors; only
+// a malformed request or one over the cap is. tenantID scopes trust and the
+// cache and is the only caller context received.
 func (s *StatusService) Lists(ctx context.Context, tenantID string, reqs []StatusListRequest) ([]StatusListResult, error) {
 	if len(reqs) == 0 {
 		return nil, fmt.Errorf("%w: no lists", ErrStatusInvalidRequest)
@@ -261,14 +234,12 @@ func (s *StatusService) Lists(ctx context.Context, tenantID string, reqs []Statu
 	return results, nil
 }
 
-// one resolves a single list. Whatever goes wrong, the answer is
-// undetermined: the only way to "verified" is a complete List result.
+// one resolves a single list; anything but a complete List result is undetermined.
 func (s *StatusService) one(ctx context.Context, r StatusListRequest) (res StatusListResult) {
 	undetermined := func(reason statuslist.Reason) StatusListResult {
 		return StatusListResult{URI: r.URI, State: StatusStateUndetermined, Reason: string(reason)}
 	}
-	// A panic must not take the process down (this is not a request
-	// goroutine gin recovers) and must not read as success.
+	// gin does not recover this goroutine; a panic must not crash or read as success.
 	defer func() {
 		if p := recover(); p != nil {
 			res = undetermined(statuslist.ReasonMalformed)

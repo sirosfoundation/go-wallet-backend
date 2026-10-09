@@ -21,9 +21,8 @@ import (
 )
 
 // COSE / CWT constants for the CWT form of a Status List Token
-// (draft-ietf-oauth-status-list, CWT section; RFC 9052, RFC 8392). The COSE
-// structure, header labels and signature verification come from
-// github.com/veraison/go-cose; only the status-list policy is kept here.
+// (draft-ietf-oauth-status-list; RFC 9052, RFC 8392). COSE parsing and
+// signature verification are go-cose's; only status-list policy lives here.
 const (
 	coseHashSHA256 = -16
 	coseHashSHA384 = -43
@@ -34,10 +33,8 @@ const (
 	cwtClaimExp = 4
 	cwtClaimNbf = 5
 	cwtClaimIat = 6
-	// The draft registers status_list as 65533 and ttl as 65534. vc#703
-	// (SUNET/vc pkg/tokenstatuslist) still emits status_list=65534 and
-	// ttl=65535; that legacy layout is read when 65533 is absent and 65534
-	// holds a map, so both sides interoperate.
+	// The draft registers status_list=65533 and ttl=65534. SUNET/vc emits the
+	// legacy layout (65534, 65535), read when 65533 is absent and 65534 is a map.
 	cwtClaimStatusList       = 65533
 	cwtClaimTTL              = 65534
 	cwtClaimLegacyStatusList = 65534
@@ -54,10 +51,8 @@ var errCWT = errors.New("status list CWT")
 // parseCWT verifies a CWT-form Status List Token and applies the same claim
 // checks and trust decision as the JWT form.
 func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsedList, error) {
-	// UnmarshalCBOR requires exactly one tag 18 (draft-ietf-oauth-status-list
-	// section 5.2 forbids the CWT tag 61 and untagged arrays), rejects
-	// indefinite lengths and duplicate header labels, and requires crit to be
-	// protected, non-empty and to name only protected labels.
+	// UnmarshalCBOR requires exactly one tag 18 (draft §5.2), rejects
+	// indefinite lengths and duplicate header labels, and validates crit.
 	var msg cose.Sign1Message
 	if err := msg.UnmarshalCBOR(body); err != nil {
 		return parsedList{}, fmt.Errorf("%w: %v", errCWT, err)
@@ -67,8 +62,7 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 		return parsedList{}, fmt.Errorf("%w header: %v", errCWT, err)
 	}
 
-	// typ must be integrity-protected: the unprotected header is not covered
-	// by the signature, so it is not consulted for it.
+	// typ is read from the protected header only (the unprotected is unsigned).
 	typ, _ := prot[cose.HeaderLabelType].(string)
 	if strings.TrimPrefix(strings.ToLower(typ), "application/") != cwtTypValue {
 		return parsedList{}, fmt.Errorf("%w typ is %q, want %q", errCWT, typ, cwtTypValue)
@@ -101,19 +95,16 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 	if err != nil {
 		return parsedList{}, fmt.Errorf("%w payload: %v", errCWT, err)
 	}
-	// Membership, not nil-ness, decides whether the standard claim is
-	// present: a CBOR null decodes to nil but is a present (malformed)
-	// claim, which must not fall back to the legacy layout.
+	// Presence is by membership: a CBOR null is a present, malformed claim and
+	// must not fall back to the legacy layout.
 	slRaw, ttlLabel := claims[cwtClaimStatusList], int64(cwtClaimTTL)
 	if _, present := claims[cwtClaimStatusList]; !present {
 		if _, isMap := anyMap(claims[cwtClaimLegacyStatusList]); isMap {
 			slRaw, ttlLabel = claims[cwtClaimLegacyStatusList], cwtClaimLegacyTTL
 		}
 	} else {
-		// Both layouts at once are ambiguous: the standard and legacy
-		// spellings could carry different verdicts. Label 65534 is the
-		// standard ttl and the legacy status_list, so a map there next to
-		// the standard status_list (or both ttl spellings) is rejected.
+		// Both layouts at once are ambiguous (65534 is the standard ttl and the
+		// legacy status_list), so reject them.
 		if _, isMap := anyMap(claims[cwtClaimLegacyStatusList]); isMap {
 			return parsedList{}, fmt.Errorf("%w has both the standard and the legacy status_list claim", errCWT)
 		}
@@ -126,8 +117,7 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 	if !ok {
 		return parsedList{}, fmt.Errorf("%w has no status_list claim", errCWT)
 	}
-	// The draft's CDDL uses the text keys "bits" and "lst"; the integer
-	// labels 1 and 2 are also read (vc#703 writes those).
+	// The draft uses text keys "bits"/"lst"; the integer labels 1/2 (SUNET/vc) are also read.
 	bitsRaw, err := member(sl, "bits", statusListKeyBits)
 	if err != nil {
 		return parsedList{}, fmt.Errorf("%w status_list: %v", errCWT, err)
@@ -144,9 +134,8 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 	if !ok || len(lst) == 0 {
 		return parsedList{}, fmt.Errorf("%w status_list has no lst", errCWT)
 	}
-	// Present-but-invalid claims are rejected, never read as absent: a
-	// text-valued exp would otherwise skip expiry validation and a
-	// malformed iss would change the trust subject.
+	// Present-but-invalid claims are rejected, never read as absent (a text exp
+	// would skip expiry; a malformed iss would change the trust subject).
 	var lc listClaims
 	if lc.sub, err = cwtString(claims, cwtClaimSub, "sub"); err != nil {
 		return parsedList{}, err
@@ -177,12 +166,9 @@ var understoodHeaders = map[int64]bool{
 	cose.HeaderLabelX5Chain: true, cose.HeaderLabelX5T: true,
 }
 
-// checkHeaders enforces the COSE header rules that go-cose leaves to the
-// caller: a label appears in at most one bucket (RFC 9052 section 3), and
-// every critical label is understood (which excludes crit itself) and listed
-// once (RFC 9052 section 3.1). go-cose has already checked that crit is only in
-// the protected header, non-empty, and that each critical label is present
-// in the protected header.
+// checkHeaders enforces the header rules go-cose leaves to the caller: a label
+// is in at most one bucket (RFC 9052 §3), and every critical label is
+// understood and listed once (§3.1).
 func checkHeaders(prot, unprot map[any]any) error {
 	for k := range unprot {
 		if _, dup := prot[k]; dup {
@@ -219,19 +205,15 @@ var claimsDecMode = func() cbor.DecMode {
 	return dm
 }()
 
-// decodeClaims reads a CWT claims set. Claim keys may be integers or text
-// strings and the status-list profile permits additional claims, so the
-// map is decoded with mixed keys: the integer-labelled claims are returned
-// and text-labelled ones (extensions) are ignored. A repeated key, a label
-// that is neither an integer nor a text string, or a null/undefined map is
-// an error.
+// decodeClaims reads a CWT claims set and returns the integer-labelled claims;
+// text-labelled extensions are ignored. A repeated key, another label type, or
+// a null/undefined map is an error.
 func decodeClaims(b []byte) (map[int64]any, error) {
 	var raw map[any]any
 	if err := claimsDecMode.Unmarshal(b, &raw); err != nil {
 		return nil, err
 	}
-	// CBOR null and undefined decode into a nil map without an error; a map
-	// is required here (an empty map is fine).
+	// CBOR null and undefined decode to a nil map without error.
 	if raw == nil {
 		return nil, errors.New("not a CBOR map (null or undefined)")
 	}
@@ -246,9 +228,7 @@ func decodeClaims(b []byte) (map[int64]any, error) {
 	return ints, nil
 }
 
-// cwtString reads an optional text claim; a present claim of another type, or
-// one that is empty or only whitespace, is an error (never read as absent, which
-// would change the trust subject).
+// cwtString reads an optional text claim; a present non-text or blank claim is an error.
 func cwtString(claims map[int64]any, label int64, name string) (string, error) {
 	v, ok := claims[label]
 	if !ok {
@@ -264,8 +244,7 @@ func cwtString(claims map[int64]any, label int64, name string) (string, error) {
 	return s, nil
 }
 
-// cwtInt reads an optional NumericDate/integer claim; a present claim that is
-// not an integer is an error.
+// cwtInt reads an optional integer claim; a present non-integer is an error.
 func cwtInt(claims map[int64]any, label int64, name string) (*int64, error) {
 	v, ok := claims[label]
 	if !ok {
@@ -278,25 +257,17 @@ func cwtInt(claims map[int64]any, label int64, name string) (*int64, error) {
 	return &n, nil
 }
 
-// signerChain returns the x5chain that carries the signer certificate.
-// RFC 9360 section 2: "The end-entity certificate MUST be integrity
-// protected by COSE. This can, for example, be done by sending the header
-// parameter in the protected header, sending an 'x5chain' in the unprotected
-// header combined with an 'x5t' in the protected header, or including the
-// end-entity certificate in the external_aad." An x5chain in the protected
-// header is accepted; one only in the unprotected header is accepted solely
-// when the protected header holds an x5t that matches its end-entity
-// certificate. Otherwise the chain could be swapped without invalidating the
-// signature, changing the trust decision.
+// signerChain returns the signer's x5chain. Per RFC 9360 §2 the end-entity
+// certificate must be integrity protected: a protected x5chain is accepted; an
+// unprotected one only with a matching protected x5t. Otherwise the chain could
+// be swapped without invalidating the signature.
 func signerChain(prot, unprot map[any]any) ([][]byte, error) {
 	if v, ok := prot[cose.HeaderLabelX5Chain]; ok {
 		chain, err := x5chain(v)
 		if err != nil || len(chain) == 0 {
 			return chain, err
 		}
-		// A protected x5t is validated whenever it is present, so a token
-		// cannot carry a (possibly critical) mismatching certificate hash
-		// and still yield a verdict.
+		// A present protected x5t must match, even if not needed.
 		if _, has := prot[cose.HeaderLabelX5T]; has {
 			if err := checkX5T(prot[cose.HeaderLabelX5T], chain[0]); err != nil {
 				return nil, fmt.Errorf("protected x5t: %v", err)
@@ -376,11 +347,9 @@ func x5chain(v any) ([][]byte, error) {
 	return nil, fmt.Errorf("unexpected type %T", v)
 }
 
-// verifyCOSE verifies the COSE_Sign1 signature through go-cose. Only the
-// ECDSA algorithms are accepted (the allowlist keeps go-cose from also being
-// pointed at RSA or EdDSA keys), and the key's curve must be the one the
-// algorithm names: go-cose derives only the hash from the algorithm, so an
-// ES256 label over a P-384 key would otherwise verify.
+// verifyCOSE verifies the COSE_Sign1 signature through go-cose. Only ECDSA is
+// accepted, and the key's curve must match the algorithm (go-cose derives only
+// the hash, so ES256 over a P-384 key would otherwise verify).
 func verifyCOSE(alg cose.Algorithm, pub crypto.PublicKey, msg *cose.Sign1Message) error {
 	var curve elliptic.Curve
 	switch alg {
@@ -432,11 +401,8 @@ func anyMap(raw any) (map[any]any, bool) {
 	return nil, false
 }
 
-// member looks a status_list member up by its text key or by any integer
-// encoding (int64 or uint64) of its numeric label. A map carrying both
-// spellings is rejected, even when the values agree: an implementation that
-// reads only the other spelling could otherwise derive a different verdict
-// from the same signed token.
+// member looks a status_list member up by text key or numeric label. Both
+// spellings present is an error, even if equal, so no reader can see another verdict.
 func member(m map[any]any, text string, label int64) (any, error) {
 	tv, hasText := m[text]
 	var iv any

@@ -12,8 +12,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 )
 
-// maxStatusRequestBytes bounds the request body: a request names at most a
-// few dozen URIs of at most 2 KiB each.
+// maxStatusRequestBytes bounds the request body.
 const maxStatusRequestBytes = 128 << 10
 
 // StatusListsRequest is the request body of POST /status/v1/lists.
@@ -26,16 +25,11 @@ type StatusListsResponse struct {
 	Results []service.StatusListResult `json:"results"`
 }
 
-// StatusLists handles POST /status/v1/lists: it fetches, verifies and
-// trust-evaluates the Token Status Lists the caller names and returns them
-// for the client to read its own entries from. The response says "verified"
-// only for a list the backend can vouch for and never that a credential is
-// valid; see service.StatusService and docs/API.md.
+// StatusLists handles POST /status/v1/lists: it returns the verified Token
+// Status Lists the caller names (see service.StatusService and docs/API.md).
 //
-// Privacy: the list URIs reveal what credentials the caller holds, so this
-// handler (and everything below it) logs no URI, emits no audit event about
-// lists and stores nothing per user. The body is POSTed so that URIs stay out
-// of access logs and URLs, and the user identity is not passed to the service.
+// Privacy: URIs reveal what the caller holds, so nothing here logs one or
+// stores anything per user; the body is POSTed to keep URIs out of access logs.
 func (h *Handlers) StatusLists(c *gin.Context) {
 	if h.services.Status == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{
@@ -50,7 +44,7 @@ func (h *Handlers) StatusLists(c *gin.Context) {
 	dec := json.NewDecoder(c.Request.Body)
 	err := dec.Decode(&req)
 	if err == nil && dec.More() {
-		// Exactly one JSON value: trailing input is a malformed request.
+		// Exactly one JSON value is allowed.
 		err = errors.New("trailing data")
 	}
 	if err != nil {
@@ -86,7 +80,7 @@ func (h *Handlers) StatusLists(c *gin.Context) {
 				"message": "Each item needs a uri; at least one list is required",
 			})
 		default:
-			// The error is deliberately not logged: it may carry a uri.
+			// Not logged: the error may carry a uri.
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"error":   "STATUS_CHECK_FAILED",
 				"message": "Failed to process the status list request",
@@ -99,11 +93,9 @@ func (h *Handlers) StatusLists(c *gin.Context) {
 	c.JSON(http.StatusOK, StatusListsResponse{Results: results})
 }
 
-// setStatusCacheHeaders sets Cache-Control and, for a single-list response,
-// ETag. Caching is private to the caller. When every list is verified (or
-// unchanged) max-age is the shortest remaining freshness, further limited by
-// the list's own ttl; if any list is undetermined the response must not be
-// reused.
+// setStatusCacheHeaders sets private Cache-Control (max-age is the shortest
+// remaining freshness, capped by ttl; no-store if any list is undetermined)
+// and, for a single list, ETag.
 func setStatusCacheHeaders(c *gin.Context, results []service.StatusListResult, now time.Time) {
 	c.Header("Vary", "Authorization")
 	maxAge := int64(-1)

@@ -499,10 +499,8 @@ func FetchJWKS(ctx context.Context, uri string, client *http.Client) (interface{
 	return jwks, nil
 }
 
-// DecodeX5CCert decodes one x5c certificate string. RFC 7515 requires
-// standard base64, but base64url (unpadded) is also accepted, since some
-// publishers emit it. Every x5c decode should go through this so the
-// accepted alphabets cannot drift apart.
+// DecodeX5CCert decodes one x5c certificate string: standard base64 (RFC 7515),
+// else unpadded base64url, which some publishers emit.
 func DecodeX5CCert(s string) ([]byte, error) {
 	der, err := base64.StdEncoding.DecodeString(s)
 	if err == nil {

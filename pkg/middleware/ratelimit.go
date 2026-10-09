@@ -189,8 +189,7 @@ func AuthRateLimitMiddlewareWithIdentifier(rl *AuthRateLimiter, extractID func(*
 }
 
 // AuthRateLimitMiddlewareWithResponse is AuthRateLimitMiddlewareWithIdentifier
-// with a caller-chosen 429 body, for endpoints whose clients expect their own
-// error vocabulary. The response carries a Retry-After header (the lockout).
+// with a caller-chosen 429 body; it also sets Retry-After.
 func AuthRateLimitMiddlewareWithResponse(rl *AuthRateLimiter, extractID func(*gin.Context) string, body gin.H) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !rl.config.Enabled {

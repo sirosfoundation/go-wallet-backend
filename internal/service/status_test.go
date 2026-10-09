@@ -246,9 +246,8 @@ func TestStatusService_DefaultDeadlineBelowWriteTimeout(t *testing.T) {
 	}
 }
 
-// TestStatusService_LogsNoURI: the only thing logged about a request is
-// counts, outcomes and a duration; never a list URI, not even from the error a
-// failed list produced (those errors carry URIs).
+// TestStatusService_LogsNoURI: only counts, outcomes and a duration are logged,
+// never a URI (including from errors, which carry them).
 func TestStatusService_LogsNoURI(t *testing.T) {
 	l := &fakeLister{fn: func(_ context.Context, uri string) (*statuslist.VerifiedList, error) {
 		if strings.HasSuffix(uri, "/bad") {

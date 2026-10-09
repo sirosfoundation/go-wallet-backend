@@ -3068,9 +3068,7 @@ func TestConfig_Validate_StatusCheck(t *testing.T) {
 	}
 }
 
-// The presentation-time modes were removed from the engine: only the
-// status_check section remains, and the old presentation.status_* keys are not
-// settings any more.
+// TestLoad_StatusCheckSection checks that yaml and env values override the defaults.
 func TestLoad_StatusCheckSection(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "c.yaml")
 	yaml := `

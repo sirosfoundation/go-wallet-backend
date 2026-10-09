@@ -289,8 +289,7 @@ func TestEntry_Bounds(t *testing.T) {
 	if _, err := entry(1, list, -1); err == nil {
 		t.Error("negative index must fail")
 	}
-	// A credential-controlled idx must not wrap idx*bits around to a valid
-	// position (2^62*4 wraps to 0) or a negative one (which would panic).
+	// idx*bits must not wrap to a valid (2^62*4 wraps to 0) or negative position.
 	for _, bits := range []int{1, 2, 4, 8} {
 		for _, idx := range []int64{1 << 62, 1<<62 + 1, 1<<63 - 1, 1 << 61, -1 << 63} {
 			if _, err := entry(bits, list, idx); err == nil {
@@ -402,8 +401,7 @@ func TestCheck_NotBefore(t *testing.T) {
 	}
 }
 
-// The minimum list cardinality is an opt-in policy (the draft sets none): off
-// by default, and when set it counts entries (bytes*8/bits) and is applied
+// The minimum list size is opt-in, counts entries (bytes*8/bits) and applies
 // before the trust service is consulted. The fixtures hold 64 entries.
 func TestCheck_MinEntries(t *testing.T) {
 	ctx := context.Background()
@@ -445,9 +443,8 @@ func TestCheck_MinEntries(t *testing.T) {
 	}
 }
 
-// The cache and flights are keyed by the exact reference URI: a list whose sub
-// was validated against one URI is never returned for another spelling of it
-// (different fragment, equivalent origin) without sub being checked again.
+// The cache and flights are keyed by the exact URI: another spelling of it
+// (fragment, equivalent origin) never gets a list validated for a different one.
 func TestCheck_CacheKeyedByExactURI(t *testing.T) {
 	key := newKey(t)
 	hits := 0
@@ -488,11 +485,8 @@ func TestCheck_CacheKeyedByExactURI(t *testing.T) {
 
 func srvURL(r *http.Request) string { return "https://" + r.Host }
 
-// testEpoch is the single fake "now" shared by token minting and the Checker
-// in every test: tokens are minted relative to it and newTestChecker pins the
-// Checker's clock to it, so no test depends on the wall clock or on where in
-// a second it happens to run. Tests advance time by replacing c.now with
-// testEpoch.Add(d), never by reading real time.
+// testEpoch is the fake "now" for token minting and the Checker clock; tests
+// advance time by replacing c.now with testEpoch.Add(d).
 var testEpoch = time.Date(2026, time.October, 1, 12, 0, 0, 0, time.UTC)
 
 // newTestChecker is NewChecker with the clock pinned to testEpoch.

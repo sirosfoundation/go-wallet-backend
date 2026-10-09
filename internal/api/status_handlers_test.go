@@ -271,12 +271,9 @@ func (p *pdpStub) Name() string                                 { return "pdp-st
 func (p *pdpStub) SupportedResourceTypes() []trust.ResourceType { return nil }
 func (p *pdpStub) Healthy() bool                                { return true }
 
-// TestStatusLists_EndToEnd_NoURIInAnyLog drives a request through the real
-// Checker, the real trust service and the real handler, with every logger
-// (handler, service, trust) captured at debug level, and requires that no log
-// entry contains any part of a requested URI. It also checks the verified list
-// matches the signed token byte for byte and that an untrusted signer yields
-// undetermined.
+// TestStatusLists_EndToEnd_NoURIInAnyLog drives the real Checker, trust service
+// and handler with every logger captured at debug level and requires that no
+// log entry contains any part of a requested URI.
 func TestStatusLists_EndToEnd_NoURIInAnyLog(t *testing.T) {
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	var tokenURI string

@@ -48,10 +48,8 @@ func serviceToken(t *testing.T, key *ecdsa.PrivateKey, listURL string, values ma
 	return s
 }
 
-// x5cServiceToken is the expected future service shape: the service header
-// plus the signer's x5c chain (and optionally a jwk), which is what lets a
-// wallet verify and trust-evaluate the list. jwkMode is "", "match" or
-// "mismatch" (a jwk that is not the leaf key).
+// x5cServiceToken is serviceToken plus the signer's x5c chain, and optionally a
+// jwk (jwkMode "", "match" or "mismatch" against the leaf key).
 func x5cServiceToken(t *testing.T, key *ecdsa.PrivateKey, listURL string, values map[int]int, jwkMode string) (string, *trust.KeyMaterial) {
 	t.Helper()
 	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "status service"},
@@ -111,8 +109,7 @@ func TestInterop_SirosStatusServiceShape(t *testing.T) {
 	defer srv.Close()
 	uri = srv.URL + "/lists/shard-a-abc"
 
-	// Kid only (no embedded key; the service is being updated to send x5c/jwk):
-	// unverifiable, never a verdict, even for a revoked index.
+	// Kid only (no embedded key): unverifiable, never a verdict.
 	c := newTestChecker(srv.Client(), false, trustAll)
 	err := c.Check(ctx, &Reference{Idx: 3, URI: uri})
 	if !errors.Is(err, ErrNoSignerKey) || errors.Is(err, ErrRevoked) {
@@ -122,8 +119,8 @@ func TestInterop_SirosStatusServiceShape(t *testing.T) {
 		t.Fatalf("Accept = %q", accept)
 	}
 
-	// With an x5c chain (and kid) in the header and a positive trust decision the list is authoritative. INVALID (1),
-	// SUSPENDED (2) and application-specific (3) are all not valid.
+	// With an x5c chain and a positive trust decision the list is authoritative;
+	// INVALID (1), SUSPENDED (2) and application-specific (3) are all not valid.
 	withX5C = true
 	var gotSubject string
 	var gotKM *trust.KeyMaterial
@@ -404,9 +401,7 @@ func TestCache_TTLMeasuredFromIat(t *testing.T) {
 	}
 }
 
-// The trust call can be slow (PDP plus fallback); the cache deadline is fixed
-// before it and checked against the clock after it, so it never outlives
-// iat+ttl.
+// A slow trust call must not let the cache entry outlive iat+ttl.
 func TestCache_DeadlineNotExtendedBySlowTrust(t *testing.T) {
 	key := newKey(t)
 	c, uri, hits := serve(t, func(u string) string {

@@ -64,8 +64,8 @@ type cwtOpts struct {
 	legacy    bool                // vc#703 layout: status_list=65534, ttl=65535
 	badSig    bool
 	rawLst    []byte
-	// badLabel is a raw CBOR map key (not an integer or text string) added
-	// to the map named by badLabelIn: "prot", "unprot" or "claims".
+	// badLabel is a raw CBOR map key added to the map named by badLabelIn
+	// ("prot", "unprot" or "claims").
 	badLabel   cbor.RawMessage
 	badLabelIn string
 }
@@ -329,9 +329,7 @@ func TestCWT_Rejections(t *testing.T) {
 		{"bad bits", cwtOpts{bits: 3}, nil, "bits", nil},
 		{"unknown alg", cwtOpts{alg: -8}, nil, "unsupported COSE alg", nil},
 		{"alg/key mismatch", cwtOpts{alg: coseAlgES384}, nil, "does not match alg", nil},
-		// go-cose requires a typ text value to be of the form type/subtype,
-		// so the bare "statuslist+cwt" the hand-rolled decoder accepted is now
-		// rejected at decode time (the draft mandates the full media type).
+		// go-cose requires typ to be type/subtype; the draft mandates the full media type.
 		{"typ short form", cwtOpts{typ: "statuslist+cwt"}, nil, "type/subtype", nil},
 		{"wrong typ", cwtOpts{typ: "application/cwt"}, nil, "typ", nil},
 		{"missing typ", cwtOpts{noTyp: true}, nil, "typ", nil},
@@ -595,9 +593,8 @@ func TestContentTypeMalformedVsMissing(t *testing.T) {
 	}
 }
 
-// TestCWT_AmbiguousAliasesRejected: a signed map must not carry two
-// spellings of one member or claim, since a reader of the other spelling
-// would derive a different verdict from the same token.
+// TestCWT_AmbiguousAliasesRejected: a signed map must not carry two spellings
+// of one member or claim.
 func TestCWT_AmbiguousAliasesRejected(t *testing.T) {
 	ctx := context.Background()
 	lst := zlibBytes(t, 2, map[int]int{3: 1})
@@ -917,8 +914,7 @@ func TestCWT_NullStandardStatusListIsNotAbsent(t *testing.T) {
 	})
 }
 
-// ttl must be a positive integer in the CWT form too (standard and legacy
-// labels); an oversized one is capped, not overflowed.
+// ttl must be a positive integer in the CWT form too; an oversized one is capped.
 func TestCWT_TTLValues(t *testing.T) {
 	ctx := context.Background()
 	for _, legacy := range []bool{false, true} {
@@ -972,9 +968,8 @@ func TestCWT_TTLValues(t *testing.T) {
 	}
 }
 
-// A COSE label is an integer or a text string. A map in the headers or the
-// claims that carries any other key type is malformed, never skipped, even
-// when the signature is valid.
+// A COSE label is an integer or a text string; any other key type is
+// malformed, even under a valid signature.
 func TestParseCWT_NonIntegerNonTextLabelsMalformed(t *testing.T) {
 	ctx := context.Background()
 	labels := map[string]cbor.RawMessage{

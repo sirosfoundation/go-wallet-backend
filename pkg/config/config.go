@@ -388,79 +388,60 @@ const (
 	// DefaultStatusRequestTimeoutSeconds is the default per-request deadline.
 	DefaultStatusRequestTimeoutSeconds = 8
 	// MaxStatusRequestTimeoutSeconds is the largest accepted per-request
-	// deadline: the HTTP server's WriteTimeout is 15 s and the response must
-	// still be written within it.
+	// deadline (the HTTP WriteTimeout is 15 s).
 	MaxStatusRequestTimeoutSeconds = 12
-	// DefaultStatusMaxListBytes is the default cap on one list's compressed
-	// `lst` in an API response (2 MiB).
+	// DefaultStatusMaxListBytes is the default cap on one compressed `lst` (2 MiB).
 	DefaultStatusMaxListBytes = 2 << 20
 )
 
 // StatusCheckConfig configures the verified Token Status List API
-// (POST /status/v1/lists) and the status list verifier behind it. The wallet
-// engine does NOT check credential status at presentation time (see
-// docs/adr/013-status-checking-outside-the-engine.md); clients call this API
-// in the background.
+// (POST /status/v1/lists) and its verifier; see
+// docs/adr/013-status-checking-outside-the-engine.md.
 type StatusCheckConfig struct {
-	// Enabled turns the API on. When false the route answers 503
+	// Enabled turns the API on; when false the route answers 503
 	// STATUS_NOT_SUPPORTED. Default: true. Env: WALLET_STATUS_CHECK_ENABLED
 	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
 
-	// StatusListSignerFallback controls what happens when go-trust cannot
-	// answer (transport or evaluation error) the `status-list-signer`
-	// evaluation of a status list's signer: when true (default) the backend
-	// asks once more as `credential-issuer` and trusts the signer if that is
-	// positive; when false the error stands and the list is undetermined
-	// (trust_unavailable). A genuine negative decision to `status-list-signer`
-	// is always final and never falls back.
+	// StatusListSignerFallback: when go-trust errors on the `status-list-signer`
+	// evaluation and this is true (default), ask once more as
+	// `credential-issuer`; when false the list is undetermined
+	// (trust_unavailable). A genuine negative never falls back.
 	// Env: WALLET_STATUS_CHECK_STATUS_LIST_SIGNER_FALLBACK
 	StatusListSignerFallback bool `yaml:"status_list_signer_fallback" envconfig:"STATUS_LIST_SIGNER_FALLBACK"`
 
-	// StatusListMinEntries rejects a Token Status List that holds fewer than
-	// this many entries once inflated (bytes*8/bits), before its signer is
-	// evaluated; such a list is undetermined (list_too_small). Default 0: no
-	// minimum. The Token Status List draft (-21) sets no receiver-side minimum,
-	// it only notes that a larger list gives better herd privacy (a
-	// recommendation for the Status Issuer), and real publishers emit smaller
-	// lists (the SIROS status service defaults to 100000 entries). Set e.g.
-	// 131072 (16 KiB at 1 bit) only if every status issuer you rely on
-	// publishes at least that. Must not be negative.
+	// StatusListMinEntries rejects a list with fewer entries once inflated
+	// (bytes*8/bits) as undetermined (list_too_small). Default 0: no minimum,
+	// as the draft sets none; set e.g. 131072 only if every status issuer you
+	// rely on publishes at least that. Must not be negative.
 	// Env: WALLET_STATUS_CHECK_STATUS_LIST_MIN_ENTRIES
 	StatusListMinEntries int `yaml:"status_list_min_entries" envconfig:"STATUS_LIST_MIN_ENTRIES"`
 
-	// StatusListMaxConcurrentLoads bounds how many Token Status Lists the
-	// backend fetches and inflates at the same time, across all requests.
-	// Each load can hold up to 36 MiB (4 MiB token plus 32 MiB inflated list),
-	// which the list cache limit does not cover, so without this bound a burst
-	// of requests could exhaust memory. Loads of the same list are shared
-	// regardless. A request waiting for a slot gives up when its deadline
-	// expires (undetermined, budget_exhausted). 0 (default) means 8. Must not
-	// be negative. Env: WALLET_STATUS_CHECK_STATUS_LIST_MAX_CONCURRENT_LOADS
+	// StatusListMaxConcurrentLoads bounds concurrent list fetch-and-inflate
+	// loads across all requests; each can hold up to 36 MiB, which the cache
+	// limit does not cover. A request waiting for a slot gives up at its
+	// deadline (budget_exhausted). 0 (default) means 8. Must not be negative.
+	// Env: WALLET_STATUS_CHECK_STATUS_LIST_MAX_CONCURRENT_LOADS
 	StatusListMaxConcurrentLoads int `yaml:"status_list_max_concurrent_loads" envconfig:"STATUS_LIST_MAX_CONCURRENT_LOADS"`
 
-	// MaxListsPerRequest caps the lists one request may ask for (over the cap:
-	// 400 TOO_MANY_URIS). Clients are expected to ask for 1-3 per request, so
-	// the server learns as little as possible about which credentials a user
-	// holds; the server only enforces this cap. 0 (default) means 20.
+	// MaxListsPerRequest caps the lists per request (over it: 400
+	// TOO_MANY_URIS). Clients should ask for 1-3 to limit what the server
+	// learns. 0 (default) means 20.
 	// Env: WALLET_STATUS_CHECK_MAX_LISTS_PER_REQUEST
 	MaxListsPerRequest int `yaml:"max_lists_per_request" envconfig:"MAX_LISTS_PER_REQUEST"`
 
-	// RequestTimeoutSeconds is the deadline of one API request, covering
-	// every list in it. It must stay well under the HTTP server's 15 s write
-	// timeout so the response can still be written; lists not finished by
-	// then are undetermined (budget_exhausted). 0 (default) means 8; at most
-	// 12. Env: WALLET_STATUS_CHECK_REQUEST_TIMEOUT_SECONDS
+	// RequestTimeoutSeconds is the deadline of one request, covering all its
+	// lists; unfinished lists are undetermined (budget_exhausted). Must stay
+	// under the 15 s HTTP write timeout. 0 (default) means 8; at most 12.
+	// Env: WALLET_STATUS_CHECK_REQUEST_TIMEOUT_SECONDS
 	RequestTimeoutSeconds int `yaml:"request_timeout_seconds" envconfig:"REQUEST_TIMEOUT_SECONDS"`
 
-	// MaxListBytes caps the size of one list's compressed `lst` that the API
-	// returns; a larger list is undetermined (too_large) rather than
-	// truncated. 0 (default) means 2097152 (2 MiB). Must not be negative.
+	// MaxListBytes caps one returned compressed `lst`; a larger list is
+	// undetermined (too_large). 0 (default) means 2097152 (2 MiB). Must not be
+	// negative.
 	// Env: WALLET_STATUS_CHECK_MAX_LIST_BYTES
 	MaxListBytes int `yaml:"max_list_bytes" envconfig:"MAX_LIST_BYTES"`
 
-	// RateLimit caps how many API requests one authenticated caller (keyed by
-	// user, else tenant) may make per window. The limiter holds a counter per
-	// caller, never the lists asked for.
+	// RateLimit caps API requests per authenticated caller (user, else tenant) per window.
 	RateLimit AuthRateLimitConfig `yaml:"rate_limit" envconfig:"RATE_LIMIT"`
 }
 
