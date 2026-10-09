@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -264,7 +265,7 @@ func TestManager_validateToken_UUID(t *testing.T) {
 	userID, tenantID, _, err := m.validateToken(context.Background(), tokenString)
 	require.NoError(t, err)
 	assert.Equal(t, "uuid-user-456", userID)
-	assert.Empty(t, tenantID) // wallet-backend-server tokens don't have tenant_id
+	assert.Equal(t, "default", tenantID) // no tenant_id claim: normalised to the default tenant
 }
 
 func TestManager_validateToken_UserIDTakesPrecedence(t *testing.T) {
@@ -1089,7 +1090,7 @@ func TestManager_CloseUserSessions_ClosesLiveConnection(t *testing.T) {
 	require.Eventually(t, func() bool {
 		m.sessionsMu.RLock()
 		defer m.sessionsMu.RUnlock()
-		_, stillIndexed := m.userIndex[deletedUser]
+		stillIndexed := hasUserIndexed(m, deletedUser)
 		return len(m.sessions) == 0 && !stillIndexed
 	}, time.Second, 10*time.Millisecond, "session bookkeeping was not cleaned up after close")
 }
@@ -1197,7 +1198,7 @@ func TestManager_CloseUserSessions_NeverTouchesOtherUsers(t *testing.T) {
 	require.NoError(t, survivorWS.SetReadDeadline(time.Time{}))
 
 	m.sessionsMu.RLock()
-	_, stillPresent := m.userIndex["innocent-bystander"]
+	stillPresent := hasUserIndexed(m, "innocent-bystander")
 	m.sessionsMu.RUnlock()
 	assert.True(t, stillPresent, "the innocent bystander must still be registered")
 }
@@ -1265,16 +1266,16 @@ func TestManager_RegisterSession_RejectsAlreadyRevokedUser(t *testing.T) {
 	srvConn := <-srvConnCh
 
 	session := &Session{
-		ID:       "revoked-user-session",
-		UserID:   "already-revoked-user",
-		conn:     srvConn,
-		flows:    make(map[string]*Flow),
-		logger:   zap.NewNop(),
-		actionCh: make(chan *FlowActionMessage, 1),
-		signCh:   make(chan *SignResponseMessage, 1),
-		matchCh:  make(chan *MatchResponseMessage, 1),
-		closeCh:  make(chan struct{}, 1),
-		stopPing: make(chan struct{}),
+		ID:        "revoked-user-session",
+		UserID:    "already-revoked-user",
+		transport: newWSTransport(srvConn),
+		flows:     make(map[string]*Flow),
+		logger:    zap.NewNop(),
+		actionCh:  make(chan *FlowActionMessage, 1),
+		signCh:    make(chan *SignResponseMessage, 1),
+		matchCh:   make(chan *MatchResponseMessage, 1),
+		closeCh:   make(chan struct{}, 1),
+		stopPing:  make(chan struct{}),
 	}
 
 	accepted := m.registerSession(session)
@@ -1282,7 +1283,7 @@ func TestManager_RegisterSession_RejectsAlreadyRevokedUser(t *testing.T) {
 
 	m.sessionsMu.RLock()
 	_, present := m.sessions[session.ID]
-	_, indexed := m.userIndex[session.UserID]
+	_, indexed := m.userIndex[session.userKey()]
 	m.sessionsMu.RUnlock()
 	assert.False(t, present, "a rejected session must not be added to m.sessions")
 	assert.False(t, indexed, "a rejected session must not be added to m.userIndex")
@@ -1316,16 +1317,16 @@ func TestManager_RegisterSession_RejectsRevokedUser_WithoutBlacklistFeature(t *t
 	srvConn := <-srvConnCh
 
 	session := &Session{
-		ID:       "revoked-user-session-no-blacklist",
-		UserID:   "already-revoked-user",
-		conn:     srvConn,
-		flows:    make(map[string]*Flow),
-		logger:   zap.NewNop(),
-		actionCh: make(chan *FlowActionMessage, 1),
-		signCh:   make(chan *SignResponseMessage, 1),
-		matchCh:  make(chan *MatchResponseMessage, 1),
-		closeCh:  make(chan struct{}, 1),
-		stopPing: make(chan struct{}),
+		ID:        "revoked-user-session-no-blacklist",
+		UserID:    "already-revoked-user",
+		transport: newWSTransport(srvConn),
+		flows:     make(map[string]*Flow),
+		logger:    zap.NewNop(),
+		actionCh:  make(chan *FlowActionMessage, 1),
+		signCh:    make(chan *SignResponseMessage, 1),
+		matchCh:   make(chan *MatchResponseMessage, 1),
+		closeCh:   make(chan struct{}, 1),
+		stopPing:  make(chan struct{}),
 	}
 
 	accepted := m.registerSession(session)
@@ -1393,6 +1394,332 @@ func TestManager_DeleteByUser_WorksWithoutTokenBlacklistFeature(t *testing.T) {
 	var msg Message
 	require.NoError(t, ws2.ReadJSON(&msg))
 	assert.Equal(t, TypeError, msg.Type, "a new handshake for a revoked user must be rejected, not completed")
+}
+
+// TestHandleNewConnection_TACEnforcementByProvenance: a modern token with an
+// empty TAC is refused for a protocol needing one; legacy tokens are unaffected.
+func TestHandleNewConnection_TACEnforcementByProvenance(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := newManagerWithStubOID4VCIHandler(t)
+	m.cfg = cfg
+	v, key, issuer := setupEngineTokenValidatorTest(t)
+	m.SetTokenValidator(v)
+
+	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
+	t.Cleanup(server.Close)
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+	// Legacy HMAC tokens are served by a manager without a go-tokenauth validator.
+	lm := newManagerWithStubOID4VCIHandler(t)
+	lserver := httptest.NewServer(http.HandlerFunc(lm.HandleConnection))
+	t.Cleanup(lserver.Close)
+	legacyURL := "ws" + strings.TrimPrefix(lserver.URL, "http")
+
+	modern := func(tac claims.TAC) string {
+		return signEngineToken(t, key, issuer, claims.AccessTokenClaims{
+			Claims:   gojosejwt.Claims{Audience: gojosejwt.Audience{"wallet-backend"}, Subject: "u1"},
+			TenantID: "test-tenant",
+			TAC:      tac,
+			ACR:      "urn:siros:acr:passkey",
+		})
+	}
+	legacy, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "u2", "tenant_id": "test-tenant", "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte("test-secret"))
+	require.NoError(t, err)
+
+	required := requiredTACForProtocol[ProtocolOID4VCI]
+	cases := []struct {
+		name      string
+		url       string
+		token     string
+		forbidden bool
+	}{
+		{"modern empty TAC refused", wsURL, modern(""), true},
+		{"modern sufficient TAC allowed", wsURL, modern(claims.TAC(required)), false},
+		{"legacy token unaffected", legacyURL, legacy, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ws, _, err := websocket.DefaultDialer.Dial(tc.url, nil)
+			require.NoError(t, err)
+			defer func() { _ = ws.Close() }()
+			require.NoError(t, ws.WriteJSON(HandshakeMessage{Message: Message{Type: TypeHandshake}, AppToken: tc.token}))
+			var complete HandshakeCompleteMessage
+			require.NoError(t, ws.ReadJSON(&complete))
+			require.Equal(t, TypeHandshakeComplete, complete.Type)
+
+			require.NoError(t, ws.WriteJSON(FlowStartMessage{
+				Message:  Message{Type: TypeFlowStart, FlowID: "flow-1234"},
+				Protocol: ProtocolOID4VCI,
+			}))
+			_ = ws.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			var fe FlowErrorMessage
+			err = ws.ReadJSON(&fe)
+			if tc.forbidden {
+				require.NoError(t, err)
+				assert.Equal(t, ErrCodeForbidden, fe.Error.Code)
+			} else {
+				assert.Error(t, err, "no flow_error expected")
+			}
+		})
+	}
+}
+
+// hasUserIndexed reports whether userID has an entry in m.userIndex under any
+// tenant. The caller must hold m.sessionsMu.
+func hasUserIndexed(m *Manager, userID string) bool {
+	for k := range m.userIndex {
+		if k.UserID == userID {
+			return true
+		}
+	}
+	return false
+}
+
+func newMultiTenantTestSession(id, tenantID, userID string) *Session {
+	return &Session{ID: id, TenantID: tenantID, UserID: userID, logger: zap.NewNop(), transport: &closeHookTransport{}}
+}
+
+// closeHookTransport is a no-op SessionTransport that reports Close calls.
+type closeHookTransport struct{ onClose func() }
+
+func (c *closeHookTransport) SendJSON(interface{}) error { return nil }
+func (c *closeHookTransport) ReadMessage(ctx context.Context) ([]byte, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (c *closeHookTransport) Close() error {
+	if c.onClose != nil {
+		c.onClose()
+	}
+	return nil
+}
+
+// A user in tenants A and B keeps one session in each; a second session in
+// the same tenant supersedes only that tenant's first.
+func TestManager_RegisterSession_OneSessionPerTenantUser(t *testing.T) {
+	m := testManager()
+	defer m.Close()
+
+	var supersededA int
+	a1 := newMultiTenantTestSession("a1", "tenant-a", "user-1")
+	a1.onSuperseded = func() { supersededA++ }
+	b1 := newMultiTenantTestSession("b1", "tenant-b", "user-1")
+	require.True(t, m.registerSession(a1))
+	require.True(t, m.registerSession(b1))
+
+	assert.Equal(t, 0, supersededA, "a session in tenant B must not supersede tenant A's")
+	assert.True(t, m.isCurrentSession(a1))
+	assert.True(t, m.isCurrentSession(b1))
+	gotA, err := m.GetSessionByUser("tenant-a", "user-1")
+	require.NoError(t, err)
+	assert.Same(t, a1, gotA)
+	gotB, err := m.GetSessionByUser("tenant-b", "user-1")
+	require.NoError(t, err)
+	assert.Same(t, b1, gotB)
+
+	a2 := newMultiTenantTestSession("a2", "tenant-a", "user-1")
+	require.True(t, m.registerSession(a2))
+	assert.Equal(t, 1, supersededA)
+	assert.False(t, m.isCurrentSession(a1))
+	assert.True(t, m.isCurrentSession(a2))
+	assert.True(t, m.isCurrentSession(b1), "tenant B session must survive tenant A supersede")
+
+	// Unregistering the superseded session must not drop its successor's index.
+	m.unregisterSession(a1)
+	assert.True(t, m.isCurrentSession(a2))
+
+	// Anonymous sessions are never indexed or superseded.
+	an1 := newMultiTenantTestSession("an1", "tenant-a", "")
+	an2 := newMultiTenantTestSession("an2", "tenant-a", "")
+	require.True(t, m.registerSession(an1))
+	require.True(t, m.registerSession(an2))
+	assert.True(t, m.isCurrentSession(an1))
+	assert.True(t, m.isCurrentSession(an2))
+}
+
+// Persisted session bookkeeping is also per (tenant, user).
+func TestManager_RegisterSession_StoreKeepsBothTenants(t *testing.T) {
+	m := testManager()
+	store := NewMemorySessionStore(zap.NewNop())
+	m.SetSessionStore(store)
+	defer m.Close()
+	ctx := context.Background()
+
+	require.True(t, m.registerSession(newMultiTenantTestSession("a1", "tenant-a", "user-1")))
+	require.True(t, m.registerSession(newMultiTenantTestSession("b1", "tenant-b", "user-1")))
+	_, err := store.GetByUser(ctx, "tenant-a", "user-1")
+	require.NoError(t, err)
+	_, err = store.GetByUser(ctx, "tenant-b", "user-1")
+	require.NoError(t, err)
+
+	require.True(t, m.registerSession(newMultiTenantTestSession("a2", "tenant-a", "user-1")))
+	_, err = store.Get(ctx, "a1")
+	assert.ErrorIs(t, err, ErrSessionNotFound)
+	_, err = store.Get(ctx, "b1")
+	require.NoError(t, err)
+	got, err := store.GetByUser(ctx, "tenant-a", "user-1")
+	require.NoError(t, err)
+	assert.Equal(t, "a2", got.ID)
+}
+
+// User-wide revocation closes the user's sessions in every tenant.
+func TestManager_RevokeUser_ClosesSessionsInAllTenants(t *testing.T) {
+	m := testManager()
+	defer m.Close()
+
+	var closed []string
+	mk := func(id, tenant, user string) *Session {
+		s := newMultiTenantTestSession(id, tenant, user)
+		s.transport = &closeHookTransport{onClose: func() { closed = append(closed, id) }}
+		return s
+	}
+	require.True(t, m.registerSession(mk("a", "tenant-a", "user-1")))
+	require.True(t, m.registerSession(mk("b", "tenant-b", "user-1")))
+	require.True(t, m.registerSession(mk("other", "tenant-a", "user-2")))
+
+	require.NoError(t, m.DeleteByUser(context.Background(), "user-1"))
+	assert.ElementsMatch(t, []string{"a", "b"}, closed)
+}
+
+func TestMemorySessionStore_DeleteByUser_AllTenants(t *testing.T) {
+	store := NewMemorySessionStore(zap.NewNop())
+	ctx := context.Background()
+	exp := time.Now().Add(time.Hour)
+	for _, s := range []*SessionData{
+		{ID: "a", UserID: "u", TenantID: "ta", ExpiresAt: exp},
+		{ID: "b", UserID: "u", TenantID: "tb", ExpiresAt: exp},
+		{ID: "c", UserID: "other", TenantID: "ta", ExpiresAt: exp},
+	} {
+		require.NoError(t, store.Put(ctx, s))
+	}
+	require.NoError(t, store.Delete(ctx, "a"))
+	_, err := store.GetByUser(ctx, "tb", "u")
+	require.NoError(t, err, "deleting tenant A's session must not drop tenant B's index")
+
+	require.NoError(t, store.DeleteByUser(ctx, "u"))
+	_, err = store.Get(ctx, "b")
+	assert.ErrorIs(t, err, ErrSessionNotFound)
+	_, err = store.Get(ctx, "c")
+	assert.NoError(t, err)
+}
+
+// dialRaw performs the handshake for userID without waiting for registration.
+func handshakeNoWait(t *testing.T, m *Manager, wsURL, userID string) *websocket.Conn {
+	t.Helper()
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": userID,
+		"exp":     time.Now().Add(time.Hour).Unix(),
+	})
+	tokenString, err := token.SignedString([]byte(m.cfg.JWT.Secret))
+	require.NoError(t, err)
+	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	require.NoError(t, ws.WriteJSON(HandshakeMessage{
+		Message:  Message{Type: TypeHandshake},
+		AppToken: tokenString,
+	}))
+	return ws
+}
+
+// A connection authenticated before Close but not yet registered must be
+// refused at registration, not land in the cleared maps.
+func TestManager_Close_ConnectionBetweenCloseAndRegisterDoesNotSurvive(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+
+	reached := make(chan struct{})
+	release := make(chan struct{})
+	m.beforeRegisterHook = func() {
+		close(reached)
+		<-release
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
+	defer server.Close()
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	ws := handshakeNoWait(t, m, wsURL, "late-user")
+	defer ws.Close()
+
+	<-reached // accepted, authenticated, not yet registered
+	m.Close()
+	close(release)
+
+	_ = ws.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for {
+		var msg Message
+		if err := ws.ReadJSON(&msg); err != nil {
+			break // closed by the server, as required
+		}
+		require.NotEqual(t, TypeHandshakeComplete, msg.Type, "handshake must not complete after Close")
+	}
+
+	m.sessionsMu.RLock()
+	defer m.sessionsMu.RUnlock()
+	assert.Empty(t, m.sessions)
+	assert.Empty(t, m.userIndex)
+}
+
+type nopTransport struct{ closed atomic.Bool }
+
+func (n *nopTransport) SendJSON(interface{}) error { return nil }
+func (n *nopTransport) ReadMessage(context.Context) ([]byte, error) {
+	return nil, errors.New("nop")
+}
+func (n *nopTransport) Close() error { n.closed.Store(true); return nil }
+
+func newBareSession(id, user string) *Session {
+	return &Session{
+		ID:        id,
+		UserID:    user,
+		transport: &nopTransport{},
+		flows:     make(map[string]*Flow),
+		logger:    zap.NewNop(),
+		stopPing:  make(chan struct{}),
+	}
+}
+
+func TestManager_HandleConnection_RejectedWith503WhenDraining(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	m := NewManager(cfg, zap.NewNop())
+	m.Drain()
+	m.Drain() // idempotent
+
+	rec := httptest.NewRecorder()
+	m.HandleConnection(rec, httptest.NewRequest(http.MethodGet, "/ws", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+}
+
+// Stress: registrations racing Close never leave a session behind.
+func TestManager_RegisterSession_RacingClose_NoLeak(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	for round := 0; round < 20; round++ {
+		m := NewManager(cfg, zap.NewNop())
+		const n = 32
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				m.registerSession(newBareSession(fmt.Sprintf("s%d", i), fmt.Sprintf("u%d", i)))
+			}(i)
+		}
+		wg.Add(1)
+		go func() { defer wg.Done(); <-start; m.Close() }()
+		close(start)
+		wg.Wait()
+
+		// Registered before Close: swept; after: refused.
+		m.sessionsMu.Lock()
+		leftover := len(m.sessions)
+		m.sessionsMu.Unlock()
+		// Sessions registered before Close are cleared by it; those after are refused.
+		assert.Zero(t, leftover, "round %d leaked sessions", round)
+		assert.False(t, m.registerSession(newBareSession("late", "late-user")))
+	}
 }
 
 func TestManager_validateToken_GoTokenauth_ModeLegacy_UndeterminableSIDFailsClosed(t *testing.T) {

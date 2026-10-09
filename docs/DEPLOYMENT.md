@@ -238,6 +238,30 @@ Apply:
 kubectl apply -f k8s/deployment.yaml
 ```
 
+### Rolling Upgrades and the Redis Session Store
+
+Earlier releases kept the per-user session pointer at `<prefix>user:<userID>`.
+This release scopes it by tenant at `<prefix>usert:<b64url(tenant)>:<b64url(userID)>`
+(unpadded base64url, so the `:` separator is unambiguous) and adds a
+`<prefix>userall:<userID>` index used for account deletion. The new pointer
+deliberately does not reuse the `user:` namespace: the legacy key is the raw
+user ID, so with `:` in IDs a legacy user `default:u` and the new
+(tenant `default`, user `u`) would otherwise share one key and could overwrite
+each other's pointer during a rolling upgrade. New writes use only the new keys. To keep sessions created by not-yet-upgraded replicas reachable
+during a rolling upgrade, the store falls back to the legacy pointer:
+
+- `GetByUser` uses the legacy pointer when the new one is absent, returns the
+  session only if its user and (normalised) tenant match the request, and
+  lazily backfills the new pointer and index.
+- `DeleteByUser` and `Delete` also remove the legacy pointer, and delete the
+  session it names only if that session belongs to the target user.
+
+The fallback is bounded by the maximum session lifetime (`DefaultTTL`, 24h
+unless configured): legacy keys carry the session TTL and disappear on their
+own, after which the fallback finds nothing. Sessions still written by old
+replicas during the rollout stay covered for the same window; complete the
+rollout within it and no migration step is needed.
+
 ### Horizontal Pod Autoscaler
 
 Create `k8s/hpa.yaml`:
@@ -579,6 +603,67 @@ same replica (session affinity) and accept that a restart forgets revocations.
 The AS session store itself is shared when it is MongoDB-backed, so sessions
 and the recorded refresh-token family survive across replicas; only the
 revocation markers are process-local.
+
+#### WMP sessions need load-balancer affinity
+
+The WMP (HTTP+SSE) transport keeps its session state in the memory of the
+engine process that created the session. This is process-local and is **not**
+shared between replicas:
+
+- the WMP session registry (the peer, the authenticated user and tenant, the
+  session TTL and the resumption tokens),
+- the active flows and their handler goroutines, and
+- the per-session SSE event buffer used for `Last-Event-ID` replay.
+
+The Redis session store does **not** change this: it backs the WebSocket
+engine's persisted session bookkeeping, not the WMP session registry, event
+buffer or flows. Without affinity, a `POST /api/v2/wallet/rpc` or an SSE `GET`
+(`/api/v2/wallet/events`, `/api/v2/wallet/rpc/events`) that lands on a replica
+which did not create the session fails with `session not found` (HTTP 404), and
+a flow in progress cannot continue.
+
+With more than one engine replica you must therefore configure the load
+balancer to route every request of a WMP session to the same replica. The
+only key present on every request is the Authorization bearer token:
+
+- Which routing identifiers each request carries (stock go-wmp HTTPS+SSE
+  client, which is constructed before `session.create` and sends only the
+  headers it was configured with):
+
+  | Request | Authorization bearer | `Wmp-Session-Id` header | `params.wmp.session_id` | `params.session_id` | `session_id` query |
+  |---|---|---|---|---|---|
+  | `wmp.session.create` POST | yes | no | no | no | no |
+  | RPC POST | yes | optional (not set by the stock client) | yes | no | no |
+  | `wmp.session.resume` POST | yes | optional | no | yes (top level) | no |
+  | SSE GET | yes | optional | no | no | yes |
+  | Response to a server-initiated request | yes | optional | no | no | no |
+
+- Key affinity on a hash of the `Authorization` header value. It is the only
+  key present on every request, including `session.create` and the responses
+  to server-initiated requests, so the whole lifetime of a session lands on the
+  replica that created it. For example `hash $http_authorization consistent;`
+  in an NGINX `upstream`, or a header hash policy on `authorization` in Envoy.
+  Several sessions of one token share a replica, which is fine.
+- Limits: access tokens rotate on refresh. A request carrying a refreshed token
+  may hash to a different replica, where the session is not found (404).
+  `wmp.session.resume` does not recover from this: the resumption token and the
+  session registry are process-local too, so that replica answers
+  `session not found` for the resume as well. The client must create a new
+  session (`wmp.session.create`) and restart its flows. Resume works only while
+  routing still reaches the original replica. Do not
+  rely on `Wmp-Session-Id` or the `session_id` query parameter alone: they are
+  secondary hints usable only for requests that carry them, and the stock client
+  does not send the header at all.
+- The server does not set an affinity cookie: the stock go-wmp HTTPS+SSE client
+  uses `http.DefaultClient`, which has no cookie jar, so a cookie would not be
+  returned on later requests.
+- Make sure the proxy forwards `Authorization` and does not buffer the SSE
+  stream.
+
+The engine logs a warning at startup, when the WMP routes are mounted, as a
+reminder of this requirement. Sharing WMP session state between replicas, which
+would remove the requirement, is tracked in
+[#432](https://github.com/sirosfoundation/go-wallet-backend/issues/432).
 
 ### Database Scaling
 

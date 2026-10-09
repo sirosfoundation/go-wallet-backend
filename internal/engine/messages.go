@@ -118,8 +118,12 @@ const (
 	// was never asked, so reporting this to the wallet as "declined" would be
 	// wrong. The verifier is told neither apart - see submitErrorResponse.
 	ErrCodeNoMatchingCredentials ErrorCode = "NO_MATCHING_CREDENTIALS"
-	ErrCodeInternalError         ErrorCode = "INTERNAL_ERROR"
-	ErrCodeTooManyRequests       ErrorCode = "TOO_MANY_REQUESTS"
+	// ErrCodeUnsupportedTransactionData is returned when a request carries transaction_data
+	// the client cannot process (it did not declare FeatureTransactionDataV1, or the type
+	// is unsupported). The wallet refuses rather than present without the hashes.
+	ErrCodeUnsupportedTransactionData ErrorCode = "UNSUPPORTED_TRANSACTION_DATA"
+	ErrCodeInternalError              ErrorCode = "INTERNAL_ERROR"
+	ErrCodeTooManyRequests            ErrorCode = "TOO_MANY_REQUESTS"
 )
 
 // UserFacingMessage returns a generic user-facing message for an error code.
@@ -168,6 +172,8 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "Presentation failed"
 	case ErrCodeNoMatchingCredentials:
 		return "You do not have any credentials that match this request"
+	case ErrCodeUnsupportedTransactionData:
+		return "This wallet cannot process the transaction in this request. Please update the wallet and try again"
 	case ErrCodeInternalError:
 		return "Internal server error"
 	case ErrCodeTooManyRequests:
@@ -278,6 +284,12 @@ type FlowStartMessage struct {
 	// client that never sends this behaves exactly as before.
 	AuthorizationDetails []AuthorizationDetail `json:"authorization_details,omitempty"`
 
+	// Features lists the optional protocol features this client implements. A client
+	// that omits a feature is treated as not supporting it and is refused with an
+	// explicit error rather than sent work it cannot do. Unknown entries are ignored.
+	// The only feature today is FeatureTransactionDataV1.
+	Features []string `json:"features,omitempty"`
+
 	// Resumption fields (same-tab redirect flow)
 	AuthCode     string `json:"auth_code,omitempty"`     // Authorization code from OAuth redirect
 	CodeVerifier string `json:"code_verifier,omitempty"` // PKCE code verifier (saved by client before redirect)
@@ -314,6 +326,25 @@ type FlowStartMessage struct {
 	// SignActionSignClientAuth of the renewal so the client signs with that
 	// same key. Takes precedence over DPoPJWK.
 	DPoPKeyID string `json:"dpop_key_id,omitempty"`
+}
+
+// FeatureTransactionDataV1 is declared by a client that processes OID4VP
+// transaction_data end to end: validates it against the type metadata, shows it
+// to the user, and hashes each entry exactly as received (the base64url string).
+// A client that ignores the field would sign without the hashes (EC TS12 payment SCA).
+const FeatureTransactionDataV1 = "transaction_data.v1"
+
+// Supports reports whether the client declared feature; false on a nil message.
+func (m *FlowStartMessage) Supports(feature string) bool {
+	if m == nil {
+		return false
+	}
+	for _, f := range m.Features {
+		if f == feature {
+			return true
+		}
+	}
+	return false
 }
 
 // authorizationDetailTypeOpenIDCredential is the only `type` OID4VCI 1.0
@@ -473,9 +504,14 @@ type SignRequestParams struct {
 	// session rather than the verifier's static identity. Empty for
 	// non-ZK presentations.
 	VerifierSessionID string `json:"verifier_session_id,omitempty"`
-	// TransactionData carries TS12 transaction data from the verifier's OID4VP request.
-	// The frontend must hash each item and include transaction_data_hashes in the KB-JWT.
+	// TransactionData carries the verifier's OID4VP transaction_data (EC TS12), one
+	// entry per request element, in order. Sent only to a client that declared
+	// FeatureTransactionDataV1. The client hashes each entry's Raw string into the
+	// KB-JWT's transaction_data_hashes and shows the user Raw, not the decoded members.
 	TransactionData []TransactionData `json:"transaction_data,omitempty"`
+	// ResponseMode is the request's response_mode, set only with TransactionData
+	// (EC TS12 requires it in the KB-JWT).
+	ResponseMode string `json:"response_mode,omitempty"`
 	// ReissuanceKid, when set (a renewal request - credential re-issuance/
 	// renewal plan, Phase 1 Slice 2), asks the client to sign this
 	// generate_proof request with the EXISTING keypair identified by this
@@ -544,6 +580,9 @@ type SignResponseMessage struct {
 	// given.
 	DPoPKeyID string `json:"dpop_key_id,omitempty"`
 	DPoPProof string `json:"dpop_proof,omitempty"`
+	// Error is set when the client failed the sign request (for WMP, a
+	// wmp.flow.error); RequestSign returns it instead of waiting for a timeout.
+	Error string `json:"error,omitempty"`
 }
 
 // MatchRequestMessage requests client-side credential matching.

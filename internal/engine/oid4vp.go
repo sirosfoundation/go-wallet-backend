@@ -90,11 +90,39 @@ const (
 // TransactionData represents a single transaction data object from
 // the verifier's OID4VP authorization request (TS12/SCA per OID4VP draft §7.4).
 type TransactionData struct {
-	Type                     string                 `json:"type"`
-	Params                   map[string]interface{} `json:"params,omitempty"`
-	CredentialIDs            []string               `json:"credential_ids,omitempty"`
-	HashAlgorithm            string                 `json:"hash_alg,omitempty"`
-	TransactionDataHashesAlg string                 `json:"transaction_data_hashes_alg,omitempty"`
+	Type string `json:"type"`
+	// Raw is the entry exactly as received: the base64url string from the request's
+	// transaction_data array. It is the only valid input to transaction_data_hashes
+	// (OID4VP 1.0 Appendix B) and is always set from the received string, never from
+	// the decoded JSON.
+	Raw string `json:"raw,omitempty"`
+	// Payload is the decoded `payload` object (EC TS12 4.2), for validation and display. Never hash it.
+	Payload       json.RawMessage        `json:"payload,omitempty"`
+	Params        map[string]interface{} `json:"params,omitempty"`
+	CredentialIDs []string               `json:"credential_ids,omitempty"`
+	HashAlgorithm string                 `json:"hash_alg,omitempty"`
+	// TransactionDataHashesAlg lists the acceptable hash algorithms for this entry
+	// (OID4VP 1.0 Appendix B); the KB-JWT carries the single chosen one.
+	TransactionDataHashesAlg HashAlgList `json:"transaction_data_hashes_alg,omitempty"`
+}
+
+// HashAlgList is the request-side `transaction_data_hashes_alg` member: an array of
+// hash algorithm names, or a bare string some verifiers send for a single one.
+type HashAlgList []string
+
+// UnmarshalJSON accepts either a JSON string or an array of strings.
+func (l *HashAlgList) UnmarshalJSON(b []byte) error {
+	var one string
+	if err := json.Unmarshal(b, &one); err == nil {
+		*l = HashAlgList{one}
+		return nil
+	}
+	var many []string
+	if err := json.Unmarshal(b, &many); err != nil {
+		return errors.New("transaction_data_hashes_alg must be a string or an array of strings")
+	}
+	*l = HashAlgList(many)
+	return nil
 }
 
 // AuthorizationRequest represents an OpenID4VP authorization request
@@ -188,6 +216,11 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	// OID4VP §5 / §6: Validate request parameters before proceeding
 	if err := h.validateAuthorizationRequest(authReq, msg); err != nil {
 		h.Logger.Debug("authorization request validation failed", zap.Error(err))
+		var tdErr *transactionDataError
+		if errors.As(err, &tdErr) {
+			h.failTransactionData(ctx, authReq, tdErr)
+			return err
+		}
 		_ = h.Error(StepParsingRequest, ErrCodeInvalidMessage, ErrCodeInvalidMessage.UserFacingMessage())
 		return err
 	}
@@ -371,6 +404,16 @@ func (h *OID4VPHandler) parseRequestFromURL(u *url.URL) (*AuthorizationRequest, 
 		authReq.DCQLQuery = json.RawMessage(dcqlStr)
 	}
 
+	// Parse transaction_data (a JSON array of base64url strings in a query string).
+	// It must be kept even though nothing here interprets it: dropping it would let a
+	// transaction request bypass validateTransactionData.
+	if tdStr := q.Get("transaction_data"); tdStr != "" {
+		if !json.Valid([]byte(tdStr)) {
+			return nil, fmt.Errorf("invalid transaction_data: not valid JSON")
+		}
+		authReq.TransactionDataRaw = json.RawMessage(tdStr)
+	}
+
 	// Parse client_metadata if inline
 	if cmStr := q.Get("client_metadata"); cmStr != "" {
 		var cm ClientMetadata
@@ -441,6 +484,10 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 		return nil, err
 	}
 
+	// codeql[go/request-forgery]: h.httpClient is constructed via
+	// cfg.HTTPClient.NewHTTPClient(), whose DialContext blocks private/
+	// loopback/link-local IPs by default (SSRF protection). Fetching an
+	// attacker-supplied request_uri is inherent to OID4VP §5.10.
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		return nil, &requestFetchError{fmt.Errorf("failed to fetch request: %w", err)}
@@ -1487,6 +1534,10 @@ func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*C
 		return nil, err
 	}
 
+	// codeql[go/request-forgery]: h.httpClient is constructed via
+	// cfg.HTTPClient.NewHTTPClient(), whose DialContext blocks private/
+	// loopback/link-local IPs by default (SSRF protection). Fetching an
+	// attacker-supplied client_metadata_uri is inherent to OID4VP §5.7.
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -1723,7 +1774,7 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 
 	verifierJwkThumbprint := h.computeVerifierJWKThumbprint(authReq)
 
-	resp, err := h.RequestSign(ctx, SignActionSignPresentation, SignRequestParams{
+	params := SignRequestParams{
 		Audience:              audience,
 		Nonce:                 authReq.Nonce,
 		CredentialsToInclude:  credRefs,
@@ -1731,7 +1782,13 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 		VerifierJwkThumbprint: verifierJwkThumbprint,
 		VerifierSessionID:     authReq.VerifierSessionID,
 		TransactionData:       authReq.TransactionData,
-	})
+	}
+	// EC TS12 puts response_mode in the KB-JWT of an SCA presentation; sent only with
+	// transaction data.
+	if len(authReq.TransactionData) > 0 {
+		params.ResponseMode = effectiveResponseMode(authReq)
+	}
+	resp, err := h.RequestSign(ctx, SignActionSignPresentation, params)
 	if err != nil {
 		return "", err
 	}
@@ -1741,6 +1798,15 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 	}
 
 	return resp.VPToken, nil
+}
+
+// effectiveResponseMode returns the request's response_mode (default direct_post
+// per OID4VP); validation, submission and the KB-JWT must all see the same value.
+func effectiveResponseMode(authReq *AuthorizationRequest) string {
+	if authReq.ResponseMode == "" {
+		return ResponseModeDirectPost
+	}
+	return authReq.ResponseMode
 }
 
 // computeVerifierJWKThumbprint returns the verifier JWK thumbprint for direct_post.jwt,
@@ -1827,10 +1893,7 @@ func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *Authorizati
 	}
 
 	// Determine response mode
-	responseMode := authReq.ResponseMode
-	if responseMode == "" {
-		responseMode = ResponseModeDirectPost
-	}
+	responseMode := effectiveResponseMode(authReq)
 
 	switch responseMode {
 	case ResponseModeDirectPost:
@@ -1859,6 +1922,11 @@ func (h *OID4VPHandler) submitDirectPost(ctx context.Context, endpoint string, a
 	}
 	req.Header.Set(hdrContentType, mimeFormURLEncoded)
 
+	// codeql[go/request-forgery]: endpoint was rebuilt by sanitizeEndpointURL()
+	// (scheme validated, taint broken) above, and h.httpClient additionally
+	// blocks private/loopback/link-local IPs via its DialContext by default
+	// (SSRF protection). Posting to an attacker-supplied response_uri is
+	// inherent to OID4VP §6.2.
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to submit response: %w", err)
@@ -2113,10 +2181,7 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 	}
 
 	// OID4VP §5: redirect_uri MUST NOT be present when response_mode is direct_post or direct_post.jwt
-	responseMode := authReq.ResponseMode
-	if responseMode == "" {
-		responseMode = ResponseModeDirectPost
-	}
+	responseMode := effectiveResponseMode(authReq)
 	isDirectPost := responseMode == ResponseModeDirectPost || responseMode == ResponseModeDirectPostJWT
 	if isDirectPost && authReq.RedirectURI != "" {
 		return errors.New("redirect_uri must not be present with direct_post response mode")
@@ -2212,7 +2277,7 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 	}
 
 	// OID4VP §7.4: Decode and validate transaction_data if present.
-	return validateTransactionData(authReq)
+	return validateTransactionData(authReq, msg)
 }
 
 // validateClientIDMatch checks that client_id in the URL matches the JWT request object.
@@ -2266,38 +2331,140 @@ func validateResponseURIOrigin(authReq *AuthorizationRequest, msg *FlowStartMess
 	return nil
 }
 
-// validateTransactionData decodes and validates the transaction_data array.
-func validateTransactionData(authReq *AuthorizationRequest) error {
-	if len(authReq.TransactionDataRaw) == 0 {
-		return nil
+// transactionDataError is a transaction_data problem mapped to invalid_transaction_data
+// for the verifier and its own error code for the client.
+type transactionDataError struct {
+	code ErrorCode
+	err  error
+}
+
+func (e *transactionDataError) Error() string { return e.err.Error() }
+func (e *transactionDataError) Unwrap() error { return e.err }
+
+func newTransactionDataError(code ErrorCode, format string, args ...any) error {
+	return &transactionDataError{code: code, err: fmt.Errorf(format, args...)}
+}
+
+// decodedTransactionData pairs a decoded entry with the exact string received; the
+// string is what a presentation binds to, since re-encoding does not reproduce it.
+type decodedTransactionData struct {
+	Raw  string
+	Data TransactionData
+}
+
+// decodeTransactionData decodes the array structurally (base64url strings, each a
+// JSON object) without deciding which types are supported.
+func decodeTransactionData(raw json.RawMessage) ([]decodedTransactionData, error) {
+	if len(raw) == 0 {
+		return nil, nil
 	}
-	// Reject JSON null — transaction_data must be an array if present.
-	if string(authReq.TransactionDataRaw) == "null" {
-		return errors.New("invalid transaction_data: must be an array, not null")
+	// Reject JSON null: transaction_data must be an array if present.
+	if string(raw) == "null" {
+		return nil, newTransactionDataError(ErrCodeInvalidMessage, "invalid transaction_data: must be an array, not null")
 	}
 	var rawStrings []string
-	if err := json.Unmarshal(authReq.TransactionDataRaw, &rawStrings); err != nil {
-		return fmt.Errorf("invalid transaction_data: expected array of base64url strings: %w", err)
+	if err := json.Unmarshal(raw, &rawStrings); err != nil {
+		return nil, newTransactionDataError(ErrCodeInvalidMessage, "invalid transaction_data: expected array of base64url strings: %w", err)
 	}
-	knownTypes := map[string]bool{
-		"owf_payment_initiation": true,
-	}
+	out := make([]decodedTransactionData, 0, len(rawStrings))
 	for i, encoded := range rawStrings {
 		decoded, err := base64.RawURLEncoding.DecodeString(encoded)
 		if err != nil {
-			return fmt.Errorf("transaction_data[%d]: invalid base64url encoding: %w", i, err)
+			return nil, newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: invalid base64url encoding: %w", i, err)
 		}
 		var td TransactionData
 		if err := json.Unmarshal(decoded, &td); err != nil {
-			return fmt.Errorf("transaction_data[%d]: invalid JSON: %w", i, err)
+			return nil, newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: invalid JSON: %w", i, err)
 		}
-		if !knownTypes[td.Type] {
-			return fmt.Errorf("unsupported transaction_data type: %q", td.Type)
+		// A `raw` member in the verifier-controlled JSON would land in td.Raw; overwrite it.
+		td.Raw = encoded
+		out = append(out, decodedTransactionData{Raw: encoded, Data: td})
+	}
+	return out, nil
+}
+
+// validateTransactionData decodes and validates transaction_data for the client that
+// started the flow. A request with transaction_data is only passed to a client that
+// declared FeatureTransactionDataV1; older clients ignore unknown fields and would
+// sign without the hashes, so they are refused.
+func validateTransactionData(authReq *AuthorizationRequest, msg *FlowStartMessage) error {
+	entries, err := decodeTransactionData(authReq.TransactionDataRaw)
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	if !msg.Supports(FeatureTransactionDataV1) {
+		return newTransactionDataError(ErrCodeUnsupportedTransactionData,
+			"request carries transaction_data but the client did not declare %q", FeatureTransactionDataV1)
+	}
+	dcqlIDs := dcqlCredentialIDs(authReq.DCQLQuery)
+	for i, e := range entries {
+		if err := checkTransactionDataEntry(i, e.Data, dcqlIDs); err != nil {
+			return err
 		}
-		authReq.TransactionData = append(authReq.TransactionData, td)
+		authReq.TransactionData = append(authReq.TransactionData, e.Data)
 	}
 	return nil
 }
+
+// checkTransactionDataEntry is the structural check OID4VP 1.0 puts on an entry: a
+// type and a non-empty list of credential_ids naming credentials in the DCQL query.
+// Support for the type is the client's decision (it depends on type metadata).
+func checkTransactionDataEntry(i int, td TransactionData, dcqlIDs map[string]bool) error {
+	if td.Type == "" {
+		return newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: missing type", i)
+	}
+	if len(td.CredentialIDs) == 0 {
+		return newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: credential_ids must be a non-empty array", i)
+	}
+	if dcqlIDs == nil {
+		// Fail closed: without a readable DCQL credential set, credential_ids cannot be checked.
+		return newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: transaction_data requires a dcql_query with at least one credential for credential_ids to reference", i)
+	}
+	for _, id := range td.CredentialIDs {
+		if !dcqlIDs[id] {
+			return newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: credential_ids references %q, which is not a credential in dcql_query", i, id)
+		}
+	}
+	return nil
+}
+
+// dcqlCredentialIDs returns the DCQL credential query ids, or nil when the query is
+// absent or unreadable (reported by other validation).
+func dcqlCredentialIDs(dcql json.RawMessage) map[string]bool {
+	if len(dcql) == 0 {
+		return nil
+	}
+	var q struct {
+		Credentials []struct {
+			ID string `json:"id"`
+		} `json:"credentials"`
+	}
+	if err := json.Unmarshal(dcql, &q); err != nil || len(q.Credentials) == 0 {
+		return nil
+	}
+	ids := make(map[string]bool, len(q.Credentials))
+	for _, c := range q.Credentials {
+		ids[c.ID] = true
+	}
+	return ids
+}
+
+// failTransactionData ends the flow: the verifier is told (as for a decline) and the
+// client gets the error code and any verifier redirect.
+func (h *OID4VPHandler) failTransactionData(ctx context.Context, authReq *AuthorizationRequest, tdErr *transactionDataError) {
+	details := map[string]interface{}{}
+	if redirectURI := h.submitErrorResponse(ctx, authReq, "invalid_transaction_data", transactionDataVerifierDescription); redirectURI != "" {
+		details["redirect_uri"] = redirectURI
+	}
+	_ = h.ErrorWithDetails(StepParsingRequest, tdErr.code, tdErr.code.UserFacingMessage(), details)
+}
+
+// transactionDataVerifierDescription is deliberately generic: it does not reveal
+// which client feature is missing.
+const transactionDataVerifierDescription = "The wallet cannot process the transaction data in this request"
 
 func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string, authReq *AuthorizationRequest, vpToken string) (string, error) {
 	now := time.Now()
@@ -2428,6 +2595,11 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 	}
 	req.Header.Set(hdrContentType, mimeFormURLEncoded)
 
+	// codeql[go/request-forgery]: endpoint was rebuilt by sanitizeEndpointURL()
+	// (scheme validated, taint broken) above, and h.httpClient additionally
+	// blocks private/loopback/link-local IPs via its DialContext by default
+	// (SSRF protection). Posting to an attacker-supplied response_uri is
+	// inherent to OID4VP §6.2.
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("failed to submit JARM response: %w", err)

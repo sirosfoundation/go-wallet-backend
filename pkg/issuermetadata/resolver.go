@@ -44,6 +44,7 @@ import (
 	"github.com/sirosfoundation/go-trust/pkg/authzen"
 	"golang.org/x/sync/singleflight"
 
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
 )
 
@@ -77,8 +78,13 @@ type Config struct {
 	// HTTPClient is the HTTP client used for outbound requests.
 	// The caller is responsible for configuring timeouts, TLS settings,
 	// and SSRF protections (e.g. blocking private IP ranges).
-	// If nil, http.DefaultClient is used.
+	// If nil, New builds an SSRF-guarded client (config.HTTPClientConfig.NewHTTPClient)
+	// that refuses private, loopback, link-local and metadata addresses.
 	HTTPClient *http.Client
+
+	// UnsafeAllowPrivateAddressesForTesting lets the client New builds (when HTTPClient
+	// is nil) reach private and loopback addresses. Testing only.
+	UnsafeAllowPrivateAddressesForTesting bool
 
 	// AllowHTTP permits non-TLS issuer URLs.
 	// For testing only; do not set in production.
@@ -214,6 +220,9 @@ type cachedEntry struct {
 }
 
 // maxResponseBodyBytes is the maximum HTTP response body size (10 MB).
+// defaultHTTPTimeout is the timeout of the client New builds.
+const defaultHTTPTimeout = 30 * time.Second
+
 const maxResponseBodyBytes = 10 * 1024 * 1024
 
 // readLimitedBody reads up to maxResponseBodyBytes from r.
@@ -263,7 +272,11 @@ func New(cfg Config) (*Resolver, error) {
 
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		// Never http.DefaultClient: issuer URLs are caller-controlled.
+		httpClient = config.HTTPClientConfig{
+			AllowHTTP:       cfg.AllowHTTP,
+			AllowPrivateIPs: cfg.UnsafeAllowPrivateAddressesForTesting,
+		}.NewHTTPClient(defaultHTTPTimeout)
 	}
 
 	return &Resolver{
@@ -333,10 +346,7 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 	// Normalize trailing slash for consistent cache keys, but only when the
 	// path is empty or just "/". Issuers with meaningful paths (e.g.
 	// https://host/issuer/) retain their trailing slash per RFC 8615.
-	parsed, _ := url.Parse(issuerURL) // already validated above
-	if parsed.Path == "" || parsed.Path == "/" {
-		issuerURL = strings.TrimRight(issuerURL, "/")
-	}
+	issuerURL = oidc.NormalizeIssuerURL(issuerURL)
 
 	if entry := r.getCachedEntry(issuerURL); entry != nil {
 		return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial}, nil
@@ -355,7 +365,10 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 
 		// RFC 8615 well-known URI construction (required since OID4VCI draft 16):
 		// https://{host}/.well-known/openid-credential-issuer{path}
-		metadataURL, _ := oidc.WellKnownURL(issuerURL, "openid-credential-issuer") // already validated above
+		metadataURL, err := oidc.WellKnownURL(issuerURL, "openid-credential-issuer")
+		if err != nil {
+			return nil, fmt.Errorf("building well-known URL: %w", err)
+		}
 		fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer fetchCancel()
 		result, err := r.fetch(fetchCtx, issuerURL, metadataURL)
@@ -431,10 +444,14 @@ func (r *Resolver) fetchOnce(ctx context.Context, issuerURL, metadataURL, accept
 
 	// The issuerURL is validated by validateURL() (HTTPS required) before
 	// fetch() is called, and r.httpClient enforces SSRF protection via its
-	// DialContext (blocking private/loopback IPs). Fetching arbitrary public
-	// HTTPS endpoints is inherent to OpenID4VCI issuer metadata discovery —
-	// the issuer URL comes from a user-presented credential and can be any
-	// public HTTPS endpoint; there is no known-good allowlist.
+	// DialContext (blocking private/loopback IPs): New either uses the
+	// caller's Config.HTTPClient (documented to be guarded, built via
+	// config.HTTPClientConfig.NewHTTPClient in production) or, when that is
+	// nil, builds a guarded client itself; it never uses http.DefaultClient.
+	// Fetching arbitrary
+	// public HTTPS endpoints is inherent to OpenID4VCI issuer metadata
+	// discovery — the issuer URL comes from a user-presented credential and
+	// can be any public HTTPS endpoint; there is no known-good allowlist.
 	resp, err := r.httpClient.Do(req) // codeql[go/request-forgery]
 	if err != nil {
 		return nil, 0, fmt.Errorf("HTTP request failed: %w", err)
@@ -576,7 +593,7 @@ func validateCredentialIssuerClaim(claims map[string]interface{}, issuerURL stri
 	if credentialIssuer == "" {
 		return fmt.Errorf("metadata missing required 'credential_issuer' claim")
 	}
-	if credentialIssuer != issuerURL {
+	if !oidc.SameIssuerIdentifier(credentialIssuer, issuerURL) {
 		return fmt.Errorf("metadata 'credential_issuer' claim %q does not match issuer URL %q", credentialIssuer, issuerURL)
 	}
 	return nil
@@ -748,9 +765,7 @@ func validateJWTClaims(claims map[string]interface{}, issuerURL string) error {
 	if sub == "" {
 		return fmt.Errorf("JWT payload missing required 'sub' claim")
 	}
-	normalizedSub := strings.TrimSuffix(sub, "/")
-	normalizedIssuer := strings.TrimSuffix(issuerURL, "/")
-	if normalizedSub != normalizedIssuer {
+	if !oidc.SameIssuerIdentifier(sub, issuerURL) {
 		return fmt.Errorf("JWT 'sub' claim %q does not match issuer URL %q", sub, issuerURL)
 	}
 

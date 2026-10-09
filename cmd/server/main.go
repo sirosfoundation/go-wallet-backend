@@ -363,6 +363,17 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
+	// Shutdown order matters:
+	//  1. Drain the engine: WMP and WebSocket refuse new requests, sessions and
+	//     upgrades (503), so nothing can register after step 2 clears the session maps.
+	//  2. Close the engine: ends live sessions, including the SSE handlers and hijacked
+	//     WebSocket connections that http.Server.Shutdown does not end.
+	//  3. Shut the listeners down within the timeout.
+	if engineProvider != nil {
+		engineProvider.Drain()
+		engineProvider.Close()
+	}
+
 	if err := mgr.Shutdown(shutdownCtx); err != nil {
 		logger.Error("Server shutdown error", zap.Error(err))
 	}

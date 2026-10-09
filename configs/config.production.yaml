@@ -50,6 +50,8 @@ server:
       - "Sec-WebSocket-Key"
       - "Sec-WebSocket-Version"
       - "Sec-WebSocket-Protocol"
+      - "Wmp-Session-Id"
+      - "Last-Event-ID"
     exposed_headers:
       - "X-Private-Data-ETag"
     # Can be true with specific origins
