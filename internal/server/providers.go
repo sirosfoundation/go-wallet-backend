@@ -496,11 +496,10 @@ func (p *EngineProvider) Manager() *wsengine.Manager {
 // process; Close stops its JWKS refresh.
 type StandaloneValidator struct {
 	*tokenvalidator.Validator
-	relay *jwksRelay
 }
 
-// Close stops the background JWKS refresh and the loopback relay.
-func (v StandaloneValidator) Close() error { v.Stop(); return v.relay.Close() }
+// Close stops the background JWKS refresh.
+func (v StandaloneValidator) Close() error { v.Stop(); return nil }
 
 // legacyValidatorConfig builds the go-tokenauth legacy (HMAC) configuration
 // shared by every validator constructor. The shared secret alone would
@@ -558,12 +557,12 @@ func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (
 	if err != nil {
 		return nil, err
 	}
-	relay, err := newRemoteJWKSRelay(cfg)
+	jwksURL, err := asJWKSURL(cfg)
 	if err != nil {
 		return nil, err
 	}
 	v := tokenvalidator.New(tokenvalidator.Config{
-		JWKSURL: relay.url,
+		JWKSURL: jwksURL,
 		Issuer:  issuer,
 		// Legacy tokens carry aud = RP ID, which config validation requires
 		// in as.audiences while legacy is enabled, so the validator can apply
@@ -575,7 +574,7 @@ func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (
 	logger.Warn("Standalone engine has no token revocation source: AS session tokens stay valid at this engine until they expire, even after logout or user revocation. Mitigate with short access token TTLs, or co-host the engine with the backend (shared blacklist).",
 		zap.String("jwks_source", "as.external_url"))
 	logger.Info("Standalone engine token validator started", zap.Bool("legacy_enabled", cfg.LegacyEnabled()))
-	return &StandaloneValidator{Validator: v, relay: relay}, nil
+	return &StandaloneValidator{Validator: v}, nil
 }
 
 // SetRegistryHandler wires a co-located registry (see
@@ -657,7 +656,6 @@ type BackendProvider struct {
 	metadataResolver *issuermetadata.Resolver
 	asModule         *as.ASModule
 	tokenValidator   *tokenvalidator.Validator
-	jwksRelay        *jwksRelay
 	auditor          *audit.Emitter
 	logger           *zap.Logger
 }
@@ -693,7 +691,7 @@ func requireLegacyIssuer(cfg *config.Config, role string) error {
 // remote AS (as.issuer, falling back to jwt.issuer) and refuses an empty
 // value: the validator would then leave the issuer of JWKS-signed tokens
 // unrestricted. It applies whether or not legacy HMAC tokens are enabled, and
-// is checked before any relay or validator is created.
+// is checked before any validator is created.
 func remoteASIssuer(cfg *config.Config, role string) (string, error) {
 	issuer := cfg.AS.Issuer
 	if issuer == "" {
@@ -769,7 +767,6 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 	// Initialize AS module when enabled.
 	var asModule *as.ASModule
 	var tv *tokenvalidator.Validator
-	var relayHandle *jwksRelay
 	if cfg.AS.Enabled {
 		// Reuse the auth provider's Services rather than building a second,
 		// unmanaged one: a separate NewServices would open its own
@@ -805,19 +802,17 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		if issuer == "" {
 			issuer = cfg.JWT.Issuer
 		}
-		// The co-hosted AS's own keys are served to the validator in-process
-		// (no network fetch, nothing to intercept).
-		relay, relayErr := newLocalJWKSRelay(asModule.KeyManager.JWKS)
-		if relayErr != nil {
+		// The validator fetches the AS JWKS from as.external_url, like every
+		// other role.
+		jwksURL, urlErr := asJWKSURL(cfg)
+		if urlErr != nil {
 			_ = asModule.Close()
 			_ = authProvider.Close()
 			_ = store.Close()
-			return nil, fmt.Errorf("failed to start JWKS relay: %w", relayErr)
+			return nil, urlErr
 		}
-		relayHandle = relay
-		jwksURL := relay.url
 		tv = tokenvalidator.New(tokenvalidator.Config{
-			JWKSURL:   relay.url,
+			JWKSURL:   jwksURL,
 			Issuer:    issuer,
 			Audiences: cfg.AS.Audiences,
 			Legacy:    legacyValidatorConfig(cfg, cfg.AS.Legacy.Enabled),
@@ -859,7 +854,6 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		metadataResolver: metadataResolver,
 		asModule:         asModule,
 		tokenValidator:   tv,
-		jwksRelay:        relayHandle,
 		auditor:          newAuditEmitter(cfg, logger),
 		logger:           logger,
 	}, nil
@@ -938,7 +932,6 @@ func (p *BackendProvider) Close() error {
 	if p.asModule != nil {
 		_ = p.asModule.Close() // releases HSM sessions
 	}
-	_ = p.jwksRelay.Close()
 	if p.store != nil {
 		return p.store.Close()
 	}
@@ -1098,7 +1091,6 @@ type RegistryProvider struct {
 	tenants   middleware.TenantLookup
 	blacklist middleware.TokenBlacklistChecker
 
-	jwksRelay   *jwksRelay
 	rootAliases bool
 }
 
@@ -1187,10 +1179,9 @@ func NewRegistryProvider(cfg *config.Config, logger *zap.Logger) (*RegistryProvi
 	return p, nil
 }
 
-// buildValidator builds the registry's go-tokenauth validator. The AS JWKS is
-// fetched from as.external_url through the guarded HTTP client and a loopback
-// relay (see jwksrelay.go), exactly as for the wallet-provider and the
-// standalone engine; without as.external_url only legacy HMAC tokens can be
+// buildValidator builds the registry's go-tokenauth validator. The validator
+// fetches the AS JWKS from as.external_url itself, as for the wallet-provider
+// and the standalone engine; without as.external_url only legacy HMAC tokens can be
 // recognised. go-tokenauth v0.5 refuses to validate without an audience list;
 // the registry's narrower rule (registry.AuthMiddlewares) is still enforced on
 // top of it.
@@ -1212,12 +1203,11 @@ func (p *RegistryProvider) buildValidator() error {
 		if err != nil {
 			return err
 		}
-		relay, err := newRemoteJWKSRelay(cfg)
+		jwksURL, err := asJWKSURL(cfg)
 		if err != nil {
 			return err
 		}
-		p.jwksRelay = relay
-		tc.JWKSURL, tc.Issuer = relay.url, issuer
+		tc.JWKSURL, tc.Issuer = jwksURL, issuer
 		jwksSource = "as.external_url"
 	} else {
 		tc.Issuer = cfg.AS.Issuer
@@ -1324,7 +1314,6 @@ func (p *RegistryProvider) Close() error {
 	if p.validator != nil {
 		p.validator.Stop()
 	}
-	_ = p.jwksRelay.Close()
 	if p.fetcher != nil {
 		p.fetcher.Stop()
 	}
@@ -1375,7 +1364,6 @@ type WalletProviderProvider struct {
 	services       *service.Services
 	wiaRateLimiter *middleware.AuthRateLimiter
 	tokenValidator *tokenvalidator.Validator
-	jwksRelay      *jwksRelay
 }
 
 // NewWalletProviderProvider creates a new isolated wallet-provider.
@@ -1406,7 +1394,6 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 	// isolated wallet-provider deployments would reject valid AS-issued
 	// access tokens — only legacy HMAC JWTs would work.
 	var tv *tokenvalidator.Validator
-	var relayHandle *jwksRelay
 	//
 	// The AS JWKS is fetched from as.external_url. Without it there is no
 	// JWKS to fetch: if legacy HMAC is still enabled, fall back to the
@@ -1427,15 +1414,14 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 			_ = store.Close()
 			return nil, issuerErr
 		}
-		wpRelay, relayErr := newRemoteJWKSRelay(cfg)
-		if relayErr != nil {
+		jwksURL, urlErr := asJWKSURL(cfg)
+		if urlErr != nil {
 			services.Stop()
 			_ = store.Close()
-			return nil, relayErr
+			return nil, urlErr
 		}
-		relayHandle = wpRelay
 		tv = tokenvalidator.New(tokenvalidator.Config{
-			JWKSURL:   wpRelay.url,
+			JWKSURL:   jwksURL,
 			Issuer:    issuer,
 			Audiences: cfg.AS.Audiences,
 			Legacy:    legacyValidatorConfig(cfg, cfg.AS.Legacy.Enabled),
@@ -1455,7 +1441,6 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 		services:       services,
 		wiaRateLimiter: middleware.NewAuthRateLimiter(cfg.WalletProvider.WIA.RateLimit, logger.Named("wia")),
 		tokenValidator: tv,
-		jwksRelay:      relayHandle,
 	}, nil
 }
 
@@ -1515,7 +1500,6 @@ func (p *WalletProviderProvider) Close() error {
 	if p.tokenValidator != nil {
 		p.tokenValidator.Stop()
 	}
-	_ = p.jwksRelay.Close()
 	p.services.Stop()
 	return p.store.Close()
 }
@@ -1524,4 +1508,17 @@ func (p *WalletProviderProvider) Close() error {
 // Returns nil if audit is not enabled (audit is then a no-op).
 func newAuditEmitter(cfg *config.Config, logger *zap.Logger) *audit.Emitter {
 	return audit.NewFromConfig(cfg, logger)
+}
+
+// asJWKSURL returns <as.external_url>/auth/.well-known/jwks.json, built with
+// JoinPath so a trailing slash in as.external_url is harmless. go-tokenauth's
+// validator fetches it itself. The AS is infrastructure-internal (typically a
+// cluster-internal URL), so http and https are both accepted and no SSRF
+// policy is applied to this fetch.
+func asJWKSURL(cfg *config.Config) (string, error) {
+	u, err := cfg.AS.ExternalBaseURL()
+	if err != nil {
+		return "", err
+	}
+	return u.JoinPath("auth", ".well-known", "jwks.json").String(), nil
 }

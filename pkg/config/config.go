@@ -526,20 +526,8 @@ type HTTPClientConfig struct {
 	// token_endpoint/jwks_uri named by a discovery document included, so a
 	// discovery document cannot steer the request to an unlisted internal
 	// host. Cloud metadata endpoints stay blocked regardless.
-	// It also covers the JWKS fetch from the deployment's OWN authorization
-	// server (as.external_url) by processes that validate its session tokens
-	// remotely (split-mode engine, registry-only process, isolated
-	// wallet-provider), see NewOwnASHTTPClient. In a split-pod deployment
-	// as.external_url is usually a cluster-internal address such as
-	// http://backend.ns.svc:8080: list that one hostname here (and nothing
-	// broader) instead of setting http_client.allow_http /
-	// allow_private_ips, which would loosen the policy for third-party
-	// issuers and verifiers too. For that own-AS JWKS fetch ONLY, a listed
-	// host may also be reached over plain http (public keys cross the
-	// cluster network; the host is one the operator named explicitly). The
-	// OIDC identity-provider exchange never gets that plaintext allowance.
-	// The wallet server's AS and the processes above read this setting; the
-	// registry's own handlers have no identity-provider client.
+	// Only the wallet server's AS reads this setting; the registry has no
+	// identity-provider client and ignores it.
 	// Env: WALLET_HTTP_CLIENT_TRUSTED_IDP_HOSTS (comma-separated)
 	TrustedIdPHosts []string `yaml:"trusted_idp_hosts" envconfig:"TRUSTED_IDP_HOSTS"`
 }
@@ -589,26 +577,6 @@ func (c HTTPClientConfig) NewIdPHTTPClient(timeoutOverride time.Duration) *http.
 	return c.newHTTPClient(timeoutOverride, c.trustedIdPHostSet())
 }
 
-// NewOwnASHTTPClient is NewIdPHTTPClient for the one fetch a process makes of
-// its OWN deployment's authorization server: the AS JWKS at as.external_url
-// that a remote token validator (split-mode engine, registry-only process,
-// isolated wallet-provider) needs. Same address policy as the IdP client
-// (hostnames in TrustedIdPHosts may sit on private addresses, cloud metadata
-// stays blocked). In addition, plain http is accepted for a request whose
-// hostname is in TrustedIdPHosts, so a cluster-internal AS needs exactly one
-// explicit trusted host entry and no global allow_http / allow_private_ips.
-// Any other host still needs https unless AllowsPlaintext. Never use it for a
-// host a counterparty chose, nor for the OIDC identity-provider exchange.
-func (c HTTPClientConfig) NewOwnASHTTPClient(timeoutOverride time.Duration) *http.Client {
-	return c.newClient(timeoutOverride, c.trustedIdPHostSet(), true)
-}
-
-// IsTrustedIdPHost reports whether host (no port) is listed in TrustedIdPHosts.
-func (c HTTPClientConfig) IsTrustedIdPHost(host string) bool {
-	_, ok := c.trustedIdPHostSet()[strings.ToLower(host)]
-	return ok
-}
-
 // trustedIdPHostSet returns TrustedIdPHosts as a lowercase set, or nil.
 func (c HTTPClientConfig) trustedIdPHostSet() map[string]struct{} {
 	if len(c.TrustedIdPHosts) == 0 {
@@ -624,10 +592,6 @@ func (c HTTPClientConfig) trustedIdPHostSet() map[string]struct{} {
 }
 
 func (c HTTPClientConfig) newHTTPClient(timeoutOverride time.Duration, trustedHosts map[string]struct{}) *http.Client {
-	return c.newClient(timeoutOverride, trustedHosts, false)
-}
-
-func (c HTTPClientConfig) newClient(timeoutOverride time.Duration, trustedHosts map[string]struct{}, plaintextToTrusted bool) *http.Client {
 	timeout := time.Duration(c.Timeout) * time.Second
 	if timeout <= 0 {
 		timeout = 30 * time.Second
@@ -663,8 +627,6 @@ func (c HTTPClientConfig) newClient(timeoutOverride time.Duration, trustedHosts 
 			lookup:    defaultLookupIP,
 			httpsOnly: !c.AllowsPlaintext(),
 			trusted:   trustedHosts,
-
-			plaintextToTrusted: plaintextToTrusted,
 		}
 	}
 
@@ -922,13 +884,10 @@ type ssrfGuard struct {
 	lookup    lookupFunc
 	httpsOnly bool
 	trusted   map[string]struct{}
-	// plaintextToTrusted lets plain http through to a host in trusted; set
-	// only by NewOwnASHTTPClient.
-	plaintextToTrusted bool
 }
 
 func (g ssrfGuard) RoundTrip(req *http.Request) (*http.Response, error) {
-	if g.httpsOnly && req.URL.Scheme != "https" && !g.plaintextAllowedFor(req) {
+	if g.httpsOnly && req.URL.Scheme != "https" {
 		// Naming all three keys AllowsPlaintext consults, since an operator
 		// who reads only one of them is told to change a setting that may
 		// already be set. insecure_skip_verify is listed last and with the
@@ -952,17 +911,6 @@ func (g ssrfGuard) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	return g.base.RoundTrip(req)
-}
-
-// plaintextAllowedFor reports whether a non-https request is let through
-// despite httpsOnly: only for the own-AS client, only to a trusted host, and
-// only plain http (not other schemes). Redirect hops are checked the same way.
-func (g ssrfGuard) plaintextAllowedFor(req *http.Request) bool {
-	if !g.plaintextToTrusted || req.URL.Scheme != "http" {
-		return false
-	}
-	_, ok := g.trusted[strings.ToLower(req.URL.Hostname())]
-	return ok
 }
 
 // proxied reports whether this request would be sent through a proxy, and so

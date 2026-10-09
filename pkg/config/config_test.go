@@ -3298,42 +3298,6 @@ as:
 	}
 }
 
-func TestNewOwnASHTTPClient_PlaintextOnlyToTrustedHosts(t *testing.T) {
-	cfg := HTTPClientConfig{TrustedIdPHosts: []string{"Backend.NS.svc"}}
-	rt := func(c *http.Client) ssrfGuard {
-		g, ok := c.Transport.(ssrfGuard)
-		if !ok {
-			t.Fatal("client is not guarded")
-		}
-		g.base = roundTripFunc(func(*http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
-		})
-		return g
-	}
-	own := rt(cfg.NewOwnASHTTPClient(0))
-	idp := rt(cfg.NewIdPHTTPClient(0))
-	get := func(g ssrfGuard, u string) error {
-		req, _ := http.NewRequest(http.MethodGet, u, nil)
-		_, err := g.RoundTrip(req)
-		return err
-	}
-	if err := get(own, "http://backend.ns.svc:8080/x"); err != nil {
-		t.Errorf("trusted host, plain http: %v", err)
-	}
-	if get(own, "http://other.ns.svc:8080/x") == nil {
-		t.Error("unlisted host must stay https-only")
-	}
-	if get(own, "ftp://backend.ns.svc/x") == nil {
-		t.Error("only http, not other schemes")
-	}
-	if get(idp, "http://backend.ns.svc:8080/x") == nil {
-		t.Error("the OIDC IdP client gets no plaintext allowance")
-	}
-	if !cfg.IsTrustedIdPHost("backend.ns.SVC") || cfg.IsTrustedIdPHost("other") {
-		t.Error("IsTrustedIdPHost")
-	}
-}
-
 // A deployer injects the HSM's PKCS#11 module path (and slot, label, PIN file)
 // with environment variables, with no signing key in the config file: the
 // module itself, its libraries and its own config are mounted separately.

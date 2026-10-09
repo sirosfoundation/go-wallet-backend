@@ -66,8 +66,6 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 		c.AS.Issuer = "as-issuer"
 		c.AS.Audiences = []string{"wallet-backend", "rp.example", "any-rp-id"}
 		c.AS.ExternalURL = srv.URL + "/"
-		// The test AS is plain http on loopback.
-		c.HTTPClient = config.HTTPClientConfig{AllowHTTP: true, AllowPrivateIPs: true}
 		return c
 	}
 
@@ -106,27 +104,6 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 		res, err := v.Validate(context.Background(), hmBad(jwt.MapClaims{"iss": "legacy", "aud": "any-rp-id"}))
 		require.NoError(t, err, "aud (the RP ID) is in as.audiences")
 		assert.Equal(t, []string{"any-rp-id"}, res.Audience)
-	})
-
-	t.Run("plain-http external_url refused unless allow_http", func(t *testing.T) {
-		c := base(false)
-		c.HTTPClient = config.HTTPClientConfig{}
-		v, err := NewStandaloneEngineTokenValidator(c, zap.NewNop())
-		assert.ErrorContains(t, err, "plain http")
-		assert.Nil(t, v)
-		_, err = newRemoteJWKSRelay(c)
-		assert.Error(t, err)
-	})
-
-	t.Run("guarded client blocks a loopback JWKS host without allow_private_ips", func(t *testing.T) {
-		c := base(false)
-		c.HTTPClient = config.HTTPClientConfig{AllowHTTP: true} // plaintext ok, private IPs not
-		v, err := NewStandaloneEngineTokenValidator(c, zap.NewNop())
-		require.NoError(t, err)
-		defer func() { _ = v.Close() }()
-		time.Sleep(200 * time.Millisecond)
-		_, err = v.Validate(context.Background(), es)
-		assert.Error(t, err, "keys must not be fetched from a private address the guard forbids")
 	})
 
 	t.Run("invalid external_url", func(t *testing.T) {
@@ -196,4 +173,23 @@ func TestNewStandaloneEngineTokenValidator_WarnsNoRevocation(t *testing.T) {
 	warns := logs.FilterMessageSnippet("no token revocation source").All()
 	require.Len(t, warns, 1)
 	assert.Equal(t, zap.WarnLevel, warns[0].Level)
+}
+
+func TestASJWKSURL(t *testing.T) {
+	for in, want := range map[string]string{
+		"https://as.example.com":                "https://as.example.com/auth/.well-known/jwks.json",
+		"https://as.example.com/":               "https://as.example.com/auth/.well-known/jwks.json",
+		"http://backend.ns.svc:8080/":           "http://backend.ns.svc:8080/auth/.well-known/jwks.json",
+		"http://backend.ns.svc:8080/base/path/": "http://backend.ns.svc:8080/base/path/auth/.well-known/jwks.json",
+	} {
+		c := &config.Config{}
+		c.AS.ExternalURL = in
+		got, err := asJWKSURL(c)
+		require.NoError(t, err, in)
+		assert.Equal(t, want, got)
+	}
+	c := &config.Config{}
+	c.AS.ExternalURL = "ftp://x"
+	_, err := asJWKSURL(c)
+	assert.Error(t, err)
 }

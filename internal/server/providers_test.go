@@ -1211,15 +1211,15 @@ func walletProviderASConfig(t *testing.T, externalURL string, legacy bool) *conf
 }
 
 // AS enabled, no as.external_url, legacy HMAC on: starts with the HMAC-only
-// middleware (no validator, no relay).
+// middleware (no validator).
 func TestNewWalletProviderProvider_NoExternalURL_LegacyOn_HMACOnly(t *testing.T) {
 	p, err := NewWalletProviderProvider(walletProviderASConfig(t, "", true), zap.NewNop())
 	if err != nil {
 		t.Fatalf("NewWalletProviderProvider: %v", err)
 	}
 	defer func() { _ = p.Close() }()
-	if p.tokenValidator != nil || p.jwksRelay != nil {
-		t.Fatal("expected HMAC-only fallback: no token validator and no JWKS relay")
+	if p.tokenValidator != nil {
+		t.Fatal("expected HMAC-only fallback: no token validator")
 	}
 }
 
@@ -1235,15 +1235,15 @@ func TestNewWalletProviderProvider_NoExternalURL_LegacyOff_Fails(t *testing.T) {
 	}
 }
 
-// AS enabled with as.external_url: validator and relay are wired.
-func TestNewWalletProviderProvider_ExternalURL_WiresValidatorAndRelay(t *testing.T) {
+// AS enabled with as.external_url: the validator is wired.
+func TestNewWalletProviderProvider_ExternalURL_WiresValidator(t *testing.T) {
 	p, err := NewWalletProviderProvider(walletProviderASConfig(t, "https://as.example.com", true), zap.NewNop())
 	if err != nil {
 		t.Fatalf("NewWalletProviderProvider: %v", err)
 	}
 	defer func() { _ = p.Close() }()
-	if p.tokenValidator == nil || p.jwksRelay == nil {
-		t.Fatal("expected token validator and JWKS relay when as.external_url is set")
+	if p.tokenValidator == nil {
+		t.Fatal("expected token validator when as.external_url is set")
 	}
 }
 
