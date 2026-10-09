@@ -551,7 +551,7 @@ when `Role` is empty.
 | `Service.EvaluateIssuer` (engine OID4VCI, `internal/engine/oid4vci.go`) | `credential-issuer` | issuer identifier | `x5c` (chain, base64 DER strings) or `jwk` (flat list of JWKs); none = resolution-only | `credential_type` (comma-separated vct/doctype list) when set | the key/chain is trusted for this issuer to issue credentials |
 | `Service.EvaluateVerifier` / `EvaluateVerifierWithContext` (engine OID4VP) | `credential-verifier` | verifier `client_id` | `x5c` or `jwk` as above | `client_id_scheme`, `response_uri`, `redirect_uri`, `trust_chain` (OIDF), attestation fields when present | the key is trusted for this verifier to request credentials |
 | `Service.EvaluateFIDO2Attestation` (`internal/service/fido2_attestation.go`) | `wscd-previewsign-provision` (`trust.FIDO2AttestationAction`) | authenticator AAGUID | `x5c` (attestation chain) | none | the AAGUID/chain is an acceptable hardware key (global PDP, no per-flow override) |
-| `Service.EvaluateStatusListSigner` (engine OID4VP status check) | `status-list-signer` (`trust.StatusListSignerAction`), then, only if that call errors, `credential-issuer` (see below) | list `iss` claim, else origin of the list URI (`scheme://host[:port]`) | `x5c` (JWS `x5c` / COSE `x5chain`, base64 DER, leaf first) or `jwk` | none | see below |
+| `Service.EvaluateStatusListSigner` (verified status list API, `internal/service/status.go`; see ADR-013) | `status-list-signer` (`trust.StatusListSignerAction`), then, only if that call errors, `credential-issuer` (see below) | list `iss` claim, else origin of the list URI (`scheme://host[:port]`) | `x5c` (JWS `x5c` / COSE `x5chain`, base64 DER, leaf first) or `jwk` | none | see below |
 | `Service.ResolveDID` (engine OID4VP JAR signed by a DID) | none | the DID | no type/key (resolution-only) | none | the DID resolved; the DID document comes back in `trust_metadata` |
 | `POST /v1/evaluate` (authzen proxy) | forwarded unchanged from the caller (`getActionName` only logs it) | as supplied | as supplied | as supplied | as the PDP defines it |
 | `POST /v1/resolve` for `url` subjects (`resolveURLSubject`) | `credential-issuer`, with `action.parameters.credential_types` when supplied | issuer URL | `x5c`/`jwk`, or `resolution` when no key could be extracted | none | as `credential-issuer` above |
@@ -563,8 +563,9 @@ them today.
 
 ### `status-list-signer`
 
-Sent when the wallet has verified the signature of a Token Status List (JWT or
-CWT form) and must decide whether the signing key may publish status lists:
+Sent when the backend has verified the signature of a Token Status List (JWT or
+CWT form) while serving the verified status list API (`POST /status/v1/lists`,
+ADR-013; the engine does not check status) and must decide whether the signing key may publish status lists:
 
 ```
 POST /evaluation            X-Tenant-ID: <tenant>
@@ -598,7 +599,7 @@ POST /evaluation            X-Tenant-ID: <tenant>
     `signer_trust_action=status-list-signer`);
   - no PDP configured (Framework `none`): untrusted, no second call;
   - **error** (transport or evaluation failure): if
-    `presentation.status_list_signer_fallback` is true (the default), a second
+    `status_check.status_list_signer_fallback` is true (the default), a second
     request is sent as `credential-issuer` (`EvaluateIssuer`) with the same subject,
     key material, endpoint and tenant, and the signer is trusted if that is
     positive; a negative there is a negative, an error there leaves the first error.
@@ -615,9 +616,8 @@ POST /evaluation            X-Tenant-ID: <tenant>
   status-list PDP setting.
 - **Backend fail-closed semantics**: no PDP configured, a transport or evaluation
   error, or a negative decision all leave the list *unverifiable*; an unverifiable
-  list never produces a revoked verdict. What that means for the presentation
-  follows the `presentation.status_check` mode table (warn and enforce-revoked
-  proceed with a warning, strict refuses).
+  list is reported `undetermined` (reasons `signer_untrusted`, `trust_unavailable`,
+  `no_signer_key`) and never as verified.
 
 #### Default-policy fallback hazard
 
@@ -652,9 +652,9 @@ policies:
 Compatibility: a go-trust version or deployment without this policy applies its
 default policy to the action (there is no error), with the consequences above.
 The `credential-issuer` fallback does not help there, since it happens only on
-errors. Roll the policy out to go-trust before enabling
-`presentation.status_check: enforce-revoked` or `strict`; with the default `warn`
-mode a wrong trust decision can only affect log output.
+errors. Roll the policy out to go-trust before enabling the status API
+(`status_check.enabled`, on by default): a missing policy can DENY every list
+signer, in which case every list is `undetermined`/`signer_untrusted`.
 
 ## Related
 
