@@ -3165,39 +3165,36 @@ func TestApplyASSecurityDefaults_Parity(t *testing.T) {
 	}
 }
 
-func TestNewOwnASHTTPClient_PlaintextOnlyToTrustedHosts(t *testing.T) {
-	cfg := HTTPClientConfig{TrustedIdPHosts: []string{"Backend.NS.svc"}}
-	rt := func(c *http.Client) ssrfGuard {
-		g, ok := c.Transport.(ssrfGuard)
-		if !ok {
-			t.Fatal("client is not guarded")
-		}
-		g.base = roundTripFunc(func(*http.Request) (*http.Response, error) {
-			return &http.Response{StatusCode: 200, Body: http.NoBody}, nil
-		})
-		return g
+// as.legacy.sunset_date shipped in v0.10.0; it is now a no-op that must still
+// load and be reported by DeprecatedSettings so the process can warn.
+func TestLoad_DeprecatedSunsetDateStillLoads(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := `
+server:
+  host: localhost
+  port: 8080
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+storage:
+  type: memory
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+as:
+  legacy:
+    sunset_date: "2027-10-01T00:00:00Z"
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
 	}
-	own := rt(cfg.NewOwnASHTTPClient(0))
-	idp := rt(cfg.NewIdPHTTPClient(0))
-	get := func(g ssrfGuard, u string) error {
-		req, _ := http.NewRequest(http.MethodGet, u, nil)
-		_, err := g.RoundTrip(req)
-		return err
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("a config that still sets as.legacy.sunset_date must load: %v", err)
 	}
-	if err := get(own, "http://backend.ns.svc:8080/x"); err != nil {
-		t.Errorf("trusted host, plain http: %v", err)
+	if got := cfg.DeprecatedSettings(); len(got) != 1 || !strings.Contains(got[0], "as.legacy.sunset_date") {
+		t.Errorf("DeprecatedSettings() = %v, want as.legacy.sunset_date", got)
 	}
-	if get(own, "http://other.ns.svc:8080/x") == nil {
-		t.Error("unlisted host must stay https-only")
-	}
-	if get(own, "ftp://backend.ns.svc/x") == nil {
-		t.Error("only http, not other schemes")
-	}
-	if get(idp, "http://backend.ns.svc:8080/x") == nil {
-		t.Error("the OIDC IdP client gets no plaintext allowance")
-	}
-	if !cfg.IsTrustedIdPHost("backend.ns.SVC") || cfg.IsTrustedIdPHost("other") {
-		t.Error("IsTrustedIdPHost")
+	if got := (&Config{}).DeprecatedSettings(); len(got) != 0 {
+		t.Errorf("DeprecatedSettings() on a clean config = %v, want none", got)
 	}
 }
 

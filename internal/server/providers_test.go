@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -985,15 +986,15 @@ func TestNewWalletProviderProvider_ASDisabledLocally_ExternalURL_WiresValidator(
 	}
 }
 
-// AS enabled with as.external_url: validator and relay are wired.
-func TestNewWalletProviderProvider_ExternalURL_WiresValidatorAndRelay(t *testing.T) {
+// AS enabled with as.external_url: the validator is wired.
+func TestNewWalletProviderProvider_ExternalURL_WiresValidator(t *testing.T) {
 	p, err := NewWalletProviderProvider(walletProviderASConfig(t, "https://as.example.com"), zap.NewNop())
 	if err != nil {
 		t.Fatalf("NewWalletProviderProvider: %v", err)
 	}
 	defer func() { _ = p.Close() }()
-	if p.tokenValidator == nil || p.jwksRelay == nil {
-		t.Fatal("expected token validator and JWKS relay when as.external_url is set")
+	if p.tokenValidator == nil {
+		t.Fatal("expected token validator when as.external_url is set")
 	}
 }
 
@@ -1192,6 +1193,18 @@ func TestWIARateLimiter_TripsAfterMaxAttempts(t *testing.T) {
 func TestBackendProvider_Logout_BlacklistSharedAcrossAuthAndStorage(t *testing.T) {
 	logger := zap.NewNop()
 	asKeyPath, _ := writeTestECKeyAndCert(t, t.TempDir(), "as")
+	// The validator fetches the AS JWKS from as.external_url itself, so serve
+	// this process's own router (which carries /auth/.well-known/jwks.json)
+	// on a real listener and point external_url at it.
+	var routerRef atomic.Pointer[gin.Engine]
+	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if rt := routerRef.Load(); rt != nil {
+			rt.ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(jwksSrv.Close)
 	cfg := &config.Config{
 		Server: config.ServerConfig{RPID: "localhost", RPOrigin: "http://localhost:8080"},
 		JWT:    config.JWTConfig{Secret: "test-secret-for-e2e-blacklist-0123456789", Issuer: "test"},
@@ -1201,7 +1214,7 @@ func TestBackendProvider_Logout_BlacklistSharedAcrossAuthAndStorage(t *testing.T
 		AS: config.ASConfig{
 			Enabled:        true,
 			SigningKeyPath: asKeyPath,
-			ExternalURL:    "https://as.example.com",
+			ExternalURL:    jwksSrv.URL,
 			Audiences:      []string{"wallet-backend"},
 			DefaultMaxTAC:  "rwlid",
 		},
@@ -1221,9 +1234,10 @@ func TestBackendProvider_Logout_BlacklistSharedAcrossAuthAndStorage(t *testing.T
 
 	router := gin.New()
 	provider.RegisterRoutes(router)
+	routerRef.Store(router)
 
 	// A real AS-issued session access token, validated through the real
-	// go-tokenauth validator (in-process JWKS relay).
+	// go-tokenauth validator (JWKS fetched over HTTP from jwksSrv).
 	tokenStr, err := provider.ASModule().TokenIssuer.Issue("user-e2e", "wallet-backend", "default", "rwlid", "urn:siros:acr:passkey")
 	if err != nil {
 		t.Fatalf("issuing an AS token: %v", err)
