@@ -12,32 +12,22 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"math/big"
 	"strings"
 
 	"github.com/fxamacker/cbor/v2"
+	"github.com/veraison/go-cose"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
 // COSE / CWT constants for the CWT form of a Status List Token
-// (draft-ietf-oauth-status-list, CWT section; RFC 9052, RFC 8392).
+// (draft-ietf-oauth-status-list, CWT section; RFC 9052, RFC 8392). The COSE
+// structure, header labels and signature verification come from
+// github.com/veraison/go-cose; only the status-list policy is kept here.
 const (
-	coseTagSign1 = 18
-
-	coseHdrAlg     = 1
-	coseHdrCrit    = 2  // RFC 9052 section 3.1
-	coseHdrTyp     = 16 // "type" header parameter
-	coseHdrX5Chain = 33 // RFC 9360
-	coseHdrX5T     = 34 // RFC 9360, COSE_CertHash
-
 	coseHashSHA256 = -16
 	coseHashSHA384 = -43
 	coseHashSHA512 = -44
-
-	coseAlgES256 = -7
-	coseAlgES384 = -35
-	coseAlgES512 = -36
 
 	cwtClaimIss = 1
 	cwtClaimSub = 2
@@ -64,30 +54,31 @@ var errCWT = errors.New("status list CWT")
 // parseCWT verifies a CWT-form Status List Token and applies the same claim
 // checks and trust decision as the JWT form.
 func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsedList, error) {
-	sign1, err := decodeSign1(body)
-	if err != nil {
+	// UnmarshalCBOR requires exactly one tag 18 (draft-ietf-oauth-status-list
+	// section 5.2 forbids the CWT tag 61 and untagged arrays), rejects
+	// indefinite lengths and duplicate header labels, and requires crit to be
+	// protected, non-empty and to name only protected labels.
+	var msg cose.Sign1Message
+	if err := msg.UnmarshalCBOR(body); err != nil {
 		return parsedList{}, fmt.Errorf("%w: %v", errCWT, err)
 	}
-	prot, protText, err := decodeHeaderMap(sign1.protected)
-	if err != nil {
-		return parsedList{}, fmt.Errorf("%w protected header: %v", errCWT, err)
-	}
-	if err := checkHeaders(prot, sign1.unprotected, protText, sign1.unprotectedText); err != nil {
+	prot, unprot := map[any]any(msg.Headers.Protected), map[any]any(msg.Headers.Unprotected)
+	if err := checkHeaders(prot, unprot); err != nil {
 		return parsedList{}, fmt.Errorf("%w header: %v", errCWT, err)
 	}
 
 	// typ must be integrity-protected: the unprotected header is not covered
 	// by the signature, so it is not consulted for it.
-	typ, _ := prot[coseHdrTyp].(string)
+	typ, _ := prot[cose.HeaderLabelType].(string)
 	if strings.TrimPrefix(strings.ToLower(typ), "application/") != cwtTypValue {
 		return parsedList{}, fmt.Errorf("%w typ is %q, want %q", errCWT, typ, cwtTypValue)
 	}
-	alg, ok := toInt64(prot[coseHdrAlg])
-	if !ok {
-		return parsedList{}, fmt.Errorf("%w has no alg in its protected header", errCWT)
+	alg, err := msg.Headers.Protected.Algorithm()
+	if err != nil {
+		return parsedList{}, fmt.Errorf("%w has no usable alg in its protected header: %v", errCWT, err)
 	}
 
-	chain, err := signerChain(prot, sign1.unprotected)
+	chain, err := signerChain(prot, unprot)
 	if err != nil {
 		return parsedList{}, fmt.Errorf("%w x5chain: %v", errCWT, err)
 	}
@@ -98,7 +89,7 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 	if err != nil {
 		return parsedList{}, fmt.Errorf("%w x5chain leaf: %v", errCWT, err)
 	}
-	if err := verifyCOSE(alg, leaf.PublicKey, sign1); err != nil {
+	if err := verifyCOSE(alg, leaf.PublicKey, &msg); err != nil {
 		return parsedList{}, classify(ReasonSignatureInvalid, fmt.Errorf("%w signature: %v", errCWT, err))
 	}
 	km := &trust.KeyMaterial{Type: "x5c"}
@@ -106,7 +97,7 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 		km.X5C = append(km.X5C, base64.StdEncoding.EncodeToString(der))
 	}
 
-	claims, err := decodeClaims(sign1.payload)
+	claims, err := decodeClaims(msg.Payload)
 	if err != nil {
 		return parsedList{}, fmt.Errorf("%w payload: %v", errCWT, err)
 	}
@@ -181,35 +172,26 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 
 // understoodHeaders are the header labels this verifier processes; a label
 // listed in crit must be one of them (RFC 9052 section 3.1).
-var understoodHeaders = map[int64]bool{coseHdrAlg: true, coseHdrTyp: true, coseHdrX5Chain: true, coseHdrX5T: true}
+var understoodHeaders = map[int64]bool{
+	cose.HeaderLabelAlgorithm: true, cose.HeaderLabelType: true,
+	cose.HeaderLabelX5Chain: true, cose.HeaderLabelX5T: true,
+}
 
-// checkHeaders enforces the COSE header rules that the signature does not:
-// a label appears in at most one bucket (RFC 9052 section 3), crit is
-// integrity-protected and non-empty, and every critical label is present in
-// the protected header and understood. Integer and text labels are both
-// checked for cross-bucket duplicates; unknown non-critical text labels are
-// otherwise ignored.
-func checkHeaders(prot, unprot map[int64]any, protText, unprotText map[string]bool) error {
-	for k := range unprotText {
-		if protText[k] {
-			return fmt.Errorf("label %q is in both the protected and unprotected header", k)
-		}
-	}
+// checkHeaders enforces the COSE header rules that go-cose leaves to the
+// caller: a label appears in at most one bucket (RFC 9052 section 3), and
+// every critical label is understood (which excludes crit itself) and listed
+// once (RFC 9052 section 3.1). go-cose has already checked that crit is only in
+// the protected header, non-empty, and that each critical label is present
+// in the protected header.
+func checkHeaders(prot, unprot map[any]any) error {
 	for k := range unprot {
 		if _, dup := prot[k]; dup {
-			return fmt.Errorf("label %d is in both the protected and unprotected header", k)
+			return fmt.Errorf("label %v is in both the protected and unprotected header", k)
 		}
 	}
-	if _, ok := unprot[coseHdrCrit]; ok {
-		return errors.New("crit must be in the protected header")
-	}
-	raw, ok := prot[coseHdrCrit]
-	if !ok {
-		return nil
-	}
-	crit, ok := raw.([]any)
-	if !ok || len(crit) == 0 {
-		return errors.New("crit must be a non-empty array")
+	crit, err := cose.ProtectedHeader(prot).Critical()
+	if err != nil {
+		return err
 	}
 	seen := make(map[int64]bool, len(crit))
 	for _, e := range crit {
@@ -217,20 +199,12 @@ func checkHeaders(prot, unprot map[int64]any, protText, unprotText map[string]bo
 		if !ok {
 			return fmt.Errorf("critical header %v is not understood", e)
 		}
-		// RFC 9052 section 3.1: crit must not list itself, and each
-		// critical label occurs once.
-		if label == coseHdrCrit {
-			return errors.New("crit must not list itself")
-		}
 		if seen[label] {
 			return fmt.Errorf("critical header %d is listed more than once", label)
 		}
 		seen[label] = true
 		if !understoodHeaders[label] {
 			return fmt.Errorf("critical header %d is not understood", label)
-		}
-		if _, present := prot[label]; !present {
-			return fmt.Errorf("critical header %d is not in the protected header", label)
 		}
 	}
 	return nil
@@ -248,10 +222,28 @@ var claimsDecMode = func() cbor.DecMode {
 // decodeClaims reads a CWT claims set. Claim keys may be integers or text
 // strings and the status-list profile permits additional claims, so the
 // map is decoded with mixed keys: the integer-labelled claims are returned
-// and text-labelled ones (extensions) are ignored. A repeated key is an
-// error.
-func decodeClaims(payload []byte) (map[int64]any, error) {
-	return decodeHeaderBucket(payload)
+// and text-labelled ones (extensions) are ignored. A repeated key, a label
+// that is neither an integer nor a text string, or a null/undefined map is
+// an error.
+func decodeClaims(b []byte) (map[int64]any, error) {
+	var raw map[any]any
+	if err := claimsDecMode.Unmarshal(b, &raw); err != nil {
+		return nil, err
+	}
+	// CBOR null and undefined decode into a nil map without an error; a map
+	// is required here (an empty map is fine).
+	if raw == nil {
+		return nil, errors.New("not a CBOR map (null or undefined)")
+	}
+	ints := make(map[int64]any, len(raw))
+	for k, v := range raw {
+		if label, ok := toInt64(k); ok {
+			ints[label] = v
+		} else if _, ok := k.(string); !ok {
+			return nil, fmt.Errorf("label of type %T is neither an integer nor a text string", k)
+		}
+	}
+	return ints, nil
 }
 
 // cwtString reads an optional text claim; a present claim of another type, or
@@ -286,103 +278,6 @@ func cwtInt(claims map[int64]any, label int64, name string) (*int64, error) {
 	return &n, nil
 }
 
-type sign1 struct {
-	protected, payload, signature []byte
-	unprotected                   map[int64]any
-	unprotectedText               map[string]bool
-}
-
-// decodeSign1 reads a COSE_Sign1. draft-ietf-oauth-status-list-21 section 5.2
-// requires the tagged COSE_Sign1 (18) and forbids the CWT tag (61), so exactly
-// one tag 18 is accepted: untagged arrays, tag 61 (alone or nested with 18),
-// repeated tags and COSE_Mac0 (17, which needs a shared key and cannot be
-// verified against a public signer key) are all rejected.
-func decodeSign1(data []byte) (*sign1, error) {
-	var tag cbor.RawTag
-	if len(data) == 0 || data[0]>>5 != 6 {
-		return nil, errors.New("COSE_Sign1 must be tagged with CBOR tag 18")
-	}
-	if err := cbor.Unmarshal(data, &tag); err != nil {
-		return nil, err
-	}
-	if tag.Number != coseTagSign1 {
-		return nil, fmt.Errorf("unexpected CBOR tag %d, want COSE_Sign1 (18)", tag.Number)
-	}
-	data = tag.Content
-	if len(data) > 0 && data[0]>>5 == 6 {
-		return nil, errors.New("nested CBOR tag inside COSE_Sign1 tag")
-	}
-	var arr []cbor.RawMessage
-	if err := cbor.Unmarshal(data, &arr); err != nil || len(arr) != 4 {
-		return nil, errors.New("not a COSE_Sign1 array")
-	}
-	out := &sign1{}
-	if err := cbor.Unmarshal(arr[0], &out.protected); err != nil {
-		return nil, fmt.Errorf("protected header: %w", err)
-	}
-	var err error
-	if out.unprotected, out.unprotectedText, err = decodeHeaderLabels(arr[1]); err != nil {
-		return nil, fmt.Errorf("unprotected header: %w", err)
-	}
-	if err := cbor.Unmarshal(arr[2], &out.payload); err != nil || out.payload == nil {
-		return nil, errors.New("missing payload")
-	}
-	if err := cbor.Unmarshal(arr[3], &out.signature); err != nil {
-		return nil, fmt.Errorf("signature: %w", err)
-	}
-	return out, nil
-}
-
-// decodeHeaderMap decodes the serialized protected header (empty means an
-// empty map).
-func decodeHeaderMap(b []byte) (map[int64]any, map[string]bool, error) {
-	if len(b) == 0 {
-		return map[int64]any{}, map[string]bool{}, nil
-	}
-	return decodeHeaderLabels(b)
-}
-
-// decodeHeaderBucket decodes a COSE map for claim decoding: integer labels
-// are returned and text-labelled extension parameters are ignored. A
-// repeated label is an error.
-func decodeHeaderBucket(b []byte) (map[int64]any, error) {
-	ints, _, err := decodeHeaderLabels(b)
-	return ints, err
-}
-
-// decodeHeaderLabels decodes a COSE header map with mixed keys. Integer
-// labels are returned with their values; text labels are returned only as a
-// set so that cross-bucket duplicates can be rejected (RFC 9052 section 3).
-// A repeated label within the map, or a label that is neither an integer
-// nor a text string, is an error.
-func decodeHeaderLabels(b []byte) (map[int64]any, map[string]bool, error) {
-	var raw map[any]any
-	if err := claimsDecMode.Unmarshal(b, &raw); err != nil {
-		return nil, nil, err
-	}
-	// CBOR null and undefined decode into a nil map without an error; a map
-	// is required here (an empty map is fine), so they are malformed rather
-	// than an empty header or claims set.
-	if raw == nil {
-		return nil, nil, errors.New("not a CBOR map (null or undefined)")
-	}
-	ints := make(map[int64]any, len(raw))
-	texts := make(map[string]bool)
-	for k, v := range raw {
-		if label, ok := toInt64(k); ok {
-			ints[label] = v
-		} else if t, ok := k.(string); ok {
-			texts[t] = true
-		} else {
-			// COSE labels are integers or text strings (RFC 9052 section
-			// 1.4); any other key type makes the map malformed rather than
-			// being skipped.
-			return nil, nil, fmt.Errorf("label of type %T is neither an integer nor a text string", k)
-		}
-	}
-	return ints, texts, nil
-}
-
 // signerChain returns the x5chain that carries the signer certificate.
 // RFC 9360 section 2: "The end-entity certificate MUST be integrity
 // protected by COSE. This can, for example, be done by sending the header
@@ -393,8 +288,8 @@ func decodeHeaderLabels(b []byte) (map[int64]any, map[string]bool, error) {
 // when the protected header holds an x5t that matches its end-entity
 // certificate. Otherwise the chain could be swapped without invalidating the
 // signature, changing the trust decision.
-func signerChain(prot, unprot map[int64]any) ([][]byte, error) {
-	if v, ok := prot[coseHdrX5Chain]; ok {
+func signerChain(prot, unprot map[any]any) ([][]byte, error) {
+	if v, ok := prot[cose.HeaderLabelX5Chain]; ok {
 		chain, err := x5chain(v)
 		if err != nil || len(chain) == 0 {
 			return chain, err
@@ -402,14 +297,14 @@ func signerChain(prot, unprot map[int64]any) ([][]byte, error) {
 		// A protected x5t is validated whenever it is present, so a token
 		// cannot carry a (possibly critical) mismatching certificate hash
 		// and still yield a verdict.
-		if _, has := prot[coseHdrX5T]; has {
-			if err := checkX5T(prot[coseHdrX5T], chain[0]); err != nil {
+		if _, has := prot[cose.HeaderLabelX5T]; has {
+			if err := checkX5T(prot[cose.HeaderLabelX5T], chain[0]); err != nil {
 				return nil, fmt.Errorf("protected x5t: %v", err)
 			}
 		}
 		return chain, nil
 	}
-	v, ok := unprot[coseHdrX5Chain]
+	v, ok := unprot[cose.HeaderLabelX5Chain]
 	if !ok {
 		return nil, nil
 	}
@@ -417,7 +312,7 @@ func signerChain(prot, unprot map[int64]any) ([][]byte, error) {
 	if err != nil || len(chain) == 0 {
 		return chain, err
 	}
-	if err := checkX5T(prot[coseHdrX5T], chain[0]); err != nil {
+	if err := checkX5T(prot[cose.HeaderLabelX5T], chain[0]); err != nil {
 		return nil, fmt.Errorf("unprotected x5chain is not integrity protected (RFC 9360 section 2): %v", err)
 	}
 	return chain, nil
@@ -481,17 +376,20 @@ func x5chain(v any) ([][]byte, error) {
 	return nil, fmt.Errorf("unexpected type %T", v)
 }
 
-// verifyCOSE checks an ECDSA COSE_Sign1 signature (RFC 9052 section 4.4).
-func verifyCOSE(alg int64, pub crypto.PublicKey, s *sign1) error {
+// verifyCOSE verifies the COSE_Sign1 signature through go-cose. Only the
+// ECDSA algorithms are accepted (the allowlist keeps go-cose from also being
+// pointed at RSA or EdDSA keys), and the key's curve must be the one the
+// algorithm names: go-cose derives only the hash from the algorithm, so an
+// ES256 label over a P-384 key would otherwise verify.
+func verifyCOSE(alg cose.Algorithm, pub crypto.PublicKey, msg *cose.Sign1Message) error {
 	var curve elliptic.Curve
-	var h crypto.Hash
 	switch alg {
-	case coseAlgES256:
-		curve, h = elliptic.P256(), crypto.SHA256
-	case coseAlgES384:
-		curve, h = elliptic.P384(), crypto.SHA384
-	case coseAlgES512:
-		curve, h = elliptic.P521(), crypto.SHA512
+	case cose.AlgorithmES256:
+		curve = elliptic.P256()
+	case cose.AlgorithmES384:
+		curve = elliptic.P384()
+	case cose.AlgorithmES512:
+		curve = elliptic.P521()
 	default:
 		return fmt.Errorf("unsupported COSE alg %d", alg)
 	}
@@ -499,22 +397,11 @@ func verifyCOSE(alg int64, pub crypto.PublicKey, s *sign1) error {
 	if !ok || key.Curve != curve {
 		return fmt.Errorf("key does not match alg %d", alg)
 	}
-	size := (curve.Params().BitSize + 7) / 8
-	if len(s.signature) != 2*size {
-		return errors.New("bad signature length")
-	}
-	tbs, err := cbor.Marshal([]any{"Signature1", s.protected, []byte{}, s.payload})
+	verifier, err := cose.NewVerifier(alg, key)
 	if err != nil {
 		return err
 	}
-	hh := h.New()
-	hh.Write(tbs)
-	r := new(big.Int).SetBytes(s.signature[:size])
-	sv := new(big.Int).SetBytes(s.signature[size:])
-	if !ecdsa.Verify(key, hh.Sum(nil), r, sv) {
-		return errors.New("signature does not verify")
-	}
-	return nil
+	return msg.Verify(nil, verifier)
 }
 
 // anyMap normalises the map shapes fxamacker/cbor produces for a CBOR map with

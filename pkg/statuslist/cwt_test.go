@@ -22,8 +22,23 @@ import (
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
+	"github.com/veraison/go-cose"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
+)
+
+// Test-local aliases for the COSE labels and algorithms the fixtures use.
+const (
+	coseTagSign1   = cose.CBORTagSign1Message
+	coseHdrAlg     = cose.HeaderLabelAlgorithm
+	coseHdrCrit    = cose.HeaderLabelCritical
+	coseHdrTyp     = cose.HeaderLabelType
+	coseHdrX5Chain = cose.HeaderLabelX5Chain
+	coseHdrX5T     = cose.HeaderLabelX5T
+
+	coseAlgES256 = int64(cose.AlgorithmES256)
+	coseAlgES384 = int64(cose.AlgorithmES384)
+	coseAlgES512 = int64(cose.AlgorithmES512)
 )
 
 type cwtOpts struct {
@@ -274,7 +289,6 @@ func TestCWT_VerifyAndVerdicts(t *testing.T) {
 		"x5chain prot + crit matching x5t": {x5t: "match", critX5T: true},
 		"ES384":                            {key: p384},
 		"ES512":                            {key: p521},
-		"typ short form":                   {typ: "statuslist+cwt"},
 		"exp":                              {exp: future},
 		"legacy vc#703":                    {legacy: true},
 		"1 bit":                            {bits: 1},
@@ -315,6 +329,10 @@ func TestCWT_Rejections(t *testing.T) {
 		{"bad bits", cwtOpts{bits: 3}, nil, "bits", nil},
 		{"unknown alg", cwtOpts{alg: -8}, nil, "unsupported COSE alg", nil},
 		{"alg/key mismatch", cwtOpts{alg: coseAlgES384}, nil, "does not match alg", nil},
+		// go-cose requires a typ text value to be of the form type/subtype,
+		// so the bare "statuslist+cwt" the hand-rolled decoder accepted is now
+		// rejected at decode time (the draft mandates the full media type).
+		{"typ short form", cwtOpts{typ: "statuslist+cwt"}, nil, "type/subtype", nil},
 		{"wrong typ", cwtOpts{typ: "application/cwt"}, nil, "typ", nil},
 		{"missing typ", cwtOpts{noTyp: true}, nil, "typ", nil},
 		{"typ only in unprotected header", cwtOpts{typUnprot: true}, nil, "typ", nil},
@@ -330,19 +348,19 @@ func TestCWT_Rejections(t *testing.T) {
 		{"empty lst", cwtOpts{rawLst: []byte{}}, nil, "lst", nil},
 		{"garbage lst", cwtOpts{rawLst: []byte("not zlib")}, nil, "lst", nil},
 		{"not cose", cwtOpts{}, func([]byte) []byte { return []byte{0x01} }, "COSE_Sign1", nil},
-		{"untagged", cwtOpts{wrap: func(a []any) any { return a }}, nil, "tag 18", nil},
-		{"tag 61 alone", cwtOpts{wrap: func(a []any) any { return cbor.Tag{Number: 61, Content: a} }}, nil, "tag 61", nil},
+		{"untagged", cwtOpts{wrap: func(a []any) any { return a }}, nil, "COSE_Sign1_Tagged", nil},
+		{"tag 61 alone", cwtOpts{wrap: func(a []any) any { return cbor.Tag{Number: 61, Content: a} }}, nil, "COSE_Sign1_Tagged", nil},
 		{"61 wrapping 18", cwtOpts{wrap: func(a []any) any {
 			return cbor.Tag{Number: 61, Content: cbor.Tag{Number: 18, Content: a}}
-		}}, nil, "tag 61", nil},
+		}}, nil, "COSE_Sign1_Tagged", nil},
 		{"18 wrapping 61", cwtOpts{wrap: func(a []any) any {
 			return cbor.Tag{Number: 18, Content: cbor.Tag{Number: 61, Content: a}}
-		}}, nil, "nested", nil},
+		}}, nil, "COSE_Sign1_Tagged", nil},
 		{"double tag 18", cwtOpts{wrap: func(a []any) any {
 			return cbor.Tag{Number: 18, Content: cbor.Tag{Number: 18, Content: a}}
-		}}, nil, "nested", nil},
-		{"COSE_Mac0 tag 17", cwtOpts{wrap: func(a []any) any { return cbor.Tag{Number: 17, Content: a} }}, nil, "tag 17", nil},
-		{"wrong tag", cwtOpts{}, func([]byte) []byte { return []byte{0xc1, 0x80} }, "tag", nil},
+		}}, nil, "COSE_Sign1_Tagged", nil},
+		{"COSE_Mac0 tag 17", cwtOpts{wrap: func(a []any) any { return cbor.Tag{Number: 17, Content: a} }}, nil, "COSE_Sign1_Tagged", nil},
+		{"wrong tag", cwtOpts{}, func([]byte) []byte { return []byte{0xc1, 0x80} }, "COSE_Sign1_Tagged", nil},
 		{"truncated", cwtOpts{}, func(b []byte) []byte { return b[:len(b)/2] }, "CWT", nil},
 	}
 	for _, tc := range tests {
@@ -663,19 +681,7 @@ func TestCWTHelpers(t *testing.T) {
 	if b, err := x5chain([]byte{1}); err != nil || len(b) != 1 {
 		t.Error("single-cert x5chain")
 	}
-	if m, _, err := decodeHeaderMap(nil); err != nil || len(m) != 0 {
-		t.Error("empty protected header")
-	}
-	if m, _, err := decodeHeaderMap([]byte{}); err != nil || m == nil || len(m) != 0 {
-		t.Error("empty protected bstr must be an empty map")
-	}
-	if m, _, err := decodeHeaderMap([]byte{0xa0}); err != nil || len(m) != 0 {
-		t.Error("empty-map protected header must be accepted")
-	}
 	for _, b := range [][]byte{{0xf6}, {0xf7}} {
-		if _, _, err := decodeHeaderMap(b); err == nil {
-			t.Errorf("protected header %x accepted", b)
-		}
 		if _, err := decodeClaims(b); err == nil {
 			t.Errorf("claims payload %x accepted", b)
 		}
@@ -993,20 +999,20 @@ func TestParseCWT_NonIntegerNonTextLabelsMalformed(t *testing.T) {
 	}
 }
 
-func TestDecodeHeaderLabels_KeyTypes(t *testing.T) {
-	// Valid integer and text labels are kept; a repeated label is refused.
-	ints, texts, err := decodeHeaderLabels(marshalMapWith(t, map[int64]any{1: -7, 4: "k"}, nil))
-	if err != nil || len(ints) != 2 || len(texts) != 0 {
-		t.Fatalf("int labels: %v %v %v", ints, texts, err)
+func TestDecodeClaims_KeyTypes(t *testing.T) {
+	// Valid integer and text keys are kept; a repeated key is refused.
+	ints, err := decodeClaims(marshalMapWith(t, map[int64]any{1: -7, 4: "k"}, nil))
+	if err != nil || len(ints) != 2 {
+		t.Fatalf("int labels: %v %v", ints, err)
 	}
-	ints, texts, err = decodeHeaderLabels([]byte{0xa2, 0x01, 0x01, 0x63, 'e', 'x', 't', 0x02})
-	if err != nil || len(ints) != 1 || !texts["ext"] {
-		t.Fatalf("mixed labels: %v %v %v", ints, texts, err)
+	ints, err = decodeClaims([]byte{0xa2, 0x01, 0x01, 0x63, 'e', 'x', 't', 0x02})
+	if err != nil || len(ints) != 1 {
+		t.Fatalf("mixed labels: %v %v", ints, err)
 	}
-	if _, _, err = decodeHeaderLabels([]byte{0xa2, 0x01, 0x01, 0x01, 0x02}); err == nil {
+	if _, err = decodeClaims([]byte{0xa2, 0x01, 0x01, 0x01, 0x02}); err == nil {
 		t.Fatal("repeated integer label accepted")
 	}
-	if _, _, err = decodeHeaderLabels([]byte{0xa2, 0x63, 'e', 'x', 't', 0x01, 0x63, 'e', 'x', 't', 0x02}); err == nil {
+	if _, err = decodeClaims([]byte{0xa2, 0x63, 'e', 'x', 't', 0x01, 0x63, 'e', 'x', 't', 0x02}); err == nil {
 		t.Fatal("repeated text label accepted")
 	}
 	for name, m := range map[string][]byte{
@@ -1017,7 +1023,7 @@ func TestDecodeHeaderLabels_KeyTypes(t *testing.T) {
 		"map":         {0xa1, 0xa1, 0x01, 0x01, 0x00},
 		"mixed":       {0xa2, 0x01, 0x01, 0xf5, 0x00},
 	} {
-		if _, _, err := decodeHeaderLabels(m); err == nil {
+		if _, err := decodeClaims(m); err == nil {
 			t.Errorf("%s label accepted", name)
 		}
 	}
