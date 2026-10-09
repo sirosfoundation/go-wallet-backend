@@ -1,17 +1,14 @@
 package as
 
 import (
-	"bytes"
 	"crypto"
 	"crypto/ecdsa"
 	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
-	"encoding/asn1"
 	"errors"
 	"io"
-	"math/big"
 	"os"
 	"path/filepath"
 	"testing"
@@ -82,20 +79,12 @@ func TestKeyManagerFromSigner_HSMWrapped(t *testing.T) {
 			ref, err := newSigningKey(tc.s)
 			require.NoError(t, err)
 			assert.Equal(t, ref.Kid, sk.Kid)
-			assert.IsType(t, &opaqueSigner{}, sk.joseKey())
 			issueAndVerify(t, km)
 			require.Len(t, km.JWKS().Keys, 1)
 			assert.NoError(t, km.Close())
 			assert.True(t, h.closed)
 		})
 	}
-}
-
-func TestSigningKey_JoseKeyNativePassThrough(t *testing.T) {
-	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	sk, err := newSigningKey(k)
-	require.NoError(t, err)
-	assert.Same(t, k, sk.joseKey())
 }
 
 func TestNewSigningKey_Rejects(t *testing.T) {
@@ -131,7 +120,7 @@ func (fakeShortEd) Sign(io.Reader, []byte, crypto.SignerOpts) ([]byte, error) {
 	return nil, errors.New("x")
 }
 
-func TestOpaqueSigner_FailClosed(t *testing.T) {
+func TestIssue_SignerFailures(t *testing.T) {
 	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	km, h := newFakeKM(t, k)
 	ti := NewTokenIssuer(km, "iss", func(string) time.Duration { return time.Minute })
@@ -140,88 +129,50 @@ func TestOpaqueSigner_FailClosed(t *testing.T) {
 	_, err := ti.Issue("s", "a", "t", "r", "")
 	assert.Error(t, err)
 
+	// Signer output that is not ASN.1 DER is rejected by go-jose's adapter.
 	h.err = nil
-	h.mutate = func(sig []byte) []byte { // valid DER, wrong signature
-		other, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-		bad, _ := other.Sign(rand.Reader, make([]byte, 32), crypto.SHA256)
-		return bad
-	}
-	_, err = ti.Issue("s", "a", "t", "r", "")
-	assert.ErrorContains(t, err, "invalid signature")
-
 	h.mutate = func([]byte) []byte { return []byte{1, 2, 3} }
 	_, err = ti.Issue("s", "a", "t", "r", "")
-	assert.ErrorContains(t, err, "malformed")
-
-	o := &opaqueSigner{signer: h, alg: jose.ES256}
-	_, err = o.SignPayload([]byte("x"), jose.ES384)
 	assert.Error(t, err)
-	assert.Equal(t, []jose.SignatureAlgorithm{jose.ES256}, o.Algs())
 }
 
-func TestEcdsaSigToRaw(t *testing.T) {
-	type rs struct{ R, S *big.Int }
-	mk := func(rb, sb int, rTop, sTop byte) []byte {
-		r := make([]byte, rb)
-		s := make([]byte, sb)
-		for i := range r {
-			r[i] = 0x11
-		}
-		for i := range s {
-			s[i] = 0x22
-		}
-		r[0], s[0] = rTop, sTop
-		der, err := asn1.Marshal(rs{new(big.Int).SetBytes(r), new(big.Int).SetBytes(s)})
-		require.NoError(t, err)
-		return der
-	}
-
-	// Every byte-length edge: short components (leading zeros stripped by DER),
-	// full-width, high bit set (DER adds a 0x00 pad byte).
-	for _, tc := range []struct {
-		name         string
-		rb, sb       int
-		rTop, sTop   byte
-		wantDERLen64 bool
+// A DER-signing signer's tokens verify with go-jose against the published
+// JWKS, carry the kid and the expected alg, and are refused under another alg.
+func TestIssue_HSMStyleTokensVerifyAgainstJWKS(t *testing.T) {
+	p256, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	p384, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	_, ed, _ := ed25519.GenerateKey(rand.Reader)
+	for name, tc := range map[string]struct {
+		s     crypto.Signer
+		alg   jose.SignatureAlgorithm
+		other jose.SignatureAlgorithm
 	}{
-		{"full width, high bits clear", 32, 32, 0x11, 0x22, false},
-		{"full width, high bit set", 32, 32, 0xF1, 0xE2, false},
-		{"r short", 20, 32, 0x11, 0x22, false},
-		{"s short", 32, 1, 0x11, 0x02, false},
-		{"both 29 bytes: DER is exactly 2*size", 29, 29, 0x11, 0x22, true},
-		{"both 1 byte", 1, 1, 0x05, 0x07, false},
+		"ES256": {p256, jose.ES256, jose.ES384},
+		"ES384": {p384, jose.ES384, jose.ES256},
+		"EdDSA": {ed, jose.EdDSA, jose.ES256},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			der := mk(tc.rb, tc.sb, tc.rTop, tc.sTop)
-			if tc.wantDERLen64 {
-				require.Equal(t, 64, len(der), "test vector must hit the ambiguous length")
+		t.Run(name, func(t *testing.T) {
+			km, _ := newFakeKM(t, tc.s)
+			ti := NewTokenIssuer(km, "iss", func(string) time.Duration { return time.Minute })
+			for i := 0; i < 64; i++ { // r/s of varying DER length
+				raw, err := ti.Issue("sub", "aud", "t1", "rw", "")
+				require.NoError(t, err)
+
+				_, err = jose.ParseSigned(raw, []jose.SignatureAlgorithm{tc.other})
+				assert.Error(t, err, "wrong alg must be refused")
+
+				jws, err := jose.ParseSigned(raw, []jose.SignatureAlgorithm{tc.alg})
+				require.NoError(t, err)
+				assert.Equal(t, tc.alg, jose.SignatureAlgorithm(jws.Signatures[0].Header.Algorithm))
+				assert.Equal(t, km.ActiveKey().Kid, jws.Signatures[0].Header.KeyID)
+				set := km.JWKS()
+				jwk := set.Key(jws.Signatures[0].Header.KeyID)
+				require.Len(t, jwk, 1)
+				_, err = jws.Verify(jwk[0].Key)
+				require.NoError(t, err)
 			}
-			raw, err := ecdsaSigToRaw(der, 32)
-			require.NoError(t, err)
-			require.Len(t, raw, 64)
-			var p rs
-			_, err = asn1.Unmarshal(der, &p)
-			require.NoError(t, err)
-			assert.Equal(t, 0, new(big.Int).SetBytes(raw[:32]).Cmp(p.R))
-			assert.Equal(t, 0, new(big.Int).SetBytes(raw[32:]).Cmp(p.S))
 		})
 	}
-
-	// A raw 64-byte r||s is not DER and must be rejected, not passed through.
-	_, err := ecdsaSigToRaw(bytes.Repeat([]byte{0x11}, 64), 32)
-	assert.Error(t, err)
-
-	der, _ := asn1.Marshal(rs{big.NewInt(0), big.NewInt(1)})
-	_, err = ecdsaSigToRaw(der, 32)
-	assert.Error(t, err)
-	der, _ = asn1.Marshal(rs{new(big.Int).Lsh(big.NewInt(1), 300), big.NewInt(1)})
-	_, err = ecdsaSigToRaw(der, 32)
-	assert.Error(t, err)
-	der, _ = asn1.Marshal(rs{big.NewInt(5), big.NewInt(7)})
-	_, err = ecdsaSigToRaw(append(der, 0), 32)
-	assert.Error(t, err, "trailing bytes")
-	_, err = ecdsaSigToRaw(nil, 32)
-	assert.Error(t, err)
 }
 
 func TestNewConfiguredKeyManager(t *testing.T) {
