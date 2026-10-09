@@ -49,6 +49,7 @@ type tokenOpts struct {
 	exp, nbf time.Time
 	iat      time.Time // zero: now
 	bits     int
+	ttl      int64 // seconds; 0: no ttl claim
 	values   map[int]int
 	key      *ecdsa.PrivateKey
 }
@@ -73,6 +74,9 @@ func makeToken(t *testing.T, o tokenOpts) string {
 	}
 	if !o.nbf.IsZero() {
 		claims["nbf"] = o.nbf.Unix()
+	}
+	if o.ttl != 0 {
+		claims["ttl"] = o.ttl
 	}
 	tok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
 	tok.Header["typ"] = o.typ

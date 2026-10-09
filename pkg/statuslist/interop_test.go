@@ -348,7 +348,12 @@ func TestCache_ByteBound(t *testing.T) {
 
 	// Budget for exactly one list: a second URI evicts (resets) the first and
 	// the accounted bytes never exceed the limit.
-	c.cacheLimit = 12 // one 8-byte list fits, two do not
+	// An entry costs its inflated list plus the original compressed lst.
+	c.cacheLimit = maxCacheBytes
+	_ = c.Check(trust.ContextWithTenant(ctx, "probe"), ref)
+	one := c.cacheBytes
+	c.cache, c.cacheBytes = map[string]cachedList{}, 0
+	c.cacheLimit = one + one/2 // one list fits, two do not
 	for _, tenant := range []string{"a", "b", "c"} {
 		_ = c.Check(trust.ContextWithTenant(ctx, tenant), ref)
 		if c.cacheBytes > c.cacheLimit {

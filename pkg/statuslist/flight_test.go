@@ -328,8 +328,8 @@ func TestStore_SameIatOlderGenerationNeverReplaces(t *testing.T) {
 	c.now = func() time.Time { return now }
 	newer := parsedList{bits: 1, list: []byte{0x02}, expires: now.Add(time.Minute), iat: 100, gen: 2}
 	older := parsedList{bits: 1, list: []byte{0x00}, expires: now.Add(time.Hour), iat: 100, gen: 1}
-	_, _, _ = c.store("k", newer, nil)
-	_, list, _ := c.store("k", older, nil)
+	_ = c.store("k", newer, nil)
+	list := c.store("k", older, nil).list
 	if list[0] != 0x02 || c.cache["k"].gen != 2 {
 		t.Fatalf("same-iat older generation replaced the newer: list=%v gen=%d", list, c.cache["k"].gen)
 	}
@@ -342,11 +342,9 @@ func TestStore_NeverReplacesNewerVersion(t *testing.T) {
 	newer := parsedList{bits: 1, list: []byte{0x02}, expires: now.Add(time.Minute), iat: 200}
 	older := parsedList{bits: 1, list: []byte{0x00}, expires: now.Add(time.Hour), iat: 100}
 
-	if _, _, err := c.store("k", newer, nil); err != nil {
-		t.Fatal(err)
-	}
+	c.store("k", newer, nil)
 	// The older load is answered from the newer entry, which stays cached.
-	_, list, _ := c.store("k", older, nil)
+	list := c.store("k", older, nil).list
 	if len(list) != 1 || list[0] != 0x02 {
 		t.Fatalf("older load answered with %v, want the newer list", list)
 	}
@@ -355,13 +353,13 @@ func TestStore_NeverReplacesNewerVersion(t *testing.T) {
 	}
 	// Same or newer iat does replace.
 	newest := parsedList{bits: 1, list: []byte{0x06}, expires: now.Add(time.Minute), iat: 300}
-	_, _, _ = c.store("k", newest, nil)
+	_ = c.store("k", newest, nil)
 	if c.cache["k"].iat != 300 {
 		t.Fatal("newer version did not replace the cache entry")
 	}
 	// An expired newer entry is not served to the older load, but is not replaced either.
 	now = now.Add(2 * time.Minute)
-	_, list, _ = c.store("k", older, nil)
+	list = c.store("k", older, nil).list
 	if list[0] != 0x00 || c.cache["k"].iat != 300 {
 		t.Fatalf("older load after expiry: list=%v cached iat=%d", list, c.cache["k"].iat)
 	}

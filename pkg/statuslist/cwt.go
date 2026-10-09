@@ -99,7 +99,7 @@ func (c *Checker) parseCWT(ctx context.Context, body []byte, uri string) (parsed
 		return parsedList{}, fmt.Errorf("%w x5chain leaf: %v", errCWT, err)
 	}
 	if err := verifyCOSE(alg, leaf.PublicKey, sign1); err != nil {
-		return parsedList{}, fmt.Errorf("%w signature: %v", errCWT, err)
+		return parsedList{}, classify(ReasonSignatureInvalid, fmt.Errorf("%w signature: %v", errCWT, err))
 	}
 	km := &trust.KeyMaterial{Type: "x5c"}
 	for _, der := range chain {

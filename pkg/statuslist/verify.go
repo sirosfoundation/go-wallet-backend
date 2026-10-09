@@ -5,8 +5,10 @@ import (
 	"compress/zlib"
 	"context"
 	"crypto"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +17,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -83,6 +86,12 @@ var (
 // unless this returns (true, nil).
 type SignerTrust func(ctx context.Context, subject string, km *trust.KeyMaterial) (trusted bool, err error)
 
+// SignerTrustAction is a SignerTrust that also reports the trust action whose
+// positive decision accepted the signer (for example "status-list-signer", or
+// "credential-issuer" when the fallback applied). action is meaningful only
+// when trusted is true.
+type SignerTrustAction func(ctx context.Context, subject string, km *trust.KeyMaterial) (trusted bool, action string, err error)
+
 // Reference is the `status.status_list` claim of a credential
 // (draft-ietf-oauth-status-list §6.2).
 type Reference struct {
@@ -150,6 +159,9 @@ func ReferenceFromCredentialClaims(claims map[string]any) (ref *Reference, prese
 type Checker struct {
 	client *http.Client
 	trust  SignerTrust
+	// trustAction, when set, is used instead of trust and also reports which
+	// trust action accepted the signer (WithSignerTrustAction).
+	trustAction SignerTrustAction
 	// allowHTTP permits a plain-http status list URI (development only).
 	allowHTTP bool
 	now       func() time.Time
@@ -183,8 +195,7 @@ type flight struct {
 	// the flight was withdrawn; its result has no consumer and must not be
 	// cached.
 	abandoned bool
-	bits      int
-	list      []byte
+	res       parsedList
 	err       error
 }
 
@@ -199,7 +210,31 @@ type parsedList struct {
 	expires time.Time
 	iat     int64
 	gen     uint64
+
+	// Fields below serve the verified-list accessor (List) and the
+	// conditional GET; they hold public data only.
+
+	// lst is the ORIGINAL compressed `lst` bytes of the signed token, kept so
+	// a caller can be handed bytes identical to what the signer signed.
+	lst []byte
+	// exp is the token's exp claim and ttl its ttl claim (nil when absent).
+	exp, ttl *int64
+	// signerAction is the trust action that accepted the signer.
+	signerAction string
+	// etag identifies this version of the list: a stable hash of the uri and
+	// the token version (iat, bits, lst), independent of upstream caching.
+	etag string
+	// upstreamETag is the ETag the list host sent, for If-None-Match.
+	upstreamETag string
+	// subject and km are what the signer trust decision was taken for; they
+	// are kept so a 304 refresh can re-evaluate the signer instead of
+	// extending a stale trust decision.
+	subject string
+	km      *trust.KeyMaterial
 }
+
+// size is what the entry costs against the cache byte limit.
+func (p parsedList) size() int { return len(p.list) + len(p.lst) }
 
 type cachedList = parsedList
 
@@ -212,6 +247,14 @@ type cachedList = parsedList
 func NewChecker(client *http.Client, allowHTTP bool, signerTrust SignerTrust) *Checker {
 	return &Checker{client: client, trust: signerTrust, allowHTTP: allowHTTP, now: time.Now, cache: map[string]cachedList{}, cacheLimit: maxCacheBytes,
 		flights: map[string]*flight{}, loadSem: make(chan struct{}, DefaultMaxConcurrentLoads)}
+}
+
+// WithSignerTrustAction makes the Checker use fn, which also reports the
+// accepting trust action, instead of the SignerTrust given to NewChecker.
+// Call it before the Checker is shared.
+func (c *Checker) WithSignerTrustAction(fn SignerTrustAction) *Checker {
+	c.trustAction = fn
+	return c
 }
 
 // WithMinEntries makes the Checker reject a status list that holds fewer than
@@ -256,11 +299,11 @@ func (c *Checker) WithMaxConcurrentLoads(n int) *Checker {
 // wrap ErrRevoked; a negative trust decision wraps ErrSignerUntrusted and an
 // unobtainable one ErrTrustUnavailable. Callers choose what to do with those.
 func (c *Checker) Check(ctx context.Context, ref *Reference) error {
-	bits, list, err := c.load(ctx, ref.URI)
+	pl, err := c.load(ctx, ref.URI)
 	if err != nil {
 		return err
 	}
-	value, err := entry(bits, list, ref.Idx)
+	value, err := entry(pl.bits, pl.list, ref.Idx)
 	if err != nil {
 		return err
 	}
@@ -268,6 +311,64 @@ func (c *Checker) Check(ctx context.Context, ref *Reference) error {
 		return fmt.Errorf("%w: status value %d", ErrRevoked, value)
 	}
 	return nil
+}
+
+// VerifiedList is a Token Status List that was fetched, whose signature, typ,
+// sub and temporal claims were verified, and whose signer key the trust
+// service accepted. It carries public data only. Lst must be treated as
+// read-only: it is shared with the Checker's cache.
+type VerifiedList struct {
+	// Bits is the number of bits per entry (1, 2, 4 or 8).
+	Bits int
+	// Lst is the ORIGINAL zlib-compressed `lst` bytes of the signed token,
+	// byte-identical to what the signer signed (not re-compressed).
+	Lst []byte
+	// IssuedAt is the token's iat.
+	IssuedAt time.Time
+	// ExpiresAt is the token's exp claim; nil when the token has none.
+	ExpiresAt *time.Time
+	// TTL is the token's ttl claim; 0 when the token has none.
+	TTL time.Duration
+	// FreshUntil is when the Checker stops treating this list as fresh: the
+	// ttl/exp/max-age derived deadline, never more than one hour ahead.
+	FreshUntil time.Time
+	// SignerAction is the trust action that accepted the signer
+	// ("status-list-signer", or "credential-issuer" for the fallback). It is
+	// empty when the Checker has no SignerTrustAction.
+	SignerAction string
+	// ETag identifies this version of the list: a quoted, stable hash of the
+	// uri and the token version, the same for every caller and across refetches
+	// of an unchanged token.
+	ETag string
+}
+
+// List returns the verified list at uri, from the cache when fresh. It
+// applies exactly the checks Check applies (fetch, media type, signature,
+// typ/sub, iat/nbf/exp/ttl, bits, minimum entries, signer trust); a list that
+// does not pass is an error (see Classify for its Reason) and no data. The
+// uri is used verbatim: it must be the exact string a credential carries.
+// The cache is keyed by tenant (from ctx) and uri.
+func (c *Checker) List(ctx context.Context, uri string) (*VerifiedList, error) {
+	pl, err := c.load(ctx, uri)
+	if err != nil {
+		return nil, err
+	}
+	vl := &VerifiedList{
+		Bits: pl.bits, Lst: pl.lst, IssuedAt: time.Unix(pl.iat, 0).UTC(),
+		FreshUntil: pl.expires, SignerAction: pl.signerAction, ETag: pl.etag,
+	}
+	if pl.exp != nil {
+		t := time.Unix(*pl.exp, 0).UTC()
+		vl.ExpiresAt = &t
+	}
+	if pl.ttl != nil && *pl.ttl > 0 {
+		secs := *pl.ttl
+		if secs > maxTTLSeconds {
+			secs = maxTTLSeconds
+		}
+		vl.TTL = time.Duration(secs) * time.Second
+	}
+	return vl, nil
 }
 
 // load returns the status list for uri. Concurrent callers for the same
@@ -281,7 +382,7 @@ func (c *Checker) Check(ctx context.Context, ref *Reference) error {
 // soon as it expires, and a caller giving up never cancels the flight for
 // the others. The flight itself is cancelled only when its last waiter has
 // left.
-func (c *Checker) load(ctx context.Context, uri string) (int, []byte, error) {
+func (c *Checker) load(ctx context.Context, uri string) (parsedList, error) {
 	// The signer trust decision is tenant-scoped (the tenant travels in ctx),
 	// so a cached, already trust-evaluated list is only reused within the
 	// tenant it was evaluated for.
@@ -296,7 +397,7 @@ func (c *Checker) load(ctx context.Context, uri string) (int, []byte, error) {
 	c.mu.Lock()
 	if e, ok := c.cache[key]; ok && c.now().Before(e.expires) {
 		c.mu.Unlock()
-		return e.bits, e.list, nil
+		return e, nil
 	}
 	f, ok := c.flights[key]
 	if !ok {
@@ -313,7 +414,7 @@ func (c *Checker) load(ctx context.Context, uri string) (int, []byte, error) {
 
 	select {
 	case <-f.done:
-		return f.bits, f.list, f.err
+		return f.res, f.err
 	case <-ctx.Done():
 		c.mu.Lock()
 		f.waiters--
@@ -327,14 +428,14 @@ func (c *Checker) load(ctx context.Context, uri string) (int, []byte, error) {
 			f.cancel()
 		}
 		c.mu.Unlock()
-		return 0, nil, fmt.Errorf("status list load: %w", ctx.Err())
+		return parsedList{}, fmt.Errorf("status list load: %w", ctx.Err())
 	}
 }
 
 // runFlight performs one load and publishes the outcome to its waiters.
 func (c *Checker) runFlight(ctx context.Context, key, uri string, f *flight) {
 	defer f.cancel()
-	f.bits, f.list, f.err = c.loadOnce(ctx, key, uri, f)
+	f.res, f.err = c.loadOnce(ctx, key, uri, f)
 	c.mu.Lock()
 	if c.flights[key] == f {
 		delete(c.flights, key)
@@ -344,33 +445,115 @@ func (c *Checker) runFlight(ctx context.Context, key, uri string, f *flight) {
 }
 
 // loadOnce fetches, verifies and caches one list, holding a load slot for
-// the duration.
-func (c *Checker) loadOnce(ctx context.Context, key, uri string, f *flight) (int, []byte, error) {
+// the duration. When the cache holds an expired entry that carries an
+// upstream ETag the fetch is conditional; a 304 refreshes that entry (see
+// refresh) instead of re-parsing a body.
+func (c *Checker) loadOnce(ctx context.Context, key, uri string, f *flight) (parsedList, error) {
 	select {
 	case c.loadSem <- struct{}{}:
 		defer func() { <-c.loadSem }()
 	case <-ctx.Done():
-		return 0, nil, fmt.Errorf("waiting for a status list load slot: %w", ctx.Err())
+		return parsedList{}, fmt.Errorf("waiting for a status list load slot: %w", ctx.Err())
 	}
-	body, mediaType, err := c.fetch(ctx, uri)
+	var stale *parsedList
+	c.mu.Lock()
+	if e, ok := c.cache[key]; ok && e.upstreamETag != "" && e.km != nil {
+		stale = &e
+	}
+	c.mu.Unlock()
+	etag := ""
+	if stale != nil {
+		etag = stale.upstreamETag
+	}
+	res, err := c.fetch(ctx, uri, etag)
 	if err != nil {
-		return 0, nil, err
+		return parsedList{}, err
+	}
+	if res.notModified {
+		pl, err := c.refresh(ctx, *stale, res)
+		if err != nil {
+			// The entry can no longer be vouched for: drop it so the next
+			// request fetches afresh.
+			c.mu.Lock()
+			c.dropLocked(key)
+			c.mu.Unlock()
+			return parsedList{}, err
+		}
+		return c.store(key, pl, f), nil
 	}
 	var pl parsedList
-	switch mediaType {
+	switch res.mediaType {
 	case mediaTypeJWT, "":
 		// A missing Content-Type is read as the JWT form, the only one
 		// that ever came without one; a CWT body then fails to parse.
-		pl, err = c.parseJWT(ctx, strings.TrimSpace(string(body)), uri)
+		pl, err = c.parseJWT(ctx, strings.TrimSpace(string(res.body)), uri)
 	case mediaTypeCWT:
-		pl, err = c.parseCWT(ctx, body, uri)
+		pl, err = c.parseCWT(ctx, res.body, uri)
 	default:
-		err = fmt.Errorf("status list has unsupported media type %q", mediaType)
+		err = classify(ReasonUnsupportedMediaType, fmt.Errorf("status list has unsupported media type %q", res.mediaType))
 	}
 	if err != nil {
-		return 0, nil, err
+		return parsedList{}, err
 	}
-	return c.store(key, pl, f)
+	pl.upstreamETag = res.etag
+	// A shorter upstream max-age wins over the token-derived freshness; it
+	// can never lengthen it (and the one hour cap already applied).
+	if res.maxAge != nil {
+		if limit := c.now().Add(*res.maxAge); limit.Before(pl.expires) {
+			pl.expires = limit
+		}
+	}
+	return c.store(key, pl, f), nil
+}
+
+// refresh turns a 304 into a refreshed copy of the stale entry. The list is
+// the one already verified, but nothing else is assumed: the token's own
+// exp and nbf are enforced again, and the signer is trust-evaluated again,
+// so a signer that was distrusted meanwhile is not carried along by 304s.
+// The new freshness window is the 304's max-age, else the token's ttl (else
+// the default), counted from now, never past the token's exp and never more
+// than maxCacheTTL.
+func (c *Checker) refresh(ctx context.Context, old parsedList, res fetchResult) (parsedList, error) {
+	now := c.now()
+	if old.exp != nil && !now.Before(time.Unix(*old.exp, 0)) {
+		return parsedList{}, classify(ReasonExpired, errors.New("status list token has expired"))
+	}
+	if _, err := c.evaluateSignerSubject(ctx, old.subject, old.km); err != nil {
+		return parsedList{}, err
+	}
+	window := defaultCacheTTL
+	if old.ttl != nil && *old.ttl > 0 {
+		secs := *old.ttl
+		if secs > maxTTLSeconds {
+			secs = maxTTLSeconds
+		}
+		window = time.Duration(secs) * time.Second
+	}
+	if res.maxAge != nil {
+		window = *res.maxAge
+	}
+	if window > maxCacheTTL {
+		window = maxCacheTTL
+	}
+	expires := now.Add(window)
+	if old.exp != nil {
+		if exp := time.Unix(*old.exp, 0); exp.Before(expires) {
+			expires = exp
+		}
+	}
+	old.expires = expires
+	if res.etag != "" {
+		old.upstreamETag = res.etag
+	}
+	return old, nil
+}
+
+// dropLocked removes a cache entry (c.mu held).
+func (c *Checker) dropLocked(key string) {
+	if e, ok := c.cache[key]; ok {
+		c.cacheBytes -= e.size()
+		delete(c.cache, key)
+	}
 }
 
 // store caches pl and returns the list to act on. expires is an absolute
@@ -387,52 +570,69 @@ func (c *Checker) loadOnce(ctx context.Context, key, uri string, f *flight) (int
 // abandoned, or whose generation is lower than the cached entry's or than the
 // key's current flight, never stores. f is the loading flight (nil outside
 // flights, e.g. in tests, which then carry their own gen in pl).
-func (c *Checker) store(key string, pl parsedList, f *flight) (int, []byte, error) {
+func (c *Checker) store(key string, pl parsedList, f *flight) parsedList {
 	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if f != nil {
 		pl.gen = f.gen
 		if cur := c.flights[key]; f.abandoned || (cur != nil && cur.gen > f.gen) {
-			return pl.bits, pl.list, nil
+			return pl
 		}
 	}
 	old, had := c.cache[key]
 	if had && (old.iat > pl.iat || (old.iat == pl.iat && old.gen > pl.gen)) {
 		if now.Before(old.expires) {
-			return old.bits, old.list, nil
+			return old
 		}
-		return pl.bits, pl.list, nil
+		return pl
 	}
-	if pl.expires.After(now) && len(pl.list) <= c.cacheLimit {
+	if pl.expires.After(now) && pl.size() <= c.cacheLimit {
 		if had {
-			c.cacheBytes -= len(old.list)
+			c.cacheBytes -= old.size()
 		}
-		if len(c.cache) >= maxCacheEntries || c.cacheBytes+len(pl.list) > c.cacheLimit {
+		if len(c.cache) >= maxCacheEntries || c.cacheBytes+pl.size() > c.cacheLimit {
 			c.cache = map[string]cachedList{}
 			c.cacheBytes = 0
 		}
 		c.cache[key] = pl
-		c.cacheBytes += len(pl.list)
+		c.cacheBytes += pl.size()
+	} else if had {
+		// A fresh version that cannot be cached must not leave the older one
+		// behind to be served by the freshness check.
+		c.dropLocked(key)
 	}
-	return pl.bits, pl.list, nil
+	return pl
 }
 
-// fetch returns the raw body and the response media type ("" when the server
-// sent none).
-func (c *Checker) fetch(ctx context.Context, uri string) ([]byte, string, error) {
+// fetchResult is one upstream response.
+type fetchResult struct {
+	// notModified is a 304 answer to a conditional request; body is empty.
+	notModified bool
+	body        []byte
+	mediaType   string // "" when the server sent none
+	etag        string // upstream ETag, "" when none
+	maxAge      *time.Duration
+}
+
+// fetch GETs uri. When ifNoneMatch is not empty the request is conditional
+// and a 304 comes back as notModified.
+func (c *Checker) fetch(ctx context.Context, uri, ifNoneMatch string) (fetchResult, error) {
 	u, err := url.Parse(uri)
 	if err != nil {
-		return nil, "", fmt.Errorf("status list uri: %w", err)
+		return fetchResult{}, classify(ReasonURINotAllowed, fmt.Errorf("status list uri: %w", err))
 	}
 	if u.Scheme != "https" && (!c.allowHTTP || u.Scheme != "http") {
-		return nil, "", fmt.Errorf("status list uri must be https: %q", u.Scheme)
+		return fetchResult{}, classify(ReasonURINotAllowed, fmt.Errorf("status list uri must be https: %q", u.Scheme))
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
-		return nil, "", err
+		return fetchResult{}, classify(ReasonURINotAllowed, err)
 	}
 	req.Header.Set("Accept", mediaTypeJWT+", "+mediaTypeCWT+";q=0.8")
+	if ifNoneMatch != "" {
+		req.Header.Set("If-None-Match", ifNoneMatch)
+	}
 	// The URI comes from a credential the holder presents, so it is
 	// attacker-influenced by nature. The scheme is checked above and c.client
 	// is the SSRF-guarded client (NewHTTPClient: private, loopback, link-local
@@ -441,31 +641,61 @@ func (c *Checker) fetch(ctx context.Context, uri string) ([]byte, string, error)
 	// hosts.
 	resp, err := c.client.Do(req) // lgtm[go/request-forgery]
 	if err != nil {
-		return nil, "", fmt.Errorf("fetch status list: %w", err)
+		return fetchResult{}, classify(ReasonFetchFailed, fmt.Errorf("fetch status list: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
+	res := fetchResult{etag: strings.TrimSpace(resp.Header.Get("ETag")), maxAge: maxAgeOf(resp.Header.Get("Cache-Control"))}
+	if resp.StatusCode == http.StatusNotModified && ifNoneMatch != "" {
+		res.notModified = true
+		return res, nil
+	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, "", fmt.Errorf("fetch status list: http %d", resp.StatusCode)
+		return fetchResult{}, classify(ReasonFetchFailed, fmt.Errorf("fetch status list: http %d", resp.StatusCode))
 	}
 	// A missing Content-Type is distinct from a malformed one: only the
 	// former takes the intentional "read as JWT" path. A non-empty value that
 	// does not parse (including a valid type with an invalid parameter, for
 	// which ParseMediaType returns both a type and an error) is unverifiable.
-	var mt string
 	if ct := strings.TrimSpace(resp.Header.Get("Content-Type")); ct != "" {
 		var err error
-		if mt, _, err = mime.ParseMediaType(ct); err != nil {
-			return nil, "", fmt.Errorf("status list has malformed Content-Type %q: %w", ct, err)
+		if res.mediaType, _, err = mime.ParseMediaType(ct); err != nil {
+			return fetchResult{}, classify(ReasonUnsupportedMediaType, fmt.Errorf("status list has malformed Content-Type %q: %w", ct, err))
 		}
 	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxTokenBytes+1))
+	res.body, err = io.ReadAll(io.LimitReader(resp.Body, maxTokenBytes+1))
 	if err != nil {
-		return nil, "", fmt.Errorf("read status list: %w", err)
+		return fetchResult{}, classify(ReasonFetchFailed, fmt.Errorf("read status list: %w", err))
 	}
-	if len(body) > maxTokenBytes {
-		return nil, "", errors.New("status list token too large")
+	if len(res.body) > maxTokenBytes {
+		return fetchResult{}, classify(ReasonTooLarge, errors.New("status list token too large"))
 	}
-	return body, mt, nil
+	return res, nil
+}
+
+// maxAgeOf reads Cache-Control's max-age. no-store and no-cache count as 0
+// (the list may be used for this request but is not kept fresh); a missing or
+// unparsable max-age is nil.
+func maxAgeOf(cc string) *time.Duration {
+	var out *time.Duration
+	for _, d := range strings.Split(cc, ",") {
+		d = strings.ToLower(strings.TrimSpace(d))
+		switch {
+		case d == "no-store" || d == "no-cache":
+			zero := time.Duration(0)
+			return &zero
+		case strings.HasPrefix(d, "max-age="):
+			n, err := strconv.ParseInt(strings.Trim(strings.TrimPrefix(d, "max-age="), `"`), 10, 64)
+			if err != nil || n < 0 {
+				continue
+			}
+			if n > int64(maxCacheTTL/time.Second) {
+				n = int64(maxCacheTTL / time.Second)
+			}
+			v := time.Duration(n) * time.Second
+			out = &v
+		}
+	}
+	return out
 }
 
 func (c *Checker) parseJWT(ctx context.Context, token, uri string) (parsedList, error) {
@@ -510,7 +740,7 @@ func (c *Checker) parseJWT(ctx context.Context, token, uri string) (parsedList, 
 		return parsedList{}, ErrNoSignerKey
 	}
 	if err != nil {
-		return parsedList{}, fmt.Errorf("status list signature: %w", err)
+		return parsedList{}, classify(ReasonSignatureInvalid, fmt.Errorf("status list signature: %w", err))
 	}
 	// Precedence when the header carries both: x5c is what is verified and
 	// trust-evaluated; a jwk that is also present must be the x5c leaf's key,
@@ -630,10 +860,10 @@ type listClaims struct {
 // signer key km. Only a list that passes all of it is returned.
 func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial, lc listClaims) (parsedList, error) {
 	if lc.iat == nil {
-		return parsedList{}, errors.New("status list token has no iat")
+		return parsedList{}, classify(ReasonMalformed, errors.New("status list token has no iat"))
 	}
 	if lc.sub != uri {
-		return parsedList{}, fmt.Errorf("status list sub %q does not match uri %q", lc.sub, uri)
+		return parsedList{}, classify(ReasonMalformed, fmt.Errorf("status list sub %q does not match uri %q", lc.sub, uri))
 	}
 	now := c.now()
 	// A token issued in the future is not yet valid, whatever its ttl or exp
@@ -643,7 +873,7 @@ func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial,
 	// draft defines none, and a publisher that stamps iat ahead of real time
 	// is misconfigured rather than merely skewed.
 	if time.Unix(*lc.iat, 0).After(now) {
-		return parsedList{}, errors.New("status list token is issued in the future (iat)")
+		return parsedList{}, classify(ReasonNotYetValid, errors.New("status list token is issued in the future (iat)"))
 	}
 	// The ttl claim is the token's freshness window, measured from its iat
 	// (not from when this wallet fetched it). Without ttl, a default window
@@ -667,12 +897,12 @@ func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial,
 		expires = time.Unix(*lc.iat, 0).Add(time.Duration(secs) * time.Second)
 	}
 	if lc.nbf != nil && now.Before(time.Unix(*lc.nbf, 0)) {
-		return parsedList{}, errors.New("status list token is not yet valid (nbf)")
+		return parsedList{}, classify(ReasonNotYetValid, errors.New("status list token is not yet valid (nbf)"))
 	}
 	if lc.exp != nil {
 		exp := time.Unix(*lc.exp, 0)
 		if !now.Before(exp) {
-			return parsedList{}, errors.New("status list token has expired")
+			return parsedList{}, classify(ReasonExpired, errors.New("status list token has expired"))
 		}
 		if exp.Before(expires) {
 			expires = exp
@@ -694,13 +924,26 @@ func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial,
 	}
 	if c.minEntries > 0 {
 		if n := len(list) * 8 / lc.bits; n < c.minEntries {
-			return parsedList{}, fmt.Errorf("status list has %d entries, below the configured minimum of %d", n, c.minEntries)
+			return parsedList{}, classify(ReasonListTooSmall, fmt.Errorf("status list has %d entries, below the configured minimum of %d", n, c.minEntries))
 		}
 	}
-	if err := c.evaluateSigner(ctx, lc.iss, uri, km); err != nil {
+	subject, err := signerSubject(lc.iss, uri)
+	if err != nil {
 		return parsedList{}, err
 	}
-	return parsedList{bits: lc.bits, list: list, expires: expires, iat: *lc.iat}, nil
+	action, err := c.evaluateSignerSubject(ctx, subject, km)
+	if err != nil {
+		return parsedList{}, err
+	}
+	h := sha256.New()
+	_, _ = fmt.Fprintf(h, "%s\x00%d\x00%d\x00", uri, *lc.iat, lc.bits)
+	h.Write(lc.lst)
+	return parsedList{
+		bits: lc.bits, list: list, expires: expires, iat: *lc.iat,
+		lst: lc.lst, exp: lc.exp, ttl: lc.ttl, signerAction: action,
+		etag:    `"` + hex.EncodeToString(h.Sum(nil)[:16]) + `"`,
+		subject: subject, km: km,
+	}, nil
 }
 
 // canonicalOrigin returns the serialized origin of uri in canonical form, so
@@ -745,28 +988,54 @@ func originOf(u *url.URL) (string, error) {
 	return scheme + "://" + host, nil
 }
 
+// signerSubject is the trust subject for a list: its iss claim, or the
+// canonical origin of its URI.
+func signerSubject(iss, uri string) (string, error) {
+	if iss != "" {
+		return iss, nil
+	}
+	origin, err := canonicalOrigin(uri)
+	if err != nil {
+		return "", fmt.Errorf("%w: no signer identity", ErrTrustUnavailable)
+	}
+	return origin, nil
+}
+
 // evaluateSigner asks the trust service whether the list signer may publish
 // status lists. The subject is the list's iss claim, or the origin of its URI.
 func (c *Checker) evaluateSigner(ctx context.Context, iss, uri string, km *trust.KeyMaterial) error {
-	if c.trust == nil {
-		return fmt.Errorf("%w: no trust service configured", ErrTrustUnavailable)
-	}
-	subject := iss
-	if subject == "" {
-		origin, err := canonicalOrigin(uri)
-		if err != nil {
-			return fmt.Errorf("%w: no signer identity", ErrTrustUnavailable)
-		}
-		subject = origin
-	}
-	trusted, err := c.trust(ctx, subject, km)
+	subject, err := signerSubject(iss, uri)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrTrustUnavailable, err)
+		return err
+	}
+	_, err = c.evaluateSignerSubject(ctx, subject, km)
+	return err
+}
+
+// evaluateSignerSubject is evaluateSigner for a resolved subject. It also
+// returns the trust action that accepted the signer when the trust function
+// reports one (WithSignerTrustAction), else "".
+func (c *Checker) evaluateSignerSubject(ctx context.Context, subject string, km *trust.KeyMaterial) (string, error) {
+	var (
+		trusted bool
+		action  string
+		err     error
+	)
+	switch {
+	case c.trustAction != nil:
+		trusted, action, err = c.trustAction(ctx, subject, km)
+	case c.trust != nil:
+		trusted, err = c.trust(ctx, subject, km)
+	default:
+		return "", fmt.Errorf("%w: no trust service configured", ErrTrustUnavailable)
+	}
+	if err != nil {
+		return "", fmt.Errorf("%w: %v", ErrTrustUnavailable, err)
 	}
 	if !trusted {
-		return fmt.Errorf("%w (%s)", ErrSignerUntrusted, subject)
+		return "", fmt.Errorf("%w (%s)", ErrSignerUntrusted, subject)
 	}
-	return nil
+	return action, nil
 }
 
 // checkJWKMatchesLeaf requires a jwk header parameter, when present, to be the
@@ -848,7 +1117,7 @@ func inflate(compressed []byte) ([]byte, error) {
 		return nil, fmt.Errorf("status list lst: %w", err)
 	}
 	if len(out) > maxInflateBytes {
-		return nil, errors.New("status list lst inflates too large")
+		return nil, classify(ReasonTooLarge, errors.New("status list lst inflates too large"))
 	}
 	return out, nil
 }
