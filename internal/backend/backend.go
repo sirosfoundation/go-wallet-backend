@@ -127,3 +127,17 @@ func New(ctx context.Context, cfg *config.Config) (Backend, error) {
 		return nil, fmt.Errorf("unsupported storage type: %s", storageType)
 	}
 }
+
+// NewReadOnly opens the configured storage like New, but without the startup
+// writes (default tenant and index creation for MongoDB). Use it for a process
+// that only reads.
+func NewReadOnly(ctx context.Context, cfg *config.Config) (Backend, error) {
+	if Type(cfg.Storage.Type) != TypeMongoDB {
+		return New(ctx, cfg)
+	}
+	store, err := mongodb.NewReadOnlyStore(ctx, &cfg.Storage.MongoDB)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create read-only MongoDB backend: %w", err)
+	}
+	return &mongoBackend{store: store}, nil
+}

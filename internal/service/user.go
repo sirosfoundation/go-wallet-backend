@@ -13,6 +13,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -23,7 +24,8 @@ var (
 )
 
 // SessionCleaner can remove sessions for a user.
-// Implemented by engine.SessionStore (memory or Redis) and as.SessionStore.
+// Implemented by engine.Manager (which also closes the live WebSocket),
+// engine.SessionStore, and as.SessionStore.
 type SessionCleaner interface {
 	DeleteByUser(ctx context.Context, userID string) error
 }
@@ -60,6 +62,20 @@ type TokenRevoker interface {
 	RevokeUser(ctx context.Context, userID string) error
 }
 
+// UserRevoker permanently bars a deleted user from token-independent session
+// holders (engine Manager.RevokeUser); unlike SessionCleaner, which leaves the
+// user free to log in again.
+type UserRevoker interface {
+	RevokeUser(userID string)
+}
+
+// UserLocker is the per-user lock WIAService holds from its instance write to
+// its post-write checks; deletion takes it so an attestation finishes before the
+// final sweep or finds the user gone.
+type UserLocker interface {
+	LockUser(userID domain.UserID) func()
+}
+
 // UserService handles user-related operations
 type UserService struct {
 	store          storage.Store
@@ -67,6 +83,12 @@ type UserService struct {
 	logger         *zap.Logger
 	sessionCleaner SessionCleaner
 	tokenBlacklist TokenRevoker
+	userRevokers   []UserRevoker
+	// locker serializes the final sweep and user removal with WIA instance
+	// writes. Nil without a lifecycle service.
+	locker UserLocker
+	// now is the clock for tombstone timestamps (replaced in tests).
+	now func() time.Time
 }
 
 // NewUserService creates a new UserService
@@ -75,13 +97,27 @@ func NewUserService(store storage.Store, cfg *config.Config, logger *zap.Logger)
 		store:  store,
 		cfg:    cfg,
 		logger: logger.Named("user-service"),
+		now:    time.Now,
 	}
 }
+
+// SetClock replaces the clock used to stamp deletion tombstones (tests).
+func (s *UserService) SetClock(now func() time.Time) { s.now = now }
+
+// SetUserLocker wires the per-user lock shared with WIA generation. Taken last;
+// DeleteUser never calls the lifecycle service while holding it.
+func (s *UserService) SetUserLocker(l UserLocker) { s.locker = l }
 
 // SetSessionCleaner sets the session cleanup implementation.
 // When set, DeleteUser will purge active sessions for the deleted user.
 func (s *UserService) SetSessionCleaner(sc SessionCleaner) {
 	s.sessionCleaner = sc
+}
+
+// AddUserRevoker registers a component that permanently rejects the deleted
+// user; called before sessions are purged.
+func (s *UserService) AddUserRevoker(r UserRevoker) {
+	s.userRevokers = append(s.userRevokers, r)
 }
 
 // SetTokenBlacklist sets the token revoker (in production, always the
@@ -210,10 +246,25 @@ func (s *UserService) GetPrivateData(ctx context.Context, userID domain.UserID) 
 	return user.PrivateData, user.PrivateDataETag, nil
 }
 
+// refuseIfCutOff judges the request token against the freshly loaded record
+// (SID-AUTH-06), catching a revocation after the middleware check.
+func refuseIfCutOff(ctx context.Context, user *domain.User) error {
+	return tokengate.RefuseLoaded(ctx, user.AuthInvalidBefore)
+}
+
+// requestIssuedAt is the request token's iat, or zero for an internal caller.
+func requestIssuedAt(ctx context.Context) time.Time {
+	t, _ := tokengate.IssuedAtFrom(ctx)
+	return t
+}
+
 // UpdatePrivateData updates user's private data with optimistic locking
 func (s *UserService) UpdatePrivateData(ctx context.Context, userID domain.UserID, data []byte, ifMatch string) (string, error) {
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
+		return "", err
+	}
+	if err := refuseIfCutOff(ctx, user); err != nil {
 		return "", err
 	}
 
@@ -233,53 +284,157 @@ func (s *UserService) UpdatePrivateData(ctx context.Context, userID domain.UserI
 	return user.PrivateDataETag, nil
 }
 
-// DeleteUser deletes a user and all associated data across ALL tenants.
-// Note: If GetUserTenants fails, deletion proceeds with only the default tenant,
-// which may leave orphaned data in other tenants. This is a best-effort cleanup
-// that prioritizes completing the user deletion over strict data consistency.
-func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, holderDID string) error {
-	// Get all tenants the user belongs to
-	tenantIDs, err := s.store.UserTenants().GetUserTenants(ctx, userID)
+// LogoutEverywhere ends all sessions and refuses already-issued bearer tokens,
+// the caller's included (SID-AUTH-06); logging in again undoes it.
+func (s *UserService) LogoutEverywhere(ctx context.Context, userID domain.UserID) error {
+	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
-		s.logger.Warn("Failed to get user tenants for cleanup", zap.Error(err))
-		// Continue with user deletion even if we can't get tenants
-		tenantIDs = []domain.TenantID{domain.DefaultTenantID}
+		if errors.Is(err, storage.ErrNotFound) {
+			return ErrUserNotFound
+		}
+		return fmt.Errorf("failed to load user: %w", err)
 	}
-	if len(tenantIDs) == 0 {
-		// User may have been registered without an explicit tenant membership;
-		// always clean up the default tenant as a fallback.
-		tenantIDs = []domain.TenantID{domain.DefaultTenantID}
+	// A token already cut off must not advance the cut-off again.
+	if err := refuseIfCutOff(ctx, user); err != nil {
+		return err
+	}
+	// Cut-off first; compare-and-set against the request's token so a concurrent
+	// lifecycle event is not overwritten.
+	if err := s.store.Users().InvalidateAuthBeforeForToken(ctx, userID, time.Now(), requestIssuedAt(ctx)); err != nil {
+		if errors.Is(err, storage.ErrStaleWrite) {
+			return fmt.Errorf("%w: a lifecycle revocation landed during the logout", tokengate.ErrRevoked)
+		}
+		if errors.Is(err, storage.ErrNotFound) {
+			return ErrUserNotFound
+		}
+		return fmt.Errorf("failed to cut off issued tokens: %w", err)
+	}
+	if s.sessionCleaner != nil {
+		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
+			return fmt.Errorf("failed to drop sessions: %w", err)
+		}
+	}
+	s.logger.Info("User logged out everywhere", zap.String("user_id", userID.String()))
+	return nil
+}
+
+// ErrDeletionIncomplete is returned when an instance could not be removed; the
+// record is kept so the request can be repeated (an orphan instance blocks re-
+// enrolment).
+var ErrDeletionIncomplete = errors.New("account deletion incomplete")
+
+// ErrDeletionCleanupPending is returned when the account was deleted but the
+// final sweep could not confirm no holder data remains; the caller must not
+// retry, an operator clears the rest.
+var ErrDeletionCleanupPending = errors.New("account deleted, cleanup of data written during the deletion incomplete")
+
+// ErrDeletionOperatorRequired is returned when deletion stopped after the
+// permanent token revocation, so even a fresh login is refused; only an operator
+// or restart can finish it.
+var ErrDeletionOperatorRequired = errors.New("account deletion stalled after the user's tokens were revoked, an operator must finish it")
+
+// DeleteUser removes a user and all their data in every tenant, finally the
+// record itself.
+//
+// Failure semantics:
+//   - ErrDeletionIncomplete (record kept, safe to repeat): the tombstone write,
+//     instance or holder-data removal, a lookup, or the first session-cleaner run
+//     failed before any permanent revocation.
+//   - ErrDeletionOperatorRequired: the second cleaner run or final holder sweep
+//     failed after the blacklist revocation took effect; without it these stay
+//     ErrDeletionIncomplete.
+//   - The cut-off (User.AuthInvalidBefore) advances durably before the
+//     revocations, by compare-and-set against the request's token
+//     (UserStore.InvalidateAuthBeforeForToken); a concurrent revocation answers
+//     tokengate.ErrRevoked with nothing irreversible done.
+//   - The sweeps after the advance and after the record's removal pair with
+//     tokengate.ConfirmWrite; failure of the latter is ErrDeletionCleanupPending.
+//   - Best-effort, logged only: pending challenges, invite used_by, membership
+//     removal, blacklist RevokeUser. A failing final Users().Delete answers a
+//     plain error.
+func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, holderDID string) error {
+	var instanceErrs []error
+	// dataErrs collects failures that must not answer 200.
+	var dataErrs []error
+
+	// Credentials are stored under User.DID, not the bare uuid the handler
+	// passes.
+	if user, err := s.store.Users().GetByID(ctx, userID); err == nil {
+		// Cut-off check (SID-AUTH-06): a request admitted before a logout must
+		// not erase the account.
+		if err := refuseIfCutOff(ctx, user); err != nil {
+			return err
+		}
+		if user.DID != "" {
+			holderDID = user.DID
+		} else {
+			holderDID = userID.String()
+		}
+	} else if !errors.Is(err, storage.ErrNotFound) {
+		return fmt.Errorf("%w: load user: %w", ErrDeletionIncomplete, err)
+	} else if _, terr := s.store.Users().GetDeletionTombstone(ctx, userID.String()); errors.Is(terr, storage.ErrNotFound) {
+		// No record and no tombstone: nothing was deleted, and a tombstone for
+		// an unknown identity would let any caller poison the table.
+		return ErrUserNotFound
+	} else if terr != nil {
+		return fmt.Errorf("%w: look up deletion tombstone: %w", ErrDeletionIncomplete, terr)
+	}
+	// A failed membership lookup is fatal: an undiscovered tenant could hold
+	// instances.
+	memberships, err := s.store.UserTenants().GetUserTenants(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("%w: list tenant memberships: %w", ErrDeletionIncomplete, err)
+	}
+	// Always sweep the default tenant, plus the instances' tenants (a membership
+	// can be removed while an instance remains).
+	instances, err := s.store.WalletInstances().GetAllByUser(ctx, userID)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return fmt.Errorf("%w: list wallet instances: %w", ErrDeletionIncomplete, err)
+	}
+	seen := map[domain.TenantID]bool{}
+	tenantIDs := make([]domain.TenantID, 0, len(memberships)+len(instances)+1)
+	for _, tid := range append([]domain.TenantID{domain.DefaultTenantID}, memberships...) {
+		if !seen[tid] {
+			seen[tid] = true
+			tenantIDs = append(tenantIDs, tid)
+		}
+	}
+	for _, inst := range instances {
+		if !seen[inst.TenantID] {
+			seen[inst.TenantID] = true
+			tenantIDs = append(tenantIDs, inst.TenantID)
+		}
 	}
 
-	// Delete any legacy server-side stored credentials and presentations from
-	// each tenant, regardless of whether credential/VC endpoints are currently enabled.
+	// Write the deletion tombstone before the first irreversible step: the gate
+	// refuses a deleted account's tokens only through it. Failure removes
+	// nothing; retries rewrite it idempotently.
+	deletedAt := s.now().UTC()
+	putTombstone := func() error {
+		if err := s.store.Users().PutDeletionTombstone(ctx, &domain.DeletionTombstone{
+			UserID:    userID.String(),
+			TenantIDs: tenantIDs,
+			DeletedAt: deletedAt,
+			ExpiresAt: deletedAt.Add(s.cfg.DeletionTombstoneRetention()),
+		}); err != nil {
+			s.logger.Error("Account deletion incomplete: deletion tombstone could not be written",
+				zap.Error(err), zap.String("user_id", userID.String()))
+			return fmt.Errorf("%w: write deletion tombstone: %w", ErrDeletionIncomplete, err)
+		}
+		return nil
+	}
+	if err := putTombstone(); err != nil {
+		return err
+	}
+
+	// Delete legacy credentials and presentations per tenant; failures count.
 	for _, tenantID := range tenantIDs {
-		credentials, err := s.store.Credentials().GetAllByHolder(ctx, tenantID, holderDID)
-		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			s.logger.Warn("Failed to get credentials for tenant", zap.Error(err), zap.String("tenant_id", string(tenantID)))
-		}
-		for _, cred := range credentials {
-			if err := s.store.Credentials().Delete(ctx, tenantID, holderDID, cred.CredentialIdentifier); err != nil {
-				s.logger.Warn("Failed to delete credential", zap.Error(err))
-			}
-		}
-
-		// Delete any server-side stored presentations (VPs) for GDPR compliance
-		presentations, err := s.store.Presentations().GetAllByHolder(ctx, tenantID, holderDID)
-		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			s.logger.Warn("Failed to get presentations for tenant", zap.Error(err), zap.String("tenant_id", string(tenantID)))
-		}
-		for _, pres := range presentations {
-			if err := s.store.Presentations().Delete(ctx, tenantID, holderDID, pres.PresentationIdentifier); err != nil {
-				s.logger.Warn("Failed to delete presentation", zap.Error(err))
-			}
-		}
-
-		// Remove tenant membership
-		if err := s.store.UserTenants().RemoveMembership(ctx, userID, tenantID); err != nil {
-			s.logger.Warn("Failed to remove tenant membership", zap.Error(err), zap.String("tenant_id", string(tenantID)))
-		}
+		dataErrs = append(dataErrs, s.eraseHolderData(ctx, tenantID, holderDID)...)
 	}
+
+	// Remove the user's wallet instances; failures keep the record for a retry
+	// (residue blocks re-enrolment).
+	instanceErrs = s.deleteWalletInstances(ctx, userID)
 
 	// Delete pending WebAuthn challenges (defense-in-depth; TTL handles expiry)
 	if err := s.store.Challenges().DeleteByUserID(ctx, userID.String()); err != nil {
@@ -289,6 +444,73 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// Clear user reference from consumed invites
 	if err := s.store.Invites().ClearUsedBy(ctx, userID); err != nil {
 		s.logger.Warn("Failed to clear invite used_by references", zap.Error(err))
+	}
+
+	// Re-list before deleting the record: an attestation may have bound an
+	// instance since the first sweep. Not a lock (go-wallet-backend#330); this
+	// pass decides on its own.
+	if len(instanceErrs) > 0 {
+		s.logger.Warn("wallet instance cleanup failed on the first pass, retrying before the user record is removed",
+			zap.Error(errors.Join(instanceErrs...)), zap.String("user_id", userID.String()))
+	}
+	// Serialize with attestation until the record is removed, so a WIA write
+	// cannot bind an orphan instance to a deleted user. WIAService takes the
+	// same lock; it is per process, replicas rely on the WIA-side refusal after
+	// the write.
+	if s.locker != nil {
+		defer s.locker.LockUser(userID)()
+	}
+	late, lateErrs := s.listWalletInstances(ctx, userID)
+	instanceErrs = lateErrs
+	var lateTenants []domain.TenantID
+	for _, inst := range late {
+		if seen[inst.TenantID] {
+			continue
+		}
+		seen[inst.TenantID] = true
+		tenantIDs = append(tenantIDs, inst.TenantID)
+		lateTenants = append(lateTenants, inst.TenantID)
+	}
+	if len(lateTenants) > 0 {
+		// Record the new tenants on the tombstone before erasing in them.
+		if err := putTombstone(); err != nil {
+			return err
+		}
+	}
+	for _, tid := range lateTenants {
+		dataErrs = append(dataErrs, s.eraseHolderData(ctx, tid, holderDID)...)
+	}
+	instanceErrs = append(instanceErrs, s.deleteWalletInstances(ctx, userID)...)
+
+	outstanding := append(append([]error{}, instanceErrs...), dataErrs...)
+	if len(outstanding) > 0 {
+		s.logger.Error("Account deletion incomplete",
+			zap.Error(errors.Join(outstanding...)), zap.String("user_id", userID.String()))
+		return fmt.Errorf("%w: %w", ErrDeletionIncomplete, errors.Join(outstanding...))
+	}
+
+	// Everything below is irreversible; applying the permanent revocations
+	// earlier would lock the caller out of an ErrDeletionIncomplete retry. The
+	// session cleaner runs before them (retryable) and after.
+	if s.sessionCleaner != nil {
+		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
+			s.logger.Error("Account deletion incomplete: sessions could not be dropped",
+				zap.Error(err), zap.String("user_id", userID.String()))
+			return fmt.Errorf("%w: drop sessions: %w", ErrDeletionIncomplete, err)
+		}
+	}
+
+	// Advance the token cut-off durably before the first irreversible step; the
+	// tombstone cannot, since the gate reads only the record's cut-off while it
+	// exists. Compare-and-set against the request's token, so a concurrent
+	// revocation answers 401 with nothing irreversible done.
+	if err := s.store.Users().InvalidateAuthBeforeForToken(ctx, userID, s.now().UTC(), requestIssuedAt(ctx)); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		if errors.Is(err, storage.ErrStaleWrite) {
+			return fmt.Errorf("%w: a lifecycle revocation landed during the deletion", tokengate.ErrRevoked)
+		}
+		s.logger.Error("Account deletion incomplete: token cut-off could not be advanced",
+			zap.Error(err), zap.String("user_id", userID.String()))
+		return fmt.Errorf("%w: advance token cut-off: %w", ErrDeletionIncomplete, err)
 	}
 
 	// Revoke all previously-issued tokens for this user (#383) BEFORE
@@ -308,32 +530,145 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// registration that instead completed *before* this revocation is
 	// still guaranteed to be present in m.sessions by the time the scan
 	// below runs. Reversing this order would reopen that gap.
+	// lockedOut: only a successful blacklist revocation refuses a fresh login's
+	// token.
+	lockedOut := false
 	if s.tokenBlacklist != nil {
 		if err := s.tokenBlacklist.RevokeUser(ctx, userID.String()); err != nil {
 			s.logger.Warn("Failed to revoke tokens for deleted user", zap.Error(err))
+		} else {
+			lockedOut = true
 		}
+	}
+
+	for _, r := range s.userRevokers {
+		r.RevokeUser(userID.String())
 	}
 
 	// Purge active WebSocket sessions (Redis or memory)
 	if s.sessionCleaner != nil {
 		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
-			s.logger.Warn("Failed to delete sessions for user", zap.Error(err))
+			// Blacklist in force: the user cannot retry; keep the record for an
+			// operator.
+			s.logger.Error("Account deletion incomplete: sessions could not be dropped after the user was revoked",
+				zap.Error(err), zap.String("user_id", userID.String()))
+			return fmt.Errorf("%w: drop sessions: %w", deletionStallErr(lockedOut), err)
+		}
+	}
+
+	// Final holder sweep, after the cut-off advance: a write persisted earlier
+	// is found here, a later one rolls itself back (tokengate.ConfirmWrite).
+	// Fails closed.
+	var finalErrs []error
+	for _, tenantID := range tenantIDs {
+		finalErrs = append(finalErrs, s.eraseHolderData(ctx, tenantID, holderDID)...)
+	}
+	if len(finalErrs) > 0 {
+		s.logger.Error("Account deletion incomplete: holder data could not be removed after the token cut-off",
+			zap.Error(errors.Join(finalErrs...)), zap.String("user_id", userID.String()))
+		return fmt.Errorf("%w: final holder-data sweep: %w", deletionStallErr(lockedOut), errors.Join(finalErrs...))
+	}
+
+	// Memberships last: a retry rebuilds its tenant list from them.
+	for _, tenantID := range tenantIDs {
+		if err := s.store.UserTenants().RemoveMembership(ctx, userID, tenantID); err != nil {
+			s.logger.Warn("Failed to remove tenant membership", zap.Error(err), zap.String("tenant_id", string(tenantID)))
 		}
 	}
 
 	// Delete the user
-	if err := s.store.Users().Delete(ctx, userID); err != nil {
+	// An already-removed record is the wanted outcome.
+	if err := s.store.Users().Delete(ctx, userID); err != nil && !errors.Is(err, storage.ErrNotFound) {
 		return fmt.Errorf("failed to delete user: %w", err)
+	}
+
+	// Last sweep, after the record is gone: the tombstone now refuses writes, so
+	// this removes anything a fresh login persisted since. Not retryable by the
+	// user, hence ErrDeletionCleanupPending.
+	var lastErrs []error
+	for _, tenantID := range tenantIDs {
+		lastErrs = append(lastErrs, s.eraseHolderData(ctx, tenantID, holderDID)...)
+	}
+	if len(lastErrs) > 0 {
+		s.logger.Error("Account deleted but holder data written during the deletion could not be removed",
+			zap.Error(errors.Join(lastErrs...)), zap.String("user_id", userID.String()))
+		return fmt.Errorf("%w: sweep after user removal: %w", ErrDeletionCleanupPending, errors.Join(lastErrs...))
 	}
 
 	s.logger.Info("User deleted")
 	return nil
 }
 
+// deletionStallErr picks ErrDeletionIncomplete while a fresh login still passes
+// the token gate, else ErrDeletionOperatorRequired.
+func deletionStallErr(lockedOut bool) error {
+	if lockedOut {
+		return ErrDeletionOperatorRequired
+	}
+	return ErrDeletionIncomplete
+}
+
+// listWalletInstances lists the user's wallet instances across all tenants.
+func (s *UserService) listWalletInstances(ctx context.Context, userID domain.UserID) ([]*domain.WalletInstance, []error) {
+	instances, err := s.store.WalletInstances().GetAllByUser(ctx, userID)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return nil, []error{fmt.Errorf("list wallet instances: %w", err)}
+	}
+	return instances, nil
+}
+
+// eraseHolderData removes the holder's credentials and presentations in one
+// tenant, logging failures.
+func (s *UserService) eraseHolderData(ctx context.Context, tenantID domain.TenantID, holderDID string) []error {
+	var errs []error
+	credentials, err := s.store.Credentials().GetAllByHolder(ctx, tenantID, holderDID)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		errs = append(errs, fmt.Errorf("list credentials in tenant %s: %w", tenantID, err))
+	}
+	for _, cred := range credentials {
+		if err := s.store.Credentials().Delete(ctx, tenantID, holderDID, cred.CredentialIdentifier); err != nil && !errors.Is(err, storage.ErrNotFound) {
+			errs = append(errs, fmt.Errorf("delete credential %s: %w", cred.CredentialIdentifier, err))
+		}
+	}
+	presentations, err := s.store.Presentations().GetAllByHolder(ctx, tenantID, holderDID)
+	if err != nil && !errors.Is(err, storage.ErrNotFound) {
+		errs = append(errs, fmt.Errorf("list presentations in tenant %s: %w", tenantID, err))
+	}
+	for _, pres := range presentations {
+		if err := s.store.Presentations().Delete(ctx, tenantID, holderDID, pres.PresentationIdentifier); err != nil && !errors.Is(err, storage.ErrNotFound) {
+			errs = append(errs, fmt.Errorf("delete presentation %s: %w", pres.PresentationIdentifier, err))
+		}
+	}
+	return errs
+}
+
+// deleteWalletInstances removes the user's wallet instances in every tenant and
+// returns what it could not do.
+func (s *UserService) deleteWalletInstances(ctx context.Context, userID domain.UserID) []error {
+	instances, errs := s.listWalletInstances(ctx, userID)
+	if len(errs) > 0 {
+		return errs
+	}
+	for _, inst := range instances {
+		// Keyed by id, tenant and owner so a replacement bound after the listing
+		// is not removed; a mismatch counts as incomplete.
+		if err := s.store.WalletInstances().DeleteIfUnchanged(ctx, inst.ID, inst.TenantID, inst.Binding()); err != nil {
+			if errors.Is(err, storage.ErrNotFound) || errors.Is(err, storage.ErrBindingChanged) {
+				err = fmt.Errorf("record is gone or no longer this user's in tenant %s: %w", inst.TenantID, err)
+			}
+			errs = append(errs, fmt.Errorf("delete wallet instance %s: %w", inst.ID, err))
+		}
+	}
+	return errs
+}
+
 // DeleteWebAuthnCredential deletes a WebAuthn credential
 func (s *UserService) DeleteWebAuthnCredential(ctx context.Context, userID domain.UserID, credentialID string, privateData []byte, ifMatch string) (string, error) {
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
+		return "", err
+	}
+	if err := refuseIfCutOff(ctx, user); err != nil {
 		return "", err
 	}
 
@@ -382,6 +717,9 @@ func (s *UserService) RenameWebAuthnCredential(ctx context.Context, userID domai
 	if err != nil {
 		return err
 	}
+	if err := refuseIfCutOff(ctx, user); err != nil {
+		return err
+	}
 
 	// Find and update the credential
 	found := false
@@ -410,6 +748,9 @@ func (s *UserService) RenameWebAuthnCredential(ctx context.Context, userID domai
 
 // UpdateUser updates a user
 func (s *UserService) UpdateUser(ctx context.Context, user *domain.User) error {
+	if err := refuseIfCutOff(ctx, user); err != nil {
+		return err
+	}
 	user.UpdatedAt = time.Now()
 	if err := s.store.Users().Update(ctx, user); err != nil {
 		return fmt.Errorf("failed to update user: %w", err)

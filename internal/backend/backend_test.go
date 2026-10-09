@@ -218,3 +218,10 @@ func TestMemoryBackend_DoesNotImplementDatabaseProvider(t *testing.T) {
 		t.Fatal("memoryBackend unexpectedly implements databaseProvider")
 	}
 }
+
+func TestNewReadOnly_MemoryFallsBackToNew(t *testing.T) {
+	b, err := NewReadOnly(context.Background(), &config.Config{Storage: config.StorageConfig{Type: "memory"}})
+	if err != nil || b == nil || b.Users() == nil {
+		t.Fatalf("NewReadOnly(memory) = %v, %v", b, err)
+	}
+}

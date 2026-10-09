@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -16,6 +17,8 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 )
@@ -137,12 +140,13 @@ func TestUpdateWalletInstanceStatus_Success(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
 	h := NewAdminHandlers(store, zap.NewNop(), nil)
+	h.SetLifecycle(service.NewWalletLifecycleService(store, zap.NewNop(), nil))
 	router := gin.New()
 	router.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
 
 	seedInstance(t, h, "inst-1", "acme", nil)
 
-	body := `{"status":"suspended","reason":"compliance review"}`
+	body := `{"status":"revoked","reason":"compliance review"}`
 	req := httptest.NewRequest(http.MethodPut, "/admin/tenants/acme/instances/inst-1/status", strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
@@ -156,8 +160,8 @@ func TestUpdateWalletInstanceStatus_Success(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if resp["status"] != "suspended" {
-		t.Errorf("expected status suspended, got %s", resp["status"])
+	if resp["status"] != "revoked" {
+		t.Errorf("expected status revoked, got %s", resp["status"])
 	}
 }
 
@@ -295,6 +299,7 @@ func TestUpdateWalletInstanceStatus_WithAudit_Revoked(t *testing.T) {
 	store := memory.NewStore()
 	auditor := testAuditEmitter(t)
 	h := NewAdminHandlers(store, zap.NewNop(), auditor)
+	h.SetLifecycle(service.NewWalletLifecycleService(store, zap.NewNop(), auditor))
 	router := gin.New()
 	router.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
 
@@ -311,28 +316,8 @@ func TestUpdateWalletInstanceStatus_WithAudit_Revoked(t *testing.T) {
 	}
 }
 
-func TestUpdateWalletInstanceStatus_WithAudit_Suspended(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	store := memory.NewStore()
-	auditor := testAuditEmitter(t)
-	h := NewAdminHandlers(store, zap.NewNop(), auditor)
-	router := gin.New()
-	router.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
-
-	seedInstance(t, h, "suspend-inst", "acme", nil)
-
-	body := `{"status":"suspended","reason":"under review"}`
-	req := httptest.NewRequest(http.MethodPut, "/admin/tenants/acme/instances/suspend-inst/status", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-}
-
-func TestUpdateWalletInstanceStatus_WithAudit_Reactivate(t *testing.T) {
+// "active" is not accepted: revocation is terminal, so reactivation is a 400 at the binding.
+func TestUpdateWalletInstanceStatus_RejectsReactivation(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
 	auditor := testAuditEmitter(t)
@@ -348,8 +333,16 @@ func TestUpdateWalletInstanceStatus_WithAudit_Reactivate(t *testing.T) {
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+
+	got, err := store.WalletInstances().GetByID(context.Background(), "reactivate-inst")
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.Status != domain.InstanceStatusActive {
+		t.Errorf("status = %s, want it untouched", got.Status)
 	}
 }
 
@@ -369,5 +362,261 @@ func TestDeleteWalletInstance_WithAudit(t *testing.T) {
 
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// With the shared lifecycle service wired (as BackendProvider does), an admin
+// revocation of the user's last instance runs the SID-AUTH-06 cascade.
+func TestUpdateWalletInstanceStatus_LifecycleCascade(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop(), testAuditEmitter(t))
+	h.SetLifecycle(service.NewWalletLifecycleService(store, zap.NewNop(), nil))
+	userID := domain.NewUserID()
+	if err := store.Users().Create(context.Background(), &domain.User{UUID: userID, PrivateData: []byte("vault")}); err != nil {
+		t.Fatal(err)
+	}
+	seedInstance(t, h, "inst-1", "acme", &userID)
+
+	r := gin.New()
+	r.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPut, "/admin/tenants/acme/instances/inst-1/status", strings.NewReader(`{"status":"revoked","reason":"compromised"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d %s", w.Code, w.Body.String())
+	}
+	inst, err := store.WalletInstances().GetByID(context.Background(), "inst-1")
+	if err != nil || inst.Status != domain.InstanceStatusRevoked {
+		t.Fatalf("expected revoked, got %v %v", err, inst)
+	}
+	user, err := store.Users().GetByID(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user.PrivateData != nil {
+		t.Errorf("revoking the last instance must erase the wallet's private data")
+	}
+
+	// Reactivation is refused at the binding: "revoked" is the only accepted status.
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPut, "/admin/tenants/acme/instances/inst-1/status", strings.NewReader(`{"status":"active"}`))
+	req.Header.Set("Content-Type", "application/json")
+	r.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+	inst, err = store.WalletInstances().GetByID(context.Background(), "inst-1")
+	if err != nil || inst.Status != domain.InstanceStatusRevoked {
+		t.Fatalf("status must still be revoked, got %v %v", err, inst)
+	}
+}
+
+// SID-AUTH-06: a revoked instance (owned or anonymous) is the tombstone that
+// keeps login and WIA refused; the admin API must not delete it.
+func TestDeleteWalletInstance_RevokedInstanceIsRetained(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
+	userID := domain.NewUserID()
+	seedInstance(t, h, "owned-revoked", "acme", &userID)
+	seedInstance(t, h, "stray-revoked", "acme", nil)
+	for _, id := range []string{"owned-revoked", "stray-revoked"} {
+		if err := store.WalletInstances().UpdateStatus(context.Background(), id, "acme", domain.InstanceStatusRevoked, "test"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	router := gin.New()
+	router.DELETE("/admin/tenants/:id/instances/:instance_id", h.DeleteWalletInstance)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/admin/tenants/acme/instances/owned-revoked", nil))
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), errCodeInstanceRetained) {
+		t.Fatalf("expected 409 %s, got %d %s", errCodeInstanceRetained, w.Code, w.Body.String())
+	}
+	if _, err := store.WalletInstances().GetByID(context.Background(), "owned-revoked"); err != nil {
+		t.Fatalf("the tombstone must still exist: %v", err)
+	}
+
+	w = httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/admin/tenants/acme/instances/stray-revoked", nil))
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), errCodeInstanceRetained) {
+		t.Fatalf("a revoked record without a user must be retained, got %d %s", w.Code, w.Body.String())
+	}
+	if _, err := store.WalletInstances().GetByID(context.Background(), "stray-revoked"); err != nil {
+		t.Fatalf("the unowned tombstone must still exist: %v", err)
+	}
+}
+
+// A revocation must never be answered 200 by a handler without a lifecycle
+// service: it would skip the cut-off, session drop and erasure. Both providers
+// wire the service, so this test guards against omission.
+func TestUpdateWalletInstanceStatus_FailsClosedWithoutLifecycle(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop(), nil) // deliberately no SetLifecycle
+	router := gin.New()
+	router.PUT("/admin/tenants/:id/instances/:instance_id/status", h.UpdateWalletInstanceStatus)
+
+	seedInstance(t, h, "no-lifecycle", "acme", nil)
+
+	body := `{"status":"revoked","reason":"stolen"}`
+	req := httptest.NewRequest(http.MethodPut, "/admin/tenants/acme/instances/no-lifecycle/status", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), errCodeLifecycleNotSupported) {
+		t.Errorf("expected %s, got %s", errCodeLifecycleNotSupported, w.Body.String())
+	}
+
+	got, err := store.WalletInstances().GetByID(context.Background(), "no-lifecycle")
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.Status != domain.InstanceStatusActive {
+		t.Errorf("status = %s, want it untouched - a refused revocation must change nothing", got.Status)
+	}
+}
+
+// A streamed body sends no Content-Length; the reason must still reach the audit trail.
+func TestRevokeAllWalletInstancesForUser_ReadsAChunkedBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
+	h.SetLifecycle(service.NewWalletLifecycleService(store, zap.NewNop(), nil))
+	router := gin.New()
+	router.POST("/admin/tenants/:id/users/:user_id/instances/revoke-all", h.RevokeAllWalletInstancesForUser)
+
+	userID := domain.NewUserID()
+	ctx := context.Background()
+	if err := store.Users().Create(ctx, &domain.User{UUID: userID, DID: "did:example:chunked"}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-chunked", TenantID: "acme", UserID: &userID, Status: domain.InstanceStatusActive,
+	}); err != nil {
+		t.Fatalf("seed instance: %v", err)
+	}
+
+	// An io.Reader of unknown length makes net/http send chunked with ContentLength -1.
+	body := io.NopCloser(strings.NewReader(`{"reason":"device reported stolen"}`))
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants/acme/users/"+userID.String()+"/instances/revoke-all", body)
+	req.ContentLength = -1
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	got, err := store.WalletInstances().GetByID(ctx, "inst-chunked")
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.DeactivationReason != "device reported stolen" {
+		t.Errorf("reason = %q, want it read from the chunked body", got.DeactivationReason)
+	}
+}
+
+// And an entirely absent body is still accepted.
+func TestRevokeAllWalletInstancesForUser_AcceptsNoBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
+	h.SetLifecycle(service.NewWalletLifecycleService(store, zap.NewNop(), nil))
+	router := gin.New()
+	router.POST("/admin/tenants/:id/users/:user_id/instances/revoke-all", h.RevokeAllWalletInstancesForUser)
+
+	userID := domain.NewUserID()
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants/acme/users/"+userID.String()+"/instances/revoke-all", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for an absent body, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// replacingInstanceStore re-attests the same thumbprint for another user of the
+// tenant between the handler's read and its conditional delete; the live,
+// owned replacement would pass the removability condition on its own.
+type replacingInstanceStore struct {
+	storage.Store
+	other domain.UserID
+}
+
+func (s *replacingInstanceStore) WalletInstances() storage.WalletInstanceStore {
+	return &replacingInstances{s.Store.WalletInstances(), s}
+}
+
+type replacingInstances struct {
+	storage.WalletInstanceStore
+	s *replacingInstanceStore
+}
+
+func (r *replacingInstances) DeleteIfRemovable(ctx context.Context, id string, tenantID domain.TenantID, exp domain.InstanceBinding) error {
+	cur, err := r.WalletInstanceStore.GetByID(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := r.WalletInstanceStore.DeleteIfUnchanged(ctx, id, tenantID, cur.Binding()); err != nil {
+		return err
+	}
+	other := r.s.other
+	if err := r.WalletInstanceStore.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: tenantID, UserID: &other, Status: domain.InstanceStatusActive}); err != nil {
+		return err
+	}
+	return r.WalletInstanceStore.DeleteIfRemovable(ctx, id, tenantID, exp)
+}
+
+func TestDeleteWalletInstance_ReplacementBetweenReadAndDeleteSurvives(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	base := memory.NewStore()
+	other := domain.NewUserID()
+	store := &replacingInstanceStore{Store: base, other: other}
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
+	seedInstance(t, h, "inst-1", "acme", nil)
+	router := gin.New()
+	router.DELETE("/admin/tenants/:id/instances/:instance_id", h.DeleteWalletInstance)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/admin/tenants/acme/instances/inst-1", nil))
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "wallet_instance_changed") {
+		t.Fatalf("expected 409 wallet_instance_changed, got %d %s", w.Code, w.Body.String())
+	}
+	got, err := base.WalletInstances().GetByID(context.Background(), "inst-1")
+	if err != nil {
+		t.Fatalf("the replacement must survive: %v", err)
+	}
+	if got.UserID == nil || *got.UserID != other || got.Status != domain.InstanceStatusActive {
+		t.Fatalf("the replacement must be untouched, got %+v", got)
+	}
+}
+
+// A live user-owned instance cannot be hard-deleted (it would skip the
+// lifecycle cascade); the admin is told to revoke.
+func TestDeleteWalletInstance_LiveUserOwnedIsRefused(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
+	userID := domain.NewUserID()
+	seedInstance(t, h, "owned-live", "acme", &userID)
+	router := gin.New()
+	router.DELETE("/admin/tenants/:id/instances/:instance_id", h.DeleteWalletInstance)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/admin/tenants/acme/instances/owned-live", nil))
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), errCodeInstanceOwned) {
+		t.Fatalf("expected 409 %s, got %d %s", errCodeInstanceOwned, w.Code, w.Body.String())
+	}
+	got, err := store.WalletInstances().GetByID(context.Background(), "owned-live")
+	if err != nil || got.Status != domain.InstanceStatusActive {
+		t.Fatalf("the live instance must be untouched: %v %+v", err, got)
 	}
 }

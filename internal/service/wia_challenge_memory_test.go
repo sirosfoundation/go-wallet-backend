@@ -20,12 +20,12 @@ func TestMemoryWIAChallengeStore_PutAndConsume(t *testing.T) {
 	assert.True(t, ok)
 
 	// Consume succeeds once
-	ok, err = store.Consume(ctx, "challenge-1")
+	ok, err = store.Consume(ctx, domain.DefaultTenantID, "challenge-1")
 	require.NoError(t, err)
 	assert.True(t, ok)
 
 	// Second consume fails (single-use)
-	ok, err = store.Consume(ctx, "challenge-1")
+	ok, err = store.Consume(ctx, domain.DefaultTenantID, "challenge-1")
 	require.NoError(t, err)
 	assert.False(t, ok)
 }
@@ -34,7 +34,7 @@ func TestMemoryWIAChallengeStore_ConsumeNonexistent(t *testing.T) {
 	store := newMemoryWIAChallengeStore(100, 100)
 	ctx := context.Background()
 
-	ok, err := store.Consume(ctx, "does-not-exist")
+	ok, err := store.Consume(ctx, domain.DefaultTenantID, "does-not-exist")
 	require.NoError(t, err)
 	assert.False(t, ok)
 }
@@ -93,8 +93,26 @@ func TestMemoryWIAChallengeStore_PerTenantCapacity(t *testing.T) {
 	assert.True(t, ok, "a different tenant must not be blocked by tenant A's cap")
 
 	// Consuming one of tenant A's challenges frees a slot for tenant A again.
-	consumed, _ := store.Consume(ctx, "a1")
+	consumed, _ := store.Consume(ctx, tenantA, "a1")
 	assert.True(t, consumed)
 	ok, _ = store.Put(ctx, tenantA, "a4", time.Now().Add(5*time.Minute))
 	assert.True(t, ok, "consuming a challenge should free tenant A's per-tenant slot")
+}
+
+// A challenge is bound to the tenant it was minted for: another tenant's
+// caller can neither redeem nor burn it.
+func TestMemoryWIAChallengeStore_ConsumeIsTenantBound(t *testing.T) {
+	store := newMemoryWIAChallengeStore(100, 100)
+	ctx := context.Background()
+	ok, err := store.Put(ctx, domain.TenantID("a"), "c1", time.Now().Add(time.Minute))
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	ok, err = store.Consume(ctx, domain.TenantID("b"), "c1")
+	require.NoError(t, err)
+	assert.False(t, ok, "another tenant must not redeem the challenge")
+
+	ok, err = store.Consume(ctx, domain.TenantID("a"), "c1")
+	require.NoError(t, err)
+	assert.True(t, ok, "the failed cross-tenant attempt must not have burned it")
 }

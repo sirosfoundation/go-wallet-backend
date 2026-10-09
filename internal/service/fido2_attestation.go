@@ -15,6 +15,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
@@ -57,7 +58,14 @@ type FIDO2AttestationService struct {
 	instances       storage.WalletInstanceStore
 	keyAttestations storage.KeyAttestationStore
 	trust           *trust.Service
+	// users is read for the SID-AUTH-06 cut-off at the write boundary. Nil disables
+	// the recheck.
+	users tokengate.UserLookup
 }
+
+// SetUsers wires the user store Verify rechecks the token cut-off against, before
+// and after recording the evidence.
+func (s *FIDO2AttestationService) SetUsers(users tokengate.UserLookup) { s.users = users }
 
 // NewFIDO2AttestationService creates a new FIDO2 attestation verifier. trust
 // evaluates the attestation's x5c chain against go-trust's fidomds3
@@ -187,12 +195,15 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 		return fmt.Errorf("%w: compute key thumbprint: %v", ErrFIDO2AttestationInvalid, err)
 	}
 
-	// TenantID is for auditing/scoping only - best-effort lookup, not part
-	// of the trust decision (which is keyed by thumbprint alone).
-	var tenantID domain.TenantID
-	if instance, err := s.instances.GetByID(ctx, req.WalletInstanceID); err == nil {
-		tenantID = instance.TenantID
+	// The instance must be live and belong to the authenticated tenant and user:
+	// keyAttestationTrustsBatch later trusts the evidence, so a token from another
+	// device must not attach it to a revoked or foreign instance. Same gate as key
+	// attestation generation; an unknown instance is refused too.
+	instance, err := refuseWalletInstance(ctx, s.instances, req.WalletInstanceID, true)
+	if err != nil {
+		return err
 	}
+	tenantID := instance.TenantID
 
 	verifiedAt := time.Now().UTC()
 	rec := &domain.KeyAttestationRecord{
@@ -202,8 +213,18 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 		AAGUID:           aaguid.String(),
 		VerifiedAt:       verifiedAt,
 	}
+	// Mutation-boundary gate: a cut-off since admission (the verification is slow)
+	// must stop the write.
+	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
+		return err
+	}
 	if err := s.keyAttestations.MarkKeyAttested(ctx, rec); err != nil {
 		return fmt.Errorf("%w: record verification: %v", ErrFIDO2AttestationInvalid, err)
+	}
+	// A cut-off during the write fails the request closed; the revocation cascade
+	// cleans up the record just written.
+	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
+		return err
 	}
 
 	s.logger.Info("FIDO2 hardware attestation verified",

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 )
@@ -13,6 +14,12 @@ var (
 	ErrAlreadyExists = errors.New("already exists")
 	ErrInvalidInput  = errors.New("invalid input")
 	ErrDatabase      = errors.New("database error")
+	// ErrBindingChanged is returned by conditional instance writes when the
+	// record is no longer the one the caller read. Nothing was written.
+	ErrBindingChanged = errors.New("wallet instance binding changed")
+	// ErrStaleWrite is returned when the stored cut-off advanced after the
+	// caller loaded the record; callers reload and re-check.
+	ErrStaleWrite = errors.New("stale write: the user's authorization changed since the record was loaded")
 )
 
 // TenantStore defines the interface for tenant storage operations
@@ -57,8 +64,26 @@ type UserTenantStore interface {
 	GetMembership(ctx context.Context, userID domain.UserID, tenantID domain.TenantID) (*domain.UserTenantMembership, error)
 }
 
+// DeletionTombstoneStore keeps the record DeleteUser leaves so the deleted
+// user's tokens stay refused.
+type DeletionTombstoneStore interface {
+	// PutDeletionTombstone records a deletion idempotently: earliest DeletedAt
+	// kept, expiry only moves later, tenant ids merged.
+	PutDeletionTombstone(ctx context.Context, t *domain.DeletionTombstone) error
+
+	// GetDeletionTombstone returns the tombstone or ErrNotFound; an expired but
+	// unswept one is still returned.
+	GetDeletionTombstone(ctx context.Context, userID string) (*domain.DeletionTombstone, error)
+
+	// DeleteExpiredDeletionTombstones removes tombstones expired by now and
+	// returns the count, for backends without a TTL index.
+	DeleteExpiredDeletionTombstones(ctx context.Context, now time.Time) (int, error)
+}
+
 // UserStore defines the interface for user storage operations
 type UserStore interface {
+	DeletionTombstoneStore
+
 	// Create creates a new user
 	Create(ctx context.Context, user *domain.User) error
 
@@ -71,7 +96,8 @@ type UserStore interface {
 	// GetByDID retrieves a user by DID
 	GetByDID(ctx context.Context, did string) (*domain.User, error)
 
-	// Update updates a user
+	// Update refuses (ErrStaleWrite) a record whose AuthFence is behind the
+	// stored one, so a stale copy cannot undo a cut-off or restore erased data.
 	Update(ctx context.Context, user *domain.User) error
 
 	// Delete deletes a user
@@ -79,6 +105,24 @@ type UserStore interface {
 
 	// UpdatePrivateData updates user's private data with optimistic locking
 	UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error
+
+	// InvalidateAuthBefore records that tokens issued before t are refused (see
+	// internal/tokengate). The cut-off only moves forward.
+	InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error
+
+	// InvalidateAuthBeforeForToken is an atomic compare-and-set: it advances the
+	// cut-off only while the stored one does not already refuse a token issued
+	// at tokenIssuedAt (whole seconds, tokengate.IssuedBeforeCutoff); otherwise
+	// it returns ErrStaleWrite. Zero tokenIssuedAt is unconditional.
+	InvalidateAuthBeforeForToken(ctx context.Context, id domain.UserID, t time.Time, tokenIssuedAt time.Time) error
+
+	// EraseWalletData erases the wallet key material and, in the same atomic
+	// write, advances the cut-off to fence.
+	EraseWalletData(ctx context.Context, id domain.UserID, fence time.Time) error
+
+	// GetAuthCutoff returns only the user's token cut-off, for the per-request
+	// gate.
+	GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, error)
 
 	// UpdateCredentialAuthenticator atomically persists a single WebAuthn
 	// credential's SignCount and CloneWarning, identified by the
@@ -141,6 +185,14 @@ type CredentialStore interface {
 
 	// Delete deletes a credential
 	Delete(ctx context.Context, tenantID domain.TenantID, holderDID, credentialIdentifier string) error
+
+	// DeleteIfUnchanged deletes the credential with this record id only if its
+	// WriteToken is unchanged; ErrNotFound otherwise. A compensating rollback.
+	DeleteIfUnchanged(ctx context.Context, tenantID domain.TenantID, id int64, writeToken string) error
+
+	// RestoreIfUnchanged replaces the credential (matched by record id and
+	// WriteToken) with previous; ErrNotFound if gone or rewritten.
+	RestoreIfUnchanged(ctx context.Context, written, previous *domain.VerifiableCredential) error
 }
 
 // PresentationStore defines the interface for presentation storage operations
@@ -162,6 +214,10 @@ type PresentationStore interface {
 
 	// Delete deletes a presentation
 	Delete(ctx context.Context, tenantID domain.TenantID, holderDID, presentationIdentifier string) error
+
+	// DeleteByID deletes the presentation with this record id; ErrNotFound if
+	// gone or replaced. A compensating rollback.
+	DeleteByID(ctx context.Context, tenantID domain.TenantID, id int64) error
 }
 
 // ChallengeStore defines the interface for WebAuthn challenge storage
@@ -327,6 +383,10 @@ type InviteStore interface {
 // WalletInstanceStore defines the interface for wallet instance storage
 type WalletInstanceStore interface {
 	// Upsert creates a new instance or updates an existing one (idempotent on first attestation).
+	// An existing instance keeps its Status and first non-empty CredentialID. On
+	// success instance.Generation is that of the record written; the bind and
+	// link are conditional on it, so a record re-created mid-call yields
+	// ErrBindingChanged.
 	Upsert(ctx context.Context, instance *domain.WalletInstance) error
 
 	// GetByID retrieves a wallet instance by its JWK Thumbprint ID.
@@ -338,14 +398,45 @@ type WalletInstanceStore interface {
 	// GetByUser retrieves all wallet instances belonging to a specific user.
 	GetByUser(ctx context.Context, tenantID domain.TenantID, userID domain.UserID) ([]*domain.WalletInstance, error)
 
-	// UpdateStatus updates the status of a wallet instance (activate, suspend, revoke).
-	UpdateStatus(ctx context.Context, id string, status domain.InstanceStatus, reason string) error
+	// GetAllByUser returns the user's instances in every tenant, so account
+	// deletion misses none.
+	GetAllByUser(ctx context.Context, userID domain.UserID) ([]*domain.WalletInstance, error)
+
+	// UpdateStatus revokes an instance (terminal, see
+	// domain.ValidateStatusTransition). The tenant is in the filter because the
+	// id is a global key; another tenant's record answers ErrNotFound.
+	UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, status domain.InstanceStatus, reason string) error
+
+	// UpdateStatusForUser is UpdateStatus with the owner in the filter too;
+	// another user's record answers ErrNotFound.
+	UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, userID domain.UserID, status domain.InstanceStatus, reason string) error
+
+	// UpdateStatusIfUnchanged is UpdateStatus conditional on tenantID,
+	// expected.Owner (nil meaning unowned) and expected.Generation.
+	// ErrBindingChanged if the record differs, ErrNotFound if gone or another
+	// tenant's, ErrInvalidStatusTransition if already revoked.
+	UpdateStatusIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding, status domain.InstanceStatus, reason string) error
+
+	// DeleteIfUnchanged hard-deletes atomically while the record matches
+	// expected (owner and generation); errors as UpdateStatusIfUnchanged minus
+	// the transition one.
+	DeleteIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding) error
 
 	// IncrementAttestation atomically increments the attestation count and updates last_attested_at.
 	IncrementAttestation(ctx context.Context, id string) error
 
 	// Delete hard-deletes a wallet instance.
 	Delete(ctx context.Context, id string) error
+
+	// DeleteForUser hard-deletes an instance only while it is in tenantID and
+	// bound to userID; otherwise ErrNotFound.
+	DeleteForUser(ctx context.Context, id string, tenantID domain.TenantID, userID domain.UserID) error
+
+	// DeleteIfRemovable hard-deletes an active instance still matching the one
+	// the caller read. ErrBindingChanged if replaced; ErrInvalidStatusTransition
+	// if it became a tombstone (which must survive); ErrNotFound if gone or
+	// another tenant's.
+	DeleteIfRemovable(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding) error
 }
 
 // KeyAttestationStore defines the interface for per-credential-key FIDO2

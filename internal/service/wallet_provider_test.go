@@ -82,6 +82,7 @@ func TestGenerateKeyAttestation_TopLevelSecurityProperties(t *testing.T) {
 	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
 	instanceID := "test-instance-native"
 	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+		Status:            domain.InstanceStatusActive,
 		ID:                instanceID,
 		AttestationSource: "ios_app_attest",
 	}); err != nil {
@@ -171,7 +172,8 @@ func TestGenerateKeyAttestation_SecurityProperties_TrustedWhenAllBatchKeysHaveEv
 	svc, instances, keyAttestations := newTestWalletProviderServiceWithInstances(t)
 	instanceID := "test-instance-fido2-hardware"
 	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
-		ID: instanceID,
+		Status: domain.InstanceStatusActive,
+		ID:     instanceID,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +223,7 @@ func TestGenerateKeyAttestation_SecurityProperties_TrustedWhenAllBatchKeysHaveEv
 func TestGenerateKeyAttestation_SecurityProperties_ClampedWhenOnlySomeBatchKeysHaveEvidence(t *testing.T) {
 	svc, instances, keyAttestations := newTestWalletProviderServiceWithInstances(t)
 	instanceID := "test-instance-mixed-batch"
-	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: instanceID}); err != nil {
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: instanceID, Status: domain.InstanceStatusActive}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -270,7 +272,7 @@ func TestGenerateKeyAttestation_SecurityProperties_ClampedWhenOnlySomeBatchKeysH
 func TestGenerateKeyAttestation_SecurityProperties_UnrelatedPriorAttestationDoesNotLeak(t *testing.T) {
 	svc, instances, keyAttestations := newTestWalletProviderServiceWithInstances(t)
 	instanceID := "test-instance-plugin-switch"
-	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: instanceID}); err != nil {
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: instanceID, Status: domain.InstanceStatusActive}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -389,6 +391,7 @@ func TestGenerateKeyAttestation_SecurityProperties_ClampedForBackendAttestedInst
 	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
 	instanceID := "test-instance-backend-attested"
 	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+		Status:            domain.InstanceStatusActive,
 		ID:                instanceID,
 		AttestationSource: "backend_attested",
 	}); err != nil {
@@ -435,6 +438,7 @@ func TestGenerateKeyAttestation_SecurityProperties_NormalizesRawVocabulary(t *te
 	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
 	instanceID := "test-instance-native-2"
 	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+		Status:            domain.InstanceStatusActive,
 		ID:                instanceID,
 		AttestationSource: "android_play_integrity",
 	}); err != nil {
@@ -469,6 +473,7 @@ func TestGenerateKeyAttestation_SecurityProperties_UnrecognizedValueDefaultsToBa
 	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
 	instanceID := "test-instance-native-3"
 	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+		Status:            domain.InstanceStatusActive,
 		ID:                instanceID,
 		AttestationSource: "ios_app_attest",
 	}); err != nil {
@@ -542,6 +547,7 @@ func TestGenerateKeyAttestation_NoSecurityProperties_TrustedStillEmitsFloor(t *t
 	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
 	instanceID := "test-instance-native-no-secprops"
 	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+		Status:            domain.InstanceStatusActive,
 		ID:                instanceID,
 		AttestationSource: "ios_app_attest",
 	}); err != nil {

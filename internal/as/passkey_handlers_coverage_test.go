@@ -3,7 +3,9 @@ package as
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +17,8 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
@@ -405,5 +409,55 @@ func TestPasskeyRegisterBegin_ErrorMapping(t *testing.T) {
 				t.Errorf("expected %d, got %d: %s", tc.wantStatus, w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+// SID-AUTH-06: the registration auto-login session inherits the token's iat, so
+// a cut-off between mint and store refuses it.
+func TestPasskeyRegisterFinish_SessionInheritsTokenIssuedAt(t *testing.T) {
+	iat := time.Now().Add(-10 * time.Second).Truncate(time.Second)
+	hdr := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	pl := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"iat":%d}`, iat.Unix())))
+	tok := hdr + "." + pl + ".sig"
+
+	mock := &capturingWebAuthn{mockWebAuthn: mockWebAuthn{
+		finishRegResp: &service.FinishRegistrationResponse{UUID: "user-1", TenantID: "t", Token: tok},
+	}}
+	h, store := newTestPasskeyHandlers(mock)
+	router := gin.New()
+	router.POST("/finish", h.RegisterFinish)
+	body, _ := json.Marshal(service.FinishRegistrationRequest{ChallengeID: "c1"})
+	req := httptest.NewRequest(http.MethodPost, "/finish", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var jti string
+	for _, ck := range w.Result().Cookies() {
+		if ck.Name == sessionCookieInsecure {
+			jti = ck.Value
+		}
+	}
+	sess, err := store.Get(context.Background(), jti)
+	if err != nil {
+		t.Fatalf("session not stored: %v", err)
+	}
+	if !sess.AuthenticatedAt.Equal(iat) {
+		t.Fatalf("AuthenticatedAt = %v, want the registration token iat %v", sess.AuthenticatedAt, iat)
+	}
+
+	// A cut-off between the token mint and the session store refuses it.
+	users := memory.NewStore().Users()
+	uid := domain.NewUserID()
+	if err := users.Create(context.Background(), &domain.User{UUID: uid}); err != nil {
+		t.Fatal(err)
+	}
+	if err := users.InvalidateAuthBefore(context.Background(), uid, iat.Add(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tokengate.New(users).Check(context.Background(), uid.String(), sess.authInstant()); !errors.Is(err, tokengate.ErrRevoked) {
+		t.Fatalf("session must be refused after a cut-off past the token iat, got %v", err)
 	}
 }

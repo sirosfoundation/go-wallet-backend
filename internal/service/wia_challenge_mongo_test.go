@@ -56,11 +56,11 @@ func TestMongoWIAChallengeStore_PutAndConsume(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	ok, err = store.Consume(ctx, "challenge-1")
+	ok, err = store.Consume(ctx, domain.DefaultTenantID, "challenge-1")
 	require.NoError(t, err)
 	require.True(t, ok, "first consume should succeed")
 
-	ok, err = store.Consume(ctx, "challenge-1")
+	ok, err = store.Consume(ctx, domain.DefaultTenantID, "challenge-1")
 	require.NoError(t, err)
 	require.False(t, ok, "second consume should fail (single-use)")
 }
@@ -139,4 +139,22 @@ func TestMongoWIAChallengeStore_PerTenantCapacity(t *testing.T) {
 	ok, err = store.Put(ctx, tenantB, "b1", time.Now().Add(5*time.Minute))
 	require.NoError(t, err)
 	require.True(t, ok, "a different tenant must not be blocked by tenant A's cap")
+}
+
+func TestMongoWIAChallengeStore_ConsumeIsTenantBound(t *testing.T) {
+	db := skipIfNoMongo(t)
+	ctx := context.Background()
+	store, err := NewMongoWIAChallengeStore(ctx, db, 100, 100)
+	require.NoError(t, err)
+
+	ok, err := store.Put(ctx, domain.TenantID("a"), "tb-1", time.Now().Add(5*time.Minute))
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	ok, err = store.Consume(ctx, domain.TenantID("b"), "tb-1")
+	require.NoError(t, err)
+	require.False(t, ok)
+	ok, err = store.Consume(ctx, domain.TenantID("a"), "tb-1")
+	require.NoError(t, err)
+	require.True(t, ok)
 }

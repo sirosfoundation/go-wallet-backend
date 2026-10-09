@@ -543,6 +543,58 @@ cp wallet.db wallet.db.backup
 cp wallet.db.backup wallet.db
 ```
 
+## Account Deletion Tombstones
+
+Deleting a user removes the record that carries the user's token cut-off
+(`AuthInvalidBefore`). Bearer tokens are stateless, so a token issued before
+the deletion would otherwise stay valid until it expires. `DeleteUser`
+therefore writes a **deletion tombstone** (user id, tenants, deleted-at,
+expires-at) as soon as it knows which tenants the account touches, before it
+removes any holder credential, presentation or wallet instance, and stops with
+`account deletion incomplete` (nothing deleted, safe to retry) if the write
+fails. Repeating a deletion rewrites the tombstone idempotently (earliest
+deleted-at, latest expiry, union of tenants). A tenant that only a late
+re-list of the wallet instances reveals is added to the tombstone before
+anything in it is removed.
+
+The token gate (both bearer middlewares, and the WIA attestation path) refuses
+every token whose user has no record but has a tombstone, whenever the token
+was issued (`401 Token has been revoked`). A user with neither a record nor a
+tombstone is an external identity (for example an OIDC-authenticated admin
+whose subject is the IdP's `sub`); those tokens are not judged, as before.
+
+A tombstone must outlive every token that could name the user. Its expiry is
+deletion time plus the longest of `jwt.expiry_hours`, `jwt.refresh_days`, the
+AS `default_token_ttl` and `audience_ttls`, and `as.session_ttl`, plus
+`security.deletion_tombstone.retention_margin_days` (default 30). The longest
+lifetime is floored at 365 days (the same floor as refresh-token family
+markers): tokens keep the expiry they were minted with, so lowering a
+lifetime later (for example `jwt.refresh_days`) must not shorten retention
+below what tokens issued under the earlier configuration may still carry. A
+deployment that ever issued tokens valid for more than a year must keep the
+larger lifetime configured. Raising a token lifetime only lengthens the
+tombstones written afterwards; tombstones already written keep the expiry
+they were given, a repeated deletion only moves it later, and neither the
+sweeper nor the TTL index removes a tombstone before its stored expiry.
+
+Expired tombstones are removed by two mechanisms:
+
+- MongoDB: the `user_deletion_tombstones` collection has a TTL index on
+  `expires_at` (created with the other indexes at start-up).
+- All backends: a sweeper started and stopped with the service workers runs
+  once at start-up and then every
+  `security.deletion_tombstone.cleanup_interval_seconds` (default 3600). It is
+  the only expiry for the in-memory store and a backstop for MongoDB's TTL
+  monitor, which can lag by about a minute. Running it on every replica is
+  harmless.
+
+A standalone engine (no backend role in the process) opens storage read-only
+and reads the tombstone whenever a token's user has no record, to tell a
+deleted account from an external identity. Its MongoDB principal therefore
+needs read access to both the `users` and `user_deletion_tombstones`
+collections (and nothing else); without the tombstone read, such tokens fail
+closed with a storage error at the handshake.
+
 ## Scaling Guidelines
 
 ### Vertical Scaling
@@ -555,6 +607,31 @@ cp wallet.db.backup wallet.db
 - Add more instances
 - Use load balancer
 - Required for > 1000 users
+
+### Single-replica limits
+
+Some state is held per process, not shared between replicas. Running more than
+one replica is supported, but these limits apply:
+
+- **Per-user lifecycle lock.** `WalletLifecycleService.LockUser` serializes, per
+  user, a first attestation's instance write with the revocation cascade's
+  "is anything still live? then erase" step. The lock is an in-process mutex:
+  it serializes work within one process, not across replicas. The cross-replica
+  window is covered by the WIA post-write recheck
+  (`revokeIfWalletDeactivatedMeanwhile`): after it writes an instance, the WIA
+  path re-reads the wallet's state, and an instance inserted after a
+  concurrent erasure on another replica is revoked again (and the erasure
+  re-run) instead of being kept. No external lock service is required.
+
+- **Holder-write fence.** A credential or presentation write re-reads the
+  user's token cut-off after it persists and removes itself if the token was
+  cut off meanwhile (`tokengate.ConfirmWrite`), by a rollback conditional on the
+  exact record it wrote (id and write token), so it never removes a record
+  recreated under the same identifier; every erasure advances the
+  cut-off before it sweeps. This is a store-level check, not an in-process lock,
+  so it holds across replicas as long as reads see the write (MongoDB: read
+  from the primary). See "Erasure and requests already in flight" in API.md for
+  the exact guarantee and its limits.
 
 #### Token revocation with several replicas
 
