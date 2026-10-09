@@ -2530,10 +2530,9 @@ func TestUserStore_UpdateRefusesStaleRecordAfterAuthCutoff(t *testing.T) {
 	}
 }
 
-// The stale-write fence is a counter, not a timestamp comparison: a copy
-// loaded before a lifecycle write is refused even when both carry the same
-// cut-off instant. The getters hand out snapshots, so the copy does not
-// silently observe the write through a shared pointer.
+// The stale-write fence is a counter, not a timestamp: a copy loaded before a
+// lifecycle write is refused even with an equal cut-off instant. Getters hand
+// out snapshots, so the copy does not observe the write through a pointer.
 func TestUserStore_FenceRefusesStaleCopyAtEqualCutoff(t *testing.T) {
 	store := NewStore()
 	ctx := context.Background()

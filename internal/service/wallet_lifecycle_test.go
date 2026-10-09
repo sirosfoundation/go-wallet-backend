@@ -28,9 +28,7 @@ func (f *fakeSessionCleaner) DeleteByUser(_ context.Context, userID string) erro
 	return nil
 }
 
-// failAfterInstances lets the first UpdateStatus through and fails every
-// later one, so a revoke-all can be made to fail part-way through (the
-// memory store returns instances in no particular order).
+// failAfterInstances lets the first UpdateStatus through and fails every later one.
 type failAfterInstances struct {
 	storage.WalletInstanceStore
 	allowed string
@@ -87,10 +85,7 @@ func lifecycleFixture(t *testing.T, statuses ...domain.InstanceStatus) (*WalletL
 
 func userActor(id domain.UserID) LifecycleActor { return LifecycleActor{Kind: "user", UserID: &id} }
 
-// Revoking one instance of several drops the user's sessions but erases
-// nothing: the wallet is only deactivated when no live instance is left
-// anywhere. There is no reversible state to test here - revocation is the
-// only status change a wallet instance has, and it cannot be undone.
+// Revoking one of several instances erases nothing; revocation is terminal.
 func TestWalletLifecycle_RevokingOneOfSeveralBlocksWithoutErasing(t *testing.T) {
 	svc, store, userID, sc := lifecycleFixture(t, domain.InstanceStatusActive, domain.InstanceStatusActive)
 	ctx := context.Background()
@@ -210,8 +205,7 @@ func TestWalletLifecycle_OwnershipAndTransitions(t *testing.T) {
 	assert.Nil(t, user.PrivateData, "the single instance was revoked, so the wallet is deactivated")
 }
 
-// SID-AUTH-06: revoking an instance also cuts off bearer tokens that were
-// issued before it, since dropping sessions does not invalidate them.
+// Revoking an instance also cuts off earlier bearer tokens.
 func TestWalletLifecycle_StatusChangeCutsOffIssuedTokens(t *testing.T) {
 	svc, store, userID, _ := lifecycleFixture(t, domain.InstanceStatusActive, domain.InstanceStatusActive)
 	ctx := context.Background()
@@ -226,11 +220,7 @@ func TestWalletLifecycle_StatusChangeCutsOffIssuedTokens(t *testing.T) {
 	assert.Equal(t, []byte("encrypted-vault"), user.PrivateData, "another instance is live, so nothing is erased")
 }
 
-// A revocation whose cascade failed answers ErrErasureIncomplete; repeating
-// the same request (same target status) must re-run the cascade, not answer
-// success while the old sessions are still live. Revocation is idempotent
-// for exactly this reason: the retry finds the instance already revoked and
-// still has to finish the work the first attempt left undone.
+// A failed cascade answers ErrErasureIncomplete and a repeat re-runs it.
 func TestWalletLifecycle_FailedCascadeRetryRerunsCascade(t *testing.T) {
 	svc, _, userID, sc := lifecycleFixture(t, domain.InstanceStatusActive, domain.InstanceStatusActive)
 	ctx := context.Background()
@@ -248,9 +238,7 @@ func TestWalletLifecycle_FailedCascadeRetryRerunsCascade(t *testing.T) {
 	assert.Equal(t, []string{userID.String()}, sc.users, "the retry dropped the sessions")
 }
 
-// When revoke-all fails part-way, the instances already revoked must still
-// get their cascade (tokens cut off, sessions dropped) instead of staying live
-// until the retry; the not-yet-revoked instance keeps the erasure off.
+// A partial revoke-all failure must still cascade for the instances already revoked.
 func TestWalletLifecycle_RevokeAllPartialFailureStillCascades(t *testing.T) {
 	svc, store, userID, sc := lifecycleFixture(t, domain.InstanceStatusActive, domain.InstanceStatusActive)
 	ctx := context.Background()
@@ -266,18 +254,8 @@ func TestWalletLifecycle_RevokeAllPartialFailureStillCascades(t *testing.T) {
 	assert.Equal(t, []byte("encrypted-vault"), user.PrivateData, "one instance is still active, so nothing is erased")
 }
 
-// TestWalletLifecycle_CutOffIsUserWideNotInstanceScoped pins the documented
-// scope of the cut-off: revoking one device of a two-device user cuts off
-// that user's tokens and drops that user's sessions, so the other device is
-// signed out too and has to authenticate again.
-//
-// This is wider than the change that caused it. It stays that way because a
-// bearer token and a session record carry the user and the tenant and no
-// wallet instance (see cutOffTokens), so there is nothing to narrow the
-// cut-off with: a device whose token was not cut off would keep it until it
-// expired, and nothing after login checks instance status. The test exists so
-// the day an instance identity does survive login, this assertion is the one
-// that has to be rewritten on purpose.
+// TestWalletLifecycle_CutOffIsUserWideNotInstanceScoped pins the user-wide
+// cut-off (tokens carry no instance identity; see cutOffTokens).
 func TestWalletLifecycle_CutOffIsUserWideNotInstanceScoped(t *testing.T) {
 	svc, store, userID, sc := lifecycleFixture(t, domain.InstanceStatusActive, domain.InstanceStatusActive)
 	ctx := context.Background()
@@ -296,10 +274,7 @@ func TestWalletLifecycle_CutOffIsUserWideNotInstanceScoped(t *testing.T) {
 		"the other instance keeps its status: it can log in again, it just cannot keep its session")
 }
 
-// seedLegacySuspended inserts an instance already in the pre-removal
-// "suspended" state, the way a record written by an earlier release sits in
-// the database. It goes in through Upsert because the stores refuse to write
-// that status any more - which is the point: it can be read, not created.
+// seedLegacySuspended inserts a legacy "suspended" record via Upsert.
 func seedLegacySuspended(t *testing.T, store storage.Store, id string, userID domain.UserID) {
 	t.Helper()
 	require.NoError(t, store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{
@@ -307,11 +282,8 @@ func seedLegacySuspended(t *testing.T, store storage.Store, id string, userID do
 	}))
 }
 
-// TestWalletLifecycle_LegacySuspendedIsNotLive covers records written before
-// suspension was removed. A suspended instance must be closable by an
-// operator, must not count as a live instance of the wallet, and must not
-// keep the wallet's data alive - otherwise removing the state would have
-// silently upgraded every suspended device back to a working one.
+// TestWalletLifecycle_LegacySuspendedIsNotLive: a legacy suspended instance
+// can be revoked and does not count as live.
 func TestWalletLifecycle_LegacySuspendedIsNotLive(t *testing.T) {
 	ctx := context.Background()
 
@@ -328,9 +300,7 @@ func TestWalletLifecycle_LegacySuspendedIsNotLive(t *testing.T) {
 		svc, store, userID, _ := lifecycleFixture(t, domain.InstanceStatusActive)
 		seedLegacySuspended(t, store, "inst-legacy", userID)
 
-		// Revoking the only live instance deactivates the wallet: the
-		// suspended one cannot log in or attest, so nothing is left to use
-		// the data.
+		// Revoking the only live instance deactivates the wallet.
 		_, err := svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, domain.DefaultTenantID, "inst-a", domain.InstanceStatusRevoked, "compromised")
 		require.NoError(t, err)
 		user, err := store.Users().GetByID(ctx, userID)
@@ -363,10 +333,8 @@ func TestWalletLifecycle_RevokeAllRefusesAnotherUsersWallet(t *testing.T) {
 	assert.Zero(t, n)
 }
 
-// The cut-off is recorded before the status write, so a login already past
-// its own lifecycle check can mint a token in between: it sees a live
-// instance, and its fresh iat clears that first cut-off. Advancing the
-// cut-off again after the write is what refuses such a token.
+// A token minted by a login racing the status write is refused by the
+// post-write cut-off.
 func TestWalletLifecycle_CutOffIsAdvancedAfterTheStatusWrite(t *testing.T) {
 	svc, store, userID, _ := lifecycleFixture(t, domain.InstanceStatusActive, domain.InstanceStatusActive)
 	ctx := context.Background()
@@ -374,10 +342,7 @@ func TestWalletLifecycle_CutOffIsAdvancedAfterTheStatusWrite(t *testing.T) {
 	_, err := svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, domain.DefaultTenantID, "inst-a", domain.InstanceStatusRevoked, "stolen")
 	require.NoError(t, err)
 
-	// The status write is the moment the sliver closes: a login that got its
-	// lifecycle check in before it saw a live instance. So the cut-off has
-	// to sit at or after that write, not before it. With only the pre-write
-	// cut-off this is false, and a token minted in between survives.
+	// The cut-off must sit at or after the status write, not before it.
 	revoked, err := store.WalletInstances().GetByID(ctx, "inst-a")
 	require.NoError(t, err)
 	cutoff, err := store.Users().GetAuthCutoff(ctx, userID)
@@ -387,10 +352,7 @@ func TestWalletLifecycle_CutOffIsAdvancedAfterTheStatusWrite(t *testing.T) {
 		cutoff, revoked.UpdatedAt)
 }
 
-// The account-deletion retry has to be able to find the tenant again. A
-// membership removed while one of its instances is still there would hide
-// that instance from the next attempt, which would then find nothing
-// outstanding and delete the account over the top of the orphan.
+// A removed membership must not hide a surviving instance from the deletion retry.
 func TestDeleteUser_KeepsMembershipWhenAnInstanceSurvives(t *testing.T) {
 	ctx := context.Background()
 	inner := memory.NewStore()
@@ -414,11 +376,7 @@ func TestDeleteUser_KeepsMembershipWhenAnInstanceSurvives(t *testing.T) {
 		"the membership must survive so the retry can still find this tenant")
 }
 
-// An instance can outlive the membership of its tenant: the admin
-// DELETE /admin/tenants/{id}/users/{user_id} removes a membership and
-// nothing else. The erasure decision must still see it. Missing it would
-// declare the wallet deactivated and erase the user's shared key material
-// while that instance could still log in.
+// An instance can outlive its tenant membership; erasure must still see it.
 func TestWalletLifecycle_OrphanedTenantInstanceKeepsSharedDataAlive(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()
@@ -429,8 +387,7 @@ func TestWalletLifecycle_OrphanedTenantInstanceKeepsSharedDataAlive(t *testing.T
 		UUID: userID, DID: "did:example:" + userID.String(),
 		PrivateData: []byte("encrypted-vault"), PrivateDataETag: "e1",
 	}))
-	// The only instance in the default tenant, plus one in a tenant the user
-	// has no membership row for.
+	// A default-tenant instance plus one in a tenant without a membership row.
 	require.NoError(t, store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
 		ID: "inst-default", TenantID: domain.DefaultTenantID, UserID: &userID, Status: domain.InstanceStatusActive,
 	}))
@@ -447,11 +404,7 @@ func TestWalletLifecycle_OrphanedTenantInstanceKeepsSharedDataAlive(t *testing.T
 		"a live instance remains in a tenant with no membership, so the shared key material must survive")
 }
 
-// The cut-off is advanced twice: once before the status write and once after
-// it. If the second one failed, the recorded cut-off predates the revocation
-// and every token minted in between stays valid. The idempotent retry has to
-// repair that, not just re-run the cascade, whose ensureCutoff leaves an
-// existing cut-off alone.
+// A retry must repair a cut-off older than the revocation, not just re-run the cascade.
 func TestWalletLifecycle_RetryRepairsACutOffOlderThanTheRevocation(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()
@@ -468,8 +421,7 @@ func TestWalletLifecycle_RetryRepairsACutOffOlderThanTheRevocation(t *testing.T)
 		ID: "inst-b", TenantID: domain.DefaultTenantID, UserID: &userID, Status: domain.InstanceStatusActive,
 	}))
 
-	// The state a half-finished first attempt leaves: a cut-off recorded
-	// before the revocation, and the revocation persisted after it.
+	// Half-finished first attempt: cut-off before the revocation, revocation after.
 	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now()))
 	stale, err := store.Users().GetAuthCutoff(ctx, userID)
 	require.NoError(t, err)
@@ -546,8 +498,7 @@ func holderDataCount(t *testing.T, store storage.Store, tid domain.TenantID, hol
 	return len(creds) + len(pres)
 }
 
-// Revoking in tenant A while tenant B still has a live instance erases
-// nothing at all, not even tenant A's credentials and presentations.
+// Revoking in tenant A while tenant B has a live instance erases nothing.
 func TestWalletLifecycle_RevokeInOneTenantErasesNothingWhileAnotherIsLive(t *testing.T) {
 	svc, store, _, holder := twoTenantFixture(t)
 	_, err := svc.ChangeStatus(context.Background(), LifecycleActor{Kind: "provider"}, tenantA, "inst-"+string(tenantA), domain.InstanceStatusRevoked, "lost")

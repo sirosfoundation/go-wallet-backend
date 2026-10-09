@@ -36,8 +36,7 @@ func (s *VerifierService) Create(ctx context.Context, tenantID domain.TenantID, 
 		return fmt.Errorf("verifier URL is required")
 	}
 
-	// SID-AUTH-06: judge the request's token against the cut-off as it stands
-	// now, at the mutation boundary, not as it stood at admission.
+	// SID-AUTH-06: judge the token against the cut-off as of now.
 	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
 		return err
 	}
@@ -79,8 +78,7 @@ func (s *VerifierService) GetAll(ctx context.Context, tenantID domain.TenantID) 
 
 // Update updates an existing verifier
 func (s *VerifierService) Update(ctx context.Context, verifier *domain.Verifier) error {
-	// SID-AUTH-06: judge the request's token against the cut-off as it stands
-	// now, at the mutation boundary, not as it stood at admission.
+	// SID-AUTH-06: judge the token against the cut-off as of now.
 	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
 		return err
 	}
@@ -101,8 +99,7 @@ func (s *VerifierService) Update(ctx context.Context, verifier *domain.Verifier)
 
 // Delete removes a verifier
 func (s *VerifierService) Delete(ctx context.Context, tenantID domain.TenantID, id int64) error {
-	// SID-AUTH-06: judge the request's token against the cut-off as it stands
-	// now, at the mutation boundary, not as it stood at admission.
+	// SID-AUTH-06: judge the token against the cut-off as of now.
 	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
 		return err
 	}

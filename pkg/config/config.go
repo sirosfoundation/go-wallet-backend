@@ -1847,13 +1847,8 @@ func (c *TokenBlacklistConfig) SetDefaults() {
 	}
 }
 
-// DeletionTombstoneConfig configures the tombstone DeleteUser leaves behind.
-//
-// Deleting a user removes the record that carries the token cut-off, so
-// without a tombstone every token issued before the deletion would be taken
-// for one of an unknown (external) identity and pass the token gate. The
-// tombstone outlives every token it could cover and is then removed by a
-// periodic sweeper (and, on MongoDB, by a TTL index).
+// DeletionTombstoneConfig configures the tombstones DeleteUser leaves so that
+// a deleted user's earlier tokens stay refused until they have all expired.
 type DeletionTombstoneConfig struct {
 	// CleanupIntervalSeconds is how often expired tombstones are swept.
 	// The sweeper is what expires tombstones on backends without a TTL index
@@ -1879,22 +1874,10 @@ func (c *DeletionTombstoneConfig) SetDefaults() {
 }
 
 // DeletionTombstoneRetention is how long a deletion tombstone must be kept:
-// the longest lifetime of any bearer token that can name the deleted user
-// (legacy access token JWT.ExpiryHours, refresh token JWT.RefreshDays, AS
-// access token TTLs, AS session TTL) plus RetentionMarginDays. A tombstone
-// that expired earlier would let a still-valid token for the deleted account
-// pass the token gate again.
-//
-// The lifetimes are floored at MinFamilyRetention, the same deployment-wide
-// floor used for refresh-token family markers. Tokens carry the expiry they
-// were minted with, but the only bound available at deletion time is the
-// CURRENT configuration; if a lifetime was lowered after tokens were issued
-// (e.g. jwt.refresh_days 365 -> 7), a tombstone sized from the new value
-// would expire while older tokens are still valid, and the token gate would
-// then treat the deleted user as an external identity and accept them.
-// The floor keeps retention from shrinking below what earlier configurations
-// with lifetimes up to a year may have issued; larger current lifetimes still
-// extend it. The margin is added on top of the floored value.
+// the longest bearer-token lifetime (JWT access/refresh, AS token and session
+// TTLs) plus RetentionMarginDays. The lifetimes are floored at
+// MinFamilyRetention because tokens carry the expiry of the configuration they
+// were minted under, which may have been longer than the current one.
 func (c *Config) DeletionTombstoneRetention() time.Duration {
 	margin := c.Security.DeletionTombstone
 	margin.SetDefaults()

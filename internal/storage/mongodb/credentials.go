@@ -113,10 +113,8 @@ func (s *CredentialStore) Delete(ctx context.Context, tenantID domain.TenantID, 
 	return nil
 }
 
-// DeleteIfUnchanged deletes the record in one atomic filtered DeleteOne: the
-// filter carries the record id and the write token, so a record that was
-// removed and recreated under the same business key (new id, new token) does
-// not match.
+// DeleteIfUnchanged is one atomic DeleteOne filtered on record id and write
+// token, so a record recreated under the same business key does not match.
 func (s *CredentialStore) DeleteIfUnchanged(ctx context.Context, tenantID domain.TenantID, id int64, writeToken string) error {
 	if writeToken == "" {
 		return storage.ErrNotFound

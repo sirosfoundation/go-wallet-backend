@@ -12,38 +12,20 @@ const (
 	InstanceStatusActive  InstanceStatus = "active"
 	InstanceStatusRevoked InstanceStatus = "revoked"
 
-	// InstanceStatusLegacySuspended is the reversible "suspended" state an
-	// instance could be put in before suspension was removed. Nothing enters
-	// it any more; it is named here because records written by an earlier
-	// release are still in the database and have to mean something definite.
-	//
-	// They mean "blocked": a suspended instance is not live, so it does not
-	// keep a wallet from being deactivated and its passkey does not log in.
-	// Reading it as live instead would hand back the login a provider had
-	// taken away, which is the opposite of what they asked for. Revoking one
-	// is a legal transition (see ValidateStatusTransition) so an operator can
-	// finish what they started, and a revoke-all sweeps them with everything
-	// else.
+	// InstanceStatusLegacySuspended is the old reversible "suspended" state
+	// still carried by older records. It means "blocked": not live, but may be
+	// revoked.
 	InstanceStatusLegacySuspended InstanceStatus = "suspended"
 )
 
-// IsLive reports whether an instance counts as a live instance of the wallet:
-// whether its passkey may log in, whether it may obtain a Wallet Instance
-// Attestation, and whether its existence keeps the wallet from being
-// deactivated and its data erased.
-//
-// Only "active" is live. This is deliberately not "anything but revoked":
-// a legacy suspended record is neither, and counting it as live would both
-// restore a login a provider removed and stop the erasure of a wallet that
-// has nothing left to use it.
+// IsLive reports whether an instance is live (passkey may log in, may obtain a
+// WIA, keeps the wallet from being deactivated). Only "active" is live, so a
+// legacy suspended record never restores a login.
 func (s InstanceStatus) IsLive() bool { return s == InstanceStatusActive }
 
-// IsKnownNonLive reports whether s is a status that positively means "this
-// instance cannot be used": revoked, or the legacy suspended state. It is not
-// the complement of IsLive. An unknown or corrupted value is neither live nor
-// known non-live, and a decision that destroys data or declares the wallet
-// deactivated must not be taken on it: those callers use this instead of
-// !IsLive and fail closed on anything else.
+// IsKnownNonLive reports whether s positively means "cannot be used" (revoked or
+// legacy suspended). Unknown values are neither live nor known non-live, so
+// data-destroying callers use this, not !IsLive, and fail closed.
 func (s InstanceStatus) IsKnownNonLive() bool {
 	return s == InstanceStatusRevoked || s == InstanceStatusLegacySuspended
 }
@@ -52,18 +34,9 @@ func (s InstanceStatus) IsKnownNonLive() bool {
 var ErrInvalidStatusTransition = errors.New("invalid status transition")
 
 // ValidateStatusTransition checks whether transitioning from current to target
-// is a legal state change. Revocation is the only one, and it is terminal, so
-// nothing leaves the revoked state. A legacy suspended record may be revoked,
-// which is the only way to move it at all.
-//
-// A wallet instance has no reversible state, and that is deliberate. The ARF
-// gives a Wallet Unit four states - Installed, Operational, Valid, Revoked -
-// and says "Wallet Units can only be revoked" and "Revocation cannot be
-// undone". Suspension exists in the ARF, but for Wallet Solutions, for PID
-// and Attestation Provider registrations and for Relying Party registrations,
-// never for a unit. A suspended instance state would therefore mean nothing
-// to a relying party, and the status lists the ARF defines for Wallet
-// Instance Attestations carry no value it could be published as.
+// is a legal state change. Revocation is the only one and it is terminal; a
+// legacy suspended record may be revoked. The ARF has no reversible Wallet Unit
+// state ("can only be revoked"), hence none here.
 func ValidateStatusTransition(current, target InstanceStatus) error {
 	if current == target {
 		return nil // no-op
@@ -74,13 +47,10 @@ func ValidateStatusTransition(current, target InstanceStatus) error {
 	return ErrInvalidStatusTransition
 }
 
-// RevocableStatuses lists the stored statuses an instance may be revoked from:
-// active, and the legacy suspended state. Anything else - an unknown or
-// corrupted value included - is not a legal source state, so revoking it fails
-// closed instead of turning a record nobody understands into a non-live one
-// (which would let the lifecycle cascade treat the wallet as deactivated and
-// erase its data). Storage backends build their conditional-update filters
-// from this list so they enforce the same rule as ValidateStatusTransition.
+// RevocableStatuses lists the statuses an instance may be revoked from: active
+// and legacy suspended. Anything else, an unknown value included, fails closed,
+// since revoking it would let the cascade erase data. Storage filters are built
+// from this list.
 func RevocableStatuses() []InstanceStatus {
 	return []InstanceStatus{InstanceStatusActive, InstanceStatusLegacySuspended}
 }
@@ -147,27 +117,19 @@ type WalletInstance struct {
 	// UserID is the user who owns this instance (if known).
 	UserID *UserID `json:"user_id,omitempty" bson:"user_id,omitempty"`
 
-	// Status is the lifecycle state: active or revoked, or the legacy
-	// "suspended" of a record written before suspension was removed. Use
-	// IsLive rather than comparing against revoked.
+	// Status is the lifecycle state (active, revoked, or legacy "suspended");
+	// use IsLive.
 	Status InstanceStatus `json:"status" bson:"status"`
 
 	// WSCDType identifies the type of WSCD backing this instance.
 	WSCDType WSCDType `json:"wscd_type" bson:"wscd_type"`
 
 	// CredentialID is the WebAuthn credential ID (base64url) of the passkey
-	// that created this instance, recorded whatever backs the instance: it
-	// started out as a correlation aid for the admin on WSCDTypeWebCrypto,
-	// but SID-AUTH-06 made it the key of the per-instance login gate
-	// (WebAuthnService.checkWalletLifecycle), which a native iOS or Android
-	// wallet needs as much as a Web Crypto one - revoking a device's
-	// instance has to refuse that device's passkey. The wallet supplies it
-	// at WIA generation and it must be one of the caller's own passkeys in
-	// the caller's tenant, or the request is refused with
-	// CREDENTIAL_NOT_OWNED; the first link recorded for an instance wins.
-	// Binding it to the passkey that actually authenticated the request -
-	// rather than to any passkey the caller owns - needs a credential id in
-	// the session and the token, tracked in go-wallet-backend#333.
+	// that created this instance; it keys the per-instance login gate
+	// (WebAuthnService.checkWalletLifecycle). It must be one of the caller's own
+	// passkeys in the tenant (else CREDENTIAL_NOT_OWNED) and the first link
+	// wins; binding it to the authenticating passkey is tracked in
+	// go-wallet-backend#333.
 	CredentialID string `json:"credential_id,omitempty" bson:"credential_id,omitempty"`
 
 	// R2PSClientID is the client_id used in R2PS sessions for this instance.
@@ -190,16 +152,10 @@ type WalletInstance struct {
 	// AttestationCount is the total number of WIAs issued to this instance.
 	AttestationCount int64 `json:"attestation_count" bson:"attestation_count"`
 
-	// Generation identifies this exact record. The store assigns a fresh
-	// random value when it inserts the record, and it never changes for the
-	// life of the record. The id is a global key (the instance-key
-	// thumbprint), so a record that is deleted and attested again - possibly
-	// by another user of the same tenant - has the same id and tenant as its
-	// predecessor; only the generation tells the two apart. Together with the
-	// owner it forms the InstanceBinding that conditional writes carry.
-	//
-	// A record written before the field existed has none (""), and matches an
-	// expected binding whose generation is empty.
+	// Generation identifies this exact record: random, assigned at insert, never
+	// changed. A deleted and re-attested record has the same id and tenant, so
+	// only the generation tells them apart. "" on records written before the
+	// field existed.
 	Generation string `json:"-" bson:"generation,omitempty"`
 
 	// CreatedAt is when this instance was first seen (first WIA issuance).
@@ -208,9 +164,7 @@ type WalletInstance struct {
 	// UpdatedAt tracks the last modification time.
 	UpdatedAt time.Time `json:"updated_at" bson:"updated_at"`
 
-	// DeactivatedAt is set when the instance is revoked. The stored field
-	// keeps its name because it is persisted; revocation is the only thing
-	// that sets it.
+	// DeactivatedAt is set when the instance is revoked.
 	DeactivatedAt *time.Time `json:"deactivated_at,omitempty" bson:"deactivated_at,omitempty"`
 
 	// DeactivationReason provides context for the revocation.
@@ -233,12 +187,9 @@ type SecurityProperties struct {
 	Certification      string   `json:"certification,omitempty" bson:"certification,omitempty"` // Certification scheme URI
 }
 
-// InstanceBinding identifies the exact record a caller observed: who owned it
-// (nil for an unowned one) and which generation of the record it was.
-// Conditional store writes (UpdateStatusIfUnchanged, DeleteIfUnchanged,
-// DeleteIfRemovable) apply only while the stored record still matches, so a
-// write decided from an earlier read cannot land on a replacement record that
-// has the same id and tenant.
+// InstanceBinding identifies the exact record a caller observed: owner (nil if
+// unowned) and generation. Conditional store writes apply only while the stored
+// record still matches.
 type InstanceBinding struct {
 	Owner      *UserID
 	Generation string

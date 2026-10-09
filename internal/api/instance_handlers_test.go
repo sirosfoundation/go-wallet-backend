@@ -17,8 +17,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
-// setupLifecycleHandlers is setupTestHandlers with the store exposed on the
-// Handlers (NewHandlersWithStore) so the test can seed instances directly.
+// setupLifecycleHandlers is setupTestHandlers with the store exposed, to seed instances.
 func setupLifecycleHandlers(t *testing.T) (*Handlers, *gin.Engine) {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
@@ -41,9 +40,7 @@ func seedUserInstance(t *testing.T, h *Handlers, id string, userID domain.UserID
 	}
 }
 
-// A user sees their own instances and nobody else's. Listing is all the
-// self-service surface does with them: changing a status is a provider
-// action (SID-AUTH-06), because it is reversible only by a provider.
+// A user sees their own instances and nobody else's; status changes are a provider action (SID-AUTH-06).
 func TestListMyWalletInstances_OnlyMine(t *testing.T) {
 	handlers, _ := setupLifecycleHandlers(t)
 	me := domain.UserIDFromString("user-123")
@@ -73,11 +70,8 @@ func TestListMyWalletInstances_OnlyMine(t *testing.T) {
 	}
 }
 
-// The self-service routes no longer offer a status change or a revoke-all:
-// a user who revoked the instance behind their last passkey
-// could not undo it without an administrator. What a user can do to
-// themselves is log out everywhere, which a new login undoes, and remove the
-// account, which is meant to be final.
+// The self-service routes offer no status change or revoke-all: a revocation
+// can only be undone by an administrator.
 func TestSelfServiceOffersNoInstanceStatusChange(t *testing.T) {
 	handlers, _ := setupLifecycleHandlers(t)
 	r := instanceRoutes(handlers, authMiddleware("user-123", "did:example:123"))

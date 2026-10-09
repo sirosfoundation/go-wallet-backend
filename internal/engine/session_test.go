@@ -677,7 +677,7 @@ func runHandleFlowStartWithID(t *testing.T, m *Manager, tac claims.TAC, protocol
 }
 
 // runHandleFlowStartAs is runHandleFlowStartWithID for a session of the given
-// user; "" is an anonymous session.
+// user ("" is anonymous).
 func runHandleFlowStartAs(t *testing.T, m *Manager, tac claims.TAC, protocol Protocol, flowID, userID string) *FlowErrorMessage {
 	t.Helper()
 
@@ -1022,8 +1022,8 @@ func TestBaseHandler_CompleteWithRefreshToken(t *testing.T) {
 	assert.Equal(t, "handler-refresh-token-value", received["refresh_token"])
 }
 
-// SID-AUTH-06: a token issued before the user's wallet was
-// revoked cannot open a new engine session.
+// SID-AUTH-06: a token issued before the wallet's revocation cannot open a
+// new engine session.
 func TestManager_validateToken_RefusesTokenBeforeAuthCutoff(t *testing.T) {
 	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
 	m := NewManager(cfg, zap.NewNop())
@@ -1050,10 +1050,8 @@ func TestManager_validateToken_RefusesTokenBeforeAuthCutoff(t *testing.T) {
 	assert.NoError(t, err, "a token issued after the cut-off opens a session")
 }
 
-// Revoking a wallet instance must end the user's *live*
-// WebSocket session, not just forget its persisted record: the Manager is the
-// service.SessionCleaner precisely so an already-connected client cannot keep
-// running flows after the token gate would refuse a new handshake.
+// Revoking a wallet instance must close the user's live WebSocket, not only
+// delete the persisted record (the Manager is the service.SessionCleaner).
 func TestManager_DeleteByUser_ClosesLiveSessionAndStoreRecord(t *testing.T) {
 	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
 	m := NewManager(cfg, zap.NewNop())
@@ -1098,9 +1096,8 @@ func TestManager_DeleteByUser_ClosesLiveSessionAndStoreRecord(t *testing.T) {
 	assert.NoError(t, m.DeleteByUser(context.Background(), "nobody"), "idempotent for unknown users")
 }
 
-// SID-AUTH-06: an established session is re-checked against the user's token
-// cut-off when a flow starts, so a suspension or revocation that another
-// process or instance performed still stops this wallet at its next flow.
+// SID-AUTH-06: an established session is re-checked against the token cut-off
+// when a flow starts, so a revocation made elsewhere still stops this wallet.
 func TestManager_recheckToken_RefusesEstablishedSessionAfterCutoff(t *testing.T) {
 	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
 	m := NewManager(cfg, zap.NewNop())
@@ -1112,14 +1109,13 @@ func TestManager_recheckToken_RefusesEstablishedSessionAfterCutoff(t *testing.T)
 	session := &Session{ID: "s1", UserID: uid.String(), tokenIssuedAt: time.Now().Add(-time.Minute)}
 	require.NoError(t, m.recheckToken(session), "no cut-off yet")
 
-	// The wallet is revoked by a request carrying "acting-jti", which the
-	// backend keeps exempt so that request can be repeated.
+	// Revoked by a request carrying "acting-jti", which the backend exempts so
+	// that request can be repeated.
 	require.NoError(t, store.Users().InvalidateAuthBefore(context.Background(), uid, time.Now()))
 	assert.ErrorIs(t, m.recheckToken(session), tokengate.ErrRevoked, "the handshake token predates the cut-off")
 
-	// No token is exempt anywhere: the backend's gate refuses the same token
-	// the engine just refused, so a socket held by another engine process
-	// cannot outlive the cut-off either.
+	// No token is exempt here: the backend gate refuses the same token, so a
+	// socket held by another engine process cannot outlive the cut-off.
 	gate := tokengate.New(store.Users())
 	assert.ErrorIs(t, gate.Check(context.Background(), uid.String(), session.tokenIssuedAt), tokengate.ErrRevoked,
 		"the backend gate refuses it too")
@@ -1131,12 +1127,9 @@ func TestManager_recheckToken_RefusesEstablishedSessionAfterCutoff(t *testing.T)
 	assert.NoError(t, NewManager(cfg, zap.NewNop()).recheckToken(session), "no gate configured: nothing enforced")
 }
 
-// A revocation can arrive while a flow's handler is still being built. The
-// flow is published on the session before the handler exists, and each
-// handler installs its own cancellation at the top of Execute, so cancelling
-// through the handler alone would find nothing and the flow would run on.
-// The flow's own context is created before it is visible, so cancelling it
-// always lands.
+// A revocation can arrive while a flow's handler is still being built.
+// Cancelling through the handler alone would find nothing, so the flow's own
+// context, created before the flow is visible, must be cancelled.
 func TestFlow_CancelBeforeHandlerIsBuilt(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	flow := &Flow{ID: "f1", cancel: cancel, Data: map[string]interface{}{}}
@@ -1156,8 +1149,8 @@ func TestFlow_CancelBeforeHandlerIsBuilt(t *testing.T) {
 	flow.Cancel()
 }
 
-// Cancel must not race the handler assignment: both go through the flow's
-// own lock. Run with -race.
+// Cancel must not race the handler assignment (both use the flow's lock);
+// run with -race.
 func TestFlow_CancelRacesHandlerAssignment(t *testing.T) {
 	_, cancel := context.WithCancel(context.Background())
 	flow := &Flow{ID: "f2", cancel: cancel, Data: map[string]interface{}{}}
@@ -1554,9 +1547,8 @@ func TestManager_RevokeUser_WorksWithoutTokenBlacklistFeature(t *testing.T) {
 }
 
 // SID-AUTH-06 race: the cut-off lands after validateToken's gate check but
-// before registerSession. The sweep cannot see the not-yet-indexed session,
-// so the post-registration recheck must refuse it and close the socket
-// immediately rather than leave it connected until a flow starts.
+// before registerSession, so the sweep misses the session and the
+// post-registration recheck must refuse it and close the socket.
 func TestHandshake_CutoffBetweenValidationAndRegistrationClosesSocket(t *testing.T) {
 	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
 	m := NewManager(cfg, zap.NewNop())
@@ -1595,10 +1587,8 @@ func TestHandshake_CutoffBetweenValidationAndRegistrationClosesSocket(t *testing
 		assert.NotContains(t, string(data), TypeHandshakeComplete, "a revoked token must never get handshake_complete")
 	}
 	assert.True(t, hookRan.Load())
-	// The close frame is written before the handler returns, and the
-	// deferred unregisterSession runs only then, so the client can observe
-	// the closed socket a moment before the bookkeeping is cleaned up.
-	// Wait for that rather than asserting at the instant of close.
+	// The close frame precedes the deferred unregisterSession, so wait for
+	// the bookkeeping rather than asserting at the instant of close.
 	assert.Eventually(t, func() bool {
 		m.sessionsMu.RLock()
 		defer m.sessionsMu.RUnlock()
@@ -1606,8 +1596,8 @@ func TestHandshake_CutoffBetweenValidationAndRegistrationClosesSocket(t *testing
 	}, 2*time.Second, 5*time.Millisecond, "the refused session must not stay registered")
 }
 
-// An anonymous token (no user) is for registry/metadata lookups: it may run the
-// VCTM lookup flow, but not a flow that acts for a wallet.
+// An anonymous token (no user) may run the VCTM lookup flow but not a flow
+// that acts for a wallet.
 func TestManager_handleFlowStart_AnonymousSessionMayOnlyLookUpMetadata(t *testing.T) {
 	m := newManagerWithStubOID4VCIHandler(t)
 	m.RegisterFlowHandler(ProtocolOID4VP, func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
@@ -1627,10 +1617,8 @@ func TestManager_handleFlowStart_AnonymousSessionMayOnlyLookUpMetadata(t *testin
 	assert.Nil(t, runHandleFlowStartAs(t, m, "rli", ProtocolOID4VCI, "", "some-user"))
 }
 
-// TestManager_NilTokenGate pins the documented no-gate behavior of a
-// standalone engine with memory/no storage (NewStandaloneTokenGate returns a
-// nil gate): the legacy handshake branch and recheckToken must not
-// dereference it.
+// TestManager_NilTokenGate pins that a standalone engine with no storage
+// (nil gate) must not dereference it in the handshake branch or recheckToken.
 func TestManager_NilTokenGate(t *testing.T) {
 	m := NewManager(&config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}, zap.NewNop())
 	m.SetTokenGate(nil)

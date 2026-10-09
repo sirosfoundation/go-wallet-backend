@@ -311,21 +311,14 @@ func main() {
 		engineProvider = provider
 	}
 
-	// Wire session cleaners into UserService so DeleteUser purges AS cookie
-	// sessions and, when the engine runs in this process, live engine
-	// (WebSocket) sessions alike, and into the wallet lifecycle service so
-	// revoking a wallet instance drops the same sessions
-	// (SID-AUTH-06). The AS cleaner is wired regardless of the engine role:
-	// a --mode=backend deployment has AS sessions to drop too. The engine
-	// cleaner is the Manager, which closes the open WebSocket as well as
-	// deleting the persisted record.
+	// Wire session cleaners into UserService (DeleteUser) and the lifecycle
+	// service (SID-AUTH-06): the AS cleaner always, since --mode=backend has AS
+	// sessions too; the engine cleaner (the Manager) also closes live WebSockets.
 	if backendProvider != nil {
 		cleaners := service.MultiSessionCleaner{backendProvider.ASSessionCleaner()}
 		if engineProvider != nil {
 			cleaners = append(cleaners, engineProvider.SessionCleaner())
-			// Account deletion (unlike wallet-instance revocation or "log
-			// out everywhere", which share the cleaner above) also bars the
-			// user from reconnecting to this engine at all (#393/#403).
+			// Account deletion also bars the user from reconnecting to this engine (#393/#403).
 			backendProvider.Services().User.AddUserRevoker(engineProvider.Manager())
 		}
 		backendProvider.Services().User.SetSessionCleaner(cleaners)
@@ -339,10 +332,8 @@ func main() {
 		if err != nil {
 			logger.Fatal("Failed to create admin provider", zap.Error(err))
 		}
-		// --mode=admin,engine is a valid combination, and then the live
-		// WebSocket sessions an admin revocation has to drop are in this
-		// process after all. Without this the cascade would cut the user's
-		// tokens off but leave the socket open until its next gate check.
+		// --mode=admin,engine is valid: the live WebSockets an admin
+		// revocation must drop are then in this process.
 		if engineProvider != nil {
 			provider.SetSessionCleaner(engineProvider.SessionCleaner())
 		}

@@ -20,9 +20,9 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
-// SID-AUTH-06: a request admitted before a cut-off must be refused at the
-// mutation/minting boundary of each wallet-scoped service, with the cut-off
-// landing between admission and the mint/write.
+// SID-AUTH-06: a request admitted before a cut-off must be refused at each
+// wallet-scoped service's mutation/minting boundary when the cut-off lands
+// between admission and the mint/write.
 
 func TestGenerateKeyAttestation_CutoffBetweenAdmissionAndMintIsRefused(t *testing.T) {
 	for _, tc := range []struct {
@@ -107,9 +107,8 @@ func TestProxyService_Execute_CutoffAfterAdmissionIsRefused(t *testing.T) {
 	assert.Zero(t, hits.Load(), "the outbound request must not be made")
 }
 
-// The early check passes, then the cut-off lands during marshaling, request
-// construction or header processing: the final recheck immediately before
-// dispatch must still stop the outbound request.
+// The early check passes, then the cut-off lands during marshaling or header
+// processing: the final recheck before dispatch must still stop the request.
 func TestProxyService_Execute_CutoffBetweenEarlyCheckAndDispatchIsRefused(t *testing.T) {
 	var hits atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -134,10 +133,9 @@ func TestProxyService_Execute_CutoffBetweenEarlyCheckAndDispatchIsRefused(t *tes
 	assert.Equal(t, 2, users.reads, "the early and the pre-dispatch check must both read the cut-off")
 }
 
-// The user-wide cut-off is not the instance's state: a token that is fresh
-// for its user can name a revoked instance (or another user's) and must not
-// obtain a KA for it, including a revoked native-attested one that
-// keyAttestationTrustsBatch would otherwise treat as trusted.
+// The user-wide cut-off is not instance state: a fresh token can name a revoked
+// (or another user's) instance and must not get a KA for it, even a revoked
+// native-attested one keyAttestationTrustsBatch would trust.
 func TestGenerateKeyAttestation_RefusesNonLiveOrForeignInstance(t *testing.T) {
 	base := context.Background()
 	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
@@ -165,9 +163,8 @@ func TestGenerateKeyAttestation_RefusesNonLiveOrForeignInstance(t *testing.T) {
 	assert.ErrorIs(t, err, ErrKeyAttestationInstanceRefused)
 }
 
-// An instance not yet bound to a user is nobody's: a token with a subject must
-// not mint a KA for it merely by knowing its id. Once bound to the caller it
-// is accepted.
+// An unbound instance is nobody's: a token with a subject must not mint a KA for
+// it merely by knowing its id. Once bound to the caller it is accepted.
 func TestGenerateKeyAttestation_RefusesUnboundInstanceForSubject(t *testing.T) {
 	base := context.Background()
 	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
@@ -185,8 +182,7 @@ func TestGenerateKeyAttestation_RefusesUnboundInstanceForSubject(t *testing.T) {
 	assert.NoError(t, err, "bound to the caller")
 }
 
-// flipAfterGets reports a revoked status from the nth GetByID on, modelling an
-// instance revoked while the KA is being signed.
+// flipAfterGets reports a revoked status from the nth GetByID on.
 type flipAfterGets struct {
 	storage.WalletInstanceStore
 	after, calls int
@@ -212,8 +208,8 @@ func TestGenerateKeyAttestation_InstanceRevokedWhileSigningIsRefused(t *testing.
 	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
 	owner := domain.NewUserID()
 	require.NoError(t, instances.Upsert(base, &domain.WalletInstance{ID: "inst", TenantID: "t", UserID: &owner, Status: domain.InstanceStatusActive}))
-	// No security_properties: the pre-mint check is the only GetByID before
-	// the post-signing one, so after=1 flips exactly the last look.
+	// No security_properties: the pre-mint check is the only GetByID before the
+	// post-signing one, so after=1 flips the last look.
 	svc.instances = &flipAfterGets{WalletInstanceStore: instances, after: 1}
 
 	ka, err := svc.GenerateKeyAttestation(tokengate.WithSubject(base, owner.String(), time.Now()),
@@ -235,9 +231,8 @@ func TestGenerateKeyAttestation_RefusesInstanceOfAnotherTenant(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// A foreign instance is refused the same way whatever its lifecycle state:
-// ownership is judged before status, so the response does not tell a caller
-// that somebody else's instance is revoked.
+// A foreign instance is refused the same way whatever its state: ownership is
+// judged before status, so callers cannot learn another's instance is revoked.
 func TestGenerateKeyAttestation_ForeignInstanceDoesNotLeakLifecycleState(t *testing.T) {
 	base := context.Background()
 	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)

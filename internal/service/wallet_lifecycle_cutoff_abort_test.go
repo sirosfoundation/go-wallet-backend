@@ -12,9 +12,8 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 )
 
-// seedRevokedWithStaleCutoff leaves the state of a half-finished revocation:
-// the instance is revoked, the user's cut-off predates that revocation, and the
-// wallet data is still there.
+// seedRevokedWithStaleCutoff leaves a half-finished revocation: instance revoked,
+// cut-off predating it, wallet data still present.
 func seedRevokedWithStaleCutoff(t *testing.T, fs *failStore) (domain.UserID, *domain.WalletInstance) {
 	t.Helper()
 	ctx := context.Background()
@@ -35,8 +34,8 @@ func vaultKept(t *testing.T, fs *failStore, uid domain.UserID) bool {
 	return u.PrivateData != nil
 }
 
-// A cut-off that cannot be read must stop the cascade before erasure: the
-// erased wallet could otherwise be written back by an already-issued token.
+// An unreadable cut-off must stop the cascade before erasure: an already-issued
+// token could otherwise write the wallet back.
 func TestWalletLifecycle_CascadeAbortsBeforeErasureWhenCutoffCannotBeRead(t *testing.T) {
 	ctx := context.Background()
 	fs := newFailStore("users.GetAuthCutoff")
@@ -52,8 +51,8 @@ func TestWalletLifecycle_CascadeAbortsBeforeErasureWhenCutoffCannotBeRead(t *tes
 	assert.False(t, vaultKept(t, fs, uid))
 }
 
-// A cut-off older than the revocation that cannot be repaired must stop the
-// cascade before erasure; once the store works, the retry repairs and erases.
+// An unrepairable stale cut-off must stop the cascade before erasure; once the
+// store works, the retry repairs and erases.
 func TestWalletLifecycle_CascadeRepairsStaleCutoffBeforeErasure(t *testing.T) {
 	ctx := context.Background()
 	fs := newFailStore("users.InvalidateAuthBefore")

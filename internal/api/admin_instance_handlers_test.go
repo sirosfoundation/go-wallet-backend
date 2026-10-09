@@ -316,9 +316,7 @@ func TestUpdateWalletInstanceStatus_WithAudit_Revoked(t *testing.T) {
 	}
 }
 
-// "active" is not a status this endpoint accepts. Revocation is the only
-// lifecycle change a wallet instance has and it cannot be undone, so a
-// request to reactivate one is a 400 at the binding, never a state change.
+// "active" is not accepted: revocation is terminal, so reactivation is a 400 at the binding.
 func TestUpdateWalletInstanceStatus_RejectsReactivation(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
@@ -401,9 +399,7 @@ func TestUpdateWalletInstanceStatus_LifecycleCascade(t *testing.T) {
 		t.Errorf("revoking the last instance must erase the wallet's private data")
 	}
 
-	// Revoked is terminal: reactivation is refused at the binding, before it
-	// is even a transition question, because "revoked" is the only status
-	// this endpoint accepts.
+	// Reactivation is refused at the binding: "revoked" is the only accepted status.
 	w = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodPut, "/admin/tenants/acme/instances/inst-1/status", strings.NewReader(`{"status":"active"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -417,10 +413,8 @@ func TestUpdateWalletInstanceStatus_LifecycleCascade(t *testing.T) {
 	}
 }
 
-// SID-AUTH-06: a revoked instance of a user is the tombstone that keeps the
-// login gate and WIA guard refusing the wallet; the admin API must not delete
-// it, and the same holds for an unowned (anonymous WIA) record: deleting its
-// tombstone would let the key enroll again as a fresh active instance.
+// SID-AUTH-06: a revoked instance (owned or anonymous) is the tombstone that
+// keeps login and WIA refused; the admin API must not delete it.
 func TestDeleteWalletInstance_RevokedInstanceIsRetained(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
@@ -455,11 +449,9 @@ func TestDeleteWalletInstance_RevokedInstanceIsRetained(t *testing.T) {
 	}
 }
 
-// A revocation must never be answered 200 by a handler that has no lifecycle
-// service behind it: the status would be written straight to the store, with
-// no token cut-off, no session drop and no erasure, so the device it was
-// meant to stop would keep working. Both providers wire the service, so this
-// is unreachable in a built server; the test is what keeps it that way.
+// A revocation must never be answered 200 by a handler without a lifecycle
+// service: it would skip the cut-off, session drop and erasure. Both providers
+// wire the service, so this test guards against omission.
 func TestUpdateWalletInstanceStatus_FailsClosedWithoutLifecycle(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
@@ -491,9 +483,7 @@ func TestUpdateWalletInstanceStatus_FailsClosedWithoutLifecycle(t *testing.T) {
 	}
 }
 
-// The revoke-all body is optional, but a client that streams it sends no
-// Content-Length. Keying the parse on that header silently dropped the reason
-// for such a client, so the reason never reached the audit trail.
+// A streamed body sends no Content-Length; the reason must still reach the audit trail.
 func TestRevokeAllWalletInstancesForUser_ReadsAChunkedBody(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()
@@ -513,8 +503,7 @@ func TestRevokeAllWalletInstancesForUser_ReadsAChunkedBody(t *testing.T) {
 		t.Fatalf("seed instance: %v", err)
 	}
 
-	// An io.Reader with no known length is what makes net/http choose
-	// chunked encoding and leaves ContentLength at -1.
+	// An io.Reader of unknown length makes net/http send chunked with ContentLength -1.
 	body := io.NopCloser(strings.NewReader(`{"reason":"device reported stolen"}`))
 	req := httptest.NewRequest(http.MethodPost, "/admin/tenants/acme/users/"+userID.String()+"/instances/revoke-all", body)
 	req.ContentLength = -1
@@ -554,11 +543,9 @@ func TestRevokeAllWalletInstancesForUser_AcceptsNoBody(t *testing.T) {
 	}
 }
 
-// replacingInstanceStore deletes the instance it is asked to delete
-// conditionally and attests the same thumbprint again for another user of the
-// same tenant first - the interleaving between the handler's read and its
-// delete. The replacement is live and owned, so it would pass the
-// removability condition on its own.
+// replacingInstanceStore re-attests the same thumbprint for another user of the
+// tenant between the handler's read and its conditional delete; the live,
+// owned replacement would pass the removability condition on its own.
 type replacingInstanceStore struct {
 	storage.Store
 	other domain.UserID
@@ -612,9 +599,8 @@ func TestDeleteWalletInstance_ReplacementBetweenReadAndDeleteSurvives(t *testing
 	}
 }
 
-// A live instance of a user cannot be hard-deleted: that would skip the
-// lifecycle cascade and, for a last instance, look like a first enrollment to
-// the login gate. The admin is told to revoke instead.
+// A live user-owned instance cannot be hard-deleted (it would skip the
+// lifecycle cascade); the admin is told to revoke.
 func TestDeleteWalletInstance_LiveUserOwnedIsRefused(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()

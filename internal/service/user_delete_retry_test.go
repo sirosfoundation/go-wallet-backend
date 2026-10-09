@@ -80,10 +80,9 @@ func newDeleteFixture(t *testing.T) (*UserService, *flakyStore, domain.UserID, *
 	return svc, fs, uid, bl, ur
 }
 
-// ErrDeletionIncomplete promises that the caller can authenticate and repeat
-// the request. The token blacklist and the engine revoke a user id for good, so
-// they must not fire until the sweep is known to be complete - otherwise the
-// retry the error promises is refused at the door.
+// The token blacklist and engine revoke a user id for good, so they must not
+// fire until the sweep is known complete, or the retry ErrDeletionIncomplete
+// promises is refused.
 func TestDeleteUser_IncompleteLeavesTheCallerAbleToRetry(t *testing.T) {
 	ctx := context.Background()
 	svc, fs, uid, bl, ur := newDeleteFixture(t)
@@ -126,10 +125,8 @@ func TestDeleteUser_CleanerFailingBeforeRevocationIsRetryable(t *testing.T) {
 	assert.ErrorIs(t, gerr, storage.ErrNotFound)
 }
 
-// The failure that cannot be retried by the user: the cleaner recovers for
-// the first pass and fails after the blacklist revoked the user for good. The
-// record is kept and the error is reported, not swallowed, and it is not the
-// retryable ErrDeletionIncomplete.
+// The unretryable failure: the cleaner fails after the blacklist revoked the
+// user. The record is kept and the error is ErrDeletionOperatorRequired.
 func TestDeleteUser_CleanerFailingAfterRevocationKeepsTheRecord(t *testing.T) {
 	ctx := context.Background()
 	svc, fs, uid, bl, ur := newDeleteFixture(t)
@@ -173,10 +170,8 @@ func (u *failingCutoffUsers) InvalidateAuthBeforeForToken(ctx context.Context, i
 	return u.UserStore.InvalidateAuthBeforeForToken(ctx, id, t, iat)
 }
 
-// With the token blacklist disabled the gate is the only thing standing
-// between an incompletely deleted account and its old bearer tokens. The
-// cut-off is on the record before the irreversible phase, so old tokens are
-// refused and a fresh login can repeat the deletion.
+// With the blacklist disabled the cut-off alone refuses old tokens after an
+// incomplete deletion, while a fresh login can repeat it.
 func TestDeleteUser_IncompleteAfterRevocationRefusesOldTokensWithoutBlacklist(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()

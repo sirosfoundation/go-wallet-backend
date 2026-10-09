@@ -862,9 +862,8 @@ func TestHandlers_RefreshToken_Disabled(t *testing.T) {
 	}
 }
 
-// A request admitted before a revocation, whose write then meets a record the
-// revocation already cut off, is answered 401 rather than restoring erased data
-// or surfacing as a server error.
+// A request admitted before a revocation whose write meets a record the
+// revocation cut off is answered 401, not restored data or a server error.
 func TestHandlers_PrivateDataWrite_TokenCutOffAfterAdmission(t *testing.T) {
 	handlers, router, user := setupTestHandlersWithUser(t)
 	admittedAt := time.Now().Add(-time.Minute)
@@ -915,9 +914,8 @@ func TestHandlers_UpdateSettings_TokenCutOffAfterAdmission(t *testing.T) {
 	assert.Equal(t, http.StatusUnauthorized, w.Code, w.Body.String())
 }
 
-// DeleteUser erases the account; a request admitted before a revocation
-// advanced the cut-off is answered 401 and deletes nothing, while a token
-// issued after the cut-off is accepted.
+// DeleteUser: a request admitted before a revocation advanced the cut-off gets 401
+// and deletes nothing; a token issued after the cut-off is accepted.
 func TestHandlers_DeleteUser_TokenCutOffAfterAdmission(t *testing.T) {
 	handlers, router, user := setupTestHandlersWithUser(t)
 	var issuedAt time.Time
@@ -942,8 +940,8 @@ func TestHandlers_DeleteUser_TokenCutOffAfterAdmission(t *testing.T) {
 	assert.Error(t, err, "a fresh token deletes the account")
 }
 
-// An unknown subject (a token the gate let through as an external identity)
-// gets 404 from DELETE, not a 400 or a tombstone.
+// An unknown subject (external identity) gets 404 from DELETE, not 400 or a
+// tombstone.
 func TestHandlers_DeleteUser_UnknownSubjectIs404(t *testing.T) {
 	handlers, router, _ := setupTestHandlersWithUser(t)
 	ghost := &domain.User{UUID: domain.NewUserID(), DID: "did:example:ghost"}

@@ -34,10 +34,8 @@ func seedWIAInstance(t *testing.T, instances interface {
 	}
 }
 
-// A deactivated wallet (every instance revoked, data erased) must not be
-// revived by attesting a brand-new instance key with an access token that
-// outlived the deactivation: that would record a new active instance and
-// re-open passkey login without the required new enrollment.
+// A deactivated wallet must not be revived by attesting a new instance key with
+// an access token that outlived the deactivation.
 func TestWIAService_GenerateWIA_RefusesNewKeyForDeactivatedWallet(t *testing.T) {
 	svc, instances := newTestWIAServiceWithInstances(t)
 	ctx := context.Background()
@@ -70,8 +68,7 @@ func TestWIAService_GenerateWIA_RefusesNewKeyForDeactivatedWallet(t *testing.T) 
 	}
 }
 
-// One live instance is enough: the wallet is not deactivated and the user may
-// still enroll another device.
+// One live instance is enough: the wallet is not deactivated.
 func TestWIAService_GenerateWIA_AllowsNewKeyWhileAnInstanceIsLive(t *testing.T) {
 	svc, instances := newTestWIAServiceWithInstances(t)
 	ctx := context.Background()
@@ -97,9 +94,7 @@ func TestWIAService_GenerateWIA_AllowsNewKeyWhileAnInstanceIsLive(t *testing.T) 
 	}
 }
 
-// failingUpsertInstances makes Upsert fail: the instance record is the
-// enforcement boundary for suspension/revocation, so a WIA must not be
-// issued when it cannot be written.
+// failingUpsertInstances makes Upsert fail.
 type failingUpsertInstances struct{ storage.WalletInstanceStore }
 
 func (failingUpsertInstances) Upsert(context.Context, *domain.WalletInstance) error {
@@ -122,9 +117,7 @@ func TestWIAService_GenerateWIA_FailsWhenInstanceCannotBeRecorded(t *testing.T) 
 	}
 }
 
-// racingRevokeInstances simulates a wallet deactivation landing between
-// GenerateWIA's lifecycle check and the insert of the new instance: right
-// after the first Upsert it revokes every *other* instance of the user.
+// racingRevokeInstances revokes the user's other instances after the first Upsert.
 type racingRevokeInstances struct {
 	storage.WalletInstanceStore
 	userID domain.UserID
@@ -184,10 +177,7 @@ func TestWIAService_GenerateWIA_RevokesNewKeyWhenWalletDeactivatedMeanwhile(t *t
 	}
 }
 
-// revokeAllRacingInstances models a revoke-all that lands between the
-// lifecycle check and the post-insert re-check and takes the new record with
-// it. Its UpdateStatus reports revoked -> revoked as an invalid transition the
-// way the Mongo store does (the memory store treats it as a no-op).
+// revokeAllRacingInstances models a revoke-all between the lifecycle check and the post-insert re-check; UpdateStatus reports revoked -> revoked as invalid, as Mongo does.
 type revokeAllRacingInstances struct {
 	storage.WalletInstanceStore
 	userID domain.UserID
@@ -227,9 +217,7 @@ func (r *revokeAllRacingInstances) UpdateStatusIfUnchanged(ctx context.Context, 
 	return r.WalletInstanceStore.UpdateStatusIfUnchanged(ctx, id, domain.DefaultTenantID, b, status, reason)
 }
 
-// A revoke-all that wins the race and revokes the just-inserted instance
-// before the re-check gets to it must still surface as "wallet deactivated",
-// not as a generic WIA failure from the refused revoked -> revoked update.
+// A revoke-all that revokes the just-inserted instance surfaces as "wallet deactivated".
 func TestWIAService_GenerateWIA_RevokeAllWinningRaceRefusesAsDeactivated(t *testing.T) {
 	uid := domain.UserIDFromString("user-revoke-all-raced")
 	base := memory.NewStore().WalletInstances()
@@ -258,8 +246,7 @@ func TestWIAService_GenerateWIA_RevokeAllWinningRaceRefusesAsDeactivated(t *test
 	}
 }
 
-// signTestPopWithKey signs a WIA-PoP for nonce with an existing instance key
-// (a re-attestation of the same instance) and returns it with the key's jkt.
+// signTestPopWithKey signs a WIA-PoP for nonce with an existing instance key and returns its jkt.
 func signTestPopWithKey(t *testing.T, nonce string, key *ecdsa.PrivateKey) (pop, jkt string) {
 	t.Helper()
 	xBytes, yBytes := key.PublicKey.X.Bytes(), key.PublicKey.Y.Bytes()
@@ -294,8 +281,7 @@ func signTestPopWithKey(t *testing.T, nonce string, key *ecdsa.PrivateKey) (pop,
 	return pop, jkt
 }
 
-// attestOnce runs a first attestation for uid in tenant and returns the
-// instance key so the same instance can re-attest.
+// attestOnce runs a first attestation and returns the instance key for re-attestation.
 func attestOnce(t *testing.T, svc *WIAService, tenant domain.TenantID, uid *domain.UserID) *ecdsa.PrivateKey {
 	t.Helper()
 	ctx := context.Background()
@@ -310,9 +296,7 @@ func attestOnce(t *testing.T, svc *WIAService, tenant domain.TenantID, uid *doma
 	return key
 }
 
-// An existing instance record must not be re-parented: the same instance key
-// presented by another user, or from another tenant, is refused instead of
-// Upsert moving tenant_id/user_id out from under the original owner.
+// An existing instance must not be re-parented by the same key from another user or tenant.
 func TestWIAService_GenerateWIA_RefusesInstanceBoundElsewhere(t *testing.T) {
 	svc, instances := newTestWIAServiceWithInstances(t)
 	ctx := context.Background()
@@ -348,7 +332,6 @@ func TestWIAService_GenerateWIA_RefusesInstanceBoundElsewhere(t *testing.T) {
 		t.Errorf("instance binding changed to tenant=%s user=%v; must stay with the original owner", got.TenantID, got.UserID)
 	}
 
-	// The owner re-attesting, and an anonymous re-attestation, stay allowed.
 	for _, uid := range []*domain.UserID{&owner, nil} {
 		challenge, _, err = svc.CreateChallenge(ctx, domain.DefaultTenantID)
 		if err != nil {
@@ -361,9 +344,7 @@ func TestWIAService_GenerateWIA_RefusesInstanceBoundElsewhere(t *testing.T) {
 	}
 }
 
-// revokeOnReattestInstances simulates a revocation landing between
-// GenerateWIA's status check and the instance write of a re-attestation:
-// when Upsert hits an existing record it first revokes that record.
+// revokeOnReattestInstances revokes an existing record when Upsert hits it.
 type revokeOnReattestInstances struct{ storage.WalletInstanceStore }
 
 func (r revokeOnReattestInstances) Upsert(ctx context.Context, inst *domain.WalletInstance) error {
@@ -400,9 +381,7 @@ func TestWIAService_GenerateWIA_RefusesReattestationRevokedMeanwhile(t *testing.
 	}
 }
 
-// bindingRaceInstances binds an anonymous instance to another user right
-// before the caller's own Upsert runs, simulating two authenticated
-// attestations racing for the same anonymous instance.
+// bindingRaceInstances binds the anonymous instance to another user just before Upsert.
 type bindingRaceInstances struct {
 	storage.WalletInstanceStore
 	winner domain.UserID
@@ -430,7 +409,6 @@ func TestWIAService_GenerateWIA_LoserOfBindingRaceGetsNoWIA(t *testing.T) {
 	racing := &bindingRaceInstances{WalletInstanceStore: base, winner: winner}
 	svc := newTestWIAServiceUsing(t, racing)
 
-	// First attest anonymously so the instance exists without a user.
 	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
 	if err != nil {
 		t.Fatal(err)
@@ -440,7 +418,6 @@ func TestWIAService_GenerateWIA_LoserOfBindingRaceGetsNoWIA(t *testing.T) {
 		t.Fatalf("anonymous attestation: %v", err)
 	}
 
-	// Now the loser attests with the same key while the winner binds first.
 	challenge2, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
 	if err != nil {
 		t.Fatal(err)
@@ -456,9 +433,7 @@ func TestWIAService_GenerateWIA_LoserOfBindingRaceGetsNoWIA(t *testing.T) {
 	}
 }
 
-// tenantRaceInstances records the caller's brand-new instance in another
-// tenant right before the caller's own Upsert, simulating two first
-// attestations of the same key racing in two tenants.
+// tenantRaceInstances records the instance in another tenant just before Upsert.
 type tenantRaceInstances struct {
 	storage.WalletInstanceStore
 	fired bool
@@ -500,9 +475,7 @@ func TestWIAService_GenerateWIA_LoserOfTenantRaceGetsNoWIA(t *testing.T) {
 	}
 }
 
-// An anonymously attested instance that a deactivated wallet's user then
-// tries to bind must be refused like a brand-new key: otherwise the
-// new-enrollment requirement could be bypassed via an unowned record.
+// Binding an anonymous instance for a deactivated wallet is refused like a new key.
 func TestWIAService_GenerateWIA_RefusesBindingUnownedInstanceToDeactivatedWallet(t *testing.T) {
 	svc, instances := newTestWIAServiceWithInstances(t)
 	ctx := context.Background()
@@ -528,17 +501,14 @@ func TestWIAService_GenerateWIA_RefusesBindingUnownedInstanceToDeactivatedWallet
 	}
 }
 
-// The passkey link decides whether suspension and revocation refuse login
-// with that passkey, and the first link recorded for an instance wins, so a
-// client must not be able to claim a passkey that is not its own.
+// The first recorded passkey link gates login; a client cannot claim another's passkey.
 func TestWIAService_GenerateWIA_RefusesUnownedCredentialID(t *testing.T) {
 	svc, store := newTestWIAServiceWithUsers(t)
 	ctx := context.Background()
 	uid := domain.NewUserID()
 	other := domain.NewUserID()
-	// "mine" carries no tenant (registered before tenants existed) and so
-	// counts as the default one; "elsewhere" is registered in another tenant
-	// and can never authenticate in the default one.
+	// "mine" has no tenant (pre-tenants) and counts as default; "elsewhere" is
+	// another tenant's.
 	if err := store.Users().Create(ctx, &domain.User{UUID: uid, WebauthnCredentials: []domain.WebauthnCredential{
 		{ID: "mine"},
 		{ID: "elsewhere", TenantID: domain.TenantID("other-tenant")},
@@ -580,9 +550,7 @@ func TestWIAService_GenerateWIA_RefusesUnownedCredentialID(t *testing.T) {
 	}
 }
 
-// racingRevokeOnBind is racingRevokeInstances for the binding attestation: it
-// fires on the Upsert of an instance that already exists, i.e. when the
-// anonymous record is being adopted by a user, not when it was created.
+// racingRevokeOnBind is racingRevokeInstances for the binding attestation.
 type racingRevokeOnBind struct {
 	storage.WalletInstanceStore
 	userID domain.UserID
@@ -612,12 +580,7 @@ func (r *racingRevokeOnBind) Upsert(ctx context.Context, inst *domain.WalletInst
 	return nil
 }
 
-// Adopting an anonymously attested instance is a new instance of that user for
-// the wallet's lifecycle, so it needs the post-write half of the guard as much
-// as a brand-new key does: until the write the record was not the user's, so a
-// revoke-all landing in between does not see it, and without the re-check the
-// adopted instance would stay active and carry a WIA out of a wallet that was
-// deactivated a moment earlier.
+// Adopting an anonymous instance needs the post-write guard too.
 func TestWIAService_GenerateWIA_RevokesBoundKeyWhenWalletDeactivatedMeanwhile(t *testing.T) {
 	uid := domain.UserIDFromString("user-bind-racing")
 	base := memory.NewStore().WalletInstances()
@@ -657,10 +620,7 @@ func TestWIAService_GenerateWIA_RevokesBoundKeyWhenWalletDeactivatedMeanwhile(t 
 	}
 }
 
-// The passkey link is permanent (first link wins), so a request asking to
-// link a different passkey than the one recorded must not walk away with a
-// WIA: revoking the instance would gate the recorded passkey while this
-// caller keeps using the one it asked for.
+// A request linking a different passkey than the recorded one gets no WIA.
 func TestWIAService_GenerateWIA_RefusesADifferentPasskeyThanRecorded(t *testing.T) {
 	svc, store := newTestWIAServiceWithUsers(t)
 	ctx := context.Background()
@@ -700,10 +660,7 @@ func TestWIAService_GenerateWIA_RefusesADifferentPasskeyThanRecorded(t *testing.
 	}
 }
 
-// A caller who is not the owner must not learn the lifecycle state of an
-// instance. Instance records are keyed by the instance-key thumbprint alone,
-// so anyone holding that key reaches the record; ownership is therefore
-// checked before status, and the answer is INSTANCE_NOT_OWNED either way.
+// A non-owner gets INSTANCE_NOT_OWNED regardless of lifecycle state (ownership is checked first).
 func TestWIAService_GenerateWIA_OwnershipCheckedBeforeLifecycle(t *testing.T) {
 	ctx := context.Background()
 	owner := domain.UserIDFromString("owner")
@@ -724,8 +681,6 @@ func TestWIAService_GenerateWIA_OwnershipCheckedBeforeLifecycle(t *testing.T) {
 				t.Fatalf("CreateChallenge: %v", err)
 			}
 			pop, instanceKey := createTestPop(t, challenge)
-			// The record the attestation will land on is keyed by this key's
-			// thumbprint, and it already belongs to someone else.
 			seedWIAInstance(t, instances, expectedThumbprint(t, &instanceKey.PublicKey), owner, tc.status)
 
 			_, err = svc.GenerateWIA(ctx, domain.DefaultTenantID, &intruder, &WIARequest{Pop: pop, Challenge: challenge})
@@ -739,17 +694,11 @@ func TestWIAService_GenerateWIA_OwnershipCheckedBeforeLifecycle(t *testing.T) {
 	}
 }
 
-// An account that has been removed must not attest itself a new wallet. The
-// token cut-off cannot stop this on its own: it lives on the user record, so
-// DELETE /user/session deletes the cut-off along with the account, and it
-// also deletes the wallet instances - leaving exactly the empty wallet that
-// a first attestation is allowed to enroll into.
+// A removed account cannot attest itself a new wallet (its cut-off was deleted with it).
 func TestWIAService_GenerateWIA_RefusesADeletedAccount(t *testing.T) {
 	ctx := context.Background()
 	svc, store := newTestWIAServiceWithUsers(t)
 
-	// A user who existed and was removed: nothing of theirs is left, which
-	// is indistinguishable from a first enrollment without this check.
 	gone := domain.UserIDFromString("deleted-account")
 	_, err := store.Users().GetByID(ctx, gone)
 	if err == nil {
@@ -767,7 +716,6 @@ func TestWIAService_GenerateWIA_RefusesADeletedAccount(t *testing.T) {
 		t.Fatalf("GenerateWIA for a deleted account = %v, want ErrWIAUnknownUser", err)
 	}
 
-	// A user who does exist is unaffected.
 	live := domain.NewUserID()
 	if err := store.Users().Create(ctx, &domain.User{UUID: live, DID: "did:example:live"}); err != nil {
 		t.Fatalf("create user: %v", err)
@@ -782,11 +730,7 @@ func TestWIAService_GenerateWIA_RefusesADeletedAccount(t *testing.T) {
 	}
 }
 
-// A re-attestation of an instance already bound to the user must be refused
-// too when the account is gone. Checking only on the first-attestation path
-// missed the case that matters: an instance that survived its account, through
-// the deletion sweep's race or a failure nobody retried, would keep handing
-// an old bearer token fresh attestations.
+// Re-attestation by a deleted account's surviving instance is refused.
 func TestWIAService_GenerateWIA_RefusesAReattestationFromADeletedAccount(t *testing.T) {
 	ctx := context.Background()
 	svc, store := newTestWIAServiceWithUsers(t)
@@ -796,7 +740,6 @@ func TestWIAService_GenerateWIA_RefusesAReattestationFromADeletedAccount(t *test
 		t.Fatalf("create user: %v", err)
 	}
 
-	// First attestation, while the account still exists.
 	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
 	if err != nil {
 		t.Fatalf("CreateChallenge: %v", err)
@@ -815,7 +758,6 @@ func TestWIAService_GenerateWIA_RefusesAReattestationFromADeletedAccount(t *test
 		t.Fatal("the instance must be bound, so the first-attestation path is behind us")
 	}
 
-	// The account goes, the instance survives it.
 	if err := store.Users().Delete(ctx, userID); err != nil {
 		t.Fatalf("delete user: %v", err)
 	}
@@ -831,11 +773,7 @@ func TestWIAService_GenerateWIA_RefusesAReattestationFromADeletedAccount(t *test
 	}
 }
 
-// replacedMidUpsertInstances simulates the record being deleted and the same
-// thumbprint attested again by another user right after the caller's upsert
-// matched it and before its owner bind/link ran. A store that scopes those
-// follow-ups to the generation it upserted refuses with ErrBindingChanged and
-// leaves the replacement unowned by the caller; this wrapper plays that store.
+// replacedMidUpsertInstances simulates the record being replaced between Upsert and the owner bind/link; the wrapper plays a store that scopes follow-ups to the upserted generation (ErrBindingChanged).
 type replacedMidUpsertInstances struct {
 	storage.WalletInstanceStore
 	replacement domain.UserID

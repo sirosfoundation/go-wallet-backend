@@ -74,9 +74,8 @@ func TestDeleteUser_TombstoneWriteFailureDeletesNothing(t *testing.T) {
 
 	err := svc.DeleteUser(ctx, uid, uid.String())
 	require.ErrorIs(t, err, ErrDeletionIncomplete)
-	// The documented semantics: a failed tombstone write removes NOTHING, not
-	// merely the user record. Holder data and wallet instances in every
-	// tenant must still be there.
+	// A failed tombstone write removes nothing: holder data and instances in
+	// every tenant must remain.
 	for _, tid := range []domain.TenantID{domain.DefaultTenantID, "acme"} {
 		creds, cerr := base.Credentials().GetAllByHolder(ctx, tid, did)
 		require.NoError(t, cerr)
@@ -94,8 +93,8 @@ func TestDeleteUser_TombstoneWriteFailureDeletesNothing(t *testing.T) {
 	_, terr := base.Users().GetDeletionTombstone(ctx, uid.String())
 	assert.ErrorIs(t, terr, storage.ErrNotFound)
 
-	// While the record exists the gate reads its cut-off: the caller is not
-	// locked out of the retry by a failed deletion.
+	// While the record exists the gate reads its cut-off, so the retry is not
+	// locked out.
 	gate := tokengate.New(base.Users())
 	assert.NoError(t, gate.Check(ctx, uid.String(), time.Now()))
 
@@ -212,9 +211,8 @@ func TestDeletionTombstoneSweeper_StartStop(t *testing.T) {
 	svcs.Stop()
 }
 
-// The scenario the tombstone exists for: a token issued before the account was
-// deleted must not create a new wallet instance or WIA for it afterwards, and
-// not pass the gate either.
+// A token issued before the account was deleted must not create a wallet
+// instance or WIA afterwards, nor pass the gate.
 func TestDeletedAccount_PreDeletionTokenCannotCreateAnInstanceOrWIA(t *testing.T) {
 	ctx := context.Background()
 	svc, store := newTestWIAServiceWithUsers(t)

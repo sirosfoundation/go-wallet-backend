@@ -58,13 +58,13 @@ type FIDO2AttestationService struct {
 	instances       storage.WalletInstanceStore
 	keyAttestations storage.KeyAttestationStore
 	trust           *trust.Service
-	// users is read for the SID-AUTH-06 cut-off at the write boundary. Nil
-	// disables the recheck.
+	// users is read for the SID-AUTH-06 cut-off at the write boundary. Nil disables
+	// the recheck.
 	users tokengate.UserLookup
 }
 
-// SetUsers wires the user store Verify rechecks the request's token cut-off
-// against before and after it records the evidence.
+// SetUsers wires the user store Verify rechecks the token cut-off against, before
+// and after recording the evidence.
 func (s *FIDO2AttestationService) SetUsers(users tokengate.UserLookup) { s.users = users }
 
 // NewFIDO2AttestationService creates a new FIDO2 attestation verifier. trust
@@ -195,12 +195,10 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 		return fmt.Errorf("%w: compute key thumbprint: %v", ErrFIDO2AttestationInvalid, err)
 	}
 
-	// The instance the evidence is recorded for must be live and belong to the
-	// authenticated tenant and user: keyAttestationTrustsBatch later treats the
-	// recorded evidence as trusted, so a token from another live device must not
-	// be able to attach it to a revoked or foreign instance. Same gate as key
-	// attestation generation; an unknown instance is refused too, since there is
-	// nothing to attach the evidence to.
+	// The instance must be live and belong to the authenticated tenant and user:
+	// keyAttestationTrustsBatch later trusts the evidence, so a token from another
+	// device must not attach it to a revoked or foreign instance. Same gate as key
+	// attestation generation; an unknown instance is refused too.
 	instance, err := refuseWalletInstance(ctx, s.instances, req.WalletInstanceID, true)
 	if err != nil {
 		return err
@@ -215,16 +213,16 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 		AAGUID:           aaguid.String(),
 		VerifiedAt:       verifiedAt,
 	}
-	// Mutation-boundary gate: the request was admitted before the (slow)
-	// verification above; a cut-off since then must stop the write.
+	// Mutation-boundary gate: a cut-off since admission (the verification is slow)
+	// must stop the write.
 	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
 		return err
 	}
 	if err := s.keyAttestations.MarkKeyAttested(ctx, rec); err != nil {
 		return fmt.Errorf("%w: record verification: %v", ErrFIDO2AttestationInvalid, err)
 	}
-	// A cut-off landing during the write fails the request closed; the
-	// revocation cascade owns cleaning up the record just written.
+	// A cut-off during the write fails the request closed; the revocation cascade
+	// cleans up the record just written.
 	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
 		return err
 	}

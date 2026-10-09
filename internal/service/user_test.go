@@ -556,15 +556,9 @@ func (e erroringTokenRevoker) RevokeUser(_ context.Context, _ string) error {
 }
 
 // TestUserService_DeleteUser_ContinuesWhenTokenRevokerErrors proves that a
-// failing TokenRevoker never aborts DeleteUser: revoking the user's
-// blacklist entries is a best-effort step, so an error from it is logged and
-// swallowed and the user deletion itself still completes.
-//
-// A failing SessionCleaner is deliberately NOT in this category any more
-// (SID-AUTH-06, merged from the wallet-instance-lifecycle work): deleting the
-// user record removes the token cut-off with it, so a session that survives
-// would keep minting bearer tokens for an account that is meant to be gone.
-// See TestUserService_DeleteUser_FailsClosedWhenSessionCleanerErrors.
+// failing TokenRevoker (best effort, logged) never aborts DeleteUser. A failing
+// SessionCleaner is different: see
+// TestUserService_DeleteUser_FailsClosedWhenSessionCleanerErrors.
 func TestUserService_DeleteUser_ContinuesWhenTokenRevokerErrors(t *testing.T) {
 	ctx := t.Context()
 	store := memory.NewStore()
@@ -593,9 +587,8 @@ func TestUserService_DeleteUser_ContinuesWhenTokenRevokerErrors(t *testing.T) {
 	}
 }
 
-// A session that cannot be dropped keeps the user record in place, so the
-// deletion can be repeated instead of leaving live sessions for a deleted
-// account (SID-AUTH-06).
+// A session that cannot be dropped keeps the user record, so the deletion can be
+// repeated (SID-AUTH-06).
 func TestUserService_DeleteUser_FailsClosedWhenSessionCleanerErrors(t *testing.T) {
 	ctx := t.Context()
 	store := memory.NewStore()
@@ -946,11 +939,9 @@ func TestUserService_RenameWebAuthnCredential(t *testing.T) {
 	})
 }
 
-// DeleteUser must sweep the default tenant even when the user has explicit
-// memberships elsewhere. A wallet instance that outlives the account is
-// permanent: records are keyed by instance-key thumbprint and the passkey
-// link is write-once, so re-enrolling on the same device would be refused
-// for good.
+// DeleteUser must sweep the default tenant even when the user has memberships
+// elsewhere: a surviving instance is permanent (keyed by thumbprint, write-once
+// passkey link), so re-enrolling that device would be refused for good.
 func TestDeleteUser_SweepsDefaultTenantAlongsideMemberships(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()
@@ -967,8 +958,7 @@ func TestDeleteUser_SweepsDefaultTenantAlongsideMemberships(t *testing.T) {
 		t.Fatalf("add membership: %v", err)
 	}
 
-	// One instance in the tenant the user is a member of, one left in the
-	// default tenant from before that membership existed.
+	// One instance in a member tenant, one left in the default tenant.
 	for id, tenant := range map[string]domain.TenantID{
 		"inst-acme":    "acme",
 		"inst-default": domain.DefaultTenantID,
@@ -991,8 +981,7 @@ func TestDeleteUser_SweepsDefaultTenantAlongsideMemberships(t *testing.T) {
 	}
 }
 
-// failInstanceDeleteStore fails every wallet-instance Delete, standing in for
-// a storage problem during account deletion.
+// failInstanceDeleteStore fails every wallet-instance Delete.
 type failInstanceDeleteStore struct {
 	storage.Store
 }
@@ -1013,11 +1002,9 @@ func (f failInstanceDeletes) DeleteIfUnchanged(context.Context, string, domain.T
 	return errors.New("storage is down")
 }
 
-// An account deletion that cannot remove a wallet instance must not report
-// success and must not delete the user record. An instance that outlives its
-// account is permanent: records are keyed by instance-key thumbprint and the
-// passkey link is write-once, so re-enrolling on that device would be refused
-// for good, and a deleted user cannot authenticate to ask again.
+// Account deletion that cannot remove a wallet instance must neither report
+// success nor delete the user record (a surviving instance is permanent and the
+// deleted user cannot authenticate to ask again).
 func TestDeleteUser_IncompleteWhenAnInstanceSurvives(t *testing.T) {
 	ctx := context.Background()
 	inner := memory.NewStore()
@@ -1043,8 +1030,7 @@ func TestDeleteUser_IncompleteWhenAnInstanceSurvives(t *testing.T) {
 	}
 }
 
-// Tenant discovery failing is fatal for the same reason: instances in a
-// tenant this never looked at would be stranded by deleting the account.
+// Tenant discovery failing is fatal for the same reason.
 func TestDeleteUser_IncompleteWhenTenantDiscoveryFails(t *testing.T) {
 	ctx := context.Background()
 	inner := memory.NewStore()
@@ -1081,9 +1067,8 @@ func (f failTenantLookups) GetUserTenants(context.Context, domain.UserID) ([]dom
 	return nil, errors.New("storage is down")
 }
 
-// lateInstanceStore is empty on the first listing and produces an undeletable
-// instance on every listing after it, standing in for an attestation that
-// binds an instance while the sweep is already running.
+// lateInstanceStore is empty on the first listing and yields an undeletable
+// instance on every later one (an attestation binding mid-sweep).
 type lateInstanceStore struct {
 	storage.Store
 	userID domain.UserID
@@ -1101,9 +1086,7 @@ type lateInstances struct {
 
 func (l *lateInstances) GetAllByUser(_ context.Context, userID domain.UserID) ([]*domain.WalletInstance, error) {
 	l.parent.seen["all"]++
-	// Nothing on the first look, so the account-deletion sweep believes it
-	// is finished; then an instance appears, as an attestation binding one
-	// mid-sweep would make it.
+	// Nothing on the first look; then an instance appears.
 	if l.parent.seen["all"] == 1 {
 		return nil, nil
 	}
@@ -1120,11 +1103,9 @@ func (l *lateInstances) DeleteIfUnchanged(ctx context.Context, id string, _ doma
 	return l.Delete(ctx, id)
 }
 
-// The first pass can come back empty and the final re-list can then discover
-// an instance bound to the user after the fact. If removing that instance
-// fails, the membership must still be there: it is what tells a later sweep
-// which tenants hold this user's holder data, and the account must not be
-// deleted over the top of the orphan.
+// The first pass can come back empty and the final re-list find an instance. If
+// removing it fails the membership must stay (it tells a later sweep which
+// tenants hold holder data) and the account must not be deleted.
 func TestDeleteUser_KeepsMembershipWhenTheFinalSweepFindsALateInstance(t *testing.T) {
 	ctx := context.Background()
 	inner := memory.NewStore()
@@ -1165,10 +1146,9 @@ func TestDeleteUser_KeepsMembershipWhenTheFinalSweepFindsALateInstance(t *testin
 	}
 }
 
-// An admin can remove a tenant membership without removing that tenant's
-// wallet instances (DELETE /admin/tenants/{id}/users/{user_id} does exactly
-// that). Account deletion must still find the instance: it asks the instances
-// which tenant they are in rather than deriving the tenants from memberships.
+// An admin can remove a membership without removing that tenant's instances
+// (DELETE /admin/tenants/{id}/users/{user_id}); account deletion must still find
+// the instance, so tenants come from the instances, not only memberships.
 func TestDeleteUser_FindsInstancesInATenantWithNoMembership(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()
@@ -1179,8 +1159,7 @@ func TestDeleteUser_FindsInstancesInATenantWithNoMembership(t *testing.T) {
 	if err := store.Users().Create(ctx, &domain.User{UUID: userID, DID: did}); err != nil {
 		t.Fatalf("create user: %v", err)
 	}
-	// No membership for "orphaned-tenant": an admin removed it and left the
-	// instance behind.
+	// No membership for "orphaned-tenant": an admin removed it, the instance stayed.
 	if err := store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
 		ID: "inst-orphan", TenantID: "orphaned-tenant", UserID: &userID, Status: domain.InstanceStatusActive,
 	}); err != nil {
@@ -1196,10 +1175,8 @@ func TestDeleteUser_FindsInstancesInATenantWithNoMembership(t *testing.T) {
 	}
 }
 
-// Credentials and presentations are stored under User.DID, which registration
-// sets to "did:key:<uuid>", while the wallet API's handler passes the bare
-// uuid as the holder. Deleting under the uuid matched nothing, so the account
-// went and the user's credentials stayed, reported as a success.
+// Credentials and presentations are stored under User.DID ("did:key:<uuid>") but
+// the API handler passes the bare uuid; deleting under the uuid matched nothing.
 func TestDeleteUser_ErasesCredentialsStoredUnderTheUsersDID(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()
@@ -1223,7 +1200,7 @@ func TestDeleteUser_ErasesCredentialsStoredUnderTheUsersDID(t *testing.T) {
 		t.Fatalf("seed presentation: %v", err)
 	}
 
-	// The handler passes the bare user id, as it does in production.
+	// The handler passes the bare user id, as in production.
 	if err := svc.DeleteUser(ctx, userID, userID.String()); err != nil {
 		t.Fatalf("DeleteUser: %v", err)
 	}
@@ -1244,17 +1221,15 @@ func TestDeleteUser_ErasesCredentialsStoredUnderTheUsersDID(t *testing.T) {
 	}
 }
 
-// failSessionCleaner stands in for a session store that will not drop a
-// user's sessions.
+// failSessionCleaner stands in for a session store that will not drop sessions.
 type failSessionCleaner struct{}
 
 func (failSessionCleaner) DeleteByUser(context.Context, string) error {
 	return errors.New("session store is down")
 }
 
-// A session that outlives account deletion is not a cosmetic failure: the
-// user record carries the token cut-off, so deleting it means the gate can
-// no longer refuse that session's tokens at all.
+// A session surviving account deletion is not cosmetic: the user record carries
+// the cut-off, so deleting it leaves the gate unable to refuse that session.
 func TestDeleteUser_IncompleteWhenSessionsSurvive(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()
@@ -1279,9 +1254,8 @@ type recordingUserRevoker struct{ ids []string }
 
 func (r *recordingUserRevoker) RevokeUser(id string) { r.ids = append(r.ids, id) }
 
-// Account deletion (unlike the shared SessionCleaner, which wallet-instance
-// revocation also uses) permanently revokes the user in registered revokers,
-// e.g. the WebSocket engine (#393/#403).
+// Account deletion (unlike the shared SessionCleaner) permanently revokes the user
+// in registered revokers, e.g. the WebSocket engine (#393/#403).
 func TestUserService_DeleteUser_CallsUserRevokers(t *testing.T) {
 	ctx := t.Context()
 	store := memory.NewStore()

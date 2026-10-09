@@ -18,9 +18,7 @@ import (
 
 var errBoom = errors.New("boom")
 
-// failStore wraps the memory store and makes the named operations fail, so
-// the lifecycle service's error branches (which must log and continue, or
-// stop, as documented) can be exercised.
+// failStore wraps the memory store and fails the named operations.
 type failStore struct {
 	storage.Store
 	fail map[string]bool
@@ -28,11 +26,7 @@ type failStore struct {
 	captureBeforeClear bool
 	captured           *domain.User
 
-	// failNth makes an operation fail on its nth call only (1-based), to hit
-	// the step after one that already succeeded.
-	failNth map[string]int
-	// failThrough extends failNth into a run: the operation fails on every
-	// call from failNth[op] up to and including failThrough[op].
+	failNth     map[string]int
 	failThrough map[string]int
 	calls       map[string]int
 }
@@ -133,8 +127,6 @@ func (s *failUsers) EraseWalletData(ctx context.Context, id domain.UserID, fence
 		return err
 	}
 	if s.f.captureBeforeClear {
-		// A request that loaded the user after the first cut-off but before
-		// the clear: it carries the current cut-off and the intact vault.
 		u, err := s.UserStore.GetByID(ctx, id)
 		if err != nil {
 			return err
@@ -225,8 +217,7 @@ type failingSessionCleaner struct{}
 
 func (failingSessionCleaner) DeleteByUser(context.Context, string) error { return errBoom }
 
-// seedWalletUser creates a user with a DID, private data, a challenge, one
-// active instance, and credentials/presentations in the given tenants.
+// seedWalletUser creates a user with an instance and holder data in the given tenants.
 func seedWalletUser(t *testing.T, store storage.Store, tenants ...domain.TenantID) domain.UserID {
 	t.Helper()
 	ctx := context.Background()
@@ -340,9 +331,7 @@ func TestWalletLifecycle_Cascade_UnownedInstanceAndErrors(t *testing.T) {
 	})
 }
 
-// Wallet instances are per tenant, but erasure is not: nothing is erased, in
-// any tenant, while a live instance remains anywhere. Once none does, the
-// holder data of every tenant and the user-level vault are erased.
+// Erasure waits until no live instance remains in any tenant.
 func TestWalletLifecycle_Erasure_IsScopedToTheTenant(t *testing.T) {
 	ctx := context.Background()
 
@@ -410,7 +399,6 @@ func TestWalletLifecycle_Erasure_StoreFailuresAreReportedAndRetryable(t *testing
 				assert.Equal(t, 1, c, "nothing is erased when the liveness check cannot run")
 			}
 
-			// Retry with everything already revoked re-runs the cascade.
 			fs.fail[op] = false
 			n, err = svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "test")
 			require.NoError(t, err)
@@ -469,9 +457,7 @@ func TestWalletLifecycle_RevokeAll_StoreErrors(t *testing.T) {
 	assert.ErrorIs(t, err, errBoom)
 }
 
-// A user record loaded between the token cut-off and the erasure must not be
-// able to write the erased vault back: the cascade advances the write fence
-// again after clearing.
+// A user record loaded between the cut-off and the erasure must not write the erased vault back.
 func TestWalletLifecycle_CopyLoadedDuringErasureIsFenced(t *testing.T) {
 	ctx := context.Background()
 	fs := newFailStore()
@@ -489,10 +475,7 @@ func TestWalletLifecycle_CopyLoadedDuringErasureIsFenced(t *testing.T) {
 	assert.Nil(t, u.PrivateData, "the erasure stands")
 }
 
-// The token cut-off is recorded after the status write confirmed the binding.
-// If it cannot be recorded the revocation stays persisted and the request is
-// reported incomplete (fail closed and retryable), rather than the cut-off
-// being taken for a record the write may then reject.
+// If the cut-off cannot be recorded the request is reported incomplete (fail closed).
 func TestWalletLifecycle_CutoffFailureAfterWriteIsIncompleteAndRetryable(t *testing.T) {
 	ctx := context.Background()
 
@@ -535,8 +518,7 @@ func TestWalletLifecycle_CutoffFailureAfterWriteIsIncompleteAndRetryable(t *test
 	})
 }
 
-// attestingInstances inserts a brand-new active instance the first time an
-// instance is revoked, simulating a first attestation racing revoke-all.
+// attestingInstances inserts a new active instance on first revoke (an attestation racing revoke-all).
 type attestingInstances struct {
 	storage.WalletInstanceStore
 	userID domain.UserID
@@ -564,9 +546,7 @@ type racingInstanceStore struct {
 
 func (r *racingInstanceStore) WalletInstances() storage.WalletInstanceStore { return r.instances }
 
-// An instance created while revoke-all is sweeping must not survive as the
-// only live one: the sweep re-lists until nothing is left to revoke, so the
-// wallet really is deactivated and the data erased.
+// An instance created during the sweep must not survive as the only live one.
 func TestWalletLifecycle_RevokeAllCatchesInstanceCreatedDuringTheSweep(t *testing.T) {
 	ctx := context.Background()
 	base := memory.NewStore()
@@ -588,22 +568,16 @@ func TestWalletLifecycle_RevokeAllCatchesInstanceCreatedDuringTheSweep(t *testin
 	assert.Nil(t, user.PrivateData, "the wallet is deactivated, so the vault is erased")
 }
 
-// A status persisted outside ChangeStatus (the standalone admin path, an
-// older deployment) leaves no cut-off; the idempotent retry establishes one
-// without advancing a cut-off that already exists.
+// A status persisted outside ChangeStatus gets a cut-off on retry, without advancing an existing one.
 func TestWalletLifecycle_CascadeEstablishesMissingCutoff(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()
 	svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
 	uid := seedWalletUser(t, store, domain.DefaultTenantID)
 	id := "inst-" + uid.String()
-	// A second live instance, so the cascade stops short of the erasure:
-	// EraseWalletData advances the cut-off as part of its atomic fence, and
-	// this test is about the path that only has to establish one.
 	require.NoError(t, store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
 		ID: id + "-b", TenantID: domain.DefaultTenantID, UserID: &uid, Status: domain.InstanceStatusActive,
 	}))
-	// Persisted directly, as another process would have.
 	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, id, domain.DefaultTenantID, domain.InstanceStatusRevoked, "elsewhere"))
 	cutoff, err := store.Users().GetAuthCutoff(ctx, uid)
 	require.NoError(t, err)
@@ -616,17 +590,13 @@ func TestWalletLifecycle_CascadeEstablishesMissingCutoff(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, cutoff.IsZero(), "the retry establishes the cut-off")
 
-	// A second retry must not advance it (that would cut off tokens issued
-	// since, for no reason).
 	_, err = svc.ChangeStatus(ctx, actor, domain.DefaultTenantID, id, domain.InstanceStatusRevoked, "retry again")
 	require.NoError(t, err)
 	again, _ := store.Users().GetAuthCutoff(ctx, uid)
 	assert.True(t, again.Equal(cutoff), "an established cut-off stays put")
 }
 
-// alwaysAttestingInstances inserts a fresh active instance after every
-// revocation, so the revoke-all sweep never reaches a fixed point and runs out
-// of passes instead.
+// alwaysAttestingInstances inserts a fresh active instance after every revocation.
 type alwaysAttestingInstances struct {
 	storage.WalletInstanceStore
 	userID domain.UserID
@@ -650,10 +620,7 @@ func (a *alwaysAttestingInstances) UpdateStatusIfUnchanged(ctx context.Context, 
 	})
 }
 
-// A client attesting fast enough to outrun the bounded sweep must not get a
-// success back for a wallet that still has an active instance: the request is
-// reported as incomplete so repeating it resumes the sweep, and the wallet
-// data is not erased while something live remains.
+// A client outrunning the bounded sweep gets an incomplete report and no erasure.
 func TestWalletLifecycle_RevokeAllReportsIncompleteWhenTheSweepRunsOutOfPasses(t *testing.T) {
 	ctx := context.Background()
 	base := memory.NewStore()
@@ -683,9 +650,7 @@ func TestWalletLifecycle_RevokeAllReportsIncompleteWhenTheSweepRunsOutOfPasses(t
 	assert.NotNil(t, user.PrivateData, "an instance the user could still use remains, so nothing is erased")
 }
 
-// The sweep cuts tokens off before its first status write and again once
-// every instance is revoked: a token minted while it was still running
-// carries an iat after the first cut-off and would otherwise survive.
+// The cut-off advances before the first write and after the last, or a token minted between would survive.
 func TestWalletLifecycle_RevokeAllAdvancesTheCutoffAfterTheSweep(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()
@@ -702,7 +667,6 @@ func TestWalletLifecycle_RevokeAllAdvancesTheCutoffAfterTheSweep(t *testing.T) {
 	assert.GreaterOrEqual(t, after.AuthFence, int64(2),
 		"one cut-off before the first revocation and one after the sweep (plus the erasure), each advancing the fence")
 
-	// Nothing left to revoke: the retry path does not keep advancing it.
 	fence := after.AuthFence
 	_, err = svc.RevokeAllForUser(ctx, userActor(uid), domain.DefaultTenantID, uid, "again")
 	require.NoError(t, err)

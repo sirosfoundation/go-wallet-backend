@@ -37,8 +37,7 @@ func TestWalletLifecycle_ChangeStatus_ConcurrentBindIsCutOffAndCascaded(t *testi
 	ctx := context.Background()
 	base := memory.NewStore()
 	uid := seedWalletUser(t, base, domain.DefaultTenantID)
-	// Drop the seeded live instance: the anonymous one is the user's only
-	// instance once it is bound, so revoking it empties the wallet.
+	// Drop the seeded live instance so revoking the bound one empties the wallet.
 	require.NoError(t, base.WalletInstances().Delete(ctx, "inst-"+uid.String()))
 	require.NoError(t, base.WalletInstances().Upsert(ctx, &domain.WalletInstance{
 		ID: "anon-inst", TenantID: domain.DefaultTenantID, Status: domain.InstanceStatusActive,

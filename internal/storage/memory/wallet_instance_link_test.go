@@ -8,10 +8,8 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
 
-// The passkey link (CredentialID) is supplied by the client at attestation.
-// The first non-empty link must stick: a later attestation may fill in a
-// missing link but must not move the instance to another passkey, or the
-// original passkey would escape per-instance revocation login gating.
+// The first non-empty passkey link must stick: a later attestation may fill a
+// missing link but not move it, or the original passkey escapes revocation gating.
 func TestWalletInstanceStore_Upsert_KeepsFirstCredentialLink(t *testing.T) {
 	ctx := context.Background()
 	wis := NewStore().WalletInstances()

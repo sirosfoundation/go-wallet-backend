@@ -15,9 +15,8 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
-// beforeAdvanceStore runs beforeAdvance immediately before the user store
-// executes DeleteUser's cut-off advance: the exact window a read-then-advance
-// would leave open between its check and its write.
+// beforeAdvanceStore runs beforeAdvance immediately before DeleteUser's cut-off
+// advance: the window a read-then-advance would leave open.
 type beforeAdvanceStore struct {
 	storage.Store
 	beforeAdvance func()
@@ -39,10 +38,9 @@ func (u *beforeAdvanceUsers) InvalidateAuthBeforeForToken(ctx context.Context, i
 	return u.UserStore.InvalidateAuthBeforeForToken(ctx, id, t, iat)
 }
 
-// A lifecycle revocation landing between the deletion's last look at the
-// cut-off and its advance is refused by the compare-and-set: 401-class error,
-// no permanent revocation, no user removal, and the independent cut-off is
-// not overwritten.
+// A revocation landing between the last cut-off look and the advance is refused
+// by the compare-and-set (401-class): no permanent revocation, no user removal,
+// and the independent cut-off stands.
 func TestDeleteUser_CompareAndSetRefusesRevocationLandingBeforeTheAdvance(t *testing.T) {
 	ctx := context.Background()
 	inner := memory.NewStore()

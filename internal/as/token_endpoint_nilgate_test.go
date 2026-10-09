@@ -11,9 +11,7 @@ import (
 )
 
 // TestTokenEndpoint_NilGate pins that TokenEndpointConfig.Gate is optional:
-// a config built without it (as the rest of this file's helpers do) mints on
-// every path, session, anonymous and delegation, without dereferencing the
-// nil gate. tokengate.(*Gate).Check is a documented no-op on a nil receiver.
+// every path mints without dereferencing a nil gate (Check is a no-op on nil).
 func TestTokenEndpoint_NilGate(t *testing.T) {
 	router, store, issuer := setupTokenEndpoint(t)
 	_ = store.Create(context.Background(), &Session{

@@ -16,10 +16,8 @@ import (
 	jwkpkg "github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 )
 
-// racingCorruptInstances models the sibling instance ending up with an
-// unrecognised status between GenerateWIA's check and the post-insert
-// re-check: right after the first Upsert every other instance of the user is
-// revoked and a sibling with unknownInstanceStatus appears.
+// racingCorruptInstances: right after the first Upsert every other instance of
+// the user is revoked and a sibling with unknownInstanceStatus appears.
 type racingCorruptInstances struct {
 	storage.WalletInstanceStore
 	userID domain.UserID
@@ -45,16 +43,14 @@ func (r *racingCorruptInstances) Upsert(ctx context.Context, inst *domain.Wallet
 			}
 		}
 	}
-	// Upsert preserves the status of an existing record, so the corrupt
-	// sibling arrives as a new record.
+	// Upsert preserves an existing record's status, so the sibling arrives as a new record.
 	return r.WalletInstanceStore.Upsert(ctx, &domain.WalletInstance{
 		ID: "corrupt-sibling", TenantID: inst.TenantID, UserID: &r.userID, Status: unknownInstanceStatus,
 	})
 }
 
 // An unrecognised sibling status is not evidence of deactivation: the racing
-// first attestation is refused, the new instance is NOT revoked and nothing
-// is erased.
+// attestation is refused, the new instance is not revoked, nothing is erased.
 func TestWIAService_GenerateWIA_UnknownStatusSiblingRefusesWithoutRevoking(t *testing.T) {
 	uid := domain.UserIDFromString("user-unknown-sibling")
 	base := memory.NewStore().WalletInstances()
@@ -131,8 +127,7 @@ func TestWIAService_RevokeIfWalletDeactivatedMeanwhile_UnknownStatus(t *testing.
 	})
 }
 
-// The pre-insert gate also fails closed on an unrecognised status without
-// claiming the wallet is deactivated.
+// The pre-insert gate also fails closed on an unrecognised status without claiming deactivation.
 func TestWIAService_GenerateWIA_UnknownStatusSiblingRefusedBeforeInsert(t *testing.T) {
 	svc, instances := newTestWIAServiceWithInstances(t)
 	ctx := context.Background()
@@ -153,8 +148,7 @@ func TestWIAService_GenerateWIA_UnknownStatusSiblingRefusedBeforeInsert(t *testi
 	assert.Len(t, byUser, 2, "no new instance recorded")
 }
 
-// statusOverrideInstances reports unknownInstanceStatus for id once armed,
-// modelling a record whose stored status this build does not recognize.
+// statusOverrideInstances reports unknownInstanceStatus for id once armed.
 type statusOverrideInstances struct {
 	storage.WalletInstanceStore
 	id    string

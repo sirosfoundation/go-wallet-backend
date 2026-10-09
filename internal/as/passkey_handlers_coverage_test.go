@@ -412,9 +412,8 @@ func TestPasskeyRegisterBegin_ErrorMapping(t *testing.T) {
 	}
 }
 
-// SID-AUTH-06: the auto-login session created by registration inherits the
-// registration token's iat, so a cut-off landing between minting that token
-// and storing the session still refuses the session.
+// SID-AUTH-06: the registration auto-login session inherits the token's iat, so
+// a cut-off between mint and store refuses it.
 func TestPasskeyRegisterFinish_SessionInheritsTokenIssuedAt(t *testing.T) {
 	iat := time.Now().Add(-10 * time.Second).Truncate(time.Second)
 	hdr := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))

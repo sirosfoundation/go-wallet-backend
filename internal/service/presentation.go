@@ -56,12 +56,10 @@ func (s *PresentationService) Store(ctx context.Context, tenantID domain.TenantI
 		return fmt.Errorf("failed to create presentation: %w", err)
 	}
 
-	// Storage-level fence: the admission check above does not stop an erasure
-	// that runs between it and the Create. Re-read the cut-off now that the
-	// record is persisted and take it out again if the token is refused
-	// (tokengate.ConfirmWrite). The rollback deletes the record this request
-	// created by its store-assigned id, not by business key, so a replacement
-	// created under the same identifier after an erasure is never touched.
+	// Storage-level fence: an erasure can run between admission and Create, so
+	// re-read the cut-off after persisting and delete the record if refused
+	// (tokengate.ConfirmWrite). The rollback is by store-assigned id, so a
+	// replacement under the same identifier is never touched.
 	createdID := presentation.ID
 	if err := tokengate.ConfirmWrite(ctx, s.store.Users(), func(rctx context.Context) error {
 		return s.store.Presentations().DeleteByID(rctx, tenantID, createdID)

@@ -1098,10 +1098,8 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 			return
 		}
 		if errors.Is(err, service.ErrDeletionCleanupPending) {
-			// The account is gone. Telling the caller to repeat the request
-			// would be wrong: their token is refused from now on, and the
-			// remainder is for an operator. 202, not an error status, since
-			// what the caller asked for has happened.
+			// The account is gone and the caller's token is refused from now
+			// on; the remainder is for an operator. 202: what was asked happened.
 			h.logger.Error("Account deleted but cleanup incomplete", zap.Error(err))
 			c.JSON(http.StatusAccepted, gin.H{
 				"error":   errCodeDeletionCleanupPending,
@@ -1111,10 +1109,8 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 			return
 		}
 		if errors.Is(err, service.ErrDeletionOperatorRequired) {
-			// The user's tokens are already refused for good, so repeating
-			// the request cannot get past the gate. The account record still
-			// exists and an operator has to finish the deletion. 202: the
-			// deletion is under way, not failed and not done.
+			// Tokens are already refused for good, so a repeat cannot pass the
+			// gate; an operator must finish the deletion. 202: under way.
 			h.logger.Error("Account deletion stalled after token revocation, operator required", zap.Error(err))
 			c.JSON(http.StatusAccepted, gin.H{
 				"error":   errCodeDeletionOperatorRequired,
@@ -1124,9 +1120,7 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 			return
 		}
 		if errors.Is(err, service.ErrDeletionIncomplete) {
-			// The account still exists on purpose, so the caller can repeat
-			// the request rather than be left with a stranded wallet
-			// instance and no way to authenticate.
+			// The account stays on purpose so the caller can repeat the request.
 			h.logger.Error("Account deletion incomplete", zap.Error(err))
 			c.JSON(409, gin.H{
 				"error":   errCodeDeletionIncomplete,
@@ -1575,22 +1569,17 @@ func publicOIDCGateToResponse(g *domain.OIDCGateConfig) *PublicOIDCGateResponse 
 }
 
 // lifecycleRefusalBody is the 403 body of a SID-AUTH-06 login refusal: the
-// error code and message clients already read, plus the `scope` that says
-// whether the wallet still exists. The AS passkey handler builds the same
-// body from the same mapping, so the two login endpoints cannot disagree.
+// error code and message plus a `scope` saying whether the wallet still exists.
+// The AS passkey handler shares the mapping.
 func lifecycleRefusalBody(err error) gin.H {
 	d := service.LifecycleRefusalDetails(err)
 	return gin.H{"error": d.Code, "scope": d.Scope, "message": d.Message}
 }
 
 // abortIfTokenRevoked answers 401 when a write refused the request's bearer
-// token because the user's authorization was cut off after the middleware
-// admitted it (tokengate.RefuseLoaded). It reports whether it answered.
-//
-// storage.ErrStaleWrite is the same refusal arriving from the other side: the
-// lifecycle fence advanced the user's cut-off after the record was loaded but
-// before UserStore.Update, so the write was rejected to keep it from restoring
-// data after an erasure. It is a revoked-token answer, not a server error.
+// token because the cut-off advanced after the middleware admitted it
+// (tokengate.RefuseLoaded), and reports whether it answered.
+// storage.ErrStaleWrite is the same refusal from the store's fence, not a server error.
 func abortIfTokenRevoked(c *gin.Context, err error) bool {
 	if !errors.Is(err, tokengate.ErrRevoked) && !errors.Is(err, storage.ErrStaleWrite) {
 		return false

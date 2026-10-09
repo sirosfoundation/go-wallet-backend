@@ -49,8 +49,7 @@ func TestWalletInstanceStore_UpdateStatus_ValidTransitions(t *testing.T) {
 	}
 	require.NoError(t, wis.Upsert(ctx, inst))
 
-	// "active" is refused outright: an instance is active from insert, so
-	// writing it could only ever mean reactivation.
+	// "active" is refused: an instance is active from insert, so writing it means reactivation.
 	err := wis.UpdateStatus(ctx, "inst-valid-transitions", "acme", domain.InstanceStatusActive, "")
 	require.Error(t, err)
 	require.True(t, errors.Is(err, domain.ErrInvalidStatusTransition))
@@ -68,10 +67,8 @@ func TestWalletInstanceStore_UpdateStatus_ValidTransitions(t *testing.T) {
 	require.True(t, errors.Is(err, domain.ErrInvalidStatusTransition))
 }
 
-// A record written by a release that still had the reversible "suspended"
-// state must remain closable. The conditional filter matches anything not
-// already revoked, so an operator can finish what they started; without that
-// the document would be stuck in a state nothing can leave.
+// A record from a release with the reversible "suspended" state must remain
+// closable: the conditional filter matches anything not already revoked.
 func TestWalletInstanceStore_UpdateStatus_LegacySuspendedIsRevocable(t *testing.T) {
 	store := skipIfNoMongo(t)
 	ctx := context.Background()

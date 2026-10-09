@@ -112,9 +112,8 @@ func TestWIAService_LifecycleReads_FailClosed(t *testing.T) {
 	})
 }
 
-// The post-insert deactivation re-check must not revoke on evidence that only
-// shows the record belongs to someone else, and must tolerate the record being
-// gone.
+// The post-insert deactivation re-check must not revoke on evidence that the
+// record belongs to someone else, and must tolerate it being gone.
 func TestWIAService_RevokeIfWalletDeactivatedMeanwhile_OwnershipAndAbsence(t *testing.T) {
 	ctx := context.Background()
 	mine, other := domain.NewUserID(), domain.NewUserID()
@@ -175,10 +174,8 @@ func TestWIAService_RevokeIfWalletDeactivatedMeanwhile_OwnershipAndAbsence(t *te
 	})
 }
 
-// The lifecycle cascade that revoked the user's last other instance may have
-// listed a raced first attestation while it was still active and so kept the
-// vault. When the attestation path then revokes that instance itself, nothing
-// live is left and the erasure has to happen now.
+// If the cascade kept the vault because it listed a raced attestation as
+// active, revoking that instance in the attestation path must erase now.
 func TestWIAService_RevokeIfWalletDeactivatedMeanwhile_RunsTheCascade(t *testing.T) {
 	ctx := context.Background()
 	fs := newFailStore()
@@ -216,9 +213,8 @@ func TestWIAService_RevokeIfWalletDeactivatedMeanwhile_RunsTheCascade(t *testing
 	})
 }
 
-// A token admitted before a user-wide cut-off (revoking one instance while
-// another stays live) must not still obtain a WIA: GenerateWIA judges it at the
-// point of signing.
+// A token admitted before a user-wide cut-off must not obtain a WIA:
+// GenerateWIA judges it at signing.
 func TestWIAService_GenerateWIA_RefusesATokenTheCutoffPredates(t *testing.T) {
 	svc, store := newTestWIAServiceWithUsers(t)
 	base := context.Background()
@@ -238,9 +234,8 @@ func TestWIAService_GenerateWIA_RefusesATokenTheCutoffPredates(t *testing.T) {
 	assert.NoError(t, attest(tokengate.WithSubject(base, uid.String(), cutoff.Add(time.Minute))))
 }
 
-// cutoffAdvancingUsers stands in for a user-wide revocation that lands while a
-// request is in flight: GetAuthCutoff reports no cut-off for the first `after`
-// reads and the given cut-off from then on.
+// cutoffAdvancingUsers reports no cut-off for the first `after` reads and the
+// given one afterwards, simulating a revocation during the request.
 type cutoffAdvancingUsers struct {
 	storage.UserStore
 	after  int
@@ -256,9 +251,8 @@ func (u *cutoffAdvancingUsers) GetAuthCutoff(ctx context.Context, id domain.User
 	return u.cutoff, nil
 }
 
-// A revocation landing after GenerateWIA's first cut-off check (before or during
-// signing and the instance write) must still refuse the request, and when it
-// lands before the write it must not record the instance either.
+// A revocation after GenerateWIA's first cut-off check must refuse the
+// request, and before the write must not record the instance.
 func TestWIAService_GenerateWIA_RevocationLandingBeforeSigningIsRefused(t *testing.T) {
 	// GenerateWIA's own check is read 1; the signing-boundary check is read 2;
 	// the release check is read 3.

@@ -43,8 +43,7 @@ type tokenDeps struct {
 	audiences []string
 	blacklist TokenBlacklistChecker
 	logger    *zap.Logger
-	// gate refuses delegating tokens issued before the user's SID-AUTH-06
-	// cut-off (optional; nil enforces nothing).
+	// gate refuses tokens issued before the user's SID-AUTH-06 cut-off (nil: none).
 	gate *tokengate.Gate
 }
 
@@ -72,8 +71,7 @@ type TokenEndpointConfig struct {
 	Audiences       []string
 	Blacklist       TokenBlacklistChecker
 	InsecureCookies bool
-	// Gate refuses delegating tokens issued before the user's SID-AUTH-06
-	// cut-off (optional; nil enforces nothing).
+	// Gate refuses tokens issued before the user's SID-AUTH-06 cut-off (nil: none).
 	Gate   *tokengate.Gate
 	Logger *zap.Logger
 }
@@ -285,11 +283,9 @@ func handleAnonymousTokenRequest(
 }
 
 // sessionPassesCutoff refuses a session that predates the user's SID-AUTH-06
-// token cut-off, so a session that outlived a revocation - the lifecycle
-// cascade drops sessions, but that can fail and is reported as
-// ERASURE_INCOMPLETE - cannot mint a fresh bearer token. Minting new tokens
-// after a lifecycle change always requires a new login. It writes the
-// response and returns false when the session is refused.
+// cut-off, so a session that outlived a revocation (the cascade can fail to
+// drop it) cannot mint a fresh token. It writes the response and returns false
+// on refusal.
 func sessionPassesCutoff(c *gin.Context, deps *tokenDeps, session *Session) bool {
 	err := deps.gate.Check(c.Request.Context(), session.UserID, session.authInstant())
 	switch {
@@ -359,10 +355,9 @@ func handleDelegationTokenRequest(
 		}
 	}
 
-	// SID-AUTH-06: a delegating token issued before the user's wallet was
-	// revoked must not mint a fresh (post-cut-off) token. The parent is what
-	// gets judged (see cutoffSubject): a child token would carry a fresh iat
-	// and so would clear the cut-off on its own.
+	// SID-AUTH-06: a delegating token issued before the revocation must not mint
+	// a fresh one; the parent is judged (see cutoffSubject), as a child would carry
+	// a fresh iat.
 	parent := cutoffSubject{userID: parentClaims.Subject, issuedAt: tokengate.IssuedAt(bearerToken)}
 	if err := deps.gate.Check(c.Request.Context(), parent.userID, parent.issuedAt); err != nil {
 		if errors.Is(err, tokengate.ErrRevoked) {
@@ -421,17 +416,10 @@ func handleDelegationTokenRequest(
 }
 
 // issueToken is the common path for both session and delegation flows.
-// cutoffSubject is what the caller authenticated with, so issueToken can
-// re-check the SID-AUTH-06 cut-off after minting: the new token's own iat is
-// necessarily fresh, so only the credential behind it can still be judged.
-//
-// What it carries is the issuing instant of the token or session that asked,
-// which is the only thing a cut-off can be applied to. A token minted here
-// would carry a fresh iat, so every gate in the system would accept it and a
-// pre-cut-off credential would have laundered itself into an unrestricted one
-// for a wallet that was just revoked. Minting after a lifecycle change always
-// requires a new login, for a delegating bearer token as for a session
-// cookie.
+// cutoffSubject is the issuing instant of the token or session that asked, so
+// issueToken can re-check the SID-AUTH-06 cut-off after minting: the new
+// token's own iat is always fresh, so only the credential behind it can be
+// judged. Minting after a lifecycle change requires a new login.
 type cutoffSubject struct {
 	userID   string
 	issuedAt time.Time
@@ -483,9 +471,8 @@ func issueToken(
 		return
 	}
 
-	// SID-AUTH-06: the cut-off was checked before the policy evaluation and
-	// the signing above; a suspension or revocation landing in between must
-	// not be handed a token whose fresh iat the resource gate would accept.
+	// SID-AUTH-06: a revocation landing since the check above must not be handed
+	// a token with a fresh iat.
 	if err := deps.gate.Check(c.Request.Context(), subject.userID, subject.issuedAt); err != nil {
 		if errors.Is(err, tokengate.ErrRevoked) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "authorization revoked while the token was being issued"})

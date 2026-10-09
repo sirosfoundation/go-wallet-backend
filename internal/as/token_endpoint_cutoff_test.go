@@ -24,8 +24,8 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
-// SID-AUTH-06: a session that predates the user's token cut-off cannot mint a
-// fresh bearer token, even when the lifecycle cascade failed to drop it.
+// SID-AUTH-06: a session predating the user's cut-off cannot mint a token, even
+// if the cascade failed to drop it.
 func TestTokenEndpoint_SessionPredatingCutoffIsRefused(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -79,16 +79,15 @@ func TestTokenEndpoint_SessionPredatingCutoffIsRefused(t *testing.T) {
 		return w.Code
 	}
 
-	// Explicit timestamps rather than sleeps: the cut-off comparison is at
-	// whole seconds (tokengate.IssuedBeforeCutoff).
+	// Explicit timestamps, not sleeps: the comparison is at whole seconds
+	// (tokengate.IssuedBeforeCutoff).
 	cutoff := time.Now().Add(-5 * time.Second)
 	newSession("before", cutoff.Add(-5*time.Second))
 	if got := post("before", `{"aud":"wallet-backend"}`); got != http.StatusOK {
 		t.Fatalf("without a cut-off the session mints a token, got %d", got)
 	}
 
-	// The wallet is revoked: the cut-off lands, but the session survives
-	// (the cascade's session drop failed and returned ERASURE_INCOMPLETE).
+	// Revoked: the cut-off lands but the session survives (session drop failed).
 	if err := users.InvalidateAuthBefore(context.Background(), uid, cutoff); err != nil {
 		t.Fatal(err)
 	}
@@ -106,9 +105,8 @@ func TestTokenEndpoint_SessionPredatingCutoffIsRefused(t *testing.T) {
 	}
 }
 
-// cutoffOnEvaluate advances the user's token cut-off while the policy is
-// being evaluated, i.e. after the endpoint's preflight check and before the
-// token is signed.
+// cutoffOnEvaluate advances the cut-off during policy evaluation, after the
+// preflight check and before signing.
 type cutoffOnEvaluate struct {
 	users storage.UserStore
 	uid   domain.UserID
@@ -127,9 +125,8 @@ func (p *cutoffOnEvaluate) Evaluate(string) (bool, error) {
 
 func (p *cutoffOnEvaluate) RuleCount() int { return 0 }
 
-// A suspension landing between the preflight check and the signing must not
-// hand out a token: its own iat would be fresh, so only the session behind it
-// can still be judged.
+// A suspension between preflight and signing must not yield a token: its iat
+// would be fresh, so only the session behind it can be judged.
 func TestTokenEndpoint_CutoffDuringIssuanceIsRefused(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -182,9 +179,8 @@ func TestTokenEndpoint_CutoffDuringIssuanceIsRefused(t *testing.T) {
 	}
 }
 
-// A session whose record was written after a cut-off but whose authentication
-// happened before it must not mint tokens: the login is what the cut-off
-// applies to, not the moment the session row was created.
+// A session written after a cut-off but authenticated before it must not mint:
+// the cut-off applies to the login, not the session row's creation.
 func TestSession_AuthInstantIsTheAuthenticationNotTheRecord(t *testing.T) {
 	cutoff := time.Now()
 	s := &Session{CreatedAt: cutoff.Add(time.Second), AuthenticatedAt: cutoff.Add(-time.Minute)}

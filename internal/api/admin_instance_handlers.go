@@ -14,27 +14,20 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
 
-// Error strings shared by the admin instance handlers (kept identical to the
-// self-service handlers so clients see one vocabulary).
-// errCodeErasureIncomplete reports a lifecycle change that was persisted but
-// whose cascade (dropping sessions, cutting off tokens, erasing wallet data)
-// did not complete. The status change stands; repeating the request resumes
-// the cleanup.
+// Error strings shared with the self-service handlers so clients see one vocabulary.
+//
+// errCodeErasureIncomplete reports a persisted lifecycle change whose cascade
+// did not complete; repeating the request resumes the cleanup.
 const (
 	errCodeErasureIncomplete = "ERASURE_INCOMPLETE"
-	// errCodeDeletionIncomplete is returned when account deletion left a
-	// wallet instance behind. The account still exists; repeat the request.
+	// errCodeDeletionIncomplete: account deletion left a wallet instance behind; repeat the request.
 	errCodeDeletionIncomplete = "DELETION_INCOMPLETE"
-	// errCodeDeletionCleanupPending is returned when the account was deleted
-	// but the sweep after its removal failed. Do not repeat the request.
+	// errCodeDeletionCleanupPending: the account was deleted but the later sweep failed; do not repeat.
 	errCodeDeletionCleanupPending = "DELETION_CLEANUP_PENDING"
-	// errCodeDeletionOperatorRequired is returned when the deletion stalled
-	// after the user's tokens were revoked for good: the record still exists
-	// but the user cannot repeat the request. Do not repeat it.
+	// errCodeDeletionOperatorRequired: deletion stalled after the user's tokens were
+	// revoked for good; the user cannot repeat it.
 	errCodeDeletionOperatorRequired = "DELETION_OPERATOR_REQUIRED"
-	// errCodeLifecycleNotSupported is returned when a lifecycle operation is
-	// reached without a lifecycle service behind it. It means the operation
-	// did not happen, not that it half happened.
+	// errCodeLifecycleNotSupported: no lifecycle service behind the operation; nothing happened.
 	errCodeLifecycleNotSupported = "LIFECYCLE_NOT_SUPPORTED"
 	errMsgErasureIncomplete      = "the status change was recorded but part of the lifecycle cleanup (dropping sessions, cutting off tokens, erasing wallet data) did not complete; repeat the request to finish it"
 )
@@ -42,19 +35,11 @@ const (
 const (
 	errMsgInstanceUpdateFailed    = "failed to update wallet instance"
 	errMsgInvalidStatusTransition = "invalid status transition"
-	// errCodeInstanceRetained refuses the hard delete of a user-owned
-	// instance that is not live. The record is the tombstone the login gate
-	// and the WIA guard read, so deleting it would make the next attestation
-	// on that device look like a first enrollment. It is status-neutral
-	// because a legacy suspended record is retained for the same reason a
-	// revoked one is.
+	// errCodeInstanceRetained refuses hard delete of a non-live user-owned
+	// instance: it is the tombstone the login gate and WIA guard read.
 	errCodeInstanceRetained = "INSTANCE_RETAINED"
-	// errCodeInstanceOwned refuses the hard delete of a live instance that
-	// belongs to a user. Removing it would skip the lifecycle cascade (token
-	// cut-off, session drop, erasure) and, for the user's last instance,
-	// leave an empty listing that the login gate reads as an initial
-	// enrollment, letting every passkey log in again. The admin has to
-	// revoke it instead, which keeps the tombstone.
+	// errCodeInstanceOwned refuses hard delete of a live user-owned instance,
+	// which would skip the lifecycle cascade; revoke it instead.
 	errCodeInstanceOwned = "INSTANCE_OWNED"
 )
 
@@ -98,18 +83,13 @@ func (h *AdminHandlers) GetWalletInstance(c *gin.Context) {
 }
 
 type updateInstanceStatusRequest struct {
-	// Status is "revoked", the only status change a wallet instance has.
-	// The field is kept rather than dropped for a bare revoke endpoint so
-	// that a client always says what it means to happen, and so a future
-	// state does not need a second URL.
+	// Status is "revoked", the only status change; kept so a future state needs no second URL.
 	Status string `json:"status" binding:"required,oneof=revoked"`
 	Reason string `json:"reason"`
 }
 
-// UpdateWalletInstanceStatus revokes a wallet instance. Revocation is the only
-// lifecycle change there is and it cannot be undone, which is why it is a
-// provider action: a user who revoked the instance behind their last passkey
-// would have no way back without an admin.
+// UpdateWalletInstanceStatus revokes a wallet instance. Terminal, hence a
+// provider action.
 func (h *AdminHandlers) UpdateWalletInstanceStatus(c *gin.Context) {
 	tenantID := domain.TenantID(c.Param("id"))
 	instanceID := c.Param("instance_id")
@@ -144,8 +124,7 @@ func (h *AdminHandlers) UpdateWalletInstanceStatus(c *gin.Context) {
 	}
 
 	if h.lifecycle != nil {
-		// Shared lifecycle service: same transition rules, audit and cascade
-		// (session drop, wallet erasure on last revocation) as self-service.
+		// Shared lifecycle service: same rules, audit and cascade as self-service.
 		if _, err := h.lifecycle.ChangeStatus(c.Request.Context(), service.LifecycleActor{Kind: "provider"}, tenantID, instanceID, status, req.Reason); err != nil {
 			switch {
 			case errors.Is(err, service.ErrErasureIncomplete):
@@ -165,16 +144,8 @@ func (h *AdminHandlers) UpdateWalletInstanceStatus(c *gin.Context) {
 		return
 	}
 
-	// No lifecycle service: fail closed. Writing the status straight to the
-	// store would skip the token cut-off, the session drop and the erasure,
-	// and answer 200 for a revocation that left the device's tokens working.
-	// For the one operation a wallet instance has, and one that cannot be
-	// undone, that is the worst possible half-measure.
-	//
-	// Both providers wire the service (server.BackendProvider and
-	// server.AdminProvider), so this is unreachable in a built server. It is
-	// here so that a future one cannot reintroduce a silent partial
-	// revocation by forgetting to.
+	// No lifecycle service: fail closed, since writing the status directly would
+	// skip cut-off, session drop and erasure yet answer 200.
 	h.logger.Error("wallet instance revocation refused: no lifecycle service is wired",
 		zap.String("instance_id", instanceID), zap.String("tenant_id", string(tenantID)))
 	c.JSON(http.StatusServiceUnavailable, gin.H{"error": errCodeLifecycleNotSupported})
@@ -201,13 +172,9 @@ func (h *AdminHandlers) DeleteWalletInstance(c *gin.Context) {
 		return
 	}
 
-	// SID-AUTH-06: a revoked instance of a user is the record that keeps the
-	// login gate and the WIA guard refusing that wallet. Deleting it would
-	// make the user look never-enrolled and re-open both. Revocation is
-	// terminal, so the record stays as a tombstone, whoever owns it: an
-	// anonymous WIA attestation leaves an unowned record, and deleting its
-	// tombstone would let the same key enroll again as a fresh active
-	// instance. Only active records can be hard-deleted.
+	// SID-AUTH-06: a revoked instance is the tombstone that keeps the login gate
+	// and WIA guard refusing that wallet, owned or not. Only active records are
+	// hard-deleted.
 	if !instance.Status.IsLive() {
 		c.JSON(http.StatusConflict, gin.H{
 			"error":   errCodeInstanceRetained,
@@ -216,14 +183,9 @@ func (h *AdminHandlers) DeleteWalletInstance(c *gin.Context) {
 		return
 	}
 
-	// A live instance of a user is not deleted either. Hard deletion bypasses
-	// the lifecycle: nothing cuts off the user's tokens or drops sessions,
-	// and removing the user's last instance leaves an empty listing, which
-	// checkWalletLifecycle treats as an initial enrollment and lets every
-	// passkey log in again (with siblings, the deleted instance's linked
-	// passkey would stop being gated). Revocation does all of that and
-	// leaves the tombstone that keeps the gate closed, so the admin is told
-	// to revoke. Only records with no owner are hard-deleted.
+	// A live user-owned instance is not deleted: that would skip the lifecycle
+	// (cut-off, session drop) and can leave an empty listing the login gate
+	// reads as a first enrollment. Revoke instead.
 	if instance.UserID != nil {
 		c.JSON(http.StatusConflict, gin.H{
 			"error":   errCodeInstanceOwned,
@@ -232,17 +194,9 @@ func (h *AdminHandlers) DeleteWalletInstance(c *gin.Context) {
 		return
 	}
 
-	// The condition travels with the delete. The check above reads a
-	// snapshot, and a revocation landing between the two would have its
-	// fresh tombstone deleted here - the very record that keeps login and
-	// new attestations refused for that device.
-	//
-	// The record read above travels with it too (owner and generation). The
-	// id is a global key, so if this instance was deleted and the same
-	// thumbprint attested again - by another user of the tenant - between
-	// the read and here, the replacement is also live or unowned and would
-	// pass the removability test; only the binding says it is not the one
-	// the operator asked about.
+	// The condition and binding (owner, generation) travel with the delete: the
+	// read above is a snapshot, and a concurrent revocation's tombstone or
+	// another user's re-attested thumbprint must not be deleted.
 	if err := h.store.WalletInstances().DeleteIfRemovable(c.Request.Context(), instanceID, tenantID, instance.Binding()); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "wallet instance not found"})
@@ -289,9 +243,7 @@ func (h *AdminHandlers) ListWalletInstancesByUser(c *gin.Context) {
 }
 
 func (h *AdminHandlers) emitInstanceAuditEvent(_ *gin.Context, instanceID string, status domain.InstanceStatus, reason string) {
-	// Revocation is the only status this endpoint accepts; anything else
-	// reaching here got past the binding, so it is recorded rather than
-	// dropped.
+	// Revocation is the only accepted status; anything else is recorded, not dropped.
 	event := set.EventWIDeactivated
 	if status == domain.InstanceStatusRevoked {
 		event = set.EventWIRevoked
@@ -307,12 +259,9 @@ type revokeAllInstancesRequest struct {
 	Reason string `json:"reason"`
 }
 
-// RevokeAllWalletInstancesForUser handles
-// POST /admin/tenants/:id/users/:user_id/instances/revoke-all: revoke every
-// instance the user has in the tenant. SID-AUTH-06 requires a provider to be
-// able to act on one instance, several, or all of them; this is the "all"
-// case, and revoking the last live one runs the same cascade as a single
-// revocation.
+// RevokeAllWalletInstancesForUser handles POST
+// /admin/tenants/:id/users/:user_id/instances/revoke-all: revokes every instance
+// the user has in the tenant (SID-AUTH-06) via the single-revocation cascade.
 func (h *AdminHandlers) RevokeAllWalletInstancesForUser(c *gin.Context) {
 	if h.lifecycle == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": errCodeLifecycleNotSupported})
@@ -321,11 +270,9 @@ func (h *AdminHandlers) RevokeAllWalletInstancesForUser(c *gin.Context) {
 	tenantID := domain.TenantID(c.Param("id"))
 	userID := domain.UserIDFromString(c.Param("user_id"))
 
-	// The body is optional, so an absent one is fine and a malformed one is
-	// not. Content-Length cannot make that distinction: a chunked request
-	// reports -1 however much it carries, so keying on it silently dropped
-	// the reason from any client that streams its body. Bind unconditionally
-	// and treat only "there was nothing to read" as absent.
+	// The body is optional: absent is fine, malformed is not. Content-Length
+	// cannot tell them apart (chunked is -1), so bind and treat only "nothing to
+	// read" as absent.
 	var req revokeAllInstancesRequest
 	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})

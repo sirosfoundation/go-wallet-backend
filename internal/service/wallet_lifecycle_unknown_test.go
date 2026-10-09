@@ -13,9 +13,8 @@ import (
 
 const unknownInstanceStatus = domain.InstanceStatus("corrupted")
 
-// seedRawInstance inserts an instance with an arbitrary stored status, the
-// way a corrupted or newer-release record sits in the database. It goes in
-// through Upsert as a new record, which keeps the status it is given.
+// seedRawInstance inserts an instance with an arbitrary stored status (a
+// corrupted or newer-release record) via Upsert.
 func seedRawInstance(t *testing.T, store storage.Store, tenant domain.TenantID, id string, userID domain.UserID, credentialID string, st domain.InstanceStatus) {
 	t.Helper()
 	require.NoError(t, store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{

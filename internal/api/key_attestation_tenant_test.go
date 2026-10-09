@@ -26,9 +26,9 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
-// The tenant the KA instance check judges comes from the handler, via a
-// context value that the service silently does not judge when absent. This
-// goes through the real handler so that dropping the handler's call fails.
+// The KA instance check's tenant comes from the handler via a context value the
+// service silently skips when absent; this goes through the real handler so
+// dropping that call fails.
 func TestHandlers_GenerateKeyAttestation_InstanceTenantScoping(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	dir := t.TempDir()

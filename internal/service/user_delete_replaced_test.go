@@ -13,9 +13,8 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 )
 
-// staleListStore hands DeleteUser a snapshot of the user's instances taken
-// before an admin cleanup removed one and the same thumbprint was attested
-// again for someone else.
+// staleListStore hands DeleteUser a stale instance snapshot: one was removed and
+// the same thumbprint attested again for someone else.
 type staleListStore struct {
 	storage.Store
 	stale []*domain.WalletInstance
@@ -54,9 +53,8 @@ func TestDeleteUser_DoesNotDeleteAReplacementInstanceFromAStaleListing(t *testin
 	}))
 
 	svc := NewUserService(&staleListStore{Store: inner, stale: []*domain.WalletInstance{stale}}, testConfig(), zap.NewNop())
-	// The first pass sees the mismatch, the second pass re-lists and finds
-	// nothing of the victim's: the deletion completes, and the replacement
-	// must be untouched throughout.
+	// The first pass sees the mismatch, the second re-lists and finds nothing
+	// of the victim's; the replacement must stay untouched.
 	err := svc.DeleteUser(ctx, victim, "did:key:"+victim.String())
 	assert.NoError(t, err)
 

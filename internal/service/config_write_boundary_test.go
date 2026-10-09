@@ -22,10 +22,8 @@ type usersOverrideStore struct {
 
 func (s *usersOverrideStore) Users() storage.UserStore { return s.users }
 
-// SID-AUTH-06: issuer and verifier configuration writes recheck the token's
-// cut-off at the mutation boundary. The cut-off lands between admission (the
-// middleware's check) and the write, so the write must be refused and
-// nothing persisted or removed.
+// SID-AUTH-06: issuer and verifier config writes recheck the token's cut-off at
+// the mutation boundary; a cut-off landing after admission refuses the write.
 func TestIssuerVerifierWrites_CutoffAfterAdmissionIsRefused(t *testing.T) {
 	base := context.Background()
 	mem := memory.NewStore()

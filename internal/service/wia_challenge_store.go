@@ -18,10 +18,8 @@ type WIAChallengeStore interface {
 	// exhaust the shared pool and deny challenge creation for everyone else).
 	Put(ctx context.Context, tenantID domain.TenantID, challenge string, expiresAt time.Time) (bool, error)
 
-	// Consume atomically retrieves and deletes a challenge minted for
-	// tenantID. Returns false if the challenge doesn't exist, is expired, or
-	// was minted for another tenant; in the last case it is left in place, so
-	// a caller of another tenant can neither use nor burn it.
+	// Consume atomically retrieves and deletes a challenge minted for tenantID.
+	// Returns false if it is missing, expired or of another tenant (left in place).
 	Consume(ctx context.Context, tenantID domain.TenantID, challenge string) (bool, error)
 
 	// Len returns the number of stored challenges (approximate for distributed stores).

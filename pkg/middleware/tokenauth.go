@@ -41,11 +41,9 @@ type TenantLookup interface {
 //	"token"          (string)           — raw Bearer token
 //	"tokenauth_result" (*claims.Result) — full validation result
 //
-// users is REQUIRED: tokens issued before the user's SID-AUTH-06
-// authorization cut-off (User.AuthInvalidBefore) are refused with 401. A nil
-// users panics at construction, so a caller that has not been migrated to
-// supply the lookup fails at compile time (signature change) or at startup,
-// never by silently running without the lifecycle gate.
+// users is REQUIRED: tokens issued before the user's SID-AUTH-06 cut-off
+// (User.AuthInvalidBefore) are refused with 401. A nil users panics at
+// construction rather than silently running without the lifecycle gate.
 //
 // blacklist, when non-nil, is checked for user-level revocation
 // (IsUserRevoked) after a token validates - see #391 review: per-jti
@@ -72,12 +70,10 @@ func TokenAuthMiddleware(cfg *config.Config, v *validator.Validator, tenants Ten
 // TokenAuthMiddlewareWithValidate is TokenAuthMiddleware with the token
 // validation step supplied by the caller (validate must return the same
 // *claims.Result a go-tokenauth Validator would, and an error to reject).
-// Every check after validation - user, refresh-token family, SID-AUTH-06
-// cut-off and tenant handling - is identical. It lets a caller route some
-// tokens through a different validation (the registry's audience-independent
-// legacy path) without duplicating the post-validation chain. users is
-// required here too: a process with no user database passes
-// tokengate.NoUserRecords explicitly rather than nil.
+// Every check after validation (user, refresh-token family, cut-off, tenant) is
+// shared, so a caller can route some tokens through a different validation (the
+// registry's legacy path). users is required here too: a process with no user
+// database passes tokengate.NoUserRecords explicitly.
 func TokenAuthMiddlewareWithValidate(cfg *config.Config, validate func(ctx context.Context, rawToken string) (*claims.Result, error), tenants TenantLookup, blacklist TokenBlacklistChecker, users tokengate.UserLookup, logger *zap.Logger) gin.HandlerFunc {
 	if users == nil {
 		panic("middleware.TokenAuthMiddleware: users lookup is required (it enforces the SID-AUTH-06 token cut-off); a process with no user database must pass tokengate.NoUserRecords explicitly")
@@ -147,13 +143,13 @@ func TokenAuthMiddlewareWithValidate(cfg *config.Config, validate func(ctx conte
 			}
 		}
 
-		// SID-AUTH-06 token cut-off. An anonymous token has no user to judge and
-		// passes here; routes that need an identity refuse it with RequireUser.
+		// SID-AUTH-06 token cut-off. An anonymous token has no user to judge and passes;
+		// routes that need an identity use RequireUser.
 		if !checkTokenGate(c, gate, result.UserID, tokengate.IssuedAt(rawToken), logger) {
 			return
 		}
-		// Carried to the writes further down, which judge the token against
-		// the user record they load (tokengate.RefuseLoaded).
+		// Carried to the writes below, which judge the token against the user record they
+		// load (tokengate.RefuseLoaded).
 		c.Request = c.Request.WithContext(tokengate.WithSubject(c.Request.Context(), result.UserID, tokengate.IssuedAt(rawToken)))
 
 		tenant, tenantID, ok := resolveTokenTenant(c, tenants, result, logger)
@@ -188,11 +184,9 @@ func TokenAuthMiddlewareWithValidate(cfg *config.Config, validate func(ctx conte
 	}
 }
 
-// resolveTokenTenant looks up the token's tenant (an empty tenant_id means
-// "default") and refuses the request when the tenant is unknown (401) or
-// disabled (403). On refusal the response has been written and the request
-// aborted, and ok is false. The JWT's tenant_id is authoritative; a
-// mismatching X-Tenant-ID header is only logged.
+// resolveTokenTenant looks up the token's tenant (empty means "default") and
+// aborts with 401 (unknown) or 403 (disabled); ok is false then. The JWT's
+// tenant_id is authoritative; a mismatching X-Tenant-ID header is only logged.
 func resolveTokenTenant(c *gin.Context, tenants TenantLookup, result *claims.Result, logger *zap.Logger) (tenant *domain.Tenant, tenantID string, ok bool) {
 	tenantID = result.TenantID
 	if tenantID == "" {
@@ -238,23 +232,16 @@ func resolveTokenTenant(c *gin.Context, tenants TenantLookup, result *claims.Res
 	return tenant, tenantID, true
 }
 
-// AnonymousTokenMessage is the error the routes that need an identity answer
-// an anonymous token with.
+// AnonymousTokenMessage is the error body for an anonymous token on a route that
+// needs an identity.
 const AnonymousTokenMessage = "anonymous tokens are not accepted on this route"
 
-// RequireUser refuses a request whose bearer token names no user (an anonymous
-// token: one the AS issued without "sub", or a legacy token with an empty
-// user id) with 403. Anonymous tokens exist for registry lookups and public
-// metadata (the AuthZEN proxy, the registry, VCTM lookups); every route that
-// acts on a wallet, an account or a tenant's configuration on behalf of a
-// user must sit behind it. The token gate cannot do this job: it judges a
-// user against the lifecycle cut-off, and an anonymous token has no user to
-// judge, so without this an anonymous token issued before a revocation or an
-// account deletion would stay usable on wallet-scoped routes until it
-// expires.
-//
-// Must be placed after the authentication middleware, which sets "user_id"
-// only for a token that names a user.
+// RequireUser refuses with 403 a token that names no user (issued without "sub",
+// or a legacy empty user id). Anonymous tokens are for public lookups (AuthZEN
+// proxy, registry, VCTM); every route acting on a wallet, account or tenant
+// configuration must sit behind this, because the token gate has no user to judge
+// and would leave pre-revocation anonymous tokens usable until expiry. Place it
+// after the authentication middleware, which sets "user_id" only for named users.
 func RequireUser() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if userID, _ := c.Get("user_id"); userID == nil || userID == "" {

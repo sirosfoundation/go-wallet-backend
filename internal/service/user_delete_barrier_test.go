@@ -15,9 +15,8 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 )
 
-// fenceHookStore runs afterFence once the user's token cut-off has been advanced,
-// which is the instant a request admitted before the cut-off can still land a
-// write that the first holder-data sweep has already missed.
+// fenceHookStore runs afterFence once the cut-off has advanced: the instant an
+// admitted request can land a write the first holder-data sweep missed.
 type fenceHookStore struct {
 	storage.Store
 	afterFence func(ctx context.Context)
@@ -50,8 +49,7 @@ func (u *fenceHookUsers) InvalidateAuthBeforeForToken(ctx context.Context, id do
 	return nil
 }
 
-// A write admitted before the cut-off lands after the first sweep and before
-// the cut-off is advanced. Account deletion must still leave no holder data.
+// A write admitted before the cut-off lands after the first sweep; deletion must leave no holder data.
 func TestDeleteUser_RemovesHolderDataWrittenByAnAlreadyAdmittedRequest(t *testing.T) {
 	ctx := context.Background()
 	hs := &fenceHookStore{Store: memory.NewStore()}

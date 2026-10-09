@@ -12,10 +12,8 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
 
-// Every way the account-deletion sweep can fail must answer
-// ErrDeletionIncomplete and keep the user record, because a deleted user
-// cannot authenticate to ask again and whatever the sweep missed would be
-// stranded.
+// Every account-deletion sweep failure must answer ErrDeletionIncomplete and keep
+// the user record: a deleted user cannot authenticate to ask again.
 func TestDeleteUser_EveryFailureKeepsTheAccount(t *testing.T) {
 	ops := []string{
 		"users.GetByID",

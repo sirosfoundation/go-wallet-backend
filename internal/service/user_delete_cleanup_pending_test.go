@@ -55,10 +55,8 @@ func (c *failAfterRemovalCreds) GetAllByHolder(ctx context.Context, tid domain.T
 	return c.CredentialStore.GetAllByHolder(ctx, tid, did)
 }
 
-// The sweep after the user's removal cannot hold the record back, so when it
-// fails the account is already gone. That must not surface as
-// ErrDeletionIncomplete, whose contract is "the account still exists, repeat
-// the request".
+// The sweep after the user's removal cannot hold the record back, so its
+// failure must not surface as ErrDeletionIncomplete ("account still exists").
 func TestDeleteUser_PostRemovalSweepFailureIsDistinctFromRetryable(t *testing.T) {
 	ctx := context.Background()
 	inner := memory.NewStore()

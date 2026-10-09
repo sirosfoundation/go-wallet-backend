@@ -37,18 +37,15 @@ type Store struct {
 	keyAttestations *KeyAttestationStore
 }
 
-// NewStore creates a new MongoDB store and runs its startup initialization:
-// the default tenant is created and the indexes are ensured.
+// NewStore creates a MongoDB store and runs startup initialization (default tenant, indexes).
 func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
 	return newStore(ctx, cfg, true)
 }
 
-// NewReadOnlyStore connects like NewStore but performs no startup writes: no
-// default tenant, no index creation. It is for a process that only reads, such
-// as a standalone engine looking up a user's token cut-off, so its database
-// principal needs read rights on the users and user_deletion_tombstones
-// collections and nothing more (the cut-off gate reads the tombstone whenever
-// a user has no record, and fails closed if that read is denied).
+// NewReadOnlyStore connects like NewStore but performs no startup writes, for
+// a process that only reads (e.g. a standalone engine checking a token cut-off).
+// Its principal needs read rights on users and user_deletion_tombstones; the
+// gate fails closed if the tombstone read is denied.
 func NewReadOnlyStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
 	return newStore(ctx, cfg, false)
 }
@@ -229,20 +226,16 @@ func (s *Store) createIndexes(ctx context.Context) error {
 	_, err = s.walletInstances.collection.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "status", Value: 1}}},
 		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "user_id", Value: 1}}},
-		// user_id alone, for the cross-tenant lookups. The compound index
-		// above cannot serve them: tenant_id leads it, so a query that does
-		// not name a tenant would scan the whole collection. Account
-		// deletion and the erasure decision both ask "every instance of this
-		// user, wherever it is" (WalletInstanceStore.GetAllByUser).
+		// user_id alone, for cross-tenant lookups (GetAllByUser): the compound
+		// index above is led by tenant_id and cannot serve them.
 		{Keys: bson.D{{Key: "user_id", Value: 1}}},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create wallet instance indexes: %w", err)
 	}
 
-	// Deletion tombstones: MongoDB removes a tombstone at its own expires_at
-	// (expireAfterSeconds 0). The service sweeper does the same through
-	// DeleteExpiredDeletionTombstones, so a lagging TTL monitor is harmless.
+	// Deletion tombstones expire at their own expires_at; the service sweeper
+	// does the same, so a lagging TTL monitor is harmless.
 	_, err = s.users.tombstones.Indexes().CreateOne(ctx, mongo.IndexModel{
 		Keys:    bson.D{{Key: "expires_at", Value: 1}},
 		Options: options.Index().SetExpireAfterSeconds(0),
@@ -327,8 +320,7 @@ func (s *UserStore) PutDeletionTombstone(ctx context.Context, t *domain.Deletion
 		return storage.ErrInvalidInput
 	}
 	update := bson.M{
-		// $setOnInsert/$max/$min on distinct fields: a retry keeps the
-		// earliest deleted_at and only ever moves expires_at later.
+		// A retry keeps the earliest deleted_at and only moves expires_at later.
 		"$min": bson.M{"deleted_at": t.DeletedAt},
 		"$max": bson.M{"expires_at": t.ExpiresAt},
 	}
@@ -419,10 +411,9 @@ func (s *UserStore) GetByDID(ctx context.Context, did string) (*domain.User, err
 
 func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
 	user.UpdatedAt = time.Now()
-	// Whole-document replace, guarded so a copy loaded before a lifecycle
-	// write (InvalidateAuthBefore, EraseWalletData) cannot write the old
-	// cut-off - or the erased wallet data - back: the filter only matches
-	// while the stored fence has not advanced past the caller's copy.
+	// Whole-document replace, matching only while the stored fence has not
+	// advanced past the caller's copy, so a copy loaded before a lifecycle write
+	// cannot write the old cut-off or erased data back.
 	filter := bson.M{
 		"_id.id":     user.UUID.String(),
 		"auth_fence": bson.M{"$not": bson.M{"$gt": user.AuthFence}},
@@ -456,10 +447,9 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 }
 
 // cutoffStage is the update-pipeline stage behind both lifecycle writes: it
-// advances auth_invalid_before to t when t is later ($max, so a delayed older
-// event cannot roll a newer cut-off back) and always advances auth_fence, so
-// UserStore.Update refuses any record loaded before this write - including
-// one carrying the same cut-off timestamp.
+// advances auth_invalid_before to t ($max, so a delayed older event cannot roll
+// it back) and always advances auth_fence, so UserStore.Update refuses any
+// record loaded before this write.
 func cutoffStage(t time.Time, extra bson.D) bson.D {
 	set := bson.D{
 		{Key: "auth_fence", Value: bson.D{{Key: "$add", Value: bson.A{bson.D{{Key: "$ifNull", Value: bson.A{"$auth_fence", 0}}}, 1}}}},
@@ -480,11 +470,9 @@ func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, 
 	return nil
 }
 
-// cutoffNotRefusingFilter matches the user whose stored cut-off does not
-// refuse a token issued at tokenIssuedAt: unset, or earlier than the start of
-// the token's second (whole-second comparison, see tokengate.IssuedBeforeCutoff:
-// refused when iat.Unix() <= cutoff.Unix(), i.e. kept when cutoff < iat second).
-// A zero tokenIssuedAt adds no condition.
+// cutoffNotRefusingFilter matches the user whose stored cut-off does not refuse
+// a token issued at tokenIssuedAt (unset, or before the token's second; see
+// tokengate.IssuedBeforeCutoff). A zero tokenIssuedAt adds no condition.
 func cutoffNotRefusingFilter(id domain.UserID, tokenIssuedAt time.Time) bson.M {
 	filter := bson.M{"_id.id": id.String()}
 	if !tokenIssuedAt.IsZero() {
@@ -497,8 +485,7 @@ func cutoffNotRefusingFilter(id domain.UserID, tokenIssuedAt time.Time) bson.M {
 }
 
 func (s *UserStore) InvalidateAuthBeforeForToken(ctx context.Context, id domain.UserID, t time.Time, tokenIssuedAt time.Time) error {
-	// One conditional UpdateOne: the check and the advance are a single atomic
-	// document write, so no independent cut-off can land between them.
+	// One conditional UpdateOne: check and advance are a single atomic write.
 	result, err := s.collection.UpdateOne(ctx, cutoffNotRefusingFilter(id, tokenIssuedAt), mongo.Pipeline{cutoffStage(t, nil)})
 	if err != nil {
 		return fmt.Errorf("failed to set auth cut-off: %w", err)
@@ -517,8 +504,7 @@ func (s *UserStore) InvalidateAuthBeforeForToken(ctx context.Context, id domain.
 }
 
 func (s *UserStore) EraseWalletData(ctx context.Context, id domain.UserID, fence time.Time) error {
-	// One pipeline update: the erasure and the fence advance land together,
-	// so no record loaded before this write can pass Update's stale check.
+	// One pipeline update: erasure and fence advance land together.
 	stage := cutoffStage(fence, bson.D{
 		{Key: "private_data", Value: "$$REMOVE"},
 		{Key: "private_data_etag", Value: "$$REMOVE"},

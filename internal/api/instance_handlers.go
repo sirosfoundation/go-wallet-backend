@@ -11,18 +11,13 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 )
 
-// Self-service wallet instance endpoints (SID-AUTH-06,
-// go-wallet-backend#195). A user can see their own wallet instances and can
-// log out everywhere, and can remove the account outright (DeleteUser). What
-// a user cannot do is revoke an instance. Revocation cannot be undone, so a
-// user who revoked the instance holding their last passkey would be locked
-// out of their own account with no self-service way back; it lives on the
-// admin API (admin_instance_handlers.go). This matches where the ARF puts
-// it: the User has a right to obtain revocation and a channel to ask for it
-// (Art. 5a(9)(a), WURevocation_10, WIAM_06), and the Wallet Provider is the
-// party that performs it after authenticating them. The irreversible path a
-// user does own is removing the account, which erases the data and the
-// passkeys with it.
+// Self-service wallet instance endpoints (SID-AUTH-06, go-wallet-backend#195).
+// A user can list their instances, log out everywhere, or delete the account,
+// but not revoke an instance: revocation is terminal, and one that took the
+// last passkey would lock the user out. It lives on the admin API
+// (admin_instance_handlers.go), matching the ARF (Art. 5a(9)(a),
+// WURevocation_10, WIAM_06): the Provider performs it after authenticating
+// the user.
 
 // ListMyWalletInstances handles GET /user/session/instances.
 func (h *Handlers) ListMyWalletInstances(c *gin.Context) {
@@ -48,11 +43,8 @@ func (h *Handlers) ListMyWalletInstances(c *gin.Context) {
 }
 
 // LogoutEverywhere handles POST /user/session/logout-all: drop every session
-// of the caller, on this device and on any other, and refuse the bearer
-// tokens already issued to them (SID-AUTH-06). The caller's own token is
-// refused too - that is what "log out everywhere" means - so the client must
-// log in again afterwards. Nothing is erased; this is the reversible thing a
-// user can safely do to themselves.
+// and refuse already-issued bearer tokens (SID-AUTH-06), including the
+// caller's own. Nothing is erased.
 func (h *Handlers) LogoutEverywhere(c *gin.Context) {
 	uid, exists := c.Get("user_id")
 	if !exists {
@@ -75,3 +67,5 @@ func (h *Handlers) LogoutEverywhere(c *gin.Context) {
 	}
 	c.Status(http.StatusNoContent)
 }
+
+// SID-AUTH-06: tokens issued before a revocation cannot open a new engine session.

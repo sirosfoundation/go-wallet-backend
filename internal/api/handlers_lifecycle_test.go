@@ -9,11 +9,8 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 )
 
-// TestLifecycleRefusalBody pins the 403 body of a SID-AUTH-06 login refusal.
-// The code cases are the ones this test has always covered; the `scope`
-// assertions are the addition: WALLET_REVOKED means both "this instance" and
-// "the whole wallet", and a client must be able to tell them apart without
-// reading the message.
+// TestLifecycleRefusalBody pins the 403 body of a SID-AUTH-06 login refusal,
+// including the `scope` that tells WALLET_REVOKED for one instance from the whole wallet.
 func TestLifecycleRefusalBody(t *testing.T) {
 	tests := []struct {
 		name, code, scope, wantMsg string
@@ -33,10 +30,8 @@ func TestLifecycleRefusalBody(t *testing.T) {
 	}
 }
 
-// TestLifecycleRefusalScopeSeparatesRevocationFromDeactivation states the
-// point of the field: the two refusals that share WALLET_REVOKED differ in
-// scope, so no client has to parse prose to decide whether its wallet still
-// exists.
+// TestLifecycleRefusalScopeSeparatesRevocationFromDeactivation: the two
+// WALLET_REVOKED refusals differ in scope, so clients need not parse prose.
 func TestLifecycleRefusalScopeSeparatesRevocationFromDeactivation(t *testing.T) {
 	instance := service.LifecycleRefusalDetails(service.ErrWalletInstanceRevoked)
 	wallet := service.LifecycleRefusalDetails(service.ErrWalletDeactivated)

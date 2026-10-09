@@ -12,10 +12,9 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
 
-// The passkey link (credential_id) is supplied by the client at attestation.
-// The first non-empty link must stick: a later attestation may fill in a
-// missing link but must not move the instance to another passkey, or the
-// original passkey would escape per-instance revocation login gating.
+// The passkey link (credential_id) is client-supplied at attestation. The first
+// non-empty link sticks: a later attestation may fill a missing link but not move
+// the instance to another passkey, or the original would escape login gating.
 func TestWalletInstanceStore_Upsert_KeepsFirstCredentialLink(t *testing.T) {
 	store := skipIfNoMongo(t)
 	ctx := context.Background()
@@ -39,7 +38,7 @@ func TestWalletInstanceStore_Upsert_KeepsFirstCredentialLink(t *testing.T) {
 	require.Equal(t, "pk-1", got.CredentialID, "first link wins; a later attestation cannot move it")
 	require.EqualValues(t, 3, got.AttestationCount, "the attestation itself is still recorded")
 
-	// A brand-new instance that presents a link on its first attestation gets it.
+	// A new instance presenting a link on first attestation gets it.
 	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id + "-2", TenantID: "acme", Status: domain.InstanceStatusActive, CredentialID: "pk-9"}))
 	got, err = wis.GetByID(ctx, id+"-2")
 	require.NoError(t, err)
@@ -70,9 +69,8 @@ func TestWalletInstanceStore_Upsert_FirstUserBindingWins(t *testing.T) {
 	require.Equal(t, b, *got.UserID)
 }
 
-// The instance key is global while the record belongs to one tenant, so an
-// attestation from another tenant is refused outright - it must not even
-// bump the attestation metadata of the owning tenant's record.
+// The instance key is global but the record is tenant-bound, so an attestation
+// from another tenant is refused and must not bump the owner's metadata.
 func TestWalletInstanceStore_Upsert_RefusesAnotherTenantsRecord(t *testing.T) {
 	store := skipIfNoMongo(t)
 	ctx := context.Background()
@@ -87,11 +85,9 @@ func TestWalletInstanceStore_Upsert_RefusesAnotherTenantsRecord(t *testing.T) {
 	require.EqualValues(t, 1, got.AttestationCount, "the refused attestation is not counted")
 }
 
-// A losing cross-tenant first attestation must not bind its user, or link its
-// passkey, onto the record the winner inserted. tenant_id is fixed at insert,
-// so the loser cannot move the record - but a bind or link that landed anyway
-// would be permanent, and the read-back that refuses the loser's WIA cannot
-// undo it.
+// A losing cross-tenant first attestation must not bind its user or link its
+// passkey onto the winner's record: tenant_id is fixed at insert, but a bind that
+// landed would be permanent.
 func TestWalletInstanceStore_Upsert_OwnershipWritesAreTenantScoped(t *testing.T) {
 	store := skipIfNoMongo(t)
 	ctx := context.Background()
@@ -100,7 +96,7 @@ func TestWalletInstanceStore_Upsert_OwnershipWritesAreTenantScoped(t *testing.T)
 	winner, loser := domain.NewUserID(), domain.NewUserID()
 
 	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "acme", Status: domain.InstanceStatusActive}))
-	// The loser's attestation: same instance key, another tenant.
+	// The loser: same instance key, another tenant.
 	require.ErrorIs(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "other", Status: domain.InstanceStatusActive, UserID: &loser, CredentialID: "pk-loser"}), storage.ErrAlreadyExists)
 	got, err := wis.GetByID(ctx, id)
 	require.NoError(t, err)
@@ -117,10 +113,9 @@ func TestWalletInstanceStore_Upsert_OwnershipWritesAreTenantScoped(t *testing.T)
 	require.Equal(t, "pk-winner", got.CredentialID)
 }
 
-// The passkey link may only be written by the user the record is actually
-// bound to: a same-tenant racer whose own bind lost must not get its
-// credential id onto the winner's record, where it would decide the
-// per-instance login gate (SID-AUTH-06) for good.
+// The passkey link may only be written by the user the record is bound to: a
+// same-tenant racer whose bind lost must not get its credential id onto the
+// winner's record (it decides the login gate, SID-AUTH-06).
 func TestWalletInstanceStore_Upsert_CredentialLinkNeedsTheBoundUser(t *testing.T) {
 	store := skipIfNoMongo(t)
 	ctx := context.Background()

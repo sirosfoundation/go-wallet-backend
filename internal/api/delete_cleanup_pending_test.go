@@ -57,8 +57,7 @@ func (c *removalFailCreds) GetAllByHolder(ctx context.Context, tid domain.Tenant
 	return c.CredentialStore.GetAllByHolder(ctx, tid, did)
 }
 
-// When the sweep after the account's removal fails the account is gone, so the
-// answer must say so and must not tell the caller to repeat the request.
+// A failed post-removal sweep must not tell the caller to repeat: the account is gone.
 func TestDeleteUser_PostRemovalCleanupFailureIsNotAskedToRepeat(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cfg := &config.Config{
@@ -101,9 +100,8 @@ type okRevoker struct{}
 
 func (okRevoker) RevokeUser(context.Context, string) error { return nil }
 
-// A session store failing after the user's tokens were revoked for good cannot
-// be fixed by repeating the request: the answer must say an operator is needed
-// and must not claim the account is deleted or ask the caller to retry.
+// A session store failing after the tokens were revoked for good needs an
+// operator; the answer must not claim deletion or ask for a retry.
 func TestDeleteUser_OperatorRequiredIsNotAskedToRepeat(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cfg := &config.Config{

@@ -90,14 +90,10 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 	resp, err := h.webauthn.FinishLogin(c.Request.Context(), &req)
 	if err != nil {
 		h.logger.Warn("passkey login finish failed", zap.Error(err))
-		// SID-AUTH-06: a revoked wallet instance is a distinct, stable
-		// refusal so the client can tell the user what happened
-		// instead of retrying a login that can never succeed. The code,
-		// scope and message come from service.LifecycleRefusalDetails, the
-		// same mapping the wallet API's login handler uses, so a deactivated
-		// wallet - scope "wallet", which needs a new enrollment - is not
-		// reported as an ordinary instance revocation, where the user's
-		// other devices answer for themselves at their own login.
+		// SID-AUTH-06: a revoked instance is a distinct, stable refusal so the client can
+		// tell the user. Code, scope and message come from service.LifecycleRefusalDetails
+		// (shared with the wallet API's login handler), so a deactivated wallet (scope
+		// "wallet", needs new enrollment) is not reported as an instance revocation.
 		switch {
 		case errors.Is(err, service.ErrWalletInstanceRevoked):
 			d := service.LifecycleRefusalDetails(err)
@@ -135,10 +131,9 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 	}
 
 	now := time.Now()
-	// The login's own token carries the instant FinishLogin checked against
-	// the SID-AUTH-06 cut-off (it re-checks after minting), so the session
-	// inherits it rather than "now": a revocation landing between that check
-	// and here must not be outrun by a fresh session timestamp.
+	// The session inherits the login token's iat (what FinishLogin checked against
+	// the cut-off) rather than "now", so a revocation between that check and here is
+	// not outrun by a fresh timestamp.
 	authenticatedAt := tokengate.IssuedAt(resp.Token)
 	if authenticatedAt.IsZero() {
 		authenticatedAt = now
@@ -336,9 +331,7 @@ func (h *PasskeyHandlers) RegisterFinish(c *gin.Context) {
 	}
 
 	now := time.Now()
-	// As for login: inherit the registration token's iat so a cut-off landing
-	// between minting that token and storing this session is not outrun by a
-	// fresh CreatedAt.
+	// As for login: inherit the registration token's iat.
 	authenticatedAt := tokengate.IssuedAt(resp.Token)
 	if authenticatedAt.IsZero() {
 		authenticatedAt = now

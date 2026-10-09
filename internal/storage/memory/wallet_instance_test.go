@@ -237,10 +237,8 @@ func TestWalletInstanceStore_UpdateStatus_Revoke(t *testing.T) {
 	}
 }
 
-// TestWalletInstanceStore_UpdateStatus_RevocationIsTerminal pins the shape of
-// the state machine: there is no way back from revoked, and "active" is not a
-// status this method will write at all. An instance is active from the moment
-// it is inserted, so accepting it here could only ever mean reactivation.
+// TestWalletInstanceStore_UpdateStatus_RevocationIsTerminal: there is no way
+// back from revoked, and "active" is never written (it is the insert state).
 func TestWalletInstanceStore_UpdateStatus_RevocationIsTerminal(t *testing.T) {
 	ctx := context.Background()
 	store := NewStore()
@@ -255,8 +253,6 @@ func TestWalletInstanceStore_UpdateStatus_RevocationIsTerminal(t *testing.T) {
 		t.Fatalf("Upsert: %v", err)
 	}
 
-	// Reactivating an active instance is refused before it is even a
-	// transition question.
 	if err := wis.UpdateStatus(ctx, "inst-term", "acme", domain.InstanceStatusActive, ""); !errors.Is(err, domain.ErrInvalidStatusTransition) {
 		t.Fatalf("UpdateStatus(active) on an active instance = %v, want ErrInvalidStatusTransition", err)
 	}
@@ -265,7 +261,6 @@ func TestWalletInstanceStore_UpdateStatus_RevocationIsTerminal(t *testing.T) {
 		t.Fatalf("Revoke: %v", err)
 	}
 
-	// And there is no way back out of revoked.
 	if err := wis.UpdateStatus(ctx, "inst-term", "acme", domain.InstanceStatusActive, ""); !errors.Is(err, domain.ErrInvalidStatusTransition) {
 		t.Fatalf("UpdateStatus(active) on a revoked instance = %v, want ErrInvalidStatusTransition", err)
 	}
@@ -292,8 +287,7 @@ func TestWalletInstanceStore_Upsert_RecordsCredentialIDWithoutTouchingStatus(t *
 	if err := store.WalletInstances().UpdateStatus(ctx, "inst-cred", "acme", domain.InstanceStatusRevoked, "x"); err != nil {
 		t.Fatal(err)
 	}
-	// A later attestation that now names the passkey records the link but
-	// must not reactivate the instance.
+	// Naming the passkey later records the link without reactivating.
 	if err := store.WalletInstances().Upsert(ctx, &domain.WalletInstance{ID: "inst-cred", TenantID: "acme", Status: domain.InstanceStatusActive, CredentialID: "pk-1"}); err != nil {
 		t.Fatal(err)
 	}
@@ -307,7 +301,6 @@ func TestWalletInstanceStore_Upsert_RecordsCredentialIDWithoutTouchingStatus(t *
 	if got.Status != domain.InstanceStatusRevoked {
 		t.Errorf("status must be untouched by upsert, got %s", got.Status)
 	}
-	// An attestation without the id keeps the recorded link.
 	if err := store.WalletInstances().Upsert(ctx, &domain.WalletInstance{ID: "inst-cred", TenantID: "acme", Status: domain.InstanceStatusActive}); err != nil {
 		t.Fatal(err)
 	}
@@ -317,8 +310,7 @@ func TestWalletInstanceStore_Upsert_RecordsCredentialIDWithoutTouchingStatus(t *
 	}
 }
 
-// The first user binding of an anonymous instance wins; a later attestation
-// by another user must not re-parent the record.
+// The first user binding of an anonymous instance wins; a later user cannot re-parent it.
 func TestWalletInstanceStore_Upsert_FirstUserBindingWins(t *testing.T) {
 	store := NewStore().WalletInstances()
 	ctx := context.Background()
@@ -344,9 +336,7 @@ func TestWalletInstanceStore_Upsert_FirstUserBindingWins(t *testing.T) {
 	}
 }
 
-// The instance key is global while the record belongs to one tenant, so an
-// attestation from another tenant is refused outright rather than allowed to
-// touch the record's metadata.
+// Another tenant's attestation is refused without touching the record.
 func TestWalletInstanceStore_Upsert_RefusesAnotherTenantsRecord(t *testing.T) {
 	store := NewStore().WalletInstances()
 	ctx := context.Background()
@@ -365,8 +355,7 @@ func TestWalletInstanceStore_Upsert_RefusesAnotherTenantsRecord(t *testing.T) {
 	}
 }
 
-// The memory store must agree with Mongo about legacy records: a "suspended"
-// instance written by an earlier release can be revoked, and nothing else.
+// Like Mongo, a legacy "suspended" instance can be revoked and nothing else.
 func TestWalletInstanceStore_UpdateStatus_LegacySuspendedIsRevocable(t *testing.T) {
 	ctx := context.Background()
 	store := NewStore()
@@ -409,17 +398,13 @@ func TestInstanceStatus_IsLive(t *testing.T) {
 	}
 }
 
-// A revocation can land between an admin's removability check and the delete
-// itself. The tombstone it creates is the record that keeps login and new
-// attestations refused, so the delete must carry its own condition rather
-// than trust the caller's snapshot.
+// A revocation can land between the removability check and the delete, so the delete carries its own condition.
 func TestWalletInstanceStore_DeleteIfRemovable(t *testing.T) {
 	ctx := context.Background()
 	store := NewStore()
 	wis := store.WalletInstances()
 	uid := domain.UserIDFromString("owner")
 
-	// A live, user-owned instance is removable.
 	if err := wis.Upsert(ctx, &domain.WalletInstance{
 		ID: "inst-live", TenantID: "acme", UserID: &uid, Status: domain.InstanceStatusActive,
 	}); err != nil {
@@ -429,7 +414,6 @@ func TestWalletInstanceStore_DeleteIfRemovable(t *testing.T) {
 		t.Fatalf("a live instance must be removable: %v", err)
 	}
 
-	// A revoked, user-owned instance is a tombstone and is not.
 	if err := wis.Upsert(ctx, &domain.WalletInstance{
 		ID: "inst-tomb", TenantID: "acme", UserID: &uid, Status: domain.InstanceStatusActive,
 	}); err != nil {
@@ -445,8 +429,6 @@ func TestWalletInstanceStore_DeleteIfRemovable(t *testing.T) {
 		t.Errorf("the tombstone must still be there, got %v", err)
 	}
 
-	// An unowned (anonymous WIA) tombstone is retained too; an active
-	// unowned record is removable.
 	if err := wis.Upsert(ctx, &domain.WalletInstance{
 		ID: "inst-stray", TenantID: "acme", Status: domain.InstanceStatusRevoked,
 	}); err != nil {
@@ -467,7 +449,6 @@ func TestWalletInstanceStore_DeleteIfRemovable(t *testing.T) {
 		t.Fatalf("an active unowned record must be removable: %v", err)
 	}
 
-	// Another tenant's record is not found.
 	if err := wis.Upsert(ctx, &domain.WalletInstance{
 		ID: "inst-other", TenantID: "other", UserID: &uid, Status: domain.InstanceStatusActive,
 	}); err != nil {
@@ -478,9 +459,7 @@ func TestWalletInstanceStore_DeleteIfRemovable(t *testing.T) {
 	}
 }
 
-// The tenant is part of the write, not only of the caller's earlier read: the
-// id is a global key, so a revocation issued for one tenant must not land on a
-// record another tenant holds under the same id.
+// The tenant is part of the write.
 func TestWalletInstanceStore_UpdateStatus_WrongTenantIsNotFound(t *testing.T) {
 	ctx := context.Background()
 	wis := NewStore().WalletInstances()
@@ -496,9 +475,7 @@ func TestWalletInstanceStore_UpdateStatus_WrongTenantIsNotFound(t *testing.T) {
 	}
 }
 
-// The id is a global key, so a delete or revocation issued for one user's
-// record must not touch a replacement that took the same id under another
-// tenant or user.
+// A delete or revocation must not touch a replacement record with the same id.
 func TestWalletInstanceStore_OwnerCheckedWrites(t *testing.T) {
 	ctx := context.Background()
 	wis := NewStore().WalletInstances()
@@ -538,7 +515,6 @@ func TestWalletInstanceStore_OwnerCheckedWrites(t *testing.T) {
 		t.Fatalf("second delete = %v, want ErrNotFound", err)
 	}
 
-	// A record with no user matches no owner.
 	seed("i2", "acme", nil)
 	if err := wis.DeleteForUser(ctx, "i2", "acme", owner); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("unowned delete = %v, want ErrNotFound", err)
@@ -558,7 +534,6 @@ func TestWalletInstanceStore_ReturnedNestedDataIsACopy(t *testing.T) {
 	if err := wis.Upsert(ctx, in); err != nil {
 		t.Fatal(err)
 	}
-	// Mutating the caller's own input after the write must not reach the store.
 	in.DeviceInfo.Model = "input-mutated"
 	in.SecurityProperties.KeyStorage[0] = "input-mutated"
 
@@ -591,7 +566,6 @@ func TestWalletInstanceStore_ReturnedNestedDataIsACopy(t *testing.T) {
 		t.Errorf("stored SecurityProperties changed: %+v", sp)
 	}
 
-	// An update through Upsert copies the incoming DeviceInfo as well.
 	upd := &domain.DeviceInfo{Platform: "android"}
 	if err := wis.Upsert(ctx, &domain.WalletInstance{ID: "inst-nested", TenantID: "acme", DeviceInfo: upd}); err != nil {
 		t.Fatal(err)
@@ -603,8 +577,7 @@ func TestWalletInstanceStore_ReturnedNestedDataIsACopy(t *testing.T) {
 	}
 }
 
-// bindingOf reads the binding of a stored record, as a caller that is about
-// to make a conditional write would.
+// bindingOf reads a stored record's binding for a conditional write.
 func bindingOf(t *testing.T, wis storage.WalletInstanceStore, id string) domain.InstanceBinding {
 	t.Helper()
 	inst, err := wis.GetByID(context.Background(), id)
@@ -614,9 +587,7 @@ func bindingOf(t *testing.T, wis storage.WalletInstanceStore, id string) domain.
 	return inst.Binding()
 }
 
-// Every insert gets a generation of its own, and a record deleted and created
-// again under the same id and tenant is a different record to a conditional
-// write, whoever owns the replacement.
+// Every insert gets its own generation, so a re-created record differs from the deleted one.
 func TestWalletInstanceStore_Conditional_ReplacementIsNotTheRecordRead(t *testing.T) {
 	ctx := context.Background()
 	alice := domain.UserIDFromString("alice")
@@ -637,7 +608,6 @@ func TestWalletInstanceStore_Conditional_ReplacementIsNotTheRecordRead(t *testin
 			return wis.DeleteIfRemovable(ctx, "jkt", "acme", b)
 		}},
 	}
-	// owners of the original and of the replacement; nil is unowned.
 	cases := []struct {
 		name         string
 		first, again *domain.UserID
@@ -680,8 +650,7 @@ func TestWalletInstanceStore_Conditional_ReplacementIsNotTheRecordRead(t *testin
 	}
 }
 
-// The binding the caller read still works, and an owner bound after the read
-// (the anonymous instance gaining its user) makes it stale.
+// A binding read earlier still works until an owner is bound after the read.
 func TestWalletInstanceStore_Conditional_MatchAndOwnerBind(t *testing.T) {
 	ctx := context.Background()
 	alice := domain.UserIDFromString("alice")
@@ -691,7 +660,6 @@ func TestWalletInstanceStore_Conditional_MatchAndOwnerBind(t *testing.T) {
 		t.Fatal(err)
 	}
 	unowned := bindingOf(t, wis, "anon")
-	// Another tenant's request does not see the record at all.
 	if err := wis.UpdateStatusIfUnchanged(ctx, "anon", "other", unowned, domain.InstanceStatusRevoked, "x"); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("wrong tenant: want ErrNotFound, got %v", err)
 	}
@@ -711,7 +679,6 @@ func TestWalletInstanceStore_Conditional_MatchAndOwnerBind(t *testing.T) {
 	if err := wis.UpdateStatusIfUnchanged(ctx, "anon", "acme", fresh, domain.InstanceStatusRevoked, "x"); err != nil {
 		t.Fatalf("the fresh binding must write: %v", err)
 	}
-	// Right record, already revoked: the transition error, not a binding one.
 	if err := wis.UpdateStatusIfUnchanged(ctx, "anon", "acme", fresh, domain.InstanceStatusRevoked, "x"); !errors.Is(err, domain.ErrInvalidStatusTransition) {
 		t.Fatalf("want ErrInvalidStatusTransition, got %v", err)
 	}
@@ -723,8 +690,7 @@ func TestWalletInstanceStore_Conditional_MatchAndOwnerBind(t *testing.T) {
 	}
 }
 
-// A record written before generations existed has none and is matched by an
-// expected binding with none.
+// A record from before generations is matched by an expected binding with none.
 func TestWalletInstanceStore_Conditional_LegacyRecordWithoutGeneration(t *testing.T) {
 	ctx := context.Background()
 	store := NewStore()
@@ -742,8 +708,7 @@ func TestWalletInstanceStore_Conditional_LegacyRecordWithoutGeneration(t *testin
 	}
 }
 
-// A corrupted or unknown stored status is not a legal source state: revoking
-// it fails closed and leaves the record untouched.
+// An unknown stored status fails closed on revoke and leaves the record untouched.
 func TestWalletInstanceStore_UpdateStatus_UnknownStatusCannotBeRevoked(t *testing.T) {
 	ctx := context.Background()
 	store := NewStore()
@@ -770,8 +735,7 @@ func TestWalletInstanceStore_UpdateStatus_UnknownStatusCannotBeRevoked(t *testin
 	}
 }
 
-// Upsert reports the generation of the record it applied to, for a new and
-// for an existing record, and a record deleted and re-created gets another.
+// Upsert reports the applied record's generation; a re-created record gets another.
 func TestWalletInstanceStore_Upsert_ReportsGeneration(t *testing.T) {
 	ctx := context.Background()
 	s := NewStore().WalletInstances()

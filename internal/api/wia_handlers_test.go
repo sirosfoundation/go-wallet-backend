@@ -219,8 +219,8 @@ func TestWIAGenerate_InvalidPopFormat(t *testing.T) {
 	}
 }
 
-// The refusals the WIA endpoint gives are a stable client contract: each
-// service error keeps its own status and code, and an unknown error is a 500.
+// WIA refusals are a stable client contract: each service error keeps its status
+// and code; an unknown error is 500.
 func TestWIAFailure_MapsEveryServiceRefusal(t *testing.T) {
 	cases := []struct {
 		err    error

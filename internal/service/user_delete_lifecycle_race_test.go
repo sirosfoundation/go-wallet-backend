@@ -30,10 +30,9 @@ func (c *hookCleaner) DeleteByUser(context.Context, string) error {
 	return nil
 }
 
-// A lifecycle revocation that lands while the deletion is running advances the
-// cut-off independently. The token admitted before it must be refused before the
-// permanent revocations and the user deletion, not just have its cut-off
-// silently overwritten.
+// A lifecycle revocation landing during the deletion advances the cut-off
+// independently; the earlier token must be refused before the permanent
+// revocations, not have the cut-off silently overwritten.
 func TestDeleteUser_RefusesATokenCutOffByALifecycleRevocationMidDeletion(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()

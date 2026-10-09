@@ -176,18 +176,14 @@ func TestPasskeyLoginFinish_AuthError(t *testing.T) {
 	}
 }
 
-// SID-AUTH-06: a revoked wallet instance is a distinct 403 with a stable
-// code, not the generic 401, so the client can explain instead of retry.
+// SID-AUTH-06: a revoked wallet instance is a distinct 403 with a stable code, not the generic 401.
 func TestPasskeyLoginFinish_WalletLifecycleRefusals(t *testing.T) {
 	for _, tc := range []struct {
 		err  error
 		code string
-		// scope distinguishes one revoked instance from a deactivated
-		// wallet, which needs a new enrollment: they share the
-		// WALLET_REVOKED code, and scope is the machine-readable field that
-		// tells them apart.
+		// scope tells one revoked instance from a deactivated wallet (both WALLET_REVOKED).
 		scope string
-		// msg says the same thing for a human, and is display-only.
+		// msg is the display-only human text.
 		msg string
 	}{
 		{service.ErrWalletInstanceRevoked, "WALLET_REVOKED", service.LifecycleScopeInstance, "other devices enrolled to this wallet keep their own status"},

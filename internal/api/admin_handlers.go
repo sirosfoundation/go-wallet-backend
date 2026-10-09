@@ -23,8 +23,8 @@ type AdminHandlers struct {
 	logger    *zap.Logger
 	audit     *audit.Emitter
 	allowHTTP bool // when true, plain HTTP OIDC issuer URLs are permitted (test/dev environments)
-	// lifecycle, when set, handles wallet instance status changes so the
-	// admin path shares the self-service cascade (SID-AUTH-06).
+	// lifecycle, when set, handles status changes so the admin path shares the
+	// self-service cascade (SID-AUTH-06).
 	lifecycle *service.WalletLifecycleService
 }
 

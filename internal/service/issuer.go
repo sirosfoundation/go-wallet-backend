@@ -33,8 +33,7 @@ func (s *IssuerService) Create(ctx context.Context, tenantID domain.TenantID, is
 		return fmt.Errorf("credential issuer identifier is required")
 	}
 
-	// SID-AUTH-06: judge the request's token against the cut-off as it stands
-	// now, at the mutation boundary, not as it stood at admission.
+	// SID-AUTH-06: judge the token against the cut-off now, not as at admission.
 	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
 		return err
 	}
@@ -97,8 +96,7 @@ func (s *IssuerService) GetAll(ctx context.Context, tenantID domain.TenantID) ([
 
 // Update updates an existing issuer
 func (s *IssuerService) Update(ctx context.Context, issuer *domain.CredentialIssuer) error {
-	// SID-AUTH-06: judge the request's token against the cut-off as it stands
-	// now, at the mutation boundary, not as it stood at admission.
+	// SID-AUTH-06: judge the token against the cut-off now, not as at admission.
 	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
 		return err
 	}
@@ -119,8 +117,7 @@ func (s *IssuerService) Update(ctx context.Context, issuer *domain.CredentialIss
 
 // Delete removes an issuer
 func (s *IssuerService) Delete(ctx context.Context, tenantID domain.TenantID, id int64) error {
-	// SID-AUTH-06: judge the request's token against the cut-off as it stands
-	// now, at the mutation boundary, not as it stood at admission.
+	// SID-AUTH-06: judge the token against the cut-off now, not as at admission.
 	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
 		return err
 	}

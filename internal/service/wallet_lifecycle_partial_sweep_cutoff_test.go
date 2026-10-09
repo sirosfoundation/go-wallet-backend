@@ -29,10 +29,9 @@ func (f *failNthGetByUser) GetByUser(ctx context.Context, tid domain.TenantID, u
 	return f.WalletInstanceStore.GetByUser(ctx, tid, uid)
 }
 
-// A revoke-all that persisted a revocation and then hits an error returns
-// through an early cascade, before the sweep's own cut-off. The local record
-// must carry the revocation time, or an older non-zero cut-off (logout
-// everywhere) passes as sufficient and the data is erased without a cut-off
+// A revoke-all that persisted a revocation then errors out through an early
+// cascade; the local record must carry the revocation time, or an older
+// non-zero cut-off passes as sufficient and data is erased without a cut-off
 // past the revocation.
 func TestRevokeAll_PartialSweepAdvancesAnOlderCutoffBeforeErasing(t *testing.T) {
 	ctx := context.Background()

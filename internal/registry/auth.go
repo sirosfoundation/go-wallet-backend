@@ -94,9 +94,8 @@ func (anyTenant) GetByID(_ context.Context, id domain.TenantID) (*domain.Tenant,
 // After a successful validation the context has AuthenticatedKey=true and,
 // when the token has a tenant_id claim, TenantIDKey set to it.
 //
-// The registry has no user database and never serves user-scoped writes, so
-// its token chain is given tokengate.NoUserRecords (an explicit no-op
-// SID-AUTH-06 lookup: no record, no cut-off) rather than a real or nil one.
+// The registry has no user database, so its token chain uses
+// tokengate.NoUserRecords (an explicit no-op SID-AUTH-06 lookup).
 func AuthMiddlewares(cfg AuthConfig) []gin.HandlerFunc {
 	logger := cfg.Logger
 	if logger == nil {

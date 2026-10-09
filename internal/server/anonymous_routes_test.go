@@ -20,14 +20,12 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
-// Anonymous tokens (no user) are for registry lookups and public metadata.
-// Every route that acts on a wallet, an account or a tenant's configuration
-// on a user's behalf must refuse them; the lookups keep working.
+// Anonymous tokens (no user) are for registry lookups and public metadata;
+// every route acting on a user's behalf must refuse them.
 
-// anonymousOKPrefixes are routes an anonymous token may use, or that take no
-// bearer token at all. Every other route the providers register must be
-// wallet-scoped and refuse an anonymous token; a new route that is in neither
-// list fails the test until somebody classifies it.
+// anonymousOKPrefixes are routes an anonymous token may use or that take no
+// bearer token. Every other route must refuse one; an unclassified new route
+// fails the test.
 var anonymousOKPrefixes = []string{
 	"/v1/",                                              // AuthZEN trust evaluation/resolution: registry lookups
 	"/user/register-webauthn-", "/user/login-webauthn-", // no bearer token
@@ -58,9 +56,8 @@ func concretePath(p string) string {
 	return strings.Join(parts, "/")
 }
 
-// walletScopedRoutes returns every registered route that is not classified as
-// anonymous-OK, failing the test for a route that looks public but is not
-// classified (there is nothing to tell them apart but the list).
+// walletScopedRoutes returns every registered route not classified as
+// anonymous-OK.
 func walletScopedRoutes(t *testing.T, router *gin.Engine) []gin.RouteInfo {
 	t.Helper()
 	var out []gin.RouteInfo
@@ -107,9 +104,8 @@ func assertAnonymousRefusedEverywhere(t *testing.T, router *gin.Engine, anonymou
 		if w := serve(router, r.Method, path, anonymous); !refusedAsAnonymous(w) {
 			t.Errorf("%s %s: anonymous token got %d %s, want 403 %q", r.Method, path, w.Code, w.Body.String(), middleware.AnonymousTokenMessage)
 		}
-		// Control: the same route is reachable with a token that names a user
-		// (whatever the handler then answers), so the refusal above is the
-		// anonymous check and not a dead route.
+		// Control: a user-named token reaches the route, so the refusal above
+		// is the anonymous check and not a dead route.
 		if w := serve(router, r.Method, path, user); refusedAsAnonymous(w) {
 			t.Errorf("%s %s: a token naming a user was refused as anonymous", r.Method, path)
 		}

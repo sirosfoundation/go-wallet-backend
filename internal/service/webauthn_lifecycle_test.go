@@ -26,8 +26,7 @@ func seedLifecycleInstance(t *testing.T, s *WebAuthnService, id string, userID d
 	}
 }
 
-// The SID-AUTH-06 login gate: which passkeys may still log in given the
-// user's wallet instances.
+// The SID-AUTH-06 login gate: which passkeys may still log in.
 func TestCheckWalletLifecycle(t *testing.T) {
 	ctx := context.Background()
 	userID := domain.NewUserID()
@@ -37,11 +36,8 @@ func TestCheckWalletLifecycle(t *testing.T) {
 		assert.NoError(t, s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1"))
 	})
 
-	// The gate, and so the scope on the wire, is per tenant: a user live in
-	// another tenant is still refused here, and their cross-tenant data is
-	// kept (WalletLifecycleService.eraseWalletData). ErrWalletDeactivated
-	// therefore means "no instance of this wallet is left in this tenant",
-	// not "nothing of this user remains anywhere".
+	// The gate is per tenant: a user live in another tenant is still refused
+	// here and their cross-tenant data is kept (eraseWalletData).
 	t.Run("deactivated in this tenant while another tenant is live", func(t *testing.T) {
 		s := &WebAuthnService{store: memory.NewStore()}
 		other := domain.TenantID("tenant-other")
@@ -72,9 +68,8 @@ func TestCheckWalletLifecycle(t *testing.T) {
 			"a revoked instance this passkey is not linked to must not block the login")
 	})
 
-	// An unrecognized status must fail closed: the login is refused, but it
-	// is not reported as a deactivated wallet (nothing established that),
-	// and it is never treated as enrollment or as a live instance.
+	// An unrecognized status fails closed: refused, but not reported as a
+	// deactivated wallet, and never treated as enrollment or live.
 	t.Run("unknown status instance: refused, not reported as deactivated", func(t *testing.T) {
 		s := &WebAuthnService{store: memory.NewStore()}
 		seedRawInstance(t, s.store, domain.DefaultTenantID, "i1", userID, "pk-1", unknownInstanceStatus)
@@ -145,9 +140,8 @@ func TestCheckWalletLifecycle(t *testing.T) {
 	})
 }
 
-// A lifecycle change that lands after the login gate but before the tokens
-// are handed out must not yield usable tokens; a cut-off in the very same
-// second only delays minting to the next second.
+// A lifecycle change landing between the login gate and token hand-out must
+// not yield usable tokens; a same-second cut-off only delays minting.
 func TestMintTokens(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()
@@ -164,31 +158,27 @@ func TestMintTokens(t *testing.T) {
 	require.NotEmpty(t, access)
 	require.NotEmpty(t, refresh)
 
-	// Cut-off in the same second as minting: the tokens are minted again in
-	// the next second and pass.
+	// Same-second cut-off: minted again in the next second and passes.
 	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now()))
 	access, refresh, err = s.mintTokens(ctx, user, domain.DefaultTenantID, "", gate, ErrVerificationFailed)
 	require.NoError(t, err)
 	cutoff, _ := store.Users().GetAuthCutoff(ctx, userID)
-	// Both handed-out tokens have to postdate the cut-off, not just the last
-	// one minted: the access token is minted first, so gating on the refresh
-	// token alone would let an access token the token gate already refuses
-	// out whenever the two mints straddle a second boundary.
+	// Both tokens must postdate the cut-off: the access token is minted first,
+	// so gating on the refresh token alone could let a refused one out when the
+	// mints straddle a second boundary.
 	assert.False(t, tokengate.IssuedBeforeCutoff(tokengate.IssuedAt(access), cutoff), "the re-minted access token postdates the cut-off")
 	require.NotEmpty(t, refresh)
 	assert.False(t, tokengate.IssuedBeforeCutoff(tokengate.IssuedAt(refresh), cutoff), "the re-minted refresh token postdates the cut-off")
 
-	// A cut-off set in the future (as a revocation landing mid-request would
-	// be, relative to the minted iat) with the passkey's instance revoked:
-	// the precise lifecycle refusal.
+	// Future cut-off (a mid-request revocation) with the passkey's instance
+	// revoked: the precise lifecycle refusal.
 	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.DefaultTenantID, domain.InstanceStatusRevoked, "stolen"))
 	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now().Add(5*time.Second)))
 	_, _, err = s.mintTokens(ctx, user, domain.DefaultTenantID, "", gate, ErrVerificationFailed)
 	assert.ErrorIs(t, err, ErrWalletInstanceRevoked)
 
-	// Same future cut-off but the gate passes (the other passkey's instance
-	// is still active): refused with the caller's refusal so the client
-	// logs in again.
+	// Same cut-off but the gate passes (other instance active): the caller's
+	// refusal, so the client logs in again.
 	gate2 := func() error { return s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-2") }
 	_, _, err = s.mintTokens(ctx, user, domain.DefaultTenantID, "", gate2, ErrVerificationFailed)
 	assert.ErrorIs(t, err, ErrVerificationFailed)
@@ -196,11 +186,9 @@ func TestMintTokens(t *testing.T) {
 	assert.ErrorIs(t, err, ErrInvalidRefreshToken, "refresh flow uses its own refusal")
 }
 
-// The cut-off is recorded before the new status is persisted, so a login that
-// passed its lifecycle check earlier in the flow mints a token whose fresh
-// iat clears the cut-off while the instance is being revoked. mintTokens
-// runs the caller's check again over the post-mint state, so that login is
-// refused rather than handed a working token for a revoked wallet.
+// The cut-off is recorded before the status is persisted, so a login that
+// passed its check earlier can mint a token past the cut-off mid-revocation;
+// mintTokens' recheck must refuse it.
 func TestMintTokens_RechecksLifecycleOnTheSuccessPath(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()
@@ -211,8 +199,7 @@ func TestMintTokens_RechecksLifecycleOnTheSuccessPath(t *testing.T) {
 	require.NoError(t, store.Users().Create(ctx, user))
 	seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusActive)
 
-	// No cut-off at all: the minted token is unimpeachable by iat alone, so
-	// only the recheck can see the revocation that landed meanwhile.
+	// No cut-off: only the recheck can see the revocation.
 	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.DefaultTenantID, domain.InstanceStatusRevoked, "racing"))
 	_, _, err := s.mintTokens(ctx, user, domain.DefaultTenantID, "", func() error {
 		return s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1")
@@ -220,9 +207,8 @@ func TestMintTokens_RechecksLifecycleOnTheSuccessPath(t *testing.T) {
 	assert.ErrorIs(t, err, ErrWalletInstanceRevoked)
 }
 
-// A record left in the pre-removal "suspended" state must still be refused at
-// login. Reading it as live would hand its passkey back the login a provider
-// had taken away.
+// A record left in the legacy "suspended" state must still be refused at
+// login; reading it as live would restore a login a provider removed.
 func TestCheckWalletLifecycle_LegacySuspended(t *testing.T) {
 	ctx := context.Background()
 	userID := domain.NewUserID()

@@ -14,9 +14,8 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
-// Clients switch on the code and scope, never on the message: a deactivated
-// wallet must be told apart from one revoked instance whose siblings still
-// answer for themselves.
+// Clients switch on code and scope, never the message: a deactivated wallet
+// must be told apart from one revoked instance.
 func TestLifecycleRefusalDetails(t *testing.T) {
 	wallet := LifecycleRefusalDetails(fmt.Errorf("login: %w", ErrWalletDeactivated))
 	assert.Equal(t, "WALLET_REVOKED", wallet.Code)

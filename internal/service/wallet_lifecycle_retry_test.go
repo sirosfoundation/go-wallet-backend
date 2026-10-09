@@ -15,18 +15,15 @@ import (
 
 var providerActor = LifecycleActor{Kind: "provider"}
 
-// The cut-off recorded after the status write can fail; the revocation is
-// then persisted with a cut-off that predates it. Repeating the request must
-// notice and advance the cut-off, or tokens minted in between stay valid
-// forever.
+// If the cut-off write after the status write fails, the revocation persists with
+// a cut-off that predates it. Repeating the request must advance it, or tokens
+// minted in between stay valid.
 func TestChangeStatus_RetryAdvancesACutoffThatPredatesTheRevocation(t *testing.T) {
 	ctx := context.Background()
 	fs := newFailStore().failOnCalls("users.InvalidateAuthBefore", 1, 2)
 	svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
 	uid := seedWalletUser(t, fs.Store)
-	// Calls 1 and 2 fail: the cut-off after the write, and the cascade's own repair of it.
-	// A second live instance keeps the wallet alive, so no erasure advances
-	// the cut-off behind the test's back.
+	// Calls 1 and 2 fail: the cut-off after the write and the cascade's repair.
 	require.NoError(t, fs.Store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
 		ID: "inst-2", TenantID: domain.DefaultTenantID, UserID: &uid, Status: domain.InstanceStatusActive,
 	}))
@@ -119,8 +116,8 @@ func TestRevokeAllForUser_FailuresAfterPersistedRevocationsAreIncomplete(t *test
 	})
 }
 
-// cascade runs for statuses persisted elsewhere too, so it establishes a
-// cut-off when there is none, and must say so when it cannot.
+// cascade also runs for statuses persisted elsewhere: it establishes a missing
+// cut-off and must say so when it cannot.
 func TestCascade_EnsuresACutoffAndReportsWhenItCannot(t *testing.T) {
 	ctx := context.Background()
 	revoked := func(t *testing.T, fs *failStore) (*WalletLifecycleService, *domain.WalletInstance, domain.UserID) {
@@ -152,7 +149,7 @@ func TestCascade_EnsuresACutoffAndReportsWhenItCannot(t *testing.T) {
 	})
 }
 
-// Erasure must not run on a guess about where the user's other instances are.
+// Erasure must not run on a guess about the user's other instances.
 func TestEraseWalletData_FailsClosedWhenOtherTenantsCannotBeSeen(t *testing.T) {
 	ctx := context.Background()
 
@@ -179,17 +176,15 @@ func TestEraseWalletData_FailsClosedWhenOtherTenantsCannotBeSeen(t *testing.T) {
 	})
 }
 
-// A revoke-all whose cut-off after the sweep failed leaves every instance
-// revoked and a cut-off that predates the last revocation. Repeating it
-// changes nothing, so it must still repair the cut-off before it reports
-// success; cascade only fills a missing one.
+// A revoke-all whose post-sweep cut-off failed leaves all instances revoked and a
+// stale cut-off. Repeating it must repair the cut-off before reporting success.
 func TestRevokeAllForUser_RetryRepairsAStaleCutoff(t *testing.T) {
 	ctx := context.Background()
 	fs := newFailStore().failOnCalls("users.InvalidateAuthBefore", 1, 2)
 	svc := NewWalletLifecycleService(fs, zap.NewNop(), nil)
 	uid := seedWalletUser(t, fs.Store)
-	// A live instance in another tenant keeps the vault, so no erasure
-	// advances the cut-off behind the test's back.
+	// A live instance in another tenant keeps the vault, so no erasure advances the
+	// cut-off.
 	require.NoError(t, fs.Store.UserTenants().AddMembership(ctx, &domain.UserTenantMembership{UserID: uid, TenantID: "acme", Role: "user"}))
 	require.NoError(t, fs.Store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
 		ID: "elsewhere", TenantID: "acme", UserID: &uid, Status: domain.InstanceStatusActive,

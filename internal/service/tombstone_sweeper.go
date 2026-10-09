@@ -12,9 +12,8 @@ import (
 )
 
 // DeletionTombstoneSweeper periodically removes expired account-deletion
-// tombstones (domain.DeletionTombstone). MongoDB expires them with a TTL index
-// as well; this sweeper is what expires them on a backend without one (the
-// in-memory store) and the backstop where the TTL monitor lags.
+// tombstones (domain.DeletionTombstone): the expiry on backends without a TTL
+// index, and the backstop where MongoDB's TTL monitor lags.
 type DeletionTombstoneSweeper struct {
 	interval time.Duration
 	store    storage.Store
@@ -39,8 +38,8 @@ func NewDeletionTombstoneSweeper(cfg config.DeletionTombstoneConfig, store stora
 }
 
 // Start begins sweeping in the background: once immediately, then every
-// interval. Calling Start on a running sweeper does nothing. A Start that
-// races a Stop waits for that Stop to finish and then starts a fresh run.
+// interval. A running sweeper is left alone; a Start racing a Stop waits for
+// it and starts a fresh run.
 func (w *DeletionTombstoneSweeper) Start() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -54,12 +53,9 @@ func (w *DeletionTombstoneSweeper) Start() {
 	w.logger.Info("Deletion tombstone sweeper started", zap.Duration("interval", w.interval))
 }
 
-// Stop stops the sweeper and waits for a sweep in progress to end.
-//
-// The lifecycle lock is held through the cancellation and the wait, so a
-// concurrent Start cannot launch a second run (or add to the wait group) while
-// this one is still draining; it runs after Stop returns. The run loop never
-// takes the lock, so holding it across wg.Wait cannot deadlock.
+// Stop stops the sweeper and waits for a sweep in progress to end. The
+// lifecycle lock is held through the wait so a concurrent Start cannot launch
+// a second run meanwhile; the run loop never takes it, so there is no deadlock.
 func (w *DeletionTombstoneSweeper) Stop() {
 	w.mu.Lock()
 	defer w.mu.Unlock()

@@ -18,10 +18,9 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 )
 
-// An admin cannot hard-delete a user's live instance into the state the
-// login gate reads as an initial enrollment. Last-instance case: the passkey
-// stays gated after revocation; the delete that would have emptied the
-// listing is refused before and after.
+// An admin cannot hard-delete a live instance into a state the login gate reads
+// as initial enrollment: the passkey stays gated after revocation and the delete
+// that would empty the listing is refused before and after.
 func TestAdminDelete_LastInstanceKeepsPasskeysGated(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx := context.Background()
@@ -51,8 +50,8 @@ func TestAdminDelete_LastInstanceKeepsPasskeysGated(t *testing.T) {
 	_, err := store.WalletInstances().GetByID(ctx, "only")
 	require.NoError(t, err, "the live instance must survive the refused delete")
 
-	// Revoke through the lifecycle; the delete is still refused and every
-	// passkey, the linked one and any other, stays refused at login.
+	// Revoke via the lifecycle; the delete is still refused and every passkey stays
+	// refused at login.
 	w = httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPut, "/admin/tenants/acme/instances/only/status", strings.NewReader(`{"status":"revoked"}`))
 	req.Header.Set("Content-Type", "application/json")

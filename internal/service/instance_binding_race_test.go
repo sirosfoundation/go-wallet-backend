@@ -16,10 +16,9 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 )
 
-// replaceInstance models the race every test here is about: the record is
-// deleted and the same thumbprint attested again, by another user of the same
-// tenant, between a caller's read and its write. It uses the store's own
-// operations, so the replacement gets a generation of its own.
+// replaceInstance models the race these tests cover: between a caller's read and
+// write the record is deleted and the same thumbprint attested again by another
+// user, so the replacement has its own generation.
 func replaceInstance(t *testing.T, wis storage.WalletInstanceStore, id string, tenant domain.TenantID, newOwner *domain.UserID) {
 	t.Helper()
 	ctx := context.Background()
@@ -29,8 +28,8 @@ func replaceInstance(t *testing.T, wis storage.WalletInstanceStore, id string, t
 	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: tenant, UserID: newOwner, Status: domain.InstanceStatusActive}))
 }
 
-// beforeWriteInstances runs hook just before the first conditional status
-// write whose id matches (every id when match is empty).
+// beforeWriteInstances runs hook before the first conditional status write
+// whose id matches (every id when match is empty).
 type beforeWriteInstances struct {
 	storage.WalletInstanceStore
 	match string
@@ -55,8 +54,8 @@ func (b *beforeWriteInstances) DeleteIfRemovable(ctx context.Context, id string,
 	return b.WalletInstanceStore.DeleteIfRemovable(ctx, id, tenantID, exp)
 }
 
-// Thread 2: ChangeStatus must not revoke, or cascade against the owner of, a
-// replacement that appeared between its read and its write.
+// ChangeStatus must not revoke, or cascade against the owner of, a replacement
+// that appeared between its read and write.
 func TestChangeStatus_ReplacementBetweenReadAndWriteIsNotRevoked(t *testing.T) {
 	for name, firstOwner := range map[string]bool{"owned original": true, "unowned original": false} {
 		t.Run(name, func(t *testing.T) {
@@ -93,8 +92,7 @@ func TestChangeStatus_ReplacementBetweenReadAndWriteIsNotRevoked(t *testing.T) {
 	}
 }
 
-// Thread 1: the admin delete must not remove a replacement that is live and
-// passes the removability test.
+// The admin delete must not remove a live replacement.
 func TestAdminStyleDeleteIfRemovable_ReplacementBetweenReadAndDeleteSurvives(t *testing.T) {
 	ctx := context.Background()
 	wis := memory.NewStore().WalletInstances()
@@ -113,8 +111,8 @@ func TestAdminStyleDeleteIfRemovable_ReplacementBetweenReadAndDeleteSurvives(t *
 	assert.Equal(t, bob, *got.UserID)
 }
 
-// Thread 4: the compensating revocation of a raced first attestation must
-// treat a replacement as a non-owned race and leave it alone.
+// The compensating revocation of a raced first attestation must leave a
+// replacement alone.
 func TestWIA_CompensatingRevocation_ReplacementIsNotRevoked(t *testing.T) {
 	ctx := context.Background()
 	alice := domain.UserIDFromString("user-compensate")
@@ -122,9 +120,8 @@ func TestWIA_CompensatingRevocation_ReplacementIsNotRevoked(t *testing.T) {
 	base := memory.NewStore().WalletInstances()
 	seedWIAInstance(t, base, "old-key", alice, domain.InstanceStatusActive)
 
-	// old-key is revoked right after the new key is inserted (a deactivation
-	// landing mid-attestation), so the compensating path runs; then the new
-	// key's record is replaced by bob's just before that revocation is written.
+	// old-key is revoked right after the new key is inserted, so the compensating
+	// path runs; then the new record is replaced by bob's just before that write.
 	racing := &racingRevokeInstances{WalletInstanceStore: base, userID: alice}
 	var newID string
 	hooked := &beforeWriteInstances{WalletInstanceStore: racing, skip: "old-key"}
@@ -155,8 +152,8 @@ func TestWIA_CompensatingRevocation_ReplacementIsNotRevoked(t *testing.T) {
 	assert.Equal(t, bob, *got.UserID)
 }
 
-// RevokeAll works from a per-user listing; a record replaced after the
-// listing, even by the same user, is not the one listed.
+// RevokeAll works from a per-user listing; a record replaced after it, even by
+// the same user, is not the one listed.
 func TestRevokeAll_ReplacementAfterListingIsNotRevoked(t *testing.T) {
 	ctx := context.Background()
 	base := memory.NewStore()
@@ -176,8 +173,8 @@ func TestRevokeAll_ReplacementAfterListingIsNotRevoked(t *testing.T) {
 	assert.Equal(t, bob, *got.UserID)
 }
 
-// hookGetInstances runs hook on the first GetByID of id, i.e. after the WIA
-// request's user-exists check and before its instance write.
+// hookGetInstances runs hook on the first GetByID of id (after the WIA user-exists
+// check, before its instance write).
 type hookGetInstances struct {
 	storage.WalletInstanceStore
 	id     string
@@ -210,9 +207,8 @@ func wireDeletionAndAttestation(t *testing.T, store storage.Store, instances sto
 	return userSvc, wia
 }
 
-// Thread 3, first interleaving: the account is deleted completely after the
-// WIA request passed its user-exists check and before its instance write. The
-// instance must not be bound to the deleted user.
+// The account is deleted completely after the WIA request's user-exists check and
+// before its instance write; the instance must not be bound to the deleted user.
 func TestWIA_AccountDeletedAfterAdmissionLeavesNoOrphanInstance(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()
@@ -242,10 +238,9 @@ func TestWIA_AccountDeletedAfterAdmissionLeavesNoOrphanInstance(t *testing.T) {
 	assert.ErrorIs(t, err, storage.ErrNotFound)
 }
 
-// Thread 3, second interleaving: the request is already inside its critical
-// section (holding the user's lock, about to write the instance) when the
-// deletion reaches its final sweep. The deletion must wait for the request and
-// then sweep the instance the request bound.
+// The request is inside its critical section (holding the user's lock) when the
+// deletion reaches its final sweep; the deletion must wait, then sweep the
+// instance the request bound.
 func TestDeleteUser_WaitsForAnAttestationInsideItsCriticalSection(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()
@@ -269,8 +264,8 @@ func TestDeleteUser_WaitsForAnAttestationInsideItsCriticalSection(t *testing.T) 
 	require.NoError(t, err)
 	pop, _ := createTestPop(t, challenge)
 	_, err = wia.GenerateWIA(ctx, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge})
-	// The request's last cut-off check may legitimately refuse the WIA once
-	// the deletion has run; what matters is the end state.
+	// The request's last cut-off check may refuse the WIA after the deletion; only
+	// the end state matters.
 	_ = err
 
 	select {
@@ -287,7 +282,7 @@ func TestDeleteUser_WaitsForAnAttestationInsideItsCriticalSection(t *testing.T) 
 }
 
 // afterWriteInstances runs hook right after the first successful conditional
-// status write for id: the record the write revoked is then replaced.
+// status write for id, so the revoked record can be replaced.
 type afterWriteInstances struct {
 	storage.WalletInstanceStore
 	match string
@@ -306,11 +301,9 @@ func (a *afterWriteInstances) UpdateStatusIfUnchanged(ctx context.Context, id st
 	return nil
 }
 
-// After the conditional status write the revoked record can be gone and its
-// id taken by a replacement of another user (account deletion removed it, a
-// concurrent attestation inserted the same thumbprint). That is a lost binding:
-// no cut-off and no cascade may run, neither against the replacement's owner
-// nor against the stale pre-write owner.
+// If the revoked record is replaced after the conditional write (deleted and
+// attested again by another user) the binding is lost: no cut-off and no cascade
+// may run, against neither the replacement's owner nor the stale pre-write owner.
 func TestChangeStatus_ReplacementAfterTheWriteRunsNoCascade(t *testing.T) {
 	ctx := context.Background()
 	base := memory.NewStore()

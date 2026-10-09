@@ -20,8 +20,8 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
-// A write refused because the lifecycle fence won the race (ErrStaleWrite,
-// possibly wrapped by a service) is answered like any other revoked token.
+// A write refused by the lifecycle fence (ErrStaleWrite, possibly wrapped) is
+// answered like any revoked token.
 func TestAbortIfTokenRevoked_MapsStaleWriteTo401(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	cases := map[string]error{
@@ -29,8 +29,8 @@ func TestAbortIfTokenRevoked_MapsStaleWriteTo401(t *testing.T) {
 		"stale":          storage.ErrStaleWrite,
 		"wrapped stale":  fmt.Errorf("update user: %w", storage.ErrStaleWrite),
 		"double wrapped": fmt.Errorf("svc: %w", fmt.Errorf("store: %w", storage.ErrStaleWrite)),
-		// A holder write that was fenced out but could not be rolled back is
-		// still a refusal to the caller (the left-behind record is logged).
+		// A fenced-out holder write that could not be rolled back is still refused
+		// (the left-behind record is logged).
 		"not rolled back": errors.Join(tokengate.ErrRevoked, fmt.Errorf("%w: store down", tokengate.ErrWriteNotRolledBack)),
 		// DeleteUser's cut-off compare-and-set lost to an independent revocation.
 		"delete cas": fmt.Errorf("%w: a lifecycle revocation landed during the deletion", tokengate.ErrRevoked),
@@ -50,7 +50,7 @@ func TestAbortIfTokenRevoked_MapsStaleWriteTo401(t *testing.T) {
 }
 
 // advancingUsers reports no cut-off for the first `after` reads and the given
-// cut-off afterwards: a revocation landing while a request is in flight.
+// cut-off afterwards (a revocation landing in flight).
 type advancingUsers struct {
 	storage.UserStore
 	after  int
@@ -66,8 +66,8 @@ func (u *advancingUsers) GetAuthCutoff(_ context.Context, _ domain.UserID) (time
 	return u.cutoff, nil
 }
 
-// A cut-off landing between the proxy's early check and its dispatch is
-// answered 401 and nothing is sent to the third party.
+// A cut-off between the proxy's early check and dispatch gives 401 and nothing
+// is sent to the third party.
 func TestProxyRequest_CutoffBeforeDispatchIs401(t *testing.T) {
 	var hits atomic.Int32
 	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hits.Add(1) }))

@@ -46,13 +46,11 @@ type WalletProviderService struct {
 	certChain       []string
 	instances       storage.WalletInstanceStore
 	keyAttestations storage.KeyAttestationStore
-	// users is read for the SID-AUTH-06 cut-off at the minting boundary (see
-	// GenerateKeyAttestation). Nil disables the recheck (tests, standalone).
+	// users is read for the SID-AUTH-06 cut-off at the minting boundary. Nil disables the recheck.
 	users tokengate.UserLookup
 }
 
-// SetUsers wires the user store the key-attestation path rechecks the
-// request's token cut-off against, immediately before and after minting.
+// SetUsers wires the user store used to recheck the request's token cut-off around minting.
 func (s *WalletProviderService) SetUsers(users tokengate.UserLookup) { s.users = users }
 
 // NewWalletProviderService creates a new WalletProviderService.
@@ -293,14 +291,12 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 	if !s.IsSupported() {
 		return "", ErrKeyAttestationNotSupported
 	}
-	// Mutation-boundary gate: the middleware admitted this request at entry,
-	// but a cut-off (user-wide revocation, deletion) may have landed since.
+	// Mutation-boundary gate: a cut-off may have landed since the middleware admitted the request.
 	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
 		return "", err
 	}
-	// The user-wide cut-off says nothing about the instance the KA is bound
-	// to: a fresh token from another live instance must not obtain a KA for a
-	// revoked one (or another user's).
+	// The user-wide cut-off says nothing about the target instance: a fresh token
+	// from another live instance must not obtain a KA for a revoked one.
 	if err := s.refuseKeyAttestationInstance(ctx, walletInstanceID); err != nil {
 		return "", err
 	}
@@ -415,8 +411,7 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 		return "", err
 	}
 
-	// Last look before the KA leaves: a cut-off landing while it was being
-	// signed must withhold it (same as the WIA path).
+	// Last look: a cut-off landing during signing must withhold the KA (as on the WIA path).
 	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
 		return "", err
 	}
@@ -428,24 +423,21 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 	return tokenString, nil
 }
 
-// ErrKeyAttestationInstanceRefused is returned when the wallet instance a key
-// attestation is requested for (or a FIDO2 attestation is recorded for) belongs
-// to another user or tenant, or is unknown.
+// ErrKeyAttestationInstanceRefused is returned when the instance a key or FIDO2
+// attestation names belongs to another user or tenant, or is unknown.
 var ErrKeyAttestationInstanceRefused = errors.New("wallet instance not usable by this caller")
 
 type kaTenantKey struct{}
 
-// WithKeyAttestationTenant records the caller's tenant for
-// GenerateKeyAttestation. Instance records are keyed by thumbprint alone, so
-// without it an instance id of another tenant would be accepted. A context
-// without a tenant is not judged (internal callers).
+// WithKeyAttestationTenant records the caller's tenant for GenerateKeyAttestation;
+// instance ids are global, so without it another tenant's id would be accepted.
+// A context without a tenant (internal callers) is not judged.
 func WithKeyAttestationTenant(ctx context.Context, tenantID domain.TenantID) context.Context {
 	return context.WithValue(ctx, kaTenantKey{}, tenantID)
 }
 
-// refuseKeyAttestationInstance validates the wallet instance at the minting
-// boundary (see refuseWalletInstance). An id the store does not know binds no
-// lifecycle state and is not judged.
+// refuseKeyAttestationInstance validates the instance at the minting boundary
+// (see refuseWalletInstance); an id the store does not know is not judged.
 func (s *WalletProviderService) refuseKeyAttestationInstance(ctx context.Context, walletInstanceID string) error {
 	if walletInstanceID == "" || s.instances == nil {
 		return nil
@@ -454,18 +446,14 @@ func (s *WalletProviderService) refuseKeyAttestationInstance(ctx context.Context
 	return err
 }
 
-// refuseWalletInstance is the one ownership/status gate for a request that
-// names a wallet instance (key attestation minting, FIDO2 attestation
-// recording). A record owned by a user other than the token's subject is
-// refused, as is an unbound one (when the token has a subject) and one
-// recorded in another tenant: ErrKeyAttestationInstanceRefused, whatever the
-// record's status, so a foreign instance's lifecycle state is not disclosed.
-// Only then is the status judged: a caller's own record that is not live
-// (revoked, suspended, or of a status this build does not recognize) is refused
-// as a revoked token (401): fail closed, nothing is changed. An id the store does not know is not judged
-// unless requireKnown is set, in which case it is refused like a foreign one;
-// a failed lookup refuses. On success the instance record is returned (nil for
-// an unknown id that is not judged).
+// refuseWalletInstance is the ownership/status gate for requests naming a wallet
+// instance. A record owned by another user, unbound (when the token has a
+// subject) or in another tenant is refused with
+// ErrKeyAttestationInstanceRefused whatever its status, so foreign lifecycle
+// state is not disclosed. Only then is status judged: the caller's own
+// non-live record (including unrecognized statuses) is refused as a revoked
+// token (401), failing closed. An unknown id is not judged unless requireKnown
+// is set; a failed lookup refuses. Returns the record (nil if not judged).
 func refuseWalletInstance(ctx context.Context, instances storage.WalletInstanceStore, walletInstanceID string, requireKnown bool) (*domain.WalletInstance, error) {
 	instance, err := instances.GetByID(ctx, walletInstanceID)
 	if err != nil {
@@ -480,18 +468,13 @@ func refuseWalletInstance(ctx context.Context, instances storage.WalletInstanceS
 	if tenantID, ok := ctx.Value(kaTenantKey{}).(domain.TenantID); ok && tenantID != "" && instance.TenantID != tenantID {
 		return nil, ErrKeyAttestationInstanceRefused
 	}
-	// A caller with a subject may only act for an instance bound to that
-	// subject. An unbound instance (anonymous or legacy attestation) is
-	// nobody's yet: the WIA flow binds it when its holder attests with a user
-	// token, so until then it is refused rather than open to any user who
-	// knows its id.
+	// A caller with a subject may only act for an instance bound to it. An
+	// unbound instance is nobody's until the WIA flow binds it, so it is refused.
 	if subject := tokengate.SubjectFrom(ctx); subject != "" && (instance.UserID == nil || instance.UserID.String() != subject) {
 		return nil, ErrKeyAttestationInstanceRefused
 	}
-	// Status last: ownership first, so a record that is not the caller's is
-	// refused identically whatever its lifecycle state. Judging status first
-	// would let any caller probe a foreign instance and learn from the 401 that
-	// it is revoked.
+	// Status last: judging it first would let a caller probe a foreign instance
+	// and learn from the 401 that it is revoked.
 	if !instance.Status.IsLive() {
 		return nil, fmt.Errorf("%w: wallet instance is not live", tokengate.ErrRevoked)
 	}

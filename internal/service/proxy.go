@@ -22,13 +22,11 @@ type ProxyService struct {
 	client *http.Client
 	cfg    *config.Config
 	logger *zap.Logger
-	// users is read for the SID-AUTH-06 cut-off before the outbound request.
-	// Nil disables the recheck.
+	// users is read for the SID-AUTH-06 cut-off before the outbound request; nil disables the recheck.
 	users tokengate.UserLookup
 }
 
-// SetUsers wires the user store Execute rechecks the request's token cut-off
-// against.
+// SetUsers wires the user store used to recheck the request's token cut-off.
 func (s *ProxyService) SetUsers(users tokengate.UserLookup) { s.users = users }
 
 // ProxyRequest represents an incoming proxy request
@@ -142,10 +140,8 @@ func (s *ProxyService) Execute(ctx context.Context, req *ProxyRequest) (*ProxyRe
 	// Set a generic user-agent to avoid fingerprinting
 	httpReq.Header.Set("User-Agent", "SIROS-Wallet/1.0")
 
-	// Final recheck immediately before dispatch. The early check above is a
-	// fast fail; marshaling, request construction and header processing run
-	// between it and the send, and a cut-off landing in that window must
-	// still stop the request, since it acts on a third party as the wallet.
+	// Final recheck just before dispatch: a cut-off landing during marshaling
+	// must still stop a request that acts on a third party as the wallet.
 	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
 		return nil, nil, err
 	}

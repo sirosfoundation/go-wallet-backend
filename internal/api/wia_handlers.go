@@ -62,8 +62,7 @@ type WIAGenerateRequest struct {
 	// NativeAttestation is optional platform attestation evidence (App Attest / Play Integrity)
 	NativeAttestation *service.NativeAttestationRequest `json:"native_attestation,omitempty"`
 	// CredentialID is the base64url WebAuthn credential id of the passkey this
-	// wallet instance logs in with, so that revoking the instance also
-	// refuses login with that passkey (SID-AUTH-06). Optional.
+	// instance logs in with; revoking the instance refuses that passkey (SID-AUTH-06). Optional.
 	CredentialID string `json:"credential_id,omitempty"`
 }
 

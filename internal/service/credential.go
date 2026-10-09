@@ -64,19 +64,12 @@ func (s *CredentialService) Store(ctx context.Context, tenantID domain.TenantID,
 		return nil, err
 	}
 
-	// Storage-level fence. The check above is only an admission check: an
-	// erasure (lifecycle cascade, account deletion) can advance the user's
-	// cut-off and sweep holder data between it and the Create above, which
-	// would then resurrect erased data. Re-read the cut-off now that the
-	// record is persisted; if the token is refused, take the record out again.
-	// See tokengate.ConfirmWrite for why this is sound without a transaction.
-	//
-	// The rollback is conditional on the record this request created (its
-	// store-assigned id and write token), not on the business key: if an erasure
-	// removed the record and a fresh, authorised request recreated the same
-	// credential identifier before the rollback runs, that replacement is a
-	// different record and is left alone. Both are captured now: the in-memory
-	// store hands out the stored pointer, which a later write mutates.
+	// Storage-level fence: the admission check above cannot stop an erasure
+	// advancing the cut-off and sweeping between it and the Create, which would
+	// resurrect erased data. Re-read the cut-off now (tokengate.ConfirmWrite) and
+	// roll back if refused. The rollback is conditional on this record's id and
+	// write token, not the business key, so a recreated record is left alone;
+	// both are captured now because the memory store hands out the stored pointer.
 	createdID, createdToken := credential.ID, credential.WriteToken
 	if err := tokengate.ConfirmWrite(ctx, s.store.Users(), func(rctx context.Context) error {
 		return s.store.Credentials().DeleteIfUnchanged(rctx, tenantID, createdID, createdToken)
@@ -169,13 +162,9 @@ func (s *CredentialService) Update(ctx context.Context, tenantID domain.TenantID
 	}
 
 	// Storage-level fence, as in Store. An update cannot resurrect an erased
-	// record (it is keyed by the existing record and does not upsert), but a
-	// revoked token must not change what it no longer may touch: when the
-	// cut-off advanced meanwhile, put the previous values back. If the
-	// erasure already removed the record there is nothing to restore. The
-	// restore is conditional on the write token this update produced, so it
-	// cannot overwrite a record that was recreated, or updated again by a fresh
-	// request, in the meantime.
+	// record, but a revoked token must not change what it no longer may touch:
+	// restore the previous values, conditional on this update's write token so a
+	// recreated or re-updated record is not overwritten.
 	written := *credential
 	if err := tokengate.ConfirmWrite(ctx, s.store.Users(), func(rctx context.Context) error {
 		return s.store.Credentials().RestoreIfUnchanged(rctx, &written, &previous)

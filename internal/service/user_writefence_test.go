@@ -15,10 +15,9 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
-// A request admitted by the token middleware just before a revocation can
-// reach a write after the revocation has erased the wallet. The record it then
-// loads is fresh, so the store's fence accepts it; the write itself has to
-// judge the request's token against the cut-off on that record.
+// A request admitted just before a revocation can reach a write after the wallet
+// was erased; the write must judge the token against the cut-off on the record
+// it loads, since the store fence accepts that fresh record.
 func TestUserWrites_RefuseATokenTheLoadedRecordCutsOff(t *testing.T) {
 	store := memory.NewStore()
 	svc := NewUserService(store, testConfig(), testLogger())
@@ -83,9 +82,9 @@ func TestUserWrites_RefuseATokenTheLoadedRecordCutsOff(t *testing.T) {
 	})
 }
 
-// Every token-authenticated write that changes wallet state judges the token
-// at the mutation: settings (UpdateUser) and stored credentials and
-// presentations (which load no user record, so read the cut-off themselves).
+// Every token-authenticated write that changes wallet state judges the token at
+// the mutation: settings (UpdateUser), credentials and presentations (which
+// read the cut-off themselves).
 func TestOtherWrites_RefuseATokenTheCutoffPredates(t *testing.T) {
 	store := memory.NewStore()
 	base := context.Background()
@@ -146,9 +145,8 @@ func TestOtherWrites_RefuseATokenTheCutoffPredates(t *testing.T) {
 	})
 }
 
-// DeleteUser is a token-authenticated write that erases the account and all
-// holder data. A request admitted just before a revocation advanced the
-// cut-off must be refused before anything is deleted.
+// DeleteUser must refuse a request admitted before a revocation advanced the
+// cut-off, before anything is deleted.
 func TestDeleteUser_RefusesATokenTheCutoffPredates(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()

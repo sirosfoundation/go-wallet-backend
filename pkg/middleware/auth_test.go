@@ -568,8 +568,8 @@ func TestAdminAuthMiddleware_CaseInsensitiveBearer(t *testing.T) {
 	}
 }
 
-// SID-AUTH-06: a legacy token issued before the user's wallet was
-// or revoked is refused even though it has not expired.
+// SID-AUTH-06: a legacy token issued before the user's wallet was revoked is
+// refused though unexpired.
 func TestAuthMiddleware_TokenBeforeAuthCutoffIsRevoked(t *testing.T) {
 	logger := zap.NewNop()
 	cfg := createTestConfig("test-secret")
@@ -609,9 +609,8 @@ func TestAuthMiddleware_TokenBeforeAuthCutoffIsRevoked(t *testing.T) {
 	}
 }
 
-// The middleware hands the admitted token's iat down to the writes behind it,
-// which judge it against the record they load (tokengate.RefuseLoaded): a
-// cut-off after that iat refuses, one before it does not.
+// The middleware passes the admitted token's iat to the writes behind it, which
+// judge it against the record they load (tokengate.RefuseLoaded).
 func TestAuthMiddleware_CarriesTokenIssuedAtToTheHandler(t *testing.T) {
 	secret := "test-secret"
 	cfg := createTestConfig(secret)

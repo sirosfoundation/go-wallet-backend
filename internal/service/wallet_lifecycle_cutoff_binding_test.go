@@ -13,9 +13,9 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 )
 
-// The user-wide token cut-off must only follow a confirmed instance
-// transition. If the instance was deleted and attested again for another user
-// between the read and the conditional write, nobody's tokens are cut off.
+// The cut-off must only follow a confirmed transition: if the instance was
+// deleted and attested again for another user between read and write, nobody's
+// tokens are cut off.
 func TestLifecycle_CutoffIsNotAdvancedWhenTheBindingChanged(t *testing.T) {
 	ctx := context.Background()
 	setup := func(t *testing.T) (*WalletLifecycleService, storage.Store, domain.UserID, domain.UserID, string) {

@@ -163,9 +163,8 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	protected.Use(
 		middleware.NoCacheMiddleware(),
 		p.authMiddleware(),
-		// Every route below acts on an account, a wallet or tenant
-		// configuration on a user's behalf; an anonymous token (no user) is
-		// for registry lookups only and is refused here.
+		// Account, wallet and tenant-config routes need a user; anonymous tokens
+		// are for registry lookups only.
 		middleware.RequireUser(),
 	)
 	// These are general user-facing routes, not the narrow-purpose calls
@@ -201,23 +200,12 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 			session.POST("/webauthn/register-finish", requireTACIfEnforced(p.tokenValidator, "i"), p.handlers.FinishAddWebAuthnCredential)
 			session.POST("/webauthn/credential/:id/rename", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.RenameWebAuthnCredential)
 			session.POST("/webauthn/credential/:id/delete", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteWebAuthnCredential)
-			// Wallet instance lifecycle, self-service (SID-AUTH-06)
-			// `l` (list), like every other collection endpoint here
-			// (/issuer/all, /verifier/all, GET /storage/vc); `r` is the
-			// per-object read permission used for /instances/{id}-shaped
-			// reads, and gating a listing on it would let a read-only token
-			// enumerate instances a list-only token cannot see.
+			// Wallet instance lifecycle, self-service (SID-AUTH-06). `l`, not `r`: a
+			// listing gated on `r` would let a read-only token enumerate.
 			session.GET("/instances", requireTACIfEnforced(p.tokenValidator, "l"), p.handlers.ListMyWalletInstances)
-			// `w`: logging out everywhere changes server-side state (it
-			// advances the token cut-off and drops live sessions) but
-			// destroys nothing, so it is a write and not a delete.
-			//
-			// There is no self-service route that revokes an instance.
-			// Revocation cannot be undone, so a user who revoked the
-			// instance behind their last passkey would lock themselves out
-			// with no way back (SID-AUTH-06, admin_instance_handlers.go).
-			// What a user owns is logging out everywhere, and removing the
-			// account outright.
+			// `w`: logout-everywhere changes state but destroys nothing. There is no
+			// self-service instance revocation: it is irreversible and could lock a user
+			// out behind their last passkey.
 			session.POST("/logout-all", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.LogoutEverywhere)
 		}
 		protected.DELETE("/user/session", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteUser)
@@ -343,8 +331,7 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 	protected.Use(
 		middleware.NoCacheMiddleware(),
 		p.authMiddleware(),
-		// Stored credentials belong to a user; an anonymous token is for
-		// registry lookups only.
+		// Stored credentials belong to a user; anonymous tokens are for registry lookups only.
 		middleware.RequireUser(),
 	)
 	// Credential storage is a general user-facing route, not one of the
@@ -464,10 +451,7 @@ func (p *EngineProvider) SessionStore() wsengine.SessionStore {
 	return p.manager.SessionStore()
 }
 
-// SessionCleaner returns the cleaner that drops a user's engine sessions:
-// the Manager itself, which closes the live WebSocket and deletes the
-// persisted record, rather than the bare SessionStore, which only does the
-// latter (see Manager.DeleteByUser).
+// SessionCleaner returns the cleaner that drops a user's engine sessions and live WebSockets.
 func (p *EngineProvider) SessionCleaner() service.SessionCleaner {
 	return p.manager
 }
@@ -493,8 +477,7 @@ func (p *EngineProvider) SetTokenValidator(v *tokenvalidator.Validator) {
 	p.manager.SetTokenValidator(v)
 }
 
-// SetTokenGate passes the SID-AUTH-06 token cut-off check to the engine so a
-// token issued before a suspension/revocation cannot open a new session.
+// SetTokenGate passes the SID-AUTH-06 token cut-off check to the engine.
 func (p *EngineProvider) SetTokenGate(g *tokengate.Gate) {
 	p.manager.SetTokenGate(g)
 }
@@ -504,18 +487,10 @@ func (p *BackendProvider) TokenGate() *tokengate.Gate {
 	return tokengate.New(p.store.Users())
 }
 
-// NewStandaloneTokenGate builds the SID-AUTH-06 token cut-off check for an
-// engine that runs without the backend role in the same process. It opens
-// the configured storage backend read-only (backend.NewReadOnly: no default
-// tenant creation, no index creation, so the database principal needs read
-// rights on the users and user_deletion_tombstones collections only: a
-// token whose user has no record is refused if a deletion tombstone exists,
-// so the gate reads the tombstone too and fails closed, refusing the token, if
-// that read is denied) and uses it for user lookups only. With no persistent
-// storage configured (memory)
-// there is nothing to consult: the caller gets a nil gate and must warn that
-// pre-suspension tokens are not cut off at the engine handshake in that
-// deployment.
+// NewStandaloneTokenGate builds the SID-AUTH-06 cut-off check for an engine
+// without the backend role, opening storage read-only (the principal needs read
+// on users and user_deletion_tombstones; a denied tombstone read refuses the
+// token). Memory storage returns a nil gate; the caller must warn.
 func NewStandaloneTokenGate(ctx context.Context, cfg *config.Config) (*tokengate.Gate, io.Closer, error) {
 	if cfg == nil || cfg.Storage.Type == "" || cfg.Storage.Type == "memory" {
 		return nil, nil, nil
@@ -760,8 +735,7 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 	if p.authzenHandler != nil {
 		protected := router.Group("/")
 		protected.Use(p.authMiddleware())
-		// Anonymous tokens ARE accepted here (no RequireUser): these are
-		// registry lookups, the one thing an anonymous token is for.
+		// Anonymous tokens are accepted here (no RequireUser): registry lookups only.
 		//
 		// Trust-evaluation calls are identity-free by design (see
 		// handleAnonymousTokenRequest) and only need a wallet-registry or
@@ -883,12 +857,8 @@ type AdminProvider struct {
 	sessionCleaner service.SessionCleaner
 }
 
-// SetSessionCleaner gives the standalone admin API a way to drop live
-// sessions when it revokes an instance. It is wired only when something in
-// this process owns sessions, which for --mode=admin means the engine is
-// co-hosted (--mode=admin,engine). Without it a revocation still cuts the
-// user's tokens off, and their sessions end at the next gate check rather
-// than immediately.
+// SetSessionCleaner lets the standalone admin API drop live sessions on
+// revocation; wire it only when this process owns sessions.
 func (p *AdminProvider) SetSessionCleaner(sc service.SessionCleaner) { p.sessionCleaner = sc }
 
 // NewAdminProvider creates a standalone admin route provider
@@ -943,20 +913,10 @@ func (p *AdminProvider) CheckReady(ctx context.Context) error {
 // RegisterAdminRoutes implements AdminRouteProvider for AdminProvider.
 func (p *AdminProvider) RegisterAdminRoutes(adminGroup *gin.RouterGroup) {
 	adminHandlers := api.NewAdminHandlers(p.store, p.logger, p.auditor)
-	// A standalone admin deployment gets the same lifecycle service the
-	// backend uses, so a revocation here is a real revocation: transition
-	// rules, audit, the SID-AUTH-06 token cut-off, and the erasure of a
-	// wallet whose last live instance is gone. Without it the handler would
-	// write the status straight to the store and answer 200 while the
-	// device's tokens still worked - which, for the one operation a wallet
-	// instance has and cannot undo, is the worst possible half-measure.
-	//
+	// Same lifecycle service as the backend, so a revocation here applies the
+	// transition rules, audit, cut-off and erasure.
 	lifecycle := service.NewWalletLifecycleService(p.store, p.logger, p.auditor)
-	// A session cleaner is wired only when this process owns sessions, which
-	// for --mode=admin means the engine is co-hosted. Otherwise the AS and
-	// the engine are other processes and there is nothing here to close:
-	// their sessions end at the cut-off, which every gate consults, rather
-	// than at an immediate drop.
+	// Wired only when this process owns sessions.
 	if p.sessionCleaner != nil {
 		lifecycle.SetSessionCleaner(p.sessionCleaner)
 	}

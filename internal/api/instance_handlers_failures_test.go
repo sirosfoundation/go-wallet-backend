@@ -164,9 +164,7 @@ func TestListMyWalletInstances_Refusals(t *testing.T) {
 	})
 }
 
-// A session store that will not drop the user's sessions must not be reported
-// as a successful logout-everywhere: the tokens are cut off, but the request
-// promised the sessions too.
+// A session store that cannot drop sessions must not report a successful logout-everywhere.
 func TestLogoutEverywhere_SessionCleanerFailureIs500(t *testing.T) {
 	h, _ := setupLifecycleHandlers(t)
 	me := domain.NewUserID()
