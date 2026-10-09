@@ -166,11 +166,8 @@ func TestColocatedEngineClientReachesRegistry(t *testing.T) {
 	assert.Nil(t, md)
 }
 
-// Deprecated registry.yaml with an HMAC secret on a registry-only process. The
-// legacy HMAC authorization server is gone, so the secret has nothing left to
-// validate: it is ignored with a loud warning, and a deployment that relied on
-// it for jwt.require_auth fails startup unless the AS JWKS (as.external_url) is
-// configured - exactly as as.legacy.enabled=true fails startup.
+// Deprecated registry.yaml HMAC secret on a registry-only process: ignored with a warning;
+// jwt.require_auth then needs as.external_url or startup fails.
 func TestDeprecatedRegistryConfigHMACSecretIgnored(t *testing.T) {
 	const secret = "0123456789abcdef0123456789abcdef"
 	dir := t.TempDir()
@@ -179,14 +176,14 @@ func TestDeprecatedRegistryConfigHMACSecretIgnored(t *testing.T) {
 		"source:\n  url: http://127.0.0.1:1/x.json\n"+
 		"jwt:\n  secret: \""+secret+"\"\n  issuer: wallet-backend\n  require_auth: true\n"), 0o600))
 
-	// No as.external_url: HMAC-only auth no longer exists -> startup fails.
+	// No as.external_url: startup fails.
 	cfg, err := config.LoadRegistryOnly("")
 	require.NoError(t, err)
 	_, err = setupRegistryConfig(cfg, old, true)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "as.external_url")
 
-	// With the AS JWKS configured it starts; the secret is ignored (loudly).
+	// With the AS JWKS configured it starts; the secret is ignored.
 	cfg, err = config.LoadRegistryOnly("")
 	require.NoError(t, err)
 	cfg.AS.ExternalURL = "https://127.0.0.1:1" // never reachable (SSRF guard); only HMAC tokens are probed

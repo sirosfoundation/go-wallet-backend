@@ -49,10 +49,8 @@ func newAuthEnv(t *testing.T) *authEnv {
 	return &authEnv{key: key, jwks: srv}
 }
 
-// validator builds a go-tokenauth validator WITHOUT legacy support, as the
-// registry does: the legacy HMAC authorization server no longer exists. Its
-// audience list is deliberately wider than the registry's ("wallet-backend"
-// too) so the registry's own audience rule is exercised on top of it.
+// validator builds a go-tokenauth validator without legacy support, as the registry does, with an
+// audience list wider than the registry's so the registry's own audience rule is exercised.
 func (e *authEnv) validator(t *testing.T) *validator.Validator {
 	t.Helper()
 	v := validator.New(validator.Config{
@@ -246,8 +244,7 @@ func TestAuthMiddlewares_JTIRevocation(t *testing.T) {
 			Blacklist: fakeBlacklist{revokedJTI: "unrelated-jti"},
 		}
 
-		// Positive control: with no matching jti revoked the token passes the
-		// whole chain.
+		// Positive control: with no matching jti revoked the token passes.
 		r := probe(t, cfg, es)
 		assert.Equal(t, http.StatusOK, r.status, "control, strict=%v", strict)
 		assert.True(t, r.auth, "control, strict=%v", strict)

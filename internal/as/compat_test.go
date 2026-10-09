@@ -32,8 +32,7 @@ func TestIsSessionMode(t *testing.T) {
 	}
 }
 
-// A request without X-Token-Mode: session expects the removed legacy flow
-// (an appToken in the body); it gets a 410 instead of a cookie-only session.
+// A request without X-Token-Mode: session gets 410, not a cookie-only session.
 func TestSessionModeGate(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	run := func(header string) *httptest.ResponseRecorder {

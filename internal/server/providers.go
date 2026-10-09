@@ -40,8 +40,7 @@ type AuthProvider struct {
 	roles          []string
 	tokenValidator *tokenvalidator.Validator
 	wiaRateLimiter *middleware.AuthRateLimiter
-	// gateRateLimiter is handed to the AS module for its passkey OIDC gates
-	// (per-IP and per-tenant buckets, #65).
+	// gateRateLimiter feeds the AS module's passkey OIDC gates (per-IP and per-tenant buckets).
 	gateRateLimiter *middleware.OIDCGateRateLimiter
 }
 
@@ -72,13 +71,9 @@ func (p *AuthProvider) Name() string         { return "auth" }
 // Services returns the auth provider's service aggregate.
 func (p *AuthProvider) Services() *service.Services { return p.services }
 
-// LogLegacyTokenStatus logs that the legacy HMAC authorization server has
-// been removed and warns about every setting that is still present but no
-// longer has any effect (Config.DeprecatedSettings). It is called exactly
-// once per process from cmd/server/main.go, so that every role combination
-// logs it; providers must not call it themselves. A configuration that still
-// enables the legacy AS (as.legacy.enabled=true) never gets this far:
-// Config.Validate refuses it.
+// LogLegacyTokenStatus logs the legacy AS removal and warns about settings that no longer have
+// effect (Config.DeprecatedSettings). Call it once per process from cmd/server;
+// as.legacy.enabled=true never gets this far (Config.Validate refuses it).
 func LogLegacyTokenStatus(cfg *config.Config, logger *zap.Logger) {
 	for _, name := range cfg.DeprecatedSettings() {
 		logger.Warn("Ignoring removed configuration setting: the legacy HMAC authorization server no longer exists; remove this setting",
@@ -97,11 +92,8 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	// Public auth routes (no authentication required)
 	public := router.Group("/")
 	{
-		// The legacy login/registration/refresh endpoints minted HS256
-		// appTokens and were removed with the legacy AS. They answer 410 for
-		// one release (instead of a bare 404) so old clients get a clear,
-		// actionable error; the replacement is /auth/passkey/* with
-		// X-Token-Mode: session (see internal/as).
+		// The removed login/registration/refresh endpoints answer 410 legacy_tokens_disabled for one
+		// release, pointing at /auth/passkey/* with X-Token-Mode: session.
 		removed := public.Group("/user")
 		removed.Use(middleware.NoCacheMiddleware(), middleware.LegacyEndpointRemoved())
 		{
@@ -229,12 +221,9 @@ func (p *AuthProvider) authMiddleware() gin.HandlerFunc {
 	return sessionAuthMiddleware(p.tokenValidator, p.store, p.services.TokenBlacklist, p.logger)
 }
 
-// sessionAuthMiddleware builds the authentication middleware shared by every
-// provider. There is no HMAC fallback: without a validator (the AS is not
-// enabled / has no JWKS to validate against) nothing can authenticate, so
-// every protected request is refused with 401 (fail closed). Constructors
-// refuse to start in that state (requireSessionAuthMechanism); this guards a
-// provider built directly.
+// sessionAuthMiddleware builds the auth middleware shared by every provider. Without a validator
+// every protected request gets 401 (fail closed); constructors refuse to start in that state
+// (requireSessionAuthMechanism), so this only guards a directly built provider.
 func sessionAuthMiddleware(tv *tokenvalidator.Validator, store backend.Backend, blacklist *service.TokenBlacklist, logger *zap.Logger) gin.HandlerFunc {
 	if tv == nil {
 		return func(c *gin.Context) {
@@ -308,11 +297,8 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 	}
 }
 
-// authMiddleware returns the auth middleware for storage routes. When this
-// provider is combined with an AuthProvider under BackendProvider,
-// p.services.TokenBlacklist is overwritten to share that AuthProvider's
-// instance, so a token blacklisted via Logout/DeleteUser is honored here too,
-// not just on /user/session routes (#382).
+// authMiddleware returns the auth middleware for storage routes. Under BackendProvider,
+// p.services.TokenBlacklist is replaced by the AuthProvider's instance so revocation applies here too.
 func (p *StorageProvider) authMiddleware() gin.HandlerFunc {
 	return sessionAuthMiddleware(p.tokenValidator, p.store, p.services.TokenBlacklist, p.logger)
 }
@@ -424,17 +410,12 @@ type StandaloneValidator struct {
 // Close stops the background JWKS refresh.
 func (v StandaloneValidator) Close() error { v.Stop(); return nil }
 
-// NewStandaloneEngineTokenValidator builds the token validator for an engine
-// running without a backend provider (--mode=engine), where none is otherwise
-// wired. The JWKS location comes from as.external_url (the AS's public base
-// URL); without it there is no way to authenticate a connection (the HMAC
-// fallback no longer exists), so this returns an error and startup fails
-// instead of silently rejecting every connection.
+// NewStandaloneEngineTokenValidator builds the token validator for an engine running without a backend
+// provider (--mode=engine). The JWKS comes from as.external_url; without it every connection would be
+// rejected, so it returns an error and startup fails.
 //
-// Revocation limitation: a standalone engine has no revocation source (no
-// backend token blacklist is wired in, and a shared one is tracked in #407 and
-// #415), so a token stays valid here until it expires even after logout or
-// user revocation. A warning is logged.
+// A standalone engine has no revocation source (shared blacklist tracked in #407 and #415): a token
+// stays valid until it expires, even after logout or user revocation. A warning is logged.
 func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (*StandaloneValidator, error) {
 	if cfg.AS.ExternalURL == "" {
 		return nil, fmt.Errorf("standalone engine needs as.external_url to fetch the AS JWKS; refusing to start with no way to authenticate connections (legacy HMAC tokens no longer exist)")
@@ -469,13 +450,8 @@ func (p *EngineProvider) SetTokenValidator(v *tokenvalidator.Validator) {
 	p.manager.SetTokenValidator(v)
 }
 
-// SetTokenBlacklist passes a token blacklist to the WebSocket engine so its
-// handshake honors revocation (both per-jti and per-user) the same way the
-// HTTP auth middlewares do - see wsengine.TokenBlacklistChecker's doc
-// comment for exactly what this covers versus what a shared
-// *tokenvalidator.Validator (see SetTokenValidator) already checks on its
-// own (#391 review, round 2: user-level revocation was not enforced during
-// the handshake).
+// SetTokenBlacklist passes a token blacklist to the WebSocket engine so its handshake honors per-jti
+// and per-user revocation like the HTTP middlewares (see wsengine.TokenBlacklistChecker).
 func (p *EngineProvider) SetTokenBlacklist(b wsengine.TokenBlacklistChecker) {
 	p.manager.SetTokenBlacklist(b)
 }
@@ -507,11 +483,8 @@ func (p *EngineProvider) CheckReady(ctx context.Context) error {
 	return nil
 }
 
-// blacklistRevocationChecker adapts *service.TokenBlacklist to
-// go-tokenauth's revocation.Checker interface (IsRevoked vs. the service
-// package's own IsBlacklisted method name), so a token revoked via
-// Logout/DeleteUser (#382/#383) is honored for AS-issued tokens validated
-// through go-tokenauth's Validator.
+// blacklistRevocationChecker adapts *service.TokenBlacklist to go-tokenauth's revocation.Checker
+// (IsRevoked vs IsBlacklisted), so Logout/DeleteUser revocation applies to AS-issued tokens.
 type blacklistRevocationChecker struct {
 	blacklist *service.TokenBlacklist
 }
@@ -539,10 +512,8 @@ type BackendProvider struct {
 	logger           *zap.Logger
 }
 
-// requireSessionAuthMechanism refuses to start a role that serves protected
-// routes when the AS is not enabled: session tokens are the only
-// authentication mechanism (the legacy HMAC fallback was removed), so without
-// as.enabled=true every protected request would return 401.
+// requireSessionAuthMechanism refuses to start a role serving protected routes when the AS is not
+// enabled: session tokens are the only authentication, so every request would return 401.
 func requireSessionAuthMechanism(cfg *config.Config, role string) error {
 	if !cfg.AS.Enabled {
 		return fmt.Errorf("%s role serves protected routes but as.enabled=false: the legacy HMAC token path was removed, so AS-issued session tokens are the only way to authenticate; set as.enabled=true (or add the auth role)", role)
@@ -550,10 +521,8 @@ func requireSessionAuthMechanism(cfg *config.Config, role string) error {
 	return nil
 }
 
-// remoteASIssuer returns the expected issuer for a validator of tokens from a
-// remote AS (as.issuer, falling back to jwt.issuer) and refuses an empty
-// value: the validator would then leave the issuer of JWKS-signed tokens
-// unrestricted. It is checked before any validator is created.
+// remoteASIssuer returns the expected issuer for remote-AS tokens (as.issuer, else jwt.issuer) and
+// refuses an empty value, which would leave the issuer of JWKS-signed tokens unrestricted.
 func remoteASIssuer(cfg *config.Config, role string) (string, error) {
 	issuer := cfg.AS.Issuer
 	if issuer == "" {
@@ -668,10 +637,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 			JWKSURL:   jwksURL,
 			Issuer:    issuer,
 			Audiences: cfg.AS.Audiences,
-			// Same blacklist as everything else in this process (#382/#383) -
-			// without this, tokens validated through go-tokenauth would never
-			// consult the blacklist at all, since the Validator has its own
-			// independent validation path.
+			// Same blacklist as the rest of the process: the Validator has its own validation path that would not consult it.
 			Revocation: blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist},
 		})
 		tv.Start(context.Background())
@@ -683,8 +649,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 
 	authProvider.tokenValidator = tv
 	if tv != nil {
-		// The keystore websocket handshake validates through the same
-		// (ES256/JWKS) validator as the HTTP routes.
+		// The keystore websocket handshake uses the same JWKS validator as the HTTP routes.
 		authProvider.services.Keystore.SetTokenValidator(tv)
 	}
 	storageProvider := NewStorageProvider(cfg, store, logger, roles)
@@ -934,17 +899,13 @@ type RegistryProvider struct {
 	rootAliases bool
 }
 
-// registryTokenAudiences is the "aud" list the registry's token validator
-// accepts: the registry audience only (AS-issued ES256 tokens; legacy HMAC
-// tokens, whose audience was the RP ID, no longer exist).
+// registryTokenAudiences is the "aud" list the registry's validator accepts.
 func registryTokenAudiences() []string {
 	return []string{config.RegistryAudience}
 }
 
-// registryNeedsValidator reports whether a token validator must be built:
-// whenever there is an AS to fetch JWKS from (as.external_url), and always
-// when registry.require_auth is set (NewRegistryProvider then fails closed if
-// there is no JWKS source, instead of serving a registry nobody can use).
+// registryNeedsValidator reports whether a token validator must be built: whenever as.external_url is
+// set, and always with registry.require_auth (NewRegistryProvider then fails closed without a JWKS source).
 func registryNeedsValidator(cfg *config.Config) bool {
 	return cfg.Registry.RequireAuth || cfg.AS.ExternalURL != ""
 }
@@ -1001,14 +962,10 @@ func NewRegistryProvider(cfg *config.Config, logger *zap.Logger) (*RegistryProvi
 	return p, nil
 }
 
-// buildValidator builds the registry's go-tokenauth validator. The validator
-// fetches the AS JWKS from as.external_url itself, as for the wallet-provider
-// and the standalone engine. There is no other token mechanism: without
-// as.external_url there is nothing to validate tokens with, which is an error
-// (a deprecated registry.yaml HMAC secret is ignored, see
-// config.ApplyLegacyRegistryConfig). go-tokenauth v0.5 refuses to validate
-// without an audience list; the registry's audience rule
-// (registry.AuthMiddlewares) is the same list.
+// buildValidator builds the registry's go-tokenauth validator, fetching the AS JWKS from
+// as.external_url. Without it there is nothing to validate tokens with, which is an error (a deprecated
+// registry.yaml HMAC secret is ignored, see config.ApplyLegacyRegistryConfig). The audience list
+// matches registry.AuthMiddlewares.
 func (p *RegistryProvider) buildValidator() error {
 	cfg := p.cfg
 	if cfg.AS.ExternalURL == "" {
@@ -1193,11 +1150,8 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 
 	handlers := api.NewHandlers(services, cfg, logger, []string{"wallet-provider"})
 
-	// Build the go-tokenauth validator that checks AS-issued session tokens.
-	// The AS runs elsewhere, so its JWKS is fetched from as.external_url
-	// (as.enabled is not needed here); without it there is nothing to
-	// validate against and, with no HMAC fallback, no way to authenticate, so
-	// fail startup (same rule as NewStandaloneEngineTokenValidator).
+	// Build the validator for AS-issued session tokens from the JWKS at as.external_url (as.enabled
+	// is not needed); without it fail startup, as in NewStandaloneEngineTokenValidator.
 	var tv *tokenvalidator.Validator
 	if cfg.AS.ExternalURL == "" {
 		services.Stop()
@@ -1220,9 +1174,8 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 		JWKSURL:   jwksURL,
 		Issuer:    issuer,
 		Audiences: cfg.SessionAudiences(),
-		// See NewBackendProvider's identical wiring (#382/#383). This
-		// provider's own services.TokenBlacklist is fine used as-is here:
-		// it never runs co-hosted with BackendProvider (see cmd/server).
+		// Same wiring as NewBackendProvider; this provider's own TokenBlacklist is used as-is (it is never
+		// co-hosted with BackendProvider).
 		Revocation: blacklistRevocationChecker{blacklist: services.TokenBlacklist},
 	})
 	tv.Start(context.Background())
@@ -1241,10 +1194,8 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 func (p *WalletProviderProvider) Transport() Transport { return TransportWalletProvider }
 func (p *WalletProviderProvider) Name() string         { return "wallet-provider" }
 
-// authMiddleware returns the auth middleware for the wallet-provider routes.
-// This provider never runs co-hosted with BackendProvider (see cmd/server -
-// it's only ever constructed standalone), so its own Services.TokenBlacklist
-// is fine used as-is (#382).
+// authMiddleware returns the auth middleware for the wallet-provider routes. This provider never runs
+// co-hosted with BackendProvider, so its own Services.TokenBlacklist is used as-is.
 func (p *WalletProviderProvider) authMiddleware() gin.HandlerFunc {
 	return sessionAuthMiddleware(p.tokenValidator, p.store, p.services.TokenBlacklist, p.logger)
 }

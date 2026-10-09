@@ -105,10 +105,10 @@ Environment prefix: `WALLET_JWT`
 
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
-| `jwt.secret` | `WALLET_JWT_SECRET` | string | Secret is a server-side secret of at least 32 bytes. It signs and validates no token; it keys the HMAC that binds the OIDC state parameter to the browser (the AS state-binding cookie). Required. |
+| `jwt.secret` | `WALLET_JWT_SECRET` | string | Secret is a server-side secret of at least 32 bytes. It keys the HMAC that binds the OIDC state parameter to the browser (state-binding cookie). Required. |
 | `jwt.secret_path` | `WALLET_JWT_SECRET_PATH` | string | SecretPath is the path to a file containing the secret (alternative to Secret). |
-| `jwt.expiry_hours` | `WALLET_JWT_EXPIRY_HOURS` | integer | REMOVED and ignored (startup warning): the legacy access-token lifetime. AS token lifetimes are as.default_token_ttl / as.audience_ttls.  Deprecated: no effect. |
-| `jwt.refresh_days` | `WALLET_JWT_REFRESH_DAYS` | integer | REMOVED and ignored (startup warning): legacy HMAC refresh tokens no longer exist; AS sessions live as.session_ttl.  Deprecated: no effect. |
+| `jwt.expiry_hours` | `WALLET_JWT_EXPIRY_HOURS` | integer | REMOVED and ignored (startup warning). AS token lifetimes are as.default_token_ttl / as.audience_ttls.  Deprecated: no effect. |
+| `jwt.refresh_days` | `WALLET_JWT_REFRESH_DAYS` | integer | REMOVED and ignored (startup warning). AS sessions live as.session_ttl.  Deprecated: no effect. |
 | `jwt.issuer` | `WALLET_JWT_ISSUER` | string | Issuer is the fallback for as.issuer (the "iss" of AS-issued access tokens). Default: "wallet-backend". |
 
 ## as
@@ -133,7 +133,7 @@ Environment prefix: `WALLET_AS`
 | `as.session_ttl` | `WALLET_AS_SESSION_TTL` | duration | SessionTTL is the maximum session lifetime before re-authentication. Default: 24h |
 | `as.session_store` | `WALLET_AS_SESSION_STORE` | string | SessionStore selects where AS sessions (the cookie-bound server-side sessions that mint access tokens) are kept: "mongodb", "memory" or "auto". "auto" (the default when empty) means "mongodb" when the storage backend is MongoDB and "memory" otherwise. Memory sessions are lost on restart and are not shared between instances; use "mongodb" for high availability. |
 | `as.default_max_tac` | `WALLET_AS_DEFAULT_MAX_TAC` | string | DefaultMaxTAC is the default maximum TAC for sessions created via passkey auth. Admin sessions (e.g. via OIDC) may get a different MaxTAC per policy. Default: "rwl" (read, write, list) |
-| `as.legacy.enabled` | `WALLET_AS_LEGACY_ENABLED` | boolean | REMOVED. true makes startup fail (the legacy AS no longer exists); false (the former sunset switch) is ignored with a startup warning. A pointer so that "unset" and "explicit false" differ. |
+| `as.legacy.enabled` | `WALLET_AS_LEGACY_ENABLED` | boolean | REMOVED. true makes startup fail; false is ignored with a startup warning. A pointer so that unset and explicit false differ. |
 | `as.legacy.deprecation_header` | `WALLET_AS_LEGACY_DEPRECATION_HEADER` | boolean | REMOVED and ignored (startup warning). |
 | `as.legacy.sunset_date` | `WALLET_AS_LEGACY_SUNSET_DATE` | string | REMOVED and ignored (startup warning). |
 | `as.external_url` | `WALLET_AS_EXTERNAL_URL` | string | ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com"). Used for OIDC redirect URIs and, in an isolated wallet-provider or standalone engine, to locate the AS JWKS. Must be an absolute http(s) URL without a query or fragment; a path prefix is allowed.  A standalone engine (--mode=engine) has no revocation source: a token stays valid there until it expires, even after logout. Use short access token TTLs, or co-host the engine with the backend. |

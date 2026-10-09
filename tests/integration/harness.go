@@ -50,10 +50,8 @@ type TestHarness struct {
 	// Readiness manager for /readyz tests
 	Readiness *health.ReadinessManager
 
-	// tokenIssuer mints the AS session access tokens CreateTestUser hands
-	// out; validator is the go-tokenauth validator (backed by a local JWKS
-	// server) that the harness's protected routes use - the same shape as
-	// production, where AS-issued ES256 tokens are the only credential.
+	// tokenIssuer mints the AS session tokens CreateTestUser hands out; validator is the JWKS-backed
+	// go-tokenauth validator the protected routes use.
 	tokenIssuer *as.TokenIssuer
 	validator   *tokenvalidator.Validator
 }
@@ -153,9 +151,8 @@ func NewTestHarness(t *testing.T, opts ...TestHarnessOption) *TestHarness {
 	return h
 }
 
-// setupTokenAuth builds an AS token issuer (in-memory ES256 key) and a
-// go-tokenauth validator that fetches that key from a local JWKS server, and
-// waits until the validator has loaded it.
+// setupTokenAuth builds an in-memory ES256 AS token issuer and a validator fetching its key from a
+// local JWKS server, and waits for the key to load.
 func (h *TestHarness) setupTokenAuth() {
 	h.T.Helper()
 
@@ -223,10 +220,8 @@ func setupRoutes(r *gin.Engine, h *api.Handlers, th *TestHarness, logger *zap.Lo
 		c.JSON(http.StatusOK, status)
 	})
 
-	// WebAuthn routes (public - for registration/login): the AS passkey
-	// handlers, wired like ASModule.RegisterRoutes does (tenant header
-	// middleware in front). They create an AS session and set the session
-	// cookie; the body carries no token.
+	// WebAuthn routes (public): the AS passkey handlers wired like ASModule.RegisterRoutes; they set the
+	// session cookie and return no token.
 	passkeyHandlers := as.NewPasskeyHandlers(th.Services.WebAuthn, as.NewMemorySessionStore(),
 		&config.ASConfig{DefaultMaxTAC: "rwl", SessionTTL: time.Hour, InsecureCookies: true}, logger)
 	passkey := r.Group("/auth/passkey")

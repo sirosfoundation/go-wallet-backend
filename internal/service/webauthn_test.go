@@ -887,8 +887,7 @@ func TestFullLoginFlow(t *testing.T) {
 		require.NoError(t, err)
 
 		assert.Equal(t, finishRegResp.UUID, finishLoginResp.UUID)
-		// The service no longer mints any token: access tokens come only from
-		// the AS (/auth/token) after the AS creates a session.
+		// The service mints no token: access tokens come from the AS (/auth/token).
 		body, err := json.Marshal(finishLoginResp)
 		require.NoError(t, err)
 		assert.NotContains(t, string(body), "appToken")

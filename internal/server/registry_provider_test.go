@@ -128,14 +128,12 @@ func TestRegistryProvider_ProtectedRoutes(t *testing.T) {
 	assert.Equal(t, http.StatusOK, doRegistryGet(t, p, "Bearer "+as.token(t, []string{"wallet-registry"})))
 	// An AS token for another audience is refused by the validator (v0.5).
 	assert.Equal(t, http.StatusUnauthorized, doRegistryGet(t, p, "Bearer "+as.token(t, []string{"wallet-backend"})))
-	// Legacy HMAC tokens are never accepted any more, whatever secret/issuer
-	// they were signed with (the legacy AS was removed).
+	// HMAC tokens are never accepted, whatever secret/issuer they were signed with.
 	assert.Equal(t, http.StatusUnauthorized, doRegistryGet(t, p, "Bearer "+regHMAC(t)))
 }
 
-// A deprecated registry.yaml HMAC secret (jwt.secret) is not used for
-// validation: with registry.require_auth the registry still starts (JWKS from
-// as.external_url) but rejects HMAC tokens signed with that very secret.
+// A deprecated registry.yaml HMAC secret is not used: with registry.require_auth the registry starts
+// (JWKS from as.external_url) but rejects HMAC tokens signed with it.
 func TestRegistryProvider_DeprecatedHMACSecretIgnored(t *testing.T) {
 	as := newRegAS(t)
 	cfg := registryTestConfig(t)
@@ -189,8 +187,7 @@ func TestRegistryNeedsValidator(t *testing.T) {
 	assert.True(t, registryNeedsValidator(c))
 }
 
-// require_auth without as.external_url must fail the provider closed: there is
-// no HMAC fallback to authenticate anyone with.
+// require_auth without as.external_url must fail closed.
 func TestRegistryProvider_RequireAuthWithoutJWKSFails(t *testing.T) {
 	c := registryTestConfig(t)
 	c.Registry.RequireAuth = true

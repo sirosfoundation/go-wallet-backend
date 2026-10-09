@@ -29,8 +29,7 @@ func TestLogLegacyTokenStatus_ReportsRemoval(t *testing.T) {
 	assert.Contains(t, logs.All()[0].Message, "has been removed")
 }
 
-// Leftover settings are warned about, one warning per setting, before the
-// removal notice.
+// Leftover settings are warned about once each, before the removal notice.
 func TestLogLegacyTokenStatus_WarnsAboutRemovedSettings(t *testing.T) {
 	core, logs := observer.New(zap.InfoLevel)
 	cfg := &config.Config{
@@ -50,8 +49,7 @@ func TestLogLegacyTokenStatus_WarnsAboutRemovedSettings(t *testing.T) {
 	}
 }
 
-// The /user/* endpoints that used to mint HS256 tokens answer 410 (before any
-// tenant or OIDC gate logic), so an old client gets a clear error.
+// The /user/* endpoints that minted HS256 tokens answer 410 before any tenant or OIDC gate.
 func TestAuthProvider_RemovedLegacyUserRoutes_Answer410(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := memory.NewStore()

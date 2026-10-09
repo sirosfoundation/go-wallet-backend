@@ -24,11 +24,8 @@ type WebAuthnProvider interface {
 	FinishRegistration(ctx context.Context, req *service.FinishRegistrationRequest) (*service.FinishRegistrationResponse, error)
 }
 
-// PasskeyHandlers provides the AS wrappers around the existing WebAuthnService.
-// On successful authentication, they create an AS session and set the session
-// cookie; the response body carries no token (access tokens come from
-// /auth/token). The routes are only reachable with X-Token-Mode: session
-// (see sessionModeGate).
+// PasskeyHandlers wraps WebAuthnService: on success they create an AS session and set its cookie;
+// the body carries no token (see /auth/token). Routes require X-Token-Mode: session (sessionModeGate).
 type PasskeyHandlers struct {
 	webauthn WebAuthnProvider
 	sessions SessionStore

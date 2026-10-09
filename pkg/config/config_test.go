@@ -2678,10 +2678,7 @@ func writeLoadConfig(t *testing.T, yamlText string) string {
 
 const minimalLoadConfig = "server:\n  rp_id: localhost\n  rp_origin: http://localhost:8080\njwt:\n  secret: test-secret-that-is-at-least-32-bytes!\n"
 
-// The legacy AS was removed: a deployment that still asks for it
-// (as.legacy.enabled=true, in YAML or via the environment) must fail to start
-// with a clear error instead of silently running without the legacy tokens it
-// expects.
+// as.legacy.enabled=true (YAML or environment) must fail startup with a clear error.
 func TestLoad_LegacyEnabledTrueIsRefused(t *testing.T) {
 	t.Run("yaml", func(t *testing.T) {
 		_, err := Load(writeLoadConfig(t, minimalLoadConfig+"as:\n  legacy:\n    enabled: true\n"))
@@ -2698,8 +2695,7 @@ func TestLoad_LegacyEnabledTrueIsRefused(t *testing.T) {
 	})
 }
 
-// as.legacy.enabled=false (the old sunset switch) and the other removed keys
-// still load, and are reported by DeprecatedSettings so the process warns.
+// as.legacy.enabled=false and the other removed keys still load and are reported by DeprecatedSettings.
 func TestLoad_RemovedLegacySettingsLoadAndAreReported(t *testing.T) {
 	cfg, err := Load(writeLoadConfig(t, minimalLoadConfig+"  expiry_hours: 48\n  refresh_days: 7\nas:\n  legacy:\n    enabled: false\n    deprecation_header: true\n    sunset_date: \"2027-10-01T00:00:00Z\"\n"))
 	if err != nil {
@@ -2902,8 +2898,7 @@ func TestSSRFGuard_RefusesHTTPSToHTTPRedirect(t *testing.T) {
 	}
 }
 
-// jwt.issuer is only the fallback for as.issuer now; an enabled AS needs one of
-// the two, and nothing else requires jwt.issuer.
+// jwt.issuer is only the fallback for as.issuer; an enabled AS needs one of the two.
 func TestConfig_Validate_JWTIssuerIsOnlyASIssuerFallback(t *testing.T) {
 	t.Run("empty jwt.issuer is fine when the AS is off", func(t *testing.T) {
 		cfg := validBaseConfig()
@@ -3049,8 +3044,8 @@ func TestConfig_EnableForRole_DefaultsAudiencesAndValidates(t *testing.T) {
 
 // chartShapedConfig mirrors what siros-id-stack's templates/04-wallet-backend.yaml
 // renders for backend.yaml: as.enabled true, NO as.audiences, no jwt.issuer,
-// and the old as.legacy.enabled=false sunset switch. config.Load must keep accepting it (documented defaults apply
-// before Validate), otherwise chart-based deployments crash-loop on upgrade.
+// and as.legacy.enabled=false. config.Load must keep accepting it (documented defaults apply before
+// Validate), otherwise chart-based deployments crash-loop on upgrade.
 const chartShapedConfig = `
 server:
   port: 8080

@@ -31,8 +31,7 @@ func TestLogLegacyStatus_NilConfigLogsNothing(t *testing.T) {
 	assert.Equal(t, 0, logs.Len())
 }
 
-// A registry-only process has no legacy AS to report on, but still warns about
-// leftover removed settings it was given (once each).
+// A registry-only process still warns about leftover removed settings (once each).
 func TestLogLegacyStatus_RegistryOnly(t *testing.T) {
 	no := false
 	core, logs := observer.New(zap.InfoLevel)

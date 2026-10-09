@@ -9,10 +9,8 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 )
 
-// TestLegacyHMACTokenRejected proves the removed legacy HMAC token path is
-// really gone end to end: an HS256 appToken signed with jwt.secret, shaped
-// exactly like the ones the legacy AS issued, gets a 401 on protected routes,
-// while the user's AS session token works.
+// TestLegacyHMACTokenRejected: an HS256 appToken signed with jwt.secret gets 401 on protected routes
+// while the AS session token works.
 func TestLegacyHMACTokenRejected(t *testing.T) {
 	h := NewTestHarness(t)
 	user := h.CreateTestUser("Legacy Token User")

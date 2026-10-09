@@ -18,12 +18,8 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
 
-// LegacyEndpointRemoved answers 410 Gone to a request for an endpoint that
-// existed only to mint legacy HMAC session tokens (the /user/*-webauthn-*
-// login and registration endpoints and /user/session/refresh). The legacy AS
-// is gone; the response tells old clients how to migrate. It is kept for one
-// release instead of letting those paths fall through to a bare 404, which
-// would look like a routing or deployment fault.
+// LegacyEndpointRemoved answers 410 Gone for endpoints that only minted legacy HMAC session tokens
+// (/user/*-webauthn-* login/registration and /user/session/refresh), telling old clients how to migrate.
 func LegacyEndpointRemoved() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.AbortWithStatusJSON(410, gin.H{
@@ -52,16 +48,10 @@ type TenantLookup interface {
 //	"token"          (string)           — raw Bearer token
 //	"tokenauth_result" (*claims.Result) — full validation result
 //
-// blacklist, when non-nil, is checked for user-level revocation
-// (IsUserRevoked) after a token validates: per-jti revocation is already
-// enforced *inside* v.Validate itself (the go-tokenauth Validator's own
-// Revocation checker, wired in internal/server/providers.go to the same
-// blacklist), but that checker's interface only takes a jti, not a user_id,
-// so DeleteUser's user-level RevokeUser (#383) would otherwise never be
-// consulted (#391).
+// blacklist, when non-nil, is checked for user-level revocation (IsUserRevoked) after validation:
+// the validator's own Revocation checker only sees a jti, so RevokeUser would otherwise never apply.
 //
-// HMAC (legacy) bearer tokens are never accepted: the validator is built
-// without legacy support, so they fail validation and get a 401.
+// HMAC (legacy) bearer tokens fail validation and get a 401.
 func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Extract Bearer token
@@ -73,8 +63,7 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist
 			return
 		}
 
-		// Validate via go-tokenauth. Per-jti revocation is already checked inside Validate itself (see
-		// this function's doc comment).
+		// Validate via go-tokenauth (per-jti revocation happens inside Validate).
 		result, err := v.Validate(c.Request.Context(), rawToken)
 		if err != nil {
 			logAuthReject(logger, c, "token_validation_failed", zap.Error(err))

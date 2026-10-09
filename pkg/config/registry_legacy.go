@@ -60,13 +60,10 @@ func newLegacyRegistryFile() *legacyRegistryFile {
 //     explicitly in the new `registry:` section (or WALLET_REGISTRY_*) wins,
 //     while keys it leaves unset are still filled from the deprecated
 //     configuration. A warning names every key where both set a value, and
-//     the new value was kept. The old `jwt` block is not used for
-//     validation any more: jwt.require_auth becomes registry.require_auth,
-//     while jwt.secret / jwt.secret_path / jwt.issuer are IGNORED with a loud
-//     warning (the legacy HMAC authorization server is gone, so no HMAC token
-//     is accepted; the secret file is never read). Without as.external_url the
-//     registry then has no way to authenticate anyone, which fails startup in
-//     ValidateRegistry when require_auth is set.
+//     the new value was kept. Of the old `jwt` block only jwt.require_auth is used
+//     (-> registry.require_auth); jwt.secret / jwt.secret_path / jwt.issuer are IGNORED with a
+//     loud warning (the secret file is never read). Without as.external_url, ValidateRegistry
+//     fails startup when require_auth is set.
 //
 // standalone is true when the registry role runs without any backend role; the
 // old server, logging, CORS, TLS and http_client settings then map onto the
@@ -129,12 +126,8 @@ func (c *Config) ApplyLegacyRegistryConfig(path string, standalone bool) ([]stri
 			"configuration set "+strings.Join(conflicts, ", ")+": the new `registry:` values take precedence")
 	}
 
-	// jwt block: auth is now the shared go-tokenauth validator, which accepts
-	// AS-issued ES256 tokens only (JWKS at as.external_url). The old HMAC
-	// secret has nothing left to validate, so it is IGNORED, loudly. Only
-	// jwt.require_auth keeps meaning: it maps to registry.require_auth, and
-	// without as.external_url ValidateRegistry then refuses to start (the
-	// registry would otherwise have no way to authenticate anyone).
+	// jwt block: only jwt.require_auth is kept (-> registry.require_auth; ValidateRegistry then
+	// needs as.external_url). The HMAC secret has nothing left to validate and is IGNORED, loudly.
 	if f.JWT.RequireAuth && !c.registryKeyExplicit([]string{"require_auth"}, "WALLET_REGISTRY_REQUIRE_AUTH") {
 		c.Registry.RequireAuth = true
 		warnings = append(warnings, "deprecated registry jwt.require_auth=true is mapped to registry.require_auth; "+

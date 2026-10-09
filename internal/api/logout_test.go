@@ -65,11 +65,8 @@ func TestHandlers_Logout_NoToken(t *testing.T) {
 	}
 }
 
-// TestHandlers_Logout_ASToken proves the #391 review fix: when the request
-// was authenticated via go-tokenauth (pkg/middleware.TokenAuthMiddleware
-// sets "tokenauth_result" in context, and the raw token is ES256/EdDSA-signed
-// and cannot be re-parsed with a shared secret), Logout blacklists the
-// token's jti, taken from the already-validated result.
+// TestHandlers_Logout_ASToken: when the request was authenticated via go-tokenauth ("tokenauth_result"
+// in context), Logout blacklists the jti from that validated result (the raw token cannot be re-parsed).
 func TestHandlers_Logout_ASToken(t *testing.T) {
 	handlers, router := setupLogoutTestHandlers(t)
 
@@ -97,9 +94,7 @@ func TestHandlers_Logout_ASToken(t *testing.T) {
 	}
 }
 
-// A raw HMAC token left in the context by something other than
-// TokenAuthMiddleware (the removed legacy path used to blacklist it) is never
-// parsed: without a validated tokenauth_result, Logout revokes nothing.
+// A raw HMAC token in the context without a validated tokenauth_result is never parsed: Logout revokes nothing.
 func TestHandlers_Logout_HMACTokenWithoutValidatedResultRevokesNothing(t *testing.T) {
 	handlers, router := setupLogoutTestHandlers(t)
 

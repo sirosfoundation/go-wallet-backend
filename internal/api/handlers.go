@@ -86,15 +86,9 @@ func (h *Handlers) Status(c *gin.Context) {
 
 // Storage handlers - Credentials
 
-// getHolderDID retrieves the canonical holder DID for the authenticated
-// caller. It is always derived from user_id via domain.HolderDID, never
-// trusted from the token's own "did" claim: AS-issued tokens
-// (internal/as/token.go) carry only "sub"/user_id and no "did" claim at all.
-// (The removed legacy HMAC tokens carried did == domain.HolderDID(user_id),
-// and preferring "did" when present once gave the same physical user two
-// holder identities depending on the token type, #384.) Deriving from user_id
-// alone keeps resolving to the value those tokens' "did" claim carried, so
-// credentials stored under it stay reachable.
+// getHolderDID returns the holder DID for the caller, always derived from user_id via
+// domain.HolderDID. AS-issued tokens carry no "did" claim, and trusting one would give
+// a user two holder identities.
 func (h *Handlers) getHolderDID(c *gin.Context) (string, bool) {
 	userID, exists := c.Get("user_id")
 	if !exists {
@@ -593,10 +587,7 @@ func maxConfiguredASTokenTTL(cfg *config.Config) time.Duration {
 	return longest
 }
 
-// Logout invalidates the current session by blacklisting the presented
-// access token's jti. The token was already validated by
-// pkg/middleware.TokenAuthMiddleware, which left the go-tokenauth result in
-// the context; its jti is used directly instead of re-parsing the token.
+// Logout blacklists the jti of the access token TokenAuthMiddleware already validated.
 func (h *Handlers) Logout(c *gin.Context) {
 	v, exists := c.Get("tokenauth_result")
 	if !exists {

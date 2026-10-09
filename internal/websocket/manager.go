@@ -307,33 +307,27 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 	}
 }
 
-// SetTokenValidator makes the handshake validate tokens through the shared
-// go-tokenauth validator (AS-issued ES256/EdDSA session tokens via JWKS).
-// Call before serving connections; without a validator every handshake is
-// refused.
+// SetTokenValidator makes the handshake validate tokens through the shared go-tokenauth validator.
+// Call before serving connections; without one every handshake is refused.
 func (m *Manager) SetTokenValidator(v *tokenvalidator.Validator) {
 	m.tokenValidator = v
 }
 
 func (m *Manager) validateToken(tokenString string) (string, error) {
 	if m.tokenValidator == nil {
-		// No HMAC fallback exists any more: fail closed.
+		// No validator: fail closed.
 		return "", errors.New("no token validator configured")
 	}
 	result, err := m.tokenValidator.Validate(context.Background(), tokenString)
 	if err != nil {
 		return "", err
 	}
-	// The AS audience list (as.audiences) is already enforced by the
-	// validator. The keystore socket is a user-facing surface, so beyond
-	// that the token must carry wallet-backend (as
-	// internal/server/providers.go requires); a registry-only token is
-	// refused.
+	// The validator enforces as.audiences; the keystore socket additionally requires wallet-backend
+	// (registry-only tokens are refused).
 	if !result.HasAudience("wallet-backend") {
 		return "", errors.New("token audience not accepted")
 	}
-	// The keystore socket is per-user: an anonymous (identity-free)
-	// token has nothing to bind to.
+	// Per-user socket: an anonymous token has nothing to bind to.
 	if result.UserID == "" {
 		return "", errors.New("invalid token claims")
 	}

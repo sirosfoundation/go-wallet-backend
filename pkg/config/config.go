@@ -161,10 +161,8 @@ type ASConfig struct {
 	// Default: "rwl" (read, write, list)
 	DefaultMaxTAC string `yaml:"default_max_tac" envconfig:"DEFAULT_MAX_TAC"`
 
-	// Legacy holds the removed as.legacy.* settings. The legacy all-in-one
-	// HMAC authorization server no longer exists; the keys are still parsed
-	// so an existing configuration gets a clear startup message instead of
-	// being silently ignored. See ASLegacyConfig.
+	// Legacy holds the removed as.legacy.* settings; they are still parsed so an existing
+	// configuration gets a clear startup message. See ASLegacyConfig.
 	Legacy ASLegacyConfig `yaml:"legacy" envconfig:"LEGACY"`
 
 	// ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com").
@@ -199,26 +197,17 @@ func (a *ASConfig) ExternalBaseURL() (*url.URL, error) {
 	return u, nil
 }
 
-// ASLegacyConfig holds the REMOVED as.legacy.* settings.
+// ASLegacyConfig holds the REMOVED as.legacy.* settings, still readable so a leftover configuration
+// is reported rather than silently misread.
 //
-// The legacy all-in-one HMAC authorization server (HS256 appTokens minted by
-// the /user/*-webauthn-* endpoints and by /auth/passkey/* without
-// X-Token-Mode: session) has been deleted, so none of these keys has any
-// effect any more. They are kept readable for one release so that an
-// existing configuration or environment is not silently misread:
-//
-//   - enabled: true (as.legacy.enabled / WALLET_AS_LEGACY_ENABLED) makes
-//     Validate() fail, because the deployment explicitly asked for tokens
-//     that this binary can no longer issue or validate. enabled: false is
-//     accepted and merely reported by DeprecatedSettings.
-//   - deprecation_header and sunset_date are ignored and reported.
+// enabled: true makes Validate() fail (this binary cannot issue or validate legacy tokens);
+// enabled: false, deprecation_header and sunset_date are ignored and reported by DeprecatedSettings.
 //
 // Deprecated: remove the whole as.legacy section; it will be dropped from
 // the configuration schema in a later release.
 type ASLegacyConfig struct {
-	// REMOVED. true makes startup fail (the legacy AS no longer exists); false
-	// (the former sunset switch) is ignored with a startup warning. A pointer so
-	// that "unset" and "explicit false" differ.
+	// REMOVED. true makes startup fail; false is ignored with a startup warning. A pointer so
+	// that unset and explicit false differ.
 	Enabled *bool `yaml:"enabled" envconfig:"ENABLED"`
 
 	// REMOVED and ignored (startup warning).
@@ -228,10 +217,7 @@ type ASLegacyConfig struct {
 	SunsetDate string `yaml:"sunset_date" envconfig:"SUNSET_DATE"`
 }
 
-// rejectLegacyASEnabled refuses a configuration that still asks for the removed
-// legacy HMAC authorization server (as.legacy.enabled=true). A deployment that
-// does must not start and silently serve nothing. Shared by Validate and
-// ValidateRegistry, so every role handles the switch the same way.
+// rejectLegacyASEnabled refuses as.legacy.enabled=true; shared by Validate and ValidateRegistry so every role behaves the same.
 func (c *Config) rejectLegacyASEnabled() error {
 	if c.AS.Legacy.Enabled != nil && *c.AS.Legacy.Enabled {
 		return fmt.Errorf("as.legacy.enabled=true (or WALLET_AS_LEGACY_ENABLED=true) is no longer supported: the legacy HMAC authorization server (HS256 appTokens, /user/*-webauthn-*, jwt.refresh_days refresh tokens) has been removed. " +
@@ -240,10 +226,8 @@ func (c *Config) rejectLegacyASEnabled() error {
 	return nil
 }
 
-// DeprecatedSettings returns the names of settings that are present in the
-// configuration but no longer have any effect, so the process can warn about
-// them at startup. (as.legacy.enabled=true is not listed here: it is refused
-// by Validate.)
+// DeprecatedSettings returns the names of present settings that no longer have any effect, for a
+// startup warning. (as.legacy.enabled=true is refused by Validate instead.)
 func (c *Config) DeprecatedSettings() []string {
 	var out []string
 	if c.AS.Legacy.Enabled != nil && !*c.AS.Legacy.Enabled {
@@ -362,11 +346,9 @@ func (c *Config) applyASSecurityDefaults() {
 	}
 }
 
-// SessionAudiences returns the audiences a token validator must be built
-// with: as.audiences when set, otherwise the documented defaults. Load() fills as.audiences
-// only when the AS is enabled; a process that validates remote-AS tokens
-// without running the AS itself (standalone engine) still needs a non-empty
-// list, because go-tokenauth refuses to validate without one.
+// SessionAudiences returns the audiences a validator must be built with: as.audiences, else the
+// documented defaults. Load() fills as.audiences only when the AS is enabled; a standalone engine
+// still needs a non-empty list because go-tokenauth refuses to validate without one.
 func (c *Config) SessionAudiences() []string {
 	if len(c.AS.Audiences) > 0 {
 		return c.AS.Audiences
@@ -1182,35 +1164,21 @@ type LoggingConfig struct {
 	Format string `yaml:"format" envconfig:"FORMAT"` // json, text
 }
 
-// JWTConfig contains the jwt.* settings.
-//
-// With the legacy HMAC authorization server removed, session tokens are
-// signed by the AS's asymmetric key (as.signing_key_path or
-// as.signing_key_pkcs11) and no jwt.* setting controls their lifetime.
-// What remains:
-//
-//   - Secret / SecretPath: a server-side secret (>= 32 bytes). It no longer
-//     signs or validates any token; it keys the HMAC that binds the OIDC
-//     `state` parameter to the browser (the AS state-binding cookie).
-//   - Issuer: the fallback for as.issuer, the "iss" of AS-issued tokens.
-//
-// ExpiryHours and RefreshDays are removed no-ops (see
-// Config.DeprecatedSettings).
+// JWTConfig contains the jwt.* settings. Session tokens are signed by the AS's asymmetric key, so only
+// Secret (keys the OIDC state-binding cookie HMAC) and Issuer (fallback for as.issuer) matter;
+// ExpiryHours and RefreshDays are removed no-ops (see Config.DeprecatedSettings).
 type JWTConfig struct {
-	// Secret is a server-side secret of at least 32 bytes. It signs and
-	// validates no token; it keys the HMAC that binds the OIDC state parameter
-	// to the browser (the AS state-binding cookie). Required.
+	// Secret is a server-side secret of at least 32 bytes. It keys the HMAC that binds the OIDC
+	// state parameter to the browser (state-binding cookie). Required.
 	Secret string `yaml:"secret" envconfig:"SECRET"`
 	// SecretPath is the path to a file containing the secret (alternative to Secret).
 	SecretPath string `yaml:"secret_path" envconfig:"SECRET_PATH"`
 
-	// REMOVED and ignored (startup warning): the legacy access-token lifetime.
-	// AS token lifetimes are as.default_token_ttl / as.audience_ttls.
+	// REMOVED and ignored (startup warning). AS token lifetimes are as.default_token_ttl / as.audience_ttls.
 	//
 	// Deprecated: no effect.
 	ExpiryHours int `yaml:"expiry_hours" envconfig:"EXPIRY_HOURS"`
-	// REMOVED and ignored (startup warning): legacy HMAC refresh tokens no
-	// longer exist; AS sessions live as.session_ttl.
+	// REMOVED and ignored (startup warning). AS sessions live as.session_ttl.
 	//
 	// Deprecated: no effect.
 	RefreshDays int `yaml:"refresh_days" envconfig:"REFRESH_DAYS"`
@@ -1966,9 +1934,8 @@ func Load(configFile string) (*Config, error) {
 // caller after any deprecated-alias overlay (see ValidateRegistry and
 // ValidateRegistryStandalone).
 func LoadRegistryOnly(configFile string) (*Config, error) {
-	// No secret files are read: the registry validates AS tokens through the
-	// JWKS and has no use for jwt.secret / jwt.secret_path (a deprecated
-	// registry.yaml `jwt` secret is ignored, see ApplyLegacyRegistryConfig).
+	// No secret files are read: the registry validates AS tokens through the JWKS (a deprecated
+	// registry.yaml jwt secret is ignored).
 	return load(configFile, func(*Config) error { return nil }, (*Config).validateRegistryStandaloneServer)
 }
 
@@ -2453,8 +2420,7 @@ func (c *Config) Validate() error {
 		return err
 	}
 
-	// jwt.secret no longer signs or validates any token; it keys the HMAC
-	// that binds the OIDC state parameter to the browser (see JWTConfig).
+	// jwt.secret keys the OIDC state-binding cookie HMAC (see JWTConfig).
 	if c.JWT.Secret == "" {
 		return fmt.Errorf("jwt secret is required (it keys the OIDC state-binding cookie)")
 	}

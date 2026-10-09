@@ -386,9 +386,7 @@ func TestManager_handleFlowStart_AllowsSufficientTAC(t *testing.T) {
 }
 
 // TestManager_handleFlowStart_NoOpWhenTACEmpty is a regression test: an
-// empty session.TAC means "not applicable" (the token carries no TAC claim -
-// see Manager.validateToken), not "no permissions". Such a session must not
-// be blocked from starting any flow.
+// empty session.TAC means no TAC claim, not "no permissions"; such a session must not be blocked.
 func TestManager_handleFlowStart_NoOpWhenTACEmpty(t *testing.T) {
 	m := newManagerWithStubOID4VCIHandler(t)
 
@@ -670,11 +668,8 @@ func TestBaseHandler_CompleteWithRefreshToken(t *testing.T) {
 	assert.Equal(t, "handler-refresh-token-value", received["refresh_token"])
 }
 
-// dialAndHandshakeAsUser dials m's HandleConnection over a real WebSocket
-// connection, completes the handshake for userID with an AS session token
-// (see engineSessionToken), and waits for the session to
-// be registered in m.sessions before returning. This exercises the same
-// path a real client goes through, not a synthetic Session built by hand.
+// dialAndHandshakeAsUser dials m's HandleConnection over a real WebSocket, completes the handshake
+// for userID with an AS session token (engineSessionToken) and waits for the session to be registered.
 // (Named distinctly from keepalive_test.go's dialAndHandshake, which always
 // authenticates as the same fixed user and manages its own Manager/server.)
 func dialAndHandshakeAsUser(t *testing.T, m *Manager, wsURL, userID string) *websocket.Conn {
@@ -1043,15 +1038,11 @@ func TestManager_DeleteByUser_WorksWithoutTokenBlacklistFeature(t *testing.T) {
 	assert.Equal(t, TypeError, msg.Type, "a new handshake for a revoked user must be rejected, not completed")
 }
 
-// engineKeys remembers the signing key of the validator engineSessionToken
-// installs on a Manager, so repeated calls for one Manager sign with the key
-// its validator trusts.
+// engineKeys remembers the signing key of the validator engineSessionToken installs on a Manager.
 var engineKeys sync.Map // *Manager -> *ecdsa.PrivateKey
 
-// engineSessionToken returns an AS-style ES256 session token for userID,
-// installing a go-tokenauth validator (backed by a local JWKS server) on m the
-// first time it is called for that Manager. Handshakes authenticate through
-// the validator only: there is no HMAC fallback.
+// engineSessionToken returns an ES256 session token for userID, installing a JWKS-backed
+// validator on m on first use.
 func engineSessionToken(t *testing.T, m *Manager, userID string) string {
 	t.Helper()
 	_, key, issuer := ensureEngineValidator(t, m)
@@ -1075,8 +1066,7 @@ func ensureEngineValidator(t *testing.T, m *Manager) (*tokenvalidator.Validator,
 	return v, key, issuer
 }
 
-// With no token validator wired the handshake has no way to authenticate, and
-// there is no HMAC fallback: every token is refused (fail closed).
+// With no validator wired every token is refused (fail closed).
 func TestManager_validateToken_NoValidatorFailsClosed(t *testing.T) {
 	m := NewManager(&config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}, zap.NewNop())
 
@@ -1090,8 +1080,7 @@ func TestManager_validateToken_NoValidatorFailsClosed(t *testing.T) {
 	assert.Contains(t, err.Error(), "no token validator")
 }
 
-// An HS256 token signed with jwt.secret - what the removed legacy AS issued -
-// is refused even when a validator is wired.
+// An HS256 token signed with jwt.secret is refused even with a validator wired.
 func TestManager_validateToken_HMACTokenRefused(t *testing.T) {
 	m := NewManager(&config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}, zap.NewNop())
 	v, _, issuer := setupEngineTokenValidatorTest(t)

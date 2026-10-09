@@ -259,12 +259,8 @@ func TestTokenAuthMiddleware_UnknownTenant(t *testing.T) {
 // TestTokenAuthMiddleware_RevokedUserDenied proves the #391 review fix:
 // per-jti revocation is already enforced inside v.Validate itself (via the
 // go-tokenauth Validator's own Revocation checker - see
-// blacklistRevocationChecker in internal/server/providers.go), but that
-// checker only ever sees a jti, never a user_id, so account deletion's
-// bulk user-level revocation (TokenBlacklist.RevokeUser, #383) would
-// otherwise never be consulted for a token validated through this path.
-// TokenAuthMiddleware must check it itself, using the blacklist passed in
-// directly.
+// blacklistRevocationChecker in internal/server/providers.go) sees only a jti, so TokenAuthMiddleware
+// must check user-level revocation (TokenBlacklist.RevokeUser) itself, using the blacklist passed in.
 func TestTokenAuthMiddleware_RevokedUserDenied(t *testing.T) {
 	v, key, issuer := setupTokenAuthTest(t)
 	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{
@@ -522,9 +518,7 @@ func TestLegacyEndpointRemoved(t *testing.T) {
 	}
 }
 
-// The legacy HMAC token path is gone: a well-formed HS256 bearer token, even
-// one signed with the same secret and issuer a legacy deployment used, must
-// be refused with 401 and never reach the handler.
+// A well-formed HS256 bearer token signed with the legacy secret and issuer is refused with 401.
 func TestTokenAuthMiddleware_HMACBearerTokenRejected(t *testing.T) {
 	v, _, issuer := setupTokenAuthTest(t)
 	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{

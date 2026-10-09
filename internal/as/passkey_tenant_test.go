@@ -434,9 +434,7 @@ func TestNewASModule_WiresPasskeyTenantPerimeter(t *testing.T) {
 	}
 }
 
-// Requests without X-Token-Mode: session (the removed legacy flow) must get
-// 410 BEFORE the OIDC gate can answer with an OIDC error; session-mode
-// requests still reach the gate.
+// Requests without X-Token-Mode: session get 410 before the OIDC gate; session-mode requests reach it.
 func TestPasskeyRoutes_SessionModeRequired410BeforeOIDCGate(t *testing.T) {
 	router, store := setupPasskeyTenantTest(t)
 	mustCreateTenant(t, store, &domain.Tenant{

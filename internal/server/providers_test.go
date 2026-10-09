@@ -953,9 +953,7 @@ func walletProviderASConfig(t *testing.T, externalURL string) *config.Config {
 	return cfg
 }
 
-// No as.external_url: there is no JWKS to validate session tokens against and
-// no HMAC fallback, so nothing can authenticate - startup must fail, whether
-// or not as.enabled is set in this process.
+// No as.external_url: nothing can authenticate, so startup must fail whether or not as.enabled is set.
 func TestNewWalletProviderProvider_NoExternalURL_Fails(t *testing.T) {
 	for _, asEnabled := range []bool{true, false} {
 		cfg := walletProviderASConfig(t, "")
@@ -971,8 +969,7 @@ func TestNewWalletProviderProvider_NoExternalURL_Fails(t *testing.T) {
 	}
 }
 
-// The wallet-provider process does not need as.enabled: it validates tokens of
-// an AS running elsewhere (as.external_url).
+// The wallet-provider process validates tokens of a remote AS (as.external_url); it does not need as.enabled.
 func TestNewWalletProviderProvider_ASDisabledLocally_ExternalURL_WiresValidator(t *testing.T) {
 	cfg := walletProviderASConfig(t, "https://as.example.com")
 	cfg.AS.Enabled = false
@@ -1193,9 +1190,7 @@ func TestWIARateLimiter_TripsAfterMaxAttempts(t *testing.T) {
 func TestBackendProvider_Logout_BlacklistSharedAcrossAuthAndStorage(t *testing.T) {
 	logger := zap.NewNop()
 	asKeyPath, _ := writeTestECKeyAndCert(t, t.TempDir(), "as")
-	// The validator fetches the AS JWKS from as.external_url itself, so serve
-	// this process's own router (which carries /auth/.well-known/jwks.json)
-	// on a real listener and point external_url at it.
+	// Serve this process's router (with /auth/.well-known/jwks.json) on a real listener and point external_url at it.
 	var routerRef atomic.Pointer[gin.Engine]
 	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if rt := routerRef.Load(); rt != nil {
@@ -1236,8 +1231,7 @@ func TestBackendProvider_Logout_BlacklistSharedAcrossAuthAndStorage(t *testing.T
 	provider.RegisterRoutes(router)
 	routerRef.Store(router)
 
-	// A real AS-issued session access token, validated through the real
-	// go-tokenauth validator (JWKS fetched over HTTP from jwksSrv).
+	// A real AS session token, validated through the go-tokenauth validator (JWKS fetched from jwksSrv).
 	tokenStr, err := provider.ASModule().TokenIssuer.Issue("user-e2e", "wallet-backend", "default", "rwlid", "urn:siros:acr:passkey")
 	if err != nil {
 		t.Fatalf("issuing an AS token: %v", err)
@@ -1251,8 +1245,7 @@ func TestBackendProvider_Logout_BlacklistSharedAcrossAuthAndStorage(t *testing.T
 		return w
 	}
 
-	// Storage route works before logout (the validator fetches the JWKS
-	// asynchronously, so allow it a moment).
+	// Storage route works before logout (the JWKS loads asynchronously).
 	var w *httptest.ResponseRecorder
 	deadline := time.Now().Add(3 * time.Second)
 	for {
@@ -1266,8 +1259,7 @@ func TestBackendProvider_Logout_BlacklistSharedAcrossAuthAndStorage(t *testing.T
 		t.Fatalf("GET /storage/vc before logout: status = %d, body = %s", w.Code, w.Body.String())
 	}
 
-	// The validator NewBackendProvider builds accepts no HMAC token: one signed
-	// with jwt.secret (what the removed legacy AS issued) is refused.
+	// The validator accepts no HMAC token: one signed with jwt.secret is refused.
 	hmacToken, err := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
 		"iss": cfg.JWT.Issuer, "aud": "wallet-backend", "user_id": "user-e2e", "tenant_id": "default",
 		"jti": "jti-hmac-e2e", "exp": time.Now().Add(time.Hour).Unix(),
@@ -1491,10 +1483,8 @@ func TestNewBackendProvider_WiresASModuleWhenEnabled(t *testing.T) {
 	}
 }
 
-// Every service.Services may open its own wallet-provider PKCS#11 signer
-// (HSM session pool). The combined backend role with the AS enabled must
-// therefore construct exactly two (auth + storage), never a third, unmanaged
-// one for the AS module that nothing would Stop().
+// Each Services may open its own wallet-provider PKCS#11 signer (HSM session pool); the combined
+// backend role with the AS enabled must construct exactly two (auth + storage), none unmanaged.
 func TestNewBackendProvider_ASEnabled_DoesNotBuildExtraServices(t *testing.T) {
 	keyPath, _ := writeTestECKeyAndCert(t, t.TempDir(), "as-signing")
 
@@ -1583,9 +1573,7 @@ func TestBackendProvider_Close_ClosesBothSignerPools(t *testing.T) {
 	}
 }
 
-// With no validator there is no HMAC fallback: the shared auth middleware
-// fails closed with 401 for every request (even one carrying a token), and
-// never reaches the handler.
+// With no validator the shared auth middleware returns 401 for every request and never reaches the handler.
 func TestSessionAuthMiddleware_NoValidatorFailsClosed(t *testing.T) {
 	reached := false
 	r := gin.New()
@@ -1608,10 +1596,7 @@ func TestSessionAuthMiddleware_NoValidatorFailsClosed(t *testing.T) {
 	}
 }
 
-// An HS256 bearer token signed with jwt.secret and carrying the claims the
-// removed legacy AS minted is refused on a real protected route, while a
-// genuine AS token on the same route passes: the validator is built without
-// legacy support.
+// An HS256 token signed with jwt.secret is refused on a protected route while a genuine AS token passes.
 func TestProtectedRoute_HMACBearerRejected_ASTokenAccepted(t *testing.T) {
 	v, key, issuer := setupServerTokenValidatorTest(t)
 	provider := newTestBackendProviderWithValidator(t, v)
@@ -1648,9 +1633,7 @@ func TestProtectedRoute_HMACBearerRejected_ASTokenAccepted(t *testing.T) {
 	}
 }
 
-// The backend role serves protected routes and has only AS session tokens to
-// authenticate them: with as.enabled=false it must refuse to start with a
-// message that says what to do, instead of answering 401 to everything.
+// With as.enabled=false the backend role must refuse to start with an actionable message, not 401 everything.
 func TestRequireSessionAuthMechanism(t *testing.T) {
 	err := requireSessionAuthMechanism(&config.Config{}, "backend")
 	if err == nil || !strings.Contains(err.Error(), "as.enabled") || !strings.Contains(err.Error(), "legacy") {

@@ -118,10 +118,7 @@ func NewASModule(
 	// Passkey handlers.
 	passkeyHandler := NewPasskeyHandlers(webauthnSvc, sessions, cfg, logger)
 
-	// OIDC handlers. The state-binding cookie (go-wallet-backend#385) is keyed
-	// by jwt.secret (its only use now that legacy HMAC tokens are gone);
-	// pkg/config.Config.Validate already requires it to be present and >=32
-	// bytes.
+	// OIDC handlers; the state-binding cookie is keyed by jwt.secret (validated >=32 bytes).
 	oidcHandler := NewOIDCHandlers(store, sessions, cfg, []byte(jwtCfg.Secret), httpClient, logger)
 
 	// Shared cache of OIDC validators for the passkey gate (see
@@ -313,11 +310,8 @@ func (m *ASModule) Close() error {
 	return m.KeyManager.Close()
 }
 
-// newPKCS11KeyManager builds a KeyManager from an HSM signer, refusing key
-// types the PKCS#11 backend cannot sign with. The pinned pkcs11pool signer
-// handles only CKK_EC (P-256/P-384 here) and CKK_RSA; Ed25519 tokens use
-// CKK_EC_EDWARDS and RSA is not an AS algorithm, so only ECDSA is accepted.
-// This is checked on the key's actual type (the config carries no algorithm).
+// newPKCS11KeyManager builds a KeyManager from an HSM signer, accepting only ECDSA keys
+// (checked on the actual key type; the config carries no algorithm).
 func newPKCS11KeyManager(signer crypto.Signer) (*KeyManager, error) {
 	if signer == nil {
 		return nil, fmt.Errorf("as: pkcs11 signing key: nil signer")

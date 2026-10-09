@@ -347,19 +347,14 @@ func (c *RegistryConfig) Validate() error {
 // carry to be accepted by the registry role.
 const RegistryAudience = "wallet-registry"
 
-// ValidateRegistry validates everything the registry role needs from the
-// backend configuration: the registry section itself and, when
-// registry.require_auth is true, the as.* fields used to build the shared
-// go-tokenauth validator. It is meaningful whether or not the auth role runs in
-// the same process (as.enabled may be false: the registry then only validates
-// tokens issued by a remote authorization server).
+// ValidateRegistry validates what the registry role needs from the backend configuration: the
+// registry section and, with registry.require_auth, the as.* fields for the shared go-tokenauth
+// validator. It applies whether or not the AS runs in this process (as.enabled may be false).
 //
-// The registry accepts AS-issued ES256 tokens only, validated through the AS
-// JWKS (<as.external_url>/auth/.well-known/jwks.json). The legacy HMAC
-// authorization server is gone, so as.legacy.enabled=true is refused exactly as
-// Config.Validate refuses it (registry-only processes do not run Validate), and
-// a deprecated registry.yaml `jwt` secret is ignored with a warning (see
-// ApplyLegacyRegistryConfig).
+// The registry accepts AS-issued ES256 tokens only, validated through
+// <as.external_url>/auth/.well-known/jwks.json. as.legacy.enabled=true is refused as in
+// Config.Validate (registry-only processes do not run it), and a deprecated registry.yaml `jwt`
+// secret is ignored with a warning (see ApplyLegacyRegistryConfig).
 func (c *Config) ValidateRegistry() error {
 	if err := c.rejectLegacyASEnabled(); err != nil {
 		return err

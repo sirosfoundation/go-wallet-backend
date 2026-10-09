@@ -51,9 +51,8 @@ func (anyTenant) GetByID(_ context.Context, id domain.TenantID) (*domain.Tenant,
 // AuthMiddlewares returns the authentication middleware chain for the
 // registry routes.
 //
-// Audience rule: tokens must carry the "wallet-registry" audience. Legacy HMAC
-// tokens no longer exist (the legacy AS was removed), so only AS-issued ES256
-// tokens validated through the AS JWKS are accepted.
+// Audience rule: tokens must carry the "wallet-registry" audience; only AS-issued ES256 tokens
+// validated through the AS JWKS are accepted.
 //
 // After a successful validation the context has AuthenticatedKey=true and,
 // when the token has a tenant_id claim, TenantIDKey set to it.

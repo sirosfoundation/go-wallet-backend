@@ -345,8 +345,7 @@ func TestApplyLegacyRegistryConfig_FileMappingStandalone(t *testing.T) {
 	assert.Equal(t, "debug", c.Logging.Level)
 	assert.Equal(t, "text", c.Logging.Format)
 
-	// the jwt block's HMAC secret and issuer are IGNORED (no legacy HS256
-	// validation exists any more), with a loud warning
+	// the jwt block's HMAC secret and issuer are IGNORED, with a loud warning
 	assert.Empty(t, c.JWT.Secret)
 	assert.Equal(t, "wallet-backend", c.JWT.Issuer, "old jwt.issuer is not adopted")
 	assert.Equal(t, "", c.AS.Issuer)
@@ -370,9 +369,8 @@ func TestApplyLegacyRegistryConfig_CombinedIgnoresServerAndJWT(t *testing.T) {
 	assert.Contains(t, strings.Join(w, "\n"), "jwt` block (secret, secret_path, issuer) is IGNORED")
 }
 
-// A deployment whose old registry.yaml enforced HMAC auth (jwt.require_auth)
-// has nothing left to validate tokens with unless as.external_url is set:
-// startup must fail rather than serve a registry nobody can authenticate to.
+// A registry.yaml with jwt.require_auth needs as.external_url: startup must fail rather than
+// serve a registry nobody can authenticate to.
 func TestApplyLegacyRegistryConfig_RequireAuthWithoutExternalURLFailsStartup(t *testing.T) {
 	p := writeFile(t, t.TempDir(), "registry.yaml", legacyRegistryYAML)
 	c := defaultConfig()
@@ -388,9 +386,7 @@ func TestApplyLegacyRegistryConfig_RequireAuthWithoutExternalURLFailsStartup(t *
 	assert.Empty(t, c.JWT.Secret)
 }
 
-// The old secret file is never read: its content has no use any more, so a
-// missing or unreadable file must not fail startup, and the secret is not
-// adopted.
+// The old secret file is never read: a missing or unreadable file must not fail startup.
 func TestApplyLegacyRegistryConfig_SecretPathIgnored(t *testing.T) {
 	dir := t.TempDir()
 	sp := writeFile(t, dir, "secret", "  0123456789abcdef0123456789abcdef\n")
@@ -708,8 +704,7 @@ func TestLoadRegistryOnly_IgnoresBackendOnlySecretFiles(t *testing.T) {
 	assert.Empty(t, cfg.JWT.Secret)
 }
 
-// as.legacy.enabled=true is refused by a registry-only process exactly as by
-// the full backend load (Validate): same switch, same behaviour in every role.
+// as.legacy.enabled=true is refused by a registry-only process as by Validate.
 func TestRegistryOnly_LegacyEnabledRefusedLikeBackend(t *testing.T) {
 	dir := t.TempDir()
 	p := writeFile(t, dir, "c.yaml", "as:\n  legacy:\n    enabled: true\n")
@@ -733,9 +728,7 @@ func TestApplyLegacyRegistryConfig_CombinedDoesNotReadOldSecretFile(t *testing.T
 	require.NoError(t, err)
 }
 
-// The old jwt.issuer is not adopted: it named the issuer of HMAC tokens, which
-// no longer exist; the expected issuer is as.issuer (fallback jwt.issuer of the
-// backend config).
+// The old jwt.issuer is not adopted; the expected issuer is as.issuer (fallback: backend jwt.issuer).
 func TestApplyLegacyRegistryConfig_IssuerNotAdopted(t *testing.T) {
 	p := writeFile(t, t.TempDir(), "registry.yaml", "jwt:\n  secret: \"0123456789abcdef0123456789abcdef\"\n  issuer: legacy-issuer\n")
 	c := defaultConfig()

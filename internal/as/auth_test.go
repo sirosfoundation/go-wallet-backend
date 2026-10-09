@@ -158,8 +158,7 @@ func TestSessionAuth_SessionButNoAccessToken(t *testing.T) {
 	}
 }
 
-// A bearer access token without the session cookie that minted it is not
-// enough: there is no cookie-less (HMAC or otherwise) bearer path any more.
+// A bearer access token without the session cookie that minted it is refused.
 func TestSessionAuth_BearerWithoutSessionCookieRejected(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	tokenIssuer, store := setupSessionAuth(t)

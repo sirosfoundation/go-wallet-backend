@@ -144,10 +144,8 @@ func TestNewASModule_WiresBlacklistAndRegistersRoutes(t *testing.T) {
 	}
 }
 
-// A legacy HMAC token (HS256 signed with jwt.secret, iss = jwt.issuer, the
-// shape the removed legacy AS issued) must not authenticate anything through
-// the session auth middleware wired from a real ASModule, with or without the
-// session cookie.
+// A legacy HMAC token (HS256, jwt.secret, jwt.issuer) must not authenticate through the
+// session auth middleware of a real ASModule, with or without the session cookie.
 func TestNewASModule_LegacyHMACBearerRejected(t *testing.T) {
 	dir := t.TempDir()
 	keyPath := writeTestSigningKey(t, dir)

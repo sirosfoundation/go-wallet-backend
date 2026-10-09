@@ -50,11 +50,8 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to load backend configuration: %v", err)
 		}
-		// The backend role serves protected routes and AS-issued session
-		// tokens are its only authentication mechanism (the legacy HMAC
-		// path was removed), so it turns the AS on exactly like the auth
-		// role does; an explicit as.enabled: false is still honoured and
-		// makes the backend refuse to start with a clear error.
+		// The backend role's only authentication is AS session tokens, so it enables the AS
+		// like the auth role; an explicit as.enabled: false makes startup fail.
 		if roles.Has(modes.RoleAuth) || roles.Has(modes.RoleBackend) {
 			backendCfg.EnableForRole()
 			// EnableForRole mutates the already-validated config (e.g.
@@ -119,8 +116,7 @@ func main() {
 		zap.Bool("pkcs11_supported", signing.PKCS11Supported),
 	)
 
-	// Every process that loaded the backend config logs that the legacy AS is
-	// gone and warns about leftover settings, whatever its roles, exactly once.
+	// Logged once per process, whatever its roles.
 	logLegacyStatus(backendCfg, registryCfg, logger)
 
 	// Security configuration validation for production environments
@@ -295,9 +291,7 @@ func main() {
 		if backendProvider != nil && backendProvider.TokenValidator() != nil {
 			provider.SetTokenValidator(backendProvider.TokenValidator())
 		}
-		// Standalone engine (no backend provider): build a JWKS-backed
-		// validator so session tokens work (there is no HMAC fallback to
-		// authenticate the handshake otherwise).
+		// Standalone engine: a JWKS-backed validator is the only way to authenticate handshakes.
 		if backendProvider == nil {
 			sv, err := server.NewStandaloneEngineTokenValidator(backendCfg, logger)
 			if err != nil {
@@ -457,10 +451,8 @@ func loggingConfig(backendCfg, registryCfg *config.Config) *logging.Config {
 	return &logging.Config{Level: src.Logging.Level, Format: src.Logging.Format}
 }
 
-// logLegacyStatus logs that the legacy HMAC AS was removed, and warns about
-// leftover settings, once for a process that loaded the backend config. A
-// registry-only process (no backend config) has no legacy AS to report on, but
-// still warns about leftover as.legacy.* / jwt.* settings it was given.
+// logLegacyStatus logs the legacy AS removal and warns about leftover as.legacy.* / jwt.*
+// settings. A registry-only process warns about the settings it was given.
 func logLegacyStatus(backendCfg, registryCfg *config.Config, logger *zap.Logger) {
 	if backendCfg != nil {
 		server.LogLegacyTokenStatus(backendCfg, logger)

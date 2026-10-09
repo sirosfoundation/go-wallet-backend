@@ -38,11 +38,8 @@ var (
 // pkg/middleware.TokenBlacklistChecker's shape; *service.TokenBlacklist
 // satisfies this.
 //
-// validateToken relies on the shared *tokenvalidator.Validator (see
-// SetTokenValidator) already having its own per-jti Revocation checker wired
-// to the same blacklist instance (see
-// internal/server.blacklistRevocationChecker) - this field only adds the
-// user-level check that checker's interface can't express.
+// validateToken relies on the shared Validator's own per-jti Revocation checker; this field
+// adds only the user-level check that checker's interface can't express.
 type TokenBlacklistChecker interface {
 	IsBlacklisted(ctx context.Context, jti string) bool
 	IsUserRevoked(ctx context.Context, userID string) bool
@@ -85,10 +82,8 @@ type Session struct {
 	ID       string
 	UserID   string
 	TenantID string
-	// TAC is the token's TAC claim - see Manager.validateToken. An empty TAC
-	// means "not applicable" (a token carrying no TAC claim), not "no
-	// permissions" - handleFlowStart's per-protocol check must treat it as a
-	// no-op.
+	// TAC is the token's TAC claim. Empty means no TAC claim, not "no permissions":
+	// handleFlowStart skips the check.
 	TAC     claims.TAC
 	conn    *websocket.Conn
 	sendMu  sync.Mutex
@@ -602,8 +597,7 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	}
 
 	// TAC check: only enforced when the session actually has a TAC to check
-	// (empty means the token carries no TAC claim - see
-	// Manager.validateToken - not "no permissions").
+	// (empty means the token carries no TAC claim, not "no permissions").
 	if session.TAC != "" {
 		if required, ok := requiredTACForProtocol[msg.Protocol]; ok && !session.TAC.HasAll(required) {
 			_ = session.SendFlowError(flowID, "", ErrCodeForbidden, "insufficient permissions for protocol: "+string(msg.Protocol))
@@ -783,10 +777,8 @@ func (m *Manager) unregisterSession(session *Session) {
 	session.logger.Info("Session closed", zap.String("session_id", session.ID))
 }
 
-// validateToken authenticates tokenString and returns its identity. Only
-// AS-issued asymmetric session tokens validated by the go-tokenauth validator
-// are accepted; there is no HMAC fallback, so with no validator wired (see
-// SetTokenValidator) every handshake is refused (fail closed).
+// validateToken authenticates tokenString and returns its identity. Only tokens accepted by the
+// go-tokenauth validator are allowed; with none wired (SetTokenValidator) every handshake is refused.
 //
 // ctx is the handshake-scoped context and is passed to every validator and
 // revocation lookup. If it is already done, validation fails closed (a
@@ -803,19 +795,12 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 	if err != nil {
 		return "", "", "", err
 	}
-	// The engine transport, like the AuthZEN proxy, only needs a
-	// wallet-registry or wallet-backend audience - never a broader one.
+	// The engine transport needs a wallet-registry or wallet-backend audience, nothing broader.
 	if !result.HasAudience("wallet-registry", "wallet-backend") {
 		return "", "", "", errors.New("token audience not permitted for engine transport")
 	}
-	// Per-jti revocation is already enforced inside Validate itself (the
-	// shared Validator's own Revocation checker - see
-	// internal/server.blacklistRevocationChecker); user-level revocation
-	// is not, since that checker's interface only ever sees a jti (see
-	// #391 review, round 2). Checked against both the optional
-	// TokenBlacklist feature and the engine's own always-on
-	// revokedUsers (#403) - either one saying revoked is enough to
-	// reject.
+	// Per-jti revocation happens inside Validate; user-level revocation does not (the checker only
+	// sees a jti), so check the optional TokenBlacklist and the engine's own revokedUsers (#403).
 	if (m.blacklist != nil && m.blacklist.IsUserRevoked(ctx, result.UserID)) || m.isUserRevoked(result.UserID) {
 		return "", "", "", errors.New("token has been revoked")
 	}

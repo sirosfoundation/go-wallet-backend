@@ -67,7 +67,7 @@ func wsES256Aud(t *testing.T, key *ecdsa.PrivateKey, sub string, exp time.Durati
 	return raw
 }
 
-// wsHMAC signs an HS256 token the way the removed legacy AS did.
+// wsHMAC signs an HS256 token (what the legacy AS issued).
 func wsHMAC(t *testing.T, secret string) string {
 	t.Helper()
 	s, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
@@ -102,8 +102,7 @@ func TestManager_validateToken(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// The legacy HMAC AS is gone: an HS256 token - whatever its secret, issuer or
-// audience - is refused, with a validator wired or not.
+// An HS256 token is refused whatever its secret, issuer or audience, with a validator wired or not.
 func TestManager_validateToken_HMACRefused(t *testing.T) {
 	v, key := wsValidator(t)
 	m := NewManager(&config.Config{JWT: config.JWTConfig{Secret: wsHMACSecret, Issuer: "as"}}, zap.NewNop())

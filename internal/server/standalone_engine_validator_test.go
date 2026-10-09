@@ -47,8 +47,7 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 		require.NoError(t, err)
 		return raw
 	}()
-	// What the removed legacy AS issued: HS256 signed with jwt.secret, with
-	// jwt.issuer as iss and the RP ID as aud.
+	// HS256 signed with jwt.secret, jwt.issuer as iss and the RP ID as aud.
 	hm, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"user_id": "u", "tenant_id": "t", "iss": "legacy", "aud": "rp.example",
 		"exp": time.Now().Add(time.Hour).Unix(),

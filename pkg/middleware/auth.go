@@ -12,10 +12,7 @@ import (
 )
 
 // TokenBlacklistChecker is an interface for checking if a token is
-// blacklisted, either individually by jti (e.g. an explicit logout) or in
-// bulk for every token belonging to a user (e.g. an account deletion, which
-// has no way to enumerate every jti it ever issued - see
-// TokenBlacklist.RevokeUser).
+// blacklisted, either individually by jti or in bulk for every token of a user (TokenBlacklist.RevokeUser).
 type TokenBlacklistChecker interface {
 	IsBlacklisted(ctx context.Context, jti string) bool
 	IsUserRevoked(ctx context.Context, userID string) bool

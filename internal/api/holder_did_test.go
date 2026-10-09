@@ -17,10 +17,8 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
-// legacyAuthContext mimics an authentication that sets both "did" and
-// "user_id" in the gin context, with did == domain.HolderDID(userID): what the
-// removed legacy HMAC tokens carried. Credentials stored under that did must
-// stay reachable via user_id alone.
+// legacyAuthContext sets both "did" (== domain.HolderDID(userID)) and "user_id";
+// credentials stored under that did must stay reachable via user_id alone.
 func legacyAuthContext(userID string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		c.Set("user_id", userID)
@@ -39,9 +37,8 @@ func asAuthContext(userID string) gin.HandlerFunc {
 	}
 }
 
-// TestGetHolderDID_ConsistentAcrossTokenTypes proves #384 is fixed: the same
-// physical user resolves to the same holder DID whether they authenticated
-// with a token that sets "did" (as the removed legacy HMAC tokens did) or an AS-issued token (which only
+// TestGetHolderDID_ConsistentAcrossTokenTypes: the same user gets the same holder DID with a token
+// that sets "did" or an AS-issued token (which only sets "user_id").
 // ever sets "user_id").
 func TestGetHolderDID_ConsistentAcrossTokenTypes(t *testing.T) {
 	handlers, _ := setupTestHandlers(t)
