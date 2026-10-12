@@ -23,6 +23,7 @@ Environment variables use the prefix `WALLET_` (the registry role's settings are
 - [authzen_proxy](#authzen_proxy)
 - [audit](#audit)
 - [presentation](#presentation)
+- [user](#user)
 - [registry](#registry)
 
 ---
@@ -293,6 +294,14 @@ Environment prefix: `WALLET_PRESENTATION`
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
 | `presentation.dcql_consent_check` | `WALLET_PRESENTATION_DCQL_CONSENT_CHECK` | DCQLConsentCheckMode | DCQLConsentCheck compares the user's consent (selected credential query ids and disclosed claims) with the DCQL query the backend sent to the client, before any signing. The frontend is not trusted to have honoured the query. Values: `off` (no check); `warn` (default: log a warning with the reason class and query id, never refuse; claim-path matching can disagree with a real verifier's notion of a path, so a deployer opts into enforcement); `enforce` (refuse with PRESENTATION_ERROR and answer the verifier access_denied, without signing). Nothing about claim names or values is logged. Not enforced: credential_sets satisfaction (only that no query outside every option is selected), `values` constraints, and the contents of the resulting vp_token. Unknown values fail at startup. Env: WALLET_PRESENTATION_DCQL_CONSENT_CHECK |
+
+## user
+
+Environment prefix: `WALLET_USER`
+
+| YAML Key | Env Variable | Type | Description |
+|----------|-------------|------|-------------|
+| `user.delete.require_step_up` | `WALLET_USER_DELETE_REQUIRE_STEP_UP` | boolean | RequireStepUp refuses the bodyless DELETE /user/session with 401 STEP_UP_REQUIRED, so that every deletion carries a fresh passkey assertion minted by POST /user/session/delete-begin. Default: false (the bodyless request still works) for one release so that clients can move first; the default will then become true. Env: WALLET_USER_DELETE_REQUIRE_STEP_UP |
 
 ## registry
 

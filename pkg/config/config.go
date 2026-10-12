@@ -34,6 +34,7 @@ type Config struct {
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
 	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
 	Presentation   PresentationConfig   `yaml:"presentation" envconfig:"PRESENTATION"`
+	User           UserConfig           `yaml:"user" envconfig:"USER"`
 
 	// Registry configures the VCTM registry role (--mode=registry). It
 	// replaces the retired standalone registry configuration file
@@ -2702,6 +2703,22 @@ func (c *ServerConfig) ResolvedServedBy() string {
 		return h
 	}
 	return *c.ServedByHeader
+}
+
+// UserConfig configures self-service user operations.
+type UserConfig struct {
+	Delete UserDeleteConfig `yaml:"delete" envconfig:"DELETE"`
+}
+
+// UserDeleteConfig configures DELETE /user/session (account deletion).
+type UserDeleteConfig struct {
+	// RequireStepUp refuses the bodyless DELETE /user/session with 401
+	// STEP_UP_REQUIRED, so that every deletion carries a fresh passkey
+	// assertion minted by POST /user/session/delete-begin. Default: false
+	// (the bodyless request still works) for one release so that clients can
+	// move first; the default will then become true.
+	// Env: WALLET_USER_DELETE_REQUIRE_STEP_UP
+	RequireStepUp bool `yaml:"require_step_up" envconfig:"REQUIRE_STEP_UP"`
 }
 
 // AuditConfig configures the SET (Security Event Token) audit trail emitter.

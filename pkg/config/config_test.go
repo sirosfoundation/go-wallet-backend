@@ -2721,6 +2721,12 @@ func TestConfig_Validate_Audit_IdentityEvents(t *testing.T) {
 	}
 }
 
+func TestUserDeleteConfig_RequireStepUpDefaultsOff(t *testing.T) {
+	if (Config{}).User.Delete.RequireStepUp {
+		t.Error("require_step_up must default to false")
+	}
+}
+
 // A trusted IdP host may resolve to a private address (#349); an unlisted
 // host, and the cloud metadata endpoints, may not.
 func TestGuardedDial_TrustedHostMayBePrivate(t *testing.T) {

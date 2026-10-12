@@ -41,6 +41,9 @@ func (s *WebAuthnService) BeginDeleteAccountStepUp(ctx context.Context, userID d
 	if err != nil {
 		return nil, err
 	}
+	if err := refuseIfCutOff(ctx, user); err != nil {
+		return nil, err
+	}
 	if len(user.WebauthnCredentials) == 0 {
 		return nil, ErrCredentialNotFound
 	}

@@ -1,8 +1,11 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -1071,11 +1074,121 @@ func (h *Handlers) Logout(c *gin.Context) {
 	c.JSON(200, gin.H{"message": "Logged out successfully"})
 }
 
-// DeleteUser deletes the current user and all associated data
+// deleteAccountConfirmation is the text the caller must send in `confirm`.
+const deleteAccountConfirmation = "DELETE"
+
+// maxDeleteAccountBody bounds the step-up request body.
+const maxDeleteAccountBody = 1 << 20
+
+// Error codes of the account-deletion step-up.
+const (
+	errCodeStepUpRequired       = "STEP_UP_REQUIRED"
+	errCodeStepUpFailed         = "STEP_UP_FAILED"
+	errCodeStepUpExpired        = "STEP_UP_EXPIRED"
+	errCodeConfirmationRequired = "CONFIRMATION_REQUIRED"
+	errCodeNoPasskey            = "NO_PASSKEY"
+)
+
+// deleteAccountRequest is the body of DELETE /user/session.
+type deleteAccountRequest struct {
+	ChallengeID string          `json:"challengeId"`
+	Credential  json.RawMessage `json:"credential"`
+	Confirm     string          `json:"confirm"`
+}
+
+// BeginDeleteAccount returns WebAuthn assertion options, restricted to the
+// caller's own passkeys, whose assertion authorises DELETE /user/session.
+func (h *Handlers) BeginDeleteAccount(c *gin.Context) {
+	if h.services.WebAuthn == nil {
+		c.JSON(503, gin.H{"error": "WebAuthn not available"})
+		return
+	}
+	userID, exists := c.Get("user_id")
+	if !exists {
+		c.JSON(401, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	resp, err := h.services.WebAuthn.BeginDeleteAccountStepUp(c.Request.Context(), domain.UserIDFromString(userID.(string)))
+	if err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
+		switch {
+		case errors.Is(err, storage.ErrNotFound):
+			c.JSON(404, gin.H{"error": "User not found"})
+		case errors.Is(err, service.ErrCredentialNotFound):
+			c.JSON(400, gin.H{"error": errCodeNoPasskey, "message": "the account has no passkey to confirm the deletion with"})
+		default:
+			h.logger.Error("Failed to begin account deletion step-up", zap.Error(err))
+			c.JSON(500, gin.H{"error": "Failed to start account deletion"})
+		}
+		return
+	}
+	c.JSON(200, resp)
+}
+
+// requireDeleteStepUp authorises an account deletion. It answers and returns
+// false unless the request carries a verified step-up assertion (or is the
+// legacy bodyless request and the flag still allows it). The body is
+// authoritative: a non-empty body never falls back to the legacy path.
+func (h *Handlers) requireDeleteStepUp(c *gin.Context, userID domain.UserID) bool {
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxDeleteAccountBody))
+	if err != nil {
+		c.JSON(400, gin.H{"error": errCodeStepUpFailed, "message": "the request body could not be read"})
+		return false
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		if h.cfg.User.Delete.RequireStepUp {
+			c.JSON(401, gin.H{
+				"error":   errCodeStepUpRequired,
+				"message": "deleting the account requires a fresh passkey assertion: call POST /user/session/delete-begin and send the result with the confirmation",
+			})
+			return false
+		}
+		return true
+	}
+
+	var req deleteAccountRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		c.JSON(401, gin.H{"error": errCodeStepUpFailed, "message": "the step-up request is malformed"})
+		return false
+	}
+	// A mistyped confirmation does not burn the assertion.
+	if req.Confirm != deleteAccountConfirmation {
+		c.JSON(400, gin.H{"error": errCodeConfirmationRequired, "message": `set "confirm" to "DELETE" to delete the account`})
+		return false
+	}
+	if h.services.WebAuthn == nil {
+		c.JSON(503, gin.H{"error": "WebAuthn not available"})
+		return false
+	}
+
+	if err := h.services.WebAuthn.VerifyDeleteAccountStepUp(c.Request.Context(), userID, req.ChallengeID, req.Credential); err != nil {
+		switch {
+		case errors.Is(err, service.ErrChallengeExpired):
+			c.JSON(410, gin.H{"error": errCodeStepUpExpired, "message": "the step-up assertion expired; start again with POST /user/session/delete-begin"})
+		case errors.Is(err, service.ErrStepUpFailed):
+			c.JSON(401, gin.H{"error": errCodeStepUpFailed, "message": "the step-up assertion was not accepted; start again with POST /user/session/delete-begin"})
+		default:
+			h.logger.Error("Account deletion step-up failed", zap.Error(err))
+			c.JSON(500, gin.H{"error": "Failed to verify step-up"})
+		}
+		return false
+	}
+	return true
+}
+
+// DeleteUser deletes the current user and all associated data. With
+// user.delete.require_step_up it needs a verified step-up assertion and the
+// typed confirmation (see requireDeleteStepUp).
 func (h *Handlers) DeleteUser(c *gin.Context) {
 	userID, exists := c.Get("user_id")
 	if !exists {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
+		return
+	}
+	if !h.requireDeleteStepUp(c, domain.UserIDFromString(userID.(string))) {
 		return
 	}
 

@@ -3,6 +3,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -183,7 +184,11 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 			session.POST("/settings", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.UpdateSettings)
 			session.GET("/private-data", requireTACIfEnforced(p.tokenValidator, "r"), p.handlers.GetPrivateData)
 			session.POST("/private-data", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.UpdatePrivateData)
-			session.DELETE("/", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteUser)
+			session.DELETE("/", requireTACUnlessStepUp(p.tokenValidator, "d"), p.handlers.DeleteUser)
+			// Step-up for DELETE /user/session: only mints assertion options, so `w` (it
+			// stores a short-lived challenge) rather than `d`, which a passkey session
+			// (default max TAC `rwl`) never holds.
+			session.POST("/delete-begin", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.BeginDeleteAccount)
 			// Logout: blacklists the caller's own current token (see
 			// api.Handlers.Logout / #382). This handler existed since the
 			// blacklist itself was added but was never actually registered
@@ -208,7 +213,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 			// out behind their last passkey.
 			session.POST("/logout-all", requireTACIfEnforced(p.tokenValidator, "w"), p.handlers.LogoutEverywhere)
 		}
-		protected.DELETE("/user/session", requireTACIfEnforced(p.tokenValidator, "d"), p.handlers.DeleteUser)
+		protected.DELETE("/user/session", requireTACUnlessStepUp(p.tokenValidator, "d"), p.handlers.DeleteUser)
 
 		// Issuer routes
 		issuerGroup := protected.Group("/issuer")
@@ -293,6 +298,37 @@ func requireTACIfEnforced(tv *tokenvalidator.Validator, required string) gin.Han
 		return func(c *gin.Context) { c.Next() }
 	}
 	return middleware.MustHaveTAC(required)
+}
+
+// maxStepUpBody bounds the body requireTACUnlessStepUp buffers.
+const maxStepUpBody = 1 << 20
+
+// requireTACUnlessStepUp is requireTACIfEnforced for a route a verified step-up
+// assertion authorises. A request with a body is the step-up form: the
+// handler must verify the assertion before doing anything (a body never falls
+// back to the bodyless path), so the token's TAC is not consulted. A request
+// without one is the legacy form and still needs the TAC. The body is buffered
+// and restored for the handler.
+func requireTACUnlessStepUp(tv *tokenvalidator.Validator, required string) gin.HandlerFunc {
+	tac := requireTACIfEnforced(tv, required)
+	return func(c *gin.Context) {
+		var body []byte
+		if c.Request.Body != nil {
+			var err error
+			body, err = io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxStepUpBody))
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "request body could not be read"})
+				c.Abort()
+				return
+			}
+		}
+		c.Request.Body = io.NopCloser(bytes.NewReader(body))
+		if len(bytes.TrimSpace(body)) > 0 {
+			c.Next()
+			return
+		}
+		tac(c)
+	}
 }
 
 // =============================================================================
