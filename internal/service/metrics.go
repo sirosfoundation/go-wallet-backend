@@ -102,3 +102,11 @@ var (
 		Help:      "Total number of App Attest verifications that proceeded despite a failed x5c chain check because apple_app_attest_environment=development. Should be zero in production.",
 	})
 )
+
+// Erasure reconciler metrics.
+var reconcilerUsersTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Namespace: "siros",
+	Subsystem: "erasure_reconciler",
+	Name:      "users_total",
+	Help:      "Users examined by the erasure reconciler, by outcome (clean, live, grace, erased, failed).",
+}, []string{"outcome"})

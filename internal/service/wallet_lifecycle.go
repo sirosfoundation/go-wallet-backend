@@ -442,11 +442,7 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	if err != nil {
 		return []error{fmt.Errorf("load user: %w", err)}
 	}
-	// Holder data is keyed by DID, or by user id when there is none.
-	holder := user.DID
-	if holder == "" {
-		holder = userID.String()
-	}
+	holder := holderKey(user, userID)
 	// A failed liveness check counts as live (fail closed).
 	tenants, err := s.userTenants(ctx, userID, tenantID)
 	if err != nil {
@@ -489,6 +485,15 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 			zap.String("user_id", userID.String()), zap.String("tenant_id", string(tenantID)), zap.Error(errors.Join(errs...)))
 	}
 	return errs
+}
+
+// holderKey is the key holder data is stored under: the user's DID, or the
+// user id when there is none.
+func holderKey(user *domain.User, userID domain.UserID) string {
+	if user.DID != "" {
+		return user.DID
+	}
+	return userID.String()
 }
 
 // userTenants lists the tenants holding the user's wallet data (memberships,
