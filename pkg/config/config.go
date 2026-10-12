@@ -1862,7 +1862,20 @@ type TokenBlacklistConfig struct {
 	// CleanupIntervalSeconds is how often to clean up expired blacklist entries
 	// Default: 3600 (1 hour)
 	CleanupIntervalSeconds int `yaml:"cleanup_interval_seconds" envconfig:"CLEANUP_INTERVAL_SECONDS"`
+
+	// Backend selects where revoked access-token jtis and revoked users are
+	// kept: "memory" (per process; lost on restart, not seen by other
+	// replicas) or "storage" (the MongoDB storage backend; shared by all
+	// replicas and survives restarts). Empty means "storage" when
+	// storage.type is mongodb and "memory" otherwise.
+	Backend string `yaml:"backend" envconfig:"BACKEND"`
 }
+
+// Token blacklist backends.
+const (
+	TokenBlacklistBackendMemory  = "memory"
+	TokenBlacklistBackendStorage = "storage"
+)
 
 // SetDefaults sets default values for token blacklist
 func (c *TokenBlacklistConfig) SetDefaults() {
@@ -2371,6 +2384,16 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("sqlite storage is not yet implemented - please use 'memory' or 'mongodb'")
 	default:
 		return fmt.Errorf("invalid storage type: %s (must be memory or mongodb)", c.Storage.Type)
+	}
+
+	switch c.Security.TokenBlacklist.Backend {
+	case "", TokenBlacklistBackendMemory:
+	case TokenBlacklistBackendStorage:
+		if c.Storage.Type != "mongodb" {
+			return fmt.Errorf("security.token_blacklist.backend=storage requires storage.type=mongodb")
+		}
+	default:
+		return fmt.Errorf("invalid security.token_blacklist.backend: %q (must be memory or storage)", c.Security.TokenBlacklist.Backend)
 	}
 
 	if c.Storage.Type == "mongodb" && c.Storage.MongoDB.URI == "" {

@@ -47,6 +47,7 @@ type AuthProvider struct {
 
 // NewAuthProvider creates a new auth route provider
 func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logger, roles []string) *AuthProvider {
+	warnProcessLocalState(cfg, store, logger)
 	services := service.NewServices(store, cfg, logger)
 	services.Start()
 	handlers := api.NewHandlers(services, cfg, logger, roles)

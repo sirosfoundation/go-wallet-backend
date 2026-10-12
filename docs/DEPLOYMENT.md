@@ -558,14 +558,45 @@ cp wallet.db.backup wallet.db
 
 #### Token revocation with several replicas
 
-Token revocation state is held **in memory, per process**: revoked access-token
-JTIs, revoked users (account deletion), single-use refresh-token consumption
-and, since refresh-token family revocation on logout, the revoked
-refresh-token family markers. With one replica a logout or account deletion is
-enforced immediately. With **several replicas, or after a restart**, a
-revocation recorded on one replica is not seen by the others, so for example a
-stolen refresh token can still be exchanged on a replica that never handled
-the logout until the token expires (refresh tokens live `jwt.refresh_days`).
+Revoked access-token JTIs (logout) and revoked users (account deletion) are
+kept in the **revocation store**, selected by
+`security.token_blacklist.backend` (env
+`WALLET_SECURITY_TOKEN_BLACKLIST_BACKEND`):
+
+| Value | Behaviour |
+|-------|-----------|
+| *(empty, default)* | `storage` when `storage.type` is `mongodb`, otherwise `memory` |
+| `storage` | MongoDB. Shared by all replicas and survives restarts. Requires `storage.type: mongodb` (rejected at startup otherwise) |
+| `memory` | Per process. Lost on restart and not seen by other replicas |
+
+The `storage` backend uses two collections in the storage database:
+`revoked_tokens` (`_id` is the JTI, `expires_at` with a TTL index, so entries
+disappear after the token's own expiry; the check compares `expires_at`
+itself because MongoDB's TTL monitor only runs about once a minute) and
+`revoked_users` (one document per revoked user, no TTL: a user revocation is
+permanent). Reads go to the primary and writes use majority write concern,
+so a revocation is seen by the next check on any replica. A secondary-read
+lag is therefore not a concern for these collections.
+
+The store fails closed. If it cannot be reached or set up, token checks
+refuse the request instead of accepting it. A revocation write that fails
+during logout or account deletion is logged as before; those operations
+still complete, so the revocation is missing until the store is back. If
+the store cannot be set up at startup the process still starts, logs an
+error and refuses authenticated requests until restarted.
+
+Switching backend starts with an empty store: revocations recorded in the
+old one are not carried over, so tokens revoked shortly before the switch
+(access tokens live `as.default_token_ttl`, 2 minutes by default) may be
+accepted again until they expire.
+
+Single-use refresh-token consumption and the refresh-token family markers
+written on logout are **still per process** and are not covered by the
+backend setting. With several replicas, or after a restart, a stolen refresh
+token can still be exchanged on a replica that never handled the logout until
+it expires (refresh tokens live `jwt.refresh_days`). Run a single replica for
+the token-issuing role, or route a user's requests to the same replica
+(session affinity), until that state is moved or removed.
 
 `POST /user/session/logout` fails closed: if the refresh-token family cannot
 be revoked it answers `500 {"error":"Failed to revoke session"}` instead of
@@ -573,12 +604,12 @@ be revoked it answers `500 {"error":"Failed to revoke session"}` instead of
 jti is blacklisted only after the family revocation succeeds, so the same
 token still authenticates on the retry.
 
-Until a shared revocation store exists (tracked in #407 / #415), either run a
-single replica for the token-issuing role, or route a user's requests to the
-same replica (session affinity) and accept that a restart forgets revocations.
-The AS session store itself is shared when it is MongoDB-backed, so sessions
-and the recorded refresh-token family survive across replicas; only the
-revocation markers are process-local.
+**Startup warning.** The configuration has no replica count, so a MongoDB
+storage backend is taken as the sign that several replicas are plausible. In
+that case the process logs a warning when `as.session_store` is `memory`
+(AS sessions are per process) or when the token blacklist is enabled with
+`backend: memory`. With in-memory storage nothing is logged: only one
+process is possible.
 
 ### Database Scaling
 
