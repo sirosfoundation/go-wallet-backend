@@ -422,6 +422,11 @@ type WalletInstanceStore interface {
 	// the transition one.
 	DeleteIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding) error
 
+	// ListUsersWithRevokedInstances returns up to limit distinct owners of
+	// revoked instances, in ascending id order, starting after the given id
+	// (zero value for the start); it is the cursor of the erasure reconciler.
+	ListUsersWithRevokedInstances(ctx context.Context, after domain.UserID, limit int) ([]domain.UserID, error)
+
 	// IncrementAttestation atomically increments the attestation count and updates last_attested_at.
 	IncrementAttestation(ctx context.Context, id string) error
 

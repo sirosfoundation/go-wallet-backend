@@ -280,3 +280,52 @@ func TestWalletInstanceStore_Conditional_LegacyRecordWithoutGeneration(t *testin
 	require.ErrorIs(t, wis.UpdateStatusIfUnchanged(ctx, "cond-legacy", "acme", domain.InstanceBinding{Generation: "g"}, domain.InstanceStatusRevoked, "x"), storage.ErrBindingChanged)
 	require.NoError(t, wis.UpdateStatusIfUnchanged(ctx, "cond-legacy", "acme", b, domain.InstanceStatusRevoked, "x"))
 }
+
+func TestWalletInstanceStore_ListUsersWithRevokedInstances(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	wis := store.WalletInstances()
+	seed := func(id, tenant, owner string, status domain.InstanceStatus) {
+		inst := &domain.WalletInstance{ID: id, TenantID: domain.TenantID(tenant), Status: domain.InstanceStatusActive}
+		if owner != "" {
+			u := domain.UserIDFromString(owner)
+			inst.UserID = &u
+		}
+		require.NoError(t, wis.Upsert(ctx, inst))
+		if status != domain.InstanceStatusActive {
+			_, err := store.walletInstances.collection.UpdateOne(ctx, bson.M{"_id": id}, bson.M{"$set": bson.M{"status": status}})
+			require.NoError(t, err)
+		}
+	}
+	rev := domain.InstanceStatusRevoked
+	seed("a1", "t1", "u1", rev)
+	seed("a2", "t2", "u1", rev) // same owner twice: listed once
+	seed("b1", "t1", "u2", domain.InstanceStatusActive)
+	seed("c1", "t1", "u3", rev)
+	seed("d1", "t1", "", rev) // unowned
+	seed("e1", "t1", "u4", rev)
+	seed("f1", "t1", "u5", domain.InstanceStatusLegacySuspended)
+
+	ids := func(after string, limit int) []string {
+		got, err := wis.ListUsersWithRevokedInstances(ctx, domain.UserIDFromString(after), limit)
+		require.NoError(t, err)
+		var out []string
+		for _, id := range got {
+			out = append(out, id.ID)
+		}
+		return out
+	}
+	require.Equal(t, []string{"u1", "u3", "u4"}, ids("", 10))
+	require.Equal(t, []string{"u1", "u3"}, ids("", 2))
+	require.Equal(t, []string{"u4"}, ids("u3", 2))
+	require.Empty(t, ids("u4", 2))
+	require.Empty(t, ids("", 0))
+}
+
+// The cursor filter compares the stored owner document, so it must carry the
+// cursor as a UserID and require a revoked status.
+func TestRevokedAfterFilter(t *testing.T) {
+	f := revokedAfterFilter(domain.UserIDFromString("u1"))
+	require.Equal(t, domain.InstanceStatusRevoked, f["status"])
+	require.Equal(t, bson.M{"$gt": domain.UserIDFromString("u1")}, f["user_id"])
+}

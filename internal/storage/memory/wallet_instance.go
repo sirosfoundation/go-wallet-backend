@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 
@@ -284,4 +285,30 @@ func (s *WalletInstanceStore) DeleteForUser(_ context.Context, id string, tenant
 	}
 	delete(s.data, id)
 	return nil
+}
+
+// ListUsersWithRevokedInstances lists distinct owners of revoked instances in id order after the given id.
+func (s *WalletInstanceStore) ListUsersWithRevokedInstances(_ context.Context, after domain.UserID, limit int) ([]domain.UserID, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	seen := map[string]bool{}
+	for _, instance := range s.data {
+		if instance.Status == domain.InstanceStatusRevoked && instance.UserID != nil && instance.UserID.ID > after.ID {
+			seen[instance.UserID.ID] = true
+		}
+	}
+	ids := make([]string, 0, len(seen))
+	for id := range seen {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	if limit >= 0 && len(ids) > limit {
+		ids = ids[:limit]
+	}
+	out := make([]domain.UserID, len(ids))
+	for i, id := range ids {
+		out[i] = domain.UserIDFromString(id)
+	}
+	return out, nil
 }
