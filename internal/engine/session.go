@@ -51,8 +51,10 @@ var (
 // found to bypass both TokenAuthMiddleware's own user-level check and, for
 // legacy tokens, revocation entirely).
 type TokenBlacklistChecker interface {
-	IsBlacklisted(ctx context.Context, jti string) bool
-	IsUserRevoked(ctx context.Context, userID string) bool
+	// IsBlacklisted and IsUserRevoked return an error when the revocation
+	// store cannot answer; the handshake is then refused.
+	IsBlacklisted(ctx context.Context, jti string) (bool, error)
+	IsUserRevoked(ctx context.Context, userID string) (bool, error)
 
 	// IsFamilyRevoked reports whether sid - a refresh-token family/session
 	// id (see service.WebAuthnService.generateToken's doc comment) - has
@@ -68,6 +70,14 @@ type TokenBlacklistChecker interface {
 // MaxPendingFlowsPerSession limits concurrent flows to prevent DoS.
 // A session cannot start a new flow if it already has this many pending flows.
 const MaxPendingFlowsPerSession = 3
+
+// revocationCheckTimeout bounds a revocation lookup made outside a request
+// context (session registration).
+const revocationCheckTimeout = 5 * time.Second
+
+// errRevocationUnavailable refuses a handshake whose revocation status could
+// not be determined.
+var errRevocationUnavailable = errors.New("token revocation check unavailable")
 
 const (
 	// defaultWSPingInterval/defaultWSPongTimeout are the fallback keepalive
@@ -727,14 +737,31 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 // always caught here (RevokeUser sets revokedUsers before it scans for
 // and closes existing sessions, so there's no ordering to get wrong);
 // registering before it is caught by that same scan.
+//
+// The shared store is consulted before taking sessionsMu: a lookup that
+// reaches a remote store must not stall every other session. The engine's own
+// revokedUsers, which is what orders against RevokeUser, is still checked
+// under the lock.
 func (m *Manager) registerSession(session *Session) bool {
+	if session.UserID != "" && m.blacklist != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), revocationCheckTimeout)
+		revoked, err := m.blacklist.IsUserRevoked(ctx, session.UserID)
+		cancel()
+		if err != nil {
+			m.logger.Error("Session refused: revocation check failed", zap.Error(err))
+			session.closeWithReason("revocation check unavailable")
+			return false
+		}
+		if revoked {
+			session.closeWithReason("account deleted")
+			return false
+		}
+	}
+
 	m.sessionsMu.Lock()
 
 	if session.UserID != "" {
 		revoked := m.isUserRevoked(session.UserID)
-		if !revoked && m.blacklist != nil {
-			revoked = m.blacklist.IsUserRevoked(context.Background(), session.UserID)
-		}
 		if revoked {
 			m.sessionsMu.Unlock()
 			session.closeWithReason("account deleted")
@@ -850,7 +877,17 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 		// TokenBlacklist feature and the engine's own always-on
 		// revokedUsers (#403) - either one saying revoked is enough to
 		// reject.
-		if (m.blacklist != nil && m.blacklist.IsUserRevoked(ctx, result.UserID)) || m.isUserRevoked(result.UserID) {
+		if m.blacklist != nil {
+			revoked, err := m.blacklist.IsUserRevoked(ctx, result.UserID)
+			if err != nil {
+				m.logger.Error("Handshake refused: revocation check failed", zap.Error(err))
+				return "", "", "", errRevocationUnavailable
+			}
+			if revoked {
+				return "", "", "", errors.New("token has been revoked")
+			}
+		}
+		if m.isUserRevoked(result.UserID) {
 			return "", "", "", errors.New("token has been revoked")
 		}
 		// Refresh-token family revocation (#402/#414), legacy-mode tokens
@@ -909,10 +946,22 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 			return "", "", "", errors.New("invalid token claims: missing user_id or uuid")
 		}
 		if m.blacklist != nil {
-			if jti, _ := mapClaims["jti"].(string); jti != "" && m.blacklist.IsBlacklisted(ctx, jti) {
-				return "", "", "", errors.New("token has been revoked")
+			if jti, _ := mapClaims["jti"].(string); jti != "" {
+				revoked, err := m.blacklist.IsBlacklisted(ctx, jti)
+				if err != nil {
+					m.logger.Error("Handshake refused: revocation check failed", zap.Error(err))
+					return "", "", "", errRevocationUnavailable
+				}
+				if revoked {
+					return "", "", "", errors.New("token has been revoked")
+				}
 			}
-			if m.blacklist.IsUserRevoked(ctx, userID) {
+			userRevoked, err := m.blacklist.IsUserRevoked(ctx, userID)
+			if err != nil {
+				m.logger.Error("Handshake refused: revocation check failed", zap.Error(err))
+				return "", "", "", errRevocationUnavailable
+			}
+			if userRevoked {
 				return "", "", "", errors.New("token has been revoked")
 			}
 			// Refresh-token family revocation (#402/#414) - see the

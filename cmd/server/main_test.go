@@ -236,6 +236,8 @@ func TestDeprecatedRegistryConfigLegacyTokensEndToEnd(t *testing.T) {
 
 type revokedJTI string
 
-func (r revokedJTI) IsBlacklisted(_ context.Context, jti string) bool { return jti == string(r) }
-func (revokedJTI) IsUserRevoked(context.Context, string) bool         { return false }
-func (revokedJTI) IsFamilyRevoked(context.Context, string) bool       { return false }
+func (r revokedJTI) IsBlacklisted(_ context.Context, jti string) (bool, error) {
+	return jti == string(r), nil
+}
+func (revokedJTI) IsUserRevoked(context.Context, string) (bool, error) { return false, nil }
+func (revokedJTI) IsFamilyRevoked(context.Context, string) bool        { return false }

@@ -125,7 +125,7 @@ func TestLogoutHandler_BlacklistsPresentedBearerToken(t *testing.T) {
 		t.Fatalf("expected 204, got %d: %s", w.Code, w.Body.String())
 	}
 
-	if !blacklist.IsBlacklisted(context.Background(), parentClaims.ID) {
+	if !blacklisted(t, blacklist, context.Background(), parentClaims.ID) {
 		t.Error("expected the presented bearer token's jti to be blacklisted on logout")
 	}
 }
@@ -175,7 +175,7 @@ func TestLogoutHandler_RefusesToBlacklistOtherUsersToken(t *testing.T) {
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("expected 204 (session logout still succeeds), got %d: %s", w.Code, w.Body.String())
 	}
-	if blacklist.IsBlacklisted(context.Background(), otherUsersClaims.ID) {
+	if blacklisted(t, blacklist, context.Background(), otherUsersClaims.ID) {
 		t.Error("must not blacklist a bearer token belonging to a different user than the session")
 	}
 }
@@ -225,7 +225,7 @@ func TestLogoutHandler_BlacklistsLegacyBearerToken(t *testing.T) {
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d: %s", w.Code, w.Body.String())
 	}
-	if !blacklist.IsBlacklisted(context.Background(), legacyClaims.ID) {
+	if !blacklisted(t, blacklist, context.Background(), legacyClaims.ID) {
 		t.Error("expected the legacy bearer token's jti to be blacklisted on logout")
 	}
 }
@@ -270,7 +270,7 @@ func TestLogoutHandler_RefusesToBlacklistOtherUsersLegacyToken(t *testing.T) {
 	if w.Code != http.StatusNoContent {
 		t.Fatalf("expected 204, got %d: %s", w.Code, w.Body.String())
 	}
-	if blacklist.IsBlacklisted(context.Background(), otherUsersClaims.ID) {
+	if blacklisted(t, blacklist, context.Background(), otherUsersClaims.ID) {
 		t.Error("must not blacklist a legacy bearer token belonging to a different user than the session")
 	}
 }
@@ -590,4 +590,28 @@ func TestLogoutHandler_SIDParserWorksWithLegacyAuthDisabled(t *testing.T) {
 	if bl := run(mint("someone-else")); len(bl.families) != 0 {
 		t.Errorf("a stranger's bearer must not revoke any family, got %v", bl.families)
 	}
+}
+
+// revocationReader is the check half of a revocation checker.
+type revocationReader interface {
+	IsBlacklisted(ctx context.Context, jti string) (bool, error)
+	IsUserRevoked(ctx context.Context, userID string) (bool, error)
+}
+
+func blacklisted(t *testing.T, r revocationReader, ctx context.Context, jti string) bool {
+	t.Helper()
+	ok, err := r.IsBlacklisted(ctx, jti)
+	if err != nil {
+		t.Fatalf("IsBlacklisted: %v", err)
+	}
+	return ok
+}
+
+func userRevoked(t *testing.T, r revocationReader, ctx context.Context, userID string) bool {
+	t.Helper()
+	ok, err := r.IsUserRevoked(ctx, userID)
+	if err != nil {
+		t.Fatalf("IsUserRevoked: %v", err)
+	}
+	return ok
 }

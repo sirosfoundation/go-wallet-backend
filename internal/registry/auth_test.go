@@ -210,15 +210,18 @@ func (f fakeTenants) GetByID(_ context.Context, id domain.TenantID) (*domain.Ten
 	return &domain.Tenant{ID: id, Enabled: en}, nil
 }
 
-type fakeBlacklist struct{ revokedUser, revokedJTI string }
+type fakeBlacklist struct {
+	revokedUser, revokedJTI string
+	err                     error // returned by IsBlacklisted and IsUserRevoked
+}
 
 func (fakeBlacklist) IsFamilyRevoked(context.Context, string) bool { return false }
 
-func (f fakeBlacklist) IsBlacklisted(_ context.Context, j string) bool {
-	return f.revokedJTI != "" && j == f.revokedJTI
+func (f fakeBlacklist) IsBlacklisted(_ context.Context, j string) (bool, error) {
+	return f.revokedJTI != "" && j == f.revokedJTI, f.err
 }
-func (f fakeBlacklist) IsUserRevoked(_ context.Context, u string) bool {
-	return f.revokedUser != "" && u == f.revokedUser
+func (f fakeBlacklist) IsUserRevoked(_ context.Context, u string) (bool, error) {
+	return f.revokedUser != "" && u == f.revokedUser, f.err
 }
 
 func TestAuthMiddlewares_StrictWithTenantStoreAndBlacklist(t *testing.T) {
@@ -522,4 +525,52 @@ func TestAuthMiddlewares_LegacyAudienceIndependent(t *testing.T) {
 	ni := mk(true, true, nil)
 	ni.Config.JWT.Issuer = ""
 	assert.Equal(t, http.StatusUnauthorized, probe(t, ni, tok(testSecret, func(c gojwt.MapClaims) { delete(c, "iss") })).status)
+}
+
+// errBlacklist fails the selected lookup, like an unreachable revocation store.
+type errBlacklist struct{ jti, user bool }
+
+func (b errBlacklist) IsBlacklisted(context.Context, string) (bool, error) {
+	if b.jti {
+		return false, assert.AnError
+	}
+	return false, nil
+}
+
+func (b errBlacklist) IsUserRevoked(context.Context, string) (bool, error) {
+	if b.user {
+		return false, assert.AnError
+	}
+	return false, nil
+}
+
+func (errBlacklist) IsFamilyRevoked(context.Context, string) bool { return false }
+
+// A revocation lookup that fails must refuse the request (strict: 503) or
+// leave it unauthenticated (optional), never authenticate it.
+func TestAuthMiddlewares_RevocationStoreErrorFailsClosed(t *testing.T) {
+	env := newAuthEnv(t)
+	tok := "Bearer " + env.es256(t, []string{"wallet-registry"}, "acme", time.Now().Add(time.Hour))
+
+	for name, bl := range map[string]errBlacklist{
+		"jti lookup":  {jti: true},
+		"user lookup": {user: true},
+	} {
+		for _, strict := range []bool{true, false} {
+			cfg := AuthConfig{Validator: env.validator(t, true), RequireAuth: strict, Logger: zap.NewNop(), Blacklist: bl}
+			r := probe(t, cfg, tok)
+			assert.False(t, r.auth, "%s, strict=%v", name, strict)
+			if strict {
+				assert.Equal(t, http.StatusServiceUnavailable, r.status, name)
+			} else {
+				assert.Equal(t, http.StatusOK, r.status, "%s: optional mode downgrades, never rejects", name)
+			}
+		}
+	}
+
+	// Positive control: with a working store the same token is accepted.
+	cfg := AuthConfig{Validator: env.validator(t, true), RequireAuth: true, Logger: zap.NewNop(), Blacklist: errBlacklist{}}
+	r := probe(t, cfg, tok)
+	assert.True(t, r.auth)
+	assert.Equal(t, http.StatusOK, r.status)
 }

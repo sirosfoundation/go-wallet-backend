@@ -20,6 +20,10 @@ import (
 const (
 	revokedTokensCollection = "revoked_tokens"
 	revokedUsersCollection  = "revoked_users"
+
+	// revocationOpTimeout bounds each operation, so an unreachable database
+	// produces a prompt error instead of waiting out server selection.
+	revocationOpTimeout = 5 * time.Second
 )
 
 // mongoRevocationStore is a RevocationStore shared by every process using
@@ -62,6 +66,8 @@ func NewMongoRevocationStore(ctx context.Context, db *mongo.Database) (Revocatio
 
 // Add records jti until expiry. Re-adding never shortens an existing entry.
 func (s *mongoRevocationStore) Add(ctx context.Context, jti string, expiry time.Time) error {
+	ctx, cancel := context.WithTimeout(ctx, revocationOpTimeout)
+	defer cancel()
 	_, err := s.tokens.UpdateOne(ctx,
 		bson.M{"_id": jti},
 		bson.M{"$max": bson.M{"expires_at": expiry}},
@@ -73,6 +79,8 @@ func (s *mongoRevocationStore) Add(ctx context.Context, jti string, expiry time.
 }
 
 func (s *mongoRevocationStore) Has(ctx context.Context, jti string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, revocationOpTimeout)
+	defer cancel()
 	err := s.tokens.FindOne(ctx,
 		bson.M{"_id": jti, "expires_at": bson.M{"$gt": time.Now()}},
 		options.FindOne().SetProjection(bson.M{"_id": 1})).Err()
@@ -80,6 +88,8 @@ func (s *mongoRevocationStore) Has(ctx context.Context, jti string) (bool, error
 }
 
 func (s *mongoRevocationStore) RevokeUser(ctx context.Context, userID string) error {
+	ctx, cancel := context.WithTimeout(ctx, revocationOpTimeout)
+	defer cancel()
 	_, err := s.users.UpdateOne(ctx,
 		bson.M{"_id": userID},
 		bson.M{"$setOnInsert": bson.M{"revoked_at": time.Now()}},
@@ -91,6 +101,8 @@ func (s *mongoRevocationStore) RevokeUser(ctx context.Context, userID string) er
 }
 
 func (s *mongoRevocationStore) IsUserRevoked(ctx context.Context, userID string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, revocationOpTimeout)
+	defer cancel()
 	err := s.users.FindOne(ctx, bson.M{"_id": userID},
 		options.FindOne().SetProjection(bson.M{"_id": 1})).Err()
 	return foundOrErr(err, "check user revocation")

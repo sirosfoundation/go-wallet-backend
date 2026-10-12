@@ -127,7 +127,7 @@ func TestTokenBlacklist_DelegatesToStore(t *testing.T) {
 	if len(rs.revoked) != 1 || rs.revoked[0] != "u" {
 		t.Errorf("RevokeUser forwarded %v, want [u]", rs.revoked)
 	}
-	if !b.IsBlacklisted(ctx, "j") || b.IsBlacklisted(ctx, "") || !b.IsUserRevoked(ctx, "u") || b.IsUserRevoked(ctx, "") {
+	if !blacklisted(t, b, ctx, "j") || blacklisted(t, b, ctx, "") || !userRevoked(t, b, ctx, "u") || userRevoked(t, b, ctx, "") {
 		t.Error("checks must reflect the store, and empty identifiers must never be revoked")
 	}
 
@@ -135,19 +135,49 @@ func TestTokenBlacklist_DelegatesToStore(t *testing.T) {
 	rs.added, rs.revoked = nil, nil
 	_ = off.Add(ctx, "j2", time.Now().Add(time.Hour))
 	_ = off.RevokeUser(ctx, "u2")
-	if len(rs.added)+len(rs.revoked) != 0 || off.IsBlacklisted(ctx, "j") || off.IsUserRevoked(ctx, "u") {
+	if len(rs.added)+len(rs.revoked) != 0 || blacklisted(t, off, ctx, "j") || userRevoked(t, off, ctx, "u") {
 		t.Error("a disabled blacklist must neither write to nor read from the store")
 	}
 }
 
-func TestTokenBlacklist_StoreErrorRefuses(t *testing.T) {
+func TestTokenBlacklist_StoreErrorIsReported(t *testing.T) {
 	ctx := context.Background()
 	rs := &recordingStore{err: errors.New("store down")}
 	b := NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop(), rs)
-	if !b.IsBlacklisted(ctx, "j") {
-		t.Error("a store error must not read as 'not revoked'")
+	if revoked, err := b.IsBlacklisted(ctx, "j"); err == nil || revoked {
+		t.Errorf("IsBlacklisted = (%v, %v), want (false, error): the caller must be told the answer is unknown", revoked, err)
 	}
-	if !b.IsUserRevoked(ctx, "u") {
-		t.Error("a store error must not read as 'user not revoked'")
+	if revoked, err := b.IsUserRevoked(ctx, "u"); err == nil || revoked {
+		t.Errorf("IsUserRevoked = (%v, %v), want (false, error)", revoked, err)
 	}
+
+	// A disabled blacklist never consults the store, so it cannot fail.
+	off := NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop(), rs)
+	if _, err := off.IsBlacklisted(ctx, "j"); err != nil {
+		t.Errorf("disabled blacklist must not error: %v", err)
+	}
+}
+
+// revocationReader is the check half of a revocation checker.
+type revocationReader interface {
+	IsBlacklisted(ctx context.Context, jti string) (bool, error)
+	IsUserRevoked(ctx context.Context, userID string) (bool, error)
+}
+
+func blacklisted(t *testing.T, r revocationReader, ctx context.Context, jti string) bool {
+	t.Helper()
+	ok, err := r.IsBlacklisted(ctx, jti)
+	if err != nil {
+		t.Fatalf("IsBlacklisted: %v", err)
+	}
+	return ok
+}
+
+func userRevoked(t *testing.T, r revocationReader, ctx context.Context, userID string) bool {
+	t.Helper()
+	ok, err := r.IsUserRevoked(ctx, userID)
+	if err != nil {
+		t.Fatalf("IsUserRevoked: %v", err)
+	}
+	return ok
 }

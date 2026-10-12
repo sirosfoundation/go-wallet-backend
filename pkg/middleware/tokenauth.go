@@ -95,13 +95,20 @@ func TokenAuthMiddlewareWithValidate(cfg *config.Config, validate func(ctx conte
 		// deleted user, even one whose own jti was never individually
 		// blacklisted. A no-op for anonymous tokens (empty UserID - see
 		// TokenBlacklist.IsUserRevoked).
-		if blacklist != nil && blacklist.IsUserRevoked(c.Request.Context(), result.UserID) {
-			logger.Warn("Token for revoked user used",
-				zap.String("user_id", result.UserID),
-			)
-			c.JSON(401, gin.H{"error": "Token has been revoked"})
-			c.Abort()
-			return
+		if blacklist != nil {
+			userRevoked, err := blacklist.IsUserRevoked(c.Request.Context(), result.UserID)
+			if err != nil {
+				RefuseRevocationUnavailable(c, logger, err)
+				return
+			}
+			if userRevoked {
+				logger.Warn("Token for revoked user used",
+					zap.String("user_id", result.UserID),
+				)
+				c.JSON(401, gin.H{"error": "Token has been revoked"})
+				c.Abort()
+				return
+			}
 		}
 
 		// Refresh-token family revocation (#402), legacy-mode tokens only:

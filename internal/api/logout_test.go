@@ -97,7 +97,7 @@ func TestHandlers_Logout_LegacyToken(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if !handlers.services.TokenBlacklist.IsBlacklisted(context.Background(), "jti-legacy-logout") {
+	if !blacklisted(t, handlers.services.TokenBlacklist, context.Background(), "jti-legacy-logout") {
 		t.Error("expected the legacy token's jti to be blacklisted")
 	}
 }
@@ -134,7 +134,7 @@ func TestHandlers_Logout_ASToken(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if !handlers.services.TokenBlacklist.IsBlacklisted(context.Background(), "jti-as-logout") {
+	if !blacklisted(t, handlers.services.TokenBlacklist, context.Background(), "jti-as-logout") {
 		t.Error("expected the AS-issued token's jti to be blacklisted via tokenauth_result")
 	}
 }
@@ -206,7 +206,7 @@ func TestHandlers_Logout_LegacyToken_NoSidClaim_NoFamilyRevocationAttempted(t *t
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if !handlers.services.TokenBlacklist.IsBlacklisted(context.Background(), "jti-legacy-no-sid") {
+	if !blacklisted(t, handlers.services.TokenBlacklist, context.Background(), "jti-legacy-no-sid") {
 		t.Error("expected the token's own jti to still be blacklisted")
 	}
 }
@@ -641,7 +641,7 @@ func TestLogout_FailedFamilyRevocation_RetryableThroughRealMiddleware(t *testing
 			if w := logout(); w.Code != http.StatusInternalServerError {
 				t.Fatalf("attempt 1: expected 500, got %d: %s", w.Code, w.Body.String())
 			}
-			if services.TokenBlacklist.IsBlacklisted(ctx, jti) {
+			if blacklisted(t, services.TokenBlacklist, ctx, jti) {
 				t.Fatal("a failed logout must not blacklist the access token's jti")
 			}
 			if services.TokenBlacklist.IsFamilyRevoked(ctx, sid) {
@@ -657,7 +657,7 @@ func TestLogout_FailedFamilyRevocation_RetryableThroughRealMiddleware(t *testing
 			if !services.TokenBlacklist.IsFamilyRevoked(ctx, sid) {
 				t.Error("retry: expected the family to be revoked")
 			}
-			if !services.TokenBlacklist.IsBlacklisted(ctx, jti) {
+			if !blacklisted(t, services.TokenBlacklist, ctx, jti) {
 				t.Error("a successful logout must blacklist the access token's jti")
 			}
 
@@ -667,4 +667,28 @@ func TestLogout_FailedFamilyRevocation_RetryableThroughRealMiddleware(t *testing
 			}
 		})
 	}
+}
+
+// revocationReader is the check half of a revocation checker.
+type revocationReader interface {
+	IsBlacklisted(ctx context.Context, jti string) (bool, error)
+	IsUserRevoked(ctx context.Context, userID string) (bool, error)
+}
+
+func blacklisted(t *testing.T, r revocationReader, ctx context.Context, jti string) bool {
+	t.Helper()
+	ok, err := r.IsBlacklisted(ctx, jti)
+	if err != nil {
+		t.Fatalf("IsBlacklisted: %v", err)
+	}
+	return ok
+}
+
+func userRevoked(t *testing.T, r revocationReader, ctx context.Context, userID string) bool {
+	t.Helper()
+	ok, err := r.IsUserRevoked(ctx, userID)
+	if err != nil {
+		t.Fatalf("IsUserRevoked: %v", err)
+	}
+	return ok
 }

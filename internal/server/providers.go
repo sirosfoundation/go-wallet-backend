@@ -508,11 +508,21 @@ func (p *EngineProvider) CheckReady(ctx context.Context) error {
 // standalone legacy path (middleware.AuthMiddlewareWithBlacklist).
 type blacklistRevocationChecker struct {
 	blacklist *service.TokenBlacklist
+	logger    *zap.Logger // optional
 }
 
-// IsRevoked implements revocation.Checker.
+// IsRevoked implements revocation.Checker. The interface has no error
+// return, so a store failure is reported as "revoked": the Validator then
+// rejects the token (401) rather than accepting it unchecked.
 func (c blacklistRevocationChecker) IsRevoked(ctx context.Context, jti string) bool {
-	return c.blacklist.IsBlacklisted(ctx, jti)
+	revoked, err := c.blacklist.IsBlacklisted(ctx, jti)
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Error("Revocation check failed; rejecting token", zap.Error(err))
+		}
+		return true
+	}
+	return revoked
 }
 
 // =============================================================================
@@ -631,7 +641,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		// path that AuthMiddlewareWithBlacklist's check is never reached
 		// by.
 		tv = buildTokenValidator(cfg, cfg.AS.Audiences,
-			blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist})
+			blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist, logger: logger})
 		tv.Start(context.Background())
 		logger.Info("Authorization Server module initialized",
 			zap.String("jwks_url", jwksURL),
@@ -1145,7 +1155,7 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 		// provider's own services.TokenBlacklist is fine used as-is here:
 		// it never runs co-hosted with BackendProvider (see cmd/server).
 		tv = buildTokenValidator(cfg, cfg.AS.Audiences,
-			blacklistRevocationChecker{blacklist: services.TokenBlacklist})
+			blacklistRevocationChecker{blacklist: services.TokenBlacklist, logger: logger})
 		tv.Start(context.Background())
 	}
 

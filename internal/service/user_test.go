@@ -618,7 +618,7 @@ func TestUserService_DeleteUser_RevokesTokens(t *testing.T) {
 	// A token issued before deletion (e.g. from a different, still-logged-in
 	// device) must be rejected afterward, even though it was never
 	// individually blacklisted by jti.
-	if blacklist.IsUserRevoked(ctx, user.UUID.String()) {
+	if userRevoked(t, blacklist, ctx, user.UUID.String()) {
 		t.Fatal("user should not be revoked before deletion")
 	}
 
@@ -626,12 +626,12 @@ func TestUserService_DeleteUser_RevokesTokens(t *testing.T) {
 		t.Fatalf("DeleteUser() error = %v", err)
 	}
 
-	if !blacklist.IsUserRevoked(ctx, user.UUID.String()) {
+	if !userRevoked(t, blacklist, ctx, user.UUID.String()) {
 		t.Error("expected a pre-deletion token to be revoked after DeleteUser")
 	}
 
 	// A different, unrelated user must be unaffected.
-	if blacklist.IsUserRevoked(ctx, "some-other-user") {
+	if userRevoked(t, blacklist, ctx, "some-other-user") {
 		t.Error("DeleteUser must not revoke tokens for unrelated users")
 	}
 }

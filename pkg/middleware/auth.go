@@ -27,9 +27,24 @@ import (
 // and the go-tokenauth path (TokenAuthMiddleware), so a revocation is
 // honored regardless of which authenticated the request.
 type TokenBlacklistChecker interface {
-	IsBlacklisted(ctx context.Context, jti string) bool
-	IsUserRevoked(ctx context.Context, userID string) bool
+	// IsBlacklisted and IsUserRevoked return an error when the revocation
+	// store cannot answer; callers must then refuse the request.
+	IsBlacklisted(ctx context.Context, jti string) (bool, error)
+	IsUserRevoked(ctx context.Context, userID string) (bool, error)
 	IsFamilyRevoked(ctx context.Context, sid string) bool
+}
+
+// RefuseRevocationUnavailable aborts the request with 503 because the
+// revocation store could not say whether the token is revoked. Only the
+// error is logged, never token content.
+func RefuseRevocationUnavailable(c *gin.Context, logger *zap.Logger, err error) {
+	logger.Error("Revocation check failed; refusing request",
+		zap.Error(err),
+		zap.String("method", c.Request.Method),
+		zap.String("path", c.FullPath()),
+	)
+	c.JSON(503, gin.H{"error": "Token revocation check unavailable"})
+	c.Abort()
 }
 
 // GenerateAdminToken generates a secure random token for admin API authentication
@@ -173,7 +188,15 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 		// until it naturally expires (#383).
 		if blacklist != nil {
 			jti, _ := claims["jti"].(string)
-			if jti != "" && blacklist.IsBlacklisted(c.Request.Context(), jti) {
+			revoked := false
+			if jti != "" {
+				var err error
+				if revoked, err = blacklist.IsBlacklisted(c.Request.Context(), jti); err != nil {
+					RefuseRevocationUnavailable(c, logger, err)
+					return
+				}
+			}
+			if revoked {
 				logger.Warn("Blacklisted token used",
 					zap.String("jti", jti),
 				)
@@ -182,7 +205,12 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 				return
 			}
 
-			if blacklist.IsUserRevoked(c.Request.Context(), userID) {
+			userRevoked, err := blacklist.IsUserRevoked(c.Request.Context(), userID)
+			if err != nil {
+				RefuseRevocationUnavailable(c, logger, err)
+				return
+			}
+			if userRevoked {
 				logger.Warn("Token for revoked user used",
 					zap.String("user_id", userID),
 				)

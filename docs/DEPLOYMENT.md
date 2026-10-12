@@ -578,8 +578,12 @@ permanent). Reads go to the primary and writes use majority write concern,
 so a revocation is seen by the next check on any replica. A secondary-read
 lag is therefore not a concern for these collections.
 
-The store fails closed. If it cannot be reached or set up, token checks
-refuse the request instead of accepting it. A revocation write that fails
+The store fails closed. If it cannot be reached or set up, a revocation
+lookup that cannot be answered refuses the request instead of accepting it:
+API requests get `503 {"error":"Token revocation check unavailable"}`, the
+token-delegation endpoint answers 503, a WebSocket handshake is refused, and a
+token checked by the token validator is rejected with 401. Every lookup is
+bounded to 5 seconds. A revocation write that fails
 during logout or account deletion is logged as before; those operations
 still complete, so the revocation is missing until the store is back. If
 the store cannot be set up at startup the process still starts, logs an

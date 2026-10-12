@@ -1558,7 +1558,7 @@ func TestNewBackendProvider_ASEnabled_WiresBlacklistAndRevocation(t *testing.T) 
 	if err := provider.auth.services.TokenBlacklist.Add(ctx, "jti-shared-with-as", time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	if !provider.asModule.Blacklist.IsBlacklisted(ctx, "jti-shared-with-as") {
+	if revoked, err := provider.asModule.Blacklist.IsBlacklisted(ctx, "jti-shared-with-as"); err != nil || !revoked {
 		t.Error("expected AS module's Blacklist to share AuthProvider's TokenBlacklist instance")
 	}
 }
@@ -1614,12 +1614,12 @@ func TestEngineProvider_SetTokenBlacklist(t *testing.T) {
 // implementation, just to prove SetTokenBlacklist accepts a real implementer.
 type fakeEngineBlacklistForProviderTest struct{}
 
-func (fakeEngineBlacklistForProviderTest) IsBlacklisted(ctx context.Context, jti string) bool {
-	return false
+func (fakeEngineBlacklistForProviderTest) IsBlacklisted(ctx context.Context, jti string) (bool, error) {
+	return false, nil
 }
 
-func (fakeEngineBlacklistForProviderTest) IsUserRevoked(ctx context.Context, userID string) bool {
-	return false
+func (fakeEngineBlacklistForProviderTest) IsUserRevoked(ctx context.Context, userID string) (bool, error) {
+	return false, nil
 }
 
 func (fakeEngineBlacklistForProviderTest) IsFamilyRevoked(ctx context.Context, sid string) bool {
@@ -1704,5 +1704,33 @@ func TestLegacyValidatorConfig_UsesJWTIssuer(t *testing.T) {
 	}
 	if _, err := v.Validate(context.Background(), raw); err != nil {
 		t.Fatalf("legacy token minted with JWT.Issuer must validate when AS.Issuer differs: %v", err)
+	}
+}
+
+var errFailingStore = errors.New("store down")
+
+// failingRevocationStore is a service.RevocationStore whose every call fails.
+type failingRevocationStore struct{}
+
+func (failingRevocationStore) Add(context.Context, string, time.Time) error { return errFailingStore }
+func (failingRevocationStore) Has(context.Context, string) (bool, error) {
+	return false, errFailingStore
+}
+func (failingRevocationStore) RevokeUser(context.Context, string) error { return errFailingStore }
+func (failingRevocationStore) IsUserRevoked(context.Context, string) (bool, error) {
+	return false, errFailingStore
+}
+
+// go-tokenauth's Checker has no error return, so a store failure must read
+// as revoked: the Validator then rejects the token.
+func TestBlacklistRevocationChecker_StoreErrorReadsAsRevoked(t *testing.T) {
+	bl := service.NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop(), failingRevocationStore{})
+	checker := blacklistRevocationChecker{blacklist: bl, logger: zap.NewNop()}
+	if !checker.IsRevoked(context.Background(), "jti-1") {
+		t.Error("a store failure must not read as 'not revoked'")
+	}
+	// Without a logger the adapter must still refuse.
+	if !(blacklistRevocationChecker{blacklist: bl}).IsRevoked(context.Background(), "jti-1") {
+		t.Error("a store failure must not read as 'not revoked' (no logger)")
 	}
 }

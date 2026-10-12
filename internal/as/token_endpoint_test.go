@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -566,6 +567,8 @@ type fakeBlacklist struct {
 	added        map[string]time.Time
 	families     map[string]time.Time
 	familyErr    error
+	jtiErr       error // returned by IsBlacklisted
+	userErr      error // returned by IsUserRevoked
 }
 
 func (f *fakeBlacklist) RevokeFamily(ctx context.Context, sid string, expiry time.Time) error {
@@ -582,12 +585,12 @@ func (f *fakeBlacklist) RevokeFamily(ctx context.Context, sid string, expiry tim
 	return nil
 }
 
-func (f *fakeBlacklist) IsBlacklisted(ctx context.Context, jti string) bool {
-	return f.revoked[jti]
+func (f *fakeBlacklist) IsBlacklisted(ctx context.Context, jti string) (bool, error) {
+	return f.revoked[jti], f.jtiErr
 }
 
-func (f *fakeBlacklist) IsUserRevoked(ctx context.Context, userID string) bool {
-	return f.revokedUsers[userID]
+func (f *fakeBlacklist) IsUserRevoked(ctx context.Context, userID string) (bool, error) {
+	return f.revokedUsers[userID], f.userErr
 }
 
 func (f *fakeBlacklist) Add(ctx context.Context, jti string, expiry time.Time) error {
@@ -1090,5 +1093,38 @@ func TestTokenEndpoint_Anonymous_ExceedsSessionMaxTACDenied(t *testing.T) {
 
 	if w.Code != http.StatusForbidden {
 		t.Errorf("expected 403 for a session whose MaxTAC (l) doesn't include the default anonymous tac (r), got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// A revocation lookup that fails must refuse the delegation (503), not mint a
+// token from a parent whose revocation status is unknown.
+func TestTokenEndpoint_Delegation_RevocationStoreErrorRefuses(t *testing.T) {
+	issuer := newTestTokenIssuer(t)
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	post := func(bl TokenBlacklistChecker) *httptest.ResponseRecorder {
+		router, _ := setupRouterWithIssuer(t, issuer, nil, bl)
+		body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r"})
+		req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+parentToken)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+
+	if w := post(&fakeBlacklist{}); w.Code != http.StatusOK {
+		t.Fatalf("positive control: expected 200 with a working store, got %d: %s", w.Code, w.Body.String())
+	}
+	for name, bl := range map[string]*fakeBlacklist{
+		"jti lookup":  {jtiErr: errors.New("store down")},
+		"user lookup": {userErr: errors.New("store down")},
+	} {
+		if w := post(bl); w.Code != http.StatusServiceUnavailable {
+			t.Errorf("%s: expected 503 when revocation cannot be checked, got %d: %s", name, w.Code, w.Body.String())
+		}
 	}
 }

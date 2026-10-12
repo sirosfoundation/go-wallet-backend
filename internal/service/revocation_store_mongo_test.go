@@ -171,9 +171,9 @@ func TestTokenBlacklist_MongoStoreSharedBetweenInstances(t *testing.T) {
 	}
 	a, b := mk(), mk()
 	require.NoError(t, a.Add(ctx, "j", time.Now().Add(time.Hour)))
-	require.True(t, b.IsBlacklisted(ctx, "j"))
+	require.True(t, blacklisted(t, b, ctx, "j"))
 	require.NoError(t, a.RevokeUser(ctx, "u"))
-	require.True(t, b.IsUserRevoked(ctx, "u"))
+	require.True(t, userRevoked(t, b, ctx, "u"))
 }
 
 // deadMongoDB returns a database whose server is unreachable.
@@ -205,8 +205,10 @@ func TestMongoRevocationStore_OutageRefuses(t *testing.T) {
 	require.Error(t, s.RevokeUser(ctx, "u"))
 
 	b := NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop(), s)
-	require.True(t, b.IsBlacklisted(ctx, "j"), "store outage must not read as 'not revoked'")
-	require.True(t, b.IsUserRevoked(ctx, "u"), "store outage must not read as 'user not revoked'")
+	_, err = b.IsBlacklisted(ctx, "j")
+	require.Error(t, err, "a store outage must be reported, not read as 'not revoked'")
+	_, err = b.IsUserRevoked(ctx, "u")
+	require.Error(t, err)
 	require.Error(t, b.Add(ctx, "j", time.Now().Add(time.Hour)), "a failed revocation write must be reported")
 }
 
@@ -251,7 +253,7 @@ func TestNewRevocationStore_Selection(t *testing.T) {
 	})
 }
 
-func TestNewServices_RevocationStoreFailureRefuses(t *testing.T) {
+func TestNewServices_RevocationStoreFailureIsReported(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Security.TokenBlacklist = config.TokenBlacklistConfig{Enabled: true, Backend: "storage"}
 	cfg.Server.RPID = "localhost"
@@ -259,7 +261,9 @@ func TestNewServices_RevocationStoreFailureRefuses(t *testing.T) {
 	// Storage is not MongoDB, so backend=storage cannot be honoured.
 	svc := NewServices(memory.NewStore(), cfg, zap.NewNop())
 	ctx := context.Background()
-	require.True(t, svc.TokenBlacklist.IsBlacklisted(ctx, "any"))
-	require.True(t, svc.TokenBlacklist.IsUserRevoked(ctx, "any"))
+	_, err := svc.TokenBlacklist.IsBlacklisted(ctx, "any")
+	require.Error(t, err)
+	_, err = svc.TokenBlacklist.IsUserRevoked(ctx, "any")
+	require.Error(t, err)
 	require.Error(t, svc.TokenBlacklist.Add(ctx, "any", time.Now().Add(time.Hour)))
 }
