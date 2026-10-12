@@ -13,12 +13,14 @@ import (
 type RevocationStore interface {
 	// Add revokes jti until expiry (the token's own exp).
 	Add(ctx context.Context, jti string, expiry time.Time) error
-	// Has reports whether jti is revoked and its entry has not expired.
-	Has(ctx context.Context, jti string) bool
+	// Has reports whether jti is revoked and its entry has not expired. An
+	// error means the answer is unknown (store unreachable), not "no".
+	Has(ctx context.Context, jti string) (bool, error)
 	// RevokeUser permanently revokes every token for userID.
 	RevokeUser(ctx context.Context, userID string) error
-	// IsUserRevoked reports whether userID was revoked via RevokeUser.
-	IsUserRevoked(ctx context.Context, userID string) bool
+	// IsUserRevoked reports whether userID was revoked via RevokeUser. An
+	// error means the answer is unknown, not "no".
+	IsUserRevoked(ctx context.Context, userID string) (bool, error)
 }
 
 // memoryRevocationStore is the process-local RevocationStore. It borrows the
@@ -37,11 +39,11 @@ func (s *memoryRevocationStore) Add(_ context.Context, jti string, expiry time.T
 	return nil
 }
 
-func (s *memoryRevocationStore) Has(_ context.Context, jti string) bool {
+func (s *memoryRevocationStore) Has(_ context.Context, jti string) (bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	expiry, exists := s.tokens[jti]
-	return exists && !time.Now().After(expiry)
+	return exists && !time.Now().After(expiry), nil
 }
 
 func (s *memoryRevocationStore) RevokeUser(_ context.Context, userID string) error {
@@ -51,8 +53,8 @@ func (s *memoryRevocationStore) RevokeUser(_ context.Context, userID string) err
 	return nil
 }
 
-func (s *memoryRevocationStore) IsUserRevoked(_ context.Context, userID string) bool {
+func (s *memoryRevocationStore) IsUserRevoked(_ context.Context, userID string) (bool, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.users[userID]
+	return s.users[userID], nil
 }

@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -9,6 +10,24 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
+
+func mustHas(t *testing.T, s RevocationStore, jti string) bool {
+	t.Helper()
+	ok, err := s.Has(context.Background(), jti)
+	if err != nil {
+		t.Fatalf("Has(%q): %v", jti, err)
+	}
+	return ok
+}
+
+func mustUserRevoked(t *testing.T, s RevocationStore, id string) bool {
+	t.Helper()
+	ok, err := s.IsUserRevoked(context.Background(), id)
+	if err != nil {
+		t.Fatalf("IsUserRevoked(%q): %v", id, err)
+	}
+	return ok
+}
 
 // runRevocationStoreContract exercises the behaviour every RevocationStore
 // must share; newStore returns a fresh, empty store.
@@ -18,16 +37,16 @@ func runRevocationStoreContract(t *testing.T, newStore func(t *testing.T) Revoca
 
 	t.Run("added jti is revoked until its expiry", func(t *testing.T) {
 		s := newStore(t)
-		if s.Has(ctx, "jti-1") {
+		if mustHas(t, s, "jti-1") {
 			t.Fatal("unknown jti must not be revoked")
 		}
 		if err := s.Add(ctx, "jti-1", time.Now().Add(time.Hour)); err != nil {
 			t.Fatal(err)
 		}
-		if !s.Has(ctx, "jti-1") {
+		if !mustHas(t, s, "jti-1") {
 			t.Error("added jti must be revoked")
 		}
-		if s.Has(ctx, "jti-2") {
+		if mustHas(t, s, "jti-2") {
 			t.Error("other jti must not be revoked")
 		}
 	})
@@ -37,14 +56,14 @@ func runRevocationStoreContract(t *testing.T, newStore func(t *testing.T) Revoca
 		if err := s.Add(ctx, "jti-old", time.Now().Add(-time.Second)); err != nil {
 			t.Fatal(err)
 		}
-		if s.Has(ctx, "jti-old") {
+		if mustHas(t, s, "jti-old") {
 			t.Error("a jti past its expiry must not be reported revoked")
 		}
 	})
 
 	t.Run("revoked user stays revoked, others unaffected", func(t *testing.T) {
 		s := newStore(t)
-		if s.IsUserRevoked(ctx, "u1") {
+		if mustUserRevoked(t, s, "u1") {
 			t.Fatal("unknown user must not be revoked")
 		}
 		if err := s.RevokeUser(ctx, "u1"); err != nil {
@@ -53,10 +72,10 @@ func runRevocationStoreContract(t *testing.T, newStore func(t *testing.T) Revoca
 		if err := s.RevokeUser(ctx, "u1"); err != nil {
 			t.Fatalf("revoking twice must be idempotent: %v", err)
 		}
-		if !s.IsUserRevoked(ctx, "u1") {
+		if !mustUserRevoked(t, s, "u1") {
 			t.Error("revoked user must be reported revoked")
 		}
-		if s.IsUserRevoked(ctx, "u2") {
+		if mustUserRevoked(t, s, "u2") {
 			t.Error("other user must not be revoked")
 		}
 	})
@@ -75,18 +94,23 @@ type recordingStore struct {
 	revoked []string
 	has     map[string]bool
 	users   map[string]bool
+	err     error // returned by Has/IsUserRevoked
 }
 
 func (r *recordingStore) Add(_ context.Context, jti string, _ time.Time) error {
 	r.added = append(r.added, jti)
 	return nil
 }
-func (r *recordingStore) Has(_ context.Context, jti string) bool { return r.has[jti] }
+func (r *recordingStore) Has(_ context.Context, jti string) (bool, error) {
+	return r.has[jti], r.err
+}
 func (r *recordingStore) RevokeUser(_ context.Context, id string) error {
 	r.revoked = append(r.revoked, id)
 	return nil
 }
-func (r *recordingStore) IsUserRevoked(_ context.Context, id string) bool { return r.users[id] }
+func (r *recordingStore) IsUserRevoked(_ context.Context, id string) (bool, error) {
+	return r.users[id], r.err
+}
 
 func TestTokenBlacklist_DelegatesToStore(t *testing.T) {
 	ctx := context.Background()
@@ -113,5 +137,17 @@ func TestTokenBlacklist_DelegatesToStore(t *testing.T) {
 	_ = off.RevokeUser(ctx, "u2")
 	if len(rs.added)+len(rs.revoked) != 0 || off.IsBlacklisted(ctx, "j") || off.IsUserRevoked(ctx, "u") {
 		t.Error("a disabled blacklist must neither write to nor read from the store")
+	}
+}
+
+func TestTokenBlacklist_StoreErrorRefuses(t *testing.T) {
+	ctx := context.Background()
+	rs := &recordingStore{err: errors.New("store down")}
+	b := NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop(), rs)
+	if !b.IsBlacklisted(ctx, "j") {
+		t.Error("a store error must not read as 'not revoked'")
+	}
+	if !b.IsUserRevoked(ctx, "u") {
+		t.Error("a store error must not read as 'user not revoked'")
 	}
 }

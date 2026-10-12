@@ -235,7 +235,13 @@ func (b *TokenBlacklist) IsBlacklisted(ctx context.Context, jti string) bool {
 		return false
 	}
 
-	return b.store.Has(ctx, jti)
+	revoked, err := b.store.Has(ctx, jti)
+	if err != nil {
+		// The bool signature cannot carry the error; refuse rather than accept.
+		b.logger.Error("Revocation store unavailable; treating token as revoked", zap.Error(err))
+		return true
+	}
+	return revoked
 }
 
 // RevokeUser permanently marks userID as revoked: every token for it,
@@ -275,7 +281,12 @@ func (b *TokenBlacklist) IsUserRevoked(ctx context.Context, userID string) bool 
 		return false
 	}
 
-	return b.store.IsUserRevoked(ctx, userID)
+	revoked, err := b.store.IsUserRevoked(ctx, userID)
+	if err != nil {
+		b.logger.Error("Revocation store unavailable; treating user as revoked", zap.Error(err))
+		return true
+	}
+	return revoked
 }
 
 // RevokeFamily permanently revokes sid - a refresh-token family/session id
