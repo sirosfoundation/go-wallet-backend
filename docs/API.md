@@ -429,7 +429,7 @@ authenticating the User. Providers do it through `PUT
 /admin/tenants/{tenantId}/users/{userId}/instances/revoke-all`.
 
 The irreversible operation a user does own is removing the account, `DELETE
-/user/session`: it drops every session, erases the wallet data, stored
+/user/session` (confirmed with a passkey assertion, see below): it drops every session, erases the wallet data, stored
 credentials and presentations, deletes the user's wallet instances so the same
 device can enrol again, and removes the user record with its passkeys.
 
@@ -468,6 +468,86 @@ back. If it fails, the answer is `202` with `DELETION_CLEANUP_PENDING` and
 `"result": "DELETED"`: the account **is** deleted, repeating the request is
 pointless (the token is refused and the account is unknown), and an operator
 clears the remainder. The leftover is not served to any token.
+
+##### POST /user/session/delete-begin
+
+Start deleting the account. The caller must confirm it with a fresh passkey
+assertion, so a stolen bearer token alone cannot erase an account. Needs `w` in
+the token's TAC (it stores a short-lived challenge); a passkey session's default
+maximum TAC `rwl` is enough.
+
+**Response:** `200`
+```json
+{
+  "challengeId": "a1b2c3...",
+  "publicKey": {
+    "rpId": "wallet.example.org",
+    "challenge": { "$b64u": "..." },
+    "allowCredentials": [ { "type": "public-key", "id": { "$b64u": "..." }, "transports": ["internal"] } ],
+    "userVerification": "required"
+  }
+}
+```
+`allowCredentials` lists only the caller's own passkeys; any one of them may
+sign. The challenge is bound to the caller and to this action, expires after
+120 seconds and is single use (it is consumed by the first `DELETE` that
+presents it, whatever the outcome). `400 NO_PASSKEY` when the account has no
+passkey (an OIDC-only account cannot confirm this way yet); `401` when
+unauthenticated; `404` when the user no longer exists.
+
+##### DELETE /user/session
+
+Delete the account: the operation described above, authorised by the assertion.
+
+**Request:**
+```json
+{
+  "challengeId": "a1b2c3...",
+  "credential": { "id": "...", "rawId": "...", "type": "public-key", "response": { "authenticatorData": "...", "clientDataJSON": "...", "signature": "...", "userHandle": "..." } },
+  "confirm": "DELETE"
+}
+```
+`credential` is the `PublicKeyCredential` the authenticator returned for the
+options of `delete-begin`, serialised like the login `credential`. `confirm`
+must be the exact text `DELETE`.
+
+The server checks the typed confirmation, consumes the challenge for the
+caller, and verifies the assertion against the caller's own passkeys. A
+credential of another user is refused, as is a challenge that was minted for
+another user or another action (for example a login challenge). No session or
+token is minted. It then runs the deletion unchanged, so `200 {"result":
+"DELETED"}`, `202` (`DELETION_CLEANUP_PENDING`, `DELETION_OPERATOR_REQUIRED`),
+`409 DELETION_INCOMPLETE`, `401` and `404` mean what they do above. A retry
+after `409` needs a fresh `delete-begin` and assertion.
+
+| Status | `error` | Meaning |
+|--------|---------|---------|
+| 401 | `STEP_UP_REQUIRED` | no body, and `user.delete.require_step_up` is on |
+| 401 | `STEP_UP_FAILED` | challenge unknown, already used, minted for someone or something else, or the assertion did not verify; the body was malformed |
+| 410 | `STEP_UP_EXPIRED` | the challenge is older than 120 seconds |
+| 400 | `CONFIRMATION_REQUIRED` | `confirm` is not `DELETE`; the assertion is not consumed, so the request can be sent again |
+
+A request with a body is authorised by its assertion alone: it does not need
+`d` in the token's TAC, which a passkey session never holds. The bodyless
+request still needs `d`, so it only works for a token that has it.
+
+**Rollout.** For one release the bodyless `DELETE /user/session` still works,
+so the backend can ship before the clients. Set
+`user.delete.require_step_up: true` (`WALLET_USER_DELETE_REQUIRE_STEP_UP`) to
+refuse it with `401 STEP_UP_REQUIRED` once the clients send the assertion; the
+default will flip to true in a later release.
+
+**What is erased and what is kept.** Erased: the user record (private data,
+passkeys, external identities), the credentials and presentations in every
+tenant, the wallet instances, and all sessions and tokens. Kept: a deletion
+tombstone for its retention period (it refuses the user's old tokens) and the
+audit log. `202` means an operator completes the last cleanup. Issuers and
+relying parties keep their own records; they are not notified.
+
+**Audit.** With `audit.enabled`, `audit.account_events` selects the SET events
+`requested` (the assertion verified; `step_up: false` for a bodyless request),
+`succeeded` and `cleanup_pending`. The subject is a hash of the user id; no
+credential content is recorded. None is emitted by default.
 
 ### Credential Management
 
