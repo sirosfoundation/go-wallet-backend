@@ -31,6 +31,7 @@ type Services struct {
 	TokenBlacklist   *TokenBlacklist
 	ChallengeCleanup *ChallengeCleanupWorker
 	TombstoneSweeper *DeletionTombstoneSweeper
+	Reconciler       *ErasureReconciler
 	AAGUIDValidator  *AAGUIDValidator
 }
 
@@ -115,7 +116,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	proxySvc.SetUsers(store.Users())
 	fido2Svc := NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), engine.NewTrustService(cfg, logger), logger)
 	fido2Svc.SetUsers(store.Users())
-	return &Services{
+	svcs := &Services{
 		User:             userSvc,
 		Tenant:           NewTenantService(store, logger),
 		UserTenant:       NewUserTenantService(store, logger),
@@ -135,6 +136,10 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		TombstoneSweeper: NewDeletionTombstoneSweeper(cfg.Security.DeletionTombstone, store, logger),
 		AAGUIDValidator:  aaguidValidator,
 	}
+	if cfg.Lifecycle.Reconciler.Enabled {
+		svcs.Reconciler = NewErasureReconciler(cfg.Lifecycle.Reconciler, lifecycle, store, logger)
+	}
+	return svcs
 }
 
 // Start starts background workers
@@ -148,6 +153,9 @@ func (s *Services) Start() {
 	if s.TombstoneSweeper != nil {
 		s.TombstoneSweeper.Start()
 	}
+	if s.Reconciler != nil {
+		s.Reconciler.Start()
+	}
 	if s.WIA != nil {
 		s.WIA.Start()
 	}
@@ -157,6 +165,9 @@ func (s *Services) Start() {
 func (s *Services) Stop() {
 	if s.WIA != nil {
 		s.WIA.Stop()
+	}
+	if s.Reconciler != nil {
+		s.Reconciler.Stop()
 	}
 	if s.TombstoneSweeper != nil {
 		s.TombstoneSweeper.Stop()

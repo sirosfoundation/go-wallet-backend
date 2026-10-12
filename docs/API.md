@@ -348,6 +348,10 @@ What is **not** guaranteed:
   no wallet instance at all in the tenant being logged into (a first enrollment,
   which the gate does not refuse) - and that write is not swept until the next
   erasure.
+- The erasure reconciler (DEPLOYMENT.md, "Single-replica limits") later
+  erases what the two items above leave behind, once the grace period has
+  passed, so those residues are removed within about one reconciler pass; until
+  then they stay.
 - Delete and update-in-place operations are not fenced beyond the admission
   check: they cannot create data, so a late one removes or changes only
   something the erasure is removing anyway.

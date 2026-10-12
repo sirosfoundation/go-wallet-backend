@@ -633,6 +633,29 @@ one replica is supported, but these limits apply:
   from the primary). See "Erasure and requests already in flight" in API.md for
   the exact guarantee and its limits.
 
+- **Erasure reconciler.** A background job (`lifecycle.reconciler.*`, on by
+  default, `docs/CONFIGURATION.md`) backs up the two items above. Every
+  `interval_seconds` (jittered) it examines up to `batch_size` users with a
+  revoked wallet instance, resuming from a cursor and wrapping at the end. A
+  user qualifies when every instance in every tenant is non-live, at least one
+  is revoked and the latest revocation is older than `grace_period_seconds`,
+  and the user still has private data, key material or holder data
+  (credentials, presentations). Then it runs the same cascade as a revocation,
+  under the same per-user lock and cut-off ordering. It never touches a user
+  with a live or unrecognized-status instance, and a failed probe or cut-off
+  advance erases nothing. It needs no coordination between replicas: the
+  cascade is idempotent, and each replica re-checks liveness under its own user
+  lock immediately before erasing. Several replicas may erase the same user at
+  once with the same end state, at the price of duplicate work. Its guarantee
+  is eventual: data a late write or a failed cascade left behind is erased
+  within about one pass over the users plus the grace period. Limits: a
+  legacy suspended-only wallet (never revoked) is not erased; sessions and
+  challenges are dropped only when the cascade runs for another reason; a
+  first enrollment on another replica between the reconciler's liveness check
+  and its erase (milliseconds) is still unserialized across processes; and a
+  cycle takes `ceil(users / batch_size)` runs, so size the batch for the number
+  of users with revoked instances.
+
 #### Token revocation with several replicas
 
 Token revocation state is held **in memory, per process**: revoked access-token
