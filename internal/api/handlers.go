@@ -1146,6 +1146,7 @@ func (h *Handlers) requireDeleteStepUp(c *gin.Context, userID domain.UserID) boo
 			})
 			return false
 		}
+		h.services.User.AuditAccountEvent(config.AuditAccountRequested, userID, map[string]any{"step_up": false})
 		return true
 	}
 
@@ -1176,6 +1177,7 @@ func (h *Handlers) requireDeleteStepUp(c *gin.Context, userID domain.UserID) boo
 		}
 		return false
 	}
+	h.services.User.AuditAccountEvent(config.AuditAccountRequested, userID, map[string]any{"step_up": true})
 	return true
 }
 
@@ -1214,6 +1216,7 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 			// The account is gone and the caller's token is refused from now
 			// on; the remainder is for an operator. 202: what was asked happened.
 			h.logger.Error("Account deleted but cleanup incomplete", zap.Error(err))
+			h.services.User.AuditAccountEvent(config.AuditAccountCleanupPending, domain.UserIDFromString(userID.(string)), map[string]any{"error": errCodeDeletionCleanupPending})
 			c.JSON(http.StatusAccepted, gin.H{
 				"error":   errCodeDeletionCleanupPending,
 				"result":  "DELETED",
@@ -1225,6 +1228,7 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 			// Tokens are already refused for good, so a repeat cannot pass the
 			// gate; an operator must finish the deletion. 202: under way.
 			h.logger.Error("Account deletion stalled after token revocation, operator required", zap.Error(err))
+			h.services.User.AuditAccountEvent(config.AuditAccountCleanupPending, domain.UserIDFromString(userID.(string)), map[string]any{"error": errCodeDeletionOperatorRequired})
 			c.JSON(http.StatusAccepted, gin.H{
 				"error":   errCodeDeletionOperatorRequired,
 				"result":  "PENDING",
@@ -1246,6 +1250,7 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		return
 	}
 
+	h.services.User.AuditAccountEvent(config.AuditAccountSucceeded, domain.UserIDFromString(userID.(string)), nil)
 	c.JSON(200, gin.H{"result": "DELETED"})
 }
 

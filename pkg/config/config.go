@@ -2618,6 +2618,12 @@ func (c *Config) Validate() error {
 	if len(c.Audit.IdentityEvents) > 0 && !c.Audit.Enabled {
 		return fmt.Errorf("audit.identity_events requires audit.enabled")
 	}
+	if err := c.Audit.validateAccountEvents(); err != nil {
+		return err
+	}
+	if len(c.Audit.AccountEvents) > 0 && !c.Audit.Enabled {
+		return fmt.Errorf("audit.account_events requires audit.enabled")
+	}
 	if c.Audit.Enabled {
 		if c.Audit.Issuer == "" {
 			return fmt.Errorf("audit.issuer is required when audit is enabled")
@@ -2737,6 +2743,46 @@ type AuditConfig struct {
 	// hash. Unknown names are rejected at startup.
 	// Env: WALLET_AUDIT_IDENTITY_EVENTS (comma-separated)
 	IdentityEvents []string `yaml:"identity_events" envconfig:"IDENTITY_EVENTS"`
+	// AccountEvents selects which account-deletion audit events are emitted,
+	// by short name: requested, succeeded, cleanup_pending. Default: none.
+	// Requires enabled. The subject is only ever emitted as a hash; no
+	// credential content is recorded. Unknown names are rejected at startup.
+	// Env: WALLET_AUDIT_ACCOUNT_EVENTS (comma-separated)
+	AccountEvents []string `yaml:"account_events" envconfig:"ACCOUNT_EVENTS"`
+}
+
+// Names accepted in AuditConfig.AccountEvents.
+const (
+	// AuditAccountRequested: a deletion was authorised by a verified step-up
+	// assertion and is about to run.
+	AuditAccountRequested = "requested"
+	// AuditAccountSucceeded: the deletion completed (200).
+	AuditAccountSucceeded = "succeeded"
+	// AuditAccountCleanupPending: the account is gone or its tokens are revoked
+	// but an operator must finish the cleanup (202).
+	AuditAccountCleanupPending = "cleanup_pending"
+)
+
+// AccountEventEnabled reports whether the named account event is selected.
+func (c AuditConfig) AccountEventEnabled(name string) bool {
+	for _, e := range c.AccountEvents {
+		if strings.EqualFold(strings.TrimSpace(e), name) {
+			return true
+		}
+	}
+	return false
+}
+
+// validateAccountEvents rejects unknown event names.
+func (c AuditConfig) validateAccountEvents() error {
+	for _, e := range c.AccountEvents {
+		switch strings.ToLower(strings.TrimSpace(e)) {
+		case AuditAccountRequested, AuditAccountSucceeded, AuditAccountCleanupPending:
+		default:
+			return fmt.Errorf("audit.account_events: unknown event %q (valid: requested, succeeded, cleanup_pending)", e)
+		}
+	}
+	return nil
 }
 
 // Names accepted in AuditConfig.IdentityEvents.

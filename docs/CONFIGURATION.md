@@ -286,6 +286,7 @@ Environment prefix: `WALLET_AUDIT`
 | `audit.key_path` | `WALLET_AUDIT_KEY_PATH` | string | KeyPath is the path to a PEM-encoded EC private key for signing SET records. |
 | `audit.key_id` | `WALLET_AUDIT_KEY_ID` | string | KeyID is the kid used in SET JWS headers. |
 | `audit.identity_events` | `WALLET_AUDIT_IDENTITY_EVENTS` | string list | IdentityEvents selects which enterprise-identity (OIDC gate) audit events are emitted, by short name: bound, verified, mismatch, gate_bypass. Default: none. Requires enabled. The subject is only ever emitted as a hash. Unknown names are rejected at startup. Env: WALLET_AUDIT_IDENTITY_EVENTS (comma-separated) |
+| `audit.account_events` | `WALLET_AUDIT_ACCOUNT_EVENTS` | string list | AccountEvents selects which account-deletion audit events are emitted, by short name: requested, succeeded, cleanup_pending. Default: none. Requires enabled. The subject is only ever emitted as a hash; no credential content is recorded. Unknown names are rejected at startup. Env: WALLET_AUDIT_ACCOUNT_EVENTS (comma-separated) |
 
 ## presentation
 
