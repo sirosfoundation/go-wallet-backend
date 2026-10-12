@@ -1863,6 +1863,12 @@ type ErasureReconcilerConfig struct {
 	// completes erasures that revocation already decided on.
 	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
 
+	// DryRun runs the full decision (liveness, grace period, leftover-data
+	// probe) but writes nothing: the reconciler only logs and counts the users
+	// it would erase. Recommended for the first run on an existing deployment.
+	// Default: false
+	DryRun bool `yaml:"dry_run" envconfig:"DRY_RUN"`
+
 	// IntervalSeconds is the time between runs, jittered by up to 10%.
 	// Default: 600 (10 minutes)
 	IntervalSeconds int `yaml:"interval_seconds" envconfig:"INTERVAL_SECONDS"`

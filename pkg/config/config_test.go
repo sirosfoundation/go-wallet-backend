@@ -3063,3 +3063,29 @@ func TestErasureReconcilerConfig(t *testing.T) {
 		t.Errorf("non-positive values must fall back to defaults: %+v", neg)
 	}
 }
+
+func TestErasureReconcilerDryRunConfig(t *testing.T) {
+	if defaultConfig().Lifecycle.Reconciler.DryRun {
+		t.Error("dry_run must default to false")
+	}
+	cfgPath := filepath.Join(t.TempDir(), "c.yaml")
+	yaml := "server:\n  rp_id: localhost\n  rp_origin: http://localhost:8080\nstorage:\n  type: memory\njwt:\n  secret: test-secret-that-is-at-least-32-bytes!\n"
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Lifecycle.Reconciler.DryRun {
+		t.Error("dry_run must default to false after Load")
+	}
+	t.Setenv("WALLET_LIFECYCLE_RECONCILER_DRY_RUN", "true")
+	cfg, err = Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Lifecycle.Reconciler.DryRun || !cfg.Lifecycle.Reconciler.Enabled {
+		t.Errorf("env override: %+v", cfg.Lifecycle.Reconciler)
+	}
+}

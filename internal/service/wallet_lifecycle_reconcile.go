@@ -27,6 +27,17 @@ const (
 // reconcilerActor marks cascades run by the erasure reconciler.
 var reconcilerActor = LifecycleActor{Kind: "reconciler"}
 
+// ReconcileWouldErase is the dry-run outcome for a user ReconcileUser would erase.
+const ReconcileWouldErase ReconcileOutcome = "would_erase"
+
+// Categories of leftover data a reconciliation reports; never contents.
+const (
+	leftoverPrivateData   = "private_data"
+	leftoverKeyMaterial   = "key_material"
+	leftoverCredentials   = "credentials"
+	leftoverPresentations = "presentations"
+)
+
 // ReconcileUser finishes the erasure of a deactivated wallet: a user whose
 // instances are all non-live, at least one revoked, the latest revoked at or
 // before revokedBefore, and who still has key material, private data or holder
@@ -35,72 +46,107 @@ var reconcilerActor = LifecycleActor{Kind: "reconciler"}
 // ErrErasureIncomplete from the cascade or a failed probe; both are retryable
 // and nothing is erased on a probe failure.
 func (s *WalletLifecycleService) ReconcileUser(ctx context.Context, userID domain.UserID, revokedBefore time.Time) (ReconcileOutcome, error) {
+	out, _, err := s.reconcile(ctx, userID, revokedBefore, false)
+	return out, err
+}
+
+// ReconcileUserDryRun makes the same decision as ReconcileUser but writes
+// nothing (not even the cut-off). A user that would be erased yields
+// ReconcileWouldErase and the categories of data found.
+func (s *WalletLifecycleService) ReconcileUserDryRun(ctx context.Context, userID domain.UserID, revokedBefore time.Time) (ReconcileOutcome, []string, error) {
+	return s.reconcile(ctx, userID, revokedBefore, true)
+}
+
+func (s *WalletLifecycleService) reconcile(ctx context.Context, userID domain.UserID, revokedBefore time.Time, dryRun bool) (ReconcileOutcome, []string, error) {
 	defer s.LockUser(userID)()
 
+	latest, outcome, err := s.reconcileCandidate(ctx, userID, revokedBefore)
+	if err != nil || latest == nil {
+		return outcome, nil, err
+	}
+	leftover, err := s.leftoverData(ctx, userID, latest.TenantID)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(leftover) == 0 {
+		return ReconcileClean, nil, nil
+	}
+	if dryRun {
+		return ReconcileWouldErase, leftover, nil
+	}
+	if err := s.cascadeLocked(ctx, latest.TenantID, latest, reconcilerActor); err != nil {
+		return "", leftover, err
+	}
+	return ReconcileErased, leftover, nil
+}
+
+// reconcileCandidate applies the liveness and grace checks. It returns the
+// latest revoked instance when the user may be erased, else nil and why.
+func (s *WalletLifecycleService) reconcileCandidate(ctx context.Context, userID domain.UserID, revokedBefore time.Time) (*domain.WalletInstance, ReconcileOutcome, error) {
 	instances, err := s.store.WalletInstances().GetAllByUser(ctx, userID)
 	if err != nil && !errors.Is(err, storage.ErrNotFound) {
-		return "", fmt.Errorf("list wallet instances: %w", err)
+		return nil, "", fmt.Errorf("list wallet instances: %w", err)
 	}
 	var revoked []*domain.WalletInstance
 	for _, inst := range instances {
 		switch {
 		case inst.Status.IsLive() || !inst.Status.IsKnownNonLive():
-			return ReconcileLive, nil
+			return nil, ReconcileLive, nil
 		case inst.Status == domain.InstanceStatusRevoked:
 			revoked = append(revoked, inst)
 		}
 	}
 	if len(revoked) == 0 {
-		return ReconcileClean, nil
+		return nil, ReconcileClean, nil
 	}
 	latest := latestRevoked(revoked)
 	if latest.DeactivatedAt == nil || latest.DeactivatedAt.After(revokedBefore) {
-		return ReconcileGrace, nil
+		return nil, ReconcileGrace, nil
 	}
-	present, err := s.walletDataPresent(ctx, userID, latest.TenantID)
-	if err != nil {
-		return "", err
-	}
-	if !present {
-		return ReconcileClean, nil
-	}
-	if err := s.cascadeLocked(ctx, latest.TenantID, latest, reconcilerActor); err != nil {
-		return "", err
-	}
-	return ReconcileErased, nil
+	return latest, "", nil
 }
 
-// walletDataPresent reports whether the user still has private data, key
-// material or holder data in any tenant. Sessions and challenges are not
-// probed; the cascade drops them whenever it runs.
-func (s *WalletLifecycleService) walletDataPresent(ctx context.Context, userID domain.UserID, tenantID domain.TenantID) (bool, error) {
+// leftoverData lists the categories of wallet data the user still has in any
+// tenant. Sessions and challenges are not probed; the cascade drops them
+// whenever it runs.
+func (s *WalletLifecycleService) leftoverData(ctx context.Context, userID domain.UserID, tenantID domain.TenantID) ([]string, error) {
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			return false, nil
+			return nil, nil
 		}
-		return false, fmt.Errorf("load user: %w", err)
+		return nil, fmt.Errorf("load user: %w", err)
 	}
-	if len(user.PrivateData) > 0 || len(user.Keys) > 0 {
-		return true, nil
+	var found []string
+	if len(user.PrivateData) > 0 {
+		found = append(found, leftoverPrivateData)
+	}
+	if len(user.Keys) > 0 {
+		found = append(found, leftoverKeyMaterial)
 	}
 	tenants, err := s.userTenants(ctx, userID, tenantID)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	holder := holderKey(user, userID)
+	var hasCreds, hasPres bool
 	for _, tid := range tenants {
 		creds, err := s.store.Credentials().GetAllByHolder(ctx, tid, holder)
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			return false, fmt.Errorf("list credentials: %w", err)
+			return nil, fmt.Errorf("list credentials: %w", err)
 		}
 		pres, err := s.store.Presentations().GetAllByHolder(ctx, tid, holder)
 		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			return false, fmt.Errorf("list presentations: %w", err)
+			return nil, fmt.Errorf("list presentations: %w", err)
 		}
-		if len(creds) > 0 || len(pres) > 0 {
-			return true, nil
-		}
+		hasCreds = hasCreds || len(creds) > 0
+		hasPres = hasPres || len(pres) > 0
 	}
-	return false, nil
+	if hasCreds {
+		found = append(found, leftoverCredentials)
+	}
+	if hasPres {
+		found = append(found, leftoverPresentations)
+	}
+	return found, nil
 }

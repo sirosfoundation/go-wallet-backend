@@ -302,6 +302,7 @@ Environment prefix: `WALLET_LIFECYCLE`
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
 | `lifecycle.reconciler.enabled` | `WALLET_LIFECYCLE_RECONCILER_ENABLED` | boolean | Enabled controls whether the reconciler runs. On by default: it only completes erasures that revocation already decided on. |
+| `lifecycle.reconciler.dry_run` | `WALLET_LIFECYCLE_RECONCILER_DRY_RUN` | boolean | DryRun runs the full decision (liveness, grace period, leftover-data probe) but writes nothing: the reconciler only logs and counts the users it would erase. Recommended for the first run on an existing deployment. Default: false |
 | `lifecycle.reconciler.interval_seconds` | `WALLET_LIFECYCLE_RECONCILER_INTERVAL_SECONDS` | integer | IntervalSeconds is the time between runs, jittered by up to 10%. Default: 600 (10 minutes) |
 | `lifecycle.reconciler.grace_period_seconds` | `WALLET_LIFECYCLE_RECONCILER_GRACE_PERIOD_SECONDS` | integer | GracePeriodSeconds is how long after a user's latest revocation the reconciler leaves the user alone, so a request in flight on another replica can finish. Keep it above the WIA lifetime. Default: 900 (15 minutes) |
 | `lifecycle.reconciler.batch_size` | `WALLET_LIFECYCLE_RECONCILER_BATCH_SIZE` | integer | BatchSize is the most users examined per run; a cursor walks all users with a revoked instance over successive runs. Default: 50 |

@@ -19,7 +19,7 @@ const outcomeFailed ReconcileOutcome = "failed"
 
 // ReconcileStats counts what one reconciler run did, by outcome.
 type ReconcileStats struct {
-	Scanned, Clean, Live, Grace, Erased, Failed int
+	Scanned, Clean, Live, Grace, Erased, WouldErase, Failed int
 }
 
 func (s *ReconcileStats) add(o ReconcileOutcome) {
@@ -33,6 +33,8 @@ func (s *ReconcileStats) add(o ReconcileOutcome) {
 		s.Grace++
 	case ReconcileErased:
 		s.Erased++
+	case ReconcileWouldErase:
+		s.WouldErase++
 	default:
 		s.Failed++
 	}
@@ -49,6 +51,7 @@ type ErasureReconciler struct {
 	interval  time.Duration
 	grace     time.Duration
 	batch     int
+	dryRun    bool
 	logger    *zap.Logger
 	// now is the clock; tests replace it.
 	now func() time.Time
@@ -72,6 +75,7 @@ func NewErasureReconciler(cfg config.ErasureReconcilerConfig, lifecycle *WalletL
 		interval:  time.Duration(cfg.IntervalSeconds) * time.Second,
 		grace:     time.Duration(cfg.GracePeriodSeconds) * time.Second,
 		batch:     cfg.BatchSize,
+		dryRun:    cfg.DryRun,
 		logger:    logger.Named("erasure-reconciler"),
 		now:       time.Now,
 		// A random start spreads replicas, and restarts, over the user list.
@@ -92,6 +96,13 @@ func (r *ErasureReconciler) Start() {
 	r.cancel = cancel
 	r.wg.Add(1)
 	go r.run(ctx)
+	if r.dryRun {
+		reconcilerDryRun.Set(1)
+		r.logger.Warn("Erasure reconciler is in DRY-RUN mode: it only reports what it would erase and erases nothing; set lifecycle.reconciler.dry_run=false to erase",
+			zap.Duration("interval", r.interval), zap.Duration("grace_period", r.grace), zap.Int("batch_size", r.batch))
+		return
+	}
+	reconcilerDryRun.Set(0)
 	r.logger.Info("Erasure reconciler started",
 		zap.Duration("interval", r.interval), zap.Duration("grace_period", r.grace), zap.Int("batch_size", r.batch))
 }
@@ -107,6 +118,7 @@ func (r *ErasureReconciler) Stop() {
 	r.cancel()
 	r.cancel = nil
 	r.wg.Wait()
+	reconcilerDryRun.Set(0)
 }
 
 // jittered returns d plus or minus up to a tenth of it.
@@ -142,9 +154,9 @@ func (r *ErasureReconciler) reconcile(ctx context.Context) {
 		r.logger.Error("Erasure reconciler run failed", zap.Error(err))
 		return
 	}
-	if stats.Erased > 0 || stats.Failed > 0 {
-		r.logger.Info("Erasure reconciler run finished",
-			zap.Int("scanned", stats.Scanned), zap.Int("erased", stats.Erased), zap.Int("failed", stats.Failed),
+	if stats.Erased > 0 || stats.WouldErase > 0 || stats.Failed > 0 {
+		r.logger.Info("Erasure reconciler run finished", zap.Bool("dry_run", r.dryRun),
+			zap.Int("scanned", stats.Scanned), zap.Int("erased", stats.Erased), zap.Int("would_erase", stats.WouldErase), zap.Int("failed", stats.Failed),
 			zap.Int("live", stats.Live), zap.Int("in_grace", stats.Grace), zap.Int("clean", stats.Clean))
 	}
 }
@@ -173,7 +185,17 @@ func (r *ErasureReconciler) RunOnce(ctx context.Context) (ReconcileStats, error)
 		if ctx.Err() != nil {
 			break
 		}
-		outcome, err := r.lifecycle.ReconcileUser(ctx, id, revokedBefore)
+		var outcome ReconcileOutcome
+		var err error
+		if r.dryRun {
+			var leftover []string
+			outcome, leftover, err = r.lifecycle.ReconcileUserDryRun(ctx, id, revokedBefore)
+			if outcome == ReconcileWouldErase {
+				r.logger.Info("Erasure reconciler dry run: would erase", zap.String("user_id", id.String()), zap.Strings("leftover", leftover))
+			}
+		} else {
+			outcome, err = r.lifecycle.ReconcileUser(ctx, id, revokedBefore)
+		}
 		if err != nil {
 			// The cascade already logged its own failure; a probe failure is logged here.
 			r.logger.Warn("Erasure reconciliation failed", zap.String("user_id", id.String()), zap.Error(err))

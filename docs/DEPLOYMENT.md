@@ -656,6 +656,18 @@ one replica is supported, but these limits apply:
   cycle takes `ceil(users / batch_size)` runs, so size the batch for the number
   of users with revoked instances.
 
+  **Rolling it out.** On an existing deployment, first enable the reconciler
+  with `lifecycle.reconciler.dry_run: true`. It then makes every decision
+  (liveness, grace period, leftover-data probe) but writes nothing, not even
+  the token cut-off. It logs a warning at startup, sets the gauge
+  `siros_erasure_reconciler_dry_run` to 1, counts users in
+  `siros_erasure_reconciler_users_total{outcome="would_erase"}` and logs each
+  such user (pseudonymous id and the categories `private_data`,
+  `key_material`, `credentials`, `presentations`, never contents). Check that
+  the list matches what you expect, then set `dry_run: false`; users counted
+  as `erased` from then on are real. Do not leave dry run on: nothing is
+  erased while it is.
+
 #### Token revocation with several replicas
 
 Token revocation state is held **in memory, per process**: revoked access-token
