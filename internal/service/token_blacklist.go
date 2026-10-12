@@ -34,25 +34,38 @@ type TokenBlacklist struct {
 	config config.TokenBlacklistConfig
 	logger *zap.Logger
 
-	mu              sync.RWMutex
-	tokens          map[string]time.Time // jti -> expiry time
-	userRevocations map[string]bool      // userID -> permanently revoked
-	families        map[string]time.Time // sid (refresh-token family) -> revocation retention expiry
-	stopChan        chan struct{}
-	wg              sync.WaitGroup
+	// store holds the jti and user revocations (in-memory unless replaced);
+	// ConsumeOnce and the families map stay process-local.
+	store RevocationStore
+
+	mu       sync.RWMutex
+	tokens   map[string]time.Time // jti -> expiry time (local; also backs the in-memory store)
+	families map[string]time.Time // sid (refresh-token family) -> revocation retention expiry
+	stopChan chan struct{}
+	wg       sync.WaitGroup
 }
 
 // NewTokenBlacklist creates a new token blacklist
 func NewTokenBlacklist(cfg config.TokenBlacklistConfig, logger *zap.Logger) *TokenBlacklist {
+	return NewTokenBlacklistWithStore(cfg, logger, nil)
+}
+
+// NewTokenBlacklistWithStore creates a token blacklist whose jti and user
+// revocations live in store; a nil store means the in-memory one.
+func NewTokenBlacklistWithStore(cfg config.TokenBlacklistConfig, logger *zap.Logger, store RevocationStore) *TokenBlacklist {
 	cfg.SetDefaults()
-	return &TokenBlacklist{
-		config:          cfg,
-		logger:          logger.Named("token-blacklist"),
-		tokens:          make(map[string]time.Time),
-		userRevocations: make(map[string]bool),
-		families:        make(map[string]time.Time),
-		stopChan:        make(chan struct{}),
+	b := &TokenBlacklist{
+		config:   cfg,
+		logger:   logger.Named("token-blacklist"),
+		tokens:   make(map[string]time.Time),
+		families: make(map[string]time.Time),
+		stopChan: make(chan struct{}),
 	}
+	if store == nil {
+		store = &memoryRevocationStore{mu: &b.mu, tokens: b.tokens, users: make(map[string]bool)}
+	}
+	b.store = store
+	return b
 }
 
 // Start begins the cleanup worker for expired blacklist entries.
@@ -161,10 +174,9 @@ func (b *TokenBlacklist) Add(ctx context.Context, jti string, expiry time.Time) 
 		return nil
 	}
 
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b.tokens[jti] = expiry
+	if err := b.store.Add(ctx, jti, expiry); err != nil {
+		return err
+	}
 
 	b.logger.Debug("Token added to blacklist",
 		zap.String("jti", jti),
@@ -223,20 +235,7 @@ func (b *TokenBlacklist) IsBlacklisted(ctx context.Context, jti string) bool {
 		return false
 	}
 
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	expiry, exists := b.tokens[jti]
-	if !exists {
-		return false
-	}
-
-	// Check if the blacklist entry has expired (token itself expired)
-	if time.Now().After(expiry) {
-		return false
-	}
-
-	return true
+	return b.store.Has(ctx, jti)
 }
 
 // RevokeUser permanently marks userID as revoked: every token for it,
@@ -254,10 +253,9 @@ func (b *TokenBlacklist) RevokeUser(ctx context.Context, userID string) error {
 		return nil
 	}
 
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b.userRevocations[userID] = true
+	if err := b.store.RevokeUser(ctx, userID); err != nil {
+		return err
+	}
 
 	b.logger.Debug("All tokens revoked for user", zap.String("user_id", userID))
 
@@ -277,10 +275,7 @@ func (b *TokenBlacklist) IsUserRevoked(ctx context.Context, userID string) bool 
 		return false
 	}
 
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	return b.userRevocations[userID]
+	return b.store.IsUserRevoked(ctx, userID)
 }
 
 // RevokeFamily permanently revokes sid - a refresh-token family/session id
