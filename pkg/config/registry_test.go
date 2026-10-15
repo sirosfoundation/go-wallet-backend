@@ -975,3 +975,15 @@ func TestLoadRegistryOnly_MongoPasswordForSharedRevocations(t *testing.T) {
 		assert.Contains(t, cfg.Storage.MongoDB.URI, "%PASSWORD%", name)
 	}
 }
+
+func TestLoadRegistryOnly_RejectsBadRevocationBackend(t *testing.T) {
+	dir := t.TempDir()
+	load := func(name, extra string) error {
+		_, err := LoadRegistryOnly(writeFile(t, dir, name, "as:\n  legacy:\n    enabled: false\n"+extra))
+		return err
+	}
+	assert.ErrorContains(t, load("a.yaml", "security:\n  token_blacklist:\n    backend: storag\n"), "security.token_blacklist.backend")
+	assert.ErrorContains(t, load("b.yaml", "security:\n  token_blacklist:\n    backend: storage\n"), "requires storage.type=mongodb")
+	require.NoError(t, load("c.yaml", "security:\n  token_blacklist:\n    backend: memory\n"))
+	require.NoError(t, load("d.yaml", ""))
+}
