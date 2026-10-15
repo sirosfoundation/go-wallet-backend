@@ -414,44 +414,8 @@ func TestEnrollment_AccountWithoutPasskeyNeedsNoAuthorization(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// withoutPasskeys strips u's account of its passkeys.
-func withoutPasskeys(t *testing.T, setup *testVirtualWebAuthnSetup, u *stepUpUser) {
-	t.Helper()
-	user, err := setup.store.Users().GetByID(setup.ctx, u.id)
-	require.NoError(t, err)
-	user.WebauthnCredentials = nil
-	require.NoError(t, setup.store.Users().Update(setup.ctx, user))
-}
-
-// The first passkey of an account that had none could only be enrolled on the
-// bearer token's word, so it cannot authorise a deletion or another enrolment
-// until it has aged.
-func TestStepUp_FirstPasskeyOfPasskeylessAccountWaits(t *testing.T) {
-	setup := newTestVirtualWebAuthnSetup(t)
-	alice := registerStepUpUser(t, setup, "Alice")
-	withoutPasskeys(t, setup, alice)
-
-	e := beginEnrol(t, setup, alice)
-	_, err := setup.service.FinishAddCredential(setup.ctx, alice.id, e.finish, "")
-	require.NoError(t, err)
-
-	_, err = setup.service.BeginDeleteAccountStepUp(setup.ctx, alice.id)
-	assert.ErrorIs(t, err, ErrCredentialNotFound, "no passkey is eligible yet")
-	_, err = setup.service.BeginAddCredential(setup.ctx, alice.id)
-	assert.ErrorIs(t, err, ErrEnrollmentAuthorizationFailed)
-
-	user, err := setup.store.Users().GetByID(setup.ctx, alice.id)
-	require.NoError(t, err)
-	user.WebauthnCredentials[0].StepUpEligibleAt = time.Now().Add(-time.Second)
-	require.NoError(t, setup.store.Users().Update(setup.ctx, user))
-
-	resp, err := setup.service.BeginDeleteAccountStepUp(setup.ctx, alice.id)
-	require.NoError(t, err)
-	require.NoError(t, setup.service.VerifyDeleteAccountStepUp(setup.ctx, alice.id, resp.ChallengeID, e.passkey.assertFor(t, setup, resp)))
-}
-
-// A passkey whose enrolment an existing passkey authorised needs no waiting.
-func TestStepUp_AuthorisedPasskeyUsableAtOnce(t *testing.T) {
+// A passkey whose enrolment an existing passkey authorised can authorise a deletion.
+func TestStepUp_AuthorisedPasskeyAcceptedForDeletion(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
 	alice := registerStepUpUser(t, setup, "Alice")
 	added := enrollPasskey(t, setup, alice)

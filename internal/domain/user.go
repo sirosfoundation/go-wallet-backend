@@ -162,15 +162,6 @@ type WebauthnCredential struct {
 	PRFCapable      bool          `json:"prfCapable" bson:"prf_capable"`
 	CreatedAt       time.Time     `json:"createTime" bson:"created_at"`
 	LastUseTime     *time.Time    `json:"lastUseTime,omitempty" bson:"last_use_time,omitempty"`
-
-	// StepUpEligibleAt is when a passkey added to an existing account may
-	// first authorise a step-up (account deletion). Zero means it may now.
-	StepUpEligibleAt time.Time `json:"-" bson:"step_up_eligible_at,omitempty"`
-}
-
-// UsableForStepUp reports whether the credential may authorise a step-up at now.
-func (c *WebauthnCredential) UsableForStepUp(now time.Time) bool {
-	return !now.Before(c.StepUpEligibleAt)
 }
 
 // Authenticator represents the authenticator data

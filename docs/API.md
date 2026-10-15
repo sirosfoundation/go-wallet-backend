@@ -489,13 +489,11 @@ maximum TAC `rwl` is enough.
 }
 ```
 `allowCredentials` lists only the caller's own passkeys; any one of them may
-sign. The first passkey of an account that had none is left out for its first
-24 hours: no passkey could authorise its enrolment, so it may have been
-enrolled with a stolen bearer token. The challenge is bound to the caller and to this action, expires after
+sign. The challenge is bound to the caller and to this action, expires after
 120 seconds and is single use: the first `DELETE` that presents it consumes
 it, whatever the outcome, except that a `confirm` other than `DELETE` is
 refused before the challenge is touched. `400 NO_PASSKEY` when the account has no
-eligible passkey (an OIDC-only account cannot confirm this way yet); `401` when
+passkey (an OIDC-only account cannot confirm this way yet); `401` when
 unauthenticated; `404` when the user no longer exists.
 
 ##### DELETE /user/session
@@ -583,8 +581,12 @@ request; the authorising assertion is made first or second, in either order.
 `authorization` has the shape of the `delete-begin` options and is bound to the
 same `challengeId`: its challenge is fresh, single use and dies with the
 registration challenge (5 minutes). It is absent only for an account with no
-passkey yet. `403 ENROLLMENT_AUTHORIZATION_FAILED` when the account has
-passkeys but none can authorise yet.
+passkey yet.
+
+**Known limit.** An account with no passkey (for example one that signs in
+only through OIDC) has nothing to authorise with, so the first passkey is added
+on the bearer token alone. A holder of a stolen token can therefore enrol the
+first passkey of such an account and use it to confirm a deletion.
 
 **`register-finish` request:** as before (`challengeId`, `credential`,
 `nickname`, `privateData`), plus `authorization`: the `PublicKeyCredential`

@@ -1393,10 +1393,6 @@ func (h *Handlers) StartAddWebAuthnCredential(c *gin.Context) {
 			c.JSON(403, gin.H{})
 			return
 		}
-		if errors.Is(err, service.ErrEnrollmentAuthorizationFailed) {
-			c.JSON(403, gin.H{"error": errCodeEnrollmentAuthorizationFailed, "message": "no passkey on the account can authorise adding another yet"})
-			return
-		}
 		h.logger.Error("Failed to start adding credential", zap.Error(err))
 		c.JSON(500, gin.H{"error": "Failed to start registration"})
 		return

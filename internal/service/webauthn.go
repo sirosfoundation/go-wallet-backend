@@ -1932,11 +1932,7 @@ func (s *WebAuthnService) BeginAddCredential(ctx context.Context, userID domain.
 	var authorization *EnrollmentAuthorization
 	var assertionChallenge string
 	if len(user.WebauthnCredentials) > 0 {
-		eligible := withStepUpCredentials(user, time.Now())
-		if len(eligible.WebauthnCredentials) == 0 {
-			return nil, ErrEnrollmentAuthorizationFailed
-		}
-		ch, options, err := s.ownAssertionOptions(eligible)
+		ch, options, err := s.ownAssertionOptions(user)
 		if err != nil {
 			return nil, err
 		}
@@ -2188,11 +2184,6 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 		},
 		Nickname:  &nickname,
 		CreatedAt: now,
-	}
-	if len(user.WebauthnCredentials) == 0 {
-		// Nothing could authorise this enrolment but the bearer token, so
-		// the passkey must not authorise a step-up straight away.
-		newCred.StepUpEligibleAt = now.Add(AddedPasskeyStepUpDelay)
 	}
 
 	user.WebauthnCredentials = append(user.WebauthnCredentials, newCred)

@@ -27,25 +27,6 @@ const DeleteAccountChallengeTTL = 120 * time.Second
 // a late assertion is answered as expired rather than unknown.
 const deleteAccountChallengeGrace = 10 * time.Minute
 
-// AddedPasskeyStepUpDelay is how long the first passkey of an account that had
-// none waits before it can authorise a step-up. No existing passkey could
-// authorise that enrolment, so the delay gives the owner time to notice a
-// passkey enrolled with a stolen bearer token.
-const AddedPasskeyStepUpDelay = 24 * time.Hour
-
-// withStepUpCredentials returns a copy of user holding only the passkeys that
-// may authorise a step-up now.
-func withStepUpCredentials(user *domain.User, now time.Time) *domain.User {
-	u := *user
-	u.WebauthnCredentials = nil
-	for i := range user.WebauthnCredentials {
-		if user.WebauthnCredentials[i].UsableForStepUp(now) {
-			u.WebauthnCredentials = append(u.WebauthnCredentials, user.WebauthnCredentials[i])
-		}
-	}
-	return &u
-}
-
 // ErrStepUpFailed refuses a step-up assertion that is missing, unknown,
 // already used, minted for someone or something else, or does not verify.
 var ErrStepUpFailed = errors.New("step-up assertion failed")
@@ -73,7 +54,6 @@ func (s *WebAuthnService) BeginDeleteAccountStepUp(ctx context.Context, userID d
 	if err := refuseIfCutOff(ctx, user); err != nil {
 		return nil, err
 	}
-	user = withStepUpCredentials(user, time.Now())
 	if len(user.WebauthnCredentials) == 0 {
 		return nil, ErrCredentialNotFound
 	}
@@ -177,13 +157,10 @@ func (s *WebAuthnService) VerifyDeleteAccountStepUp(ctx context.Context, userID 
 }
 
 // verifyOwnAssertion reports whether credential is a valid user-verifying
-// assertion over challenge from one of user's passkeys eligible to authorise a
-// step-up. The user is never derived from the assertion's userHandle, which
+// assertion over challenge from one of user's passkeys. The user is never derived from the assertion's userHandle, which
 // must only name userID. A clone warning is recorded but does not refuse it,
 // as at login.
 func (s *WebAuthnService) verifyOwnAssertion(ctx context.Context, user *domain.User, userID domain.UserID, challenge string, credential json.RawMessage) bool {
-	eligible := withStepUpCredentials(user, time.Now())
-
 	parsed, err := protocol.ParseCredentialRequestResponseBody(newCredentialReader(credential))
 	if err != nil {
 		return false
@@ -198,7 +175,7 @@ func (s *WebAuthnService) verifyOwnAssertion(ctx context.Context, user *domain.U
 		}
 		handle = h
 	}
-	waUser := &TenantWebAuthnUser{user: eligible, userHandle: handle}
+	waUser := &TenantWebAuthnUser{user: user, userHandle: handle}
 	creds := waUser.WebAuthnCredentials()
 	allowed := make([][]byte, 0, len(creds))
 	for _, c := range creds {
