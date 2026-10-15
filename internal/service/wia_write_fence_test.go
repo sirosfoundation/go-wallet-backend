@@ -131,3 +131,63 @@ func TestWIAService_GenerateWIA_CutoffAfterTheWriteRemovesOnlyANewInstance(t *te
 		t.Fatalf("a pre-existing instance survives a plain revocation, GetByID = %v", gerr)
 	}
 }
+
+// lateCutoffUsers advances the cut-off right after the first cut-off read that
+// follows arm(): that read is the in-lock fence, so the final gate sees it.
+type lateCutoffUsers struct {
+	storage.UserStore
+	armed   bool
+	advance func()
+}
+
+func (u *lateCutoffUsers) GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, error) {
+	at, err := u.UserStore.GetAuthCutoff(ctx, id)
+	if u.armed {
+		u.armed = false
+		u.advance()
+	}
+	return at, err
+}
+
+func TestWIAService_GenerateWIA_CutoffAfterTheFenceRemovesOnlyANewInstance(t *testing.T) {
+	for _, preexisting := range []bool{false, true} {
+		store := memory.NewStore()
+		uid := domain.NewUserID()
+		ctx := context.Background()
+		if err := store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:key:" + uid.String()}); err != nil {
+			t.Fatal(err)
+		}
+		users := &lateCutoffUsers{UserStore: store.Users(), advance: advanceCutoff(t, store, uid)}
+		wrapped := &fenceHookInstances{WalletInstanceStore: store.WalletInstances(), hook: func() {}}
+		svc := newTestWIAServiceUsingStores(t, wrapped, users)
+		tok := tokengate.WithSubject(ctx, uid.String(), time.Now().Add(-time.Minute))
+
+		challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pop, key := createTestPop(t, challenge)
+		jkt := expectedThumbprint(t, &key.PublicKey)
+		if preexisting {
+			if _, err := svc.GenerateWIA(tok, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge}); err != nil {
+				t.Fatalf("seed attestation: %v", err)
+			}
+			if challenge, _, err = svc.CreateChallenge(ctx, domain.DefaultTenantID); err != nil {
+				t.Fatal(err)
+			}
+			pop = createTestPopWithKey(t, challenge, key)
+		}
+		wrapped.hook = func() { users.armed = true }
+		_, err = svc.GenerateWIA(tok, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge})
+		if !errors.Is(err, tokengate.ErrRevoked) {
+			t.Fatalf("preexisting=%v: err = %v, want ErrRevoked", preexisting, err)
+		}
+		_, gerr := store.WalletInstances().GetByID(ctx, jkt)
+		if preexisting && gerr != nil {
+			t.Fatalf("a pre-existing instance survives a plain revocation, GetByID = %v", gerr)
+		}
+		if !preexisting && !errors.Is(gerr, storage.ErrNotFound) {
+			t.Fatalf("a new instance must be rolled back, GetByID = %v", gerr)
+		}
+	}
+}
