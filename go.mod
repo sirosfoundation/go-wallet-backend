@@ -28,7 +28,7 @@ require (
 	github.com/veraison/go-cose v1.3.0
 	go.mongodb.org/mongo-driver v1.17.10
 	go.uber.org/zap v1.28.0
-	golang.org/x/net v0.59.0
+	golang.org/x/net v0.60.0
 	golang.org/x/sync v0.24.0
 	golang.org/x/time v0.16.0
 	gopkg.in/yaml.v3 v3.0.1

@@ -60,7 +60,11 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.13.2
+          version: v2.14.0
+          # Build golangci-lint with the runner's Go (setup-go resolves the
+          # latest 1.27.x). The prebuilt binary is built with an older Go and
+          # fails to read newer stdlib export data ("typecheck" errors).
+          install-mode: goinstall
           args: --timeout=5m --tests=false
           verify: false
 
@@ -98,3 +102,32 @@ jobs:
 
       - name: Build
         run: go build -v ./...
+
+  build-variants:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build without cgo
+        env:
+          CGO_ENABLED: "0"
+        run: go build ./...
+
+      - name: Vet without cgo
+        env:
+          CGO_ENABLED: "0"
+        run: go vet ./...
+
+      - name: Vet with pkcs11 tag
+        # Non-blocking until PR #429 (fixes untagged stub tests in
+        # pkg/signing) merges; then remove continue-on-error.
+        continue-on-error: true
+        env:
+          CGO_ENABLED: "1"
+        run: go vet -tags pkcs11 ./...
