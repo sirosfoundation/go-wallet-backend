@@ -172,10 +172,14 @@ func (s *WebAuthnService) VerifyDeleteAccountStepUp(ctx context.Context, userID 
 	}
 
 	credID := base64.RawURLEncoding.EncodeToString(verified.ID)
-	if _, err := s.store.Users().UpdateCredentialAuthenticator(ctx, userID, credID,
-		verified.Authenticator.SignCount, verified.Authenticator.CloneWarning); err != nil {
-		s.logger.Warn("Failed to persist step-up sign count", zap.Error(err))
+	tenantID := domain.DefaultTenantID
+	for _, c := range user.WebauthnCredentials {
+		if c.ID == credID && c.TenantID != "" {
+			tenantID = domain.TenantID(c.TenantID) //nolint:unconvert
+		}
 	}
+	// Like login, a clone warning does not refuse the assertion.
+	s.recordAuthenticatorUse(ctx, userID, tenantID, credID, verified.Authenticator.SignCount, verified.Authenticator.CloneWarning)
 	return nil
 }
 

@@ -9,6 +9,8 @@ import (
 	"github.com/descope/virtualwebauthn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 )
@@ -232,4 +234,38 @@ func TestVerifyDeleteAccountStepUp_AssertionForAnotherChallengeRefused(t *testin
 
 	err = setup.service.VerifyDeleteAccountStepUp(setup.ctx, alice.id, second.ChallengeID, alice.assertFor(t, setup, first))
 	assert.ErrorIs(t, err, ErrStepUpFailed)
+}
+
+// A sign-counter regression is accepted, as at login, but leaves the same
+// security log line and SET event, once, and the flag persisted.
+func TestVerifyDeleteAccountStepUp_CloneWarningSurfaced(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+	core, observed := observer.New(zap.WarnLevel)
+	setup.service.logger = zap.New(core)
+	captured := attachIdentityAudit(t, setup.service)
+	alice := registerStepUpUser(t, setup, "Alice")
+
+	stepUp := func(counter uint32) {
+		t.Helper()
+		alice.credential.Counter = counter
+		resp, err := setup.service.BeginDeleteAccountStepUp(setup.ctx, alice.id)
+		require.NoError(t, err)
+		require.NoError(t, setup.service.VerifyDeleteAccountStepUp(setup.ctx, alice.id, resp.ChallengeID, alice.assertFor(t, setup, resp)))
+	}
+	stepUp(10)
+	require.Empty(t, observed.FilterMessage("possible cloned authenticator detected").All())
+	stepUp(3)
+
+	entries := observed.FilterMessage("possible cloned authenticator detected").All()
+	require.Len(t, entries, 1)
+	assert.Equal(t, "webauthn_clone_warning", entries[0].ContextMap()["security_event"])
+	assert.Equal(t, alice.id.String(), entries[0].ContextMap()["user_id"])
+	assert.Equal(t, []string{string(EventWebAuthnCloneWarning)}, captured.URIs())
+
+	user, err := setup.store.Users().GetByID(setup.ctx, alice.id)
+	require.NoError(t, err)
+	assert.True(t, user.WebauthnCredentials[0].Authenticator.CloneWarning)
+
+	stepUp(2)
+	assert.Len(t, observed.FilterMessage("possible cloned authenticator detected").All(), 1, "latched: no repeat")
 }
