@@ -218,19 +218,33 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
 		return err
 	}
+	// The instance can be revoked between the first check and here.
+	if _, err := refuseWalletInstance(ctx, s.instances, req.WalletInstanceID, true); err != nil {
+		return err
+	}
 	if err := s.keyAttestations.MarkKeyAttested(ctx, rec); err != nil {
 		return fmt.Errorf("record key attestation: %w", err)
 	}
-	// A cut-off during the write fails the request closed. The erasure cascade
-	// does not cover this record, so undo it, conditionally on this write: delete
-	// a new record, restore the evidence an overwrite replaced.
+	// A cut-off or an instance revocation during the write fails the request
+	// closed. The erasure cascade does not cover this record, so undo it,
+	// conditionally on this write: delete a new record, restore the evidence an
+	// overwrite replaced.
 	written := *rec
-	if err := tokengate.ConfirmWrite(ctx, s.users, func(rctx context.Context) error {
+	undo := func(rctx context.Context) error {
 		if written.Previous != nil {
 			return s.keyAttestations.RestoreIfUnchanged(rctx, &written, written.Previous)
 		}
 		return s.keyAttestations.DeleteIfUnchanged(rctx, written.KeyThumbprint, written.WriteToken)
-	}); err != nil {
+	}
+	if err := tokengate.ConfirmWrite(ctx, s.users, undo); err != nil {
+		return err
+	}
+	if _, err := refuseWalletInstance(ctx, s.instances, req.WalletInstanceID, true); err != nil {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if rerr := undo(rctx); rerr != nil && !errors.Is(rerr, storage.ErrNotFound) {
+			return errors.Join(err, fmt.Errorf("%w: %w", tokengate.ErrWriteNotRolledBack, rerr))
+		}
 		return err
 	}
 
