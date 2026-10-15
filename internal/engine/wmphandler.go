@@ -678,7 +678,12 @@ func (a *WMPAdapter) HandleRPCAs(ctx context.Context, sessionID string, caller w
 
 	a.touchSession(sessionID)
 
-	return ws.peer.HandleRequestSync(context.WithValue(ctx, wmpCallerTACKey{}, wmpTACInfo{TAC: caller.TAC, Enforce: caller.EnforceTAC || caller.TAC != ""}), body)
+	return ws.peer.HandleRequestSync(withCallerTAC(ctx, caller), body)
+}
+
+// withCallerTAC carries the caller's token permissions to the method handlers.
+func withCallerTAC(ctx context.Context, caller wmpCaller) context.Context {
+	return context.WithValue(ctx, wmpCallerTACKey{}, wmpTACInfo{TAC: caller.TAC, Enforce: caller.EnforceTAC || caller.TAC != ""})
 }
 
 // Events returns the session's outbound notifications (retained events, then
@@ -2326,6 +2331,9 @@ const wmpOutboundRequestTTL = childFlowStartTimeout + 30*time.Second
 // outboundRequest is a server->client JSON-RPC request awaiting its response.
 type outboundRequest struct {
 	sessionID string
+	// flowID is the flow_id in the request's params (the child flow of a
+	// sign/match start), used to find the parent flow the response drives.
+	flowID    string
 	expiresAt time.Time
 }
 
@@ -2335,6 +2343,9 @@ func (a *WMPAdapter) trackOutbound(sessionID string, data []byte) {
 	var env struct {
 		ID     json.RawMessage `json:"id"`
 		Method string          `json:"method"`
+		Params struct {
+			FlowID string `json:"flow_id"`
+		} `json:"params"`
 	}
 	if json.Unmarshal(data, &env) != nil || env.Method == "" || len(env.ID) == 0 || string(env.ID) == "null" {
 		return
@@ -2344,7 +2355,7 @@ func (a *WMPAdapter) trackOutbound(sessionID string, data []byte) {
 	if a.outbound == nil {
 		a.outbound = make(map[string]outboundRequest)
 	}
-	a.outbound[string(env.ID)] = outboundRequest{sessionID: sessionID, expiresAt: time.Now().Add(wmpOutboundRequestTTL)}
+	a.outbound[string(env.ID)] = outboundRequest{sessionID: sessionID, flowID: env.Params.FlowID, expiresAt: time.Now().Add(wmpOutboundRequestTTL)}
 }
 
 // routeResponse delivers a client response to the session with the matching
@@ -2364,15 +2375,9 @@ func (a *WMPAdapter) routeResponse(ctx context.Context, sessionID string, caller
 		tracked = false
 	}
 	if sessionID != "" {
-		if tracked && o.sessionID == sessionID {
-			delete(a.outbound, key)
-		}
 		ws = a.peers[sessionID]
 	} else if tracked {
 		if cand, ok := a.peers[o.sessionID]; ok && ownsSession(cand, caller) {
-			// Consume only for the owner so a foreign token cannot burn another
-			// user's pending ID.
-			delete(a.outbound, key)
 			ws = cand
 			sessionID = o.sessionID
 		}
@@ -2387,6 +2392,39 @@ func (a *WMPAdapter) routeResponse(ctx context.Context, sessionID string, caller
 			"reason": "unknown or unauthorized response ID",
 		})
 	}
+
+	// A response can fail the flow that awaits it, so it needs the permission
+	// that flow's protocol requires, like flow.cancel. A denied caller must
+	// leave the ID usable by an authorized one.
+	if !a.authorizeResponse(ctx, caller, sessionID, ws, o.flowID) {
+		return wmpErrorBytes(nil, wmp.ErrNotAuthorized, map[string]string{
+			"reason": "insufficient permissions for flow type",
+		})
+	}
+
+	a.mu.Lock()
+	// Consume only for the owner so a foreign token cannot burn another
+	// user's pending ID.
+	if cur, ok := a.outbound[key]; ok && cur.sessionID == sessionID {
+		delete(a.outbound, key)
+	}
+	a.mu.Unlock()
+
 	a.touchSession(sessionID)
 	return ws.peer.HandleRequestSync(ctx, body)
+}
+
+// authorizeResponse reports whether caller may answer a request the server sent
+// for child flow flowID: it must hold the permission of the parent flow's
+// protocol. When the parent cannot be resolved, the token must cover everything
+// the session was created with.
+func (a *WMPAdapter) authorizeResponse(ctx context.Context, caller wmpCaller, sessionID string, ws *wmpSession, flowID string) bool {
+	if ws.handler != nil && flowID != "" {
+		if child, ok := ws.handler.peekChildFlow(flowID); ok {
+			if parent, rpcErr := ws.handler.authorizeFlow(withCallerTAC(ctx, caller), child.parentFlowID); parent != nil {
+				return rpcErr == nil
+			}
+		}
+	}
+	return a.tokenCoversSession(sessionID, caller.TAC, caller.EnforceTAC || caller.TAC != "")
 }

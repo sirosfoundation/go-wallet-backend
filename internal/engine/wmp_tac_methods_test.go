@@ -371,3 +371,43 @@ func TestWMP_SSE_LegacySessionRequiresEffectivePermissionsFromModernToken(t *tes
 	a.HandleWMPEvents(w, req)
 	assert.Equal(t, http.StatusForbidden, w.Code)
 }
+
+// A response to a server-initiated request can fail the flow that awaits it, so
+// a token without that flow's permission cannot send one, with or without the
+// session header, and does not consume the pending ID.
+func TestWMP_OutboundResponse_EnforcesParentProtocolTAC(t *testing.T) {
+	for name, header := range map[string]bool{"with session header": true, "without session header": false} {
+		t.Run(name, func(t *testing.T) {
+			f := newTACMethodFixture(t)
+			f.a.mu.RLock()
+			ws := f.a.peers[f.sid]
+			f.a.mu.RUnlock()
+			ws.handler.registerChildFlow("child-1", "f-i", "msg-1", "sign")
+
+			id := json.RawMessage(`"req-1"`)
+			f.a.mu.Lock()
+			f.a.outbound[string(id)] = outboundRequest{sessionID: f.sid, flowID: "child-1", expiresAt: time.Now().Add(time.Minute)}
+			f.a.mu.Unlock()
+
+			sid := ""
+			if header {
+				sid = f.sid
+			}
+			body, err := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": id, "error": map[string]any{"code": -32000, "message": "no"}})
+			require.NoError(t, err)
+
+			reduced := tacReduced
+			reduced.UserID, reduced.TenantID = ws.session.UserID, ws.session.TenantID
+			resp, err := f.a.HandleRPCAs(context.Background(), sid, reduced, body)
+			require.NoError(t, err)
+			assert.Equal(t, wmp.ErrNotAuthorized, rpcErrCode(t, resp))
+			assert.Equal(t, 1, f.a.outboundCount(), "denied response must not consume the pending ID")
+
+			full := tacFull
+			full.UserID, full.TenantID = ws.session.UserID, ws.session.TenantID
+			_, err = f.a.HandleRPCAs(context.Background(), sid, full, body)
+			require.NoError(t, err)
+			assert.Equal(t, 0, f.a.outboundCount(), "authorized response consumes the ID")
+		})
+	}
+}
