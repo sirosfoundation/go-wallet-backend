@@ -300,3 +300,42 @@ func TestDeleteUser_FinalSweepFailureAfterBlacklistIsOperatorOnly(t *testing.T) 
 		})
 	}
 }
+
+type failUserDeleteStore struct{ storage.Store }
+
+type failUserDeleteUsers struct{ storage.UserStore }
+
+func (s *failUserDeleteStore) Users() storage.UserStore { return &failUserDeleteUsers{s.Store.Users()} }
+
+func (failUserDeleteUsers) Delete(context.Context, domain.UserID) error {
+	return errors.New("user store is down")
+}
+
+// A failed record removal says whether a fresh login can retry or an operator
+// must finish, like the other post-revocation stalls.
+func TestDeleteUser_RecordRemovalFailureReportsWhoCanRetry(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name      string
+		blacklist TokenRevoker
+		want      error
+		notWant   error
+	}{
+		{"blacklist in force", &countingRevoker{}, ErrDeletionOperatorRequired, ErrDeletionIncomplete},
+		{"no blacklist: a fresh login can retry", nil, ErrDeletionIncomplete, ErrDeletionOperatorRequired},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &failUserDeleteStore{Store: memory.NewStore()}
+			svc := NewUserService(fs, testConfig(), zap.NewNop())
+			if tc.blacklist != nil {
+				svc.SetTokenBlacklist(tc.blacklist)
+			}
+			uid := domain.NewUserID()
+			require.NoError(t, fs.Store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:key:" + uid.String()}))
+
+			err := svc.DeleteUser(ctx, uid, uid.String())
+			require.ErrorIs(t, err, tc.want)
+			assert.NotErrorIs(t, err, tc.notWant)
+		})
+	}
+}

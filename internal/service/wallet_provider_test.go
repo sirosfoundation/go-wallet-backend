@@ -966,3 +966,30 @@ func TestWalletProviderService_PublicKey_NilWithoutSigner(t *testing.T) {
 		t.Errorf("expected nil PublicKey() without a configured signer, got %v", pub)
 	}
 }
+
+// Evidence recorded for one instance must not lift another instance's batch.
+func TestGenerateKeyAttestation_SecurityProperties_ClampedWhenEvidenceBelongsToAnotherInstance(t *testing.T) {
+	svc, instances, keyAttestations := newTestWalletProviderServiceWithInstances(t)
+	ctx := context.Background()
+	for _, id := range []string{"inst-a", "inst-b"} {
+		if err := instances.Upsert(ctx, &domain.WalletInstance{ID: id, Status: domain.InstanceStatusActive}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}
+	thumbprint, err := jwk.Thumbprint(jwks[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := keyAttestations.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{
+		KeyThumbprint: thumbprint, WalletInstanceID: "inst-a", VerifiedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !svc.keyAttestationTrustsBatch(ctx, "inst-a", jwks) {
+		t.Fatal("the instance the evidence was recorded for must be trusted")
+	}
+	if svc.keyAttestationTrustsBatch(ctx, "inst-b", jwks) {
+		t.Fatal("evidence recorded for another instance must not be trusted")
+	}
+}

@@ -618,7 +618,9 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// Delete the user
 	// An already-removed record is the wanted outcome.
 	if err := s.store.Users().Delete(ctx, userID); err != nil && !errors.Is(err, storage.ErrNotFound) {
-		return fmt.Errorf("failed to delete user: %w", err)
+		s.logger.Error("Account deletion incomplete: the user record could not be removed",
+			zap.Error(err), zap.String("user_id", userID.String()))
+		return fmt.Errorf("%w: delete user: %w", deletionStallErr(lockedOut), err)
 	}
 
 	// Last sweep, after the record is gone: the tombstone now refuses writes, so
