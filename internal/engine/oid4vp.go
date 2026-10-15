@@ -106,22 +106,34 @@ type TransactionData struct {
 	TransactionDataHashesAlg HashAlgList `json:"transaction_data_hashes_alg,omitempty"`
 }
 
-// HashAlgList is the request-side `transaction_data_hashes_alg` member: an array of
-// hash algorithm names, or a bare string some verifiers send for a single one.
+// HashAlgList is the request-side `transaction_data_hashes_alg` member: a
+// non-empty array of hash algorithm names. It also accepts a bare string,
+// which some verifiers send for a single algorithm.
 type HashAlgList []string
 
-// UnmarshalJSON accepts either a JSON string or an array of strings.
+// UnmarshalJSON accepts a non-empty string or a non-empty array of non-empty
+// strings. OID4VP defines the member as a non-empty array of algorithm
+// identifiers, one of which the wallet must use, so an empty list leaves it
+// nothing valid to choose. Anything else is rejected, and `null` is not the
+// same as leaving the member out.
 func (l *HashAlgList) UnmarshalJSON(b []byte) error {
+	errInvalid := errors.New("transaction_data_hashes_alg must be a non-empty string or a non-empty array of non-empty strings")
+	var algs []string
 	var one string
-	if err := json.Unmarshal(b, &one); err == nil {
-		*l = HashAlgList{one}
-		return nil
+	if err := json.Unmarshal(b, &one); err == nil && string(b) != "null" {
+		algs = []string{one}
+	} else if err := json.Unmarshal(b, &algs); err != nil || algs == nil {
+		return errInvalid
 	}
-	var many []string
-	if err := json.Unmarshal(b, &many); err != nil {
-		return errors.New("transaction_data_hashes_alg must be a string or an array of strings")
+	if len(algs) == 0 {
+		return errInvalid
 	}
-	*l = HashAlgList(many)
+	for _, a := range algs {
+		if a == "" {
+			return errInvalid
+		}
+	}
+	*l = HashAlgList(algs)
 	return nil
 }
 
@@ -406,8 +418,10 @@ func (h *OID4VPHandler) parseRequestFromURL(u *url.URL) (*AuthorizationRequest, 
 
 	// Parse transaction_data (a JSON array of base64url strings in a query string).
 	// It must be kept even though nothing here interprets it: dropping it would let a
-	// transaction request bypass validateTransactionData.
-	if tdStr := q.Get("transaction_data"); tdStr != "" {
+	// transaction request bypass validateTransactionData. A parameter that is
+	// present but empty is rejected rather than read as absent.
+	if q.Has("transaction_data") {
+		tdStr := q.Get("transaction_data")
 		if !json.Valid([]byte(tdStr)) {
 			return nil, fmt.Errorf("invalid transaction_data: not valid JSON")
 		}
@@ -2352,7 +2366,7 @@ type decodedTransactionData struct {
 	Data TransactionData
 }
 
-// decodeTransactionData decodes the array structurally (base64url strings, each a
+// decodeTransactionData decodes the array structurally (non-empty, base64url strings, each a
 // JSON object) without deciding which types are supported.
 func decodeTransactionData(raw json.RawMessage) ([]decodedTransactionData, error) {
 	if len(raw) == 0 {
@@ -2365,6 +2379,10 @@ func decodeTransactionData(raw json.RawMessage) ([]decodedTransactionData, error
 	var rawStrings []string
 	if err := json.Unmarshal(raw, &rawStrings); err != nil {
 		return nil, newTransactionDataError(ErrCodeInvalidMessage, "invalid transaction_data: expected array of base64url strings: %w", err)
+	}
+	// An empty array is not the same as leaving the parameter out.
+	if len(rawStrings) == 0 {
+		return nil, newTransactionDataError(ErrCodeInvalidMessage, "invalid transaction_data: must not be an empty array")
 	}
 	out := make([]decodedTransactionData, 0, len(rawStrings))
 	for i, encoded := range rawStrings {

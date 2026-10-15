@@ -135,7 +135,10 @@ func TestHashAlgList_Unmarshal(t *testing.T) {
 	}{
 		"array (OID4VP 1.0 request form)": {`["sha-256","sha-384"]`, HashAlgList{"sha-256", "sha-384"}, false},
 		"bare string tolerated":           {`"sha-384"`, HashAlgList{"sha-384"}, false},
-		"empty array":                     {`[]`, HashAlgList{}, false},
+		"empty array rejected":            {`[]`, nil, true},
+		"null rejected":                   {`null`, nil, true},
+		"empty string rejected":           {`""`, nil, true},
+		"empty name in array rejected":    {`["sha-256",""]`, nil, true},
 		"number rejected":                 {`5`, nil, true},
 		"array of numbers rejected":       {`[1,2]`, nil, true},
 	}
@@ -216,7 +219,6 @@ func TestValidateTransactionData_NoTransactionDataIsUnaffectedByDeclaration(t *t
 	for name, msg := range map[string]*FlowStartMessage{"nil": nil, "none": {}, "declared": tdClient} {
 		t.Run(name, func(t *testing.T) {
 			assert.NoError(t, validateTransactionData(&AuthorizationRequest{}, msg))
-			assert.NoError(t, validateTransactionData(&AuthorizationRequest{TransactionDataRaw: json.RawMessage(`[]`)}, msg))
 		})
 	}
 }
@@ -449,6 +451,19 @@ func TestParseRequestFromURL_NoTransactionDataStaysEmpty(t *testing.T) {
 	authReq, err := (&OID4VPHandler{}).parseRequestFromURL(inlineURL(t, map[string]string{"client_id": "x", "nonce": "n"}))
 	require.NoError(t, err)
 	assert.Empty(t, authReq.TransactionDataRaw)
+}
+
+func TestParseRequestFromURL_EmptyTransactionDataParameterIsRejected(t *testing.T) {
+	_, err := (&OID4VPHandler{}).parseRequestFromURL(inlineURL(t, map[string]string{"client_id": "x", "transaction_data": ""}))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid transaction_data")
+}
+
+func TestValidateTransactionData_EmptyArrayIsRejected(t *testing.T) {
+	err := validateTransactionData(&AuthorizationRequest{TransactionDataRaw: json.RawMessage(`[]`)}, tdClient)
+	var tdErr *transactionDataError
+	require.True(t, errors.As(err, &tdErr))
+	assert.Equal(t, ErrCodeInvalidMessage, tdErr.code)
 }
 
 func TestParseRequestFromURL_InvalidTransactionDataJSON(t *testing.T) {
