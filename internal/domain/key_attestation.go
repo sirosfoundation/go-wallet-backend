@@ -34,6 +34,10 @@ type KeyAttestationRecord struct {
 	// VerifiedAt is when this key's attestation was verified.
 	VerifiedAt time.Time `json:"verified_at" bson:"verified_at"`
 
+	// WriteToken identifies the most recent write to this record: a fresh random
+	// value set by MarkKeyAttested, for a conditional rollback.
+	WriteToken string `json:"-" bson:"write_token,omitempty"`
+
 	// CreatedAt is when this record was first stored.
 	CreatedAt time.Time `json:"created_at" bson:"created_at"`
 }

@@ -252,17 +252,16 @@ func (u *cutoffAdvancingUsers) GetAuthCutoff(ctx context.Context, id domain.User
 }
 
 // A revocation after GenerateWIA's first cut-off check must refuse the
-// request, and before the write must not record the instance.
+// request and must not leave the instance it created.
 func TestWIAService_GenerateWIA_RevocationLandingBeforeSigningIsRefused(t *testing.T) {
 	// GenerateWIA's own check is read 1; the signing-boundary check is read 2;
 	// the release check is read 3.
 	for _, tc := range []struct {
-		name         string
-		after        int
-		wantRecorded bool
+		name  string
+		after int
 	}{
-		{"between the first check and signing", 1, false},
-		{"during the instance write", 2, true},
+		{"between the first check and signing", 1},
+		{"during the instance write", 2},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			base := context.Background()
@@ -284,11 +283,7 @@ func TestWIAService_GenerateWIA_RevocationLandingBeforeSigningIsRefused(t *testi
 
 			recorded, gerr := store.WalletInstances().GetByUser(base, domain.DefaultTenantID, uid)
 			require.NoError(t, gerr)
-			if tc.wantRecorded {
-				assert.Len(t, recorded, 1)
-			} else {
-				assert.Empty(t, recorded, "a refused request must not record the instance")
-			}
+			assert.Empty(t, recorded, "a refused request must not leave the instance")
 		})
 	}
 }
