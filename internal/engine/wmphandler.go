@@ -54,7 +54,11 @@ type WMPAdapter struct {
 	tokenSlotsMu sync.Mutex
 	tokenSlots   map[string]int
 
-	stopCh      chan struct{}
+	stopCh chan struct{}
+	// sweepCtx bounds the expiry sweep's store work; shutdown cancels it so a
+	// stalled delete cannot hold the cleanup loop.
+	sweepCtx    context.Context
+	sweepCancel context.CancelFunc
 	stopOnce    sync.Once
 	loopStarted chan struct{} // closed when cleanupLoop begins running
 	loopDone    chan struct{} // closed when cleanupLoop has exited
@@ -327,6 +331,10 @@ type resumptionEntry struct {
 // resume response).
 const resumptionGraceWindow = 2 * time.Minute
 
+// wmpCleanupInterval is how often the cleanup loop sweeps. A variable so tests
+// can shorten it.
+var wmpCleanupInterval = time.Minute
+
 // wmpSessionIdleTimeout closes a WMP session after this much inactivity.
 const wmpSessionIdleTimeout = 10 * time.Minute
 
@@ -428,6 +436,7 @@ func requestTACInfo(ctx context.Context) wmpTACInfo {
 // NewWMPAdapter creates an adapter bridging WMP JSON-RPC to the engine.
 // bearerToken is injected because the engine cannot import pkg/middleware.
 func NewWMPAdapter(manager *Manager, logger *zap.Logger, bearerToken func(*http.Request) string) *WMPAdapter {
+	sweepCtx, sweepCancel := context.WithCancel(context.Background())
 	a := &WMPAdapter{
 		bearerToken:      bearerToken,
 		manager:          manager,
@@ -437,10 +446,12 @@ func NewWMPAdapter(manager *Manager, logger *zap.Logger, bearerToken func(*http.
 		eventBufs:        make(map[string]*wmpEventBuffer),
 		outbound:         make(map[string]outboundRequest),
 		stopCh:           make(chan struct{}),
+		sweepCtx:         sweepCtx,
+		sweepCancel:      sweepCancel,
 		loopStarted:      make(chan struct{}),
 		loopDone:         make(chan struct{}),
 	}
-	go a.cleanupLoop()
+	go a.cleanupLoop(wmpCleanupInterval)
 	return a
 }
 
@@ -482,8 +493,16 @@ func (a *WMPAdapter) CloseContext(ctx context.Context) {
 	// snapshot below.
 	a.Drain()
 	a.stopOnce.Do(func() { close(a.stopCh) })
+	// Interrupt a sweep stuck in store work, and wait for the loop only as long
+	// as ctx allows: the live sessions below must be stopped either way.
+	if a.sweepCancel != nil {
+		a.sweepCancel()
+	}
 	if a.loopDone != nil {
-		<-a.loopDone
+		select {
+		case <-a.loopDone:
+		case <-ctx.Done():
+		}
 	}
 	a.mu.Lock()
 	closing := make([]*wmpSession, 0, len(a.peers))
@@ -503,14 +522,14 @@ func (a *WMPAdapter) CloseContext(ctx context.Context) {
 }
 
 // cleanupLoop periodically removes expired resumption tokens and idle sessions.
-func (a *WMPAdapter) cleanupLoop() {
+func (a *WMPAdapter) cleanupLoop(interval time.Duration) {
 	if a.loopStarted != nil {
 		close(a.loopStarted)
 	}
 	if a.loopDone != nil {
 		defer close(a.loopDone)
 	}
-	ticker := time.NewTicker(1 * time.Minute)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
@@ -561,12 +580,20 @@ func (a *WMPAdapter) cleanupExpired() {
 	for _, e := range expiredSessions {
 		// Re-check under the lock: the session may have been touched since the
 		// scan.
-		if a.closeSessionIf(e.sid, e.ws, func(ws *wmpSession) bool {
+		if a.closeSessionIfCtx(a.sweepContext(), e.sid, e.ws, func(ws *wmpSession) bool {
 			return wmpSessionExpiredLocked(ws, time.Now())
 		}) {
 			a.logger.Info("Closed expired/idle WMP session", zap.String("session_id", shortID(e.sid)))
 		}
 	}
+}
+
+// sweepContext is the context for the sweep's store work.
+func (a *WMPAdapter) sweepContext() context.Context {
+	if a.sweepCtx == nil {
+		return context.Background()
+	}
+	return a.sweepCtx
 }
 
 func shortID(sid string) string {
@@ -812,6 +839,11 @@ func (a *WMPAdapter) closeSessionIfCurrent(sessionID string, ws *wmpSession) {
 // under a.mu once ws is confirmed current; a false result leaves the session
 // alone. It reports whether the session was closed.
 func (a *WMPAdapter) closeSessionIf(sessionID string, ws *wmpSession, pred func(*wmpSession) bool) bool {
+	return a.closeSessionIfCtx(context.Background(), sessionID, ws, pred)
+}
+
+// closeSessionIfCtx is closeSessionIf with the persistent cleanup bounded by ctx.
+func (a *WMPAdapter) closeSessionIfCtx(ctx context.Context, sessionID string, ws *wmpSession, pred func(*wmpSession) bool) bool {
 	a.mu.Lock()
 	current, ok := a.peers[sessionID]
 	if !ok || current != ws || (pred != nil && !pred(ws)) {
@@ -823,7 +855,7 @@ func (a *WMPAdapter) closeSessionIf(sessionID string, ws *wmpSession, pred func(
 	a.dropSessionStateLocked(sessionID)
 	a.mu.Unlock()
 
-	a.teardown(ws)
+	a.teardownCtx(ctx, ws)
 	return true
 }
 

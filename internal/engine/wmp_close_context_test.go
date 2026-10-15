@@ -68,3 +68,47 @@ func TestWMPAdapter_CloseContext_BoundedByContextAndStopsSessionsFirst(t *testin
 	assert.Empty(t, a.peers)
 	a.mu.RUnlock()
 }
+
+// A sweep already blocked in a store delete must not hold up shutdown: CloseContext
+// cancels it and still stops the live sessions within the context.
+func TestWMPAdapter_CloseContext_NotBlockedByStuckExpirySweep(t *testing.T) {
+	old := wmpCleanupInterval
+	wmpCleanupInterval = 10 * time.Millisecond
+	a, m := testWMPAdapter()
+	wmpCleanupInterval = old
+
+	sid, _, _ := createSessionFull(t, a, "u", "t", nil)
+	live, _, _ := createSessionFull(t, a, "u2", "t", nil)
+	a.mu.RLock()
+	liveSess := a.peers[live].session
+	a.mu.RUnlock()
+
+	entered := make(chan struct{})
+	var once sync.Once
+	m.sessionsMu.Lock()
+	m.sessionStore = &stuckStore{MemorySessionStore: NewMemorySessionStore(zap.NewNop()), onDelete: func() { once.Do(func() { close(entered) }) }}
+	m.sessionsMu.Unlock()
+	a.mu.Lock()
+	a.peers[sid].lastActivity = time.Now().Add(-2 * wmpSessionIdleTimeout)
+	a.mu.Unlock()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the sweep never reached the store")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	done := make(chan struct{})
+	go func() { a.CloseContext(ctx); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("CloseContext blocked on the stuck sweep")
+	}
+	select {
+	case <-liveSess.closeCh:
+	default:
+		t.Fatal("the live session was not stopped")
+	}
+}
