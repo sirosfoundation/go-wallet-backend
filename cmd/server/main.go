@@ -371,7 +371,7 @@ func main() {
 	//  3. Shut the listeners down within the timeout.
 	if engineProvider != nil {
 		engineProvider.Drain()
-		engineProvider.Close()
+		engineProvider.CloseContext(shutdownCtx)
 	}
 
 	if err := mgr.Shutdown(shutdownCtx); err != nil {

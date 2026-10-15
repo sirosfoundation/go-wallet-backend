@@ -470,6 +470,14 @@ func (a *WMPAdapter) isDraining() bool {
 // Close stops the cleanup loop and waits for it to exit. Safe to call more
 // than once. Live sessions are closed when the engine Manager is closed.
 func (a *WMPAdapter) Close() {
+	a.CloseContext(context.Background())
+}
+
+// CloseContext is Close with the cleanup bounded by ctx: every live session is
+// stopped at once, so SSE handlers and connections end promptly, and only then
+// is each session's persistent state removed, as far as ctx allows. What is
+// left expires with its store TTL.
+func (a *WMPAdapter) CloseContext(ctx context.Context) {
 	// Refuse new work first so a racing session.create cannot register after the
 	// snapshot below.
 	a.Drain()
@@ -477,16 +485,20 @@ func (a *WMPAdapter) Close() {
 	if a.loopDone != nil {
 		<-a.loopDone
 	}
-	// End every live session so SSE handlers terminate; otherwise graceful
-	// shutdown waits out its timeout.
-	a.mu.RLock()
-	ids := make([]string, 0, len(a.peers))
-	for sid := range a.peers {
-		ids = append(ids, sid)
+	a.mu.Lock()
+	closing := make([]*wmpSession, 0, len(a.peers))
+	for sid, ws := range a.peers {
+		closing = append(closing, ws)
+		delete(a.peers, sid)
+		a.dropSessionStateLocked(sid)
 	}
-	a.mu.RUnlock()
-	for _, sid := range ids {
-		a.CloseSession(sid)
+	a.mu.Unlock()
+	for _, ws := range closing {
+		ws.stop()
+	}
+	for _, ws := range closing {
+		a.manager.unregisterSessionCtx(ctx, ws.session)
+		ws.slot.release()
 	}
 }
 
@@ -771,10 +783,21 @@ func (a *WMPAdapter) dropSessionStateLocked(sessionID string) {
 // teardown ends a wmpSession already removed from a.peers, as a WebSocket
 // disconnect would.
 func (a *WMPAdapter) teardown(ws *wmpSession) {
+	a.teardownCtx(context.Background(), ws)
+}
+
+// stop ends the live parts of the session: its connection, flows and SSE
+// streams. It does not touch persistent state.
+func (ws *wmpSession) stop() {
 	ws.cancel()
 	_ = ws.transport.Close()
 	ws.session.endSession()
-	a.manager.unregisterSession(ws.session)
+}
+
+// teardownCtx is teardown with the persistent-store cleanup bounded by ctx.
+func (a *WMPAdapter) teardownCtx(ctx context.Context, ws *wmpSession) {
+	ws.stop()
+	a.manager.unregisterSessionCtx(ctx, ws.session)
 	ws.slot.release()
 }
 

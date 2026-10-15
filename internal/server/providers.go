@@ -546,12 +546,19 @@ func (p *EngineProvider) Drain() {
 	}
 }
 
+// Close closes the engine without a deadline; see CloseContext.
 func (p *EngineProvider) Close() {
+	p.CloseContext(context.Background())
+}
+
+// CloseContext closes the engine, bounding the WMP sessions' persistent cleanup
+// by ctx.
+func (p *EngineProvider) CloseContext(ctx context.Context) {
 	p.Drain()
 	// Close the WMP adapter first so nothing can register a session behind its cleanup,
 	// then the manager (which closes the remaining transports).
 	if p.wmpAdapter != nil {
-		p.wmpAdapter.Close()
+		p.wmpAdapter.CloseContext(ctx)
 	}
 	if p.manager != nil {
 		p.manager.Close()

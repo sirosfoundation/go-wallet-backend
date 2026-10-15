@@ -902,9 +902,14 @@ func (m *Manager) isCurrentSession(session *Session) bool {
 }
 
 func (m *Manager) unregisterSession(session *Session) {
-	m.sessionsMu.Lock()
-	defer m.sessionsMu.Unlock()
+	m.unregisterSessionCtx(context.Background(), session)
+}
 
+// unregisterSessionCtx is unregisterSession with the persistent-store delete
+// bounded by ctx. The delete runs outside sessionsMu so a slow store does not
+// block other sessions.
+func (m *Manager) unregisterSessionCtx(ctx context.Context, session *Session) {
+	m.sessionsMu.Lock()
 	delete(m.sessions, session.ID)
 	if session.UserID != "" {
 		if current, ok := m.userIndex[session.userKey()]; ok && current == session {
@@ -912,9 +917,12 @@ func (m *Manager) unregisterSession(session *Session) {
 		}
 	}
 
+	store := m.sessionStore
+	m.sessionsMu.Unlock()
+
 	// Remove from persistent store
-	if m.sessionStore != nil {
-		_ = m.sessionStore.Delete(context.Background(), session.ID)
+	if store != nil {
+		_ = store.Delete(ctx, session.ID)
 	}
 
 	// "session" (session.logger's bound field) is the user's short ID, not
