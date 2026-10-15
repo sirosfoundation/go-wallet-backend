@@ -536,7 +536,12 @@ func (s *WalletProviderService) keyAttestationTrustsBatch(ctx context.Context, w
 			// Unsupported/malformed key (e.g. non-EC) - can't have evidence.
 			return false
 		}
-		if _, err := s.keyAttestations.GetByKeyThumbprint(ctx, thumbprint); err != nil {
+		rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, thumbprint)
+		if err != nil {
+			return false
+		}
+		// Evidence recorded for another instance does not vouch for this one.
+		if walletInstanceID != "" && rec.WalletInstanceID != walletInstanceID {
 			return false
 		}
 	}

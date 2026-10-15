@@ -286,6 +286,13 @@ func (h *AdminHandlers) RevokeAllWalletInstancesForUser(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": errCodeErasureIncomplete, "revoked": n, "message": errMsgErasureIncomplete})
 			return
 		}
+		if errors.Is(err, storage.ErrBindingChanged) {
+			// Replaced between the listing and the write; a retry sees the new record.
+			h.logger.Warn("wallet instance was replaced during revoke-all", zap.Error(err))
+			c.JSON(http.StatusConflict, gin.H{"error": "wallet_instance_changed", "revoked": n,
+				"message": "a wallet instance was replaced while the request was in flight; retry"})
+			return
+		}
 		if errors.Is(err, domain.ErrInvalidStatusTransition) {
 			// Nothing was revoked: a record with an unrecognized or already-final
 			// status needs repair before a retry can succeed.

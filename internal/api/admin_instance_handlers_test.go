@@ -14,6 +14,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-jose/go-jose/v4"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
@@ -654,4 +656,41 @@ func TestRevokeAllWalletInstancesForUser_UnknownStatusIsAConflict(t *testing.T) 
 	if err != nil || got.Status != domain.InstanceStatus("corrupted") {
 		t.Fatalf("the record must be left as found: %+v, %v", got, err)
 	}
+}
+
+type bindingChangedStore struct{ storage.Store }
+
+type bindingChangedInstances struct{ storage.WalletInstanceStore }
+
+func (s *bindingChangedStore) WalletInstances() storage.WalletInstanceStore {
+	return &bindingChangedInstances{s.Store.WalletInstances()}
+}
+
+func (bindingChangedInstances) UpdateStatusIfUnchanged(context.Context, string, domain.TenantID, domain.InstanceBinding, domain.InstanceStatus, string) error {
+	return storage.ErrBindingChanged
+}
+
+// A record replaced between the listing and the write is a conflict the caller
+// can retry, not a server error.
+func TestRevokeAllWalletInstancesForUser_ReplacedInstanceIsAConflict(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := &bindingChangedStore{memory.NewStore()}
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
+	h.SetLifecycle(service.NewWalletLifecycleService(store, zap.NewNop(), nil))
+	router := gin.New()
+	router.POST("/admin/tenants/:id/users/:user_id/instances/revoke-all", h.RevokeAllWalletInstancesForUser)
+
+	userID := domain.NewUserID()
+	ctx := context.Background()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: userID, DID: "did:example:replaced"}))
+	require.NoError(t, store.Store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-replaced", TenantID: "acme", UserID: &userID, Status: domain.InstanceStatusActive,
+	}))
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants/acme/users/"+userID.String()+"/instances/revoke-all", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+	assert.Contains(t, w.Body.String(), "wallet_instance_changed")
 }
