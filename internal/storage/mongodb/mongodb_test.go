@@ -1236,3 +1236,73 @@ func TestUserStore_InvalidateAuthBeforeForToken(t *testing.T) {
 	require.NoError(t, store.Users().InvalidateAuthBeforeForToken(ctx, uid, later.Add(time.Hour), time.Time{}), "no token: unconditional")
 	assert.ErrorIs(t, store.Users().InvalidateAuthBeforeForToken(ctx, domain.NewUserID(), later, tokenIat), storage.ErrNotFound)
 }
+
+// The enrolment authorisation challenge and the validity end of a challenge
+// survive storage, and consuming it returns them.
+func TestChallengeStore_RoundTripsAssertionChallengeAndValidUntil(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	validUntil := time.Now().Add(-time.Second).Truncate(time.Millisecond)
+	ch := &domain.WebauthnChallenge{
+		ID:                 "stepup-roundtrip",
+		UserID:             "u1",
+		Challenge:          "c",
+		Action:             "add_credential",
+		AssertionChallenge: "assertion-c",
+		ValidUntil:         validUntil,
+		ExpiresAt:          time.Now().Add(time.Hour),
+	}
+	require.NoError(t, store.Challenges().Create(ctx, ch))
+
+	got, err := store.Challenges().ConsumeByIDForUser(ctx, ch.ID, "u1")
+	require.NoError(t, err)
+	assert.Equal(t, "assertion-c", got.AssertionChallenge)
+	assert.True(t, validUntil.Equal(got.ValidUntil), "ValidUntil is stored")
+	assert.True(t, got.IsExpired(), "past ValidUntil is expired although the record is kept")
+
+	// Without ValidUntil the field stays unset and ExpiresAt decides.
+	plain := &domain.WebauthnChallenge{ID: "plain", Challenge: "c", Action: "login", ExpiresAt: time.Now().Add(time.Hour)}
+	require.NoError(t, store.Challenges().Create(ctx, plain))
+	got, err = store.Challenges().GetByID(ctx, "plain")
+	require.NoError(t, err)
+	assert.True(t, got.ValidUntil.IsZero())
+	assert.False(t, got.IsExpired())
+}
+
+// StepUpEligibleAt survives Create, Update and the arrayFilter update of the
+// authenticator state, which must not clear it.
+func TestUserStore_StepUpEligibleAtRoundTrips(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	at := time.Now().Add(24 * time.Hour).Truncate(time.Millisecond)
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "old"},
+			{ID: "new", StepUpEligibleAt: at},
+		},
+	}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	check := func(msg string) {
+		t.Helper()
+		got, err := store.Users().GetByID(ctx, user.UUID)
+		require.NoError(t, err)
+		require.Len(t, got.WebauthnCredentials, 2)
+		assert.True(t, got.WebauthnCredentials[0].UsableForStepUp(time.Now()), msg)
+		assert.True(t, at.Equal(got.WebauthnCredentials[1].StepUpEligibleAt), msg)
+		assert.False(t, got.WebauthnCredentials[1].UsableForStepUp(time.Now()), msg)
+	}
+	check("after create")
+
+	_, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "new", 3, false)
+	require.NoError(t, err)
+	check("after authenticator update")
+
+	got, err := store.Users().GetByID(ctx, user.UUID)
+	require.NoError(t, err)
+	require.NoError(t, store.Users().Update(ctx, got))
+	check("after update")
+}
