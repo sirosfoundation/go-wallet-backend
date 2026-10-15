@@ -641,6 +641,7 @@ func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{},
 	wiaGeneratedTotal.WithLabelValues(attestationSource).Inc()
 	s.logger.Info("WIA generated", zap.String("jkt", jkt[:8]+"..."))
 
+	var written *domain.WalletInstance
 	// Record wallet instance (upsert: creates on first attestation, updates on subsequent).
 	// Upsert never overwrites the status of an existing instance (that would undo a revocation).
 	if s.instances != nil {
@@ -681,13 +682,19 @@ func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{},
 		if err := s.recheckLifecycleAfterWrite(ctx, tenantID, userID, jkt, credentialID, firstAttestation); err != nil {
 			return "", err
 		}
+		written = instance
 		if err := s.fenceInstanceWrite(ctx, instance, created); err != nil {
 			return "", err
 		}
 	}
 
-	// A cut-off landing during the write must still stop the token.
-	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
+	// A cut-off landing after the fence must still stop the token, and undo the
+	// record this request wrote.
+	if written != nil {
+		if err := s.fenceInstanceWrite(ctx, written, created); err != nil {
+			return "", err
+		}
+	} else if err := tokengate.RefuseNow(ctx, s.users); err != nil {
 		return "", err
 	}
 
