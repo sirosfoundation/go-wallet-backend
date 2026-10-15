@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -3110,5 +3111,29 @@ status_check:
 	// Defaults survive a partial section.
 	if sc.MaxListBytes != DefaultStatusMaxListBytes || !sc.RateLimit.Enabled {
 		t.Fatalf("defaults lost: %+v", sc)
+	}
+}
+
+func TestNewStrictHTTPClient_IgnoresGlobalOptOuts(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	defer srv.Close()
+	tls := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
+	defer tls.Close()
+
+	cfg := HTTPClientConfig{AllowPrivateIPs: true, AllowHTTP: true, InsecureSkipVerify: true}
+	// The lax client reaches both loopback servers.
+	for _, u := range []string{srv.URL, tls.URL} {
+		resp, err := cfg.NewHTTPClient(0).Get(u)
+		if err != nil {
+			t.Fatalf("lax client %s: %v", u, err)
+		}
+		_ = resp.Body.Close()
+	}
+	// The strict client reaches neither: plaintext refused, loopback refused.
+	for _, u := range []string{srv.URL, tls.URL} {
+		if resp, err := cfg.NewStrictHTTPClient(0).Get(u); err == nil {
+			_ = resp.Body.Close()
+			t.Fatalf("strict client reached %s", u)
+		}
 	}
 }

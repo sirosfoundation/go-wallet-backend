@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -377,4 +379,25 @@ func TestStatusSignerTrust(t *testing.T) {
 			t.Fatalf("= %v, %v", ok, err)
 		}
 	})
+}
+
+// The status fetch client keeps its address and scheme guards when the
+// deployment's global opt-outs are set.
+func TestNewStatusService_GuardsSurviveGlobalOptOuts(t *testing.T) {
+	var hits int
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hits++ }))
+	defer srv.Close()
+
+	cfg := &config.Config{
+		StatusCheck: config.StatusCheckConfig{Enabled: true},
+		HTTPClient:  config.HTTPClientConfig{AllowPrivateIPs: true, AllowHTTP: true, InsecureSkipVerify: true},
+	}
+	svc := NewStatusService(cfg, nil, zap.NewNop())
+	res, err := svc.Lists(context.Background(), "t", []StatusListRequest{{URI: srv.URL + "/l/1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res[0].State != StatusStateUndetermined || hits != 0 {
+		t.Fatalf("result = %+v, hits = %d: a loopback list host must not be reached", res[0], hits)
+	}
 }

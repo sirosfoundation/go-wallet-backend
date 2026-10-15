@@ -108,7 +108,9 @@ func NewStatusService(cfg *config.Config, trustSvc *trust.Service, logger *zap.L
 	if !sc.Enabled {
 		return nil
 	}
-	checker := statuslist.NewChecker(cfg.HTTPClient.NewHTTPClient(0), cfg.HTTPClient.AllowsPlaintext(), nil).
+	// The list URI is chosen by the caller, so the guards stay on even when the
+	// deployment's global opt-outs are set for its own internal services.
+	checker := statuslist.NewChecker(cfg.HTTPClient.NewStrictHTTPClient(0), false, nil).
 		WithSignerTrustAction(statusSignerTrust(trustSvc, sc.StatusListSignerFallback)).
 		WithMinEntries(sc.StatusListMinEntries).
 		WithMaxConcurrentLoads(sc.StatusListMaxConcurrentLoads)

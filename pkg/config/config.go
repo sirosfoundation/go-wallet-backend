@@ -548,6 +548,16 @@ func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Cli
 	return c.newHTTPClient(timeoutOverride, nil)
 }
 
+// NewStrictHTTPClient is NewHTTPClient with the address and scheme guards
+// always on: allow_private_ips, allow_http and insecure_skip_verify are
+// ignored. Use it for fetches whose URL a caller chooses and that must reach
+// public HTTPS hosts only, whatever the deployment allows for its own
+// internal services.
+func (c HTTPClientConfig) NewStrictHTTPClient(timeoutOverride time.Duration) *http.Client {
+	c.AllowPrivateIPs, c.AllowHTTP, c.InsecureSkipVerify = false, false, false
+	return c.newHTTPClient(timeoutOverride, nil)
+}
+
 // NewIdPHTTPClient is NewHTTPClient for talking to the operator's OIDC
 // identity providers: the same address and scheme policy, except that the
 // hostnames in TrustedIdPHosts may resolve to private addresses. Use it for
