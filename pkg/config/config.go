@@ -2113,16 +2113,20 @@ func (c *Config) loadSecretsFromFiles() error {
 		}
 	}
 
-	// Load MongoDB password from file and inject into URI
-	if c.Storage.MongoDB.PasswordPath != "" {
-		password, err := readSecretFile(c.Storage.MongoDB.PasswordPath)
-		if err != nil {
-			return fmt.Errorf("storage.mongodb.password_path: %w", err)
-		}
-		// Replace %PASSWORD% placeholder in URI (no-op if not present)
-		c.Storage.MongoDB.URI = strings.Replace(c.Storage.MongoDB.URI, "%PASSWORD%", password, 1)
-	}
+	return c.loadMongoPassword()
+}
 
+// loadMongoPassword reads the MongoDB password file and injects it into the
+// URI's %PASSWORD% placeholder (a no-op if the URI has none).
+func (c *Config) loadMongoPassword() error {
+	if c.Storage.MongoDB.PasswordPath == "" {
+		return nil
+	}
+	password, err := readSecretFile(c.Storage.MongoDB.PasswordPath)
+	if err != nil {
+		return fmt.Errorf("storage.mongodb.password_path: %w", err)
+	}
+	c.Storage.MongoDB.URI = strings.Replace(c.Storage.MongoDB.URI, "%PASSWORD%", password, 1)
 	return nil
 }
 

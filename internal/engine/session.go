@@ -73,7 +73,7 @@ const MaxPendingFlowsPerSession = 3
 
 // revocationCheckTimeout bounds a revocation lookup made outside a request
 // context (session registration).
-const revocationCheckTimeout = 5 * time.Second
+var revocationCheckTimeout = 5 * time.Second
 
 // errRevocationUnavailable refuses a handshake whose revocation status could
 // not be determined.

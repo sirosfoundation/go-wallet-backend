@@ -1568,3 +1568,65 @@ func TestManager_RegisterSession_RevocationStoreErrorRefuses(t *testing.T) {
 	m.sessionsMu.RUnlock()
 	assert.False(t, present)
 }
+
+// stuckBlacklist blocks IsUserRevoked until its context ends, like an
+// unresponsive remote store, and then reports the context error.
+type stuckBlacklist struct {
+	fakeEngineBlacklist
+	entered chan struct{}
+}
+
+func (b *stuckBlacklist) IsUserRevoked(ctx context.Context, _ string) (bool, error) {
+	close(b.entered)
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+// A hung revocation store must neither hold the global session lock nor let
+// the session register.
+func TestManager_RegisterSession_StuckStoreFailsClosedWithoutHoldingLock(t *testing.T) {
+	old := revocationCheckTimeout
+	revocationCheckTimeout = 300 * time.Millisecond
+	defer func() { revocationCheckTimeout = old }()
+
+	m := NewManager(&config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}, zap.NewNop())
+	bl := &stuckBlacklist{entered: make(chan struct{})}
+	m.SetTokenBlacklist(bl)
+
+	srvConnCh := make(chan *websocket.Conn, 1)
+	_, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) { srvConnCh <- srvConn })
+	defer cleanup()
+	session := &Session{
+		ID: "stuck", UserID: "u", conn: <-srvConnCh, flows: make(map[string]*Flow),
+		logger: zap.NewNop(), actionCh: make(chan *FlowActionMessage, 1),
+		signCh: make(chan *SignResponseMessage, 1), matchCh: make(chan *MatchResponseMessage, 1),
+		closeCh: make(chan struct{}, 1), stopPing: make(chan struct{}),
+	}
+
+	done := make(chan bool, 1)
+	go func() { done <- m.registerSession(session) }()
+
+	<-bl.entered
+	locked := make(chan struct{})
+	go func() {
+		m.sessionsMu.Lock() // would block for the whole timeout if the lookup held the lock
+		m.sessionsMu.Unlock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+	case <-time.After(150 * time.Millisecond):
+		t.Fatal("the revocation lookup holds the global session lock")
+	}
+
+	select {
+	case accepted := <-done:
+		assert.False(t, accepted, "a lookup that times out must refuse the session")
+	case <-time.After(3 * time.Second):
+		t.Fatal("registerSession did not return after the lookup timeout")
+	}
+	m.sessionsMu.RLock()
+	_, present := m.sessions[session.ID]
+	m.sessionsMu.RUnlock()
+	assert.False(t, present)
+}
