@@ -8,6 +8,7 @@ package trust
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -105,6 +106,18 @@ func NormalizeJWKS(jwkData interface{}) []interface{} {
 		// Unknown format, wrap as single element
 		return []interface{}{v}
 	}
+}
+
+// isAmbiguousJWK reports a JWK object that carries both its own key
+// parameters (kty) and a "keys" array.
+func isAmbiguousJWK(jwkData interface{}) bool {
+	m, ok := jwkData.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	_, hasKeys := m["keys"]
+	_, hasKty := m["kty"]
+	return hasKeys && hasKty
 }
 
 // TrustInfo contains trust evaluation results.
@@ -428,6 +441,12 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 			return nil
 		}
 		return []zap.Field{zap.String(logLabel, subjectID)}
+	}
+
+	// A key that is both a single JWK and a JWKS would be evaluated as only
+	// its nested keys; which key is meant is ambiguous, so refuse it.
+	if keyMaterial != nil && isAmbiguousJWK(keyMaterial.JWK) {
+		return nil, errors.New("jwk key material is both a single key and a key set")
 	}
 
 	eval, err := s.GetEvaluator(endpoint)

@@ -390,6 +390,26 @@ func TestService_EvaluateIssuer_WithJWK(t *testing.T) {
 	}
 }
 
+func TestService_Evaluate_RefusesJWKThatIsAlsoAKeySet(t *testing.T) {
+	cfg := &config.Config{Trust: config.TrustConfig{PDPURL: "https://pdp.example.com", Timeout: 10}}
+	called := false
+	factory := func(_ string, _ time.Duration) (TrustEvaluator, error) {
+		called = true
+		return &testMockEvaluator{decision: true}, nil
+	}
+	svc := NewService(cfg, zap.NewNop(), factory)
+	km := &KeyMaterial{Type: "jwk", JWK: map[string]interface{}{
+		"kty": "EC", "crv": "P-256", "x": "outer", "y": "outer",
+		"keys": []interface{}{map[string]interface{}{"kty": "EC", "crv": "P-256", "x": "trusted", "y": "trusted"}},
+	}}
+	if res, err := svc.EvaluateIssuer(context.Background(), "did:example:issuer", "", km); err == nil {
+		t.Fatalf("EvaluateIssuer() = %+v, want an error", res)
+	}
+	if called {
+		t.Fatal("the trust endpoint was asked about an ambiguous key")
+	}
+}
+
 func TestService_EvaluateIssuer_EvaluatorError(t *testing.T) {
 	cfg := &config.Config{
 		Trust: config.TrustConfig{

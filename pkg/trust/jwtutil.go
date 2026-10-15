@@ -250,6 +250,11 @@ func VerifyJWTWithEmbeddedKey(jwtStr string, ext ...*cryptoutil.Extensions) (*Ke
 		pubKey = cert.PublicKey
 		km = &KeyMaterial{Type: "x5c", X5C: header.X5C}
 	} else if len(header.JWK) > 0 {
+		// A header jwk is one key. A "keys" member would make it a set whose
+		// members, not this key, a trust evaluation might see.
+		if _, ok := header.JWK["keys"]; ok {
+			return nil, errors.New("embedded jwk must be a single key, not a key set")
+		}
 		// Convert JWK to crypto.PublicKey
 		key, err := jwkToPublicKey(header.JWK)
 		if err != nil {
