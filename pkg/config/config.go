@@ -2116,6 +2116,22 @@ func (c *Config) loadSecretsFromFiles() error {
 	return c.loadMongoPassword()
 }
 
+// validateTokenBlacklistBackend rejects an unknown revocation backend and the
+// storage backend without MongoDB storage. A typo must not silently turn
+// shared revocations off.
+func (c *Config) validateTokenBlacklistBackend() error {
+	switch c.Security.TokenBlacklist.Backend {
+	case "", TokenBlacklistBackendMemory:
+	case TokenBlacklistBackendStorage:
+		if c.Storage.Type != "mongodb" {
+			return fmt.Errorf("security.token_blacklist.backend=storage requires storage.type=mongodb")
+		}
+	default:
+		return fmt.Errorf("invalid security.token_blacklist.backend: %q (must be memory or storage)", c.Security.TokenBlacklist.Backend)
+	}
+	return nil
+}
+
 // loadMongoPassword reads the MongoDB password file and injects it into the
 // URI's %PASSWORD% placeholder (a no-op if the URI has none).
 func (c *Config) loadMongoPassword() error {
@@ -2390,14 +2406,8 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("invalid storage type: %s (must be memory or mongodb)", c.Storage.Type)
 	}
 
-	switch c.Security.TokenBlacklist.Backend {
-	case "", TokenBlacklistBackendMemory:
-	case TokenBlacklistBackendStorage:
-		if c.Storage.Type != "mongodb" {
-			return fmt.Errorf("security.token_blacklist.backend=storage requires storage.type=mongodb")
-		}
-	default:
-		return fmt.Errorf("invalid security.token_blacklist.backend: %q (must be memory or storage)", c.Security.TokenBlacklist.Backend)
+	if err := c.validateTokenBlacklistBackend(); err != nil {
+		return err
 	}
 
 	if c.Storage.Type == "mongodb" && c.Storage.MongoDB.URI == "" {

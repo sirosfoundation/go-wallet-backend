@@ -412,6 +412,9 @@ func (c *Config) RegistryLegacyAudienceIndependent() bool {
 }
 
 func (c *Config) validateRegistryStandaloneServer() error {
+	if err := c.validateTokenBlacklistBackend(); err != nil {
+		return err
+	}
 	port := c.Server.RegistryPort
 	if port == 0 {
 		port = 8097
