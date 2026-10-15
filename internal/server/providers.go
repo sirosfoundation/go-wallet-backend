@@ -317,7 +317,8 @@ func requireTACUnlessStepUp(tv *tokenvalidator.Validator, required string) gin.H
 			var err error
 			body, err = io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxStepUpBody))
 			if err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "request body could not be read"})
+				// Same status and shape as Handlers.requireDeleteStepUp.
+				c.JSON(http.StatusBadRequest, gin.H{"error": "STEP_UP_FAILED", "message": "the request body could not be read"})
 				c.Abort()
 				return
 			}

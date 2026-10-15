@@ -167,3 +167,15 @@ func TestDeleteAccount_TAC_BodylessWithDeleteScopeAndFlag(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	assert.False(t, e.exists(t))
 }
+
+// An oversized body is refused in the step-up error shape, and nothing is deleted.
+func TestDeleteAccount_TAC_OversizedBodyUsesStepUpErrorShape(t *testing.T) {
+	e := newDeleteTACEnv(t, true, "rwl")
+	w := e.do(http.MethodDelete, "/user/session", bytes.Repeat([]byte("a"), maxStepUpBody+1))
+	assert.Equal(t, http.StatusBadRequest, w.Code)
+	var got map[string]string
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.Equal(t, "STEP_UP_FAILED", got["error"])
+	assert.NotEmpty(t, got["message"])
+	assert.True(t, e.exists(t))
+}
