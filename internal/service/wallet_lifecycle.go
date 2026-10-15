@@ -59,37 +59,56 @@ type userLocks struct {
 }
 
 type userLockEntry struct {
-	mu   sync.Mutex
+	sem  chan struct{} // holds one token while the lock is taken
 	refs int
 }
 
 func (l *userLocks) lock(id domain.UserID) func() {
+	release, _ := l.lockCtx(context.Background(), id)
+	return release
+}
+
+// lockCtx is lock, giving up with ctx's error if ctx ends first.
+func (l *userLocks) lockCtx(ctx context.Context, id domain.UserID) (func(), error) {
 	l.mu.Lock()
 	if l.m == nil {
 		l.m = map[domain.UserID]*userLockEntry{}
 	}
 	e := l.m[id]
 	if e == nil {
-		e = &userLockEntry{}
+		e = &userLockEntry{sem: make(chan struct{}, 1)}
 		l.m[id] = e
 	}
 	e.refs++
 	l.mu.Unlock()
-	e.mu.Lock()
-	return func() {
-		e.mu.Unlock()
+	drop := func() {
 		l.mu.Lock()
 		if e.refs--; e.refs == 0 {
 			delete(l.m, id)
 		}
 		l.mu.Unlock()
 	}
+	select {
+	case e.sem <- struct{}{}:
+	case <-ctx.Done():
+		drop()
+		return nil, ctx.Err()
+	}
+	return func() {
+		<-e.sem
+		drop()
+	}, nil
 }
 
 // LockUser takes the user's lifecycle lock and returns its release. Not
 // reentrant: a holder calls CascadeForRevokedLocked.
 func (s *WalletLifecycleService) LockUser(userID domain.UserID) func() {
 	return s.locks.lock(userID)
+}
+
+// lockUserCtx is LockUser, abandoned with ctx's error if ctx ends first.
+func (s *WalletLifecycleService) lockUserCtx(ctx context.Context, userID domain.UserID) (func(), error) {
+	return s.locks.lockCtx(ctx, userID)
 }
 
 // NewWalletLifecycleService creates a WalletLifecycleService. auditor may be nil.

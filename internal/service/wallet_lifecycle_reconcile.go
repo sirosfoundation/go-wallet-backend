@@ -58,7 +58,11 @@ func (s *WalletLifecycleService) ReconcileUserDryRun(ctx context.Context, userID
 }
 
 func (s *WalletLifecycleService) reconcile(ctx context.Context, userID domain.UserID, revokedBefore time.Time, dryRun bool) (ReconcileOutcome, []string, error) {
-	defer s.LockUser(userID)()
+	unlock, err := s.lockUserCtx(ctx, userID)
+	if err != nil {
+		return "", nil, fmt.Errorf("lock user: %w", err)
+	}
+	defer unlock()
 
 	latest, outcome, err := s.reconcileCandidate(ctx, userID, revokedBefore)
 	if err != nil || latest == nil {

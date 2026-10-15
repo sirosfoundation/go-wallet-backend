@@ -698,3 +698,44 @@ func TestErasureReconciler_ExactSizeFinalPageWrapsWithoutAWastedRun(t *testing.T
 	require.NoError(t, err)
 	assert.Equal(t, 2, st.Scanned, "the empty tail wraps within the run")
 }
+
+// A run cancelled while another operation holds the user's lock returns
+// promptly instead of waiting for it, and examines that user next time.
+func TestErasureReconciler_CancelledWhileUserLockedDoesNotHang(t *testing.T) {
+	store := memory.NewStore()
+	ids := seedRevokedUsers(t, store, 1)
+	r := reconcilerFor(store, 5)
+	unlock := r.lifecycle.LockUser(ids[0])
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { _, err := r.RunOnce(ctx); done <- err }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		unlock()
+		t.Fatal("RunOnce blocked on the user lock past its deadline")
+	}
+	unlock()
+
+	st, err := r.RunOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 1, st.Erased)
+}
+
+func TestUserLocks_ContextAbandonsWaitAndKeepsExclusion(t *testing.T) {
+	var l userLocks
+	id := domain.NewUserID()
+	release := l.lock(id)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := l.lockCtx(ctx, id)
+	assert.ErrorIs(t, err, context.Canceled)
+	release()
+	again, err := l.lockCtx(context.Background(), id)
+	require.NoError(t, err)
+	again()
+	assert.Empty(t, l.m, "idle entries are dropped")
+}
