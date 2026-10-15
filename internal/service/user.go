@@ -60,6 +60,10 @@ type TokenRevoker interface {
 	RevokeUser(ctx context.Context, userID string) error
 }
 
+// ErrTokenRevocationFailed is returned by DeleteUser when the user's tokens
+// could not be revoked; the user is not deleted.
+var ErrTokenRevocationFailed = errors.New("failed to revoke tokens")
+
 // UserService handles user-related operations
 type UserService struct {
 	store          storage.Store
@@ -238,6 +242,35 @@ func (s *UserService) UpdatePrivateData(ctx context.Context, userID domain.UserI
 // which may leave orphaned data in other tenants. This is a best-effort cleanup
 // that prioritizes completing the user deletion over strict data consistency.
 func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, holderDID string) error {
+	// Revoke all previously-issued tokens for this user (#383) first, before
+	// any data is removed and before purging sessions below - not after.
+	// Logout only ever blacklists the single token used for that request; without this, any of the deleted
+	// user's other still-valid tokens (a different device, a token minted
+	// before this request's) would keep working until they naturally
+	// expire.
+	//
+	// The ordering matters for engine (WebSocket) sessions specifically
+	// (#393 review): a handshake can pass the engine's own IsUserRevoked
+	// check and then only finish registering itself in
+	// engine.Manager.sessions *after* the cleaner below has already
+	// scanned it. Revoking first means engine.Manager.registerSession's own
+	// recheck (done under the same lock the scan uses) will already see
+	// this user as revoked for any such late registration, and any
+	// registration that instead completed *before* this revocation is
+	// still guaranteed to be present in m.sessions by the time the scan
+	// below runs. Reversing this order would reopen that gap.
+	if s.tokenBlacklist != nil {
+		if err := s.tokenBlacklist.RevokeUser(ctx, userID.String()); err != nil {
+			// Fail closed: deleting the user without the revocation would
+			// leave their tokens valid. Nothing has been removed yet, and the
+			// revocation is idempotent, so a retry completes the deletion even
+			// if the failed write was in fact stored (the auth middlewares let
+			// a revoked user reach this endpoint for that reason).
+			s.logger.Error("Failed to revoke tokens for deleted user", zap.Error(err))
+			return fmt.Errorf("%w: %v", ErrTokenRevocationFailed, err)
+		}
+	}
+
 	// Get all tenants the user belongs to
 	tenantIDs, err := s.store.UserTenants().GetUserTenants(ctx, userID)
 	if err != nil {
@@ -289,29 +322,6 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// Clear user reference from consumed invites
 	if err := s.store.Invites().ClearUsedBy(ctx, userID); err != nil {
 		s.logger.Warn("Failed to clear invite used_by references", zap.Error(err))
-	}
-
-	// Revoke all previously-issued tokens for this user (#383) BEFORE
-	// purging sessions below - not after. Logout only ever blacklists the
-	// single token used for that request; without this, any of the deleted
-	// user's other still-valid tokens (a different device, a token minted
-	// before this request's) would keep working until they naturally
-	// expire.
-	//
-	// The ordering matters for engine (WebSocket) sessions specifically
-	// (#393 review): a handshake can pass the engine's own IsUserRevoked
-	// check and then only finish registering itself in
-	// engine.Manager.sessions *after* the cleaner below has already
-	// scanned it. Revoking first means engine.Manager.registerSession's own
-	// recheck (done under the same lock the scan uses) will already see
-	// this user as revoked for any such late registration, and any
-	// registration that instead completed *before* this revocation is
-	// still guaranteed to be present in m.sessions by the time the scan
-	// below runs. Reversing this order would reopen that gap.
-	if s.tokenBlacklist != nil {
-		if err := s.tokenBlacklist.RevokeUser(ctx, userID.String()); err != nil {
-			s.logger.Warn("Failed to revoke tokens for deleted user", zap.Error(err))
-		}
 	}
 
 	// Purge active WebSocket sessions (Redis or memory)

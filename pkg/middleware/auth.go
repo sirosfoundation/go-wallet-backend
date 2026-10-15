@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -27,9 +28,34 @@ import (
 // and the go-tokenauth path (TokenAuthMiddleware), so a revocation is
 // honored regardless of which authenticated the request.
 type TokenBlacklistChecker interface {
-	IsBlacklisted(ctx context.Context, jti string) bool
-	IsUserRevoked(ctx context.Context, userID string) bool
+	// IsBlacklisted and IsUserRevoked return an error when the revocation
+	// store cannot answer; callers must then refuse the request.
+	IsBlacklisted(ctx context.Context, jti string) (bool, error)
+	IsUserRevoked(ctx context.Context, userID string) (bool, error)
 	IsFamilyRevoked(ctx context.Context, sid string) bool
+}
+
+// IsAccountDeletion reports whether the request is the account deletion call
+// (DELETE /user/session). A user revocation means the deletion has begun, so
+// that call stays reachable to a revoked user: a deletion interrupted after
+// the revocation was stored (including a write whose acknowledgement was
+// lost) can then be completed by retrying, with every other token check
+// (signature, jti, family, expiry) still applied.
+func IsAccountDeletion(c *gin.Context) bool {
+	return c.Request.Method == http.MethodDelete && strings.TrimSuffix(c.FullPath(), "/") == "/user/session"
+}
+
+// RefuseRevocationUnavailable aborts the request with 503 because the
+// revocation store could not say whether the token is revoked. Only the
+// error is logged, never token content.
+func RefuseRevocationUnavailable(c *gin.Context, logger *zap.Logger, err error) {
+	logger.Error("Revocation check failed; refusing request",
+		zap.Error(err),
+		zap.String("method", c.Request.Method),
+		zap.String("path", c.FullPath()),
+	)
+	c.JSON(503, gin.H{"error": "Token revocation check unavailable"})
+	c.Abort()
 }
 
 // GenerateAdminToken generates a secure random token for admin API authentication
@@ -173,7 +199,15 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 		// until it naturally expires (#383).
 		if blacklist != nil {
 			jti, _ := claims["jti"].(string)
-			if jti != "" && blacklist.IsBlacklisted(c.Request.Context(), jti) {
+			revoked := false
+			if jti != "" {
+				var err error
+				if revoked, err = blacklist.IsBlacklisted(c.Request.Context(), jti); err != nil {
+					RefuseRevocationUnavailable(c, logger, err)
+					return
+				}
+			}
+			if revoked {
 				logger.Warn("Blacklisted token used",
 					zap.String("jti", jti),
 				)
@@ -182,7 +216,12 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 				return
 			}
 
-			if blacklist.IsUserRevoked(c.Request.Context(), userID) {
+			userRevoked, err := blacklist.IsUserRevoked(c.Request.Context(), userID)
+			if err != nil {
+				RefuseRevocationUnavailable(c, logger, err)
+				return
+			}
+			if userRevoked && !IsAccountDeletion(c) {
 				logger.Warn("Token for revoked user used",
 					zap.String("user_id", userID),
 				)

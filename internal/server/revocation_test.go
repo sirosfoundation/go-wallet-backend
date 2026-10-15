@@ -3,10 +3,13 @@ package server
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
 	"testing"
 	"time"
 
+	gojwt "github.com/golang-jwt/jwt/v5"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -105,10 +108,16 @@ func TestNewSharedBlacklist_SeesOtherProcessRevocations(t *testing.T) {
 
 	require.NoError(t, writer.Add(ctx, "jti-1", time.Now().Add(time.Hour)))
 	require.NoError(t, writer.RevokeUser(ctx, "user-1"))
-	require.True(t, reader.IsBlacklisted(ctx, "jti-1"))
-	require.True(t, reader.IsUserRevoked(ctx, "user-1"))
-	require.False(t, reader.IsBlacklisted(ctx, "jti-2"))
-	require.False(t, reader.IsUserRevoked(ctx, "user-2"))
+	for jti, want := range map[string]bool{"jti-1": true, "jti-2": false} {
+		got, err := reader.IsBlacklisted(ctx, jti)
+		require.NoError(t, err)
+		require.Equal(t, want, got, jti)
+	}
+	for user, want := range map[string]bool{"user-1": true, "user-2": false} {
+		got, err := reader.IsUserRevoked(ctx, user)
+		require.NoError(t, err)
+		require.Equal(t, want, got, user)
+	}
 }
 
 func walletProviderMongoConfig(t *testing.T, backend string) *config.Config {
@@ -149,6 +158,58 @@ func TestNewWalletProviderProvider_RevocationStore(t *testing.T) {
 		require.NoError(t, err)
 		defer other.Close()
 		require.NoError(t, other.Add(ctx, "jti-1", time.Now().Add(time.Hour)))
-		require.True(t, p.services.TokenBlacklist.IsBlacklisted(ctx, "jti-1"))
+		revoked, err := p.services.TokenBlacklist.IsBlacklisted(ctx, "jti-1")
+		require.NoError(t, err)
+		require.True(t, revoked)
 	})
+}
+
+// A standalone registry given the shared blacklist rejects a jti revoked by
+// another process, and refuses (503) instead of accepting when the store is
+// unreachable.
+func TestStandaloneRegistry_SharedBlacklist(t *testing.T) {
+	mcfg := mongoSharedConfig(t)
+	ctx := context.Background()
+	shared, err := NewSharedBlacklist(ctx, mcfg, zap.NewNop())
+	require.NoError(t, err)
+	require.NotNil(t, shared)
+	closed := false
+	defer func() {
+		if !closed {
+			_ = shared.Close()
+		}
+	}()
+
+	cfg := registryTestConfig(t)
+	cfg.Registry.RequireAuth = true
+	cfg.AS.ExternalURL = newRegAS(t).srv.URL
+	cfg.AS.Legacy.Enabled = true
+	cfg.Server.RPID = regTestRPID
+	cfg.JWT.Secret = regTestSecret
+	require.NoError(t, cfg.ValidateRegistry())
+	p, err := NewRegistryProvider(cfg, zap.NewNop())
+	require.NoError(t, err)
+	require.NoError(t, p.Start(ctx))
+	t.Cleanup(func() { _ = p.Close() })
+	p.SetTokenBlacklist(shared)
+
+	withJTI := func(jti string) string {
+		s, err := gojwt.NewWithClaims(gojwt.SigningMethodHS256, gojwt.MapClaims{
+			"iss": "wallet-backend", "aud": regTestRPID, "user_id": "u", "tenant_id": "acme", "jti": jti,
+			"exp": time.Now().Add(time.Hour).Unix()}).SignedString([]byte(regTestSecret))
+		require.NoError(t, err)
+		return "Bearer " + s
+	}
+
+	assert.Equal(t, http.StatusOK, doRegistryGet(t, p, withJTI("fine")))
+	other, err := NewSharedBlacklist(ctx, mcfg, zap.NewNop())
+	require.NoError(t, err)
+	defer other.Close()
+	require.NoError(t, other.Add(ctx, "revoked", time.Now().Add(time.Hour)))
+	assert.Equal(t, http.StatusUnauthorized, doRegistryGet(t, p, withJTI("revoked")))
+	assert.Equal(t, http.StatusOK, doRegistryGet(t, p, withJTI("fine")))
+
+	require.NoError(t, shared.Close()) // the store becomes unreachable
+	closed = true
+	assert.Equal(t, http.StatusServiceUnavailable, doRegistryGet(t, p, withJTI("fine")))
 }

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,8 +13,10 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	tokenauthclaims "github.com/sirosfoundation/go-tokenauth/claims"
 	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -97,7 +100,7 @@ func TestHandlers_Logout_LegacyToken(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if !handlers.services.TokenBlacklist.IsBlacklisted(context.Background(), "jti-legacy-logout") {
+	if !blacklisted(t, handlers.services.TokenBlacklist, context.Background(), "jti-legacy-logout") {
 		t.Error("expected the legacy token's jti to be blacklisted")
 	}
 }
@@ -134,7 +137,7 @@ func TestHandlers_Logout_ASToken(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if !handlers.services.TokenBlacklist.IsBlacklisted(context.Background(), "jti-as-logout") {
+	if !blacklisted(t, handlers.services.TokenBlacklist, context.Background(), "jti-as-logout") {
 		t.Error("expected the AS-issued token's jti to be blacklisted via tokenauth_result")
 	}
 }
@@ -206,7 +209,7 @@ func TestHandlers_Logout_LegacyToken_NoSidClaim_NoFamilyRevocationAttempted(t *t
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
-	if !handlers.services.TokenBlacklist.IsBlacklisted(context.Background(), "jti-legacy-no-sid") {
+	if !blacklisted(t, handlers.services.TokenBlacklist, context.Background(), "jti-legacy-no-sid") {
 		t.Error("expected the token's own jti to still be blacklisted")
 	}
 }
@@ -641,7 +644,7 @@ func TestLogout_FailedFamilyRevocation_RetryableThroughRealMiddleware(t *testing
 			if w := logout(); w.Code != http.StatusInternalServerError {
 				t.Fatalf("attempt 1: expected 500, got %d: %s", w.Code, w.Body.String())
 			}
-			if services.TokenBlacklist.IsBlacklisted(ctx, jti) {
+			if blacklisted(t, services.TokenBlacklist, ctx, jti) {
 				t.Fatal("a failed logout must not blacklist the access token's jti")
 			}
 			if services.TokenBlacklist.IsFamilyRevoked(ctx, sid) {
@@ -657,7 +660,7 @@ func TestLogout_FailedFamilyRevocation_RetryableThroughRealMiddleware(t *testing
 			if !services.TokenBlacklist.IsFamilyRevoked(ctx, sid) {
 				t.Error("retry: expected the family to be revoked")
 			}
-			if !services.TokenBlacklist.IsBlacklisted(ctx, jti) {
+			if !blacklisted(t, services.TokenBlacklist, ctx, jti) {
 				t.Error("a successful logout must blacklist the access token's jti")
 			}
 
@@ -667,4 +670,263 @@ func TestLogout_FailedFamilyRevocation_RetryableThroughRealMiddleware(t *testing
 			}
 		})
 	}
+}
+
+// revocationReader is the check half of a revocation checker.
+type revocationReader interface {
+	IsBlacklisted(ctx context.Context, jti string) (bool, error)
+	IsUserRevoked(ctx context.Context, userID string) (bool, error)
+}
+
+func blacklisted(t *testing.T, r revocationReader, ctx context.Context, jti string) bool {
+	t.Helper()
+	ok, err := r.IsBlacklisted(ctx, jti)
+	if err != nil {
+		t.Fatalf("IsBlacklisted: %v", err)
+	}
+	return ok
+}
+
+func userRevoked(t *testing.T, r revocationReader, ctx context.Context, userID string) bool {
+	t.Helper()
+	ok, err := r.IsUserRevoked(ctx, userID)
+	if err != nil {
+		t.Fatalf("IsUserRevoked: %v", err)
+	}
+	return ok
+}
+
+// flakyAddStore is a RevocationStore whose Add fails while failing is set.
+type flakyAddStore struct {
+	failing bool
+	jtis    map[string]bool
+}
+
+func (s *flakyAddStore) Add(_ context.Context, jti string, _ time.Time) error {
+	if s.failing {
+		return errors.New("store write failed")
+	}
+	s.jtis[jti] = true
+	return nil
+}
+func (s *flakyAddStore) Has(_ context.Context, jti string) (bool, error) { return s.jtis[jti], nil }
+func (s *flakyAddStore) RevokeUser(context.Context, string) error        { return nil }
+func (s *flakyAddStore) IsUserRevoked(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+// A failed jti blacklist write fails the logout (500) instead of being
+// logged; the retry then succeeds.
+func TestLogout_FailedJTIBlacklistWrite_FailsClosed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tokenAuth := range []bool{false, true} {
+		name := "legacy HMAC path"
+		if tokenAuth {
+			name = "tokenauth path"
+		}
+		t.Run(name, func(t *testing.T) {
+			logger := zap.NewNop()
+			cfg := &config.Config{
+				Server: config.ServerConfig{RPID: "wallet.example.com"},
+				JWT:    config.JWTConfig{Secret: "test-secret", ExpiryHours: 24, Issuer: "test-wallet"},
+			}
+			store := &flakyAddStore{failing: true, jtis: map[string]bool{}}
+			services := service.NewServices(memory.NewStore(), cfg, logger)
+			services.TokenBlacklist = service.NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, logger, store)
+			handlers := NewHandlers(services, cfg, logger, []string{"test"})
+
+			tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+				"user_id": "user-1", "jti": "jti-w", "exp": time.Now().Add(time.Hour).Unix(),
+			}).SignedString([]byte(cfg.JWT.Secret))
+			require.NoError(t, err)
+
+			router := gin.New()
+			router.POST("/logout", func(c *gin.Context) {
+				c.Set("token", tok)
+				if tokenAuth {
+					c.Set("tokenauth_result", &tokenauthclaims.Result{UserID: "user-1", JTI: "jti-w"})
+				}
+				c.Next()
+			}, handlers.Logout)
+			do := func() *httptest.ResponseRecorder {
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/logout", nil))
+				return w
+			}
+
+			w := do()
+			require.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+			require.NotContains(t, w.Body.String(), "Logged out successfully")
+			require.False(t, store.jtis["jti-w"])
+
+			store.failing = false
+			require.Equal(t, http.StatusOK, do().Code, "retry")
+			require.True(t, store.jtis["jti-w"])
+		})
+	}
+}
+
+type failingRevoker struct{}
+
+func (failingRevoker) RevokeUser(context.Context, string) error {
+	return errors.New("store write failed")
+}
+
+// A failed user-revocation write answers 500 and leaves the user in place.
+func TestDeleteUser_RevocationFailureAnswers500(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger := zap.NewNop()
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		JWT:    config.JWTConfig{Secret: "test-secret", ExpiryHours: 24, Issuer: "test"},
+	}
+	services := service.NewServices(memory.NewStore(), cfg, logger)
+	services.User.SetTokenBlacklist(failingRevoker{})
+	handlers := NewHandlers(services, cfg, logger, []string{"test"})
+
+	name := "del-user"
+	user, err := services.User.Register(context.Background(), &domain.RegisterRequest{Username: &name, DisplayName: "d", WalletType: domain.WalletTypeDB})
+	require.NoError(t, err)
+
+	router := gin.New()
+	router.DELETE("/user", func(c *gin.Context) { c.Set("user_id", user.UUID.String()); c.Next() }, handlers.DeleteUser)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/user", nil))
+	require.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), "Failed to revoke tokens")
+}
+
+// With sid and jti on the token, a failed shared jti write must leave the
+// retry admissible through the real auth middleware: nothing may have been
+// revoked locally by the failed attempt.
+func TestLogout_FailedJTIWriteWithSID_RetryableThroughRealMiddleware(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tokenAuth := range []bool{false, true} {
+		name := "legacy HMAC path"
+		if tokenAuth {
+			name = "tokenauth ModeLegacy path"
+		}
+		t.Run(name, func(t *testing.T) {
+			logger := zap.NewNop()
+			cfg := &config.Config{
+				Server: config.ServerConfig{RPID: "wallet.example.com"},
+				JWT:    config.JWTConfig{Secret: "test-secret", ExpiryHours: 24, RefreshDays: 7, Issuer: "test-wallet"},
+			}
+			mem := memory.NewStore()
+			store := &flakyAddStore{failing: true, jtis: map[string]bool{}}
+			services := service.NewServices(mem, cfg, logger)
+			services.TokenBlacklist = service.NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, logger, store)
+			handlers := NewHandlers(services, cfg, logger, []string{"test"})
+
+			router := gin.New()
+			if tokenAuth {
+				v := tokenvalidator.New(tokenvalidator.Config{
+					Audiences: []string{"wallet-backend", "wallet.example.com"},
+					Legacy: tokenvalidator.LegacyConfig{
+						Enabled: true, HMACSecret: []byte(cfg.JWT.Secret), Issuers: []string{cfg.JWT.Issuer},
+					},
+				})
+				router.Use(middleware.TokenAuthMiddleware(cfg, v, mem.Tenants(), services.TokenBlacklist, logger))
+				router.Use(middleware.RequireAudience("wallet-backend"))
+			} else {
+				router.Use(middleware.AuthMiddlewareWithBlacklist(cfg, mem, services.TokenBlacklist, logger))
+			}
+			router.POST("/user/session/logout", handlers.Logout)
+
+			tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+				"user_id": "user-1", "tenant_id": "default", "jti": "jti-s", "sid": "sid-s",
+				"iss": "test-wallet", "aud": "wallet.example.com", "exp": time.Now().Add(time.Hour).Unix(),
+			}).SignedString([]byte(cfg.JWT.Secret))
+			require.NoError(t, err)
+			logout := func() int {
+				w := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodPost, "/user/session/logout", nil)
+				req.Header.Set("Authorization", "Bearer "+tok)
+				router.ServeHTTP(w, req)
+				return w.Code
+			}
+
+			require.Equal(t, http.StatusInternalServerError, logout())
+			require.False(t, services.TokenBlacklist.IsFamilyRevoked(context.Background(), "sid-s"),
+				"a failed attempt must not revoke the family: the retry would be rejected")
+
+			store.failing = false
+			require.Equal(t, http.StatusOK, logout(), "retry with the same token")
+			require.True(t, store.jtis["jti-s"], "the shared jti entry is written on the retry")
+			require.True(t, services.TokenBlacklist.IsFamilyRevoked(context.Background(), "sid-s"))
+		})
+	}
+}
+
+// userStore records a user revocation and fails the first write anyway, like
+// a MongoDB write whose majority acknowledgement was lost after it applied.
+type lostAckUserStore struct {
+	users    map[string]bool
+	failNext bool
+}
+
+func (s *lostAckUserStore) Add(context.Context, string, time.Time) error { return nil }
+func (s *lostAckUserStore) Has(context.Context, string) (bool, error)    { return false, nil }
+func (s *lostAckUserStore) RevokeUser(_ context.Context, id string) error {
+	s.users[id] = true
+	if s.failNext {
+		s.failNext = false
+		return errors.New("write concern timeout")
+	}
+	return nil
+}
+func (s *lostAckUserStore) IsUserRevoked(_ context.Context, id string) (bool, error) {
+	return s.users[id], nil
+}
+
+// A revocation that was stored although its write reported an error leaves
+// the user revoked but undeleted; the retry must still reach the deletion
+// through the real auth middleware, and other routes must stay closed to the
+// revoked user.
+func TestDeleteUser_LostAckRevocation_RetryCompletesThroughRealMiddleware(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger := zap.NewNop()
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPID: "wallet.example.com"},
+		JWT:    config.JWTConfig{Secret: "test-secret", ExpiryHours: 24, Issuer: "test-wallet"},
+	}
+	mem := memory.NewStore()
+	rs := &lostAckUserStore{users: map[string]bool{}, failNext: true}
+	services := service.NewServices(mem, cfg, logger)
+	bl := service.NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, logger, rs)
+	services.TokenBlacklist = bl
+	services.User.SetTokenBlacklist(bl)
+	handlers := NewHandlers(services, cfg, logger, []string{"test"})
+
+	name := "lost-ack"
+	user, err := services.User.Register(context.Background(), &domain.RegisterRequest{Username: &name, DisplayName: "d", WalletType: domain.WalletTypeDB})
+	require.NoError(t, err)
+
+	router := gin.New()
+	router.Use(middleware.AuthMiddlewareWithBlacklist(cfg, mem, bl, logger))
+	router.DELETE("/user/session", handlers.DeleteUser)
+	router.GET("/user/session/account-info", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": user.UUID.String(), "tenant_id": "default", "jti": "jti-d",
+		"iss": "test-wallet", "aud": "wallet.example.com", "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte(cfg.JWT.Secret))
+	require.NoError(t, err)
+	do := func(method, path string) int {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(method, path, nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		router.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	require.Equal(t, http.StatusInternalServerError, do(http.MethodDelete, "/user/session"))
+	_, err = mem.Users().GetByID(context.Background(), user.UUID)
+	require.NoError(t, err, "the user survives the failed attempt")
+	require.True(t, rs.users[user.UUID.String()], "precondition: the revocation was stored")
+
+	require.Equal(t, http.StatusUnauthorized, do(http.MethodGet, "/user/session/account-info"), "a revoked user stays locked out of every other route")
+	require.Equal(t, http.StatusOK, do(http.MethodDelete, "/user/session"), "the retry completes the deletion")
+	_, err = mem.Users().GetByID(context.Background(), user.UUID)
+	require.Error(t, err, "the user is deleted")
 }

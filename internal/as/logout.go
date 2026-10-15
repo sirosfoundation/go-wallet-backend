@@ -2,6 +2,7 @@ package as
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -54,17 +55,21 @@ func LogoutHandler(store SessionStore, issuer *TokenIssuer, legacyIssuer, sidPar
 		// subject-binding check below.
 		session, sessErr := store.Get(c.Request.Context(), sessionID)
 
-		if err := store.Revoke(c.Request.Context(), sessionID); err != nil {
-			logger.Warn("session revocation failed",
+		// A failed write is reported, not swallowed: the session may still be
+		// usable, so the cookie is kept for the client's retry.
+		if err := store.Revoke(c.Request.Context(), sessionID); err != nil && !errors.Is(err, ErrSessionNotFound) {
+			logger.Error("session revocation failed",
 				zap.String("session_id", sessionID),
 				zap.Error(err),
 			)
-			// Don't expose internal errors — clear cookie regardless.
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke session"})
+			return
 		}
 
+		var bearerErr error
 		if blacklist != nil && sessErr == nil && session != nil {
 			if bearerToken := extractBearerToken(c); bearerToken != "" {
-				blacklistOwnBearerToken(c.Request.Context(), bearerToken, session.UserID, issuer, legacyIssuer, blacklist, logger)
+				bearerErr = blacklistOwnBearerToken(c.Request.Context(), bearerToken, session.UserID, issuer, legacyIssuer, blacklist, logger)
 			}
 		}
 
@@ -88,10 +93,10 @@ func LogoutHandler(store SessionStore, issuer *TokenIssuer, legacyIssuer, sidPar
 		}
 		familyErr := revokeSessionFamily(c.Request.Context(), session, sessErr, bearerSID, blacklist, familyRetention, logger)
 
-		if familyErr != nil {
+		if familyErr != nil || bearerErr != nil {
 			// Keep the cookie: it is the client's only credential for the
-			// idempotent retry that can still revoke the family. (The
-			// session itself is already revoked.)
+			// idempotent retry that can still revoke the family or the
+			// bearer token. (The session itself is already revoked.)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke refresh token"})
 			return
 		}
@@ -138,8 +143,9 @@ func revokeSessionFamily(ctx context.Context, session *Session, sessErr error, e
 // subject matches sessionUserID (the session cookie's own owner). A
 // mismatch is logged and otherwise ignored rather than treated as an
 // error: refusing to revoke a token that isn't the caller's own is the
-// safe behavior, not a failure of logout itself.
-func blacklistOwnBearerToken(ctx context.Context, bearerToken, sessionUserID string, issuer *TokenIssuer, legacyIssuer *LegacyTokenIssuer, blacklist TokenBlacklistChecker, logger *zap.Logger) {
+// safe behavior, not a failure of logout itself. A failing blacklist write
+// is returned so the caller can fail closed.
+func blacklistOwnBearerToken(ctx context.Context, bearerToken, sessionUserID string, issuer *TokenIssuer, legacyIssuer *LegacyTokenIssuer, blacklist TokenBlacklistChecker, logger *zap.Logger) error {
 	if issuer != nil {
 		// No audience restriction: we only need this token's own claims
 		// (sub/jti/exp) to blacklist it, not to authorize anything with it.
@@ -148,18 +154,19 @@ func blacklistOwnBearerToken(ctx context.Context, bearerToken, sessionUserID str
 				logger.Warn("logout: presented bearer token belongs to a different user than the session - not blacklisting",
 					zap.String("session_user_id", sessionUserID),
 				)
-				return
+				return nil
 			}
 			if claims.ID == "" {
-				return
+				return nil
 			}
 			if err := blacklist.Add(ctx, claims.ID, claims.Expiry.Time()); err != nil {
-				logger.Warn("failed to blacklist token on logout",
+				logger.Error("failed to blacklist token on logout",
 					zap.String("jti", claims.ID),
 					zap.Error(err),
 				)
+				return err
 			}
-			return
+			return nil
 		}
 	}
 
@@ -169,21 +176,23 @@ func blacklistOwnBearerToken(ctx context.Context, bearerToken, sessionUserID str
 				logger.Warn("logout: presented legacy bearer token belongs to a different user than the session - not blacklisting",
 					zap.String("session_user_id", sessionUserID),
 				)
-				return
+				return nil
 			}
 			if claims.ID == "" {
-				return
+				return nil
 			}
 			expiry := time.Now().Add(24 * time.Hour) // shouldn't happen: legacy tokens always carry exp
 			if claims.ExpiresAt != nil {
 				expiry = claims.ExpiresAt.Time
 			}
 			if err := blacklist.Add(ctx, claims.ID, expiry); err != nil {
-				logger.Warn("failed to blacklist legacy token on logout",
+				logger.Error("failed to blacklist legacy token on logout",
 					zap.String("jti", claims.ID),
 					zap.Error(err),
 				)
+				return err
 			}
 		}
 	}
+	return nil
 }

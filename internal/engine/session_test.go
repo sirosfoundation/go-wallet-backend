@@ -466,14 +466,16 @@ type fakeEngineBlacklist struct {
 	revoked         map[string]bool
 	revokedUsers    map[string]bool
 	revokedFamilies map[string]bool
+	jtiErr          error // returned by IsBlacklisted
+	userErr         error // returned by IsUserRevoked
 }
 
-func (f *fakeEngineBlacklist) IsBlacklisted(ctx context.Context, jti string) bool {
-	return f.revoked[jti]
+func (f *fakeEngineBlacklist) IsBlacklisted(ctx context.Context, jti string) (bool, error) {
+	return f.revoked[jti], f.jtiErr
 }
 
-func (f *fakeEngineBlacklist) IsUserRevoked(ctx context.Context, userID string) bool {
-	return f.revokedUsers[userID]
+func (f *fakeEngineBlacklist) IsUserRevoked(ctx context.Context, userID string) (bool, error) {
+	return f.revokedUsers[userID], f.userErr
 }
 
 func (f *fakeEngineBlacklist) IsFamilyRevoked(ctx context.Context, sid string) bool {
@@ -1486,25 +1488,106 @@ func TestManager_validateToken_CancelledContextFailsClosed(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// A revocation lookup that fails must refuse the handshake with
+// errRevocationUnavailable on every path that consults it, never accept it.
+func TestManager_validateToken_RevocationStoreErrorRefuses(t *testing.T) {
+	storeErr := errors.New("store down")
+	legacy := func(t *testing.T) string {
+		s, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+			"user_id": "test-user-123",
+			"jti":     "jti-1",
+			"exp":     time.Now().Add(time.Hour).Unix(),
+		}).SignedString([]byte("test-secret"))
+		require.NoError(t, err)
+		return s
+	}
+
+	t.Run("legacy path", func(t *testing.T) {
+		m := NewManager(&config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}, zap.NewNop())
+		tok := legacy(t)
+
+		m.SetTokenBlacklist(&fakeEngineBlacklist{})
+		_, _, _, err := m.validateToken(context.Background(), tok)
+		require.NoError(t, err, "positive control: a working store accepts the token")
+
+		for name, bl := range map[string]*fakeEngineBlacklist{
+			"jti lookup":  {jtiErr: storeErr},
+			"user lookup": {userErr: storeErr},
+		} {
+			m.SetTokenBlacklist(bl)
+			_, _, _, err = m.validateToken(context.Background(), tok)
+			assert.ErrorIs(t, err, errRevocationUnavailable, name)
+		}
+	})
+
+	t.Run("go-tokenauth path", func(t *testing.T) {
+		m := NewManager(&config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}, zap.NewNop())
+		v, key, issuer := setupEngineTokenValidatorTest(t)
+		m.SetTokenValidator(v)
+		tok := signEngineToken(t, key, issuer, claims.AccessTokenClaims{
+			Claims:   gojosejwt.Claims{Audience: gojosejwt.Audience{"wallet-registry"}, Subject: "user-1"},
+			TenantID: "test-tenant",
+			TAC:      "r",
+			ACR:      "urn:siros:acr:passkey",
+		})
+
+		m.SetTokenBlacklist(&fakeEngineBlacklist{})
+		_, _, _, err := m.validateToken(context.Background(), tok)
+		require.NoError(t, err, "positive control: a working store accepts the token")
+
+		m.SetTokenBlacklist(&fakeEngineBlacklist{userErr: storeErr})
+		_, _, _, err = m.validateToken(context.Background(), tok)
+		assert.ErrorIs(t, err, errRevocationUnavailable)
+	})
+}
+
+func TestManager_RegisterSession_RevocationStoreErrorRefuses(t *testing.T) {
+	m := NewManager(&config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}, zap.NewNop())
+	m.SetTokenBlacklist(&fakeEngineBlacklist{userErr: errors.New("store down")})
+
+	srvConnCh := make(chan *websocket.Conn, 1)
+	_, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) { srvConnCh <- srvConn })
+	defer cleanup()
+
+	session := &Session{
+		ID:       "store-down-session",
+		UserID:   "some-user",
+		conn:     <-srvConnCh,
+		flows:    make(map[string]*Flow),
+		logger:   zap.NewNop(),
+		actionCh: make(chan *FlowActionMessage, 1),
+		signCh:   make(chan *SignResponseMessage, 1),
+		matchCh:  make(chan *MatchResponseMessage, 1),
+		closeCh:  make(chan struct{}, 1),
+		stopPing: make(chan struct{}),
+	}
+
+	assert.False(t, m.registerSession(session), "a session whose revocation status is unknown must be refused")
+	m.sessionsMu.RLock()
+	_, present := m.sessions[session.ID]
+	m.sessionsMu.RUnlock()
+	assert.False(t, present)
+}
+
 // stuckBlacklist blocks IsUserRevoked until its context ends, like an
-// unresponsive remote store, and then reports revoked (fail closed).
+// unresponsive remote store, and then reports the context error.
 type stuckBlacklist struct {
 	fakeEngineBlacklist
 	entered chan struct{}
 }
 
-func (b *stuckBlacklist) IsUserRevoked(ctx context.Context, _ string) bool {
+func (b *stuckBlacklist) IsUserRevoked(ctx context.Context, _ string) (bool, error) {
 	close(b.entered)
 	<-ctx.Done()
-	return true
+	return false, ctx.Err()
 }
 
 // A hung revocation store must neither hold the global session lock nor let
 // the session register.
 func TestManager_RegisterSession_StuckStoreFailsClosedWithoutHoldingLock(t *testing.T) {
-	old := revocationLookupTimeout
-	revocationLookupTimeout = 300 * time.Millisecond
-	defer func() { revocationLookupTimeout = old }()
+	old := revocationCheckTimeout
+	revocationCheckTimeout = 300 * time.Millisecond
+	defer func() { revocationCheckTimeout = old }()
 
 	m := NewManager(&config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}, zap.NewNop())
 	bl := &stuckBlacklist{entered: make(chan struct{})}
