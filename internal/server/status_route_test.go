@@ -145,6 +145,14 @@ func TestAuthProvider_StatusRoute_AudienceAndTAC(t *testing.T) {
 	if w := postLists(router, tok("wallet-registry", "r"), oneList); w.Code != http.StatusForbidden || fake.calls != 0 {
 		t.Fatalf("wallet-registry token: %d %s", w.Code, w.Body.String())
 	}
+	// A wallet-backend token with no subject has no caller identity.
+	anon := signServerToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   jwt.Claims{Audience: jwt.Audience{"wallet-backend"}},
+		TenantID: string(domain.DefaultTenantID), TAC: "r", ACR: "urn:siros:acr:passkey",
+	})
+	if w := postLists(router, anon, oneList); w.Code != http.StatusForbidden || fake.calls != 0 {
+		t.Fatalf("subject-less wallet-backend token: %d %s", w.Code, w.Body.String())
+	}
 	// "r" is required.
 	if w := postLists(router, tok("wallet-backend", "w"), oneList); w.Code != http.StatusForbidden || fake.calls != 0 {
 		t.Fatalf("token without r: %d %s", w.Code, w.Body.String())

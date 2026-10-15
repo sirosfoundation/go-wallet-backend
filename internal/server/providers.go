@@ -170,6 +170,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		statusGroup.Use(middleware.RequireAudience("wallet-backend"))
 	}
 	statusGroup.POST("/lists",
+		requireCallerIdentity(),
 		middleware.AuthRateLimitMiddlewareWithResponse(p.statusRateLimiter, wiaCallerIdentifier, gin.H{
 			"error":   "RATE_LIMIT_EXCEEDED",
 			"message": "Too many status list requests, please retry later",
@@ -274,6 +275,22 @@ func wiaCallerIdentifier(c *gin.Context) string {
 		return tenantID
 	}
 	return ""
+}
+
+// requireCallerIdentity refuses a request whose token carries no user or DID.
+// An identity-free anonymous token passes authentication and audience checks
+// but must not reach endpoints that are for identified callers only.
+func requireCallerIdentity() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.GetString("user_id") == "" && c.GetString("did") == "" {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"error":   "FORBIDDEN",
+				"message": "A caller identity is required",
+			})
+			return
+		}
+		c.Next()
+	}
 }
 
 // authMiddleware returns the appropriate auth middleware: go-tokenauth when
