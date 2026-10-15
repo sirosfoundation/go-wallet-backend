@@ -287,3 +287,60 @@ func TestWIAService_GenerateWIA_RevocationLandingBeforeSigningIsRefused(t *testi
 		})
 	}
 }
+
+// revokedBeforeRefusal models a concurrent revoke-all that persisted the
+// revocation of the raced instance first: our conditional write is then refused.
+type revokedBeforeRefusal struct {
+	storage.WalletInstanceStore
+	id string
+}
+
+func (r *revokedBeforeRefusal) UpdateStatusIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, b domain.InstanceBinding, st domain.InstanceStatus, reason string) error {
+	if id == r.id {
+		if err := r.WalletInstanceStore.UpdateStatus(ctx, id, tenantID, st, "concurrent revoke-all"); err != nil {
+			return err
+		}
+	}
+	return r.WalletInstanceStore.UpdateStatusIfUnchanged(ctx, id, tenantID, b, st, reason)
+}
+
+// The refused conditional write is not the same as a completed revocation: an
+// already-revoked record still gets the cascade (the other sweep may have kept
+// the data or failed), and an unrecognized status is an error, not a deactivation.
+func TestWIAService_RevokeIfWalletDeactivatedMeanwhile_RefusedTransition(t *testing.T) {
+	ctx := context.Background()
+	setup := func(t *testing.T, raced domain.InstanceStatus, wrap bool) (*WIAService, storage.Store, domain.UserID) {
+		fs := memory.NewStore()
+		uid := seedWalletUser(t, fs)
+		require.NoError(t, fs.WalletInstances().UpdateStatus(ctx, "inst-"+uid.String(), domain.DefaultTenantID, domain.InstanceStatusRevoked, "stolen"))
+		require.NoError(t, fs.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+			ID: "raced", TenantID: domain.DefaultTenantID, UserID: &uid, Status: raced,
+		}))
+		var insts storage.WalletInstanceStore = fs.WalletInstances()
+		if wrap {
+			insts = &revokedBeforeRefusal{WalletInstanceStore: insts, id: "raced"}
+		}
+		svc := newTestWIAServiceUsingStores(t, insts, fs.Users())
+		svc.SetLifecycle(NewWalletLifecycleService(fs, zap.NewNop(), nil))
+		return svc, fs, uid
+	}
+
+	t.Run("already revoked: the cascade still runs", func(t *testing.T) {
+		svc, fs, uid := setup(t, domain.InstanceStatusActive, true)
+		err := svc.revokeIfWalletDeactivatedMeanwhile(ctx, domain.DefaultTenantID, &uid, "raced")
+		require.ErrorIs(t, err, ErrWIAInstanceDeactivated)
+		u, gerr := fs.Users().GetByID(ctx, uid)
+		require.NoError(t, gerr)
+		assert.Empty(t, u.PrivateData, "the deactivated wallet's vault must be erased")
+	})
+	t.Run("unrecognized status is an error, not a deactivation", func(t *testing.T) {
+		svc, fs, uid := setup(t, domain.InstanceStatus("corrupted"), false)
+		err := svc.revokeIfWalletDeactivatedMeanwhile(ctx, domain.DefaultTenantID, &uid, "raced")
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, ErrWIAInstanceDeactivated)
+		assert.Contains(t, err.Error(), "corrupted")
+		u, gerr := fs.Users().GetByID(ctx, uid)
+		require.NoError(t, gerr)
+		assert.NotEmpty(t, u.PrivateData, "nothing is erased on an unknown status")
+	})
+}

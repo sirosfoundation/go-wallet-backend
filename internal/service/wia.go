@@ -911,20 +911,33 @@ func (s *WIAService) revokeIfWalletDeactivatedMeanwhile(ctx context.Context, ten
 		return fmt.Errorf("%w: instance was bound to another user", ErrWIAInstanceNotOwned)
 	}
 	const reason = "wallet deactivated during attestation"
-	alreadyRevoked := false
+	revokedHere := true
 	// Conditional on owner and generation: the read and write are not atomic.
 	if err := s.instances.UpdateStatusIfUnchanged(ctx, newID, tenantID, inserted.Binding(), domain.InstanceStatusRevoked, reason); err != nil {
 		if errors.Is(err, storage.ErrBindingChanged) || errors.Is(err, storage.ErrNotFound) {
 			s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was replaced during attestation"))
 			return fmt.Errorf("%w: instance was replaced during attestation", ErrWIAInstanceNotOwned)
 		}
-		// A concurrent revoke-all already took the record: intended outcome.
 		if !errors.Is(err, domain.ErrInvalidStatusTransition) {
 			return fmt.Errorf("revoke instance of deactivated wallet: %w", err)
 		}
-		alreadyRevoked = true
+		// The store reports both "already revoked" and "status cannot be revoked"
+		// this way: only a persisted revocation of this very record is the intended outcome.
+		cur, gerr := s.instances.GetByID(ctx, newID)
+		if gerr != nil {
+			return fmt.Errorf("re-read instance after refused revocation: %w", errors.Join(err, gerr))
+		}
+		if cur.TenantID != tenantID || !inserted.Binding().Matches(cur) {
+			s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was replaced during attestation"))
+			return fmt.Errorf("%w: instance was replaced during attestation", ErrWIAInstanceNotOwned)
+		}
+		if cur.Status != domain.InstanceStatusRevoked {
+			s.emitAuditFailure("instance_status_unrecognized", fmt.Errorf("instance %s has unrecognized status %q", cur.ID, cur.Status))
+			return fmt.Errorf("revoke instance of deactivated wallet: instance %s has status %q: %w", cur.ID, cur.Status, err)
+		}
+		inserted, revokedHere = cur, false
 	}
-	if s.audit != nil && !alreadyRevoked {
+	if s.audit != nil && revokedHere {
 		s.audit.EmitWithSubject(set.EventWIRevoked, newID, map[string]any{
 			"status": string(domain.InstanceStatusRevoked),
 			"reason": reason,
@@ -933,8 +946,9 @@ func (s *WIAService) revokeIfWalletDeactivatedMeanwhile(ctx context.Context, ten
 	}
 	s.emitAuditFailure("wallet_deactivated", errors.New("wallet deactivated while the first attestation was in flight"))
 	// The cascade that revoked the last other instance may have kept the wallet
-	// data because it saw this record as active; re-decide now.
-	if s.lifecycle != nil && !alreadyRevoked {
+	// data because it saw this record as active, or may have failed after the
+	// status change; re-decide now.
+	if s.lifecycle != nil {
 		inserted.Status = domain.InstanceStatusRevoked
 		if err := s.lifecycle.CascadeForRevokedLocked(ctx, tenantID, inserted, LifecycleActor{Kind: "provider"}); err != nil {
 			s.logger.Error("cascade after revoking a raced first attestation did not complete", zap.Error(err), zap.String("jkt", newID))
