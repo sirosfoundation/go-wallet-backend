@@ -247,6 +247,15 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	for {
 		events, wake := buf.after(cursor)
 		for _, ev := range events {
+			// A superseded or closed stream must not keep replaying: each write
+			// gets a fresh deadline, so a slow reader could drag a long batch on.
+			select {
+			case <-ctx.Done():
+				return
+			case <-done:
+				return
+			default:
+			}
 			armWrite()
 			if _, err := fmt.Fprintf(w, "id: %d\nevent: wmp\ndata: %s\n\n", ev.ID, ev.Data); err != nil {
 				return // client gone or too slow: stop, the event stays replayable

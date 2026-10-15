@@ -297,3 +297,41 @@ func TestWMP_SSE_DeadlineClearedAfterSuccessfulFlush(t *testing.T) {
 	require.Eventually(t, func() bool { last, _, _ := w.state(); return last.IsZero() }, 2*time.Second, 5*time.Millisecond,
 		"deadline must be cleared after the event flush")
 }
+
+// cancelAfterFirstEvent cancels the request context once the first event is
+// written, as a superseding connection or a closing session would mid-replay.
+type cancelAfterFirstEvent struct {
+	*httptest.ResponseRecorder
+	cancel context.CancelFunc
+}
+
+func (c *cancelAfterFirstEvent) Write(b []byte) (int, error) {
+	n, err := c.ResponseRecorder.Write(b)
+	if strings.Contains(string(b), "event: wmp") {
+		c.cancel()
+	}
+	return n, err
+}
+
+// Cancellation during a replay batch stops it at the next event instead of
+// after the whole batch.
+func TestWMP_SSE_ReplayStopsWhenCancelledMidBatch(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	sid, _, _ := createSessionFull(t, a, "u", "t", nil)
+	a.mu.RLock()
+	buf := a.eventBufs[sid]
+	a.mu.RUnlock()
+	for i := 0; i < 5; i++ {
+		buf.append([]byte(`{}`))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/v2/wallet/events?session_id="+sid, nil).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+testToken("u", "t"))
+	w := &cancelAfterFirstEvent{ResponseRecorder: httptest.NewRecorder(), cancel: cancel}
+	a.HandleWMPEvents(w, req)
+
+	assert.Equal(t, 1, strings.Count(w.Body.String(), "event: wmp"))
+}
