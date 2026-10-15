@@ -94,6 +94,10 @@ type StatusListResult struct {
 	ETag string `json:"etag,omitempty"`
 	// SignerTrust is the trust action that accepted the signer.
 	SignerTrust string `json:"signer_trust,omitempty"`
+
+	// tokenExp is the token's exp, kept for verified and not_modified so it can
+	// be rechecked once the whole batch is done.
+	tokenExp *time.Time
 }
 
 // NewStatusService returns the service for cfg, or nil when
@@ -208,6 +212,15 @@ func (s *StatusService) Lists(ctx context.Context, tenantID string, reqs []Statu
 	}
 	wg.Wait()
 
+	// A token can expire while the batch waits on slower lists or on trust
+	// evaluation, so exp is rechecked at the end, not only at load.
+	end := s.now()
+	for i, r := range results {
+		if r.tokenExp != nil && !end.Before(*r.tokenExp) {
+			results[i] = StatusListResult{URI: r.URI, State: StatusStateUndetermined, Reason: string(statuslist.ReasonExpired)}
+		}
+	}
+
 	// Counts, outcomes and duration only: never a uri, never a user.
 	var verified, notModified, undetermined int
 	reasons := map[string]int{}
@@ -270,14 +283,14 @@ func (s *StatusService) one(ctx context.Context, r StatusListRequest) (res Statu
 	if r.ETag != "" && r.ETag == vl.ETag {
 		return StatusListResult{
 			URI: r.URI, State: StatusStateNotModified, ETag: vl.ETag,
-			FreshUntil: &fresh, SignerTrust: vl.SignerAction,
+			FreshUntil: &fresh, SignerTrust: vl.SignerAction, tokenExp: vl.ExpiresAt,
 		}
 	}
 	bits, iat := vl.Bits, vl.IssuedAt.Unix()
 	out := StatusListResult{
 		URI: r.URI, State: StatusStateVerified, Bits: &bits,
 		Lst: base64.RawURLEncoding.EncodeToString(vl.Lst), IssuedAt: &iat,
-		FreshUntil: &fresh, ETag: vl.ETag, SignerTrust: vl.SignerAction,
+		FreshUntil: &fresh, ETag: vl.ETag, SignerTrust: vl.SignerAction, tokenExp: vl.ExpiresAt,
 	}
 	if vl.ExpiresAt != nil {
 		exp := vl.ExpiresAt.Unix()

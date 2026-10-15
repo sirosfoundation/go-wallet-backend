@@ -239,6 +239,38 @@ func TestStatusService_PerRequestDeadline(t *testing.T) {
 	}
 }
 
+// A fast list whose token expires while a slow list is still running must not
+// be returned as verified or not_modified.
+func TestStatusService_TokenExpiresWhileBatchWaits(t *testing.T) {
+	l := &fakeLister{fn: func(_ context.Context, uri string) (*statuslist.VerifiedList, error) {
+		vl := goodList()
+		if strings.HasSuffix(uri, "/fast") {
+			exp := time.Now().Add(50 * time.Millisecond)
+			vl.ExpiresAt = &exp
+			return vl, nil
+		}
+		time.Sleep(150 * time.Millisecond)
+		return vl, nil
+	}}
+	svc, _ := newTestStatusService(l, nil)
+
+	res, err := svc.Lists(context.Background(), "t", []StatusListRequest{
+		{URI: "https://a/fast"}, {URI: "https://a/slow"}, {URI: "https://b/fast", ETag: goodList().ETag},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, i := range []int{0, 2} {
+		r := res[i]
+		if r.State != StatusStateUndetermined || r.Reason != string(statuslist.ReasonExpired) || r.Lst != "" || r.Bits != nil || r.ETag != "" || r.FreshUntil != nil {
+			t.Fatalf("result %d = %+v, want undetermined/expired without list data", i, r)
+		}
+	}
+	if res[1].State != StatusStateVerified {
+		t.Fatalf("slow list with a long-lived token: %+v", res[1])
+	}
+}
+
 func TestStatusService_DefaultDeadlineBelowWriteTimeout(t *testing.T) {
 	svc, _ := newTestStatusService(&fakeLister{}, nil)
 	if svc.timeout >= 15*time.Second || svc.timeout <= 0 {
