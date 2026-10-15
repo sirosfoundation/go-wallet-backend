@@ -637,3 +637,73 @@ func TestEffectiveResponseMode(t *testing.T) {
 	assert.Equal(t, ResponseModeDirectPostJWT, effectiveResponseMode(&AuthorizationRequest{ResponseMode: ResponseModeDirectPostJWT}))
 	assert.Equal(t, ResponseModeFragment, effectiveResponseMode(&AuthorizationRequest{ResponseMode: ResponseModeFragment}))
 }
+
+// failSignHarness runs failSign against a verifier endpoint and a client socket,
+// returning what the verifier's response_uri received (nil when never contacted)
+// and the flow errors the client saw.
+func failSignHarness(t *testing.T, td []TransactionData, err error) (url.Values, []FlowErrorMessage) {
+	t.Helper()
+	var form url.Values
+	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		form = r.PostForm
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer verifier.Close()
+
+	errs := make(chan FlowErrorMessage, 4)
+	conn, cleanup := wsTestServer(t, func(srv *websocket.Conn) {
+		defer srv.Close()
+		for {
+			_, data, err := srv.ReadMessage()
+			if err != nil {
+				return
+			}
+			var m FlowErrorMessage
+			if json.Unmarshal(data, &m) == nil && m.Type == TypeFlowError {
+				errs <- m
+			}
+		}
+	})
+	defer cleanup()
+
+	h := &OID4VPHandler{}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop(), Flow: &Flow{ID: "flow-1", Session: testSession(conn)}}
+	h.httpClient = verifier.Client()
+	authReq := &AuthorizationRequest{
+		ClientID: "https://verifier.example.com", ResponseMode: ResponseModeDirectPost,
+		ResponseURI: verifier.URL, State: "st-1", TransactionData: td,
+	}
+	h.failSign(context.Background(), authReq, err)
+
+	var got []FlowErrorMessage
+	select {
+	case m := <-errs:
+		got = append(got, m)
+	case <-time.After(2 * time.Second):
+		t.Fatal("client never received a flow_error")
+	}
+	return form, got
+}
+
+// A client that refuses the transaction type after the request validated: the
+// verifier is told, and the client gets the distinct code.
+func TestFailSign_ClientRefusalOfTransactionDataTellsVerifier(t *testing.T) {
+	form, errs := failSignHarness(t, []TransactionData{{Type: "owf_payment_initiation"}},
+		&SignError{Message: "unsupported type", Code: ErrCodeUnsupportedTransactionData})
+	assert.Equal(t, "invalid_transaction_data", form.Get("error"))
+	assert.Equal(t, "st-1", form.Get("state"))
+	assert.Equal(t, ErrCodeUnsupportedTransactionData, errs[0].Error.Code)
+}
+
+// The classification counts only for a request that carried transaction_data, and
+// any other sign failure stays a SIGN_ERROR that does not contact the verifier.
+func TestFailSign_OtherFailuresStaySignError(t *testing.T) {
+	form, errs := failSignHarness(t, nil, &SignError{Message: "no", Code: ErrCodeUnsupportedTransactionData})
+	assert.Nil(t, form)
+	assert.Equal(t, ErrCodeSignError, errs[0].Error.Code)
+
+	form, errs = failSignHarness(t, []TransactionData{{Type: "x"}}, errors.New("boom"))
+	assert.Nil(t, form)
+	assert.Equal(t, ErrCodeSignError, errs[0].Error.Code)
+}

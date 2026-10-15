@@ -411,3 +411,25 @@ func TestWMP_OutboundResponse_EnforcesParentProtocolTAC(t *testing.T) {
 		})
 	}
 }
+
+// A child sign flow the client fails with capability-not-supported reaches the
+// parent's RequestSign classified, so the OID4VP flow can tell the verifier.
+func TestWMP_FlowError_ChildCapabilityNotSupportedIsClassified(t *testing.T) {
+	f := newTACMethodFixture(t)
+	f.a.mu.RLock()
+	h := f.a.peers[f.sid].handler
+	f.a.mu.RUnlock()
+
+	for code, want := range map[int]ErrorCode{wmp.ErrCapabilityNotSupported: ErrCodeUnsupportedTransactionData, wmp.ErrFlowError: ""} {
+		h.registerChildFlow("child-1", "f-i", "msg-1", "sign")
+		body := wmpNotification(wmp.MethodFlowError, wmp.FlowErrorParams{WMP: f.meta(), FlowID: "child-1", Code: code, Message: "no"})
+		_, err := f.a.HandleRPCAs(context.Background(), f.sid, tacFull, body)
+		require.NoError(t, err)
+		select {
+		case got := <-f.sess.signCh:
+			assert.Equal(t, want, got.ErrorCode, "code %d", code)
+		case <-time.After(2 * time.Second):
+			t.Fatal("sign failure not delivered")
+		}
+	}
+}

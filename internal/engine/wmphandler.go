@@ -1931,6 +1931,11 @@ func (h *wmpEngineHandler) FlowError(ctx context.Context, params *wmp.FlowErrorP
 	switch info.flowType {
 	case "sign":
 		resp := &SignResponseMessage{Message: Message{Type: TypeSignResponse, FlowID: info.parentFlowID, MessageID: info.messageID}, Error: reason}
+		// A client that cannot process the request's transaction_data answers
+		// capability-not-supported; the OID4VP flow uses it to tell the verifier.
+		if params.Code == wmp.ErrCapabilityNotSupported {
+			resp.ErrorCode = ErrCodeUnsupportedTransactionData
+		}
 		select {
 		case h.session.signCh <- resp:
 			delivered = true

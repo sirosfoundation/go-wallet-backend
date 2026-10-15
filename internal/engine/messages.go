@@ -583,6 +583,9 @@ type SignResponseMessage struct {
 	// Error is set when the client failed the sign request (for WMP, a
 	// wmp.flow.error); RequestSign returns it instead of waiting for a timeout.
 	Error string `json:"error,omitempty"`
+	// ErrorCode classifies Error. Only ErrCodeUnsupportedTransactionData is acted
+	// on: the client refused the request's transaction_data.
+	ErrorCode ErrorCode `json:"error_code,omitempty"`
 }
 
 // MatchRequestMessage requests client-side credential matching.

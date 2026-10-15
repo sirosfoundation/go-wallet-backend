@@ -1580,10 +1580,19 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 	}
 }
 
+// SignError is a sign failure reported by the client, with the client's
+// classification of it.
+type SignError struct {
+	Message string
+	Code    ErrorCode
+}
+
+func (e *SignError) Error() string { return e.Message }
+
 // signResult turns a client-reported sign failure into an error.
 func signResult(resp *SignResponseMessage) (*SignResponseMessage, error) {
 	if resp.Error != "" {
-		return nil, errors.New(resp.Error)
+		return nil, &SignError{Message: resp.Error, Code: resp.ErrorCode}
 	}
 	return resp, nil
 }

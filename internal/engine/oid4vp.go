@@ -257,7 +257,7 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	vpToken, err := h.requestVPSignature(ctx, authReq, selectedCredentials, verifier.ClientID)
 	if err != nil {
 		h.Logger.Debug("VP signature failed", zap.Error(err))
-		_ = h.Error(StepSubmittingResponse, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+		h.failSign(ctx, authReq, err)
 		return err
 	}
 
@@ -2474,6 +2474,18 @@ func dcqlCredentialIDs(dcql json.RawMessage) map[string]bool {
 		ids[c.ID] = true
 	}
 	return ids
+}
+
+// failSign reports a failed signing request. The client may refuse a transaction
+// type only it can judge; the verifier is then told invalid_transaction_data
+// rather than left waiting.
+func (h *OID4VPHandler) failSign(ctx context.Context, authReq *AuthorizationRequest, err error) {
+	var signErr *SignError
+	if len(authReq.TransactionData) > 0 && errors.As(err, &signErr) && signErr.Code == ErrCodeUnsupportedTransactionData {
+		h.failTransactionData(ctx, authReq, &transactionDataError{code: ErrCodeUnsupportedTransactionData, err: err})
+		return
+	}
+	_ = h.Error(StepSubmittingResponse, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
 }
 
 // failTransactionData ends the flow: the verifier is told (as for a decline) and the
