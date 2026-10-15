@@ -26,6 +26,10 @@ const (
 	revocationOpTimeout = 5 * time.Second
 )
 
+// RevocationInitTimeout bounds setting the store up (connecting, creating the
+// TTL index).
+var RevocationInitTimeout = 30 * time.Second
+
 // mongoRevocationStore is a RevocationStore shared by every process using
 // the same database, and surviving restarts.
 //
@@ -47,6 +51,8 @@ type mongoRevocationStore struct {
 // NewMongoRevocationStore creates the store and the TTL index on
 // revoked_tokens.expires_at.
 func NewMongoRevocationStore(ctx context.Context, db *mongo.Database) (RevocationStore, error) {
+	ctx, cancel := context.WithTimeout(ctx, RevocationInitTimeout)
+	defer cancel()
 	opts := options.Collection().
 		SetReadPreference(readpref.Primary()).
 		SetWriteConcern(writeconcern.Majority())
@@ -89,6 +95,8 @@ func (s *mongoRevocationStore) Has(ctx context.Context, jti string) (bool, error
 
 // Remove deletes the revocation of jti, if any.
 func (s *mongoRevocationStore) Remove(ctx context.Context, jti string) error {
+	ctx, cancel := context.WithTimeout(ctx, revocationOpTimeout)
+	defer cancel()
 	if _, err := s.tokens.DeleteOne(ctx, bson.M{"_id": jti}); err != nil {
 		return fmt.Errorf("remove token revocation: %w", err)
 	}
