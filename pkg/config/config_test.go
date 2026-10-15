@@ -2241,6 +2241,12 @@ func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
 		{"rfc1918", "10.0.0.5", "private/loopback"},
 		{"rfc1918 172.16", "172.16.4.2", "private/loopback"},
 		{"link-local", "169.254.10.1", "private/loopback"},
+		{"cgnat", "100.64.0.1", "private/loopback"},
+		{"cgnat upper", "100.127.255.254", "private/loopback"},
+		{"alibaba metadata", "100.100.100.200", "cloud metadata"},
+		{"oracle metadata", "192.0.0.192", "private/loopback"},
+		{"benchmarking", "198.19.1.1", "private/loopback"},
+		{"nat64", "64:ff9b::7f00:1", "private/loopback"},
 		{"cloud metadata", "169.254.169.254", "cloud metadata"},
 		{"cloud metadata ipv6", "fd00::1", "cloud metadata"},
 		{"unspecified", "0.0.0.0", "unspecified"},
@@ -2772,6 +2778,8 @@ func TestGuardedDial_TrustedHostMayBePrivate(t *testing.T) {
 		{"unlisted host, private ip", "other.internal", "10.1.2.3", true},
 		{"trusted host, metadata ip", "idp.internal", "169.254.169.254", true},
 		{"trusted host, unspecified ip", "idp.internal", "0.0.0.0", true},
+		{"trusted host, cgnat ip", "idp.internal", "100.64.0.9", false},
+		{"trusted host, alibaba metadata ip", "idp.internal", "100.100.100.200", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

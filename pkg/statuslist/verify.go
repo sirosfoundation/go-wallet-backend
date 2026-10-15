@@ -523,14 +523,46 @@ type fetchResult struct {
 	maxAge      *time.Duration
 }
 
-// fetch GETs uri, conditionally when ifNoneMatch is set (a 304 is notModified).
-func (c *Checker) fetch(ctx context.Context, uri, ifNoneMatch string) (fetchResult, error) {
+// validateFetchURI parses uri and refuses what a status list URL never needs:
+// a scheme other than https (http only when allowed), userinfo, a missing
+// host, a bad port, or an IPv6 zone. Address policy is the client's, applied
+// at dial time to the address actually connected to.
+func (c *Checker) validateFetchURI(uri string) (*url.URL, error) {
 	u, err := url.Parse(uri)
 	if err != nil {
-		return fetchResult{}, classify(ReasonURINotAllowed, fmt.Errorf("status list uri: %w", err))
+		return nil, classify(ReasonURINotAllowed, fmt.Errorf("status list uri: %w", err))
 	}
 	if u.Scheme != "https" && (!c.allowHTTP || u.Scheme != "http") {
-		return fetchResult{}, classify(ReasonURINotAllowed, fmt.Errorf("status list uri must be https: %q", u.Scheme))
+		return nil, classify(ReasonURINotAllowed, fmt.Errorf("status list uri must be https: %q", u.Scheme))
+	}
+	host := u.Hostname()
+	switch {
+	case host == "":
+		return nil, classify(ReasonURINotAllowed, errors.New("status list uri has no host"))
+	case u.User != nil:
+		return nil, classify(ReasonURINotAllowed, errors.New("status list uri must not carry userinfo"))
+	case !validPort(u.Port()):
+		return nil, classify(ReasonURINotAllowed, errors.New("status list uri has an invalid port"))
+	case strings.Contains(host, "%"):
+		return nil, classify(ReasonURINotAllowed, errors.New("status list uri host must not carry a zone"))
+	}
+	return u, nil
+}
+
+// validPort accepts an empty port or one in 1..65535.
+func validPort(p string) bool {
+	if p == "" {
+		return true
+	}
+	n, err := strconv.ParseUint(p, 10, 16)
+	return err == nil && n > 0
+}
+
+// fetch GETs uri, conditionally when ifNoneMatch is set (a 304 is notModified).
+func (c *Checker) fetch(ctx context.Context, uri, ifNoneMatch string) (fetchResult, error) {
+	u, err := c.validateFetchURI(uri)
+	if err != nil {
+		return fetchResult{}, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
 	if err != nil {
@@ -543,7 +575,7 @@ func (c *Checker) fetch(ctx context.Context, uri, ifNoneMatch string) (fetchResu
 	// The URI is attacker-influenced; SSRF protection is c.client (private,
 	// loopback, link-local and metadata addresses refused on every hop). No
 	// allowlist: issuers are arbitrary public hosts.
-	resp, err := c.client.Do(req) // lgtm[go/request-forgery]
+	resp, err := c.client.Do(req)
 	if err != nil {
 		return fetchResult{}, classify(ReasonFetchFailed, fmt.Errorf("fetch status list: %w", err))
 	}

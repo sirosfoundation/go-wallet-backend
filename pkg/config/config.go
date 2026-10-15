@@ -825,10 +825,11 @@ func checkAddressesFor(host string, ips []net.IP, trusted map[string]struct{}) e
 	for _, ip := range ips {
 		// Block cloud metadata endpoints (169.254.169.254, fd00::1)
 		// before the generic private/link-local check for a clearer message.
-		if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00::1")) {
+		if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00::1")) ||
+			ip.Equal(net.ParseIP("100.100.100.200")) {
 			return fmt.Errorf("connection to cloud metadata endpoint %s (%s) is not allowed", host, ip)
 		}
-		if !isTrusted && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()) {
+		if !isTrusted && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || inInternalRange(ip)) {
 			return fmt.Errorf("connection to %s (%s) is not allowed: private/loopback address", host, ip)
 		}
 		// 0.0.0.0 / :: name no real destination, but connect() on Linux (and
@@ -840,6 +841,32 @@ func checkAddressesFor(host string, ips []net.IP, trusted map[string]struct{}) e
 		}
 	}
 	return nil
+}
+
+// internalRanges are non-global blocks that net.IP's predicates do not cover
+// but that reach a deployment's own network: shared address space (CGNAT, also
+// used by overlay VPNs and Alibaba's metadata service), IETF protocol
+// assignments (Oracle's metadata service), benchmarking space, and the NAT64
+// prefixes, whose embedded IPv4 address a gateway would connect to.
+var internalRanges = func() []*net.IPNet {
+	var out []*net.IPNet
+	for _, c := range []string{"100.64.0.0/10", "192.0.0.0/24", "198.18.0.0/15", "64:ff9b::/96", "64:ff9b:1::/48"} {
+		_, n, err := net.ParseCIDR(c)
+		if err != nil {
+			panic(err)
+		}
+		out = append(out, n)
+	}
+	return out
+}()
+
+func inInternalRange(ip net.IP) bool {
+	for _, n := range internalRanges {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 // ssrfGuard is the half of the protection that has to sit above the transport
