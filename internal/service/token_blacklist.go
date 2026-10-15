@@ -35,7 +35,9 @@ type TokenBlacklist struct {
 	logger *zap.Logger
 
 	// store holds the jti and user revocations (in-memory unless replaced);
-	// ConsumeOnce and the families map stay process-local.
+	// ConsumeOnce and the families map stay process-local. With a custom
+	// store, tokens holds only the ConsumeOnce entries, and the cleanup
+	// sweep and Count cover only those: the store expires its own entries.
 	store RevocationStore
 
 	mu       sync.RWMutex
@@ -371,16 +373,22 @@ func (b *TokenBlacklist) IsFamilyRevoked(ctx context.Context, sid string) bool {
 	return true
 }
 
-// Remove removes a token from the blacklist (if needed for admin override)
+// Remove removes a token from the blacklist (if needed for admin override).
+// It returns ErrRevocationRemoveUnsupported if the store cannot delete
+// entries, so a store-backed blacklist never silently keeps a revocation the
+// caller asked to lift.
 func (b *TokenBlacklist) Remove(ctx context.Context, jti string) error {
 	if !b.config.Enabled {
 		return nil
 	}
 
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	delete(b.tokens, jti)
+	r, ok := b.store.(revocationRemover)
+	if !ok {
+		return ErrRevocationRemoveUnsupported
+	}
+	if err := r.Remove(ctx, jti); err != nil {
+		return err
+	}
 
 	b.logger.Debug("Token removed from blacklist",
 		zap.String("jti", jti),
@@ -389,7 +397,8 @@ func (b *TokenBlacklist) Remove(ctx context.Context, jti string) error {
 	return nil
 }
 
-// Count returns the number of tokens currently on the blacklist
+// Count returns the number of jti entries held by this process: all of them
+// with the in-memory store, only ConsumeOnce entries with any other store.
 func (b *TokenBlacklist) Count() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()

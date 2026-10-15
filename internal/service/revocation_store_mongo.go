@@ -37,8 +37,8 @@ const (
 // revocation is permanent (see TokenBlacklist), and the collection grows by
 // one small document per deleted account.
 //
-// Both collections are read from the primary and written with majority
-// concurrency, so a revocation is visible to the next check on any replica.
+// Both collections are read from the primary and written with a majority
+// write concern, so a revocation is visible to the next check on any replica.
 type mongoRevocationStore struct {
 	tokens *mongo.Collection
 	users  *mongo.Collection
@@ -87,6 +87,14 @@ func (s *mongoRevocationStore) Has(ctx context.Context, jti string) (bool, error
 	return foundOrErr(err, "check token revocation")
 }
 
+// Remove deletes the revocation of jti, if any.
+func (s *mongoRevocationStore) Remove(ctx context.Context, jti string) error {
+	if _, err := s.tokens.DeleteOne(ctx, bson.M{"_id": jti}); err != nil {
+		return fmt.Errorf("remove token revocation: %w", err)
+	}
+	return nil
+}
+
 func (s *mongoRevocationStore) RevokeUser(ctx context.Context, userID string) error {
 	ctx, cancel := context.WithTimeout(ctx, revocationOpTimeout)
 	defer cancel()
@@ -126,9 +134,9 @@ type databaseProvider interface {
 	Database() *mongo.Database
 }
 
-// newRevocationStore picks the RevocationStore for cfg.Backend. A nil store
+// NewRevocationStore picks the RevocationStore for cfg.Backend. A nil store
 // means the in-memory one.
-func newRevocationStore(ctx context.Context, cfg config.TokenBlacklistConfig, store storage.Store, logger *zap.Logger) (RevocationStore, error) {
+func NewRevocationStore(ctx context.Context, cfg config.TokenBlacklistConfig, store storage.Store, logger *zap.Logger) (RevocationStore, error) {
 	dbp, hasMongo := store.(databaseProvider)
 	switch cfg.Backend {
 	case "":

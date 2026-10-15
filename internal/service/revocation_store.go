@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 )
@@ -21,6 +22,15 @@ type RevocationStore interface {
 	// IsUserRevoked reports whether userID was revoked via RevokeUser. An
 	// error means the answer is unknown, not "no".
 	IsUserRevoked(ctx context.Context, userID string) (bool, error)
+}
+
+// ErrRevocationRemoveUnsupported is returned by TokenBlacklist.Remove when
+// the configured store cannot delete an entry.
+var ErrRevocationRemoveUnsupported = errors.New("revocation store does not support removing entries")
+
+// revocationRemover is implemented by stores that can delete a revoked jti.
+type revocationRemover interface {
+	Remove(ctx context.Context, jti string) error
 }
 
 // memoryRevocationStore is the process-local RevocationStore. It borrows the
@@ -57,4 +67,11 @@ func (s *memoryRevocationStore) IsUserRevoked(_ context.Context, userID string) 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.users[userID], nil
+}
+
+func (s *memoryRevocationStore) Remove(_ context.Context, jti string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.tokens, jti)
+	return nil
 }

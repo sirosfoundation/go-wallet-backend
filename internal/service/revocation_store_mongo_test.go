@@ -227,27 +227,27 @@ func TestNewRevocationStore_Selection(t *testing.T) {
 	dead := mongoStoreFake{Store: plain, db: deadMongoDB(t)}
 
 	t.Run("default with non-MongoDB storage is memory", func(t *testing.T) {
-		s, err := newRevocationStore(ctx, config.TokenBlacklistConfig{}, plain, logger)
+		s, err := NewRevocationStore(ctx, config.TokenBlacklistConfig{}, plain, logger)
 		require.NoError(t, err)
 		require.Nil(t, s)
 	})
 	t.Run("explicit memory with MongoDB storage is memory", func(t *testing.T) {
-		s, err := newRevocationStore(ctx, config.TokenBlacklistConfig{Backend: "memory"}, dead, logger)
+		s, err := NewRevocationStore(ctx, config.TokenBlacklistConfig{Backend: "memory"}, dead, logger)
 		require.NoError(t, err)
 		require.Nil(t, s)
 	})
 	t.Run("storage needs MongoDB", func(t *testing.T) {
-		_, err := newRevocationStore(ctx, config.TokenBlacklistConfig{Backend: "storage"}, plain, logger)
+		_, err := NewRevocationStore(ctx, config.TokenBlacklistConfig{Backend: "storage"}, plain, logger)
 		require.Error(t, err)
 	})
 	t.Run("unknown backend", func(t *testing.T) {
-		_, err := newRevocationStore(ctx, config.TokenBlacklistConfig{Backend: "redis"}, plain, logger)
+		_, err := NewRevocationStore(ctx, config.TokenBlacklistConfig{Backend: "redis"}, plain, logger)
 		require.Error(t, err)
 	})
 	t.Run("default with MongoDB storage uses MongoDB", func(t *testing.T) {
 		// The dead database cannot create its index, which proves the
 		// MongoDB store was selected without a server.
-		_, err := newRevocationStore(ctx, config.TokenBlacklistConfig{}, dead, logger)
+		_, err := NewRevocationStore(ctx, config.TokenBlacklistConfig{}, dead, logger)
 		require.Error(t, err)
 		require.True(t, strings.Contains(err.Error(), revokedTokensCollection), err.Error())
 	})
@@ -266,4 +266,22 @@ func TestNewServices_RevocationStoreFailureIsReported(t *testing.T) {
 	_, err = svc.TokenBlacklist.IsUserRevoked(ctx, "any")
 	require.Error(t, err)
 	require.Error(t, svc.TokenBlacklist.Add(ctx, "any", time.Now().Add(time.Hour)))
+}
+
+func TestMongoRevocationStore_Remove(t *testing.T) {
+	client := revocationMongoClient(t)
+	ctx := context.Background()
+	s, err := NewMongoRevocationStore(ctx, revocationTestDB(t, client))
+	require.NoError(t, err)
+	b := NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop(), s)
+
+	require.NoError(t, b.Add(ctx, "j", time.Now().Add(time.Hour)))
+	revoked, err := b.IsBlacklisted(ctx, "j")
+	require.NoError(t, err)
+	require.True(t, revoked)
+	require.NoError(t, b.Remove(ctx, "j"))
+	revoked, err = b.IsBlacklisted(ctx, "j")
+	require.NoError(t, err)
+	require.False(t, revoked)
+	require.NoError(t, b.Remove(ctx, "never-added"), "removing an absent jti is not an error")
 }

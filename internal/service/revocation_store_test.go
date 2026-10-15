@@ -181,3 +181,77 @@ func userRevoked(t *testing.T, r revocationReader, ctx context.Context, userID s
 	}
 	return ok
 }
+
+// removableStore is a recordingStore that also supports Remove.
+type removableStore struct {
+	recordingStore
+	removed []string
+}
+
+func (r *removableStore) Remove(_ context.Context, jti string) error {
+	r.removed = append(r.removed, jti)
+	return nil
+}
+
+func TestTokenBlacklist_Remove_WithStore(t *testing.T) {
+	ctx := context.Background()
+	cfg := config.TokenBlacklistConfig{Enabled: true}
+
+	rs := &removableStore{}
+	b := NewTokenBlacklistWithStore(cfg, zap.NewNop(), rs)
+	if err := b.Remove(ctx, "j"); err != nil || len(rs.removed) != 1 || rs.removed[0] != "j" {
+		t.Errorf("Remove must reach the store: err=%v removed=%v", err, rs.removed)
+	}
+
+	plain := NewTokenBlacklistWithStore(cfg, zap.NewNop(), &recordingStore{})
+	if err := plain.Remove(ctx, "j"); !errors.Is(err, ErrRevocationRemoveUnsupported) {
+		t.Errorf("Remove on a store that cannot delete = %v, want ErrRevocationRemoveUnsupported", err)
+	}
+
+	off := NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop(), rs)
+	rs.removed = nil
+	if err := off.Remove(ctx, "j"); err != nil || len(rs.removed) != 0 {
+		t.Errorf("a disabled blacklist must not call the store: err=%v removed=%v", err, rs.removed)
+	}
+}
+
+func TestMemoryRevocationStore_Remove(t *testing.T) {
+	ctx := context.Background()
+	b := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop())
+	_ = b.Add(ctx, "j", time.Now().Add(time.Hour))
+	if b.Count() != 1 {
+		t.Fatalf("Count = %d, want 1", b.Count())
+	}
+	if err := b.Remove(ctx, "j"); err != nil {
+		t.Fatal(err)
+	}
+	if blacklisted(t, b, ctx, "j") || b.Count() != 0 {
+		t.Error("Remove must delete the entry from the in-memory store")
+	}
+}
+
+// With a custom store the local map holds only ConsumeOnce entries: Count,
+// the cleanup sweep and ConsumeOnce neither see nor touch the store's jtis.
+func TestTokenBlacklist_LocalStateIsSeparateFromStore(t *testing.T) {
+	ctx := context.Background()
+	rs := &recordingStore{has: map[string]bool{}}
+	b := NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop(), rs)
+
+	_ = b.Add(ctx, "revoked", time.Now().Add(time.Hour))
+	if b.Count() != 0 {
+		t.Errorf("Count = %d, want 0: store entries are not counted locally", b.Count())
+	}
+	if first, _ := b.ConsumeOnce(ctx, "refresh", time.Now().Add(-time.Second)); !first {
+		t.Fatal("first ConsumeOnce must win")
+	}
+	if len(rs.added) != 1 {
+		t.Errorf("ConsumeOnce must not write to the store, store saw %v", rs.added)
+	}
+	if b.Count() != 1 {
+		t.Fatalf("Count = %d, want 1 ConsumeOnce entry", b.Count())
+	}
+	b.cleanup()
+	if b.Count() != 0 {
+		t.Errorf("cleanup must sweep expired ConsumeOnce entries, Count = %d", b.Count())
+	}
+}
