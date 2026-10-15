@@ -153,11 +153,17 @@ func (s *Services) Start() {
 	if s.TombstoneSweeper != nil {
 		s.TombstoneSweeper.Start()
 	}
-	if s.Reconciler != nil {
-		s.Reconciler.Start()
-	}
 	if s.WIA != nil {
 		s.WIA.Start()
+	}
+}
+
+// StartReconciler starts the erasure reconciler. It is not part of Start: its
+// cascade drops sessions through the session cleaner, which the caller wires
+// after Start, so the caller starts it once that wiring is complete.
+func (s *Services) StartReconciler() {
+	if s.Reconciler != nil {
+		s.Reconciler.Start()
 	}
 }
 

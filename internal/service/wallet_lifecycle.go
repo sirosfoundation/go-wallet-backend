@@ -44,6 +44,7 @@ type WalletLifecycleService struct {
 	store          storage.Store
 	logger         *zap.Logger
 	audit          *audit.Emitter
+	cleanerMu      sync.RWMutex
 	sessionCleaner SessionCleaner
 	// locks serializes, per user and process, an attestation's instance write
 	// against the cascade's "anything live? then erase" step; across processes
@@ -97,7 +98,17 @@ func NewWalletLifecycleService(store storage.Store, logger *zap.Logger, auditor 
 }
 
 // SetSessionCleaner wires the session store dropped on revocation.
-func (s *WalletLifecycleService) SetSessionCleaner(sc SessionCleaner) { s.sessionCleaner = sc }
+func (s *WalletLifecycleService) SetSessionCleaner(sc SessionCleaner) {
+	s.cleanerMu.Lock()
+	defer s.cleanerMu.Unlock()
+	s.sessionCleaner = sc
+}
+
+func (s *WalletLifecycleService) cleaner() SessionCleaner {
+	s.cleanerMu.RLock()
+	defer s.cleanerMu.RUnlock()
+	return s.sessionCleaner
+}
 
 // ListForUser returns the wallet instances registered for a user in a tenant.
 func (s *WalletLifecycleService) ListForUser(ctx context.Context, tenantID domain.TenantID, userID domain.UserID) ([]*domain.WalletInstance, error) {
@@ -368,8 +379,8 @@ func (s *WalletLifecycleService) cascadeLocked(ctx context.Context, tenantID dom
 	if err := s.ensureCutoff(ctx, userID, inst); err != nil {
 		return s.incomplete(userID, []error{err})
 	}
-	if s.sessionCleaner != nil {
-		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
+	if sc := s.cleaner(); sc != nil {
+		if err := sc.DeleteByUser(ctx, userID.String()); err != nil {
 			errs = append(errs, fmt.Errorf("drop sessions: %w", err))
 		}
 	}
