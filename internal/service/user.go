@@ -60,6 +60,10 @@ type TokenRevoker interface {
 	RevokeUser(ctx context.Context, userID string) error
 }
 
+// ErrTokenRevocationFailed is returned by DeleteUser when the user's tokens
+// could not be revoked; the user is not deleted.
+var ErrTokenRevocationFailed = errors.New("failed to revoke tokens")
+
 // UserService handles user-related operations
 type UserService struct {
 	store          storage.Store
@@ -310,7 +314,11 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// below runs. Reversing this order would reopen that gap.
 	if s.tokenBlacklist != nil {
 		if err := s.tokenBlacklist.RevokeUser(ctx, userID.String()); err != nil {
-			s.logger.Warn("Failed to revoke tokens for deleted user", zap.Error(err))
+			// Fail closed: deleting the user without the revocation would
+			// leave their tokens valid. The user still exists, so a retry
+			// can complete the deletion.
+			s.logger.Error("Failed to revoke tokens for deleted user", zap.Error(err))
+			return fmt.Errorf("%w: %v", ErrTokenRevocationFailed, err)
 		}
 	}
 

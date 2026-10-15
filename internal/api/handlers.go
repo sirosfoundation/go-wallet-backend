@@ -973,12 +973,15 @@ func (h *Handlers) Logout(c *gin.Context) {
 			if result.JTI != "" && h.services.TokenBlacklist != nil {
 				expiry := time.Now().Add(ttlForTokenAuthResult(h.cfg, result) + time.Minute)
 				if err := h.services.TokenBlacklist.Add(c.Request.Context(), result.JTI, expiry); err != nil {
-					h.logger.Warn("Failed to blacklist token", zap.Error(err))
-				} else {
-					h.logger.Info("User logged out, token blacklisted",
-						zap.String("jti", result.JTI),
-					)
+					// Fail closed: the token is still usable, so do not
+					// report a clean logout. The client may retry.
+					h.logger.Error("Logout: failed to blacklist token", zap.Error(err))
+					c.JSON(500, gin.H{"error": "Failed to revoke session"})
+					return
 				}
+				h.logger.Info("User logged out, token blacklisted",
+					zap.String("jti", result.JTI),
+				)
 			}
 
 			c.JSON(200, gin.H{"message": "Logged out successfully"})
@@ -1032,12 +1035,13 @@ func (h *Handlers) Logout(c *gin.Context) {
 
 				// Add to blacklist
 				if err := h.services.TokenBlacklist.Add(c.Request.Context(), jti, expiry); err != nil {
-					h.logger.Warn("Failed to blacklist token", zap.Error(err))
-				} else {
-					h.logger.Info("User logged out, token blacklisted",
-						zap.String("jti", jti),
-					)
+					h.logger.Error("Logout: failed to blacklist token", zap.Error(err))
+					c.JSON(500, gin.H{"error": "Failed to revoke session"})
+					return
 				}
+				h.logger.Info("User logged out, token blacklisted",
+					zap.String("jti", jti),
+				)
 			}
 		}
 	}
@@ -1065,6 +1069,11 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		holderDID,
 	); err != nil {
 		h.logger.Error("Failed to delete user", zap.Error(err))
+		if errors.Is(err, service.ErrTokenRevocationFailed) {
+			// Nothing was deleted yet that a retry cannot redo.
+			c.JSON(500, gin.H{"error": "Failed to revoke tokens"})
+			return
+		}
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}

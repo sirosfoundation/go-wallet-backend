@@ -584,8 +584,10 @@ API requests get `503 {"error":"Token revocation check unavailable"}`, the
 token-delegation endpoint answers 503, a WebSocket handshake is refused, and a
 token checked by the token validator is rejected with 401. Every lookup is
 bounded to 5 seconds. A revocation write that fails
-during logout or account deletion is logged as before; those operations
-still complete, so the revocation is missing until the store is back. If
+fails the request: logout (`POST /user/session/logout`, `DELETE /auth/session`)
+and account deletion answer 500 and change nothing the client cannot retry
+(the session cookie is kept, the user is not deleted); repeat the request
+once the store is back. If
 the store cannot be set up at startup the process still starts, logs an
 error and refuses authenticated requests until restarted.
 

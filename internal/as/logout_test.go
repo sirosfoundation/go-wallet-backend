@@ -276,9 +276,8 @@ func TestLogoutHandler_RefusesToBlacklistOtherUsersLegacyToken(t *testing.T) {
 }
 
 // erroringBlacklist wraps fakeBlacklist but makes Add always fail, to
-// exercise the "failed to blacklist ... on logout" warn-log paths in
-// blacklistOwnBearerToken - which must not turn logout itself into a
-// failure (the handler still returns 204).
+// exercise the "failed to blacklist ... on logout" paths in
+// blacklistOwnBearerToken, which must fail the logout.
 type erroringBlacklist struct {
 	fakeBlacklist
 }
@@ -287,10 +286,10 @@ func (e *erroringBlacklist) Add(ctx context.Context, jti string, expiry time.Tim
 	return errors.New("simulated blacklist write failure")
 }
 
-// TestLogoutHandler_BlacklistAddErrorDoesNotFailLogout proves a blacklist
-// write failure while logging out (asymmetric-token path) is logged but
-// doesn't turn session logout itself into a failure.
-func TestLogoutHandler_BlacklistAddErrorDoesNotFailLogout(t *testing.T) {
+// TestLogoutHandler_BlacklistAddErrorFailsLogout proves a blacklist write
+// failure while logging out (asymmetric-token path) fails the request and
+// keeps the session cookie for the retry.
+func TestLogoutHandler_BlacklistAddErrorFailsLogout(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := NewMemorySessionStore()
 	logger := zap.NewNop()
@@ -319,14 +318,19 @@ func TestLogoutHandler_BlacklistAddErrorDoesNotFailLogout(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+accessToken)
 	router.ServeHTTP(w, req)
 
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("expected 204 even when the blacklist write fails, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 when the blacklist write fails, got %d: %s", w.Code, w.Body.String())
+	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == sessionCookieInsecure && c.MaxAge < 0 {
+			t.Error("the session cookie must be kept so the client can retry")
+		}
 	}
 }
 
-// TestLogoutHandler_LegacyBlacklistAddErrorDoesNotFailLogout is the
+// TestLogoutHandler_LegacyBlacklistAddErrorFailsLogout is the
 // legacy-issuer counterpart of the test above.
-func TestLogoutHandler_LegacyBlacklistAddErrorDoesNotFailLogout(t *testing.T) {
+func TestLogoutHandler_LegacyBlacklistAddErrorFailsLogout(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	store := NewMemorySessionStore()
 	logger := zap.NewNop()
@@ -355,8 +359,13 @@ func TestLogoutHandler_LegacyBlacklistAddErrorDoesNotFailLogout(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer "+legacyToken)
 	router.ServeHTTP(w, req)
 
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("expected 204 even when the blacklist write fails, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500 when the blacklist write fails, got %d: %s", w.Code, w.Body.String())
+	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == sessionCookieInsecure && c.MaxAge < 0 {
+			t.Error("the session cookie must be kept so the client can retry")
+		}
 	}
 }
 
@@ -376,6 +385,36 @@ func TestLogoutHandler_NonexistentSession(t *testing.T) {
 	// Should still clear the cookie and return 204 (graceful).
 	if w.Code != http.StatusNoContent {
 		t.Errorf("expected 204 even for nonexistent session, got %d", w.Code)
+	}
+}
+
+// failingRevokeStore makes Revoke fail, as a store outage would.
+type failingRevokeStore struct{ *MemorySessionStore }
+
+func (failingRevokeStore) Revoke(context.Context, string) error {
+	return errors.New("simulated session revocation failure")
+}
+
+// A failed session revocation fails the logout and keeps the cookie.
+func TestLogoutHandler_SessionRevokeErrorFailsLogout(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := failingRevokeStore{NewMemorySessionStore()}
+	_ = store.Create(context.Background(), &Session{JTI: "sess-r", UserID: "user-1", ExpiresAt: time.Now().Add(time.Hour)})
+
+	router := gin.New()
+	router.DELETE("/auth/session", LogoutHandler(store, nil, nil, nil, nil, time.Hour, true, zap.NewNop()))
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/auth/session", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-r"})
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d", w.Code)
+	}
+	for _, c := range w.Result().Cookies() {
+		if c.Name == sessionCookieInsecure && c.MaxAge < 0 {
+			t.Error("the session cookie must be kept so the client can retry")
+		}
 	}
 }
 

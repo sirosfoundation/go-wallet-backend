@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,8 +13,10 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	tokenauthclaims "github.com/sirosfoundation/go-tokenauth/claims"
 	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
+	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -691,4 +694,104 @@ func userRevoked(t *testing.T, r revocationReader, ctx context.Context, userID s
 		t.Fatalf("IsUserRevoked: %v", err)
 	}
 	return ok
+}
+
+// flakyAddStore is a RevocationStore whose Add fails while failing is set.
+type flakyAddStore struct {
+	failing bool
+	jtis    map[string]bool
+}
+
+func (s *flakyAddStore) Add(_ context.Context, jti string, _ time.Time) error {
+	if s.failing {
+		return errors.New("store write failed")
+	}
+	s.jtis[jti] = true
+	return nil
+}
+func (s *flakyAddStore) Has(_ context.Context, jti string) (bool, error) { return s.jtis[jti], nil }
+func (s *flakyAddStore) RevokeUser(context.Context, string) error        { return nil }
+func (s *flakyAddStore) IsUserRevoked(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+// A failed jti blacklist write fails the logout (500) instead of being
+// logged; the retry then succeeds.
+func TestLogout_FailedJTIBlacklistWrite_FailsClosed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tokenAuth := range []bool{false, true} {
+		name := "legacy HMAC path"
+		if tokenAuth {
+			name = "tokenauth path"
+		}
+		t.Run(name, func(t *testing.T) {
+			logger := zap.NewNop()
+			cfg := &config.Config{
+				Server: config.ServerConfig{RPID: "wallet.example.com"},
+				JWT:    config.JWTConfig{Secret: "test-secret", ExpiryHours: 24, Issuer: "test-wallet"},
+			}
+			store := &flakyAddStore{failing: true, jtis: map[string]bool{}}
+			services := service.NewServices(memory.NewStore(), cfg, logger)
+			services.TokenBlacklist = service.NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, logger, store)
+			handlers := NewHandlers(services, cfg, logger, []string{"test"})
+
+			tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+				"user_id": "user-1", "jti": "jti-w", "exp": time.Now().Add(time.Hour).Unix(),
+			}).SignedString([]byte(cfg.JWT.Secret))
+			require.NoError(t, err)
+
+			router := gin.New()
+			router.POST("/logout", func(c *gin.Context) {
+				c.Set("token", tok)
+				if tokenAuth {
+					c.Set("tokenauth_result", &tokenauthclaims.Result{UserID: "user-1", JTI: "jti-w"})
+				}
+				c.Next()
+			}, handlers.Logout)
+			do := func() *httptest.ResponseRecorder {
+				w := httptest.NewRecorder()
+				router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/logout", nil))
+				return w
+			}
+
+			w := do()
+			require.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+			require.NotContains(t, w.Body.String(), "Logged out successfully")
+			require.False(t, store.jtis["jti-w"])
+
+			store.failing = false
+			require.Equal(t, http.StatusOK, do().Code, "retry")
+			require.True(t, store.jtis["jti-w"])
+		})
+	}
+}
+
+type failingRevoker struct{}
+
+func (failingRevoker) RevokeUser(context.Context, string) error {
+	return errors.New("store write failed")
+}
+
+// A failed user-revocation write answers 500 and leaves the user in place.
+func TestDeleteUser_RevocationFailureAnswers500(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger := zap.NewNop()
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		JWT:    config.JWTConfig{Secret: "test-secret", ExpiryHours: 24, Issuer: "test"},
+	}
+	services := service.NewServices(memory.NewStore(), cfg, logger)
+	services.User.SetTokenBlacklist(failingRevoker{})
+	handlers := NewHandlers(services, cfg, logger, []string{"test"})
+
+	name := "del-user"
+	user, err := services.User.Register(context.Background(), &domain.RegisterRequest{Username: &name, DisplayName: "d", WalletType: domain.WalletTypeDB})
+	require.NoError(t, err)
+
+	router := gin.New()
+	router.DELETE("/user", func(c *gin.Context) { c.Set("user_id", user.UUID.String()); c.Next() }, handlers.DeleteUser)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodDelete, "/user", nil))
+	require.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), "Failed to revoke tokens")
 }
