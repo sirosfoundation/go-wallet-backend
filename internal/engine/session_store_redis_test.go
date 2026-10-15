@@ -56,6 +56,24 @@ func TestRedisSessionStore_PutGetByUserDelete(t *testing.T) {
 	assert.ErrorIs(t, err, ErrSessionNotFound)
 }
 
+// Put of an existing session ID reports ErrSessionExists and changes nothing:
+// no stored data, pointer or index entry for the rejected duplicate.
+func TestRedisSessionStore_PutDuplicateIDChangesNothing(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+
+	require.NoError(t, store.Put(ctx, redisSess("s1", "t1", "u1", time.Hour)))
+	err := store.Put(ctx, redisSess("s1", "t2", "u2", time.Hour))
+	assert.ErrorIs(t, err, ErrSessionExists)
+
+	got, err := store.Get(ctx, "s1")
+	require.NoError(t, err)
+	assert.Equal(t, "u1", got.UserID)
+	assert.False(t, mr.Exists(store.userKey("t2", "u2")), "pointer for the rejected duplicate")
+	assert.False(t, mr.Exists(store.userSetKey("u2")), "index set for the rejected duplicate")
+	assert.False(t, mr.Exists(store.tenantKey("t2")), "tenant set entry for the rejected duplicate")
+}
+
 // Deleting a superseded session must not remove the pointer to its
 // replacement.
 func TestRedisSessionStore_DeleteKeepsReplacementPointer(t *testing.T) {
