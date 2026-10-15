@@ -74,6 +74,24 @@ func TestWMP_FlowStart_DeclaresTransactionDataWhenOffered(t *testing.T) {
 	assert.True(t, msg.Supports(FeatureTransactionDataV1))
 }
 
+// The capability the engine acts on is advertised and negotiated: it is in the
+// session.create result exactly when the client offered it.
+func TestWMP_SessionCreate_NegotiatesTransactionData(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+
+	_, _, res := createSessionFull(t, a, "u", "t", offered(`{"versions":[1],"hash_algs":["sha-256"]}`))
+	assert.True(t, res.Capabilities.OffersTransactionData(wmp.TransactionDataVersion1))
+
+	_, _, res = createSessionFull(t, a, "u", "t", func(p *wmp.SessionCreateParams) {
+		p.CapabilitiesOffered = wmp.Capabilities{"sign": json.RawMessage(`{}`)}
+	})
+	assert.NotContains(t, res.Capabilities, wmp.CapabilityTransactionData)
+
+	_, _, res = createSessionFull(t, a, "u", "t", nil)
+	assert.True(t, res.Capabilities.OffersTransactionData(wmp.TransactionDataVersion1), "no offer: every server capability")
+}
+
 // Negotiation falls back to every server capability when a client offers none; that must not read as transaction_data support.
 func TestWMP_FlowStart_DoesNotDeclareWhenNotOffered(t *testing.T) {
 	cases := map[string]string{

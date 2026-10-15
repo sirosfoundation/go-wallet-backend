@@ -1151,6 +1151,11 @@ func (a *WMPAdapter) serverCapabilities() wmp.Capabilities {
 		"supported":      flowTypes,
 	})
 	caps["flows"] = json.RawMessage(flowsJSON)
+
+	// The engine forwards transaction_data to clients that offer this
+	// capability (see declaredFeatures).
+	tdJSON, _ := json.Marshal(wmp.TransactionDataCap{Versions: []int{wmp.TransactionDataVersion1}})
+	caps[wmp.CapabilityTransactionData] = json.RawMessage(tdJSON)
 	return caps
 }
 
@@ -1521,9 +1526,12 @@ func (h *wmpEngineHandler) authorizeFlow(ctx context.Context, flowID string) (fl
 	return flow, h.authorizeProtocol(ctx, flow.Protocol, h.logger().With(zap.String("flow_id", flowID)))
 }
 
-// declaredFeatures maps the capabilities the client offered to engine feature
-// declarations (FlowStartMessage.Features), so transaction_data goes only to a
-// client that can handle it, as on WebSocket.
+// declaredFeatures maps the capabilities to engine feature declarations
+// (FlowStartMessage.Features), so transaction_data goes only to a client that
+// can handle it, as on WebSocket. The client must have offered it and the
+// session must have negotiated it: negotiation falls back to every server
+// capability when a client offers none, so the negotiated set alone would
+// claim support the client never offered.
 func (h *wmpEngineHandler) declaredFeatures() []string {
 	h.adapter.mu.RLock()
 	ws, ok := h.adapter.peers[h.sessionID]
@@ -1532,7 +1540,8 @@ func (h *wmpEngineHandler) declaredFeatures() []string {
 		return nil
 	}
 	var features []string
-	if ws.offered.OffersTransactionData(wmp.TransactionDataVersion1) {
+	if ws.offered.OffersTransactionData(wmp.TransactionDataVersion1) &&
+		ws.capabilities.OffersTransactionData(wmp.TransactionDataVersion1) {
 		features = append(features, FeatureTransactionDataV1)
 	}
 	return features
