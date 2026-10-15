@@ -194,6 +194,9 @@ type parsedList struct {
 	etag string
 	// upstreamETag is the list host's ETag, for If-None-Match.
 	upstreamETag string
+	// upstreamMaxAge is the list host's Cache-Control freshness lifetime, kept
+	// so a 304 that omits the header does not drop the policy; nil when none.
+	upstreamMaxAge *time.Duration
 	// subject and km are kept so a 304 refresh re-evaluates the signer.
 	subject string
 	km      *trust.KeyMaterial
@@ -417,9 +420,11 @@ func (c *Checker) loadOnce(ctx context.Context, key, uri string, f *flight) (par
 		return parsedList{}, err
 	}
 	pl.upstreamETag = res.etag
-	// A shorter upstream max-age wins; it never lengthens freshness.
-	if res.maxAge != nil {
-		if limit := c.now().Add(*res.maxAge); limit.Before(pl.expires) {
+	pl.upstreamMaxAge = res.maxAge
+	// A shorter upstream max-age wins; it never lengthens freshness. What a
+	// cache already used up (Age, time in flight) is not granted again.
+	if remaining := res.remainingFreshness(res.maxAge); remaining != nil {
+		if limit := res.received.Add(*remaining); limit.Before(pl.expires) {
 			pl.expires = limit
 		}
 	}
@@ -430,7 +435,7 @@ func (c *Checker) loadOnce(ctx context.Context, key, uri string, f *flight) (par
 // enforced and the signer re-evaluated, so a signer distrusted meanwhile is
 // not carried along, and the action that accepts it now replaces the old one.
 // The window is the token's ttl, else the default, from now, bounded by the
-// 304's max-age (which never lengthens it), exp and maxCacheTTL.
+// list host's max-age less its Age (stored, or the 304's; it never lengthens it), exp and maxCacheTTL.
 func (c *Checker) refresh(ctx context.Context, old parsedList, res fetchResult) (parsedList, error) {
 	now := c.now()
 	if old.exp != nil && !now.Before(time.Unix(*old.exp, 0)) {
@@ -449,13 +454,17 @@ func (c *Checker) refresh(ctx context.Context, old parsedList, res fetchResult) 
 		}
 		window = time.Duration(secs) * time.Second
 	}
-	if res.maxAge != nil && *res.maxAge < window {
-		window = *res.maxAge
+	// A 304 that omits Cache-Control keeps the stored policy.
+	if res.maxAge != nil {
+		old.upstreamMaxAge = res.maxAge
+	}
+	if remaining := res.remainingFreshness(old.upstreamMaxAge); remaining != nil && *remaining < window {
+		window = *remaining
 	}
 	if window > maxCacheTTL {
 		window = maxCacheTTL
 	}
-	expires := now.Add(window)
+	expires := res.received.Add(window)
 	if old.exp != nil {
 		if exp := time.Unix(*old.exp, 0); exp.Before(expires) {
 			expires = exp
@@ -524,6 +533,36 @@ type fetchResult struct {
 	mediaType   string // "" when the server sent none
 	etag        string // upstream ETag, "" when none
 	maxAge      *time.Duration
+	// age is the Age header: how old a cache had already made the response.
+	age time.Duration
+	// received is when the response arrived; freshness runs from here, not from
+	// when verification finished.
+	received time.Time
+}
+
+// remainingFreshness is lifetime less the response's age, never negative; nil
+// when there is no lifetime.
+func (r fetchResult) remainingFreshness(lifetime *time.Duration) *time.Duration {
+	if lifetime == nil {
+		return nil
+	}
+	rem := *lifetime - r.age
+	if rem < 0 {
+		rem = 0
+	}
+	return &rem
+}
+
+// ageOf reads the Age header in seconds; a missing or invalid one is 0.
+func ageOf(h string) time.Duration {
+	n, err := strconv.ParseInt(strings.TrimSpace(h), 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	if n > int64(maxCacheTTL/time.Second) {
+		n = int64(maxCacheTTL / time.Second)
+	}
+	return time.Duration(n) * time.Second
 }
 
 // validateFetchURI parses uri and refuses what a status list URL never needs:
@@ -583,7 +622,7 @@ func (c *Checker) fetch(ctx context.Context, uri, ifNoneMatch string) (fetchResu
 		return fetchResult{}, classify(ReasonFetchFailed, fmt.Errorf("fetch status list: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
-	res := fetchResult{etag: strings.TrimSpace(resp.Header.Get("ETag")), maxAge: maxAgeOf(resp.Header.Get("Cache-Control"))}
+	res := fetchResult{etag: strings.TrimSpace(resp.Header.Get("ETag")), maxAge: maxAgeOf(resp.Header.Get("Cache-Control")), age: ageOf(resp.Header.Get("Age")), received: c.now()}
 	if resp.StatusCode == http.StatusNotModified && ifNoneMatch != "" {
 		res.notModified = true
 		return res, nil

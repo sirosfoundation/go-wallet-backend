@@ -23,6 +23,7 @@ type condServer struct {
 	token        string // body for a 200
 	etag         string // upstream ETag ("" = none)
 	cacheControl string
+	age          string // Age header ("" = none)
 	hits         int
 	conditional  int      // requests carrying If-None-Match
 	ifNoneMatch  []string // values seen
@@ -40,6 +41,9 @@ func (s *condServer) handler(w http.ResponseWriter, r *http.Request) {
 	}
 	if s.cacheControl != "" {
 		w.Header().Set("Cache-Control", s.cacheControl)
+	}
+	if s.age != "" {
+		w.Header().Set("Age", s.age)
 	}
 	if s.etag != "" {
 		w.Header().Set("ETag", s.etag)
@@ -304,6 +308,71 @@ func TestList_304MaxAgeNeverLengthensTokenWindow(t *testing.T) {
 	if got := vl.FreshUntil.Sub(*clock); got != time.Minute {
 		t.Fatalf("freshness after 304 = %v, want the token ttl of 1m", got)
 	}
+}
+
+func TestList_304WithoutCacheControlKeepsStoredMaxAge(t *testing.T) {
+	cs, c, uri, clock := newCondServer(t)
+	cs.etag = `"e"`
+	cs.cacheControl = "max-age=20"
+	cs.token = makeToken(t, tokenOpts{sub: uri, key: newKey(t), values: map[int]int{3: 1}})
+	ctx := context.Background()
+	if _, err := c.List(ctx, uri); err != nil {
+		t.Fatal(err)
+	}
+	*clock = clock.Add(time.Minute)
+	cs.cacheControl = ""
+	vl, err := c.List(ctx, uri)
+	if err != nil || cs.conditional != 1 {
+		t.Fatalf("err=%v conditional=%d", err, cs.conditional)
+	}
+	if got := vl.FreshUntil.Sub(*clock); got != 20*time.Second {
+		t.Fatalf("freshness after a header-less 304 = %v, want the stored max-age 20s", got)
+	}
+}
+
+func TestList_MaxAgeAccountsForAge(t *testing.T) {
+	ctx := context.Background()
+	t.Run("200", func(t *testing.T) {
+		cs, c, uri, clock := newCondServer(t)
+		cs.cacheControl, cs.age = "max-age=60", "59"
+		cs.token = makeToken(t, tokenOpts{sub: uri, key: newKey(t), values: map[int]int{3: 1}})
+		vl, err := c.List(ctx, uri)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := vl.FreshUntil.Sub(*clock); got < 0 || got > 2*time.Second {
+			t.Fatalf("freshness = %v, want about 1s (max-age 60 less Age 59)", got)
+		}
+	})
+	t.Run("aged beyond max-age", func(t *testing.T) {
+		cs, c, uri, clock := newCondServer(t)
+		cs.cacheControl, cs.age = "max-age=60", "600"
+		cs.token = makeToken(t, tokenOpts{sub: uri, key: newKey(t), values: map[int]int{3: 1}})
+		vl, err := c.List(ctx, uri)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := vl.FreshUntil.Sub(*clock); got != 0 {
+			t.Fatalf("freshness = %v, want 0", got)
+		}
+	})
+	t.Run("304", func(t *testing.T) {
+		cs, c, uri, clock := newCondServer(t)
+		cs.etag = `"e"`
+		cs.token = makeToken(t, tokenOpts{sub: uri, key: newKey(t), values: map[int]int{3: 1}})
+		if _, err := c.List(ctx, uri); err != nil {
+			t.Fatal(err)
+		}
+		*clock = clock.Add(6 * time.Minute)
+		cs.cacheControl, cs.age = "max-age=60", "59"
+		vl, err := c.List(ctx, uri)
+		if err != nil || cs.conditional != 1 {
+			t.Fatalf("err=%v conditional=%d", err, cs.conditional)
+		}
+		if got := vl.FreshUntil.Sub(*clock); got < 0 || got > 2*time.Second {
+			t.Fatalf("freshness = %v, want about 1s", got)
+		}
+	})
 }
 
 func TestList_304RecordsTheActionThatAcceptedTheSigner(t *testing.T) {
