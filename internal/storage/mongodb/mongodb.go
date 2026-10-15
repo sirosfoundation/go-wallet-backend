@@ -36,8 +36,9 @@ type Store struct {
 	keyAttestations *KeyAttestationStore
 }
 
-// NewStore creates a new MongoDB store
-func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
+// Connect opens a client for cfg (including TLS settings) and verifies the
+// connection with a ping. It does not touch any collection.
+func Connect(ctx context.Context, cfg *config.MongoDBConfig) (*mongo.Client, error) {
 	clientOptions := options.Client().
 		ApplyURI(cfg.URI).
 		SetConnectTimeout(time.Duration(cfg.Timeout) * time.Second)
@@ -72,7 +73,17 @@ func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
 
 	// Ping the database to verify connection
 	if err := client.Ping(ctx, nil); err != nil {
+		_ = client.Disconnect(context.Background())
 		return nil, fmt.Errorf("failed to ping MongoDB: %w", err)
+	}
+	return client, nil
+}
+
+// NewStore creates a new MongoDB store
+func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
+	client, err := Connect(ctx, cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	database := client.Database(cfg.Database)

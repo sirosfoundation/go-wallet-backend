@@ -281,3 +281,34 @@ func TestMongoRevocationStore_Remove(t *testing.T) {
 	require.False(t, b.IsBlacklisted(ctx, "j"))
 	require.NoError(t, b.Remove(ctx, "never-added"), "removing an absent jti is not an error")
 }
+
+// deadMongoDBSlowSelection is unreachable and, unlike deadMongoDB, would wait
+// out the driver's default 30 s server selection.
+func deadMongoDBSlowSelection(t *testing.T) *mongo.Database {
+	t.Helper()
+	client, err := mongo.Connect(context.Background(), options.Client().ApplyURI("mongodb://127.0.0.1:1"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
+	return client.Database("unreachable")
+}
+
+// Operations on a caller context without a deadline return promptly.
+func TestMongoRevocationStore_OperationsAreBounded(t *testing.T) {
+	db := deadMongoDBSlowSelection(t)
+	s := &mongoRevocationStore{tokens: db.Collection(revokedTokensCollection), users: db.Collection(revokedUsersCollection)}
+	start := time.Now()
+	_, err := s.Has(context.Background(), "j")
+	require.Error(t, err)
+	require.Less(t, time.Since(start), 10*time.Second)
+}
+
+// Setting the store up returns an error within RevocationInitTimeout.
+func TestNewMongoRevocationStore_InitIsBounded(t *testing.T) {
+	old := RevocationInitTimeout
+	RevocationInitTimeout = time.Second
+	defer func() { RevocationInitTimeout = old }()
+	start := time.Now()
+	_, err := NewMongoRevocationStore(context.Background(), deadMongoDBSlowSelection(t))
+	require.Error(t, err)
+	require.Less(t, time.Since(start), 5*time.Second)
+}

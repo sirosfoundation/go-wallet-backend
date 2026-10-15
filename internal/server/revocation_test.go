@@ -8,11 +8,13 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -46,9 +48,10 @@ func TestNewSharedBlacklist_ConfiguredButUnusable(t *testing.T) {
 		"storage, MongoDB down":   sharedBlacklistConfig("mongodb", "storage", true),
 	} {
 		t.Run(name, func(t *testing.T) {
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			b, err := NewSharedBlacklist(ctx, cfg, zap.NewNop())
+			old := service.RevocationInitTimeout
+			service.RevocationInitTimeout = 2 * time.Second
+			defer func() { service.RevocationInitTimeout = old }()
+			b, err := NewSharedBlacklist(context.Background(), cfg, zap.NewNop())
 			require.Error(t, err, "startup must fail rather than fall back to memory")
 			require.Nil(t, b)
 		})
@@ -95,6 +98,10 @@ func TestNewSharedBlacklist_SeesOtherProcessRevocations(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, reader)
 	defer reader.Close()
+
+	names, err := writer.client.Database(cfg.Storage.MongoDB.Database).ListCollectionNames(ctx, bson.M{})
+	require.NoError(t, err)
+	require.Subset(t, []string{"revoked_tokens", "revoked_users"}, names, "only the revocation collections may be touched")
 
 	require.NoError(t, writer.Add(ctx, "jti-1", time.Now().Add(time.Hour)))
 	require.NoError(t, writer.RevokeUser(ctx, "user-1"))

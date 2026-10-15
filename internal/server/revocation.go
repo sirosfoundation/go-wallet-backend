@@ -3,11 +3,13 @@ package server
 import (
 	"context"
 	"fmt"
+	"time"
 
+	"go.mongodb.org/mongo-driver/mongo"
 	"go.uber.org/zap"
 
-	"github.com/sirosfoundation/go-wallet-backend/internal/backend"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/mongodb"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -16,33 +18,46 @@ import (
 // revocation collections.
 type SharedBlacklist struct {
 	*service.TokenBlacklist
-	store backend.Backend
+	client *mongo.Client
 }
 
 // Close releases the database connection.
-func (b *SharedBlacklist) Close() error { return b.store.Close() }
+func (b *SharedBlacklist) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return b.client.Disconnect(ctx)
+}
 
 // NewSharedBlacklist connects to the shared revocation store for a process
 // without a storage backend, so it rejects the revocations made by the
-// backend replicas. It returns nil when revocations are not shared
-// (blacklist disabled, or backend memory, or unset with non-MongoDB storage):
-// a process-local blacklist in such a process would never see a revocation.
-// A configured but unreachable store is an error, never a silent fallback.
+// backend replicas. Only the revocation collections are touched. It returns
+// nil when revocations are not shared (blacklist disabled, or backend memory,
+// or unset with non-MongoDB storage): a process-local blacklist in such a
+// process would never see a revocation. A configured but unreachable store
+// is an error, never a silent fallback; setup is bounded by
+// service.RevocationInitTimeout.
 func NewSharedBlacklist(ctx context.Context, cfg *config.Config, logger *zap.Logger) (*SharedBlacklist, error) {
 	warnProcessLocalState(cfg, logger, false)
-	bl := cfg.Security.TokenBlacklist
-	if !bl.Enabled || bl.Backend == config.TokenBlacklistBackendMemory ||
-		(bl.Backend == "" && cfg.Storage.Type != "mongodb") {
+	if !cfg.UsesSharedRevocationStore() {
 		return nil, nil
 	}
-	store, err := backend.New(ctx, cfg)
+	if cfg.Storage.Type != "mongodb" {
+		return nil, fmt.Errorf("revocation store: security.token_blacklist.backend=storage requires storage.type=mongodb")
+	}
+	ctx, cancel := context.WithTimeout(ctx, service.RevocationInitTimeout)
+	defer cancel()
+	client, err := mongodb.Connect(ctx, &cfg.Storage.MongoDB)
 	if err != nil {
 		return nil, fmt.Errorf("revocation store: %w", err)
 	}
-	rs, err := service.NewRevocationStore(ctx, bl, store, logger)
+	rs, err := service.NewMongoRevocationStore(ctx, client.Database(cfg.Storage.MongoDB.Database))
 	if err != nil {
-		_ = store.Close()
+		_ = client.Disconnect(context.Background())
 		return nil, fmt.Errorf("revocation store: %w", err)
 	}
-	return &SharedBlacklist{TokenBlacklist: service.NewTokenBlacklistWithStore(bl, logger, rs), store: store}, nil
+	logger.Info("Token revocation: MongoDB store (shared by replicas, survives restarts)")
+	return &SharedBlacklist{
+		TokenBlacklist: service.NewTokenBlacklistWithStore(cfg.Security.TokenBlacklist, logger, rs),
+		client:         client,
+	}, nil
 }

@@ -471,15 +471,15 @@ func (c *Config) loadRegistrySecrets() error {
 		}
 		c.JWT.Secret = secret
 	}
-	if c.usesSharedRevocationStore() {
+	if c.UsesSharedRevocationStore() {
 		return c.loadMongoPassword()
 	}
 	return nil
 }
 
-// usesSharedRevocationStore reports whether token revocations are kept in the
+// UsesSharedRevocationStore reports whether token revocations are kept in the
 // MongoDB storage backend (see TokenBlacklistConfig.Backend).
-func (c *Config) usesSharedRevocationStore() bool {
+func (c *Config) UsesSharedRevocationStore() bool {
 	bl := c.Security.TokenBlacklist
 	return bl.Enabled && (bl.Backend == TokenBlacklistBackendStorage ||
 		(bl.Backend == "" && c.Storage.Type == "mongodb"))
