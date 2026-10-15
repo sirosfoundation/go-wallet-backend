@@ -221,10 +221,18 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	// Each write+flush gets a fresh deadline (the connection-wide WriteTimeout
 	// would cut the stream off); the deadline is cleared after each flush so an
 	// idle healthy stream does not expire.
-	rc := http.NewResponseController(w)
+	//
+	// Framework wrappers (Gin) discard the error of their Flush, so the
+	// controller works on the innermost writer, and the headers are committed
+	// through the wrapper first so its state stays consistent.
+	rc := http.NewResponseController(innermostWriter(w))
 	armWrite := func() { _ = rc.SetWriteDeadline(time.Now().Add(wmpSSEWriteTimeout)) }
 	clearWrite := func() { _ = rc.SetWriteDeadline(time.Time{}) }
 	armWrite()
+	w.WriteHeader(http.StatusOK)
+	if h, ok := w.(interface{ WriteHeaderNow() }); ok {
+		h.WriteHeaderNow()
+	}
 	if err := rc.Flush(); err != nil {
 		return
 	}
@@ -287,6 +295,17 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 			}
 			clearWrite()
 		}
+	}
+}
+
+// innermostWriter follows Unwrap through response-writer wrappers.
+func innermostWriter(w http.ResponseWriter) http.ResponseWriter {
+	for {
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return w
+		}
+		w = u.Unwrap()
 	}
 }
 

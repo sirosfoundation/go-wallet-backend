@@ -3,6 +3,7 @@ package engine
 import (
 	"bufio"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -334,4 +336,31 @@ func TestWMP_SSE_ReplayStopsWhenCancelledMidBatch(t *testing.T) {
 	a.HandleWMPEvents(w, req)
 
 	assert.Equal(t, 1, strings.Count(w.Body.String(), "event: wmp"))
+}
+
+// failingFlushWriter is a response writer whose socket flush fails.
+type failingFlushWriter struct{ *httptest.ResponseRecorder }
+
+func (failingFlushWriter) FlushError() error { return errors.New("socket gone") }
+
+// Through the mounted Gin route a failed flush ends the stream, although Gin's
+// own Flush discards the error.
+func TestWMP_SSE_GinRouteEndsStreamOnFlushFailure(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	sid, _, _ := createSessionFull(t, a, "u", "t", nil)
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.GET(WMPEventsPath, func(c *gin.Context) { a.HandleWMPEvents(c.Writer, c.Request) })
+	req := httptest.NewRequest(http.MethodGet, WMPEventsPath+"?session_id="+sid, nil)
+	req.Header.Set("Authorization", "Bearer "+testToken("u", "t"))
+
+	done := make(chan struct{})
+	go func() { r.ServeHTTP(failingFlushWriter{httptest.NewRecorder()}, req); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stream kept running after its flush failed")
+	}
 }
