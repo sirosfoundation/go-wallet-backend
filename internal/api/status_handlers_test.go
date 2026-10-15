@@ -212,6 +212,8 @@ func TestStatusLists_BadRequests(t *testing.T) {
 		"empty lists":   {`{"lists":[]}`, "INVALID_REQUEST"},
 		"missing uri":   {`{"lists":[{"etag":"x"}]}`, "INVALID_REQUEST"},
 		"trailing data": {`{"lists":[{"uri":"https://a/1"}]} {"x":1}`, "INVALID_REQUEST"},
+		"trailing ]":    {`{"lists":[{"uri":"https://a/1"}]}]`, "INVALID_REQUEST"},
+		"trailing }":    {`{"lists":[{"uri":"https://a/1"}]}}`, "INVALID_REQUEST"},
 		"too many":      {`{"lists":[{"uri":"https://a/1"},{"uri":"https://a/2"},{"uri":"https://a/3"}]}`, "TOO_MANY_URIS"},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -233,6 +235,19 @@ func TestStatusLists_BodyTooLarge413(t *testing.T) {
 	w := postStatus(router, `{"lists":[{"uri":"https://a.example/`+strings.Repeat("a", maxStatusRequestBytes)+`"}]}`)
 	if w.Code != http.StatusRequestEntityTooLarge || errCode(t, w) != "REQUEST_TOO_LARGE" {
 		t.Fatalf("status = %d body = %.200s", w.Code, w.Body.String())
+	}
+}
+
+func TestStatusLists_OversizedTrailingWhitespace413(t *testing.T) {
+	fake := &statusFake{fn: func(context.Context, string) (*statuslist.VerifiedList, error) { return fakeVerified(), nil }}
+	_, router := setupStatusTestHandlers(t, fake, zap.NewNop(), nil)
+	w := postStatus(router, `{"lists":[{"uri":"https://a.example/1"}]}`+strings.Repeat(" ", maxStatusRequestBytes))
+	if w.Code != http.StatusRequestEntityTooLarge || errCode(t, w) != "REQUEST_TOO_LARGE" {
+		t.Fatalf("status = %d body = %.200s", w.Code, w.Body.String())
+	}
+	// Modest trailing whitespace is fine.
+	if w := postStatus(router, `{"lists":[{"uri":"https://a.example/1"}]}`+"\n  "); w.Code != http.StatusOK {
+		t.Fatalf("trailing newline: %d %s", w.Code, w.Body.String())
 	}
 }
 

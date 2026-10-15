@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"time"
@@ -43,9 +44,17 @@ func (h *Handlers) StatusLists(c *gin.Context) {
 	var req StatusListsRequest
 	dec := json.NewDecoder(c.Request.Body)
 	err := dec.Decode(&req)
-	if err == nil && dec.More() {
-		// Exactly one JSON value is allowed.
-		err = errors.New("trailing data")
+	if err == nil {
+		// Exactly one JSON value is allowed: anything but end of input after
+		// it is trailing data, and a read error (such as the size limit
+		// being hit in trailing whitespace) is passed through.
+		var extra json.RawMessage
+		switch err = dec.Decode(&extra); {
+		case err == nil:
+			err = errors.New("trailing data")
+		case errors.Is(err, io.EOF):
+			err = nil
+		}
 	}
 	if err != nil {
 		var mbe *http.MaxBytesError
