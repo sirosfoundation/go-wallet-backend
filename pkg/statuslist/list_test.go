@@ -235,15 +235,15 @@ func TestList_304HonoursMaxAgeAndCaps(t *testing.T) {
 	if got := vl.FreshUntil.Sub(*clock); got != 30*time.Second {
 		t.Fatalf("freshness after 304 = %v, want the max-age 30s", got)
 	}
-	// An absurd max-age is still capped at one hour.
+	// A larger max-age does not lengthen the default window.
 	*clock = clock.Add(time.Minute)
 	cs.cacheControl = "max-age=999999999"
 	vl, err = c.List(ctx, uri)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := vl.FreshUntil.Sub(*clock); got != maxCacheTTL {
-		t.Fatalf("freshness = %v, want the %v cap", got, maxCacheTTL)
+	if got := vl.FreshUntil.Sub(*clock); got != defaultCacheTTL {
+		t.Fatalf("freshness = %v, want the %v default window", got, defaultCacheTTL)
 	}
 }
 
@@ -285,6 +285,49 @@ func TestList_304WindowFromTTLIsCappedByOneHourAndExp(t *testing.T) {
 			t.Fatalf("fresh until %v, want the token exp %v", vl.FreshUntil, exp)
 		}
 	})
+}
+
+func TestList_304MaxAgeNeverLengthensTokenWindow(t *testing.T) {
+	cs, c, uri, clock := newCondServer(t)
+	cs.etag = `"e"`
+	cs.token = makeToken(t, tokenOpts{sub: uri, key: newKey(t), ttl: 60, values: map[int]int{3: 1}})
+	ctx := context.Background()
+	if _, err := c.List(ctx, uri); err != nil {
+		t.Fatal(err)
+	}
+	*clock = clock.Add(2 * time.Minute)
+	cs.cacheControl = "max-age=3600"
+	vl, err := c.List(ctx, uri)
+	if err != nil || cs.conditional != 1 {
+		t.Fatalf("err=%v conditional=%d", err, cs.conditional)
+	}
+	if got := vl.FreshUntil.Sub(*clock); got != time.Minute {
+		t.Fatalf("freshness after 304 = %v, want the token ttl of 1m", got)
+	}
+}
+
+func TestList_304RecordsTheActionThatAcceptedTheSigner(t *testing.T) {
+	cs, c, uri, clock := newCondServer(t)
+	cs.etag = `"e"`
+	cs.token = makeToken(t, tokenOpts{sub: uri, key: newKey(t), values: map[int]int{3: 1}})
+	action := "credential-issuer"
+	c.WithSignerTrustAction(func(context.Context, string, *trust.KeyMaterial) (bool, string, error) {
+		return true, action, nil
+	})
+	ctx := context.Background()
+	vl, err := c.List(ctx, uri)
+	if err != nil || vl.SignerAction != "credential-issuer" {
+		t.Fatalf("first load: %v %+v", err, vl)
+	}
+	action = "status-list-signer"
+	*clock = clock.Add(6 * time.Minute)
+	vl, err = c.List(ctx, uri)
+	if err != nil || cs.conditional != 1 {
+		t.Fatalf("err=%v conditional=%d", err, cs.conditional)
+	}
+	if vl.SignerAction != "status-list-signer" {
+		t.Fatalf("SignerAction after 304 = %q, want status-list-signer", vl.SignerAction)
+	}
 }
 
 func TestList_304ReevaluatesSignerAndExp(t *testing.T) {

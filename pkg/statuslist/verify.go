@@ -428,16 +428,19 @@ func (c *Checker) loadOnce(ctx context.Context, key, uri string, f *flight) (par
 
 // refresh turns a 304 into a refreshed copy of the stale entry. exp is
 // enforced and the signer re-evaluated, so a signer distrusted meanwhile is
-// not carried along. The window is the 304's max-age, else the token's ttl,
-// else the default, from now, capped by exp and maxCacheTTL.
+// not carried along, and the action that accepts it now replaces the old one.
+// The window is the token's ttl, else the default, from now, bounded by the
+// 304's max-age (which never lengthens it), exp and maxCacheTTL.
 func (c *Checker) refresh(ctx context.Context, old parsedList, res fetchResult) (parsedList, error) {
 	now := c.now()
 	if old.exp != nil && !now.Before(time.Unix(*old.exp, 0)) {
 		return parsedList{}, classify(ReasonExpired, errors.New("status list token has expired"))
 	}
-	if _, err := c.evaluateSignerSubject(ctx, old.subject, old.km); err != nil {
+	action, err := c.evaluateSignerSubject(ctx, old.subject, old.km)
+	if err != nil {
 		return parsedList{}, err
 	}
+	old.signerAction = action
 	window := defaultCacheTTL
 	if old.ttl != nil && *old.ttl > 0 {
 		secs := *old.ttl
@@ -446,7 +449,7 @@ func (c *Checker) refresh(ctx context.Context, old parsedList, res fetchResult) 
 		}
 		window = time.Duration(secs) * time.Second
 	}
-	if res.maxAge != nil {
+	if res.maxAge != nil && *res.maxAge < window {
 		window = *res.maxAge
 	}
 	if window > maxCacheTTL {
