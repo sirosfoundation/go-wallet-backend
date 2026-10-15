@@ -753,3 +753,45 @@ func TestUserLocks_ContextAbandonsWaitAndKeepsExclusion(t *testing.T) {
 	again()
 	assert.Empty(t, l.m, "idle entries are dropped")
 }
+
+// lateEnrollStore enrolls a live instance in another tenant the first time
+// the cascade lists a tenant's instances, as another replica could between
+// the reconciler's candidate check and the cascade's liveness check.
+type lateEnrollStore struct {
+	storage.Store
+	enroll func()
+	once   sync.Once
+}
+
+func (s *lateEnrollStore) WalletInstances() storage.WalletInstanceStore {
+	return &lateEnrollInstances{s.Store.WalletInstances(), s}
+}
+
+type lateEnrollInstances struct {
+	storage.WalletInstanceStore
+	s *lateEnrollStore
+}
+
+func (l *lateEnrollInstances) GetByUser(ctx context.Context, tid domain.TenantID, id domain.UserID) ([]*domain.WalletInstance, error) {
+	l.s.once.Do(l.s.enroll)
+	return l.WalletInstanceStore.GetByUser(ctx, tid, id)
+}
+
+func TestReconcileUser_LiveInstanceAppearingDuringCascadeIsNotReportedErased(t *testing.T) {
+	_, mem, userID, holder := twoTenantFixture(t)
+	ctx := context.Background()
+	revokeSilently(t, mem, userID)
+	store := &lateEnrollStore{Store: mem}
+	store.enroll = func() {
+		require.NoError(t, mem.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+			ID: "inst-late", TenantID: tenantB, UserID: &userID, Status: domain.InstanceStatusActive,
+		}))
+	}
+	svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
+
+	out, err := svc.ReconcileUser(ctx, userID, inTheFuture())
+	require.NoError(t, err)
+	assert.Equal(t, ReconcileLive, out)
+	assert.Equal(t, 2, holderDataCount(t, mem, tenantA, holder), "nothing is erased for a live wallet")
+	assert.NotNil(t, userData(t, mem, userID).PrivateData)
+}

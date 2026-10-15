@@ -81,6 +81,20 @@ func (s *WalletLifecycleService) reconcile(ctx context.Context, userID domain.Us
 	if err := s.cascadeLocked(ctx, latest.TenantID, latest, reconcilerActor); err != nil {
 		return "", leftover, err
 	}
+	// A nil cascade error is not proof of erasure: another replica may have
+	// enrolled a live instance since the check above, and the cascade then
+	// skips the erase without an error. Judge by the state afterwards.
+	again, outcome, err := s.reconcileCandidate(ctx, userID, revokedBefore)
+	if err != nil || again == nil {
+		return outcome, leftover, err
+	}
+	left, err := s.leftoverData(ctx, userID, again.TenantID)
+	if err != nil {
+		return "", leftover, err
+	}
+	if len(left) > 0 {
+		return "", leftover, fmt.Errorf("%w: wallet data still present after the cascade: %v", ErrErasureIncomplete, left)
+	}
 	return ReconcileErased, leftover, nil
 }
 
