@@ -281,6 +281,17 @@ func TestDecodeTransactionData_RawMemberInVerifierJSONIsIgnored(t *testing.T) {
 	assert.Equal(t, enc, entries[0].Data.Raw)
 }
 
+// A `raw` member of another type is ignored too, not a reason to reject an
+// otherwise valid entry.
+func TestDecodeTransactionData_NonStringRawMemberIsIgnored(t *testing.T) {
+	for _, member := range []string{`{}`, `7`, `null`, `["x"]`} {
+		enc := entry(t, `{"type":"x","credential_ids":["c"],"raw":`+member+`}`)
+		entries, err := decodeTransactionData(rawArray(t, enc))
+		require.NoError(t, err, member)
+		assert.Equal(t, enc, entries[0].Data.Raw)
+	}
+}
+
 func TestValidateTransactionData_StructuralChecks(t *testing.T) {
 	dcql := json.RawMessage(`{"credentials":[{"id":"pay"},{"id":"age"}]}`)
 	cases := map[string]struct {

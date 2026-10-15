@@ -2412,12 +2412,17 @@ func decodeTransactionData(raw json.RawMessage) ([]decodedTransactionData, error
 		if err != nil {
 			return nil, newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: invalid base64url encoding: %w", i, err)
 		}
-		var td TransactionData
-		if err := json.Unmarshal(decoded, &td); err != nil {
+		// The verifier controls the decoded JSON, so a `raw` member of any type
+		// may be in it. Decode it into a shadow field and discard it: Raw is
+		// what was received, nothing else.
+		var dec struct {
+			TransactionData
+			Raw json.RawMessage `json:"raw"`
+		}
+		if err := json.Unmarshal(decoded, &dec); err != nil {
 			return nil, newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: invalid JSON: %w", i, err)
 		}
-		// The verifier controls the decoded JSON, so a `raw` member in it would
-		// land in td.Raw. Overwrite it: Raw is what was received, nothing else.
+		td := dec.TransactionData
 		td.Raw = encoded
 		out = append(out, decodedTransactionData{Raw: encoded, Data: td})
 	}
