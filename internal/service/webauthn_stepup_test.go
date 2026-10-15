@@ -414,37 +414,47 @@ func TestEnrollment_AccountWithoutPasskeyNeedsNoAuthorization(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// A passkey enrolled with only the bearer token cannot authorise the deletion
-// until it has aged; the account's original passkey still can.
-func TestStepUp_PasskeyAddedLaterCannotAuthoriseDeletionYet(t *testing.T) {
-	setup := newTestVirtualWebAuthnSetup(t)
-	alice := registerStepUpUser(t, setup, "Alice")
-	attacker := enrollPasskey(t, setup, alice)
-
-	resp, err := setup.service.BeginDeleteAccountStepUp(setup.ctx, alice.id)
+// withoutPasskeys strips u's account of its passkeys.
+func withoutPasskeys(t *testing.T, setup *testVirtualWebAuthnSetup, u *stepUpUser) {
+	t.Helper()
+	user, err := setup.store.Users().GetByID(setup.ctx, u.id)
 	require.NoError(t, err)
-	require.Len(t, resp.PublicKey.AllowCredentials, 1, "the new passkey is not offered")
-
-	forged := attacker.assertFor(t, setup, resp)
-	err = setup.service.VerifyDeleteAccountStepUp(setup.ctx, alice.id, resp.ChallengeID, forged)
-	assert.ErrorIs(t, err, ErrStepUpFailed)
-
-	resp, err = setup.service.BeginDeleteAccountStepUp(setup.ctx, alice.id)
-	require.NoError(t, err)
-	require.NoError(t, setup.service.VerifyDeleteAccountStepUp(setup.ctx, alice.id, resp.ChallengeID, alice.assertFor(t, setup, resp)))
+	user.WebauthnCredentials = nil
+	require.NoError(t, setup.store.Users().Update(setup.ctx, user))
 }
 
-// Once the delay has passed the added passkey is accepted.
-func TestStepUp_PasskeyAddedLaterAcceptedAfterDelay(t *testing.T) {
+// The first passkey of an account that had none could only be enrolled on the
+// bearer token's word, so it cannot authorise a deletion or another enrolment
+// until it has aged.
+func TestStepUp_FirstPasskeyOfPasskeylessAccountWaits(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
 	alice := registerStepUpUser(t, setup, "Alice")
-	added := enrollPasskey(t, setup, alice)
+	withoutPasskeys(t, setup, alice)
+
+	e := beginEnrol(t, setup, alice)
+	_, err := setup.service.FinishAddCredential(setup.ctx, alice.id, e.finish, "")
+	require.NoError(t, err)
+
+	_, err = setup.service.BeginDeleteAccountStepUp(setup.ctx, alice.id)
+	assert.ErrorIs(t, err, ErrCredentialNotFound, "no passkey is eligible yet")
+	_, err = setup.service.BeginAddCredential(setup.ctx, alice.id)
+	assert.ErrorIs(t, err, ErrEnrollmentAuthorizationFailed)
 
 	user, err := setup.store.Users().GetByID(setup.ctx, alice.id)
 	require.NoError(t, err)
-	require.Len(t, user.WebauthnCredentials, 2)
-	user.WebauthnCredentials[1].StepUpEligibleAt = time.Now().Add(-time.Second)
+	user.WebauthnCredentials[0].StepUpEligibleAt = time.Now().Add(-time.Second)
 	require.NoError(t, setup.store.Users().Update(setup.ctx, user))
+
+	resp, err := setup.service.BeginDeleteAccountStepUp(setup.ctx, alice.id)
+	require.NoError(t, err)
+	require.NoError(t, setup.service.VerifyDeleteAccountStepUp(setup.ctx, alice.id, resp.ChallengeID, e.passkey.assertFor(t, setup, resp)))
+}
+
+// A passkey whose enrolment an existing passkey authorised needs no waiting.
+func TestStepUp_AuthorisedPasskeyUsableAtOnce(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+	alice := registerStepUpUser(t, setup, "Alice")
+	added := enrollPasskey(t, setup, alice)
 
 	resp, err := setup.service.BeginDeleteAccountStepUp(setup.ctx, alice.id)
 	require.NoError(t, err)

@@ -27,8 +27,9 @@ const DeleteAccountChallengeTTL = 120 * time.Second
 // a late assertion is answered as expired rather than unknown.
 const deleteAccountChallengeGrace = 10 * time.Minute
 
-// AddedPasskeyStepUpDelay is how long a passkey added to an existing account
-// waits before it can authorise a step-up, giving the owner time to notice a
+// AddedPasskeyStepUpDelay is how long the first passkey of an account that had
+// none waits before it can authorise a step-up. No existing passkey could
+// authorise that enrolment, so the delay gives the owner time to notice a
 // passkey enrolled with a stolen bearer token.
 const AddedPasskeyStepUpDelay = 24 * time.Hour
 
