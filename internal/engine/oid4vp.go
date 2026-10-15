@@ -432,8 +432,10 @@ func (h *OID4VPHandler) parseRequestFromURL(u *url.URL) (*AuthorizationRequest, 
 	// transaction look like one that did not, so it bypassed the checks in
 	// validateTransactionData and the client presented without the hashes. The
 	// signed-JWT and fetched-object forms already keep it through their
-	// `transaction_data` struct tag.
-	if tdStr := q.Get("transaction_data"); tdStr != "" {
+	// `transaction_data` struct tag. A parameter that is present but empty is
+	// rejected rather than read as absent.
+	if q.Has("transaction_data") {
+		tdStr := q.Get("transaction_data")
 		if !json.Valid([]byte(tdStr)) {
 			return nil, fmt.Errorf("invalid transaction_data: not valid JSON")
 		}
@@ -2362,7 +2364,7 @@ type decodedTransactionData struct {
 }
 
 // decodeTransactionData decodes the transaction_data array structurally: an
-// array of base64url strings, each a JSON object. It decides nothing about
+// non-empty array of base64url strings, each a JSON object. It decides nothing about
 // which types are supported.
 func decodeTransactionData(raw json.RawMessage) ([]decodedTransactionData, error) {
 	if len(raw) == 0 {
@@ -2375,6 +2377,10 @@ func decodeTransactionData(raw json.RawMessage) ([]decodedTransactionData, error
 	var rawStrings []string
 	if err := json.Unmarshal(raw, &rawStrings); err != nil {
 		return nil, newTransactionDataError(ErrCodeInvalidMessage, "invalid transaction_data: expected array of base64url strings: %w", err)
+	}
+	// An empty array is not the same as leaving the parameter out.
+	if len(rawStrings) == 0 {
+		return nil, newTransactionDataError(ErrCodeInvalidMessage, "invalid transaction_data: must not be an empty array")
 	}
 	out := make([]decodedTransactionData, 0, len(rawStrings))
 	for i, encoded := range rawStrings {
