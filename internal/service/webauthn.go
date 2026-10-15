@@ -1905,6 +1905,15 @@ type BeginAddCredentialResponse struct {
 	Username      string                `json:"username,omitempty"`
 	ChallengeID   string                `json:"challengeId"`
 	CreateOptions CreateOptionsResponse `json:"createOptions"`
+
+	// Authorization asks an existing passkey to sign off the enrolment. It is
+	// absent only for an account that has no passkey yet.
+	Authorization *EnrollmentAuthorization `json:"authorization,omitempty"`
+}
+
+// EnrollmentAuthorization carries the assertion options for an existing passkey.
+type EnrollmentAuthorization struct {
+	PublicKey PublicKeyCredentialRequestOptions `json:"publicKey"`
 }
 
 // BeginAddCredential starts the process of adding a new credential to an existing user
@@ -1916,6 +1925,23 @@ func (s *WebAuthnService) BeginAddCredential(ctx context.Context, userID domain.
 	}
 	if err := refuseIfCutOff(ctx, user); err != nil {
 		return nil, err
+	}
+
+	// An account that has a passkey needs one of them to authorise adding
+	// another, so a bearer token alone cannot enrol a passkey of its own.
+	var authorization *EnrollmentAuthorization
+	var assertionChallenge string
+	if len(user.WebauthnCredentials) > 0 {
+		eligible := withStepUpCredentials(user, time.Now())
+		if len(eligible.WebauthnCredentials) == 0 {
+			return nil, ErrEnrollmentAuthorizationFailed
+		}
+		ch, options, err := s.ownAssertionOptions(eligible)
+		if err != nil {
+			return nil, err
+		}
+		assertionChallenge = ch
+		authorization = &EnrollmentAuthorization{PublicKey: options}
 	}
 
 	waUser := &WebAuthnUser{user: user}
@@ -1941,6 +1967,8 @@ func (s *WebAuthnService) BeginAddCredential(ctx context.Context, userID domain.
 		UserID:    userID.String(),
 		Action:    "add_credential",
 		ExpiresAt: time.Now().Add(5 * time.Minute),
+
+		AssertionChallenge: assertionChallenge,
 	}
 
 	if err := s.store.Challenges().Create(ctx, challenge); err != nil {
@@ -2003,6 +2031,7 @@ func (s *WebAuthnService) BeginAddCredential(ctx context.Context, userID domain.
 		Username:      username,
 		ChallengeID:   challengeID,
 		CreateOptions: createOptions,
+		Authorization: authorization,
 	}, nil
 }
 
@@ -2012,6 +2041,11 @@ type FinishAddCredentialRequest struct {
 	Credential  json.RawMessage          `json:"credential"`
 	Nickname    string                   `json:"nickname,omitempty"`
 	PrivateData taggedbinary.TaggedBytes `json:"privateData,omitempty"`
+
+	// Authorization is the assertion by an existing passkey over the
+	// Authorization options of the begin response. Required unless the
+	// account has no passkey.
+	Authorization json.RawMessage `json:"authorization,omitempty"`
 }
 
 // FinishAddCredentialResponse contains the response for finishing adding a credential
@@ -2057,6 +2091,18 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 
 	if challenge.Action != "add_credential" {
 		return nil, errors.New("invalid challenge action")
+	}
+
+	// Fail closed: with a passkey on the account, no assertion from one of
+	// them over this enrolment's own challenge means no enrolment.
+	if len(user.WebauthnCredentials) > 0 {
+		if len(req.Authorization) == 0 {
+			return nil, ErrEnrollmentAuthorizationRequired
+		}
+		if challenge.AssertionChallenge == "" ||
+			!s.verifyOwnAssertion(ctx, user, userID, challenge.AssertionChallenge, req.Authorization) {
+			return nil, ErrEnrollmentAuthorizationFailed
+		}
 	}
 
 	waUser := &WebAuthnUser{user: user}

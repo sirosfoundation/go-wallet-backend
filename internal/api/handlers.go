@@ -1086,7 +1086,10 @@ const (
 	errCodeStepUpFailed         = "STEP_UP_FAILED"
 	errCodeStepUpExpired        = "STEP_UP_EXPIRED"
 	errCodeConfirmationRequired = "CONFIRMATION_REQUIRED"
-	errCodeNoPasskey            = "NO_PASSKEY"
+
+	errCodeEnrollmentAuthorizationRequired = "ENROLLMENT_AUTHORIZATION_REQUIRED"
+	errCodeEnrollmentAuthorizationFailed   = "ENROLLMENT_AUTHORIZATION_FAILED"
+	errCodeNoPasskey                       = "NO_PASSKEY"
 )
 
 // deleteAccountRequest is the body of DELETE /user/session.
@@ -1390,6 +1393,10 @@ func (h *Handlers) StartAddWebAuthnCredential(c *gin.Context) {
 			c.JSON(403, gin.H{})
 			return
 		}
+		if errors.Is(err, service.ErrEnrollmentAuthorizationFailed) {
+			c.JSON(403, gin.H{"error": errCodeEnrollmentAuthorizationFailed, "message": "no passkey on the account can authorise adding another yet"})
+			return
+		}
 		h.logger.Error("Failed to start adding credential", zap.Error(err))
 		c.JSON(500, gin.H{"error": "Failed to start registration"})
 		return
@@ -1436,6 +1443,10 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 			c.JSON(404, gin.H{})
 		case errors.Is(err, service.ErrChallengeExpired):
 			c.JSON(404, gin.H{})
+		case errors.Is(err, service.ErrEnrollmentAuthorizationRequired):
+			c.JSON(401, gin.H{"error": errCodeEnrollmentAuthorizationRequired, "message": "adding a passkey needs an assertion from an existing passkey: send it as \"authorization\""})
+		case errors.Is(err, service.ErrEnrollmentAuthorizationFailed):
+			c.JSON(401, gin.H{"error": errCodeEnrollmentAuthorizationFailed, "message": "the authorising assertion was not accepted; start again with POST /user/session/webauthn/register-begin"})
 		case errors.Is(err, service.ErrVerificationFailed):
 			c.JSON(400, gin.H{"error": "Registration response could not be verified"})
 		case errors.Is(err, service.ErrAAGUIDBlacklisted):

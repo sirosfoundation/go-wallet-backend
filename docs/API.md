@@ -557,6 +557,49 @@ credential content is recorded. None is emitted by default.
 
 All credential endpoints require authentication.
 
+#### Adding a passkey to an existing account
+
+`POST /user/session/webauthn/register-begin` and
+`POST /user/session/webauthn/register-finish` (token TAC `i`) add a passkey to
+the caller's account. An account that already has a passkey needs one of them to
+authorise the addition, so a bearer token alone cannot enrol a passkey of its
+own. Two WebAuthn ceremonies take place, both answered in the one `finish`
+request; the authorising assertion is made first or second, in either order.
+
+**`register-begin` response:** as before (`challengeId`, `createOptions`,
+`username`), plus, when the account has a passkey:
+```json
+{
+  "authorization": {
+    "publicKey": {
+      "rpId": "wallet.example.org",
+      "challenge": { "$b64u": "..." },
+      "allowCredentials": [ { "type": "public-key", "id": { "$b64u": "..." } } ],
+      "userVerification": "required"
+    }
+  }
+}
+```
+`authorization` has the shape of the `delete-begin` options and is bound to the
+same `challengeId`: its challenge is fresh, single use and dies with the
+registration challenge (5 minutes). It is absent only for an account with no
+passkey yet. `403 ENROLLMENT_AUTHORIZATION_FAILED` when the account has
+passkeys but none can authorise yet.
+
+**`register-finish` request:** as before (`challengeId`, `credential`,
+`nickname`, `privateData`), plus `authorization`: the `PublicKeyCredential`
+assertion an existing passkey returned for the `authorization.publicKey`
+options, serialised like the login `credential`. Required unless
+`register-begin` returned no `authorization`.
+
+| Status | `error` | Meaning |
+|--------|---------|---------|
+| 401 | `ENROLLMENT_AUTHORIZATION_REQUIRED` | the account has a passkey and `authorization` is missing |
+| 401 | `ENROLLMENT_AUTHORIZATION_FAILED` | the assertion is not from one of the caller's passkeys, is over another challenge, or does not verify |
+
+The check comes before the registration is verified, and a refused attempt
+consumes the challenge: start again with `register-begin`.
+
 #### GET /storage/vc
 
 Get all credentials for the authenticated user.

@@ -270,9 +270,17 @@ func TestVerifyDeleteAccountStepUp_CloneWarningSurfaced(t *testing.T) {
 	assert.Len(t, observed.FilterMessage("possible cloned authenticator detected").All(), 1, "latched: no repeat")
 }
 
-// enrollPasskey adds a second passkey to u through the add-credential flow, as
-// a holder of only the bearer token could.
-func enrollPasskey(t *testing.T, setup *testVirtualWebAuthnSetup, u *stepUpUser) *stepUpUser {
+// enrolment is a begun add-credential ceremony and the new passkey's response.
+type enrolment struct {
+	begin    *BeginAddCredentialResponse
+	finish   *FinishAddCredentialRequest
+	passkey  *stepUpUser
+	signable json.RawMessage // the authorisation options, as JSON
+}
+
+// beginEnrol starts adding a passkey to u's account and answers the
+// registration ceremony with a new passkey; it sets no authorisation.
+func beginEnrol(t *testing.T, setup *testVirtualWebAuthnSetup, u *stepUpUser) *enrolment {
 	t.Helper()
 	begin, err := setup.service.BeginAddCredential(setup.ctx, u.id)
 	require.NoError(t, err)
@@ -283,12 +291,127 @@ func enrollPasskey(t *testing.T, setup *testVirtualWebAuthnSetup, u *stepUpUser)
 	cred := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
 	auth := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{UserHandle: u.id.AsUserHandle()})
 	resp := virtualwebauthn.CreateAttestationResponse(setup.rp, auth, cred, *opts)
-	_, err = setup.service.FinishAddCredential(setup.ctx, u.id, &FinishAddCredentialRequest{
-		ChallengeID: begin.ChallengeID, Credential: json.RawMessage(resp), Nickname: "added",
-	}, "")
-	require.NoError(t, err)
 	auth.AddCredential(cred)
-	return &stepUpUser{id: u.id, auth: auth, credential: cred}
+	e := &enrolment{
+		begin: begin,
+		finish: &FinishAddCredentialRequest{
+			ChallengeID: begin.ChallengeID, Credential: json.RawMessage(resp), Nickname: "added",
+		},
+		passkey: &stepUpUser{id: u.id, auth: auth, credential: cred},
+	}
+	if begin.Authorization != nil {
+		e.signable, err = json.Marshal(begin.Authorization)
+		require.NoError(t, err)
+	}
+	return e
+}
+
+// authorizeWith signs the enrolment's authorisation options with u's passkey.
+func (e *enrolment) authorizeWith(t *testing.T, setup *testVirtualWebAuthnSetup, u *stepUpUser) {
+	t.Helper()
+	opts, err := virtualwebauthn.ParseAssertionOptions(string(e.signable))
+	require.NoError(t, err)
+	e.finish.Authorization = json.RawMessage(virtualwebauthn.CreateAssertionResponse(setup.rp, u.auth, u.credential, *opts))
+}
+
+// enrollPasskey adds a second passkey to u's account, authorised by u's own.
+func enrollPasskey(t *testing.T, setup *testVirtualWebAuthnSetup, u *stepUpUser) *stepUpUser {
+	t.Helper()
+	e := beginEnrol(t, setup, u)
+	e.authorizeWith(t, setup, u)
+	_, err := setup.service.FinishAddCredential(setup.ctx, u.id, e.finish, "")
+	require.NoError(t, err)
+	return e.passkey
+}
+
+func credentialCount(t *testing.T, setup *testVirtualWebAuthnSetup, u *stepUpUser) int {
+	t.Helper()
+	user, err := setup.store.Users().GetByID(setup.ctx, u.id)
+	require.NoError(t, err)
+	return len(user.WebauthnCredentials)
+}
+
+// With only the bearer token, enrolling a passkey is refused, and so the
+// attacker has no passkey to sign a deletion step-up with.
+func TestEnrollment_StolenTokenCannotEnrolThenDeleteAccount(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+	alice := registerStepUpUser(t, setup, "Alice")
+
+	e := beginEnrol(t, setup, alice)
+	require.NotNil(t, e.begin.Authorization, "an account with a passkey asks for authorisation")
+	_, err := setup.service.FinishAddCredential(setup.ctx, alice.id, e.finish, "")
+	assert.ErrorIs(t, err, ErrEnrollmentAuthorizationRequired)
+	assert.Equal(t, 1, credentialCount(t, setup, alice))
+
+	// Nor can the attacker satisfy it with their own key.
+	e = beginEnrol(t, setup, alice)
+	e.authorizeWith(t, setup, e.passkey)
+	_, err = setup.service.FinishAddCredential(setup.ctx, alice.id, e.finish, "")
+	assert.ErrorIs(t, err, ErrEnrollmentAuthorizationFailed)
+	assert.Equal(t, 1, credentialCount(t, setup, alice))
+
+	// The deletion step-up then refuses the attacker's passkey.
+	resp, err := setup.service.BeginDeleteAccountStepUp(setup.ctx, alice.id)
+	require.NoError(t, err)
+	err = setup.service.VerifyDeleteAccountStepUp(setup.ctx, alice.id, resp.ChallengeID, e.passkey.assertFor(t, setup, resp))
+	assert.ErrorIs(t, err, ErrStepUpFailed)
+}
+
+func TestEnrollment_AuthorisedByExistingPasskeySucceeds(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+	alice := registerStepUpUser(t, setup, "Alice")
+	_ = enrollPasskey(t, setup, alice)
+	assert.Equal(t, 2, credentialCount(t, setup, alice))
+}
+
+// An assertion over another challenge (here a deletion step-up) does not
+// authorise an enrolment, and the authorisation is single use with it.
+func TestEnrollment_AssertionForAnotherChallengeRefused(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+	alice := registerStepUpUser(t, setup, "Alice")
+
+	e := beginEnrol(t, setup, alice)
+	su, err := setup.service.BeginDeleteAccountStepUp(setup.ctx, alice.id)
+	require.NoError(t, err)
+	e.finish.Authorization = alice.assertFor(t, setup, su)
+	_, err = setup.service.FinishAddCredential(setup.ctx, alice.id, e.finish, "")
+	assert.ErrorIs(t, err, ErrEnrollmentAuthorizationFailed)
+	assert.Equal(t, 1, credentialCount(t, setup, alice))
+
+	// The enrolment challenge is consumed by the refusal.
+	e2 := beginEnrol(t, setup, alice)
+	e2.authorizeWith(t, setup, alice)
+	_, err = setup.service.FinishAddCredential(setup.ctx, alice.id, e2.finish, "")
+	require.NoError(t, err)
+	_, err = setup.service.FinishAddCredential(setup.ctx, alice.id, e2.finish, "")
+	assert.ErrorIs(t, err, ErrChallengeNotFound)
+}
+
+func TestEnrollment_OtherUsersPasskeyCannotAuthorise(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+	alice := registerStepUpUser(t, setup, "Alice")
+	bob := registerStepUpUser(t, setup, "Bob")
+
+	e := beginEnrol(t, setup, alice)
+	e.authorizeWith(t, setup, bob)
+	_, err := setup.service.FinishAddCredential(setup.ctx, alice.id, e.finish, "")
+	assert.ErrorIs(t, err, ErrEnrollmentAuthorizationFailed)
+	assert.Equal(t, 1, credentialCount(t, setup, alice))
+}
+
+// An account with no passkey has nothing to authorise with.
+func TestEnrollment_AccountWithoutPasskeyNeedsNoAuthorization(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+	alice := registerStepUpUser(t, setup, "Alice")
+	user, err := setup.store.Users().GetByID(setup.ctx, alice.id)
+	require.NoError(t, err)
+	user.WebauthnCredentials = nil
+	require.NoError(t, setup.store.Users().Update(setup.ctx, user))
+
+	e := beginEnrol(t, setup, alice)
+	assert.Nil(t, e.begin.Authorization)
+	_, err = setup.service.FinishAddCredential(setup.ctx, alice.id, e.finish, "")
+	require.NoError(t, err)
 }
 
 // A passkey enrolled with only the bearer token cannot authorise the deletion

@@ -23,6 +23,11 @@ type WebauthnChallenge struct {
 	// it without also having captured this value. See go-wallet-backend#373.
 	CodeVerifier string `json:"code_verifier,omitempty" bson:"code_verifier,omitempty"`
 
+	// AssertionChallenge is the challenge of the assertion by an existing
+	// passkey that authorises this enrolment (action "add_credential"); it is
+	// consumed together with the registration challenge.
+	AssertionChallenge string `json:"assertion_challenge,omitempty" bson:"assertion_challenge,omitempty"`
+
 	// ValidUntil, when set, is the end of the challenge's validity and
 	// precedes ExpiresAt. The record outlives its validity so that a late use
 	// can be told apart from an unknown challenge; it is still consumed once.

@@ -49,6 +49,12 @@ func withStepUpCredentials(user *domain.User, now time.Time) *domain.User {
 // already used, minted for someone or something else, or does not verify.
 var ErrStepUpFailed = errors.New("step-up assertion failed")
 
+// Refusals of an enrolment that no existing passkey authorised.
+var (
+	ErrEnrollmentAuthorizationRequired = errors.New("enrolment needs an assertion from an existing passkey")
+	ErrEnrollmentAuthorizationFailed   = errors.New("enrolment authorisation failed")
+)
+
 // BeginStepUpResponse carries WebAuthn assertion options restricted to the
 // caller's own credentials.
 type BeginStepUpResponse struct {
@@ -71,6 +77,30 @@ func (s *WebAuthnService) BeginDeleteAccountStepUp(ctx context.Context, userID d
 		return nil, ErrCredentialNotFound
 	}
 
+	challenge, options, err := s.ownAssertionOptions(user)
+	if err != nil {
+		return nil, err
+	}
+
+	challengeID := generateChallengeID()
+	validUntil := time.Now().Add(DeleteAccountChallengeTTL)
+	if err := s.store.Challenges().Create(ctx, &domain.WebauthnChallenge{
+		ID:         challengeID,
+		UserID:     userID.String(),
+		Challenge:  challenge,
+		Action:     ChallengeActionDeleteAccount,
+		ValidUntil: validUntil,
+		ExpiresAt:  validUntil.Add(deleteAccountChallengeGrace),
+	}); err != nil {
+		return nil, fmt.Errorf("failed to store challenge: %w", err)
+	}
+
+	return &BeginStepUpResponse{ChallengeID: challengeID, PublicKey: options}, nil
+}
+
+// ownAssertionOptions mints a user-verifying assertion challenge restricted to
+// user's own credentials, which must already be filtered to the eligible ones.
+func (s *WebAuthnService) ownAssertionOptions(user *domain.User) (string, PublicKeyCredentialRequestOptions, error) {
 	waUser := &WebAuthnUser{user: user}
 	creds := waUser.WebAuthnCredentials()
 	allowed := make([]protocol.CredentialDescriptor, 0, len(creds))
@@ -83,40 +113,22 @@ func (s *WebAuthnService) BeginDeleteAccountStepUp(ctx context.Context, userID d
 			Transports: c.Transport,
 		})
 	}
-
 	_, session, err := s.webauthn.BeginLogin(waUser,
 		webauthn.WithUserVerification(protocol.VerificationRequired),
 		webauthn.WithAllowedCredentials(allowed),
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to begin step-up: %w", err)
+		return "", PublicKeyCredentialRequestOptions{}, fmt.Errorf("failed to begin assertion: %w", err)
 	}
 	challengeBytes, err := base64.RawURLEncoding.DecodeString(session.Challenge)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decode challenge: %w", err)
+		return "", PublicKeyCredentialRequestOptions{}, fmt.Errorf("failed to decode challenge: %w", err)
 	}
-
-	challengeID := generateChallengeID()
-	validUntil := time.Now().Add(DeleteAccountChallengeTTL)
-	if err := s.store.Challenges().Create(ctx, &domain.WebauthnChallenge{
-		ID:         challengeID,
-		UserID:     userID.String(),
-		Challenge:  session.Challenge,
-		Action:     ChallengeActionDeleteAccount,
-		ValidUntil: validUntil,
-		ExpiresAt:  validUntil.Add(deleteAccountChallengeGrace),
-	}); err != nil {
-		return nil, fmt.Errorf("failed to store challenge: %w", err)
-	}
-
-	return &BeginStepUpResponse{
-		ChallengeID: challengeID,
-		PublicKey: PublicKeyCredentialRequestOptions{
-			RPId:             s.cfg.Server.RPID,
-			Challenge:        challengeBytes,
-			AllowCredentials: descriptors,
-			UserVerification: protocol.VerificationRequired,
-		},
+	return session.Challenge, PublicKeyCredentialRequestOptions{
+		RPId:             s.cfg.Server.RPID,
+		Challenge:        challengeBytes,
+		AllowCredentials: descriptors,
+		UserVerification: protocol.VerificationRequired,
 	}, nil
 }
 
@@ -157,12 +169,23 @@ func (s *WebAuthnService) VerifyDeleteAccountStepUp(ctx context.Context, userID 
 		return fmt.Errorf("failed to load user: %w", err)
 	}
 
-	// Only passkeys that may authorise a step-up are offered to the verifier.
+	if !s.verifyOwnAssertion(ctx, user, userID, challenge.Challenge, credential) {
+		return ErrStepUpFailed
+	}
+	return nil
+}
+
+// verifyOwnAssertion reports whether credential is a valid user-verifying
+// assertion over challenge from one of user's passkeys eligible to authorise a
+// step-up. The user is never derived from the assertion's userHandle, which
+// must only name userID. A clone warning is recorded but does not refuse it,
+// as at login.
+func (s *WebAuthnService) verifyOwnAssertion(ctx context.Context, user *domain.User, userID domain.UserID, challenge string, credential json.RawMessage) bool {
 	eligible := withStepUpCredentials(user, time.Now())
 
 	parsed, err := protocol.ParseCredentialRequestResponseBody(newCredentialReader(credential))
 	if err != nil {
-		return ErrStepUpFailed
+		return false
 	}
 
 	// The handle the authenticator returns is the one stored at registration
@@ -170,7 +193,7 @@ func (s *WebAuthnService) VerifyDeleteAccountStepUp(ctx context.Context, userID 
 	handle := userID.AsUserHandle()
 	if h := parsed.Response.UserHandle; len(h) > 0 {
 		if !userHandleNames(h, userID) {
-			return ErrStepUpFailed
+			return false
 		}
 		handle = h
 	}
@@ -182,15 +205,15 @@ func (s *WebAuthnService) VerifyDeleteAccountStepUp(ctx context.Context, userID 
 	}
 
 	verified, err := s.webauthn.ValidateLogin(waUser, webauthn.SessionData{
-		Challenge:            challenge.Challenge,
+		Challenge:            challenge,
 		RelyingPartyID:       s.cfg.Server.RPID,
 		UserID:               handle,
 		AllowedCredentialIDs: allowed,
 		UserVerification:     protocol.VerificationRequired,
 	}, parsed)
 	if err != nil {
-		s.logger.Warn("Step-up assertion did not verify", zap.Error(err))
-		return ErrStepUpFailed
+		s.logger.Warn("Own-passkey assertion did not verify", zap.Error(err))
+		return false
 	}
 
 	credID := base64.RawURLEncoding.EncodeToString(verified.ID)
@@ -200,9 +223,8 @@ func (s *WebAuthnService) VerifyDeleteAccountStepUp(ctx context.Context, userID 
 			tenantID = domain.TenantID(c.TenantID) //nolint:unconvert
 		}
 	}
-	// Like login, a clone warning does not refuse the assertion.
 	s.recordAuthenticatorUse(ctx, userID, tenantID, credID, verified.Authenticator.SignCount, verified.Authenticator.CloneWarning)
-	return nil
+	return true
 }
 
 // userHandleNames reports whether a stored user handle (v1 binary, legacy

@@ -179,3 +179,48 @@ func TestDeleteAccount_TAC_OversizedBodyUsesStepUpErrorShape(t *testing.T) {
 	assert.NotEmpty(t, got["message"])
 	assert.True(t, e.exists(t))
 }
+
+// A token holding `i` and `w` can reach enrolment, but with only the token the
+// enrolment is refused, so the attacker's passkey cannot sign the deletion.
+func TestDeleteAccount_TAC_StolenTokenCannotEnrolPasskeyThenDelete(t *testing.T) {
+	e := newDeleteTACEnv(t, true, "rwli")
+
+	w := e.do(http.MethodPost, "/user/session/webauthn/register-begin", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var begin struct {
+		ChallengeID   string          `json:"challengeId"`
+		CreateOptions json.RawMessage `json:"createOptions"`
+		Authorization json.RawMessage `json:"authorization"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &begin))
+	require.NotEmpty(t, begin.Authorization, "the existing passkey is asked to authorise")
+	opts, err := virtualwebauthn.ParseAttestationOptions(string(begin.CreateOptions))
+	require.NoError(t, err)
+
+	attackerCred := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+	attackerAuth := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{UserHandle: e.user.AsUserHandle()})
+	attestation := virtualwebauthn.CreateAttestationResponse(e.rp, attackerAuth, attackerCred, *opts)
+	body, err := json.Marshal(map[string]any{"challengeId": begin.ChallengeID, "credential": json.RawMessage(attestation)})
+	require.NoError(t, err)
+
+	w = e.do(http.MethodPost, "/user/session/webauthn/register-finish", body)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.Contains(t, w.Body.String(), "ENROLLMENT_AUTHORIZATION_REQUIRED")
+
+	// The attacker's passkey is not enrolled, so it cannot sign a step-up.
+	attackerAuth.AddCredential(attackerCred)
+	w = e.do(http.MethodPost, "/user/session/delete-begin", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var su struct {
+		ChallengeID string `json:"challengeId"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &su))
+	aopts, err := virtualwebauthn.ParseAssertionOptions(w.Body.String())
+	require.NoError(t, err)
+	forged := virtualwebauthn.CreateAssertionResponse(e.rp, attackerAuth, attackerCred, *aopts)
+	body, err = json.Marshal(map[string]any{"challengeId": su.ChallengeID, "credential": json.RawMessage(forged), "confirm": "DELETE"})
+	require.NoError(t, err)
+	w = e.do(http.MethodDelete, "/user/session", body)
+	assert.Equal(t, http.StatusUnauthorized, w.Code)
+	assert.True(t, e.exists(t))
+}
