@@ -89,7 +89,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	}
 
 	userSvc := NewUserService(store, cfg, logger)
-	revocationStore, err := newRevocationStore(context.Background(), cfg.Security.TokenBlacklist, store, logger)
+	revocationStore, err := NewRevocationStore(context.Background(), cfg.Security.TokenBlacklist, store, logger)
 	if err != nil {
 		// Never fall back to memory on a configured shared store: every
 		// revocation operation fails (and so refuses) until restart.

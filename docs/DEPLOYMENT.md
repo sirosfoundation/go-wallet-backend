@@ -585,6 +585,21 @@ still complete, so the revocation is missing until the store is back. If
 the store cannot be set up at startup the process still starts, logs an
 error and refuses authenticated requests until restarted.
 
+A process that has no storage backend of its own, a standalone engine
+(`--mode=engine`) or registry (`--mode=registry`), connects to the same
+revocation collections using `storage.mongodb` when the setting resolves to
+`storage`, so it rejects what the backend replicas revoked. Give such a
+process the same `storage.mongodb` settings as the backend. If the setting is
+`storage` (or unset with `storage.type: mongodb`) and the connection fails,
+that process does not start. With `memory`, or unset with non-MongoDB
+storage, it keeps no revocation state, because a process-local blacklist would
+never see a revocation. The isolated wallet-provider (`--mode=wallet-provider`)
+uses the same store through its own storage backend. The startup warning
+about process-local state is logged by every one of these roles.
+
+`Remove` (administrative override) deletes the jti revocation in the MongoDB
+store as well; `Count` only reports the entries held by the local process.
+
 Switching backend starts with an empty store: revocations recorded in the
 old one are not carried over, so tokens revoked shortly before the switch
 (access tokens live `as.default_token_ttl`, 2 minutes by default) may be
