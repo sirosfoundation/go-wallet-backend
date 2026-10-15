@@ -295,7 +295,7 @@ func (a *WMPAdapter) SetExternalURL(raw string) error {
 			u.Scheme = "http"
 		}
 	}
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 		return fmt.Errorf("invalid WMP external URL %q", raw)
 	}
 	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {

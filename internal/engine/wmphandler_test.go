@@ -2590,7 +2590,7 @@ func TestWMP_HTTPEndpoint_Configuration_NoExternalURL_FailsClosed(t *testing.T) 
 	a.HandleWMPConfiguration(w, httptest.NewRequest(http.MethodGet, "/.well-known/wmp-configuration", nil))
 	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
 
-	for _, bad := range []string{"", "/api", "ftp://x.example", "https://", "https://x.example/?q=1", "https://x.example/#f", "::"} {
+	for _, bad := range []string{"", "/api", "ftp://x.example", "https://", "https://x.example/?q=1", "https://x.example/?", "https://x.example/#f", "::"} {
 		assert.Error(t, a.SetExternalURL(bad), bad)
 	}
 	assert.False(t, a.HasExternalURL())
