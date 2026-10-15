@@ -795,3 +795,138 @@ func TestDeleteUser_RevocationFailureAnswers500(t *testing.T) {
 	require.Equal(t, http.StatusInternalServerError, w.Code, w.Body.String())
 	require.Contains(t, w.Body.String(), "Failed to revoke tokens")
 }
+
+// With sid and jti on the token, a failed shared jti write must leave the
+// retry admissible through the real auth middleware: nothing may have been
+// revoked locally by the failed attempt.
+func TestLogout_FailedJTIWriteWithSID_RetryableThroughRealMiddleware(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, tokenAuth := range []bool{false, true} {
+		name := "legacy HMAC path"
+		if tokenAuth {
+			name = "tokenauth ModeLegacy path"
+		}
+		t.Run(name, func(t *testing.T) {
+			logger := zap.NewNop()
+			cfg := &config.Config{
+				Server: config.ServerConfig{RPID: "wallet.example.com"},
+				JWT:    config.JWTConfig{Secret: "test-secret", ExpiryHours: 24, RefreshDays: 7, Issuer: "test-wallet"},
+			}
+			mem := memory.NewStore()
+			store := &flakyAddStore{failing: true, jtis: map[string]bool{}}
+			services := service.NewServices(mem, cfg, logger)
+			services.TokenBlacklist = service.NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, logger, store)
+			handlers := NewHandlers(services, cfg, logger, []string{"test"})
+
+			router := gin.New()
+			if tokenAuth {
+				v := tokenvalidator.New(tokenvalidator.Config{
+					Audiences: []string{"wallet-backend", "wallet.example.com"},
+					Legacy: tokenvalidator.LegacyConfig{
+						Enabled: true, HMACSecret: []byte(cfg.JWT.Secret), Issuers: []string{cfg.JWT.Issuer},
+					},
+				})
+				router.Use(middleware.TokenAuthMiddleware(cfg, v, mem.Tenants(), services.TokenBlacklist, logger))
+				router.Use(middleware.RequireAudience("wallet-backend"))
+			} else {
+				router.Use(middleware.AuthMiddlewareWithBlacklist(cfg, mem, services.TokenBlacklist, logger))
+			}
+			router.POST("/user/session/logout", handlers.Logout)
+
+			tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+				"user_id": "user-1", "tenant_id": "default", "jti": "jti-s", "sid": "sid-s",
+				"iss": "test-wallet", "aud": "wallet.example.com", "exp": time.Now().Add(time.Hour).Unix(),
+			}).SignedString([]byte(cfg.JWT.Secret))
+			require.NoError(t, err)
+			logout := func() int {
+				w := httptest.NewRecorder()
+				req := httptest.NewRequest(http.MethodPost, "/user/session/logout", nil)
+				req.Header.Set("Authorization", "Bearer "+tok)
+				router.ServeHTTP(w, req)
+				return w.Code
+			}
+
+			require.Equal(t, http.StatusInternalServerError, logout())
+			require.False(t, services.TokenBlacklist.IsFamilyRevoked(context.Background(), "sid-s"),
+				"a failed attempt must not revoke the family: the retry would be rejected")
+
+			store.failing = false
+			require.Equal(t, http.StatusOK, logout(), "retry with the same token")
+			require.True(t, store.jtis["jti-s"], "the shared jti entry is written on the retry")
+			require.True(t, services.TokenBlacklist.IsFamilyRevoked(context.Background(), "sid-s"))
+		})
+	}
+}
+
+// userStore records a user revocation and fails the first write anyway, like
+// a MongoDB write whose majority acknowledgement was lost after it applied.
+type lostAckUserStore struct {
+	users    map[string]bool
+	failNext bool
+}
+
+func (s *lostAckUserStore) Add(context.Context, string, time.Time) error { return nil }
+func (s *lostAckUserStore) Has(context.Context, string) (bool, error)    { return false, nil }
+func (s *lostAckUserStore) RevokeUser(_ context.Context, id string) error {
+	s.users[id] = true
+	if s.failNext {
+		s.failNext = false
+		return errors.New("write concern timeout")
+	}
+	return nil
+}
+func (s *lostAckUserStore) IsUserRevoked(_ context.Context, id string) (bool, error) {
+	return s.users[id], nil
+}
+
+// A revocation that was stored although its write reported an error leaves
+// the user revoked but undeleted; the retry must still reach the deletion
+// through the real auth middleware, and other routes must stay closed to the
+// revoked user.
+func TestDeleteUser_LostAckRevocation_RetryCompletesThroughRealMiddleware(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	logger := zap.NewNop()
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPID: "wallet.example.com"},
+		JWT:    config.JWTConfig{Secret: "test-secret", ExpiryHours: 24, Issuer: "test-wallet"},
+	}
+	mem := memory.NewStore()
+	rs := &lostAckUserStore{users: map[string]bool{}, failNext: true}
+	services := service.NewServices(mem, cfg, logger)
+	bl := service.NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, logger, rs)
+	services.TokenBlacklist = bl
+	services.User.SetTokenBlacklist(bl)
+	handlers := NewHandlers(services, cfg, logger, []string{"test"})
+
+	name := "lost-ack"
+	user, err := services.User.Register(context.Background(), &domain.RegisterRequest{Username: &name, DisplayName: "d", WalletType: domain.WalletTypeDB})
+	require.NoError(t, err)
+
+	router := gin.New()
+	router.Use(middleware.AuthMiddlewareWithBlacklist(cfg, mem, bl, logger))
+	router.DELETE("/user/session", handlers.DeleteUser)
+	router.GET("/user/session/account-info", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": user.UUID.String(), "tenant_id": "default", "jti": "jti-d",
+		"iss": "test-wallet", "aud": "wallet.example.com", "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte(cfg.JWT.Secret))
+	require.NoError(t, err)
+	do := func(method, path string) int {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(method, path, nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		router.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	require.Equal(t, http.StatusInternalServerError, do(http.MethodDelete, "/user/session"))
+	_, err = mem.Users().GetByID(context.Background(), user.UUID)
+	require.NoError(t, err, "the user survives the failed attempt")
+	require.True(t, rs.users[user.UUID.String()], "precondition: the revocation was stored")
+
+	require.Equal(t, http.StatusUnauthorized, do(http.MethodGet, "/user/session/account-info"), "a revoked user stays locked out of every other route")
+	require.Equal(t, http.StatusOK, do(http.MethodDelete, "/user/session"), "the retry completes the deletion")
+	_, err = mem.Users().GetByID(context.Background(), user.UUID)
+	require.Error(t, err, "the user is deleted")
+}

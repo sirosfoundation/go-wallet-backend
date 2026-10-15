@@ -580,12 +580,24 @@ func TestUserService_DeleteUser_RevocationFailureFailsClosed(t *testing.T) {
 		t.Fatalf("Register() error = %v", err)
 	}
 
+	if err := store.UserTenants().AddMembership(ctx, &domain.UserTenantMembership{UserID: user.UUID, TenantID: domain.DefaultTenantID, Role: "user"}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.UserTenants().GetUserTenants(ctx, user.UUID)
+	if err != nil || len(before) == 0 {
+		t.Fatalf("precondition: the user has a tenant membership (%v, %v)", before, err)
+	}
+
 	err = svc.DeleteUser(ctx, user.UUID, user.DID)
 	if !errors.Is(err, ErrTokenRevocationFailed) {
 		t.Fatalf("DeleteUser() = %v, want ErrTokenRevocationFailed", err)
 	}
 	if _, err := store.Users().GetByID(ctx, user.UUID); err != nil {
 		t.Fatalf("the user must not be deleted when revocation failed: %v", err)
+	}
+	after, err := store.UserTenants().GetUserTenants(ctx, user.UUID)
+	if err != nil || len(after) != len(before) {
+		t.Fatalf("tenant memberships must be untouched when revocation failed: %v, %v", after, err)
 	}
 
 	revoker.err = nil

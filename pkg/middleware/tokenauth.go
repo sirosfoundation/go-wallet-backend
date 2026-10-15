@@ -101,7 +101,7 @@ func TokenAuthMiddlewareWithValidate(cfg *config.Config, validate func(ctx conte
 				RefuseRevocationUnavailable(c, logger, err)
 				return
 			}
-			if userRevoked {
+			if userRevoked && !IsAccountDeletion(c) {
 				logger.Warn("Token for revoked user used",
 					zap.String("user_id", result.UserID),
 				)

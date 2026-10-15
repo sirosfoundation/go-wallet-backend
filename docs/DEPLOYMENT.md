@@ -586,8 +586,11 @@ token checked by the token validator is rejected with 401. Every lookup is
 bounded to 5 seconds. A revocation write that fails
 fails the request: logout (`POST /user/session/logout`, `DELETE /auth/session`)
 and account deletion answer 500 and change nothing the client cannot retry
-(the session cookie is kept, the user is not deleted); repeat the request
-once the store is back. If
+(the session cookie is kept, the user and their data are untouched); repeat
+the request once the store is back. Account deletion revokes first. A write
+that reported an error may still have been stored, so a revoked user can still
+call `DELETE /user/session` (and only that route) to complete the deletion;
+the revocation is idempotent. If
 the store cannot be set up at startup the process still starts, logs an
 error and refuses authenticated requests until restarted.
 

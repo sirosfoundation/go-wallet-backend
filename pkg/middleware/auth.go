@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -32,6 +33,16 @@ type TokenBlacklistChecker interface {
 	IsBlacklisted(ctx context.Context, jti string) (bool, error)
 	IsUserRevoked(ctx context.Context, userID string) (bool, error)
 	IsFamilyRevoked(ctx context.Context, sid string) bool
+}
+
+// IsAccountDeletion reports whether the request is the account deletion call
+// (DELETE /user/session). A user revocation means the deletion has begun, so
+// that call stays reachable to a revoked user: a deletion interrupted after
+// the revocation was stored (including a write whose acknowledgement was
+// lost) can then be completed by retrying, with every other token check
+// (signature, jti, family, expiry) still applied.
+func IsAccountDeletion(c *gin.Context) bool {
+	return c.Request.Method == http.MethodDelete && strings.TrimSuffix(c.FullPath(), "/") == "/user/session"
 }
 
 // RefuseRevocationUnavailable aborts the request with 503 because the
@@ -210,7 +221,7 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 				RefuseRevocationUnavailable(c, logger, err)
 				return
 			}
-			if userRevoked {
+			if userRevoked && !IsAccountDeletion(c) {
 				logger.Warn("Token for revoked user used",
 					zap.String("user_id", userID),
 				)
