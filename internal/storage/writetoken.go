@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 )
 
-// NewWriteToken returns a fresh random token for VerifiableCredential.WriteToken.
+// NewWriteToken returns a fresh random token for a record's WriteToken.
 func NewWriteToken() string {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {

@@ -219,11 +219,13 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 		return err
 	}
 	if err := s.keyAttestations.MarkKeyAttested(ctx, rec); err != nil {
-		return fmt.Errorf("%w: record verification: %v", ErrFIDO2AttestationInvalid, err)
+		return fmt.Errorf("record key attestation: %w", err)
 	}
-	// A cut-off during the write fails the request closed; the revocation cascade
-	// cleans up the record just written.
-	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
+	// A cut-off during the write fails the request closed. The erasure cascade
+	// does not cover this record, so roll it back, conditionally on this write.
+	if err := tokengate.ConfirmWrite(ctx, s.users, func(rctx context.Context) error {
+		return s.keyAttestations.DeleteIfUnchanged(rctx, rec.KeyThumbprint, rec.WriteToken)
+	}); err != nil {
 		return err
 	}
 

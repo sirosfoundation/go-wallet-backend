@@ -346,7 +346,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	// Without this check, a wallet that still holds its instance key could simply
 	// request a fresh challenge/PoP and obtain a brand-new valid WIA, completely
 	// bypassing revocation.
-	firstAttestation := false
+	firstAttestation, created := false, false
 	if s.instances != nil {
 		existing, err := s.instances.GetByID(ctx, jkt)
 		switch {
@@ -373,7 +373,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 				}
 			}
 		case errors.Is(err, storage.ErrNotFound):
-			firstAttestation = true
+			firstAttestation, created = true, true
 			// A first attestation must not revive a deactivated wallet (SID-AUTH-06).
 			if err := s.refuseIfWalletDeactivated(ctx, tenantID, userID); err != nil {
 				return "", err
@@ -415,7 +415,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	}
 
 	// Step 4: Generate WIA JWT
-	return s.signWIA(ctx, cnfJWK, jkt, tenantID, userID, attestationSource, req.ClientID, req.CredentialID, firstAttestation)
+	return s.signWIA(ctx, cnfJWK, jkt, tenantID, userID, attestationSource, req.ClientID, req.CredentialID, firstAttestation, created)
 }
 
 // validatePop validates the WIA-PoP JWT and extracts the cnf key.
@@ -514,8 +514,9 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 // signWIA creates the WIA JWT (typ: oauth-client-attestation+jwt).
 // jkt is the JWK Thumbprint of cnfJWK, precomputed by the caller (GenerateWIA)
 // so it can also be used for the instance-status guard before signing.
-// firstAttestation: the record did not exist at the lifecycle check; re-checked after the write.
-func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, attestationSource string, clientID string, credentialID string, firstAttestation bool) (string, error) {
+// firstAttestation: the record did not exist at the lifecycle check (or was anonymous); re-checked after the write.
+// created: the record did not exist at all.
+func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, attestationSource string, clientID string, credentialID string, firstAttestation, created bool) (string, error) {
 	now := time.Now()
 
 	lifetime := s.wiaLifetime()
@@ -680,6 +681,9 @@ func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{},
 		if err := s.recheckLifecycleAfterWrite(ctx, tenantID, userID, jkt, credentialID, firstAttestation); err != nil {
 			return "", err
 		}
+		if err := s.fenceInstanceWrite(ctx, instance, created); err != nil {
+			return "", err
+		}
 	}
 
 	// A cut-off landing during the write must still stop the token.
@@ -726,6 +730,35 @@ func checkInstanceBinding(existing *domain.WalletInstance, tenantID domain.Tenan
 		return fmt.Errorf("%w: instance belongs to another user", ErrWIAInstanceNotOwned)
 	}
 	return nil
+}
+
+// fenceInstanceWrite refuses the request if the cut-off landed during the
+// Upsert, removing the record it wrote. A record this request created is always
+// removed; a pre-existing one only when the account was deleted, since the
+// deletion sweep may have run before the Upsert recreated it. The removal is
+// conditional on the written binding, so a record replaced since is untouched.
+func (s *WIAService) fenceInstanceWrite(ctx context.Context, written *domain.WalletInstance, created bool) error {
+	err := tokengate.RefuseNow(ctx, s.users)
+	if err == nil {
+		return nil
+	}
+	if !created && !errors.Is(err, tokengate.ErrAccountDeleted) {
+		return err
+	}
+	id, tenantID, binding := written.ID, written.TenantID, written.Binding()
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	switch rerr := s.instances.DeleteIfRemovable(rctx, id, tenantID, binding); {
+	case rerr == nil,
+		errors.Is(rerr, storage.ErrNotFound),
+		errors.Is(rerr, storage.ErrBindingChanged),
+		errors.Is(rerr, domain.ErrInvalidStatusTransition):
+		// Gone, replaced by another request's record, or a tombstone that must survive.
+	default:
+		s.emitAuditFailure("instance_rollback_failed", rerr)
+		return errors.Join(err, fmt.Errorf("%w: %w", tokengate.ErrWriteNotRolledBack, rerr))
+	}
+	return err
 }
 
 // recheckLifecycleAfterWrite closes the window between GenerateWIA's checks

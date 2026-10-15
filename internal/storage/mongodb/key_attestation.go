@@ -19,12 +19,14 @@ type KeyAttestationStore struct {
 
 func (s *KeyAttestationStore) MarkKeyAttested(ctx context.Context, rec *domain.KeyAttestationRecord) error {
 	filter := bson.M{"_id": rec.KeyThumbprint}
+	rec.WriteToken = storage.NewWriteToken()
 	update := bson.M{
 		"$set": bson.M{
 			"wallet_instance_id": rec.WalletInstanceID,
 			"tenant_id":          rec.TenantID,
 			"aaguid":             rec.AAGUID,
 			"verified_at":        rec.VerifiedAt,
+			"write_token":        rec.WriteToken,
 		},
 		"$setOnInsert": bson.M{
 			"created_at": rec.CreatedAt,
@@ -48,4 +50,19 @@ func (s *KeyAttestationStore) GetByKeyThumbprint(ctx context.Context, thumbprint
 		return nil, fmt.Errorf("%w: get key attestation: %v", storage.ErrDatabase, err)
 	}
 	return &rec, nil
+}
+
+// DeleteIfUnchanged is one atomic filtered DeleteOne on the write token.
+func (s *KeyAttestationStore) DeleteIfUnchanged(ctx context.Context, thumbprint, writeToken string) error {
+	if writeToken == "" {
+		return storage.ErrNotFound
+	}
+	result, err := s.collection.DeleteOne(ctx, bson.M{"_id": thumbprint, "write_token": writeToken})
+	if err != nil {
+		return fmt.Errorf("%w: delete key attestation: %v", storage.ErrDatabase, err)
+	}
+	if result.DeletedCount == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
 }

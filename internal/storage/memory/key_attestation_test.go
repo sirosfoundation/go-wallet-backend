@@ -79,3 +79,34 @@ func TestKeyAttestationStore_DistinctKeysDoNotShareEvidence(t *testing.T) {
 		t.Errorf("err = %v, want storage.ErrNotFound (a different key must not inherit another key's evidence)", err)
 	}
 }
+
+func TestKeyAttestationStore_DeleteIfUnchanged(t *testing.T) {
+	ctx := context.Background()
+	kas := NewStore().KeyAttestations()
+
+	first := &domain.KeyAttestationRecord{KeyThumbprint: "t", VerifiedAt: time.Now().UTC()}
+	if err := kas.MarkKeyAttested(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	staleToken := first.WriteToken
+	if staleToken == "" {
+		t.Fatal("MarkKeyAttested must set a write token")
+	}
+	second := &domain.KeyAttestationRecord{KeyThumbprint: "t", VerifiedAt: time.Now().UTC()}
+	if err := kas.MarkKeyAttested(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := kas.DeleteIfUnchanged(ctx, "t", staleToken); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("a superseded write token must not delete, got %v", err)
+	}
+	if err := kas.DeleteIfUnchanged(ctx, "t", ""); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("an empty token must not delete, got %v", err)
+	}
+	if err := kas.DeleteIfUnchanged(ctx, "t", second.WriteToken); err != nil {
+		t.Fatalf("current token: %v", err)
+	}
+	if _, err := kas.GetByKeyThumbprint(ctx, "t"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("record must be gone, got %v", err)
+	}
+}

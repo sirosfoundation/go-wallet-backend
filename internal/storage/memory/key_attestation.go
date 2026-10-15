@@ -24,7 +24,20 @@ func (s *KeyAttestationStore) MarkKeyAttested(_ context.Context, rec *domain.Key
 	} else if rec.CreatedAt.IsZero() {
 		rec.CreatedAt = time.Now().UTC()
 	}
+	rec.WriteToken = storage.NewWriteToken()
 	s.data[rec.KeyThumbprint] = rec
+	return nil
+}
+
+func (s *KeyAttestationStore) DeleteIfUnchanged(_ context.Context, thumbprint, writeToken string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rec, ok := s.data[thumbprint]
+	if !ok || writeToken == "" || rec.WriteToken != writeToken {
+		return storage.ErrNotFound
+	}
+	delete(s.data, thumbprint)
 	return nil
 }
 

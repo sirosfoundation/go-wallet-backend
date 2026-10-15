@@ -43,3 +43,20 @@ func TestKeyAttestationStore_GetByKeyThumbprint_NotFound(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.Is(err, storage.ErrNotFound))
 }
+
+func TestKeyAttestationStore_DeleteIfUnchanged(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	kas := store.KeyAttestations()
+
+	first := &domain.KeyAttestationRecord{KeyThumbprint: "thumb-mongo-del", VerifiedAt: time.Now().UTC()}
+	require.NoError(t, kas.MarkKeyAttested(ctx, first))
+	stale := first.WriteToken
+	second := &domain.KeyAttestationRecord{KeyThumbprint: "thumb-mongo-del", VerifiedAt: time.Now().UTC()}
+	require.NoError(t, kas.MarkKeyAttested(ctx, second))
+
+	require.ErrorIs(t, kas.DeleteIfUnchanged(ctx, "thumb-mongo-del", stale), storage.ErrNotFound)
+	require.NoError(t, kas.DeleteIfUnchanged(ctx, "thumb-mongo-del", second.WriteToken))
+	_, err := kas.GetByKeyThumbprint(ctx, "thumb-mongo-del")
+	require.ErrorIs(t, err, storage.ErrNotFound)
+}
