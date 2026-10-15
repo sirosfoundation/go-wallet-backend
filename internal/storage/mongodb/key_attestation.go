@@ -2,6 +2,7 @@ package mongodb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -32,9 +33,19 @@ func (s *KeyAttestationStore) MarkKeyAttested(ctx context.Context, rec *domain.K
 			"created_at": rec.CreatedAt,
 		},
 	}
-	opts := options.Update().SetUpsert(true)
-	_, err := s.collection.UpdateOne(ctx, filter, update, opts)
-	if err != nil {
+	// The pre-image comes from the same atomic operation, so it is exactly the
+	// evidence this write replaced.
+	opts := options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.Before)
+	var prev domain.KeyAttestationRecord
+	err := s.collection.FindOneAndUpdate(ctx, filter, update, opts).Decode(&prev)
+	switch {
+	case err == nil:
+		prev.Previous = nil
+		rec.Previous = &prev
+		rec.CreatedAt = prev.CreatedAt
+	case errors.Is(err, mongo.ErrNoDocuments):
+		rec.Previous = nil
+	default:
 		return fmt.Errorf("%w: mark key attested: %v", storage.ErrDatabase, err)
 	}
 	return nil
@@ -50,6 +61,26 @@ func (s *KeyAttestationStore) GetByKeyThumbprint(ctx context.Context, thumbprint
 		return nil, fmt.Errorf("%w: get key attestation: %v", storage.ErrDatabase, err)
 	}
 	return &rec, nil
+}
+
+// RestoreIfUnchanged is one atomic filtered ReplaceOne on the thumbprint and the
+// write token of the write being undone.
+func (s *KeyAttestationStore) RestoreIfUnchanged(ctx context.Context, written, previous *domain.KeyAttestationRecord) error {
+	if written.WriteToken == "" || previous == nil {
+		return storage.ErrNotFound
+	}
+	restored := *previous
+	restored.KeyThumbprint = written.KeyThumbprint
+	restored.Previous = nil
+	restored.WriteToken = storage.NewWriteToken() // a restore is itself a new write
+	result, err := s.collection.ReplaceOne(ctx, bson.M{"_id": written.KeyThumbprint, "write_token": written.WriteToken}, &restored)
+	if err != nil {
+		return fmt.Errorf("%w: restore key attestation: %v", storage.ErrDatabase, err)
+	}
+	if result.MatchedCount == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
 }
 
 // DeleteIfUnchanged is one atomic filtered DeleteOne on the write token.

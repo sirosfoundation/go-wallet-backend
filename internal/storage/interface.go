@@ -451,12 +451,17 @@ type KeyAttestationStore interface {
 	// MarkKeyAttested durably records that a real FIDO2/CTAP2 attestation
 	// object was verified for the credential key identified by
 	// rec.KeyThumbprint.
-	// It sets rec.WriteToken to a fresh value.
+	// It sets rec.WriteToken to a fresh value and rec.Previous to the evidence it
+	// replaced (nil if there was none).
 	MarkKeyAttested(ctx context.Context, rec *domain.KeyAttestationRecord) error
 
 	// DeleteIfUnchanged deletes the record for thumbprint only if its
 	// WriteToken is unchanged; ErrNotFound otherwise. A compensating rollback.
 	DeleteIfUnchanged(ctx context.Context, thumbprint, writeToken string) error
+
+	// RestoreIfUnchanged replaces the record (matched by thumbprint and
+	// written.WriteToken) with previous; ErrNotFound if gone or rewritten.
+	RestoreIfUnchanged(ctx context.Context, written, previous *domain.KeyAttestationRecord) error
 
 	// GetByKeyThumbprint retrieves a key attestation record by its JWK
 	// Thumbprint. Returns ErrNotFound if no evidence is on file for that key.

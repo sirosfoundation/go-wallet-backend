@@ -110,3 +110,39 @@ func TestKeyAttestationStore_DeleteIfUnchanged(t *testing.T) {
 		t.Fatalf("record must be gone, got %v", err)
 	}
 }
+
+func TestKeyAttestationStore_RestoreIfUnchanged(t *testing.T) {
+	ctx := context.Background()
+	kas := NewStore().KeyAttestations()
+
+	first := &domain.KeyAttestationRecord{KeyThumbprint: "t", AAGUID: "old", VerifiedAt: time.Now().UTC()}
+	if err := kas.MarkKeyAttested(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if first.Previous != nil {
+		t.Fatal("a first insert has no previous evidence")
+	}
+	second := &domain.KeyAttestationRecord{KeyThumbprint: "t", AAGUID: "new", VerifiedAt: time.Now().UTC()}
+	if err := kas.MarkKeyAttested(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	if second.Previous == nil || second.Previous.AAGUID != "old" {
+		t.Fatalf("Previous = %+v, want the replaced record", second.Previous)
+	}
+	written := *second
+
+	stale := *first
+	if err := kas.RestoreIfUnchanged(ctx, &stale, second.Previous); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("a superseded write must not restore, got %v", err)
+	}
+	if err := kas.RestoreIfUnchanged(ctx, &written, second.Previous); err != nil {
+		t.Fatal(err)
+	}
+	got, err := kas.GetByKeyThumbprint(ctx, "t")
+	if err != nil || got.AAGUID != "old" || !got.CreatedAt.Equal(first.CreatedAt) {
+		t.Fatalf("restored = %+v, %v", got, err)
+	}
+	if err := kas.RestoreIfUnchanged(ctx, &written, second.Previous); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("a restore is itself a new write; replay must not match, got %v", err)
+	}
+}

@@ -286,6 +286,13 @@ func (h *AdminHandlers) RevokeAllWalletInstancesForUser(c *gin.Context) {
 			c.JSON(http.StatusConflict, gin.H{"error": errCodeErasureIncomplete, "revoked": n, "message": errMsgErasureIncomplete})
 			return
 		}
+		if errors.Is(err, domain.ErrInvalidStatusTransition) {
+			// Nothing was revoked: a record with an unrecognized or already-final
+			// status needs repair before a retry can succeed.
+			h.logger.Error("wallet instance cannot be revoked in its current status", zap.Error(err))
+			c.JSON(http.StatusConflict, gin.H{"error": errMsgInvalidStatusTransition, "revoked": n})
+			return
+		}
 		h.logger.Error("failed to revoke wallet instances", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke wallet instances"})
 		return
