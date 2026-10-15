@@ -412,6 +412,9 @@ func (c *Config) RegistryLegacyAudienceIndependent() bool {
 }
 
 func (c *Config) validateRegistryStandaloneServer() error {
+	if err := c.validateTokenBlacklistBackend(); err != nil {
+		return err
+	}
 	port := c.Server.RegistryPort
 	if port == 0 {
 		port = 8097
@@ -458,18 +461,29 @@ func (c *Config) validateStandaloneLegacyAudience() error {
 }
 
 // loadRegistrySecrets loads only the secret files the registry role can use:
-// jwt.secret_path, and only while legacy HMAC validation is enabled. Secret
-// paths of backend-only features (admin token, wallet-provider PKCS#11 and
-// attestation keys, MongoDB password) are not read, so a registry-only
-// process does not need them mounted.
+// jwt.secret_path, and only while legacy HMAC validation is enabled, and the
+// MongoDB password, and only while the shared revocation store is in use.
+// Secret paths of backend-only features (admin token, wallet-provider PKCS#11
+// and attestation keys) are not read, so a registry-only process does not
+// need them mounted.
 func (c *Config) loadRegistrySecrets() error {
-	if c.JWT.SecretPath == "" || !c.AS.Legacy.Enabled {
-		return nil
+	if c.JWT.SecretPath != "" && c.AS.Legacy.Enabled {
+		secret, err := readSecretFile(c.JWT.SecretPath)
+		if err != nil {
+			return fmt.Errorf("jwt.secret_path: %w", err)
+		}
+		c.JWT.Secret = secret
 	}
-	secret, err := readSecretFile(c.JWT.SecretPath)
-	if err != nil {
-		return fmt.Errorf("jwt.secret_path: %w", err)
+	if c.UsesSharedRevocationStore() {
+		return c.loadMongoPassword()
 	}
-	c.JWT.Secret = secret
 	return nil
+}
+
+// UsesSharedRevocationStore reports whether token revocations are kept in the
+// MongoDB storage backend (see TokenBlacklistConfig.Backend).
+func (c *Config) UsesSharedRevocationStore() bool {
+	bl := c.Security.TokenBlacklist
+	return bl.Enabled && (bl.Backend == TokenBlacklistBackendStorage ||
+		(bl.Backend == "" && c.Storage.Type == "mongodb"))
 }

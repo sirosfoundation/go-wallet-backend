@@ -47,6 +47,7 @@ type AuthProvider struct {
 
 // NewAuthProvider creates a new auth route provider
 func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logger, roles []string) *AuthProvider {
+	warnProcessLocalState(cfg, logger, true)
 	services := service.NewServices(store, cfg, logger)
 	services.Start()
 	handlers := api.NewHandlers(services, cfg, logger, roles)
@@ -1121,6 +1122,7 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 		return nil, fmt.Errorf("create backend: %w", err)
 	}
 
+	warnProcessLocalState(cfg, logger, false)
 	services := service.NewServices(store, cfg, logger)
 	// HasSigningKey (not IsSupported): a cert-less signing key is a valid
 	// standalone deployment when only "ietf"-mode WIA is needed. Key

@@ -229,6 +229,25 @@ func main() {
 		resources = append(resources, backendProvider)
 	}
 
+	// Engine and registry processes without the backend role have no storage
+	// of their own: give them the shared revocation store so they reject what
+	// the backend replicas revoked.
+	var sharedBlacklist *server.SharedBlacklist
+	if backendProvider == nil && (roles.Has(modes.RoleEngine) || roles.Has(modes.RoleRegistry)) {
+		revCfg := backendCfg
+		if revCfg == nil {
+			revCfg = registryCfg
+		}
+		var err error
+		sharedBlacklist, err = server.NewSharedBlacklist(context.Background(), revCfg, logger)
+		if err != nil {
+			logger.Fatal("Failed to set up the shared token revocation store", zap.Error(err))
+		}
+		if sharedBlacklist != nil {
+			resources = append(resources, sharedBlacklist)
+		}
+	}
+
 	var registryProvider *server.RegistryProvider
 	if roles.Has(modes.RoleRegistry) {
 		provider, err := server.NewRegistryProvider(registryCfg, logger)
@@ -242,6 +261,8 @@ func main() {
 		if backendProvider != nil {
 			provider.SetTenantLookup(backendProvider.Store().Tenants())
 			provider.SetTokenBlacklist(backendProvider.Services().TokenBlacklist)
+		} else if sharedBlacklist != nil {
+			provider.SetTokenBlacklist(sharedBlacklist)
 		}
 		registryProvider = provider
 		mgr.AddProvider(provider)
@@ -288,6 +309,8 @@ func main() {
 		// legacy HMAC paths - see EngineProvider.SetTokenBlacklist.
 		if backendProvider != nil {
 			provider.SetTokenBlacklist(backendProvider.Services().TokenBlacklist)
+		} else if sharedBlacklist != nil {
+			provider.SetTokenBlacklist(sharedBlacklist)
 		}
 		mgr.AddProvider(provider)
 		engineProvider = provider
