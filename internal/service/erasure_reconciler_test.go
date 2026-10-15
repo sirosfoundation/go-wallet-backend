@@ -156,6 +156,20 @@ func TestReconcileUser_GraceFollowsTheLatestRevocation(t *testing.T) {
 	assert.Equal(t, ReconcileGrace, out, "the first revocation is old enough, the second is not")
 }
 
+// A revocation with no recorded time is the most recent as far as the grace
+// period goes: it is not aged by another instance's older revocation.
+func TestReconcileUser_UnrecordedRevocationTimeStaysInGrace(t *testing.T) {
+	svc, store, userID, holder := twoTenantFixture(t)
+	ctx := context.Background()
+	revokeSilently(t, store, userID)
+	seedRawInstance(t, store, tenantA, "inst-untimed", userID, "", domain.InstanceStatusRevoked)
+
+	out, err := svc.ReconcileUser(ctx, userID, inTheFuture())
+	require.NoError(t, err)
+	assert.Equal(t, ReconcileGrace, out)
+	assert.Equal(t, 2, holderDataCount(t, store, tenantA, holder))
+}
+
 // A user with nothing left to erase is not cascaded again (no session drop, no
 // cut-off churn on every pass).
 func TestReconcileUser_ErasedUserIsLeftAlone(t *testing.T) {

@@ -103,11 +103,23 @@ func (s *WalletLifecycleService) reconcileCandidate(ctx context.Context, userID 
 	if len(revoked) == 0 {
 		return nil, ReconcileClean, nil
 	}
-	latest := latestRevoked(revoked)
+	latest := latestForGrace(revoked)
 	if latest.DeactivatedAt == nil || latest.DeactivatedAt.After(revokedBefore) {
 		return nil, ReconcileGrace, nil
 	}
 	return latest, "", nil
+}
+
+// latestForGrace picks the instance whose revocation time bounds the grace
+// period. One without a recorded time counts as the most recent, so it is
+// never aged by an older revocation (the caller then treats it as in grace).
+func latestForGrace(revoked []*domain.WalletInstance) *domain.WalletInstance {
+	for _, inst := range revoked {
+		if inst.DeactivatedAt == nil {
+			return inst
+		}
+	}
+	return latestRevoked(revoked)
 }
 
 // leftoverData lists the categories of wallet data the user still has in any
