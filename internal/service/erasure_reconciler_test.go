@@ -682,3 +682,19 @@ func TestErasureReconciler_UserInterruptedMidCascadeIsRetriedFirst(t *testing.T)
 	assert.Equal(t, 3, st.Scanned, "the interrupted user is examined again, first")
 	assert.Equal(t, 3, countErased(t, store, ids))
 }
+
+// When the user count is an exact multiple of the batch, the run after the
+// last full page wraps and examines users in the same run.
+func TestErasureReconciler_ExactSizeFinalPageWrapsWithoutAWastedRun(t *testing.T) {
+	store := memory.NewStore()
+	seedRevokedUsers(t, store, 4)
+	r := reconcilerFor(store, 2)
+	for i := 0; i < 2; i++ {
+		st, err := r.RunOnce(context.Background())
+		require.NoError(t, err)
+		assert.Equal(t, 2, st.Scanned)
+	}
+	st, err := r.RunOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 2, st.Scanned, "the empty tail wraps within the run")
+}

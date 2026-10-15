@@ -176,6 +176,13 @@ func (r *ErasureReconciler) RunOnce(ctx context.Context) (ReconcileStats, error)
 	if err != nil {
 		return stats, err
 	}
+	if len(ids) == 0 && r.cursor != (domain.UserID{}) {
+		// The previous run ended exactly at the end of the list: wrap now.
+		r.cursor = domain.UserID{}
+		if ids, err = r.store.WalletInstances().ListUsersWithRevokedInstances(ctx, r.cursor, r.batch); err != nil {
+			return stats, err
+		}
+	}
 	revokedBefore := r.now().Add(-r.grace)
 	for _, id := range ids {
 		if ctx.Err() != nil {
