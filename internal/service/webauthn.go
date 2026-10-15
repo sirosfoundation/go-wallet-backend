@@ -2142,6 +2142,9 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 		},
 		Nickname:  &nickname,
 		CreatedAt: now,
+		// Enrolling needs no existing passkey, so a stolen bearer token could
+		// enrol one; it must not authorise a step-up straight away.
+		StepUpEligibleAt: now.Add(AddedPasskeyStepUpDelay),
 	}
 
 	user.WebauthnCredentials = append(user.WebauthnCredentials, newCred)

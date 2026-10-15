@@ -27,6 +27,24 @@ const DeleteAccountChallengeTTL = 120 * time.Second
 // a late assertion is answered as expired rather than unknown.
 const deleteAccountChallengeGrace = 10 * time.Minute
 
+// AddedPasskeyStepUpDelay is how long a passkey added to an existing account
+// waits before it can authorise a step-up, giving the owner time to notice a
+// passkey enrolled with a stolen bearer token.
+const AddedPasskeyStepUpDelay = 24 * time.Hour
+
+// withStepUpCredentials returns a copy of user holding only the passkeys that
+// may authorise a step-up now.
+func withStepUpCredentials(user *domain.User, now time.Time) *domain.User {
+	u := *user
+	u.WebauthnCredentials = nil
+	for i := range user.WebauthnCredentials {
+		if user.WebauthnCredentials[i].UsableForStepUp(now) {
+			u.WebauthnCredentials = append(u.WebauthnCredentials, user.WebauthnCredentials[i])
+		}
+	}
+	return &u
+}
+
 // ErrStepUpFailed refuses a step-up assertion that is missing, unknown,
 // already used, minted for someone or something else, or does not verify.
 var ErrStepUpFailed = errors.New("step-up assertion failed")
@@ -48,6 +66,7 @@ func (s *WebAuthnService) BeginDeleteAccountStepUp(ctx context.Context, userID d
 	if err := refuseIfCutOff(ctx, user); err != nil {
 		return nil, err
 	}
+	user = withStepUpCredentials(user, time.Now())
 	if len(user.WebauthnCredentials) == 0 {
 		return nil, ErrCredentialNotFound
 	}
@@ -138,6 +157,9 @@ func (s *WebAuthnService) VerifyDeleteAccountStepUp(ctx context.Context, userID 
 		return fmt.Errorf("failed to load user: %w", err)
 	}
 
+	// Only passkeys that may authorise a step-up are offered to the verifier.
+	eligible := withStepUpCredentials(user, time.Now())
+
 	parsed, err := protocol.ParseCredentialRequestResponseBody(newCredentialReader(credential))
 	if err != nil {
 		return ErrStepUpFailed
@@ -152,7 +174,7 @@ func (s *WebAuthnService) VerifyDeleteAccountStepUp(ctx context.Context, userID 
 		}
 		handle = h
 	}
-	waUser := &TenantWebAuthnUser{user: user, userHandle: handle}
+	waUser := &TenantWebAuthnUser{user: eligible, userHandle: handle}
 	creds := waUser.WebAuthnCredentials()
 	allowed := make([][]byte, 0, len(creds))
 	for _, c := range creds {

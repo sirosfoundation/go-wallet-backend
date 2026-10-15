@@ -269,3 +269,62 @@ func TestVerifyDeleteAccountStepUp_CloneWarningSurfaced(t *testing.T) {
 	stepUp(2)
 	assert.Len(t, observed.FilterMessage("possible cloned authenticator detected").All(), 1, "latched: no repeat")
 }
+
+// enrollPasskey adds a second passkey to u through the add-credential flow, as
+// a holder of only the bearer token could.
+func enrollPasskey(t *testing.T, setup *testVirtualWebAuthnSetup, u *stepUpUser) *stepUpUser {
+	t.Helper()
+	begin, err := setup.service.BeginAddCredential(setup.ctx, u.id)
+	require.NoError(t, err)
+	optsJSON, err := json.Marshal(begin.CreateOptions)
+	require.NoError(t, err)
+	opts, err := virtualwebauthn.ParseAttestationOptions(string(optsJSON))
+	require.NoError(t, err)
+	cred := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+	auth := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{UserHandle: u.id.AsUserHandle()})
+	resp := virtualwebauthn.CreateAttestationResponse(setup.rp, auth, cred, *opts)
+	_, err = setup.service.FinishAddCredential(setup.ctx, u.id, &FinishAddCredentialRequest{
+		ChallengeID: begin.ChallengeID, Credential: json.RawMessage(resp), Nickname: "added",
+	}, "")
+	require.NoError(t, err)
+	auth.AddCredential(cred)
+	return &stepUpUser{id: u.id, auth: auth, credential: cred}
+}
+
+// A passkey enrolled with only the bearer token cannot authorise the deletion
+// until it has aged; the account's original passkey still can.
+func TestStepUp_PasskeyAddedLaterCannotAuthoriseDeletionYet(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+	alice := registerStepUpUser(t, setup, "Alice")
+	attacker := enrollPasskey(t, setup, alice)
+
+	resp, err := setup.service.BeginDeleteAccountStepUp(setup.ctx, alice.id)
+	require.NoError(t, err)
+	require.Len(t, resp.PublicKey.AllowCredentials, 1, "the new passkey is not offered")
+
+	forged := attacker.assertFor(t, setup, resp)
+	err = setup.service.VerifyDeleteAccountStepUp(setup.ctx, alice.id, resp.ChallengeID, forged)
+	assert.ErrorIs(t, err, ErrStepUpFailed)
+
+	resp, err = setup.service.BeginDeleteAccountStepUp(setup.ctx, alice.id)
+	require.NoError(t, err)
+	require.NoError(t, setup.service.VerifyDeleteAccountStepUp(setup.ctx, alice.id, resp.ChallengeID, alice.assertFor(t, setup, resp)))
+}
+
+// Once the delay has passed the added passkey is accepted.
+func TestStepUp_PasskeyAddedLaterAcceptedAfterDelay(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+	alice := registerStepUpUser(t, setup, "Alice")
+	added := enrollPasskey(t, setup, alice)
+
+	user, err := setup.store.Users().GetByID(setup.ctx, alice.id)
+	require.NoError(t, err)
+	require.Len(t, user.WebauthnCredentials, 2)
+	user.WebauthnCredentials[1].StepUpEligibleAt = time.Now().Add(-time.Second)
+	require.NoError(t, setup.store.Users().Update(setup.ctx, user))
+
+	resp, err := setup.service.BeginDeleteAccountStepUp(setup.ctx, alice.id)
+	require.NoError(t, err)
+	require.Len(t, resp.PublicKey.AllowCredentials, 2)
+	require.NoError(t, setup.service.VerifyDeleteAccountStepUp(setup.ctx, alice.id, resp.ChallengeID, added.assertFor(t, setup, resp)))
+}
