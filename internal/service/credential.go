@@ -8,6 +8,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -42,6 +43,10 @@ func (s *CredentialService) Store(ctx context.Context, tenantID domain.TenantID,
 		return nil, errors.New("format is required")
 	}
 
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return nil, err
+	}
+
 	credential := &domain.VerifiableCredential{
 		TenantID:                   tenantID,
 		HolderDID:                  req.HolderDID,
@@ -56,6 +61,21 @@ func (s *CredentialService) Store(ctx context.Context, tenantID domain.TenantID,
 
 	if err := s.store.Credentials().Create(ctx, credential); err != nil {
 		s.logger.Error("Failed to store credential", zap.Error(err))
+		return nil, err
+	}
+
+	// Storage-level fence: the admission check above cannot stop an erasure
+	// advancing the cut-off and sweeping between it and the Create, which would
+	// resurrect erased data. Re-read the cut-off now (tokengate.ConfirmWrite) and
+	// roll back if refused. The rollback is conditional on this record's id and
+	// write token, not the business key, so a recreated record is left alone;
+	// both are captured now because the memory store hands out the stored pointer.
+	createdID, createdToken := credential.ID, credential.WriteToken
+	if err := tokengate.ConfirmWrite(ctx, s.store.Users(), func(rctx context.Context) error {
+		return s.store.Credentials().DeleteIfUnchanged(rctx, tenantID, createdID, createdToken)
+	}); err != nil {
+		s.logger.Error("Credential write fenced out by a concurrent revocation", zap.Error(err),
+			zap.String("tenant_id", string(tenantID)), zap.Bool("left_behind", errors.Is(err, tokengate.ErrWriteNotRolledBack)))
 		return nil, err
 	}
 
@@ -125,12 +145,32 @@ func (s *CredentialService) Update(ctx context.Context, tenantID domain.TenantID
 		return nil, err
 	}
 
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return nil, err
+	}
+
+	// Copy for the fence's rollback, taken before the fields change.
+	previous := *credential
+
 	// Update fields
 	credential.InstanceID = req.InstanceID
 	credential.SigCount = req.SigCount
 
 	if err := s.store.Credentials().Update(ctx, credential); err != nil {
 		s.logger.Error("Failed to update credential", zap.Error(err))
+		return nil, err
+	}
+
+	// Storage-level fence, as in Store. An update cannot resurrect an erased
+	// record, but a revoked token must not change what it no longer may touch:
+	// restore the previous values, conditional on this update's write token so a
+	// recreated or re-updated record is not overwritten.
+	written := *credential
+	if err := tokengate.ConfirmWrite(ctx, s.store.Users(), func(rctx context.Context) error {
+		return s.store.Credentials().RestoreIfUnchanged(rctx, &written, &previous)
+	}); err != nil {
+		s.logger.Error("Credential update fenced out by a concurrent revocation", zap.Error(err),
+			zap.String("tenant_id", string(tenantID)), zap.Bool("not_restored", errors.Is(err, tokengate.ErrWriteNotRolledBack)))
 		return nil, err
 	}
 
@@ -149,6 +189,10 @@ func (s *CredentialService) Delete(ctx context.Context, tenantID domain.TenantID
 	}
 	if credentialIdentifier == "" {
 		return errors.New("credential_identifier is required")
+	}
+
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return err
 	}
 
 	if err := s.store.Credentials().Delete(ctx, tenantID, holderDID, credentialIdentifier); err != nil {

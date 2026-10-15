@@ -100,10 +100,11 @@ func (s *mongoWIAChallengeStore) Put(ctx context.Context, tenantID domain.Tenant
 	return true, nil
 }
 
-func (s *mongoWIAChallengeStore) Consume(ctx context.Context, challenge string) (bool, error) {
+func (s *mongoWIAChallengeStore) Consume(ctx context.Context, tenantID domain.TenantID, challenge string) (bool, error) {
 	// Atomically find and delete: guarantees single-use even across multiple pods.
 	result := s.collection.FindOneAndDelete(ctx, bson.M{
 		"_id":        challenge,
+		"tenant_id":  tenantID,
 		"expires_at": bson.M{"$gt": time.Now()},
 	})
 

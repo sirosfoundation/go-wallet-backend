@@ -33,6 +33,12 @@ type Session struct {
 	// CreatedAt is when the session was created.
 	CreatedAt time.Time `json:"created_at"`
 
+	// AuthenticatedAt is the issuance instant of the login's own token, which the
+	// SID-AUTH-06 cut-off was checked against. Without it a session created after a
+	// suspension that landed mid-login would look newer than the cut-off. Zero on
+	// older sessions; authInstant() falls back to CreatedAt.
+	AuthenticatedAt time.Time `json:"authenticated_at,omitempty"`
+
 	// ExpiresAt is when the session expires.
 	ExpiresAt time.Time `json:"expires_at"`
 
@@ -56,6 +62,15 @@ func (s *Session) IsExpired() bool {
 // IsValid returns true if the session is neither expired nor revoked.
 func (s *Session) IsValid() bool {
 	return !s.Revoked && !s.IsExpired()
+}
+
+// authInstant is the time the cut-off is compared against: when authentication
+// happened, not when the record was written.
+func (s *Session) authInstant() time.Time {
+	if !s.AuthenticatedAt.IsZero() {
+		return s.AuthenticatedAt
+	}
+	return s.CreatedAt
 }
 
 // SessionStore is the interface for session persistence.

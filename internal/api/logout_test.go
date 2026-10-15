@@ -459,7 +459,7 @@ func TestLogout_RealLegacyToken_EndToEnd_RPIDAudience(t *testing.T) {
 	})
 
 	router := gin.New()
-	router.Use(middleware.TokenAuthMiddleware(cfg, v, store.Tenants(), services.TokenBlacklist, logger))
+	router.Use(middleware.TokenAuthMiddleware(cfg, v, store.Tenants(), services.TokenBlacklist, store.Users(), logger))
 	router.Use(middleware.RequireAudience("wallet-backend"))
 	router.POST("/user/session/logout", handlers.Logout)
 	router.GET("/user/session/account-info", func(c *gin.Context) { c.Status(200) })
@@ -600,7 +600,7 @@ func TestLogout_FailedFamilyRevocation_RetryableThroughRealMiddleware(t *testing
 						Enabled: true, HMACSecret: []byte(cfg.JWT.Secret), Issuers: []string{cfg.JWT.Issuer},
 					},
 				})
-				router.Use(middleware.TokenAuthMiddleware(cfg, v, store.Tenants(), services.TokenBlacklist, logger))
+				router.Use(middleware.TokenAuthMiddleware(cfg, v, store.Tenants(), services.TokenBlacklist, store.Users(), logger))
 				router.Use(middleware.RequireAudience("wallet-backend"))
 			} else {
 				router.Use(middleware.AuthMiddlewareWithBlacklist(cfg, store, services.TokenBlacklist, logger))

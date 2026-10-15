@@ -90,6 +90,16 @@ or session cookie as appropriate for the route group.
 | POST | `/v1/evaluate` | `r` | **`aud`: `"wallet-registry"` or `"wallet-backend"`** - this is the intended anonymous-token call. |
 | POST | `/v1/resolve` | `r` | Same `aud` as `/v1/evaluate`. |
 
+**Anonymous tokens are for registry lookups only.** A token that names no
+user (the AS `anonymous` shape above, or a legacy token with an empty
+`user_id`) is accepted on `/v1/evaluate` and `/v1/resolve`, on the registry
+routes and on `vctm` engine flows, and refused with `403` (`anonymous tokens
+are not accepted on this route`) on every route in this table above them:
+account, issuer/verifier configuration, proxy, keystore, wallet-provider
+(key attestation, WIA, FIDO2) and credential storage. Such a token has no user
+for the lifecycle token gate to judge, so accepting it there would leave it
+usable after a revocation or an account deletion.
+
 Public, unauthenticated routes (registration, login, tenant config,
 `/helper/auth-check`) aren't listed - they need no token at all. Admin
 routes (`/admin/*`) aren't listed either - they use a separate static-secret
@@ -110,9 +120,10 @@ dispatches a `FlowStartMessage` gets the same enforcement automatically.
 (`wss://{backend}/api/v2/wallet`, see `docs/websocket-protocol-spec.md` for
 the full message format). Connecting (`{"type": "handshake", "app_token":
 "<token>"}`) requires `aud: "wallet-registry"` or `aud: "wallet-backend"` -
-the same as `/v1/evaluate`/`/v1/resolve`. This is exactly the anonymous-token
-use case: most wallet clients connect with an anonymous, identity-free
-token here.
+the same as `/v1/evaluate`/`/v1/resolve`. An anonymous (identity-free)
+token may connect, but it is only good for metadata lookups (`vctm` flows):
+starting an `oid4vp` or `oid4vci` flow needs a token that names a user, and
+an anonymous session is refused for them with `FORBIDDEN`.
 
 **Per flow**, once connected, starting a flow additionally requires a
 specific `tac` depending on which protocol you're starting - checked
@@ -123,9 +134,9 @@ against the same token's `tac`, not re-requested:
 | `oid4vp` | Presenting an existing credential | `r` |
 | `oid4vci` | Receiving a new credential | `i` |
 
-A token requested with only `tac: "r"` (the anonymous default) can present
-credentials but cannot receive new ones - request `tac: "ri"` (or broader)
-if your client needs to do both over the same connection.
+A token requested with only `tac: "r"` can present credentials but cannot
+receive new ones - request `tac: "ri"` (or broader) if your client needs to do
+both over the same connection. Both need a token that names a user.
 
 WMP (an alternative wire protocol for the same engine transport) is
 tracked in a separate PR and will document its own connection details

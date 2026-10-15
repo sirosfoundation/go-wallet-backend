@@ -11,6 +11,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
@@ -89,7 +90,14 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 	resp, err := h.webauthn.FinishLogin(c.Request.Context(), &req)
 	if err != nil {
 		h.logger.Warn("passkey login finish failed", zap.Error(err))
+		// SID-AUTH-06: a revoked instance is a distinct, stable refusal so the client can
+		// tell the user. Code, scope and message come from service.LifecycleRefusalDetails
+		// (shared with the wallet API's login handler), so a deactivated wallet (scope
+		// "wallet", needs new enrollment) is not reported as an instance revocation.
 		switch {
+		case errors.Is(err, service.ErrWalletInstanceRevoked):
+			d := service.LifecycleRefusalDetails(err)
+			c.JSON(http.StatusForbidden, gin.H{"error": d.Code, "scope": d.Scope, "message": d.Message})
 		case errors.Is(err, service.ErrChallengeNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"error": "challenge not found"})
 		case errors.Is(err, service.ErrChallengeExpired):
@@ -123,15 +131,23 @@ func (h *PasskeyHandlers) LoginFinish(c *gin.Context) {
 	}
 
 	now := time.Now()
+	// The session inherits the login token's iat (what FinishLogin checked against
+	// the cut-off) rather than "now", so a revocation between that check and here is
+	// not outrun by a fresh timestamp.
+	authenticatedAt := tokengate.IssuedAt(resp.Token)
+	if authenticatedAt.IsZero() {
+		authenticatedAt = now
+	}
 	session := &Session{
-		JTI:       sessionID,
-		UserID:    resp.UUID,
-		DID:       "", // DID is not in FinishLoginResponse; populated if needed.
-		TenantID:  resp.TenantID,
-		ACR:       "urn:siros:acr:passkey",
-		MaxTAC:    TAC(h.cfg.DefaultMaxTAC),
-		CreatedAt: now,
-		ExpiresAt: now.Add(h.cfg.SessionTTL),
+		JTI:             sessionID,
+		UserID:          resp.UUID,
+		DID:             "", // DID is not in FinishLoginResponse; populated if needed.
+		TenantID:        resp.TenantID,
+		ACR:             "urn:siros:acr:passkey",
+		MaxTAC:          TAC(h.cfg.DefaultMaxTAC),
+		CreatedAt:       now,
+		AuthenticatedAt: authenticatedAt,
+		ExpiresAt:       now.Add(h.cfg.SessionTTL),
 	}
 
 	// Only legacy-mode clients receive the appToken/refresh token pair, so
@@ -315,14 +331,20 @@ func (h *PasskeyHandlers) RegisterFinish(c *gin.Context) {
 	}
 
 	now := time.Now()
+	// As for login: inherit the registration token's iat.
+	authenticatedAt := tokengate.IssuedAt(resp.Token)
+	if authenticatedAt.IsZero() {
+		authenticatedAt = now
+	}
 	session := &Session{
-		JTI:       sessionID,
-		UserID:    resp.UUID,
-		TenantID:  resp.TenantID,
-		ACR:       "urn:siros:acr:passkey",
-		MaxTAC:    TAC(h.cfg.DefaultMaxTAC),
-		CreatedAt: now,
-		ExpiresAt: now.Add(h.cfg.SessionTTL),
+		JTI:             sessionID,
+		UserID:          resp.UUID,
+		TenantID:        resp.TenantID,
+		ACR:             "urn:siros:acr:passkey",
+		MaxTAC:          TAC(h.cfg.DefaultMaxTAC),
+		CreatedAt:       now,
+		AuthenticatedAt: authenticatedAt,
+		ExpiresAt:       now.Add(h.cfg.SessionTTL),
 	}
 
 	if err := h.sessions.Create(c.Request.Context(), session); err != nil {

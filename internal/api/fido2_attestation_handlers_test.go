@@ -255,7 +255,7 @@ func TestFIDO2AttestationRegister_Success(t *testing.T) {
 	// Seed the wallet instance the attestation will be recorded against,
 	// then wire handlers to a service backed by that same store.
 	store := memory.NewStore()
-	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{ID: instanceID}); err != nil {
+	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{ID: instanceID, TenantID: domain.DefaultTenantID, Status: domain.InstanceStatusActive}); err != nil {
 		t.Fatalf("seed instance: %v", err)
 	}
 	cfg := &config.Config{}
@@ -306,5 +306,61 @@ func TestFIDO2AttestationRegister_Success(t *testing.T) {
 	}
 	if rec.WalletInstanceID != instanceID {
 		t.Errorf("rec.WalletInstanceID = %q, want %q", rec.WalletInstanceID, instanceID)
+	}
+}
+
+// A foreign or revoked instance is refused by the handler: 403 and 401, and no
+// evidence is recorded.
+func TestFIDO2AttestationRegister_RefusesForeignAndRevokedInstances(t *testing.T) {
+	for name, tc := range map[string]struct {
+		inst *domain.WalletInstance
+		want int
+	}{
+		"other tenant": {&domain.WalletInstance{ID: "i", TenantID: "other", Status: domain.InstanceStatusActive}, http.StatusForbidden},
+		"revoked":      {&domain.WalletInstance{ID: "i", TenantID: domain.DefaultTenantID, Status: domain.InstanceStatusRevoked}, http.StatusUnauthorized},
+		"unknown":      {nil, http.StatusForbidden},
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := memory.NewStore()
+			if tc.inst != nil {
+				if err := store.WalletInstances().Upsert(context.Background(), tc.inst); err != nil {
+					t.Fatalf("seed: %v", err)
+				}
+			}
+			cfg := &config.Config{}
+			cfg.WalletProvider.Attestation.FIDO2Attestation = config.FIDO2AttestationConfig{Enabled: true}
+			cfg.Trust.PDPURL = "http://pdp.invalid"
+			logger := zap.NewNop()
+			trustSvc := trust.NewService(cfg, logger, func(string, time.Duration) (trust.TrustEvaluator, error) {
+				return &stubFIDO2TrustEvaluator{decision: true}, nil
+			})
+			svc := service.NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), trustSvc, logger)
+			handlers := NewHandlers(&service.Services{FIDO2Attestation: svc}, cfg, logger, []string{"test"})
+			router := gin.New()
+			router.POST("/wallet-provider/fido2-attestation/register", handlers.FIDO2AttestationRegister)
+
+			hash := make([]byte, 32)
+			attObj, pub := buildFIDO2TestAttestationObject(t, uuid.New(), hash)
+			w := doFIDO2AttestationRequest(router, map[string]string{
+				"wallet_instance_id": "i",
+				"attestation_object": base64.RawURLEncoding.EncodeToString(attObj),
+				"client_data_hash":   base64.RawURLEncoding.EncodeToString(hash),
+			})
+			if w.Code != tc.want {
+				t.Errorf("status = %d, want %d; body = %s", w.Code, tc.want, w.Body.String())
+			}
+
+			thumbprint, err := jwk.Thumbprint(map[string]interface{}{
+				"kty": "EC", "crv": "P-256",
+				"x": base64.RawURLEncoding.EncodeToString(pub.X.FillBytes(make([]byte, 32))),
+				"y": base64.RawURLEncoding.EncodeToString(pub.Y.FillBytes(make([]byte, 32))),
+			})
+			if err != nil {
+				t.Fatalf("thumbprint: %v", err)
+			}
+			if _, gerr := store.KeyAttestations().GetByKeyThumbprint(context.Background(), thumbprint); gerr == nil {
+				t.Error("evidence was recorded for an instance the caller may not use")
+			}
+		})
 	}
 }

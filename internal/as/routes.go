@@ -12,6 +12,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
@@ -28,9 +29,12 @@ type ASModule struct {
 	// is never used to authenticate requests. Nil when no secret is set.
 	LogoutSIDParser *LegacyTokenIssuer
 	Sessions        SessionStore
-	Policy          PolicyEngine
-	PasskeyHandler  *PasskeyHandlers
-	OIDCHandler     *OIDCHandlers
+	// TokenGate refuses delegating tokens issued before the user's
+	// SID-AUTH-06 cut-off (see internal/tokengate); nil enforces nothing.
+	TokenGate      *tokengate.Gate
+	Policy         PolicyEngine
+	PasskeyHandler *PasskeyHandlers
+	OIDCHandler    *OIDCHandlers
 	// Blacklist checks whether a token has been revoked (via Logout/user
 	// deletion - see #382/#383). Used by the delegation-exchange path in
 	// TokenEndpointHandler so a revoked parent token can't be re-delegated
@@ -159,6 +163,7 @@ func NewASModule(
 		LegacyIssuer:    legacyIssuer,
 		LogoutSIDParser: logoutSIDParser,
 		Sessions:        sessions,
+		TokenGate:       tokengate.New(store.Users()),
 		Policy:          policy,
 		PasskeyHandler:  passkeyHandler,
 		OIDCHandler:     oidcHandler,
@@ -235,6 +240,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 		TTLFunc:         func(aud string) time.Duration { return m.Config.GetTokenTTL(aud) },
 		Audiences:       m.Config.Audiences,
 		Blacklist:       m.Blacklist,
+		Gate:            m.TokenGate,
 		InsecureCookies: m.Config.InsecureCookies,
 		Logger:          m.Logger,
 	})
