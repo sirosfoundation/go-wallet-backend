@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"strings"
@@ -823,10 +824,8 @@ func checkAddressesFor(host string, ips []net.IP, trusted map[string]struct{}) e
 		return fmt.Errorf("no addresses found for %s", host)
 	}
 	for _, ip := range ips {
-		// Block cloud metadata endpoints (169.254.169.254, fd00::1)
-		// before the generic private/link-local check for a clearer message.
-		if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00::1")) ||
-			ip.Equal(net.ParseIP("100.100.100.200")) {
+		// Block cloud metadata endpoints before the generic private/link-local check for a clearer message.
+		if isMetadataAddr(ip) {
 			return fmt.Errorf("connection to cloud metadata endpoint %s (%s) is not allowed", host, ip)
 		}
 		if !isTrusted && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || inInternalRange(ip)) {
@@ -843,26 +842,66 @@ func checkAddressesFor(host string, ips []net.IP, trusted map[string]struct{}) e
 	return nil
 }
 
-// internalRanges are non-global blocks that net.IP's predicates do not cover
-// but that reach a deployment's own network: shared address space (CGNAT, also
-// used by overlay VPNs and Alibaba's metadata service), IETF protocol
-// assignments (Oracle's metadata service), benchmarking space, and the NAT64
-// prefixes, whose embedded IPv4 address a gateway would connect to.
-var internalRanges = func() []*net.IPNet {
-	var out []*net.IPNet
-	for _, c := range []string{"100.64.0.0/10", "192.0.0.0/24", "198.18.0.0/15", "64:ff9b::/96", "64:ff9b:1::/48"} {
-		_, n, err := net.ParseCIDR(c)
-		if err != nil {
-			panic(err)
-		}
-		out = append(out, n)
+// v4 and v6 build addresses from numeric components, so the policy tables
+// below read as data rather than as address literals.
+func v4(a, b, c, d byte) netip.Addr { return netip.AddrFrom4([4]byte{a, b, c, d}) }
+
+func v6(groups ...uint16) netip.Addr {
+	var raw [16]byte
+	for i, g := range groups {
+		raw[2*i], raw[2*i+1] = byte(g>>8), byte(g)
 	}
-	return out
-}()
+	return netip.AddrFrom16(raw)
+}
+
+// metadataAddrs are the cloud instance-metadata endpoints, named separately
+// from the generic ranges so the refusal says which rule was hit: the
+// link-local endpoint used by AWS, GCP, Azure and others; the IPv6 unique-local
+// endpoint used by AWS; and Alibaba Cloud's endpoint in shared address space.
+var metadataAddrs = []netip.Addr{
+	v4(169, 254, 169, 254),
+	v6(0xfd00, 0, 0, 0, 0, 0, 0, 1),
+	v4(100, 100, 100, 200),
+}
+
+func isMetadataAddr(ip net.IP) bool {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, m := range metadataAddrs {
+		if addr == m {
+			return true
+		}
+	}
+	return false
+}
+
+// internalRanges are non-global blocks that net.IP's predicates do not cover
+// but that reach a deployment's own network:
+//   - shared address space (RFC 6598, CGNAT), also used by overlay VPNs and
+//     Alibaba's metadata service
+//   - IETF protocol assignments (RFC 6890), which hold Oracle's metadata service
+//   - benchmarking space (RFC 2544)
+//   - the NAT64 well-known prefix (RFC 6052) and local-use prefix (RFC 8215),
+//     whose embedded IPv4 address a gateway would connect to
+var internalRanges = []netip.Prefix{
+	netip.PrefixFrom(v4(100, 64, 0, 0), 10),
+	netip.PrefixFrom(v4(192, 0, 0, 0), 24),
+	netip.PrefixFrom(v4(198, 18, 0, 0), 15),
+	netip.PrefixFrom(v6(0x64, 0xff9b), 96),
+	netip.PrefixFrom(v6(0x64, 0xff9b, 1), 48),
+}
 
 func inInternalRange(ip net.IP) bool {
-	for _, n := range internalRanges {
-		if n.Contains(ip) {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, p := range internalRanges {
+		if p.Contains(addr) {
 			return true
 		}
 	}

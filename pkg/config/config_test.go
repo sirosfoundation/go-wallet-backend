@@ -2247,6 +2247,8 @@ func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
 		{"oracle metadata", "192.0.0.192", "private/loopback"},
 		{"benchmarking", "198.19.1.1", "private/loopback"},
 		{"nat64", "64:ff9b::7f00:1", "private/loopback"},
+		{"nat64 local-use", "64:ff9b:1::1", "private/loopback"},
+		{"v4-mapped metadata", "::ffff:169.254.169.254", "cloud metadata"},
 		{"cloud metadata", "169.254.169.254", "cloud metadata"},
 		{"cloud metadata ipv6", "fd00::1", "cloud metadata"},
 		{"unspecified", "0.0.0.0", "unspecified"},
