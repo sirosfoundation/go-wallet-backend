@@ -620,3 +620,38 @@ func TestDeleteWalletInstance_LiveUserOwnedIsRefused(t *testing.T) {
 		t.Fatalf("the live instance must be untouched: %v %+v", err, got)
 	}
 }
+
+// An unrecognized status on the first instance is a conflict the operator can
+// act on, not a server error; an earlier revocation in the sweep still reports
+// the incomplete cascade.
+func TestRevokeAllWalletInstancesForUser_UnknownStatusIsAConflict(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
+	h.SetLifecycle(service.NewWalletLifecycleService(store, zap.NewNop(), nil))
+	router := gin.New()
+	router.POST("/admin/tenants/:id/users/:user_id/instances/revoke-all", h.RevokeAllWalletInstancesForUser)
+
+	userID := domain.NewUserID()
+	ctx := context.Background()
+	if err := store.Users().Create(ctx, &domain.User{UUID: userID, DID: "did:example:unknown"}); err != nil {
+		t.Fatalf("create user: %v", err)
+	}
+	if err := store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-corrupt", TenantID: "acme", UserID: &userID, Status: domain.InstanceStatus("corrupted"),
+	}); err != nil {
+		t.Fatalf("seed instance: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants/acme/users/"+userID.String()+"/instances/revoke-all", nil)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d: %s", w.Code, w.Body.String())
+	}
+	got, err := store.WalletInstances().GetByID(ctx, "inst-corrupt")
+	if err != nil || got.Status != domain.InstanceStatus("corrupted") {
+		t.Fatalf("the record must be left as found: %+v, %v", got, err)
+	}
+}
