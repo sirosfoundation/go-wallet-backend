@@ -222,9 +222,14 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 		return fmt.Errorf("record key attestation: %w", err)
 	}
 	// A cut-off during the write fails the request closed. The erasure cascade
-	// does not cover this record, so roll it back, conditionally on this write.
+	// does not cover this record, so undo it, conditionally on this write: delete
+	// a new record, restore the evidence an overwrite replaced.
+	written := *rec
 	if err := tokengate.ConfirmWrite(ctx, s.users, func(rctx context.Context) error {
-		return s.keyAttestations.DeleteIfUnchanged(rctx, rec.KeyThumbprint, rec.WriteToken)
+		if written.Previous != nil {
+			return s.keyAttestations.RestoreIfUnchanged(rctx, &written, written.Previous)
+		}
+		return s.keyAttestations.DeleteIfUnchanged(rctx, written.KeyThumbprint, written.WriteToken)
 	}); err != nil {
 		return err
 	}

@@ -38,6 +38,10 @@ type KeyAttestationRecord struct {
 	// value set by MarkKeyAttested, for a conditional rollback.
 	WriteToken string `json:"-" bson:"write_token,omitempty"`
 
+	// Previous is the record MarkKeyAttested overwrote (nil on first insert),
+	// kept so a rollback can restore it. Never persisted.
+	Previous *KeyAttestationRecord `json:"-" bson:"-"`
+
 	// CreatedAt is when this record was first stored.
 	CreatedAt time.Time `json:"created_at" bson:"created_at"`
 }
