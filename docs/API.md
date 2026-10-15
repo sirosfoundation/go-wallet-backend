@@ -490,8 +490,9 @@ maximum TAC `rwl` is enough.
 ```
 `allowCredentials` lists only the caller's own passkeys; any one of them may
 sign. The challenge is bound to the caller and to this action, expires after
-120 seconds and is single use (it is consumed by the first `DELETE` that
-presents it, whatever the outcome). `400 NO_PASSKEY` when the account has no
+120 seconds and is single use: the first `DELETE` that presents it consumes
+it, whatever the outcome, except that a `confirm` other than `DELETE` is
+refused before the challenge is touched. `400 NO_PASSKEY` when the account has no
 passkey (an OIDC-only account cannot confirm this way yet); `401` when
 unauthenticated; `404` when the user no longer exists.
 
