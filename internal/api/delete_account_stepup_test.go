@@ -279,7 +279,7 @@ func TestDeleteAccount_StepUp_Errors(t *testing.T) {
 		b := e.begin(u.id)
 		ch, err := e.mem.Challenges().GetByID(context.Background(), b.ChallengeID)
 		require.NoError(t, err)
-		ch.ExpiresAt = time.Now().Add(-time.Second)
+		ch.ValidUntil = time.Now().Add(-time.Second)
 
 		w := e.do(http.MethodDelete, "/user/session", u.id.String(), stepUpBody(b.ChallengeID, e.sign(u, b), "DELETE"))
 		assert.Equal(t, http.StatusGone, w.Code)

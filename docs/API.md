@@ -525,7 +525,7 @@ after `409` needs a fresh `delete-begin` and assertion.
 | 401 | `STEP_UP_REQUIRED` | no body, and `user.delete.require_step_up` is on |
 | 401 | `STEP_UP_FAILED` | challenge unknown, already used, minted for someone or something else, or the assertion did not verify; the body was malformed |
 | 400 | `STEP_UP_FAILED` | the body is over 1 MiB or could not be read |
-| 410 | `STEP_UP_EXPIRED` | the challenge is older than 120 seconds |
+| 410 | `STEP_UP_EXPIRED` | the challenge is older than 120 seconds, and less than 10 minutes old (an older one is deleted and reads as `STEP_UP_FAILED`) |
 | 400 | `CONFIRMATION_REQUIRED` | `confirm` is not `DELETE`; the assertion is not consumed, so the request can be sent again |
 
 A request with a body is authorised by its assertion alone: it does not need

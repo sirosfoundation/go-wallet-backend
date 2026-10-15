@@ -75,7 +75,8 @@ func TestBeginDeleteAccountStepUp_ChallengeShape(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, ChallengeActionDeleteAccount, ch.Action)
 	assert.Equal(t, alice.id.String(), ch.UserID)
-	assert.WithinDuration(t, time.Now().Add(DeleteAccountChallengeTTL), ch.ExpiresAt, 5*time.Second)
+	assert.WithinDuration(t, time.Now().Add(DeleteAccountChallengeTTL), ch.ValidUntil, 5*time.Second)
+	assert.Equal(t, deleteAccountChallengeGrace, ch.ExpiresAt.Sub(ch.ValidUntil), "kept past its validity")
 }
 
 func TestBeginDeleteAccountStepUp_NoPasskey(t *testing.T) {
@@ -169,10 +170,17 @@ func TestVerifyDeleteAccountStepUp_ExpiredChallenge(t *testing.T) {
 
 	ch, err := setup.store.Challenges().GetByID(setup.ctx, resp.ChallengeID)
 	require.NoError(t, err)
-	ch.ExpiresAt = time.Now().Add(-time.Second)
+	ch.ValidUntil = time.Now().Add(-time.Second)
+
+	// The cleanup worker leaves the challenge: it is only past its validity.
+	require.NoError(t, setup.store.Challenges().DeleteExpired(setup.ctx))
 
 	err = setup.service.VerifyDeleteAccountStepUp(setup.ctx, alice.id, resp.ChallengeID, assertion)
 	assert.ErrorIs(t, err, ErrChallengeExpired)
+
+	// An expired challenge is still consumed and never usable.
+	err = setup.service.VerifyDeleteAccountStepUp(setup.ctx, alice.id, resp.ChallengeID, assertion)
+	assert.ErrorIs(t, err, ErrStepUpFailed)
 }
 
 func TestVerifyDeleteAccountStepUp_ChallengeForOtherActionRefused(t *testing.T) {

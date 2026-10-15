@@ -23,6 +23,10 @@ const ChallengeActionDeleteAccount = "delete-account"
 // DeleteAccountChallengeTTL is how long a step-up assertion stays valid.
 const DeleteAccountChallengeTTL = 120 * time.Second
 
+// deleteAccountChallengeGrace is how long an expired challenge is kept so that
+// a late assertion is answered as expired rather than unknown.
+const deleteAccountChallengeGrace = 10 * time.Minute
+
 // ErrStepUpFailed refuses a step-up assertion that is missing, unknown,
 // already used, minted for someone or something else, or does not verify.
 var ErrStepUpFailed = errors.New("step-up assertion failed")
@@ -74,12 +78,14 @@ func (s *WebAuthnService) BeginDeleteAccountStepUp(ctx context.Context, userID d
 	}
 
 	challengeID := generateChallengeID()
+	validUntil := time.Now().Add(DeleteAccountChallengeTTL)
 	if err := s.store.Challenges().Create(ctx, &domain.WebauthnChallenge{
-		ID:        challengeID,
-		UserID:    userID.String(),
-		Challenge: session.Challenge,
-		Action:    ChallengeActionDeleteAccount,
-		ExpiresAt: time.Now().Add(DeleteAccountChallengeTTL),
+		ID:         challengeID,
+		UserID:     userID.String(),
+		Challenge:  session.Challenge,
+		Action:     ChallengeActionDeleteAccount,
+		ValidUntil: validUntil,
+		ExpiresAt:  validUntil.Add(deleteAccountChallengeGrace),
 	}); err != nil {
 		return nil, fmt.Errorf("failed to store challenge: %w", err)
 	}
