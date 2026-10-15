@@ -348,6 +348,13 @@ What is **not** guaranteed:
   no wallet instance at all in the tenant being logged into (a first enrollment,
   which the gate does not refuse) - and that write is not swept until the next
   erasure.
+- For lifecycle-revoked wallets, with the erasure reconciler enabled and
+  `dry_run` off (DEPLOYMENT.md, "Single-replica limits"), the reconciler later
+  erases what the two items above leave behind, once the grace period has
+  passed, so those residues are removed within about one reconciler pass; until
+  then they stay. It cannot do this for a deleted account: `DELETE /user`
+  removes the user record and instances it works from, so residue left after a
+  failed cleanup there (`DELETION_CLEANUP_PENDING`) has no such guarantee.
 - Delete and update-in-place operations are not fenced beyond the admission
   check: they cannot create data, so a late one removes or changes only
   something the erasure is removing anyway.

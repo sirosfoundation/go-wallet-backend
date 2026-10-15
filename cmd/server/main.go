@@ -323,6 +323,8 @@ func main() {
 		}
 		backendProvider.Services().User.SetSessionCleaner(cleaners)
 		backendProvider.Services().WalletLifecycle.SetSessionCleaner(cleaners)
+		// Only now can the reconciler's cascade drop sessions.
+		backendProvider.Services().StartReconciler()
 	}
 
 	// Admin-only mode: standalone admin API without backend auth/storage routes.

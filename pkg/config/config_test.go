@@ -3068,3 +3068,61 @@ func TestApplyASSecurityDefaults_JWTIssuerAndParity(t *testing.T) {
 		t.Errorf("AS disabled must not get audiences: %v", d.AS.Audiences)
 	}
 }
+
+func TestErasureReconcilerConfig(t *testing.T) {
+	def := defaultConfig().Lifecycle.Reconciler
+	if !def.Enabled || def.IntervalSeconds != 600 || def.GracePeriodSeconds != 900 || def.BatchSize != 50 {
+		t.Errorf("unexpected defaults: %+v", def)
+	}
+
+	cfgPath := filepath.Join(t.TempDir(), "c.yaml")
+	yaml := "server:\n  rp_id: localhost\n  rp_origin: http://localhost:8080\nstorage:\n  type: memory\njwt:\n  secret: test-secret-that-is-at-least-32-bytes!\nlifecycle:\n  reconciler:\n    enabled: false\n    batch_size: 7\n"
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := cfg.Lifecycle.Reconciler
+	if r.Enabled || r.BatchSize != 7 || r.IntervalSeconds != 600 {
+		t.Errorf("file did not override the defaults as expected: %+v", r)
+	}
+
+	var zero ErasureReconcilerConfig
+	zero.SetDefaults()
+	if zero.IntervalSeconds != 600 || zero.GracePeriodSeconds != 900 || zero.BatchSize != 50 {
+		t.Errorf("SetDefaults: %+v", zero)
+	}
+	neg := ErasureReconcilerConfig{IntervalSeconds: -1, GracePeriodSeconds: -1, BatchSize: -1}
+	neg.SetDefaults()
+	if neg != zero {
+		t.Errorf("non-positive values must fall back to defaults: %+v", neg)
+	}
+}
+
+func TestErasureReconcilerDryRunConfig(t *testing.T) {
+	if defaultConfig().Lifecycle.Reconciler.DryRun {
+		t.Error("dry_run must default to false")
+	}
+	cfgPath := filepath.Join(t.TempDir(), "c.yaml")
+	yaml := "server:\n  rp_id: localhost\n  rp_origin: http://localhost:8080\nstorage:\n  type: memory\njwt:\n  secret: test-secret-that-is-at-least-32-bytes!\n"
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Lifecycle.Reconciler.DryRun {
+		t.Error("dry_run must default to false after Load")
+	}
+	t.Setenv("WALLET_LIFECYCLE_RECONCILER_DRY_RUN", "true")
+	cfg, err = Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Lifecycle.Reconciler.DryRun || !cfg.Lifecycle.Reconciler.Enabled {
+		t.Errorf("env override: %+v", cfg.Lifecycle.Reconciler)
+	}
+}
