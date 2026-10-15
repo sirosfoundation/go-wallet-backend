@@ -109,6 +109,10 @@ func TestMongoRevocationStore_ExpiredDocumentStillPresent(t *testing.T) {
 	s, err := NewMongoRevocationStore(ctx, db)
 	require.NoError(t, err)
 
+	// Without the TTL index nothing can sweep the document before Has runs.
+	_, err = db.Collection(revokedTokensCollection).Indexes().DropAll(ctx)
+	require.NoError(t, err)
+
 	_, err = db.Collection(revokedTokensCollection).InsertOne(ctx,
 		bson.M{"_id": "expired", "expires_at": time.Now().Add(-time.Second)})
 	require.NoError(t, err)
