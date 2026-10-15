@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"sync"
 	"time"
@@ -226,20 +227,40 @@ end
 return 0
 `)
 
-// userSessionsAddScript records a session in the user's sorted set, scored by
-// expiry (unix ms), drops expired members and expires the set with its
-// longest-lived member, so a set cannot outlive the sessions it indexes.
-// Time comes from the Redis server so replicas with skewed clocks agree.
-// KEYS[1] = set, ARGV[1] = session TTL (ms), ARGV[2] = session ID.
-var userSessionsAddScript = redis.NewScript(`
+// userSessionAddLua records ARGV[idArg] in the sorted set KEYS[setKey], scored
+// by expiry (unix ms), drops expired members and expires the set with its
+// longest-lived member, so a set cannot outlive the sessions it indexes. Time
+// comes from the Redis server so replicas with skewed clocks agree.
+const userSessionAddLua = `
 local t = redis.call("TIME")
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
-redis.call("ZADD", KEYS[1], string.format("%.0f", now + tonumber(ARGV[1])), ARGV[2])
-redis.call("ZREMRANGEBYSCORE", KEYS[1], "-inf", string.format("%.0f", now))
-local top = redis.call("ZRANGE", KEYS[1], -1, -1, "WITHSCORES")
+redis.call("ZADD", %[1]s, string.format("%%.0f", now + tonumber(%[2]s)), %[3]s)
+redis.call("ZREMRANGEBYSCORE", %[1]s, "-inf", string.format("%%.0f", now))
+local top = redis.call("ZRANGE", %[1]s, -1, -1, "WITHSCORES")
 if top[2] then
-	redis.call("PEXPIREAT", KEYS[1], string.format("%.0f", tonumber(top[2])))
+	redis.call("PEXPIREAT", %[1]s, string.format("%%.0f", tonumber(top[2])))
 end
+`
+
+// userSessionsAddScript adds a session to the user's sorted set.
+// KEYS[1] = set, ARGV[1] = session TTL (ms), ARGV[2] = session ID.
+var userSessionsAddScript = redis.NewScript(fmt.Sprintf(userSessionAddLua, "KEYS[1]", "ARGV[1]", "ARGV[2]") + `
+return 1
+`)
+
+// putSessionScript stores a new session and indexes it, or does nothing and
+// returns 0 when the session key already exists: a duplicate ID must not
+// repoint the user's pointer or add index entries for data that was not
+// stored.
+// KEYS = session, user pointer, tenant set, user set;
+// ARGV = session JSON, TTL (ms), session ID.
+var putSessionScript = redis.NewScript(`
+if not redis.call("SET", KEYS[1], ARGV[1], "NX", "PX", ARGV[2]) then
+	return 0
+end
+redis.call("SET", KEYS[2], ARGV[3], "PX", ARGV[2])
+redis.call("SADD", KEYS[3], ARGV[3])
+` + fmt.Sprintf(userSessionAddLua, "KEYS[4]", "ARGV[2]", "ARGV[3]") + `
 return 1
 `)
 
@@ -417,15 +438,21 @@ func (r *RedisSessionStore) Put(ctx context.Context, session *SessionData) error
 		ttl = r.defaultTTL
 	}
 
-	// Use transaction for atomicity
-	pipe := r.client.TxPipeline()
-	pipe.SetNX(ctx, r.sessionKey(session.ID), data, ttl)
-	pipe.Set(ctx, r.userKey(session.TenantID, session.UserID), session.ID, ttl)
-	pipe.SAdd(ctx, r.tenantKey(session.TenantID), session.ID)
-	r.indexUserSession(ctx, pipe, session, ttl)
-
-	_, err = pipe.Exec(ctx)
-	return err
+	created, err := putSessionScript.Run(ctx, r.client,
+		[]string{
+			r.sessionKey(session.ID),
+			r.userKey(session.TenantID, session.UserID),
+			r.tenantKey(session.TenantID),
+			r.userSetKey(session.UserID),
+		},
+		data, ttl.Milliseconds(), session.ID).Int()
+	if err != nil {
+		return err
+	}
+	if created == 0 {
+		return ErrSessionExists
+	}
+	return nil
 }
 
 // indexUserSession queues the expiry-scored user-set update on pipe.
