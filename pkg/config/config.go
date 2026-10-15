@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"strings"
@@ -36,6 +37,7 @@ type Config struct {
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
 	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
 	Presentation   PresentationConfig   `yaml:"presentation" envconfig:"PRESENTATION"`
+	StatusCheck    StatusCheckConfig    `yaml:"status_check" envconfig:"STATUS_CHECK"`
 
 	// Registry configures the VCTM registry role (--mode=registry). It
 	// replaces the retired standalone registry configuration file
@@ -380,6 +382,70 @@ type PresentationConfig struct {
 	DCQLConsentCheck DCQLConsentCheckMode `yaml:"dcql_consent_check" envconfig:"DCQL_CONSENT_CHECK"`
 }
 
+// Limits of the verified status list API (StatusCheckConfig).
+const (
+	// DefaultStatusMaxListsPerRequest is the default cap on lists per request.
+	DefaultStatusMaxListsPerRequest = 20
+	// DefaultStatusRequestTimeoutSeconds is the default per-request deadline.
+	DefaultStatusRequestTimeoutSeconds = 8
+	// MaxStatusRequestTimeoutSeconds is the largest accepted per-request
+	// deadline (the HTTP WriteTimeout is 15 s).
+	MaxStatusRequestTimeoutSeconds = 12
+	// DefaultStatusMaxListBytes is the default cap on one compressed `lst` (2 MiB).
+	DefaultStatusMaxListBytes = 2 << 20
+)
+
+// StatusCheckConfig configures the verified Token Status List API
+// (POST /status/v1/lists) and its verifier; see
+// docs/adr/013-status-checking-outside-the-engine.md.
+type StatusCheckConfig struct {
+	// Enabled turns the API on; when false the route answers 503
+	// STATUS_NOT_SUPPORTED. Default: true. Env: WALLET_STATUS_CHECK_ENABLED
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// StatusListSignerFallback: when go-trust errors on the `status-list-signer`
+	// evaluation and this is true (default), ask once more as
+	// `credential-issuer`; when false the list is undetermined
+	// (trust_unavailable). A genuine negative never falls back.
+	// Env: WALLET_STATUS_CHECK_STATUS_LIST_SIGNER_FALLBACK
+	StatusListSignerFallback bool `yaml:"status_list_signer_fallback" envconfig:"STATUS_LIST_SIGNER_FALLBACK"`
+
+	// StatusListMinEntries rejects a list with fewer entries once inflated
+	// (bytes*8/bits) as undetermined (list_too_small). Default 0: no minimum,
+	// as the draft sets none; set e.g. 131072 only if every status issuer you
+	// rely on publishes at least that. Must not be negative.
+	// Env: WALLET_STATUS_CHECK_STATUS_LIST_MIN_ENTRIES
+	StatusListMinEntries int `yaml:"status_list_min_entries" envconfig:"STATUS_LIST_MIN_ENTRIES"`
+
+	// StatusListMaxConcurrentLoads bounds concurrent list fetch-and-inflate
+	// loads across all requests; each can hold up to 36 MiB, which the cache
+	// limit does not cover. A request waiting for a slot gives up at its
+	// deadline (budget_exhausted). 0 (default) means 8. Must not be negative.
+	// Env: WALLET_STATUS_CHECK_STATUS_LIST_MAX_CONCURRENT_LOADS
+	StatusListMaxConcurrentLoads int `yaml:"status_list_max_concurrent_loads" envconfig:"STATUS_LIST_MAX_CONCURRENT_LOADS"`
+
+	// MaxListsPerRequest caps the lists per request (over it: 400
+	// TOO_MANY_URIS). Clients should ask for 1-3 to limit what the server
+	// learns. 0 (default) means 20.
+	// Env: WALLET_STATUS_CHECK_MAX_LISTS_PER_REQUEST
+	MaxListsPerRequest int `yaml:"max_lists_per_request" envconfig:"MAX_LISTS_PER_REQUEST"`
+
+	// RequestTimeoutSeconds is the deadline of one request, covering all its
+	// lists; unfinished lists are undetermined (budget_exhausted). Must stay
+	// under the 15 s HTTP write timeout. 0 (default) means 8; at most 12.
+	// Env: WALLET_STATUS_CHECK_REQUEST_TIMEOUT_SECONDS
+	RequestTimeoutSeconds int `yaml:"request_timeout_seconds" envconfig:"REQUEST_TIMEOUT_SECONDS"`
+
+	// MaxListBytes caps one returned compressed `lst`; a larger list is
+	// undetermined (too_large). 0 (default) means 2097152 (2 MiB). Must not be
+	// negative.
+	// Env: WALLET_STATUS_CHECK_MAX_LIST_BYTES
+	MaxListBytes int `yaml:"max_list_bytes" envconfig:"MAX_LIST_BYTES"`
+
+	// RateLimit caps API requests per authenticated caller (user, else tenant) per window.
+	RateLimit AuthRateLimitConfig `yaml:"rate_limit" envconfig:"RATE_LIMIT"`
+}
+
 // HTTPClientConfig contains HTTP client configuration for outbound requests
 type HTTPClientConfig struct {
 	// ProxyURL is the URL of the HTTP proxy for egress requests (e.g., http://proxy:8080)
@@ -479,6 +545,16 @@ type HTTPClientConfig struct {
 // address this process never saw. A deployment that relies on an egress proxy
 // should enforce its own egress policy there.
 func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Client {
+	return c.newHTTPClient(timeoutOverride, nil)
+}
+
+// NewStrictHTTPClient is NewHTTPClient with the address and scheme guards
+// always on: allow_private_ips, allow_http and insecure_skip_verify are
+// ignored. Use it for fetches whose URL a caller chooses and that must reach
+// public HTTPS hosts only, whatever the deployment allows for its own
+// internal services.
+func (c HTTPClientConfig) NewStrictHTTPClient(timeoutOverride time.Duration) *http.Client {
+	c.AllowPrivateIPs, c.AllowHTTP, c.InsecureSkipVerify = false, false, false
 	return c.newHTTPClient(timeoutOverride, nil)
 }
 
@@ -758,12 +834,11 @@ func checkAddressesFor(host string, ips []net.IP, trusted map[string]struct{}) e
 		return fmt.Errorf("no addresses found for %s", host)
 	}
 	for _, ip := range ips {
-		// Block cloud metadata endpoints (169.254.169.254, fd00::1)
-		// before the generic private/link-local check for a clearer message.
-		if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00::1")) {
+		// Block cloud metadata endpoints before the generic private/link-local check for a clearer message.
+		if isMetadataAddr(ip) {
 			return fmt.Errorf("connection to cloud metadata endpoint %s (%s) is not allowed", host, ip)
 		}
-		if !isTrusted && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()) {
+		if !isTrusted && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || inInternalRange(ip)) {
 			return fmt.Errorf("connection to %s (%s) is not allowed: private/loopback address", host, ip)
 		}
 		// 0.0.0.0 / :: name no real destination, but connect() on Linux (and
@@ -775,6 +850,72 @@ func checkAddressesFor(host string, ips []net.IP, trusted map[string]struct{}) e
 		}
 	}
 	return nil
+}
+
+// v4 and v6 build addresses from numeric components, so the policy tables
+// below read as data rather than as address literals.
+func v4(a, b, c, d byte) netip.Addr { return netip.AddrFrom4([4]byte{a, b, c, d}) }
+
+func v6(groups ...uint16) netip.Addr {
+	var raw [16]byte
+	for i, g := range groups {
+		raw[2*i], raw[2*i+1] = byte(g>>8), byte(g)
+	}
+	return netip.AddrFrom16(raw)
+}
+
+// metadataAddrs are the cloud instance-metadata endpoints, named separately
+// from the generic ranges so the refusal says which rule was hit: the
+// link-local endpoint used by AWS, GCP, Azure and others; the IPv6 unique-local
+// endpoint used by AWS; and Alibaba Cloud's endpoint in shared address space.
+var metadataAddrs = []netip.Addr{
+	v4(169, 254, 169, 254),
+	v6(0xfd00, 0, 0, 0, 0, 0, 0, 1),
+	v4(100, 100, 100, 200),
+}
+
+func isMetadataAddr(ip net.IP) bool {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, m := range metadataAddrs {
+		if addr == m {
+			return true
+		}
+	}
+	return false
+}
+
+// internalRanges are non-global blocks that net.IP's predicates do not cover
+// but that reach a deployment's own network:
+//   - shared address space (RFC 6598, CGNAT), also used by overlay VPNs and
+//     Alibaba's metadata service
+//   - IETF protocol assignments (RFC 6890), which hold Oracle's metadata service
+//   - benchmarking space (RFC 2544)
+//   - the NAT64 well-known prefix (RFC 6052) and local-use prefix (RFC 8215),
+//     whose embedded IPv4 address a gateway would connect to
+var internalRanges = []netip.Prefix{
+	netip.PrefixFrom(v4(100, 64, 0, 0), 10),
+	netip.PrefixFrom(v4(192, 0, 0, 0), 24),
+	netip.PrefixFrom(v4(198, 18, 0, 0), 15),
+	netip.PrefixFrom(v6(0x64, 0xff9b), 96),
+	netip.PrefixFrom(v6(0x64, 0xff9b, 1), 48),
+}
+
+func inInternalRange(ip net.IP) bool {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, p := range internalRanges {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // ssrfGuard is the half of the protection that has to sit above the transport
@@ -2231,6 +2372,19 @@ func defaultConfig() *Config {
 			Timeout:         30,
 		},
 		Presentation: PresentationConfig{DCQLConsentCheck: DCQLConsentCheckWarn},
+		StatusCheck: StatusCheckConfig{
+			Enabled:                  true,
+			StatusListSignerFallback: true,
+			MaxListsPerRequest:       DefaultStatusMaxListsPerRequest,
+			RequestTimeoutSeconds:    DefaultStatusRequestTimeoutSeconds,
+			MaxListBytes:             DefaultStatusMaxListBytes,
+			RateLimit: AuthRateLimitConfig{
+				Enabled:        true,
+				MaxAttempts:    60,
+				WindowSeconds:  60,
+				LockoutSeconds: 60,
+			},
+		},
 		AS: ASConfig{
 			DefaultTokenTTL: 2 * time.Minute,
 			Legacy: ASLegacyConfig{
@@ -2565,6 +2719,9 @@ func (c *Config) Validate() error {
 	if err := c.Presentation.DCQLConsentCheck.validate(); err != nil {
 		return err
 	}
+	if err := c.StatusCheck.validate(); err != nil {
+		return err
+	}
 
 	// Validate audit configuration — without this, cfg.Audit.Enabled=true
 	// with a missing issuer/key_path/key_id silently disables the SET audit
@@ -2731,4 +2888,24 @@ func containsString(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// validate rejects status_check values that would misbehave at runtime.
+func (c StatusCheckConfig) validate() error {
+	if c.StatusListMinEntries < 0 {
+		return fmt.Errorf("invalid status_check.status_list_min_entries %d: must not be negative", c.StatusListMinEntries)
+	}
+	if c.StatusListMaxConcurrentLoads < 0 {
+		return fmt.Errorf("invalid status_check.status_list_max_concurrent_loads %d: must not be negative", c.StatusListMaxConcurrentLoads)
+	}
+	if c.MaxListsPerRequest < 0 {
+		return fmt.Errorf("invalid status_check.max_lists_per_request %d: must not be negative", c.MaxListsPerRequest)
+	}
+	if c.RequestTimeoutSeconds < 0 || c.RequestTimeoutSeconds > MaxStatusRequestTimeoutSeconds {
+		return fmt.Errorf("invalid status_check.request_timeout_seconds %d: must be between 0 and %d (the HTTP write timeout is 15 s)", c.RequestTimeoutSeconds, MaxStatusRequestTimeoutSeconds)
+	}
+	if c.MaxListBytes < 0 {
+		return fmt.Errorf("invalid status_check.max_list_bytes %d: must not be negative", c.MaxListBytes)
+	}
+	return nil
 }

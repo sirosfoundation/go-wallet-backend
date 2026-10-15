@@ -1,0 +1,158 @@
+# OpenAPI sketch of the verified Token Status List API.
+#
+# docs/openapi_coverage_test.go only enforces the /admin routes against
+# openapi-admin.yaml; this file is documentation and is not checked against the
+# router. The prose reference is the "Token Status Lists" section of API.md.
+openapi: 3.0.3
+info:
+  title: go-wallet-backend verified status list API
+  version: 1.0.0
+  description: |
+    Fetches, verifies and trust-evaluates IETF Token Status Lists for clients
+    that check credential status in the background. The response describes the
+    LIST; it never says that a credential is valid. Clients read their own
+    index locally, so the backend does not learn which credential is asked
+    about. List URIs are never logged, audited or stored per user.
+servers:
+  - url: https://wallet.example.org
+paths:
+  /status/v1/lists:
+    post:
+      operationId: verifiedStatusLists
+      summary: Verified Token Status Lists
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ListsRequest'
+      responses:
+        '200':
+          description: |
+            One result per distinct uri, in first-occurrence order. Partial
+            failure is still 200.
+          headers:
+            Cache-Control:
+              schema: {type: string}
+              description: >-
+                private, max-age=N (shortest remaining freshness, limited by the
+                lists' ttl), or private, no-store when any item is undetermined.
+            ETag:
+              schema: {type: string}
+              description: The list's etag; set for single-list responses only.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListsResponse'
+        '400':
+          description: INVALID_REQUEST or TOO_MANY_URIS
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '401': {description: Missing or invalid token}
+        '403': {description: Token not for audience wallet-backend, or lacking tac "r"}
+        '413':
+          description: REQUEST_TOO_LARGE (body over 128 KiB)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '429':
+          description: RATE_LIMIT_EXCEEDED
+          headers:
+            Retry-After:
+              schema: {type: integer}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '503':
+          description: STATUS_NOT_SUPPORTED (status_check.enabled is false)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    ListsRequest:
+      type: object
+      required: [lists]
+      properties:
+        lists:
+          type: array
+          minItems: 1
+          maxItems: 20   # status_check.max_lists_per_request; clients should send 1-3
+          items:
+            type: object
+            required: [uri]
+            properties:
+              uri:
+                type: string
+                format: uri
+                maxLength: 2048
+                description: Exact status.status_list.uri of the credential; https only.
+              etag:
+                type: string
+                maxLength: 128
+                description: etag of the version the client already holds.
+    ListsResponse:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          items: {$ref: '#/components/schemas/ListResult'}
+    ListResult:
+      type: object
+      required: [uri, state]
+      properties:
+        uri: {type: string}
+        state:
+          type: string
+          enum: [verified, undetermined, not_modified]
+          description: There is deliberately no "valid" state.
+        reason:
+          type: string
+          description: Only with state=undetermined.
+          enum:
+            - fetch_failed
+            - unsupported_media_type
+            - signature_invalid
+            - signer_untrusted
+            - trust_unavailable
+            - no_signer_key
+            - expired
+            - not_yet_valid
+            - malformed
+            - too_large
+            - budget_exhausted
+            - list_too_small
+            - uri_not_allowed
+        bits:
+          type: integer
+          enum: [1, 2, 4, 8]
+          description: Only with state=verified.
+        lst:
+          type: string
+          description: >-
+            base64url (no padding) of the zlib-compressed list, byte-identical
+            to the signed token's lst. Only with state=verified.
+        iat: {type: integer, description: Token iat (unix seconds).}
+        exp: {type: integer, description: Token exp (unix seconds), when present.}
+        ttl: {type: integer, description: Token ttl (seconds), when present.}
+        expires_at: {type: integer, description: Unix time until which this version is fresh.}
+        etag: {type: string}
+        signer_trust:
+          type: string
+          description: Trust action that accepted the signer.
+          example: status-list-signer
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: {type: string}
+        message: {type: string}
+        max: {type: integer, description: Present with TOO_MANY_URIS.}

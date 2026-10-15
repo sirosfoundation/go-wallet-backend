@@ -258,6 +258,7 @@ make dev
 
 #### Status
 - `GET /status` - Health check
+- `POST /status/v1/lists` - Verified Token Status Lists for background credential status checks (authenticated; see [docs/API.md](docs/API.md#token-status-lists); configuration under `status_check` in [docs/CONFIGURATION.md](docs/CONFIGURATION.md))
 
 ### Multi-Tenancy
 

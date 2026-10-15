@@ -239,13 +239,9 @@ func VerifyJWTWithEmbeddedKey(jwtStr string, ext ...*cryptoutil.Extensions) (*Ke
 
 	if len(header.X5C) > 0 {
 		// Parse the leaf certificate to get the public key
-		certDER, err := base64.StdEncoding.DecodeString(header.X5C[0])
+		certDER, err := DecodeX5CCert(header.X5C[0])
 		if err != nil {
-			// Try RawURLEncoding as fallback
-			certDER, err = base64.RawURLEncoding.DecodeString(header.X5C[0])
-			if err != nil {
-				return nil, fmt.Errorf("failed to decode x5c leaf certificate: %w", err)
-			}
+			return nil, fmt.Errorf("failed to decode x5c leaf certificate: %w", err)
 		}
 		cert, err := parseCertificateDER(certDER, ext...)
 		if err != nil {
@@ -254,6 +250,11 @@ func VerifyJWTWithEmbeddedKey(jwtStr string, ext ...*cryptoutil.Extensions) (*Ke
 		pubKey = cert.PublicKey
 		km = &KeyMaterial{Type: "x5c", X5C: header.X5C}
 	} else if len(header.JWK) > 0 {
+		// A header jwk is one key. A "keys" member would make it a set whose
+		// members, not this key, a trust evaluation might see.
+		if _, ok := header.JWK["keys"]; ok {
+			return nil, errors.New("embedded jwk must be a single key, not a key set")
+		}
 		// Convert JWK to crypto.PublicKey
 		key, err := jwkToPublicKey(header.JWK)
 		if err != nil {
@@ -501,4 +502,17 @@ func FetchJWKS(ctx context.Context, uri string, client *http.Client) (interface{
 	}
 
 	return jwks, nil
+}
+
+// DecodeX5CCert decodes one x5c certificate string: standard base64 (RFC 7515),
+// else unpadded base64url, which some publishers emit.
+func DecodeX5CCert(s string) ([]byte, error) {
+	der, err := base64.StdEncoding.DecodeString(s)
+	if err == nil {
+		return der, nil
+	}
+	if der, err2 := base64.RawURLEncoding.DecodeString(s); err2 == nil {
+		return der, nil
+	}
+	return nil, err
 }
