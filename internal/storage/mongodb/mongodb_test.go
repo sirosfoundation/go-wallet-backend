@@ -1236,3 +1236,36 @@ func TestUserStore_InvalidateAuthBeforeForToken(t *testing.T) {
 	require.NoError(t, store.Users().InvalidateAuthBeforeForToken(ctx, uid, later.Add(time.Hour), time.Time{}), "no token: unconditional")
 	assert.ErrorIs(t, store.Users().InvalidateAuthBeforeForToken(ctx, domain.NewUserID(), later, tokenIat), storage.ErrNotFound)
 }
+
+// The enrolment authorisation challenge and the validity end of a challenge
+// survive storage, and consuming it returns them.
+func TestChallengeStore_RoundTripsAssertionChallengeAndValidUntil(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	validUntil := time.Now().Add(-time.Second).Truncate(time.Millisecond)
+	ch := &domain.WebauthnChallenge{
+		ID:                 "stepup-roundtrip",
+		UserID:             "u1",
+		Challenge:          "c",
+		Action:             "add_credential",
+		AssertionChallenge: "assertion-c",
+		ValidUntil:         validUntil,
+		ExpiresAt:          time.Now().Add(time.Hour),
+	}
+	require.NoError(t, store.Challenges().Create(ctx, ch))
+
+	got, err := store.Challenges().ConsumeByIDForUser(ctx, ch.ID, "u1")
+	require.NoError(t, err)
+	assert.Equal(t, "assertion-c", got.AssertionChallenge)
+	assert.True(t, validUntil.Equal(got.ValidUntil), "ValidUntil is stored")
+	assert.True(t, got.IsExpired(), "past ValidUntil is expired although the record is kept")
+
+	// Without ValidUntil the field stays unset and ExpiresAt decides.
+	plain := &domain.WebauthnChallenge{ID: "plain", Challenge: "c", Action: "login", ExpiresAt: time.Now().Add(time.Hour)}
+	require.NoError(t, store.Challenges().Create(ctx, plain))
+	got, err = store.Challenges().GetByID(ctx, "plain")
+	require.NoError(t, err)
+	assert.True(t, got.ValidUntil.IsZero())
+	assert.False(t, got.IsExpired())
+}
