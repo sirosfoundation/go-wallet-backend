@@ -51,12 +51,11 @@ func TestGenerateKeyAttestation_CutoffBetweenAdmissionAndMintIsRefused(t *testin
 
 func TestFIDO2AttestationService_Verify_CutoffBeforeWriteIsRefused(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		after        int
-		wantRecorded bool
+		name  string
+		after int
 	}{
-		{"before the write", 0, false},
-		{"during the write", 1, true},
+		{"before the write", 0},
+		{"during the write", 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			base := context.Background()
@@ -75,13 +74,10 @@ func TestFIDO2AttestationService_Verify_CutoffBeforeWriteIsRefused(t *testing.T)
 			ctx := tokengate.WithSubject(base, uid.String(), cutoff.Add(-time.Minute))
 			err := svc.Verify(ctx, &FIDO2AttestationRequest{WalletInstanceID: "inst", AttestationObject: attObj, ClientDataHash: hash})
 			assert.ErrorIs(t, err, tokengate.ErrRevoked)
+			assert.NotErrorIs(t, err, tokengate.ErrWriteNotRolledBack)
 
 			_, gerr := store.KeyAttestations().GetByKeyThumbprint(base, expectedThumbprint(t, pub))
-			if tc.wantRecorded {
-				assert.NoError(t, gerr)
-			} else {
-				assert.Error(t, gerr, "a refused request must not record the evidence")
-			}
+			assert.ErrorIs(t, gerr, storage.ErrNotFound, "a refused request must not leave the evidence")
 		})
 	}
 }
