@@ -56,8 +56,9 @@ type ErasureReconciler struct {
 	// now is the clock; tests replace it.
 	now func() time.Time
 
-	// runMu serializes runs and guards cursor, the last user examined; a run
-	// resumes after it and wraps to the start at the end of the user list.
+	// runMu serializes runs and guards cursor, the last user examined. A run
+	// resumes after it and wraps to the start at the end of the user list; a
+	// run cut short never moves it past a user it did not examine.
 	runMu  sync.Mutex
 	cursor domain.UserID
 
@@ -175,11 +176,6 @@ func (r *ErasureReconciler) RunOnce(ctx context.Context) (ReconcileStats, error)
 	if err != nil {
 		return stats, err
 	}
-	if len(ids) < r.batch {
-		r.cursor = domain.UserID{} // end of the list: start over next run
-	} else {
-		r.cursor = ids[len(ids)-1]
-	}
 	revokedBefore := r.now().Add(-r.grace)
 	for _, id := range ids {
 		if ctx.Err() != nil {
@@ -197,11 +193,18 @@ func (r *ErasureReconciler) RunOnce(ctx context.Context) (ReconcileStats, error)
 			outcome, err = r.lifecycle.ReconcileUser(ctx, id, revokedBefore)
 		}
 		if err != nil {
+			if ctx.Err() != nil {
+				break // interrupted mid-user: examine it again next run
+			}
 			// The cascade already logged its own failure; a probe failure is logged here.
 			r.logger.Warn("Erasure reconciliation failed", zap.String("user_id", id.String()), zap.Error(err))
 			outcome = outcomeFailed
 		}
 		stats.add(outcome)
+		r.cursor = id
+	}
+	if len(ids) < r.batch && ctx.Err() == nil {
+		r.cursor = domain.UserID{} // end of the list: start over next run
 	}
 	return stats, nil
 }

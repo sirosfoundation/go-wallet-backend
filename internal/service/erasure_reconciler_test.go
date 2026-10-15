@@ -606,3 +606,79 @@ func TestErasureReconciler_CancelledRunStopsBetweenUsers(t *testing.T) {
 	assert.Zero(t, st.Scanned)
 	assert.NotNil(t, userData(t, store, u).PrivateData)
 }
+
+// cancelingCleaner cancels the run's context on its first call, as a timeout
+// or shutdown arriving mid-page would; with failWith set it also fails.
+type cancelingCleaner struct {
+	cancel   context.CancelFunc
+	failWith error
+	once     sync.Once
+}
+
+func (c *cancelingCleaner) DeleteByUser(context.Context, string) error {
+	c.once.Do(c.cancel)
+	return c.failWith
+}
+
+func seedRevokedUsers(t *testing.T, store storage.Store, n int) []domain.UserID {
+	t.Helper()
+	var ids []domain.UserID
+	for i := 0; i < n; i++ {
+		u := seedWalletUser(t, store, domain.DefaultTenantID)
+		revokeSilently(t, store, u)
+		ids = append(ids, u)
+	}
+	return ids
+}
+
+func countErased(t *testing.T, store storage.Store, ids []domain.UserID) int {
+	t.Helper()
+	n := 0
+	for _, id := range ids {
+		if userData(t, store, id).PrivateData == nil {
+			n++
+		}
+	}
+	return n
+}
+
+// A run cut short after the first user leaves the rest of the page for the
+// next run, which starts right after the last user examined.
+func TestErasureReconciler_CutShortRunDoesNotSkipUnexaminedUsers(t *testing.T) {
+	store := memory.NewStore()
+	ids := seedRevokedUsers(t, store, 3)
+	r := reconcilerFor(store, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	r.lifecycle.SetSessionCleaner(&cancelingCleaner{cancel: cancel})
+
+	st, err := r.RunOnce(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, st.Scanned)
+	assert.Equal(t, 1, countErased(t, store, ids))
+
+	st, err = r.RunOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 2, st.Scanned, "resumes after the user examined, not from the start")
+	assert.Equal(t, 2, st.Erased)
+	assert.Equal(t, 3, countErased(t, store, ids))
+}
+
+// A user whose cascade is cut short by cancellation is not counted as failed
+// and is examined again first by the next run.
+func TestErasureReconciler_UserInterruptedMidCascadeIsRetriedFirst(t *testing.T) {
+	store := memory.NewStore()
+	ids := seedRevokedUsers(t, store, 3)
+	r := reconcilerFor(store, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	r.lifecycle.SetSessionCleaner(&cancelingCleaner{cancel: cancel, failWith: context.Canceled})
+
+	st, err := r.RunOnce(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, st.Failed, "an interrupted user is not a failure")
+
+	r.lifecycle.SetSessionCleaner(&fakeSessionCleaner{})
+	st, err = r.RunOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, 3, st.Scanned, "the interrupted user is examined again, first")
+	assert.Equal(t, 3, countErased(t, store, ids))
+}
