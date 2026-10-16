@@ -6,6 +6,7 @@ package middleware
 
 import (
 	"context"
+	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -302,7 +303,13 @@ func requireAudience(admitLegacy bool, allowed []string) gin.HandlerFunc {
 
 // extractBearer extracts the token from the Authorization: Bearer header.
 func extractBearer(c *gin.Context) string {
-	auth := c.GetHeader("Authorization")
+	return ExtractBearerToken(c.Request)
+}
+
+// ExtractBearerToken returns the bearer token from the Authorization header, or ""
+// if absent or malformed. The scheme is case-insensitive.
+func ExtractBearerToken(r *http.Request) string {
+	auth := r.Header.Get("Authorization")
 	if auth == "" {
 		return ""
 	}

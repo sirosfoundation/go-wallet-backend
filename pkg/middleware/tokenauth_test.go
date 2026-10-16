@@ -597,6 +597,33 @@ func TestExtractBearer(t *testing.T) {
 	}
 }
 
+func TestExtractBearerToken_Request(t *testing.T) {
+	tests := []struct {
+		name, header, want string
+	}{
+		{"valid", "Bearer abc", "abc"},
+		{"mixed case scheme", "bEaReR abc", "abc"},
+		{"whitespace trimmed", "Bearer  abc ", "abc"},
+		{"absent", "", ""},
+		{"other scheme", "Basic abc", ""},
+		{"scheme only", "Bearer", ""},
+		{"no separator", "Bearerabc", ""},
+		{"longer scheme", "Bearers abc", ""},
+		{"leading space", " Bearer abc", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "/", nil)
+			if tt.header != "" {
+				req.Header.Set("Authorization", tt.header)
+			}
+			if got := ExtractBearerToken(req); got != tt.want {
+				t.Errorf("ExtractBearerToken() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestTokenAuthMiddleware_ModeLegacy_FamilyCheckAppliesInsideClockSkewWindow
 // proves a token go-tokenauth accepted via its leeway (expired 2s ago, 5s
 // default leeway) still gets its revoked-family check: the SID re-parse must

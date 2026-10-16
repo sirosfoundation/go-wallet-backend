@@ -1,0 +1,1042 @@
+# WMP Migration Analysis: Engine → go-wmp
+
+**Version**: 0.3.0  
+**Date**: 2026-05-12  
+**Status**: Updated — HTTP+SSE as primary transport  
+**Previous version**: websocket-protocol-spec.md (2026-02-18)
+
+## Executive Summary
+
+This document analyzes migrating the wallet backend's WebSocket engine
+(`internal/engine/`) and the wallet frontend's WebSocket transport
+(`OIDFlowWebSocketTransport`) to the WMP protocol implemented by
+`github.com/sirosfoundation/go-wmp`, with **HTTP+SSE as the primary transport**.
+
+### Why Not WebSockets?
+
+The current WebSocket transport causes recurring operational problems:
+
+1. **Mobile WebView redirects kill the connection** — OAuth redirects in OID4VCI
+   flows navigate away from the page, destroying the WebSocket. This is the root
+   cause of the reconnection bugs fixed in PR #126.
+2. **Connection lifecycle complexity** — Reconnection logic (exponential backoff,
+   budget tracking, foreground-aware reset) adds 400+ lines of fragile code.
+3. **Tenant routing at handshake time** — WebSocket connections are long-lived, so
+   tenant context must be established once and maintained. HTTP requests naturally
+   carry tenant context per-request.
+4. **Load balancer stickiness** — WebSocket connections must stay pinned to one
+   backend instance, complicating scaling (hence the Redis session store).
+5. **Proxy/firewall issues** — Some networks block WebSocket upgrades or have
+   aggressive timeout policies.
+
+The actual communication pattern (client starts flow → server streams progress →
+client occasionally responds to prompts) is **textbook SSE + REST**. The only
+"bidirectional" need is the sign request/response, which is a request-response
+pattern — not streaming.
+
+### Recommended Approach
+
+**HTTP+SSE as primary transport** with WebSocket as optional fallback:
+
+```
+POST /api/v2/wallet/rpc                     → JSON-RPC requests (flow.start, flow.action, etc.)
+GET  /api/v2/wallet/events?session_id=...   → SSE stream of server notifications (progress, sign/match sub-flow starts, etc.)
+GET  /api/v2/wallet/rpc/events?session_id=  → the same stream (alias, see Discovery below)
+GET  /.well-known/wmp-configuration         → discovery document (absolute endpoint URLs)
+```
+
+**Discovery.** go-wmp's HTTPS+SSE client (`httpsse.NewClientTransport`) takes a
+single absolute `https` base URL, POSTs JSON-RPC to it and opens the stream at
+`base + "/events"`. The discovery document therefore advertises
+`endpoints.rpc = <external-url>/api/v2/wallet/rpc` and
+`endpoints.events = <external-url>/api/v2/wallet/rpc/events`, and the server
+serves the stream at both `/api/v2/wallet/events` and `/api/v2/wallet/rpc/events`.
+The external URL comes from `server.external_urls.engine_url` (a `wss://` URL is mapped to `https://`). Because discovery advertises security mode `tls`, only `https://`/`wss://` URLs are accepted; plaintext `http://`/`ws://` is rejected unless the host is loopback (`localhost`, `127.0.0.0/8`, `::1`), a development-only exception (there is no separate dev setting),
+there is deliberately no fallback to `as.external_url`, because the WMP routes
+are served only on the engine router/port and the AS origin may not route them.
+If `engine_url` is unset, invalid or a non-loopback plaintext URL, the discovery endpoint returns 503 (and a
+warning is logged) rather than advertising unreachable or relative URLs. JSON-RPC notifications are
+answered `202 Accepted` with an empty body (the client accepts only 200/202).
+
+This eliminates all WebSocket connection management while preserving the exact
+same WMP protocol semantics. go-wmp already has an `httpsse` transport package.
+
+## What Changed Since the February Spec
+
+### Engine (go-wallet-backend)
+
+| Area | February | Now |
+|------|----------|-----|
+| OID4VP | Stub | Fully implemented (DCQL matching, consent, VP signing) |
+| Trust evaluation | Server-side only | Delegated to frontend via progress step + `trust_result` action |
+| Credential matching | Not implemented | Privacy-preserving DCQL matching via a nested `match` sub-flow |
+| Issuer metadata | External fetch | `RegistryClient` with local resolution for registered issuers |
+| Flow actions | `select_credential`, `consent` | + `trust_result`, `credentials_matched`, `decline`, `provide_pin`, `authorization_complete` |
+| Session store | Memory only | + Redis option for horizontal scaling |
+
+### go-wmp
+
+| Area | February | Now |
+|------|----------|-----|
+| Methods | 14 | 19 (added `session.authenticate`, `message.status`, `flow.cancel`) |
+| Profiles | Concept only | Implemented (`Profile`, `FlowHandler`, `MethodHandler`, `ResolveHandler`, `IdentifierResolver`) |
+| OpenID4x | None | `openid4x` profile with OID4VCI/OID4VP flow routing, step constants, capability types |
+| Session store | None | `SessionStore` interface + `MemorySessionStore` |
+| Middleware | None | Implemented (chain of `MiddlewareFunc`) |
+| Context | None | `ContextWithSender`, `ContextWithSession` propagation |
+| Discovery | None | `DiscoverConfig`, `DiscoverConfigForDID`, `ExtractDomain` |
+| Options | Fixed config | `PeerOption` pattern (`WithLogger`, `WithMaxMessageSize`) |
+| Transport | WebSocket only | `Transport` interface (WS, HTTPS+SSE) |
+| Tests | Minimal | 62.5% coverage, integration tests for all features |
+
+### Frontend
+
+| Area | February | Now |
+|------|----------|-----|
+| Transport | Single WS class | `IOIDFlowTransport` interface with WS, HTTP proxy, and direct implementations |
+| OID4VP | Not wired | Fully wired (request parsing, DCQL matching, consent, VP signing) |
+| Trust | Server-decided | Client-side trust evaluation with `trust_result` action callback |
+| Reconnection | Basic | Exponential backoff with foreground/online-aware budget reset |
+| Sign handler | Inline | `useWebSocketSignHandler` hook (single, batch, attestation proofs) |
+| Match handler | None | Client-side DCQL query evaluator |
+
+## Transport Architecture: HTTP+SSE
+
+### How It Works
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           HTTP+SSE Transport                            │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Client                                Server                           │
+│  ──────                                ──────                           │
+│                                                                         │
+│  POST /api/v2/wallet/rpc ─────────────►  Handle JSON-RPC request        │
+│    {method: "wmp.session.create"}        Return JSON-RPC response       │
+│  ◄─────────────────────────────────────  {result: {session_id: "..."}}  │
+│                                                                         │
+│  GET /api/v2/wallet/events ───────────►  Open SSE stream                │
+│  ◄─ event: wmp ────────────────────────  Server pushes notifications    │
+│     data: {method: "wmp.flow.progress",  (progress, sub-flow starts,    │
+│            params: {step: "..."}}         complete, etc.)               │
+│                                                                         │
+│  POST /api/v2/wallet/rpc ─────────────►  Handle action                  │
+│    {method: "wmp.flow.action",           Return acknowledgment          │
+│     params: {action: "consent"}}                                        │
+│  ◄─────────────────────────────────────  {result: {status: "accepted"}} │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Why This Is Better
+
+| Concern | WebSocket | HTTP+SSE |
+|---------|-----------|----------|
+| OAuth redirects | Connection dies, must reconnect + resume | SSE auto-reconnects with `Last-Event-ID`; POST requests are stateless |
+| Tenant routing | Must establish at handshake, maintain for lifetime | Every POST carries the `Authorization` bearer token; the tenant is derived from its validated claims |
+| Load balancing | Sticky sessions required | Plain HTTP (no upgrade), but session state is process-local, so RPC POSTs and SSE reconnects still need session affinity to the same instance (see [Multi-replica deployment](#multi-replica-deployment-session-affinity)); no per-connection upgrade handling |
+| Mobile WebView | Connection lost on background/navigate | SSE reconnects on foreground; pending POSTs just retry |
+| Proxy/firewall | Upgrade negotiation blocked by some | Standard HTTP/2, universally supported |
+| Code complexity | 1200+ lines of connection management | ~200 lines (fetch-based SSE + fetch) |
+| Debugging | Opaque binary frames | Standard HTTP requests visible in DevTools |
+| Latency impact | ~20ms per frame | ~50ms per HTTP round-trip (irrelevant for user flows) |
+
+### SSE Reconnection
+
+The native browser `EventSource` API cannot send custom headers (no
+`Authorization`), and the events endpoint requires the bearer token, so
+native `EventSource` cannot be used at all. Clients use fetch-based SSE; we use **`@microsoft/fetch-event-source`**
+(2.8k stars, MIT, ~3KB) which wraps `fetch()` to provide:
+
+- Custom headers on the SSE connection
+- Full control over reconnection strategy
+- Built-in Page Visibility API integration (closes on tab hide, reconnects on
+  visible with `Last-Event-ID`)
+- `AbortController` support
+
+```typescript
+import { fetchEventSource } from '@microsoft/fetch-event-source';
+
+class RetriableError extends Error {}
+class FatalError extends Error {}
+
+declare const sessionId: string;
+declare const token: string;
+declare function handleNotification(msg: unknown): void;
+
+const ctrl = new AbortController();
+await fetchEventSource(`/api/v2/wallet/events?session_id=${sessionId}`, {
+  headers: {
+    'Authorization': `Bearer ${token}`,
+  },
+  signal: ctrl.signal,
+  onmessage(ev) {
+    handleNotification(JSON.parse(ev.data));
+  },
+  onclose() {
+    // Server closed — retry automatically
+    throw new RetriableError();
+  },
+  onerror(err) {
+    if (err instanceof FatalError) throw err; // stop retrying
+    // Return retry interval in ms, or undefined for default
+    return undefined;
+  },
+});
+```
+
+The server includes event IDs in each SSE frame:
+
+```
+id: 42
+event: wmp
+data: {"jsonrpc":"2.0","method":"wmp.flow.progress","params":{...}}
+```
+
+Event IDs are decimal integers (a per-session counter that survives reconnects
+and `wmp.session.resume`). On reconnect, `fetch-event-source` sends
+`Last-Event-ID: 42` and the server replays the events after that ID. A
+`Last-Event-ID` that is absent or not a decimal integer is treated as "no
+cursor": the server replays every retained event (the bounded 200-event ring).
+The server keeps no per-session delivery state, because a successful flush only
+hands bytes to the connection or a proxy and does not prove the client parsed
+the frame. **Duplicates are therefore possible** after a reconnect, and clients
+must dedupe by event ID (IDs are monotonic per session).
+
+This means **OAuth redirects are a non-issue** — when the user returns from the
+authorization server, the SSE stream reconnects and the server replays any missed
+progress events. The client then POSTs the authorization code as a normal action.
+
+### Server-Side Implementation
+
+The go-wmp `httpsse` package already provides the SSE transport. The backend
+exposes two endpoints:
+
+```go
+// POST /api/v2/wallet/rpc — handles JSON-RPC requests
+func handleRPC(w http.ResponseWriter, r *http.Request) {
+	// Wmp-Session-Id header, else params.wmp.session_id from the body (what
+	// go-wmp's HTTPS+SSE client sends); empty for session.create.
+	sessionID := r.Header.Get("Wmp-Session-Id")
+	_ = sessionID
+
+	// User and tenant come from the validated bearer token, never from a header.
+	userID, tenantID, tac, tokenID, err := validateToken(bearerToken(r))
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	_, _, _, _ = userID, tenantID, tac, tokenID
+
+	var req wmp.Request
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	// Dispatch to WMP peer/handler
+	result, err := peer.HandleRequest(r.Context(), &req)
+	if err != nil {
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+
+	// Return the JSON-RPC response; a notification (no "id") gets an empty
+	// 202 Accepted, which is what go-wmp's client expects (200 or 202 only).
+	if result == nil {
+		w.WriteHeader(http.StatusAccepted)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(result)
+}
+
+// GET /api/v2/wallet/events — SSE stream for server→client notifications
+func handleEvents(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.URL.Query().Get("session_id")
+	lastEventID := r.Header.Get("Last-Event-ID")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+
+	// Replay missed events if Last-Event-ID is set
+	replayFrom(w, sessionID, lastEventID)
+	flusher.Flush()
+
+	// Stream new events until the client goes away
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case event, ok := <-session.Events():
+			if !ok {
+				return
+			}
+			fmt.Fprintf(w, "id: %d\nevent: wmp\ndata: %s\n\n", event.ID, event.Data)
+			flusher.Flush()
+		}
+	}
+}
+```
+
+### Frontend Implementation
+
+The frontend transport becomes dramatically simpler:
+
+```typescript
+import { fetchEventSource } from '@microsoft/fetch-event-source';
+
+// Provided by the wallet frontend; shown here only so the example type-checks.
+interface IOIDFlowTransport {
+  connect(token: string): Promise<void>;
+  startFlow(protocol: string, params: unknown): Promise<unknown>;
+  sendAction(flowId: string, action: string, params: unknown): Promise<unknown>;
+}
+
+class RetriableError extends Error {}
+
+class WMPError extends Error {
+  constructor(public readonly error: { code: number; message: string }) {
+    super(error.message);
+  }
+}
+
+class OIDFlowHTTPSSETransport implements IOIDFlowTransport {
+  private ctrl: AbortController | null = null; // fetch-based SSE, not native EventSource
+  private sessionId: string | null = null;
+  private token = '';
+
+  async connect(token: string): Promise<void> {
+    this.token = token;
+    // Create the session via POST. The request is authenticated by the
+    // Authorization header (set by the transport from the same token); the
+    // session is owned by that identity. params.auth is optional: when sent
+    // it must resolve to the SAME identity (same user, tenant and, for an
+    // anonymous token, same jti) or session.create is refused as an invalid
+    // token. There is no separate wmp.session.authenticate step.
+    const result = await this.rpc('wmp.session.create', {
+      wmp: { version: '0.1' },
+      security: { mode: 'tls' },
+      auth: { type: 'bearer', token },
+    });
+    this.sessionId = result.wmp.session_id;
+
+    // Open SSE stream for notifications (with auth headers)
+    this.ctrl = new AbortController();
+    void fetchEventSource(`/api/v2/wallet/events?session_id=${this.sessionId}`, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+      },
+      signal: this.ctrl.signal,
+      onmessage: (ev) => this.handleNotification(JSON.parse(ev.data)),
+      onclose: () => { throw new RetriableError(); },
+    });
+  }
+
+  async startFlow(protocol: string, params: unknown): Promise<any> {
+    return this.rpc('wmp.flow.start', {
+      wmp: { version: '0.1', session_id: this.sessionId },
+      flow_type: protocol,
+      flow_id: crypto.randomUUID(),
+      params,
+    });
+  }
+
+  async sendAction(flowId: string, action: string, params: unknown): Promise<any> {
+    return this.rpc('wmp.flow.action', {
+      wmp: { version: '0.1', session_id: this.sessionId },
+      flow_id: flowId,
+      action,
+      params,
+    });
+  }
+
+  private async rpc(method: string, params: unknown): Promise<any> {
+    const resp = await fetch('/api/v2/wallet/rpc', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${this.token}`,
+        // Required for every method except session.create / session.resume.
+        ...(this.sessionId ? { 'Wmp-Session-Id': this.sessionId } : {}),
+      },
+      body: JSON.stringify({
+        jsonrpc: '2.0',
+        id: crypto.randomUUID(),
+        method,
+        params,
+      }),
+    });
+    const result = await resp.json();
+    if (result.error) throw new WMPError(result.error);
+    return result.result;
+  }
+
+  private handleNotification(msg: { method: string; params: unknown }): void {
+    // Route to flow handlers based on msg.method
+    switch (msg.method) {
+      case 'wmp.flow.progress':
+        this.onProgress(msg.params);
+        break;
+      case 'wmp.flow.complete':
+        this.onComplete(msg.params);
+        break;
+      case 'wmp.flow.error':
+        this.onError(msg.params);
+        break;
+    }
+  }
+
+  // Callbacks wired up by the flow runner.
+  onProgress: (params: unknown) => void = () => {};
+  onComplete: (params: unknown) => void = () => {};
+  onError: (params: unknown) => void = () => {};
+}
+```
+
+Compare this to the current 1200-line `OIDFlowWebSocketTransport` with its
+reconnection budget, foreground detection, ping/pong, and connection state machine.
+
+### WebSocket as Fallback
+
+WebSocket remains available as a fallback transport for:
+- Native apps with persistent connections (iOS/Android wrappers)
+- Long-running DIDComm conversations (future)
+- Environments where SSE is unsupported (rare, but possible behind certain proxies)
+
+The go-wmp `Transport` interface abstracts this — the same `Peer` and handler
+logic works over either transport. The frontend's `IOIDFlowTransport` interface
+similarly abstracts the transport choice.
+
+### Event Replay and Flow Resumption
+
+HTTP+SSE has a built-in mechanism for handling disconnects that WebSocket lacks:
+
+1. Server assigns monotonic event IDs to each notification
+2. On reconnect, browser sends `Last-Event-ID` header
+3. Server replays all events since that ID
+
+This means:
+- **OAuth redirects**: User leaves page, comes back, SSE reconnects, server
+  replays the `authorization_required` progress step. Client POSTs the auth code.
+- **Mobile background**: App goes to background, SSE disconnects. On foreground,
+  reconnect + replay. No lost events.
+- **Network hiccup**: the fetch-based SSE client (`@microsoft/fetch-event-source`)
+  reconnects and sends `Last-Event-ID`; the server replays from the last confirmed
+  event. Clients must dedupe by event ID, since replay can redeliver events.
+
+For longer disconnects (the transport is gone but the session is still live),
+the client uses `wmp.session.resume` via POST. Resume only replaces the
+transport of a still-live session; it cannot bring back a session that has
+expired. Idle/TTL cleanup (`cleanupExpired`) calls `CloseSession`, which removes
+the peer, the event buffer, the resumption tokens and the active flows, and
+resume does not extend the session's TTL. After an idle timeout or TTL expiry
+the client must start a new session (`wmp.session.create`, with a fresh bearer
+token if needed) and restart any flow; a resume attempt returns
+`session not found`.
+
+### Multi-replica deployment: session affinity
+
+WMP session state is **process-local**: the session registry (peer, user and
+tenant, TTL, resumption tokens), the active flows with their handler
+goroutines, and the per-session SSE event buffer all live in the memory of the
+engine process that handled `wmp.session.create`. The Redis session store does
+not share any of it. A request for that session that reaches a different
+replica fails with `session not found` (HTTP 404), so a deployment with more
+than one engine replica must configure load-balancer affinity. The WMP session ID
+is **not** a sufficient key, because not every request carries it:
+
+| Request | Authorization bearer | `Wmp-Session-Id` header | `params.wmp.session_id` | `params.session_id` | `session_id` query |
+|---|---|---|---|---|---|
+| `wmp.session.create` | yes | no | no | no | no |
+| RPC POST | yes | optional (stock client does not set it) | yes | no | no |
+| `wmp.session.resume` | yes | optional | no | yes (top level) | no |
+| SSE GET | yes | optional | no | no | yes |
+| Response to a server-initiated request | yes | optional | no | no | no |
+
+- Key affinity on a hash of the `Authorization` header (NGINX
+  `hash $http_authorization consistent;`, an Envoy header hash policy on
+  `authorization`). It is the only identifier present on every request, so
+  `session.create`, RPCs, the SSE stream and responses all reach the owning
+  replica. Several sessions of one token share a replica.
+- Limits: tokens rotate on refresh, so a refreshed token may be routed to
+  another replica, where the session is not found. Resume does not help there
+  (the resumption token is process-local too); the client must create a new
+  session and flow. Resume works only while routing still reaches the original
+  replica.
+  `Wmp-Session-Id` and `session_id` are secondary hints usable only for the
+  requests that carry them.
+- No affinity cookie is issued: the stock go-wmp HTTPS+SSE client uses
+  `http.DefaultClient` (no cookie jar), so it would not return one.
+
+The engine logs a warning when the WMP routes are mounted. Making the state
+shareable, which would remove the requirement, is tracked in
+[#432](https://github.com/sirosfoundation/go-wallet-backend/issues/432). See
+also the Scaling Guidelines in `docs/DEPLOYMENT.md`.
+
+### Mobile WebView Token Persistence
+
+On Android WebViews, `sessionStorage` may be cleared when the app goes to
+background or when the WebView is recreated. This affects the JWT auth token
+needed for API calls (see wallet-frontend PR #126).
+
+With WebSocket, losing the token is catastrophic — the connection dies and
+cannot be re-established. The entire flow is lost.
+
+With HTTP+SSE, losing the token is **recoverable**:
+
+1. The WMP session and in-progress flow survive server-side (in the same
+   backend process today, so multi-replica deployments need session affinity; a shared store is tracked in #432)
+2. The SSE stream disconnects but the flow handler goroutine keeps waiting
+3. When the app returns to foreground and re-authenticates (e.g., via
+   refresh token from native bridge storage), the client:
+   - Reconnects SSE with `Last-Event-ID` → missed events replayed
+   - POSTs any pending action (sign response, trust result) → flow resumes
+
+The token is only needed *when making a request*, not continuously to maintain
+a connection. This reduces the severity of token loss from "flow destroyed"
+to "flow paused."
+
+**Combined with native bridge storage** (for durable token persistence outside
+the WebView's volatile `sessionStorage`), HTTP+SSE provides defense in depth:
+
+| Layer | What it handles |
+|-------|----------------|
+| Native bridge storage | Token survives WebView lifecycle (background, recreate) |
+| HTTP+SSE session | Flow state survives SSE disconnect (no connection = session) |
+| Event replay | Missed progress events replayed on SSE reconnect |
+| `wmp.session.resume` | Re-attaches a new transport to a still-live session after a longer outage; does not survive session expiry (start a new session and flow) |
+
+## Detailed Mapping
+
+### Wire Protocol
+
+| Engine (custom) | WMP (JSON-RPC 2.0) | Notes |
+|----------------|---------------------|-------|
+| `{"type":"handshake","app_token":"..."}` | `wmp.session.create` (optional `params.auth`, which must equal the `Authorization` header identity) | The `Authorization` header authenticates `session.create` and fixes the session owner; `wmp.session.authenticate` is not implemented by this server (it answers method-not-found) |
+| `{"type":"handshake_complete","session_id":"...","capabilities":[...]}` | `SessionCreateResult{WMP, Capabilities, Security}` | WMP capabilities are typed `map[string]json.RawMessage` |
+| `{"type":"flow_start","protocol":"oid4vci",...}` | `wmp.flow.start` with `flow_type:"oid4vci"` | Direct map; WMP adds `timeout` parameter |
+| `{"type":"flow_progress","step":"...","payload":{}}` | `wmp.flow.progress` notification | Direct map |
+| `{"type":"flow_action","action":"...","payload":{}}` | `wmp.flow.action` request | WMP returns `FlowActionResult`; engine is fire-and-forget |
+| `{"type":"flow_complete","credentials":[...]}` | `wmp.flow.complete` notification | WMP result is generic `json.RawMessage` |
+| `{"type":"flow_error","error":{"code":"...","message":"..."}}` | `wmp.flow.error` notification | WMP uses integer codes; engine uses strings |
+| `{"type":"sign_request","action":"...","params":{}}` | Nested `sign` sub-flow: server sends `wmp.flow.start` (`flow_type:"sign"`); client answers with `wmp.flow.complete` for the child flow | See "Sign and Match Convention" below |
+| `{"type":"sign_response","proof_jwt":"..."}` | Nested `sign` sub-flow: server sends `wmp.flow.start` (`flow_type:"sign"`); client answers with `wmp.flow.complete` for the child flow | See "Sign and Match Convention" below |
+| `{"type":"match_request","dcql_query":{}}` | Nested `match` sub-flow: server sends `wmp.flow.start` (`flow_type:"match"`); client answers with `wmp.flow.complete` for the child flow | See "Sign and Match Convention" below |
+| `{"type":"match_response","matches":[...]}` | Nested `match` sub-flow: server sends `wmp.flow.start` (`flow_type:"match"`); client answers with `wmp.flow.complete` for the child flow | See "Sign and Match Convention" below |
+| `{"type":"push","push_type":"credential_ready"}` | `wmp.message.deliver` notification | WMP is more general |
+| `{"type":"error","code":"..."}` | JSON-RPC error response | Standard JSON-RPC framing |
+| No cancel | `wmp.flow.cancel` request | WMP already has this |
+| No resume | `wmp.session.resume` request | WMP already has this |
+
+### Session Model
+
+| Engine | WMP | Gap |
+|--------|-----|-----|
+| `Session{ID, UserID, TenantID, conn}` | `Session{ID, Participants, Capabilities, Security}` | **WMP needs UserID/TenantID** — or map via Participants |
+| `userIndex` (1 active session per user) | No user→session index | Need to add or handle externally |
+| JWT HMAC validation | `AuthObject{type, token, proof}` | WMP is more flexible (bearer, DPoP, mTLS, DID auth) |
+| `SessionStore` with `GetByUser`, `List`, `Cleanup` | `SessionStore` with `Create`, `Get`, `Update`, `Delete` | **WMP needs**: `GetByUser`, `List`, `Cleanup` |
+| `MaxPendingFlowsPerSession = 3` | No flow limit | Add via middleware |
+| 120s idle timeout | No timeout management | Add via transport or middleware |
+| Redis session store | Memory only | Need Redis implementation of `wmp.SessionStore` |
+
+### Flow Handlers
+
+| Engine | WMP | Compatibility |
+|--------|-----|---------------|
+| `FlowHandler` interface (Execute) | `FlowHandler` interface (StartFlow, HandleAction, etc.) | **Different models** — see below |
+| `FlowHandlerFactory(flow, cfg, logger, ...)` | `Profile.Init(PeerContext)` | WMP is simpler; factory deps must be injected differently |
+| `BaseHandler` (Progress, Error, Complete, RequestSign, RequestMatch) | No flow base handler | **GAP**: Need `FlowContext` helper for sending progress/sign/match |
+| `Flow{ID, Protocol, SessionID, state, channels}` | `FlowStartParams` + profile tracking | Engine has richer per-flow state |
+| Goroutine-per-flow (coroutine model) | Event-driven callbacks | **Fundamental difference** |
+
+#### Coroutine vs. Event-Driven
+
+The engine uses a **coroutine model**: each flow runs as a goroutine that
+calls blocking helpers (`RequestSign`, `WaitForAction`) and progresses linearly:
+
+```go
+// Engine pattern (coroutine)
+func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) error {
+    h.Progress("parsing_offer", nil)
+    offer, err := parseOffer(msg.Offer)
+    
+    h.Progress("fetching_metadata", nil)
+    metadata, err := fetchMetadata(offer.Issuer)
+    
+    h.Progress("evaluating_trust", trustReq)
+    trustResult, err := h.WaitForAction(ctx)   // blocks
+    
+    h.Progress("generating_proof", nil)
+    proof, err := h.RequestSign(ctx, "generate_proof", params)  // blocks
+    
+    credential, err := requestCredential(proof)
+    h.Complete(credential)
+    return nil
+}
+```
+
+WMP uses an **event-driven model**: the profile receives discrete callbacks:
+
+```go
+// WMP pattern (event-driven)
+func (p *Profile) StartFlow(ctx context.Context, params *FlowStartParams) (*FlowStartResult, error) {
+    // Must return immediately; cannot block for sign/match
+}
+
+func (p *Profile) HandleAction(ctx context.Context, params *FlowActionParams) (*FlowActionResult, error) {
+    // Receives each action as it arrives
+}
+```
+
+#### Bridging Strategy
+
+Use a **goroutine bridge** that converts WMP events into channel sends,
+allowing the engine's coroutine-style handlers to run unchanged:
+
+> Historical design sketch: it models sign/match as a `sign_request` progress
+> step answered by `flow.action`. The implementation instead uses nested
+> sub-flows; see "Sign and Match Convention" below.
+
+```go
+type FlowBridge struct {
+	peer     wmp.PeerContext
+	flowID   string
+	handler  *FlowHandler
+	actionCh chan *wmp.FlowActionParams
+	signCh   chan *wmp.FlowActionParams
+	matchCh  chan *wmp.FlowActionParams
+}
+
+// StartFlow launches the coroutine
+func (b *FlowBridge) StartFlow(ctx context.Context, params *wmp.FlowStartParams) (*wmp.FlowStartResult, error) {
+	go b.handler.Execute(ctx, toEngineMsg(params))
+	return &wmp.FlowStartResult{}, nil
+}
+
+// HandleAction routes to the appropriate channel
+func (b *FlowBridge) HandleAction(ctx context.Context, params *wmp.FlowActionParams) (*wmp.FlowActionResult, error) {
+	switch classifyAction(params.Action) {
+	case "sign_response":
+		b.signCh <- params
+	case "match_response":
+		b.matchCh <- params
+	default:
+		b.actionCh <- params
+	}
+	return &wmp.FlowActionResult{Status: "accepted"}, nil
+}
+
+// RequestSign sends a progress notification and blocks on signCh
+func (b *FlowBridge) RequestSign(ctx context.Context, action string, signParams any) (json.RawMessage, error) {
+	_ = b.peer.Notify(ctx, wmp.MethodFlowProgress, &wmp.FlowProgressParams{
+		FlowID:  b.flowID,
+		Step:    "sign_request",
+		Payload: marshalSignRequest(action, signParams),
+	})
+	select {
+	case resp := <-b.signCh:
+		return resp.Params, nil
+	case <-time.After(30 * time.Second):
+		return nil, ErrSignTimeout
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+```
+
+This preserves the engine's linear flow logic while using WMP as the wire protocol.
+
+### Sign and Match Convention (as implemented)
+
+WMP has no dedicated sign/match message types. The implementation
+(`wmpSessionTransport.SendJSON` in `internal/engine/wmphandler.go`) uses
+**nested sub-flows**, not progress/action round trips:
+
+```
+Server → Client: wmp.flow.start request (blocks until the client acks it,
+                 bounded by childFlowStartTimeout)
+{
+  "wmp": {"version": "0.1", "session_id": "..."},
+  "flow_type": "sign",                  // or "match"
+  "flow_id": "<child-flow-uuid>",       // server-chosen, distinct from the parent
+  "params": {                           // openid4x.SignSubFlowParams
+    "action": "generate_proof",
+    "parent_flow_id": "flow-123",
+    "audience": "https://issuer.example.com",
+    "nonce": "n-0S6_WzA2Mj",
+    "proof_type": "jwt"
+  }
+}
+// match: params = {"dcql_query": {...}, "parent_flow_id": "flow-123"}
+
+Client → Server: result of flow.start (acknowledges the child flow)
+
+Client → Server: wmp.flow.complete notification for the CHILD flow_id
+{
+  "wmp": {"version": "0.1", "session_id": "..."},
+  "flow_id": "<child-flow-uuid>",
+  "result": { "proof_jwt": "eyJ..." }   // match: {"matches": [...]}
+}
+```
+
+`FlowComplete` looks the child flow ID up, tags the result with the parent
+flow and message IDs, and delivers it to the engine's blocking
+`RequestSign`/`RequestMatch`. The child-flow table survives
+`wmp.session.resume`, so a result sent after a reconnect still reaches the
+parent flow. Delivery to a full channel waits briefly and keeps the mapping
+so the client can retry.
+
+For backwards compatibility the server also accepts the engine-native
+`wmp.flow.action` with `action: "sign_response"` / `"match_response"`
+(carrying `message_id`) on the parent flow; new clients should use the
+child `wmp.flow.complete`.
+
+### Trust Evaluation Convention
+
+The engine delegates trust evaluation to the frontend via a progress step.
+This maps directly:
+
+```
+Server → Client: wmp.flow.progress notification
+{
+  "flow_id": "flow-123",
+  "step": "evaluating_trust",
+  "payload": {
+    "subject_id": "https://issuer.example.com",
+    "subject_type": "issuer",
+    "key_material": { ... }
+  }
+}
+
+Client → Server: wmp.flow.action request
+{
+  "flow_id": "flow-123",
+  "action": "trust_result",
+  "params": {
+    "trusted": true,
+    "name": "Example University",
+    "framework": "eudi"
+  }
+}
+```
+
+Alternatively, trust resolution could use `wmp.resolve` with `type: "trust"`,
+which is already supported by the resolve handler system. However, the current
+engine pattern of embedding trust evaluation in the flow is simpler for the
+frontend (no need to handle a separate resolve call outside the flow context).
+
+### Error Code Mapping
+
+| Engine (string) | WMP (integer) | Mapping |
+|-----------------|---------------|---------|
+| `AUTH_FAILED` | `ErrNotAuthorized (-31002)` | Direct |
+| `INVALID_MESSAGE` | `ErrInvalidRequest (-32600)` | Standard JSON-RPC |
+| `UNKNOWN_FLOW` | `ErrFlowError (-31006)` | Subsume under flow error |
+| `FLOW_TIMEOUT` | `ErrFlowError (-31006)` | With timeout data |
+| `OFFER_PARSE_ERROR` | `ErrInvalidParams (-32602)` | Standard JSON-RPC |
+| `OFFER_FETCH_ERROR` | `ErrFlowError (-31006)` | With fetch error data |
+| `METADATA_FETCH_ERROR` | `ErrFlowError (-31006)` | With fetch error data |
+| `UNTRUSTED_ISSUER` | `ErrFlowError (-31006)` | With trust data |
+| `UNTRUSTED_VERIFIER` | `ErrFlowError (-31006)` | With trust data |
+| `AUTHORIZATION_FAILED` | `ErrNotAuthorized (-31002)` | Direct |
+| `TOKEN_ERROR` | `ErrFlowError (-31006)` | With token error data |
+| `CREDENTIAL_ERROR` | `ErrFlowError (-31006)` | With credential error data |
+| `SIGN_TIMEOUT` | `ErrFlowError (-31006)` | With timeout data |
+| `SIGN_ERROR` | `ErrSignatureInvalid (-31010)` | Direct |
+| `PRESENTATION_ERROR` | `ErrFlowError (-31006)` | With presentation error data |
+| `INTERNAL_ERROR` | `ErrInternalError (-32603)` | Standard JSON-RPC |
+| `TOO_MANY_REQUESTS` | `ErrRateLimited (-31007)` | Direct |
+
+**Observation**: Most engine-specific error codes collapse into `ErrFlowError`
+with structured `data` payloads. This is actually cleaner — the flow error data
+carries the domain-specific detail, while the code indicates the error class.
+
+The engine's `UserFacingMessage()` function maps to the WMP `ErrorMessage()` pattern.
+
+## Migration Plan
+
+### Phase 1: go-wmp HTTP+SSE Transport (no engine changes)
+
+**Goal**: Make go-wmp's `httpsse` transport production-ready for the engine.
+
+| Task | Effort | Priority |
+|------|--------|----------|
+| Implement event ID tracking and replay in `httpsse` transport | Medium | P0 |
+| Add `FlowContext` helper (Progress, RequestSign, RequestMatch via channels) | Medium | P0 |
+| Extend `SessionStore` with `GetByUser`, `List`, `Cleanup` | Small | P0 |
+| Add `Session.UserID` / `Session.TenantID` (or use Participants) | Small | P0 |
+| Add per-session event buffer for SSE replay | Medium | P0 |
+| Add flow concurrency limit middleware | Small | P1 |
+| Add session TTL / idle expiry | Small | P1 |
+| Implement Redis `SessionStore` | Medium | P1 |
+
+### Phase 2: Backend HTTP+SSE Endpoints
+
+**Goal**: Expose WMP over HTTP+SSE alongside existing WebSocket engine.
+
+| Task | Effort | Priority |
+|------|--------|----------|
+| Add `POST /api/v2/wallet/rpc` endpoint (JSON-RPC dispatch to `wmp.Peer`) | Medium | P0 |
+| Add `GET /api/v2/wallet/events` SSE endpoint (session-scoped notification stream) | Medium | P0 |
+| Implement `FlowBridge` (goroutine bridge for engine coroutine handlers) | Medium | P0 |
+| Wire engine `FlowHandlerFactory` to WMP `Profile` registration | Small | P0 |
+| Map engine `HandshakeMessage` to `wmp.session.create` (owner = `Authorization` header identity; optional `params.auth` must match it) | Small | P0 |
+| JWT auth middleware for `/api/v2/wallet/rpc` and `/api/v2/wallet/events` | Small | P0 |
+| Tenant derivation from the validated bearer token | Small | P1 |
+| Map engine error codes to WMP error codes | Small | P1 |
+| Rate limiting middleware | Small | P1 |
+
+### Phase 3: Frontend HTTP+SSE Transport
+
+**Goal**: Implement `IOIDFlowTransport` backed by HTTP+SSE.
+
+| Task | Effort | Priority |
+|------|--------|----------|
+| `OIDFlowHTTPTransport` class (~200 LoC: fetch + fetch-based SSE) | Medium | P0 |
+| JSON-RPC 2.0 request/response helpers | Small | P0 |
+| Handle nested `sign` sub-flow `wmp.flow.start`; reply with child `wmp.flow.complete` | Small | P0 |
+| Handle nested `match` sub-flow `wmp.flow.start`; reply with child `wmp.flow.complete` | Small | P0 |
+| Map incoming SSE `flow.progress` to existing event callbacks | Small | P0 |
+| Handle `Last-Event-ID` for reconnection after OAuth redirect | Small | P0 |
+| Transport selection: prefer HTTP+SSE, fall back to WebSocket | Small | P1 |
+| Add `wmp.flow.cancel` support | Small | P1 |
+| Feature flag for gradual rollout | Small | P1 |
+| Remove old WebSocket transport (after validation) | Small | P2 |
+
+### Phase 4: Cleanup and Optimization
+
+**Goal**: Remove WebSocket dependency for standard web flows.
+
+| Task | Effort | Priority |
+|------|--------|----------|
+| Remove `OIDFlowWebSocketTransport` (or keep as fallback for native apps) | Small | P1 |
+| Remove gorilla/websocket dependency from engine path | Small | P1 |
+| Deprecate v1 WebSocket signing proxy | Small | P2 |
+| Implement HTTP/2 server push for notifications (optional optimization) | Medium | P3 |
+
+## What WMP + HTTP+SSE Gives Us for Free
+
+Features we gain from this migration:
+
+1. **Survives OAuth redirects** — SSE auto-reconnects with `Last-Event-ID` replay.
+   The root cause of PR #126 bugs ceases to exist.
+2. **No hand-written connection management** — native `EventSource` cannot send the
+   required `Authorization` header, so clients use fetch-based SSE
+   (e.g. `@microsoft/fetch-event-source`), which handles reconnection and
+   `Last-Event-ID`; clients must dedupe by event ID. This still eliminates 400+ lines
+   of reconnection logic.
+3. **Standard HTTP semantics** — every request carries the bearer token, from which user and tenant are derived.
+   No handshake-time context establishment.
+4. **Standard HTTP load balancing, with one caveat** — the transport is plain
+   HTTP (no protocol upgrade), but the current implementation keeps WMP sessions,
+   resumption tokens, event buffers, active flows and peers in process-local
+   memory (`WMPAdapter`), so RPC POSTs and SSE reconnects for a session must
+   reach the same backend instance (session affinity, keyed on a hash of the
+   `Authorization` header, the only identifier every request carries; see
+   [Multi-replica deployment](#multi-replica-deployment-session-affinity)). Stateless routing
+   would require moving that state to a shared store first; the existing
+   session store persists metadata only, and another replica answers
+   session-not-found.
+5. **DevTools visibility** — all requests visible in Network tab. SSE events are
+   inspectable. No WebSocket frame debugging needed.
+6. **Session resume** — `wmp.session.resume` with `last_message_id` for clean
+   recovery from extended disconnects.
+7. **Flow cancel** — `wmp.flow.cancel` with reason codes (user_cancelled, timeout).
+8. **Capability negotiation** — dynamic `wmp.capability.update/list`.
+9. **Endpoint discovery** — `.well-known/wmp-configuration` for multi-domain deploys.
+10. **Middleware chain** — composable auth, rate limiting, logging, tenant isolation.
+11. **Profile plugins** — clean extension for ISO 18013, DIDComm without core changes.
+12. **Transport fallback** — WebSocket available for native apps that benefit from
+    persistent connections.
+
+## What Needs Careful Handling
+
+### 1. Tenant Isolation
+
+The engine has `TenantID` baked into sessions, propagated via `X-Tenant-ID`
+headers on internal service calls. WMP has no tenant concept.
+
+**With HTTP+SSE this is simpler, and the tenant is never client-supplied**:
+every POST to `/api/v2/wallet/rpc` and every GET of `/api/v2/wallet/events`
+carries the `Authorization` bearer token, and the handlers derive the user and
+tenant from that validated token. The backend does not read an `X-Tenant-ID`
+header on these endpoints. A token with no tenant claim is placed in the
+`default` tenant. The engine `Session` stores the tenant; a request may only
+address a session whose user and tenant exactly match the ones derived from its
+token (a mismatch is answered as session-not-found).
+
+Sketch of the enforcement (see `HandleWMPRPC` / `HandleWMPEvents` in
+`internal/engine/wmphttp.go` and `ownsSession` in `internal/engine/wmphandler.go`):
+
+```go
+userID, tenantID, tac, tokenID, err := validateToken(bearerToken(r))
+if err != nil {
+	http.Error(w, "unauthorized", http.StatusUnauthorized)
+	return
+}
+tenantID = normalizeTenant(tenantID) // "" -> "default"
+if !ownsSession(session, caller{userID, tenantID, tokenID}) {
+	http.Error(w, "session not found", http.StatusNotFound)
+	return
+}
+_ = tac
+```
+
+### 2. Signing Timeout Semantics
+
+The engine has a 30-second hard timeout on sign requests. With HTTP+SSE:
+- Server sends sign request via SSE notification
+- Client computes signature
+- Client POSTs `wmp.flow.action` with the signed result
+
+The flow handler's goroutine bridge still enforces the 30s timeout on its
+channel wait. If the client doesn't POST back in time, the flow errors.
+
+This is actually more robust than WebSocket — if the WebSocket disconnects
+during signing, the sign is lost. With HTTP+SSE, the client can POST the
+sign response even if the SSE stream briefly disconnected and reconnected.
+
+### 3. Trust Evaluation Round-Trip
+
+Trust evaluation currently works as:
+1. Engine sends `evaluating_trust` progress step (→ SSE notification)
+2. Frontend evaluates trust (calls `/v1/evaluate` or local logic)
+3. Frontend sends `trust_result` action (→ POST `/api/v2/wallet/rpc`)
+
+This maps directly — no change in semantics, just transport.
+
+### 4. Legacy v1 Protocol
+
+The v1 WebSocket protocol (`internal/websocket/`) is still in use for the
+legacy signing proxy. This is independent of the WMP migration — it should
+be deprecated separately once all clients use the v2 engine flows.
+
+### 5. Frontend Transport Interface
+
+The frontend's `IOIDFlowTransport` interface abstracts the transport layer.
+The new `OIDFlowHTTPTransport` implements this same interface, making the
+migration transparent to the rest of the frontend:
+
+```typescript
+// Builds on OIDFlowHTTPSSETransport above: fetch() for requests, fetch-based SSE
+// for notifications (native EventSource cannot send Authorization). Same
+// IOIDFlowTransport callbacks as the WebSocket version.
+class OIDFlowHTTPTransport extends OIDFlowHTTPSSETransport {}
+```
+
+### 6. SSE Connection Limits
+
+Browsers limit concurrent SSE connections per domain (typically 6 per domain
+in HTTP/1.1). Mitigations:
+- Use HTTP/2 (multiplexed, no per-domain limit)
+- One SSE stream per session (not per flow)
+- The wallet has only one active session at a time
+
+With HTTP/2 this is a non-issue. The backend should enforce HTTP/2 for the
+SSE endpoint.
+
+### 7. Event Buffer Size
+
+The server must buffer events for replay on SSE reconnect. Considerations:
+- Buffer per session, bounded (e.g., last 100 events or last 5 minutes)
+- Events older than the buffer are lost; `wmp.session.resume` re-attaches to a live session but cannot restore events or state once the session has been closed (idle/TTL expiry), so the client must start a new session and flow
+- Flows are typically short (< 30s for OID4VCI), so buffer is small
+- For deferred credentials (hours/days), use `wmp.message.poll` on reconnect
+
+## Recommended Sequence
+
+```
+Week 1-2: go-wmp HTTP+SSE hardening (Phase 1)
+  ├─ Event ID tracking and replay in httpsse transport
+  ├─ Per-session event buffer
+  ├─ FlowContext helper with channel-based sign/match
+  ├─ SessionStore extensions (GetByUser, List, Cleanup)
+  └─ Session tenant/user fields + Redis SessionStore
+
+Week 3-4: Backend HTTP+SSE endpoints (Phase 2)
+  ├─ POST /api/v2/wallet/rpc endpoint with JSON-RPC dispatch
+  ├─ GET /api/v2/wallet/events SSE endpoint with reconnect replay
+  ├─ FlowBridge implementation (goroutine ↔ WMP events)
+  ├─ JWT auth with token-derived tenant enforcement
+  └─ Run alongside existing WebSocket engine (feature flag)
+
+Week 5-6: Frontend HTTP+SSE transport (Phase 3)
+  ├─ OIDFlowHTTPTransport (fetch + fetch-based SSE, ~200 LoC)
+  ├─ Sign/match/trust via flow.action
+  ├─ SSE reconnection with Last-Event-ID
+  └─ Feature-flagged rollout (HTTP+SSE vs WebSocket)
+
+Week 7: Integration testing
+  ├─ End-to-end OID4VCI flow via HTTP+SSE
+  ├─ End-to-end OID4VP flow via HTTP+SSE
+  ├─ OAuth redirect survival (the key test case)
+  └─ Mobile WebView background/foreground cycle
+
+Week 8: Cleanup
+  ├─ Default transport = HTTP+SSE
+  ├─ WebSocket transport → fallback only
+  ├─ Remove feature flags
+  └─ Update documentation
+```
+
+## Open Questions
+
+1. ~~Should the SSE stream use `text/event-stream` or fetch streaming?~~
+   **Decided**: Use `@microsoft/fetch-event-source` (~3KB, MIT, from Azure).
+   Wraps `fetch()` to parse SSE streams with full header control, custom
+   reconnection, and built-in Page Visibility API integration. No token-in-URL
+   needed — the `Authorization` header on every SSE connection.
+
+2. ~~Event buffer sizing and eviction policy?~~
+   **Decided (as implemented)**: one session-wide ring buffer holding the
+   last 200 events (`maxWMPBufferedEvents`); when it is full the oldest event
+   is dropped, whichever flow it belongs to. There is no flow-aware
+   retention: events of active flows are not pinned, and events of completed
+   or errored flows are not evicted on a timer. A client that is away long
+   enough for more than 200 events to accumulate loses the oldest ones on
+   replay, including those of a still-active flow; on `wmp.session.resume`
+   the server additionally re-sends the latest `flow.progress` of each active
+   flow so flow state can be recovered. Typical flows produce ~7-15 events, so
+   the cap is generous. Batch issuance (`count=N`) is a single event
+   regardless of batch size. Flow-aware retention would be a future change.
+
+3. ~~Should tenant context be a WMP concept or application-level?~~
+   **Decided**: Application-level, derived from the bearer token. WMP itself has
+   no tenant concept. Every RPC and SSE request carries `Authorization:
+   Bearer ...`; the handlers take user and tenant from the validated token
+   (no `X-Tenant-ID` header is read) and the tenant is stored on the engine
+   `Session` at `wmp.session.create`. A request can only address a session
+   whose user and tenant exactly match the token's (a token without a tenant
+   claim maps to `default`). If transport-level load-balancer routing by tenant
+   is wanted, it must be done by the proxy from the token or host name, as the
+   backend does not validate a tenant header.
+
+4. ~~When should the WebSocket transport be fully removed?~~
+   **Decided**: No runtime fallback between transports. Transport is a
+   deployment-time configuration choice. Plan:
+   - First: validate HTTP+SSE-only deployment on web (no WebSocket endpoint)
+   - Then: validate on iOS (TestFlight) and Android
+   - WebSocket transport remains available as a separate deployment option
+     until mobile validation is complete
+   - No automatic fallback logic in the frontend — the deployment config
+     determines which transport class is instantiated
+
+5. ~~Should sign/match requests be a progress step, a first-class WMP method
+   (`wmp.sign.request`), or something else?~~
+   **Decided**: Neither. Sign and match requests are **nested sub-flows**: the
+   server sends `wmp.flow.start` with `flow_type` `sign` or `match` and a
+   fresh child `flow_id` (parent referenced by `parent_flow_id` in the
+   params), and the client returns the result with `wmp.flow.complete` for
+   the child flow, which the engine routes to `RequestSign`/`RequestMatch`.
+   This needs no WMP spec change and keeps requests and results correlated
+   by flow ID. The earlier "progress step + `sign_response` action" design is
+   obsolete (the action form is still accepted for compatibility). See "Sign
+   and Match Convention".

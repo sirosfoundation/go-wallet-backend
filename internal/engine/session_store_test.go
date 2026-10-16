@@ -55,7 +55,7 @@ func TestMemorySessionStore_GetByUser(t *testing.T) {
 	err := store.Put(ctx, session)
 	require.NoError(t, err)
 
-	got, err := store.GetByUser(ctx, "user-1")
+	got, err := store.GetByUser(ctx, "tenant-1", "user-1")
 	require.NoError(t, err)
 	assert.Equal(t, session.ID, got.ID)
 }
@@ -165,7 +165,7 @@ func TestMemorySessionStore_Delete(t *testing.T) {
 	assert.ErrorIs(t, err, ErrSessionNotFound)
 
 	// User index should also be cleaned
-	_, err = store.GetByUser(ctx, "user-1")
+	_, err = store.GetByUser(ctx, "tenant-1", "user-1")
 	assert.ErrorIs(t, err, ErrSessionNotFound)
 }
 

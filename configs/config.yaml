@@ -44,6 +44,8 @@ server:
       - "Sec-WebSocket-Key"
       - "Sec-WebSocket-Version"
       - "Sec-WebSocket-Protocol"
+      - "Wmp-Session-Id"
+      - "Last-Event-ID"
     # Response headers exposed to browser
     exposed_headers:
       - "X-Private-Data-ETag"
