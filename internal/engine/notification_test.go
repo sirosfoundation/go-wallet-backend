@@ -595,7 +595,7 @@ func TestBuildCredentialResults_SingleAndBatch(t *testing.T) {
 
 	// Single credential with a top-level notification_id (per OID4VCI §8.3 the
 	// id covers the whole response).
-	single := h.buildCredentialResults(context.Background(), &CredentialResponse{
+	single, _ := h.buildCredentialResults(context.Background(), &CredentialResponse{
 		Credential:     "eyJ.single",
 		NotificationID: "notif-single",
 	}, cfg, nil)
@@ -605,7 +605,7 @@ func TestBuildCredentialResults_SingleAndBatch(t *testing.T) {
 	assert.Equal(t, "notif-single", single[0].NotificationID)
 
 	// Batch response: the single notification_id applies to every credential.
-	batch := h.buildCredentialResults(context.Background(), &CredentialResponse{
+	batch, _ := h.buildCredentialResults(context.Background(), &CredentialResponse{
 		Credentials:    []interface{}{"eyJ.a", map[string]interface{}{"credential": "eyJ.b"}},
 		NotificationID: "notif-batch",
 	}, cfg, nil)
@@ -620,7 +620,7 @@ func TestBuildCredentialResults_OmitsNotificationIDWhenAbsent(t *testing.T) {
 	h := &OID4VCIHandler{}
 	cfg := &CredentialConfig{Format: "dc+sd-jwt"}
 
-	results := h.buildCredentialResults(context.Background(), &CredentialResponse{
+	results, _ := h.buildCredentialResults(context.Background(), &CredentialResponse{
 		Credential: "eyJ.x",
 	}, cfg, nil)
 	require.Len(t, results, 1)

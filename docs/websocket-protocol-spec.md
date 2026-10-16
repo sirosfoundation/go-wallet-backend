@@ -534,6 +534,33 @@ Server → Client:
 }
 ```
 
+Per-credential `credential_metadata` (optional): when the issuer's response
+carries a `credential_metadata` member next to `credential` in an element of
+`credentials[]`, the engine validates and relays it on that credential's result:
+
+```
+{
+  "format": "mso_mdoc",
+  "credential": "<mdoc>",
+  "credential_metadata": [{"type": "org.siros.NS.secret_seed", "value": "..."}],
+  "credential_metadata_encrypted_response": true
+}
+```
+
+- Each entry is an object with exactly a non-empty string `type` and a non-null
+  `value` (any JSON value). Not the OID4VCI issuer-metadata display object, nor
+  OID4VCI 1.1's response-level `credential_metadata`; those are not read.
+- Limits: at most 16 entries per credential, `type` at most 256 bytes, each
+  serialized `value` at most 8 KiB, 32 KiB total per credential. A malformed or
+  oversized member fails the issuance with a `CREDENTIAL_ERROR` flow error; it
+  is never dropped silently.
+- `credential_metadata_encrypted_response` is `true` only when the issuer's
+  response was JWE-encrypted. When `credential_metadata` is present and this flag
+  is absent, the value arrived as plain JSON (always so for deferred issuance);
+  clients must refuse secret values in that case. The engine decrypts the JWE
+  itself, so the engine (and any TLS terminator) sees the values in clear.
+- The engine never logs or persists these values. Absent member: no field.
+
 Deferred issuance:
 
 ```

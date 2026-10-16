@@ -587,6 +587,23 @@ type CredentialResult struct {
 	// encrypted) and echoes it back in a credential_notification message when a
 	// lifecycle event occurs.
 	NotificationID string `json:"notification_id,omitempty"`
+	// CredentialMetadata is the issuer's per-credential credential_metadata
+	// extension, relayed (validated, values untouched): the sibling of
+	// "credential" in the issuer's credentials[] element. NOT OID4VCI's
+	// issuer-metadata display object. Entries may carry secrets; never log them.
+	CredentialMetadata []CredentialMetadataEntry `json:"credential_metadata,omitempty"`
+	// CredentialMetadataEncryptedResponse is true when CredentialMetadata came
+	// in a JWE-encrypted issuer response. Absent (false) alongside a non-empty
+	// CredentialMetadata means it arrived as plain TLS-protected JSON (always
+	// the case for deferred issuance), so a client should refuse secret values.
+	CredentialMetadataEncryptedResponse bool `json:"credential_metadata_encrypted_response,omitempty"`
+}
+
+// CredentialMetadataEntry is one {"type","value"} entry of the per-credential
+// credential_metadata extension. Value is any JSON value except null.
+type CredentialMetadataEntry struct {
+	Type  string          `json:"type"`
+	Value json.RawMessage `json:"value"`
 }
 
 // TrustInfo contains trust evaluation results.

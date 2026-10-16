@@ -344,6 +344,11 @@ type CredentialResponse struct {
 	CNonceExpiresIn int           `json:"c_nonce_expires_in,omitempty"`
 	TransactionID   string        `json:"transaction_id,omitempty"`
 	NotificationID  string        `json:"notification_id,omitempty"`
+
+	// Encrypted records that this response arrived as a JWE (OID4VCI
+	// credential_response_encryption) and was decrypted by us. It is local
+	// state, never part of the wire format.
+	Encrypted bool `json:"-"`
 }
 
 // AvailableCredential represents a credential available for selection
@@ -401,6 +406,7 @@ func decryptJWEResponse(jweString string, privKey *ecdsa.PrivateKey) (*Credentia
 	if err := json.Unmarshal(plaintext, &credResp); err != nil {
 		return nil, fmt.Errorf("failed to parse decrypted credential response: %w", err)
 	}
+	credResp.Encrypted = true
 	return &credResp, nil
 }
 
@@ -1136,13 +1142,23 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		}
 
 		// Complete with the issued credential
-		results := h.buildCredentialResults(ctx, deferredResp, selectedConfig, trust)
+		results, err := h.buildCredentialResults(ctx, deferredResp, selectedConfig, trust)
+		if err != nil {
+			h.Logger.Warn("rejecting deferred credential response", zap.Error(err))
+			_ = h.Error(StepDeferred, ErrCodeCredentialError, "Issuer returned malformed credential metadata")
+			return err
+		}
 		h.registerNotificationContext(metadata, token, deferredResp)
 		return h.CompleteWithRefreshToken(results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token), h.dpopKeyIDForRefreshToken(token))
 	}
 
 	// Step 9: Complete with issued credential (fetch VCTM for display)
-	results := h.buildCredentialResults(ctx, credential, selectedConfig, trust)
+	results, err := h.buildCredentialResults(ctx, credential, selectedConfig, trust)
+	if err != nil {
+		h.Logger.Warn("rejecting credential response", zap.Error(err))
+		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer returned malformed credential metadata")
+		return err
+	}
 	h.registerNotificationContext(metadata, token, credential)
 	return h.CompleteWithRefreshToken(results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token), h.dpopKeyIDForRefreshToken(token))
 }
@@ -2771,8 +2787,16 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 	return nil, fmt.Errorf("deferred credential polling timeout after %d attempts", maxAttempts)
 }
 
-func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo) []CredentialResult {
+// buildCredentialResults converts a credential response into client results.
+//
+// A credential_metadata member on an element of "credentials" is validated
+// (see parseCredentialMetadata) and relayed on that element's result; a
+// malformed one fails the whole response. The single-"credential" form and any
+// response-level credential_metadata are deliberately NOT read: the latter is
+// OID4VCI 1.1's unrelated display object.
+func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo) ([]CredentialResult, error) {
 	var results []CredentialResult
+	var buildErr error
 
 	// Fetch VCTM for display metadata embedding
 	var typeMetadata json.RawMessage
@@ -2784,24 +2808,101 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 	// (which may be a string or a wrapped object) and appends it. Per OID4VCI
 	// §8.3/§11 there is a single notification_id per Credential Response, so the
 	// same resp.NotificationID applies to every credential in the response.
-	appendResult := func(cred interface{}) {
-		results = append(results, CredentialResult{
+	appendResult := func(cred interface{}, withMetadata bool) {
+		res := CredentialResult{
 			Format:         config.Format,
 			Credential:     credentialToString(cred),
 			VCT:            config.VCT,
 			TypeMetadata:   typeMetadata,
 			NotificationID: resp.NotificationID,
-		})
+		}
+		if withMetadata {
+			if m, ok := cred.(map[string]interface{}); ok {
+				if raw, present := m["credential_metadata"]; present {
+					entries, err := parseCredentialMetadata(raw)
+					if err != nil && buildErr == nil {
+						buildErr = fmt.Errorf("credentials[%d]: %w", len(results), err)
+					}
+					res.CredentialMetadata = entries
+					res.CredentialMetadataEncryptedResponse = len(entries) > 0 && resp.Encrypted
+				}
+			}
+		}
+		results = append(results, res)
 	}
 
 	if resp.Credential != nil {
-		appendResult(resp.Credential)
+		appendResult(resp.Credential, false)
 	}
 	for _, cred := range resp.Credentials {
-		appendResult(cred)
+		appendResult(cred, true)
 	}
 
-	return results
+	if buildErr != nil {
+		return nil, buildErr
+	}
+	return results, nil
+}
+
+// Limits for the per-credential credential_metadata extension. They bound what
+// an issuer can make the engine relay; legitimate use (a seed or two) is far
+// below them.
+const (
+	maxCredentialMetadataEntries    = 16
+	maxCredentialMetadataTypeBytes  = 256
+	maxCredentialMetadataValueBytes = 8 * 1024
+	maxCredentialMetadataTotalBytes = 32 * 1024
+)
+
+// parseCredentialMetadata validates the per-credential credential_metadata
+// extension: an array of {"type": <non-empty string>, "value": <non-null>}
+// objects with no other members. Error messages never include values, since
+// they may be secrets.
+func parseCredentialMetadata(raw interface{}) ([]CredentialMetadataEntry, error) {
+	arr, ok := raw.([]interface{})
+	if !ok {
+		return nil, errors.New("credential_metadata is not an array")
+	}
+	if len(arr) > maxCredentialMetadataEntries {
+		return nil, fmt.Errorf("credential_metadata has %d entries (max %d)", len(arr), maxCredentialMetadataEntries)
+	}
+	var entries []CredentialMetadataEntry
+	total := 0
+	for i, e := range arr {
+		obj, ok := e.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("credential_metadata[%d] is not an object", i)
+		}
+		for k := range obj {
+			if k != "type" && k != "value" {
+				return nil, fmt.Errorf("credential_metadata[%d] has an unexpected member", i)
+			}
+		}
+		typ, ok := obj["type"].(string)
+		if !ok || typ == "" {
+			return nil, fmt.Errorf("credential_metadata[%d] has no non-empty string type", i)
+		}
+		if len(typ) > maxCredentialMetadataTypeBytes {
+			return nil, fmt.Errorf("credential_metadata[%d] type exceeds %d bytes", i, maxCredentialMetadataTypeBytes)
+		}
+		val, present := obj["value"]
+		if !present || val == nil {
+			return nil, fmt.Errorf("credential_metadata[%d] has no value", i)
+		}
+		vb, err := json.Marshal(val)
+		if err != nil {
+			return nil, fmt.Errorf("credential_metadata[%d] value is not serializable", i)
+		}
+		if len(vb) > maxCredentialMetadataValueBytes {
+			return nil, fmt.Errorf("credential_metadata[%d] value exceeds %d bytes", i, maxCredentialMetadataValueBytes)
+		}
+		total += len(typ) + len(vb)
+		if total > maxCredentialMetadataTotalBytes {
+			return nil, fmt.Errorf("credential_metadata exceeds %d bytes in total", maxCredentialMetadataTotalBytes)
+		}
+		entries = append(entries, CredentialMetadataEntry{Type: typ, Value: vb})
+	}
+	return entries, nil
 }
 
 // credentialToString normalizes an issuer-returned credential value into the
