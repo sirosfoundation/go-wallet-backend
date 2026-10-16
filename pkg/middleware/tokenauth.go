@@ -21,6 +21,21 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/legacytoken"
 )
 
+// LegacyIssuanceGate answers 410 on endpoints that mint legacy HMAC tokens when
+// legacy is disabled, pointing clients at X-Token-Mode: session.
+func LegacyIssuanceGate(enabled bool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if enabled {
+			c.Next()
+			return
+		}
+		c.AbortWithStatusJSON(410, gin.H{
+			"error":   "legacy_tokens_disabled",
+			"message": "legacy HMAC session tokens are no longer issued; use the /auth/passkey endpoints with X-Token-Mode: session",
+		})
+	}
+}
+
 // TenantLookup is the subset of storage.TenantStore needed by TokenAuthMiddleware.
 type TenantLookup interface {
 	GetByID(ctx context.Context, id domain.TenantID) (*domain.Tenant, error)
