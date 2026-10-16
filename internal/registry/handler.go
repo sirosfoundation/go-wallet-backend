@@ -174,7 +174,19 @@ func (h *Handler) GetTypeMetadata(c *gin.Context) {
 			return
 		}
 
-		result := v.(*FetchResult)
+		result, ok := v.(*FetchResult)
+		if !ok || result == nil {
+			h.logger.Error("dynamic fetch returned unexpected result type",
+				zap.String("vct", vctID),
+				zap.String("type", fmt.Sprintf("%T", v)),
+			)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":   "internal_error",
+				"message": "Unexpected dynamic fetch result",
+				"vct":     vctID,
+			})
+			return
+		}
 
 		// Handle 304 Not Modified
 		if result.NotModified && existingEntry != nil {
