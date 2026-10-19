@@ -1124,13 +1124,13 @@ func (h *Handlers) BeginDeleteAccount(c *gin.Context) {
 		c.JSON(503, gin.H{"error": "WebAuthn not available"})
 		return
 	}
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
 
-	resp, err := h.services.WebAuthn.BeginDeleteAccountStepUp(c.Request.Context(), domain.UserIDFromString(userID.(string)))
+	resp, err := h.services.WebAuthn.BeginDeleteAccountStepUp(c.Request.Context(), domain.UserIDFromString(userID))
 	if err != nil {
 		if abortIfTokenRevoked(c, err) {
 			return
@@ -1211,7 +1211,7 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
-	if !h.requireDeleteStepUp(c, domain.UserIDFromString(userID.(string))) {
+	if !h.requireDeleteStepUp(c, domain.UserIDFromString(userID)) {
 		return
 	}
 
@@ -1237,7 +1237,7 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 			// The account is gone and the caller's token is refused from now
 			// on; the remainder is for an operator. 202: what was asked happened.
 			h.logger.Error("Account deleted but cleanup incomplete", zap.Error(err))
-			h.services.User.AuditAccountEvent(config.AuditAccountCleanupPending, domain.UserIDFromString(userID.(string)), map[string]any{"error": errCodeDeletionCleanupPending})
+			h.services.User.AuditAccountEvent(config.AuditAccountCleanupPending, domain.UserIDFromString(userID), map[string]any{"error": errCodeDeletionCleanupPending})
 			c.JSON(http.StatusAccepted, gin.H{
 				"error":   errCodeDeletionCleanupPending,
 				"result":  "DELETED",
@@ -1249,7 +1249,7 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 			// Tokens are already refused for good, so a repeat cannot pass the
 			// gate; an operator must finish the deletion. 202: under way.
 			h.logger.Error("Account deletion stalled after token revocation, operator required", zap.Error(err))
-			h.services.User.AuditAccountEvent(config.AuditAccountCleanupPending, domain.UserIDFromString(userID.(string)), map[string]any{"error": errCodeDeletionOperatorRequired})
+			h.services.User.AuditAccountEvent(config.AuditAccountCleanupPending, domain.UserIDFromString(userID), map[string]any{"error": errCodeDeletionOperatorRequired})
 			c.JSON(http.StatusAccepted, gin.H{
 				"error":   errCodeDeletionOperatorRequired,
 				"result":  "PENDING",
@@ -1271,7 +1271,7 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		return
 	}
 
-	h.services.User.AuditAccountEvent(config.AuditAccountSucceeded, domain.UserIDFromString(userID.(string)), nil)
+	h.services.User.AuditAccountEvent(config.AuditAccountSucceeded, domain.UserIDFromString(userID), nil)
 	c.JSON(200, gin.H{"result": "DELETED"})
 }
 
