@@ -1706,3 +1706,25 @@ func TestLegacyValidatorConfig_UsesJWTIssuer(t *testing.T) {
 		t.Fatalf("legacy token minted with JWT.Issuer must validate when AS.Issuer differs: %v", err)
 	}
 }
+
+// A revocation store that failed to initialize refuses every authenticated
+// request until restart, so readiness must not report healthy meanwhile even
+// though the database itself answers its ping.
+func TestBackendProvider_CheckReady_RevocationStoreUnavailable(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := &config.Config{}
+	cfg.Security.TokenBlacklist = config.TokenBlacklistConfig{Enabled: true, Backend: "storage"}
+	store := &mockBackend{healthy: true}
+
+	// mockBackend is not MongoDB, so the "storage" revocation backend cannot
+	// be built and NewServices installs the failing stand-in.
+	provider := &BackendProvider{
+		store:  store,
+		logger: logger,
+		auth:   &AuthProvider{services: service.NewServices(store, cfg, logger)},
+	}
+	err := provider.CheckReady(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "revocation store unavailable") {
+		t.Fatalf("expected revocation store unavailable error, got %v", err)
+	}
+}

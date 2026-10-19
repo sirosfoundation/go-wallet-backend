@@ -174,6 +174,10 @@ func NewRevocationStore(ctx context.Context, cfg config.TokenBlacklistConfig, st
 // set up: every operation fails, so nothing is accepted on its say-so.
 type unavailableRevocationStore struct{ err error }
 
+// Unavailable reports why the store could not be set up, so readiness can
+// surface it instead of reporting healthy while every request is refused.
+func (u unavailableRevocationStore) Unavailable() error { return u.err }
+
 func (u unavailableRevocationStore) Add(context.Context, string, time.Time) error { return u.err }
 func (u unavailableRevocationStore) Has(context.Context, string) (bool, error)    { return false, u.err }
 func (u unavailableRevocationStore) RevokeUser(context.Context, string) error     { return u.err }
