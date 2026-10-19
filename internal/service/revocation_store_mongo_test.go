@@ -287,7 +287,9 @@ func TestNewServices_DisabledBlacklistWithFailedStoreIsReady(t *testing.T) {
 	// Storage is not MongoDB, so backend=storage cannot be honoured.
 	svc := NewServices(memory.NewStore(), cfg, zap.NewNop())
 	require.NoError(t, svc.TokenBlacklist.Ready())
-	require.False(t, svc.TokenBlacklist.IsBlacklisted(context.Background(), "any"))
+	revoked, err := svc.TokenBlacklist.IsBlacklisted(context.Background(), "any")
+	require.NoError(t, err)
+	require.False(t, revoked)
 }
 
 func TestMongoRevocationStore_Remove(t *testing.T) {
