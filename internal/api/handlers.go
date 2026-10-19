@@ -1005,11 +1005,23 @@ func (h *Handlers) Logout(c *gin.Context) {
 }
 
 // revokeSessionTokens blacklists jti, then revokes the refresh-token family
-// sid (each skipped when empty). The shared jti write goes first because it
-// is the one that can fail remotely: once the family is revoked the auth
-// middlewares reject the same token on this replica, so a failure after that
-// point could not be retried. If the family revocation fails after the jti
-// was written, the jti entry is withdrawn again so the retry is admitted.
+// sid (each skipped when empty).
+//
+// Revocations are monotonic: nothing is ever withdrawn here. A jti entry is
+// shared by every request that presents the token, so removing it after a
+// failure could undo a logout another request completed; and an error from
+// the shared write does not prove it was rejected (MongoDB can apply the
+// update and then fail to acknowledge it), so "write failed, therefore not
+// revoked" cannot be assumed either. The token is being revoked anyway, so
+// keeping its jti entry is always safe.
+//
+// What makes a failure recoverable is that logout is idempotent and
+// reachable with an already revoked token (middleware.IsLogout): the client
+// retries, the jti write is repeated harmlessly and the family revocation
+// is completed. The shared jti write goes first because it is the one that
+// can fail remotely; the family revocation is process-local and only fails
+// for an abandoned (cancelled) request, which must not read as a completed
+// logout.
 func (h *Handlers) revokeSessionTokens(ctx context.Context, jti string, jtiExpiry time.Time, sid string) error {
 	bl := h.services.TokenBlacklist
 	if jti != "" {
@@ -1020,16 +1032,7 @@ func (h *Handlers) revokeSessionTokens(ctx context.Context, jti string, jtiExpir
 	if sid == "" {
 		return nil
 	}
-	err := bl.RevokeFamily(ctx, sid, time.Now().Add(familyRetention(h.cfg)+time.Hour))
-	if err != nil && jti != "" {
-		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-		if rerr := bl.Remove(rctx, jti); rerr != nil {
-			h.logger.Error("Logout: could not withdraw the jti revocation after a failed family revocation",
-				zap.String("sid", sid), zap.Error(rerr))
-		}
-	}
-	return err
+	return bl.RevokeFamily(ctx, sid, time.Now().Add(familyRetention(h.cfg)+time.Hour))
 }
 
 // DeleteUser deletes the current user and all associated data

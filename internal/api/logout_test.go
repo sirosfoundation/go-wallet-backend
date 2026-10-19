@@ -644,8 +644,10 @@ func TestLogout_FailedFamilyRevocation_RetryableThroughRealMiddleware(t *testing
 			if w := logout(); w.Code != http.StatusInternalServerError {
 				t.Fatalf("attempt 1: expected 500, got %d: %s", w.Code, w.Body.String())
 			}
-			if blacklisted(t, services.TokenBlacklist, ctx, jti) {
-				t.Fatal("a failed logout must not blacklist the access token's jti")
+			// The jti entry is shared and monotonic: it is not withdrawn after
+			// the failure (see revokeSessionTokens).
+			if !blacklisted(t, services.TokenBlacklist, ctx, jti) {
+				t.Fatal("the jti revocation must not be withdrawn after a failed family revocation")
 			}
 			if services.TokenBlacklist.IsFamilyRevoked(ctx, sid) {
 				t.Fatal("family must not be revoked after the failure")
@@ -665,8 +667,10 @@ func TestLogout_FailedFamilyRevocation_RetryableThroughRealMiddleware(t *testing
 			}
 
 			// The token is now dead through the real middleware.
-			if w := logout(); w.Code != http.StatusUnauthorized {
-				t.Errorf("after logout the token must be rejected, got %d", w.Code)
+			// Logout is idempotent: repeating it with the revoked token is
+			// admitted (and harmless), see middleware.IsLogout.
+			if w := logout(); w.Code != http.StatusOK {
+				t.Errorf("repeating a completed logout must stay idempotent, got %d", w.Code)
 			}
 		})
 	}
@@ -929,4 +933,158 @@ func TestDeleteUser_LostAckRevocation_RetryCompletesThroughRealMiddleware(t *tes
 	require.Equal(t, http.StatusOK, do(http.MethodDelete, "/user/session"), "the retry completes the deletion")
 	_, err = mem.Users().GetByID(context.Background(), user.UUID)
 	require.Error(t, err, "the user is deleted")
+}
+
+// lostAckJTIStore applies Add and then reports an error, like a MongoDB
+// update whose majority acknowledgement timed out after it was applied.
+type lostAckJTIStore struct {
+	jtis     map[string]bool
+	failNext bool
+}
+
+func (s *lostAckJTIStore) Add(_ context.Context, jti string, _ time.Time) error {
+	s.jtis[jti] = true
+	if s.failNext {
+		s.failNext = false
+		return errors.New("write concern timeout")
+	}
+	return nil
+}
+func (s *lostAckJTIStore) Remove(_ context.Context, jti string) error {
+	delete(s.jtis, jti)
+	return nil
+}
+func (s *lostAckJTIStore) Has(_ context.Context, jti string) (bool, error) { return s.jtis[jti], nil }
+func (s *lostAckJTIStore) RevokeUser(context.Context, string) error        { return nil }
+func (s *lostAckJTIStore) IsUserRevoked(context.Context, string) (bool, error) {
+	return false, nil
+}
+
+// logoutRig wires the real auth middleware in front of Logout plus a
+// protected route, around the given jti store.
+func logoutRig(t *testing.T, tokenAuth bool, store service.RevocationStore) (*service.Services, http.Handler, string) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	logger := zap.NewNop()
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPID: "wallet.example.com"},
+		JWT:    config.JWTConfig{Secret: "test-secret", ExpiryHours: 24, RefreshDays: 7, Issuer: "test-wallet"},
+	}
+	mem := memory.NewStore()
+	services := service.NewServices(mem, cfg, logger)
+	services.TokenBlacklist = service.NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, logger, store)
+	handlers := NewHandlers(services, cfg, logger, []string{"test"})
+
+	router := gin.New()
+	if tokenAuth {
+		v := tokenvalidator.New(tokenvalidator.Config{
+			Audiences: []string{"wallet-backend", "wallet.example.com"},
+			Legacy: tokenvalidator.LegacyConfig{
+				Enabled: true, HMACSecret: []byte(cfg.JWT.Secret), Issuers: []string{cfg.JWT.Issuer},
+			},
+			Revocation: tokenRevocationChecker{services.TokenBlacklist},
+		})
+		router.Use(middleware.TokenAuthMiddleware(cfg, v, mem.Tenants(), services.TokenBlacklist, logger))
+		router.Use(middleware.RequireAudience("wallet-backend"))
+	} else {
+		router.Use(middleware.AuthMiddlewareWithBlacklist(cfg, mem, services.TokenBlacklist, logger))
+	}
+	router.POST("/user/session/logout", handlers.Logout)
+	router.GET("/user/session/protected", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"user_id": "user-1", "tenant_id": "default", "jti": "jti-x", "sid": "sid-x",
+		"iss": "test-wallet", "aud": "wallet.example.com", "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte(cfg.JWT.Secret))
+	require.NoError(t, err)
+	return services, router, tok
+}
+
+// tokenRevocationChecker mirrors internal/server's adapter (which this
+// package cannot import): store errors reject, a revoked jti is admitted only
+// for the logout call.
+type tokenRevocationChecker struct{ bl *service.TokenBlacklist }
+
+func (c tokenRevocationChecker) IsRevoked(ctx context.Context, jti string) bool {
+	revoked, err := c.bl.IsBlacklisted(ctx, jti)
+	if err != nil {
+		return true
+	}
+	return revoked && !middleware.IsLogoutCompletion(ctx)
+}
+
+func doReq(router http.Handler, method, path, tok string, ctx context.Context) int {
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(method, path, nil).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	router.ServeHTTP(w, req)
+	return w.Code
+}
+
+// An Add error does not prove the jti write was rejected. When the write was
+// applied and only its acknowledgement was lost, the first logout fails but
+// the jti is revoked; the retry with the same token must still get through
+// the real middleware to revoke the refresh-token family, and afterwards the
+// token must be dead everywhere else.
+func TestLogout_LostAckJTIWrite_RetryCompletesFamilyRevocation(t *testing.T) {
+	for _, tokenAuth := range []bool{false, true} {
+		name := "legacy HMAC path"
+		if tokenAuth {
+			name = "tokenauth ModeLegacy path"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := &lostAckJTIStore{jtis: map[string]bool{}, failNext: true}
+			services, router, tok := logoutRig(t, tokenAuth, store)
+			bg := context.Background()
+
+			require.Equal(t, http.StatusInternalServerError, doReq(router, http.MethodPost, "/user/session/logout", tok, bg))
+			require.True(t, store.jtis["jti-x"], "the write was applied despite the error")
+			require.False(t, services.TokenBlacklist.IsFamilyRevoked(bg, "sid-x"))
+			if !tokenAuth {
+				// go-tokenauth does not consult the jti checker for legacy HMAC
+				// tokens, which are covered by the family check instead.
+				require.Equal(t, http.StatusUnauthorized, doReq(router, http.MethodGet, "/user/session/protected", tok, bg),
+					"a revoked jti is refused everywhere except the logout call")
+			}
+
+			require.Equal(t, http.StatusOK, doReq(router, http.MethodPost, "/user/session/logout", tok, bg), "retry")
+			require.True(t, services.TokenBlacklist.IsFamilyRevoked(bg, "sid-x"), "retry must revoke the family")
+			require.Equal(t, http.StatusOK, doReq(router, http.MethodPost, "/user/session/logout", tok, bg), "logout is idempotent")
+			require.Equal(t, http.StatusUnauthorized, doReq(router, http.MethodGet, "/user/session/protected", tok, bg))
+		})
+	}
+}
+
+// Two requests present the same token; one completes the logout and the
+// other is abandoned (cancelled context) before it revokes the family. The
+// abandoned request must not undo the completed one: the shared jti entry
+// stays.
+func TestLogout_AbandonedRequestDoesNotUndoCompletedLogout(t *testing.T) {
+	for _, tokenAuth := range []bool{false, true} {
+		name := "legacy HMAC path"
+		if tokenAuth {
+			name = "tokenauth ModeLegacy path"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := &lostAckJTIStore{jtis: map[string]bool{}}
+			services, router, tok := logoutRig(t, tokenAuth, store)
+			bg := context.Background()
+
+			// Request B authenticates, then is abandoned before RevokeFamily.
+			// (Run it first here; its jti write is the shared entry either way.)
+			cancelled, cancel := context.WithCancel(bg)
+			cancel()
+			_ = doReq(router, http.MethodPost, "/user/session/logout", tok, cancelled)
+
+			// Request A completes.
+			require.Equal(t, http.StatusOK, doReq(router, http.MethodPost, "/user/session/logout", tok, bg))
+			require.True(t, store.jtis["jti-x"])
+			require.True(t, services.TokenBlacklist.IsFamilyRevoked(bg, "sid-x"))
+
+			// Another abandoned request after the completed logout.
+			_ = doReq(router, http.MethodPost, "/user/session/logout", tok, cancelled)
+			require.True(t, store.jtis["jti-x"], "an abandoned request must not withdraw the shared jti entry")
+			require.Equal(t, http.StatusUnauthorized, doReq(router, http.MethodGet, "/user/session/protected", tok, bg))
+		})
+	}
 }

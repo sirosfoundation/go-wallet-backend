@@ -1756,3 +1756,27 @@ func TestBackendProvider_CheckReady_RevocationStoreUnavailable(t *testing.T) {
 		t.Fatalf("expected revocation store unavailable error, got %v", err)
 	}
 }
+
+// The validator's revocation checker admits an already revoked jti only for
+// the logout call (to complete an interrupted logout); a store failure still
+// rejects there.
+func TestBlacklistRevocationChecker_LogoutCompletionAdmitsRevokedJTIOnly(t *testing.T) {
+	bl := service.NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop())
+	if err := bl.Add(context.Background(), "jti-r", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	checker := blacklistRevocationChecker{blacklist: bl}
+
+	ctx := context.Background()
+	lctx := middleware.WithLogoutCompletion(ctx)
+	if !checker.IsRevoked(ctx, "jti-r") {
+		t.Error("a revoked jti must be rejected outside logout")
+	}
+	if checker.IsRevoked(lctx, "jti-r") {
+		t.Error("a revoked jti must be admitted for the logout call")
+	}
+	failing := service.NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop(), failingRevocationStore{})
+	if !(blacklistRevocationChecker{blacklist: failing}).IsRevoked(lctx, "jti-r") {
+		t.Error("a store failure must still reject the logout call")
+	}
+}

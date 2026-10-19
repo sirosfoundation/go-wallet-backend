@@ -83,7 +83,13 @@ func TokenAuthMiddlewareWithValidate(cfg *config.Config, validate func(ctx conte
 		// Validate via go-tokenauth (auto-detects new-style vs legacy HMAC).
 		// Per-jti revocation is already checked inside Validate itself (see
 		// this function's doc comment).
-		result, err := validate(c.Request.Context(), rawToken)
+		vctx := c.Request.Context()
+		if IsLogout(c) {
+			// Lets the validator's revocation checker admit an already
+			// revoked jti for the idempotent logout call; see IsLogout.
+			vctx = WithLogoutCompletion(vctx)
+		}
+		result, err := validate(vctx, rawToken)
 		if err != nil {
 			logAuthReject(logger, c, "token_validation_failed", zap.Error(err))
 			c.JSON(401, gin.H{"error": "Invalid token"})
@@ -131,7 +137,7 @@ func TokenAuthMiddlewareWithValidate(cfg *config.Config, validate func(ctx conte
 				c.Abort()
 				return
 			}
-			if sid != "" && blacklist.IsFamilyRevoked(c.Request.Context(), sid) {
+			if sid != "" && !IsLogout(c) && blacklist.IsFamilyRevoked(c.Request.Context(), sid) {
 				logger.Warn("Token for revoked refresh-token family used",
 					zap.String("sid", sid),
 				)

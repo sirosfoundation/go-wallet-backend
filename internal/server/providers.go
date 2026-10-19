@@ -522,7 +522,10 @@ func (c blacklistRevocationChecker) IsRevoked(ctx context.Context, jti string) b
 		}
 		return true
 	}
-	return revoked
+	// A logout call may present a token whose jti is already revoked, to
+	// complete a logout that was interrupted (see middleware.IsLogout). Only
+	// a definite "revoked" answer is relaxed; a store error still rejects.
+	return revoked && !middleware.IsLogoutCompletion(ctx)
 }
 
 // =============================================================================

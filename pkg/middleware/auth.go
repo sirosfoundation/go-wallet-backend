@@ -45,6 +45,39 @@ func IsAccountDeletion(c *gin.Context) bool {
 	return c.Request.Method == http.MethodDelete && strings.TrimSuffix(c.FullPath(), "/") == "/user/session"
 }
 
+// IsLogout reports whether the request is the session logout call
+// (POST /user/session/logout).
+//
+// Logout is the one call that stays reachable to a token whose own jti or
+// refresh-token family is already revoked, so that it is an idempotent
+// completion path: a logout whose revocation write reported an error may
+// still have been applied (a MongoDB write can land before its majority
+// acknowledgement times out), and the jti entry is never withdrawn because
+// another request may have completed a logout with it. Without this the
+// retry would be rejected as "revoked" while the refresh-token family was
+// still unrevoked. Revoked jti and family are the only checks relaxed:
+// signature, expiry, user revocation, tenant and the store-unavailable
+// refusal all still apply, and the call only revokes the caller's own
+// session, so repeating it is harmless.
+func IsLogout(c *gin.Context) bool {
+	return c.Request.Method == http.MethodPost && strings.TrimSuffix(c.FullPath(), "/") == "/user/session/logout"
+}
+
+type logoutCompletionKey struct{}
+
+// WithLogoutCompletion marks ctx as belonging to a logout call, so a
+// revocation checker running inside token validation (which cannot see the
+// request) admits a token whose jti is already revoked. See IsLogout.
+func WithLogoutCompletion(ctx context.Context) context.Context {
+	return context.WithValue(ctx, logoutCompletionKey{}, true)
+}
+
+// IsLogoutCompletion reports whether ctx was marked by WithLogoutCompletion.
+func IsLogoutCompletion(ctx context.Context) bool {
+	v, _ := ctx.Value(logoutCompletionKey{}).(bool)
+	return v
+}
+
 // RefuseRevocationUnavailable aborts the request with 503 because the
 // revocation store could not say whether the token is revoked. Only the
 // error is logged, never token content.
@@ -207,7 +240,7 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 					return
 				}
 			}
-			if revoked {
+			if revoked && !IsLogout(c) {
 				logger.Warn("Blacklisted token used",
 					zap.String("jti", jti),
 				)
@@ -239,7 +272,7 @@ func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blackl
 			// no-op for a token with no sid claim at all (minted before
 			// #402, or never paired with a refresh token in the first
 			// place - e.g. FinishRegistration).
-			if sid, _ := claims["sid"].(string); sid != "" && blacklist.IsFamilyRevoked(c.Request.Context(), sid) {
+			if sid, _ := claims["sid"].(string); sid != "" && !IsLogout(c) && blacklist.IsFamilyRevoked(c.Request.Context(), sid) {
 				logger.Warn("Token for revoked refresh-token family used",
 					zap.String("sid", sid),
 				)
