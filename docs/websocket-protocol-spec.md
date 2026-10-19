@@ -534,6 +534,85 @@ Server → Client:
 }
 ```
 
+Response-level `credential_metadata` (optional): when the issuer's Credential
+Response (or Deferred Credential Response) carries the OpenID4VCI 1.1
+response-level `credential_metadata` object (openid/OpenID4VCI#721), the engine
+validates it and relays it as ONE top-level member of `flow_complete`. It applies
+to every credential in `credentials[]`:
+
+```
+{
+  "type": "flow_complete",
+  "credentials": [{"format": "mso_mdoc", "credential": "<mdoc>"}],
+  "credential_metadata": {
+    "org.siros.secret_seed": {"<namespace>": "<lowercase hex>"}
+  },
+  "credential_metadata_encrypted_response": true
+}
+```
+
+- The value must be a JSON object. Members are relayed verbatim, in order and
+  with number spelling (`1.50`, `2.0`, integers beyond float64) preserved; only
+  insignificant whitespace is removed and the JSON encoder may write `<`, `>`, `&`
+  as `\u` escapes (value-identical). Unknown members are relayed untouched:
+  wallets ignore members they do not know.
+- `org.siros.secret_seed`, when present, must be an object of 1 to 8 members
+  mapping a namespace (1 to 64 UTF-8 bytes, not the reserved name `namespaces`)
+  to a seed of exactly 32 lowercase hex characters (privatedata-spec 5A.1). The
+  advertisement form (`{"namespaces": [...]}`) in a response is therefore
+  rejected, as is uppercase or wrong-length hex.
+- Limits (abuse caps only, since the object is mostly display metadata such as
+  `display[]`, `logo.uri` data: URIs, `background_image` and `claims[]`): at most
+  1 MiB encoded (room for several embedded data: URI images; the raw HTTP body
+  is capped separately), nesting depth at most 16 (the object itself is depth 1),
+  at most 256 members in any one object, member names at most 256 bytes, and no
+  duplicate member names at the top level or inside `org.siros.secret_seed`
+  (elsewhere the display data is relayed as received). A value over a cap, or
+  `null`, an array or a non-object, fails the issuance with a `CREDENTIAL_ERROR`
+  flow error and no `flow_complete`; it is never dropped silently. Error messages
+  and logs never contain its contents. Only the `org.siros.secret_seed` member
+  is validated strictly (above); everything else is relayed verbatim.
+- `credential_metadata_encrypted_response` is `true` only when the issuer's
+  response was JWE-encrypted. When `credential_metadata` is present and this flag
+  is absent, the value arrived as plain JSON (always so for deferred issuance);
+  clients must refuse secret values in that case. The engine decrypts the JWE
+  itself, so the engine (and any TLS terminator) sees the values in clear.
+- A response whose `credential_metadata` carries `org.siros.secret_seed` must
+  also carry a non-empty response-level `notification_id` (privatedata-spec
+  5A.2); otherwise the issuance fails with `CREDENTIAL_ERROR` and no
+  `flow_complete`. This applies to normal and deferred completion alike.
+  Display-only `credential_metadata` needs no `notification_id`.
+- Seed delivery requires encryption. When the issuer metadata of the requested
+  credential configuration advertises seed delivery
+  (`credential_configurations_supported[cfg].credential_metadata["org.siros.secret_seed"]
+  = {"namespaces": [...]}`: 1 to 8 distinct names of 1 to 64 bytes, none named
+  `namespaces`, no other member; privatedata-spec 5A.4), the engine MUST request
+  response encryption (`credential_response_encryption`, same alg/enc negotiation
+  as always, even when the issuer does not mark encryption as required) and
+  refuses the issuance with `CREDENTIAL_ERROR` if the issuer offers no usable
+  encryption (no request is sent) or answers with a plain response (the body is
+  not parsed). Independently of any advertisement, a plain response (including
+  every deferred response) that carries `org.siros.secret_seed` is refused.
+  Errors and logs contain no values.
+- A malformed advertisement (hex or other values instead of a name list, wrong
+  counts, duplicate or over-long names) means the configuration is not offered
+  (privatedata-spec 5A.3): the engine drops it when decoding issuer metadata
+  (logging only the configuration id) and the resolve endpoint removes the whole
+  configuration from the metadata it serves, so no value reaches the wallet.
+- A valid advertisement is public names-only data and is served to the wallet
+  unchanged in the issuer metadata; the wallet needs it to request encryption.
+  The engine never merges `org.siros.secret_seed`, from issuer metadata or from
+  a response, into display metadata it computes; the response-level object is
+  relayed only on `flow_complete` as above, and the wallet strips the member
+  before merging display data.
+- The engine never logs or persists these values. Any buffer of completion
+  messages (e.g. a WMP event ring) must store `FlowCompleteMessage.Redacted()`,
+  which drops the whole `credential_metadata` object (display data included, not
+  only the seed) and the encrypted flag. Only seed delivery requires encryption:
+  a plain response without the seed member and with display-only
+  `credential_metadata` is relayed as usual (flag absent). Absent member: no
+  field. The same `flow_complete` payload is what `wmp.flow.complete` carries.
+
 Deferred issuance:
 
 ```

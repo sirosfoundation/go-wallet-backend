@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -14,6 +15,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -271,6 +273,10 @@ type CredentialConfig struct {
 	// credential_metadata. Kept raw and unread so an issuer that publishes it
 	// in either shape (some send an array) does not fail the whole document (#370).
 	Claims json.RawMessage `json:"claims,omitempty"`
+	// CredentialMetadata is the 1.0/1.1 credential_metadata member, kept raw.
+	// The engine reads only its org.siros.secret_seed advertisement (see
+	// secretSeedAdvertised); display data is never taken from it here.
+	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
 }
 
 // CredentialConfigurations is credential_configurations_supported, decoded
@@ -303,6 +309,11 @@ func (c *CredentialConfigurations) UnmarshalJSON(data []byte) error {
 	for id, entry := range raw {
 		var cfg CredentialConfig
 		if err := json.Unmarshal(entry, &cfg); err != nil {
+			continue
+		}
+		// A malformed org.siros.secret_seed advertisement means the
+		// configuration is not offered (privatedata-spec 5A.3).
+		if present, ok := SecretSeedAdvertisement(cfg.CredentialMetadata); present && !ok {
 			continue
 		}
 		parsed[id] = cfg
@@ -344,6 +355,17 @@ type CredentialResponse struct {
 	CNonceExpiresIn int           `json:"c_nonce_expires_in,omitempty"`
 	TransactionID   string        `json:"transaction_id,omitempty"`
 	NotificationID  string        `json:"notification_id,omitempty"`
+
+	// CredentialMetadata is the OID4VCI 1.1 response-level credential_metadata
+	// object (openid/OpenID4VCI#721), kept as received. It applies to every
+	// credential in the response and may carry secrets (org.siros.secret_seed):
+	// never log it. Validated by parseCredentialMetadata before relay.
+	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
+
+	// Encrypted records that this response arrived as a JWE (OID4VCI
+	// credential_response_encryption) and was decrypted by us. It is local
+	// state, never part of the wire format.
+	Encrypted bool `json:"-"`
 }
 
 // AvailableCredential represents a credential available for selection
@@ -401,6 +423,7 @@ func decryptJWEResponse(jweString string, privKey *ecdsa.PrivateKey) (*Credentia
 	if err := json.Unmarshal(plaintext, &credResp); err != nil {
 		return nil, fmt.Errorf("failed to parse decrypted credential response: %w", err)
 	}
+	credResp.Encrypted = true
 	return &credResp, nil
 }
 
@@ -1136,15 +1159,38 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		}
 
 		// Complete with the issued credential
-		results := h.buildCredentialResults(ctx, deferredResp, selectedConfig, trust)
-		h.registerNotificationContext(metadata, token, deferredResp)
-		return h.CompleteWithRefreshToken(results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token), h.dpopKeyIDForRefreshToken(token))
+		return h.finishIssuance(ctx, StepDeferred, deferredResp, selectedConfig, trust, metadata, token)
 	}
 
 	// Step 9: Complete with issued credential (fetch VCTM for display)
-	results := h.buildCredentialResults(ctx, credential, selectedConfig, trust)
-	h.registerNotificationContext(metadata, token, credential)
-	return h.CompleteWithRefreshToken(results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token), h.dpopKeyIDForRefreshToken(token))
+	return h.finishIssuance(ctx, StepRequestingCredential, credential, selectedConfig, trust, metadata, token)
+}
+
+// finishIssuance validates the response-level credential_metadata (failing the
+// flow cleanly with CREDENTIAL_ERROR when malformed), builds the results and
+// completes the flow, relaying credential_metadata on the completion message.
+func (h *OID4VCIHandler) finishIssuance(ctx context.Context, step FlowStep, resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo, metadata *IssuerMetadata, token *TokenResponse) error {
+	relay, err := credentialMetadataRelay(resp)
+	if err == nil && relay != nil && !relay.Encrypted {
+		// A plain response never delivers a seed, advertised or not
+		// (privatedata-spec 5A.4); deferred responses are always plain.
+		if hasSecretSeedMember(relay.Metadata) {
+			err = errors.New("secret seed credential_metadata arrived in a plain response")
+		}
+	}
+	if err == nil && relay != nil && hasSecretSeedMember(relay.Metadata) && resp.NotificationID == "" {
+		// privatedata-spec 5A.2: a delivered seed needs the response-level
+		// notification_id, so the issuer can be told if the wallet rejects it.
+		err = errors.New("secret seed credential_metadata without a notification_id")
+	}
+	if err != nil {
+		h.Logger.Warn("rejecting credential response", zap.Error(err))
+		_ = h.Error(step, ErrCodeCredentialError, "Issuer returned malformed credential metadata")
+		return err
+	}
+	results := h.buildCredentialResults(ctx, resp, config, trust)
+	h.registerNotificationContext(metadata, token, resp)
+	return h.Flow.Session.sendFlowComplete(h.Flow.ID, results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token), h.dpopKeyIDForRefreshToken(token), relay)
 }
 
 // dpopJWKForRefreshToken exports h.dpopKey as a private JWK for relay to the
@@ -1383,6 +1429,10 @@ func (h *OID4VCIHandler) logIgnoredCredentialConfigurations(source map[string]in
 			h.Logger.Warn("ignoring credential configuration with a broken format",
 				zap.String("credential_configuration_id", id),
 				zap.Error(err))
+		} else if present, ok := SecretSeedAdvertisement(cfg.CredentialMetadata); present && !ok {
+			// Never log the member: a malformed one may carry seed values.
+			h.Logger.Warn("ignoring credential configuration with a malformed secret seed advertisement",
+				zap.String("credential_configuration_id", id))
 		}
 	}
 }
@@ -2550,9 +2600,27 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		reqBody["proofs"] = map[string][]string{proofType: proofValues}
 	}
 
+	// Seed delivery needs an encrypted response: the credential_metadata then
+	// carries secret material that must not travel as plain JSON.
+	seedAdvertised, seedErr := secretSeedAdvertised(config)
+	if seedErr != nil {
+		h.Logger.Warn("rejecting issuer metadata", zap.Error(seedErr))
+		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer advertised malformed secret seed metadata")
+		return nil, seedErr
+	}
+	refuseSeed := func(msg string) (*CredentialResponse, error) {
+		err := errors.New(msg)
+		h.Logger.Warn("rejecting credential request", zap.Error(err))
+		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer cannot deliver the secret seed over an encrypted response")
+		return nil, err
+	}
+
 	// Credential response encryption (OID4VCI §7.3)
 	var encKey *ecdsa.PrivateKey
 	encCfg := metadata.CredentialResponseEncryption
+	if seedAdvertised && encCfg == nil {
+		return refuseSeed("issuer advertises secret seed delivery but no credential response encryption")
+	}
 	if encCfg != nil {
 		// Negotiate a mutually supported alg/enc pair (prefer stronger encryption)
 		type algEnc struct{ alg, enc string }
@@ -2571,6 +2639,9 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			}
 		}
 		if selectedAlg == "" || selectedEnc == "" {
+			if seedAdvertised {
+				return refuseSeed("issuer advertises secret seed delivery but no mutually supported alg/enc pair is available")
+			}
 			if encCfg.EncryptionRequired {
 				return nil, fmt.Errorf("issuer requires credential response encryption but no mutually supported alg/enc pair is available")
 			}
@@ -2662,6 +2733,12 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 				return nil, err
 			}
 			return credResp, nil
+		}
+
+		if seedAdvertised {
+			// Plain response although seed delivery was advertised: refuse
+			// without parsing, so no contents can reach errors or logs.
+			return refuseSeed("issuer answered a secret seed credential request without encrypting the response")
 		}
 
 		var credResp CredentialResponse
@@ -2784,10 +2861,12 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 		typeMetadata = h.Registry.FetchTypeMetadataJSON(ctx, config.VCT)
 	}
 
-	// appendResult builds a CredentialResult for a single credential value
+	// appendResult normalizes one issuer-returned credential entry
 	// (which may be a string or a wrapped object) and appends it. Per OID4VCI
 	// §8.3/§11 there is a single notification_id per Credential Response, so the
 	// same resp.NotificationID applies to every credential in the response.
+	// The response-level credential_metadata is relayed separately on the
+	// flow-complete message (see credentialMetadataRelay).
 	appendResult := func(cred interface{}) {
 		results = append(results, CredentialResult{
 			Format:         config.Format,
@@ -2806,6 +2885,230 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 	}
 
 	return results
+}
+
+// Limits for the response-level credential_metadata relay. The object is
+// primarily display metadata (display[], locale, logo.uri which the 1.1 draft's
+// own example sets to a data: URI, background_image, claims[]) and is relayed
+// verbatim, so the caps only stop abuse, they must not reject a conformant
+// issuer. Strict validation applies only to org.siros.secret_seed.
+const (
+	// 1 MiB: a few embedded data: URI logos / background images (each typically
+	// tens to a few hundred KiB once base64-encoded) fit comfortably, while a
+	// hostile issuer cannot make the engine relay or buffer megabytes per
+	// response. The raw HTTP body is separately capped at MaxHTTPResponseBodyBytes.
+	maxCredentialMetadataBytes   = 1 << 20
+	maxCredentialMetadataDepth   = 16  // nesting of objects/arrays (display[].logo.* needs about 4); the top-level object is depth 1
+	maxCredentialMetadataMembers = 256 // sanity cap on the members of any one object
+	maxCredentialMetadataKeyLen  = 256 // bytes of any member name
+	maxSeedNamespaces            = 8   // privatedata-spec 5A.1/5A.4: 1..8 namespaces
+	maxSeedNamespaceBytes        = 64  // privatedata-spec 5A.1: 1..64 UTF-8 bytes
+
+	// secretSeedMember is the SIROS extension member of credential_metadata:
+	// {"<namespace>": "<lowercase hex>", ...}.
+	secretSeedMember = "org.siros.secret_seed"
+)
+
+// SecretSeedAdvertisement inspects the credential_metadata of one credential
+// configuration of the issuer metadata for the org.siros.secret_seed member.
+// present reports whether the member exists; ok is true only for the valid
+// advertisement form {"namespaces": [1..8 distinct names of 1..64 bytes, none
+// "namespaces"]} (privatedata-spec 5A.4). Anything else, in particular a member
+// carrying hex or other values instead of a name list, is malformed
+// (present && !ok). A credential_metadata that is not an object has no member.
+func SecretSeedAdvertisement(credentialMetadata json.RawMessage) (present, ok bool) {
+	if len(credentialMetadata) == 0 {
+		return false, false
+	}
+	var md map[string]json.RawMessage
+	if json.Unmarshal(credentialMetadata, &md) != nil {
+		return false, false
+	}
+	raw, present := md[secretSeedMember]
+	if !present {
+		return false, false
+	}
+	var adv map[string]json.RawMessage
+	if json.Unmarshal(raw, &adv) != nil || len(adv) != 1 {
+		return true, false
+	}
+	var ns []string
+	if json.Unmarshal(adv["namespaces"], &ns) != nil || len(ns) == 0 || len(ns) > maxSeedNamespaces {
+		return true, false
+	}
+	seen := make(map[string]struct{}, len(ns))
+	for _, n := range ns {
+		if !validSeedNamespace(n) {
+			return true, false
+		}
+		if _, dup := seen[n]; dup {
+			return true, false
+		}
+		seen[n] = struct{}{}
+	}
+	return true, true
+}
+
+// secretSeedAdvertised reports whether a credential configuration advertises
+// seed delivery. A malformed advertisement returns an error that never
+// includes the offending content.
+func secretSeedAdvertised(config *CredentialConfig) (bool, error) {
+	if config == nil {
+		return false, nil
+	}
+	present, ok := SecretSeedAdvertisement(config.CredentialMetadata)
+	if present && !ok {
+		return false, fmt.Errorf("issuer metadata %s advertisement is malformed", secretSeedMember)
+	}
+	return ok, nil
+}
+
+func hasSecretSeedMember(md json.RawMessage) bool {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(md, &m) != nil {
+		return false
+	}
+	_, ok := m[secretSeedMember]
+	return ok
+}
+
+// A seed is exactly 32 lowercase hex characters (16 bytes), privatedata-spec 5A.1.
+var secretSeedHexRE = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// validSeedNamespace: 1..64 bytes, and not the name "namespaces", which is
+// reserved for the issuer-metadata advertisement (5A.1).
+func validSeedNamespace(n string) bool {
+	return n != "" && n != "namespaces" && len(n) <= maxSeedNamespaceBytes
+}
+
+// credentialMetadataRelay validates the response-level credential_metadata of
+// an issuer response and returns what to relay (nil when absent). Errors never
+// include contents (they may be secrets).
+func credentialMetadataRelay(resp *CredentialResponse) (*CredentialMetadataRelay, error) {
+	if resp == nil || len(resp.CredentialMetadata) == 0 {
+		return nil, nil
+	}
+	md, err := parseCredentialMetadata(resp.CredentialMetadata)
+	if err != nil {
+		return nil, err
+	}
+	return &CredentialMetadataRelay{Metadata: md, Encrypted: resp.Encrypted}, nil
+}
+
+// parseCredentialMetadata validates the OID4VCI 1.1 response-level
+// credential_metadata: a JSON object, within the size/depth/member/key caps,
+// without duplicate member names. Unknown members are preserved verbatim. If
+// the org.siros.secret_seed member is present it must be an object of
+// non-empty namespaces mapping to non-empty lowercase hex strings. The result
+// is the object compacted (insignificant whitespace removed), otherwise as
+// received.
+func parseCredentialMetadata(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) > maxCredentialMetadataBytes {
+		return nil, fmt.Errorf("credential_metadata exceeds %d bytes", maxCredentialMetadataBytes)
+	}
+	if err := checkCredentialMetadataShape(raw); err != nil {
+		return nil, err
+	}
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil || members == nil {
+		return nil, errors.New("credential_metadata is not an object")
+	}
+	if seed, ok := members[secretSeedMember]; ok {
+		var ns map[string]string
+		if err := json.Unmarshal(seed, &ns); err != nil || len(ns) == 0 || len(ns) > maxSeedNamespaces {
+			return nil, fmt.Errorf("credential_metadata %s is not an object of 1..%d string seeds", secretSeedMember, maxSeedNamespaces)
+		}
+		// The advertisement form ("namespaces") is not a delivery and is
+		// rejected here: "namespaces" is not a valid seed namespace.
+		for k, v := range ns {
+			if !validSeedNamespace(k) || !secretSeedHexRE.MatchString(v) {
+				return nil, fmt.Errorf("credential_metadata %s has an invalid namespace or a seed that is not 32 lowercase hex characters", secretSeedMember)
+			}
+		}
+	}
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, raw); err != nil {
+		return nil, errors.New("credential_metadata is not valid JSON")
+	}
+	return json.RawMessage(buf.Bytes()), nil
+}
+
+// checkCredentialMetadataShape walks the token stream enforcing the depth,
+// per-object member and key-length caps everywhere, and rejecting duplicate
+// member names at the top level and inside the org.siros.secret_seed object
+// (elsewhere the object is display data that is relayed as received).
+func checkCredentialMetadataShape(raw json.RawMessage) error {
+	type frame struct {
+		obj       bool
+		expectKey bool
+		members   int
+		lastKey   string
+		unique    bool // duplicate member names rejected: top level and the secret seed object
+		keys      map[string]struct{}
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	var stack []frame
+	valueDone := func() {
+		if n := len(stack); n > 0 && stack[n-1].obj {
+			stack[n-1].expectKey = true
+		}
+	}
+	for {
+		tok, err := dec.Token()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return errors.New("credential_metadata is not valid JSON")
+		}
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '{', '[':
+				if len(stack)+1 > maxCredentialMetadataDepth {
+					return fmt.Errorf("credential_metadata nests deeper than %d", maxCredentialMetadataDepth)
+				}
+				f := frame{obj: d == '{', expectKey: d == '{'}
+				if f.obj {
+					top := len(stack) == 0
+					seed := len(stack) == 1 && stack[0].obj && stack[0].lastKey == secretSeedMember
+					if top || seed {
+						f.unique = true
+						f.keys = map[string]struct{}{}
+					}
+				}
+				stack = append(stack, f)
+			default:
+				stack = stack[:len(stack)-1]
+				valueDone()
+			}
+			continue
+		}
+		n := len(stack)
+		if n > 0 && stack[n-1].obj && stack[n-1].expectKey {
+			key, _ := tok.(string)
+			if len(key) > maxCredentialMetadataKeyLen {
+				return fmt.Errorf("credential_metadata member name exceeds %d bytes", maxCredentialMetadataKeyLen)
+			}
+			if stack[n-1].unique {
+				if _, dup := stack[n-1].keys[key]; dup {
+					return errors.New("credential_metadata has a duplicate member name")
+				}
+				stack[n-1].keys[key] = struct{}{}
+			}
+			stack[n-1].lastKey = key
+			stack[n-1].members++
+			if stack[n-1].members > maxCredentialMetadataMembers {
+				return fmt.Errorf("credential_metadata object has more than %d members", maxCredentialMetadataMembers)
+			}
+			stack[n-1].expectKey = false
+			continue
+		}
+		valueDone()
+	}
+	if len(stack) != 0 {
+		return errors.New("credential_metadata is not valid JSON")
+	}
+	return nil
 }
 
 // credentialToString normalizes an issuer-returned credential value into the
