@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -159,6 +160,11 @@ type wmpEventBuffer struct {
 // wmpStream identifies one SSE connection registered on a buffer.
 type wmpStream struct {
 	cancel context.CancelFunc
+	// live holds the secret-bearing form of events that exist in the ring only
+	// in redacted form (see splitFlowCompleteSecrets), keyed by event ID. It is
+	// stream-local: delivered at most once to this connection, never replayed,
+	// and discarded with the stream. Guarded by wmpEventBuffer.mu.
+	live map[int64][]byte
 }
 
 // ensure lazily initialises the signalling channels. Callers must hold b.mu.
@@ -198,14 +204,35 @@ func (b *wmpEventBuffer) release(s *wmpStream) {
 // append records data as a new event, wakes waiting SSE handlers and returns
 // the event's sequence ID.
 func (b *wmpEventBuffer) append(data []byte) int64 {
+	return b.appendLive(data, nil)
+}
+
+// appendLive records replay (the form retained for Last-Event-ID replay and
+// resume) as a new event. live, when non-nil, is the secret-bearing form of the
+// same event: it is handed only to the SSE connection streaming at this moment
+// and is never stored in the ring. A client that is not connected sees replay.
+func (b *wmpEventBuffer) appendLive(replay, live []byte) int64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.ensure()
 	b.nextID++
 	id := b.nextID
-	b.events = append(b.events, wmpBufferedEvent{ID: id, Data: data})
+	b.events = append(b.events, wmpBufferedEvent{ID: id, Data: replay})
 	if len(b.events) > maxWMPBufferedEvents {
 		b.events = b.events[len(b.events)-maxWMPBufferedEvents:]
+	}
+	if b.active != nil {
+		if live != nil {
+			if b.active.live == nil {
+				b.active.live = make(map[int64][]byte)
+			}
+			b.active.live[id] = live
+		}
+		for lid := range b.active.live {
+			if lid < b.events[0].ID {
+				delete(b.active.live, lid) // trimmed out of the ring: never delivered
+			}
+		}
 	}
 	close(b.wake)
 	b.wake = make(chan struct{})
@@ -225,6 +252,20 @@ func (b *wmpEventBuffer) after(cursor int64) ([]wmpBufferedEvent, <-chan struct{
 		}
 	}
 	return out, b.wake
+}
+
+// takeLive returns, and forgets, the secret-bearing form of event id for the
+// stream s, or nil when there is none (not the streaming connection, or the
+// event carried no secrets).
+func (b *wmpEventBuffer) takeLive(s *wmpStream, id int64) []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if s == nil || s.live == nil {
+		return nil
+	}
+	data := s.live[id]
+	delete(s.live, id)
+	return data
 }
 
 // doneCh is closed when the owning session has ended.
@@ -291,7 +332,11 @@ func pumpEvents(ctx context.Context, ct *wmp.ChannelTransport, buf *wmpEventBuff
 		if onOut != nil {
 			onOut(data)
 		}
-		buf.append(data)
+		replay, live, ok := splitFlowCompleteSecrets(data)
+		if !ok {
+			return // fail closed: unparseable secret-bearing event is not retained
+		}
+		buf.appendLive(replay, live)
 	}
 	for {
 		select {
@@ -308,6 +353,61 @@ func pumpEvents(ctx context.Context, ct *wmp.ChannelTransport, buf *wmpEventBuff
 			}
 		}
 	}
+}
+
+// wmpCredentialMetadataRedactedKey marks a wmp.flow.complete result, as
+// replayed from the event buffer, whose credential_metadata object (and
+// credential_metadata_encrypted_response flag) was withheld because it may carry
+// secrets such as org.siros.secret_seed. It is only ever set by the replay path.
+const wmpCredentialMetadataRedactedKey = "credential_metadata_redacted"
+
+// splitFlowCompleteSecrets separates a serialised outbound notification into the
+// form safe to retain for replay and the live form. For a wmp.flow.complete whose
+// result carries credential_metadata, replay is the notification with
+// credential_metadata and credential_metadata_encrypted_response removed and
+// credential_metadata_redacted:true added (every other member is preserved
+// byte-for-byte), and live is the original. For anything else replay is data and
+// live is nil. ok is false only when a notification that mentions
+// credential_metadata cannot be parsed, in which case it must not be retained.
+func splitFlowCompleteSecrets(data []byte) (replay, live []byte, ok bool) {
+	if !bytes.Contains(data, []byte(`"credential_metadata`)) {
+		return data, nil, true
+	}
+	var env map[string]json.RawMessage
+	if json.Unmarshal(data, &env) != nil {
+		return nil, nil, false
+	}
+	var method string
+	if json.Unmarshal(env["method"], &method) != nil || method != wmp.MethodFlowComplete {
+		return data, nil, true
+	}
+	var params map[string]json.RawMessage
+	if json.Unmarshal(env["params"], &params) != nil {
+		return nil, nil, false
+	}
+	var result map[string]json.RawMessage
+	if json.Unmarshal(params["result"], &result) != nil {
+		return nil, nil, false
+	}
+	if _, has := result["credential_metadata"]; !has {
+		if _, has = result["credential_metadata_encrypted_response"]; !has {
+			return data, nil, true
+		}
+	}
+	delete(result, "credential_metadata")
+	delete(result, "credential_metadata_encrypted_response")
+	result[wmpCredentialMetadataRedactedKey] = json.RawMessage("true")
+	var err error
+	if params["result"], err = json.Marshal(result); err != nil {
+		return nil, nil, false
+	}
+	if env["params"], err = json.Marshal(params); err != nil {
+		return nil, nil, false
+	}
+	if replay, err = json.Marshal(env); err != nil {
+		return nil, nil, false
+	}
+	return replay, data, true
 }
 
 // resumptionEntry binds a resumption token to a session.
@@ -727,7 +827,9 @@ func withCallerTAC(ctx context.Context, caller wmpCaller) context.Context {
 
 // Events returns the session's outbound notifications (retained events, then
 // live ones) on a channel closed when the session ends. A convenience
-// subscription; the SSE handler reads the buffer directly.
+// subscription; the SSE handler reads the buffer directly. It sees the replay
+// form: a flow-complete's credential_metadata is withheld (see
+// splitFlowCompleteSecrets); only SSE streams receive it live.
 func (a *WMPAdapter) Events(sessionID string) (<-chan []byte, error) {
 	a.mu.RLock()
 	_, ok := a.peers[sessionID]

@@ -265,7 +265,11 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 			default:
 			}
 			armWrite()
-			if _, err := fmt.Fprintf(w, "id: %d\nevent: wmp\ndata: %s\n\n", ev.ID, ev.Data); err != nil {
+			data := ev.Data
+			if live := buf.takeLive(stream, ev.ID); live != nil {
+				data = live // secret-bearing form: this connection only, once, never replayed
+			}
+			if _, err := fmt.Fprintf(w, "id: %d\nevent: wmp\ndata: %s\n\n", ev.ID, data); err != nil {
 				return // client gone or too slow: stop, the event stays replayable
 			}
 			cursor = ev.ID

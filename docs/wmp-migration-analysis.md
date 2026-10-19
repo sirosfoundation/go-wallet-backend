@@ -535,6 +535,38 @@ the WebView's volatile `sessionStorage`), HTTP+SSE provides defense in depth:
 | No cancel | `wmp.flow.cancel` request | WMP already has this |
 | No resume | `wmp.session.resume` request | WMP already has this |
 
+#### `credential_metadata` on `wmp.flow.complete` (OpenID4VCI 1.1)
+
+For an OpenID4VCI flow the `wmp.flow.complete` `result` is the engine's
+`FlowCompleteMessage`. Besides `credentials[]` it can carry, as top-level
+members, the OpenID4VCI 1.1 response-level `credential_metadata` object of the
+issuer's Credential (or Deferred Credential) Response, relayed verbatim and
+applying to every credential in `credentials[]`, and
+`credential_metadata_encrypted_response` (`true` only when the issuer response
+was a JWE; absent means plain JSON, always the case for deferred issuance).
+The `org.siros.secret_seed` member (privatedata-spec 5A) is a delivered secret:
+the engine validates it, requires an encrypted response and a `notification_id`,
+and the client must refuse it in a completion that lacks the encrypted flag.
+The object may carry secrets, so it must never be logged. See
+`docs/websocket-protocol-spec.md` for the validation rules.
+
+Replay and the event ring. The SSE event buffer (200 events per session,
+`Last-Event-ID` replay and `wmp.session.resume`) never holds
+`credential_metadata`. The completion is delivered with the object, once, to the
+SSE connection streaming when it is emitted; the copy retained for replay has
+`credential_metadata` and `credential_metadata_encrypted_response` removed (the
+whole object, display data included, matching `FlowCompleteMessage.Redacted()`)
+and carries `"credential_metadata_redacted": true` in `result`. Trade-off: a
+client that is not connected when the completion is emitted never receives the
+seed, since holding it would put a secret in an in-memory buffer that is
+replayable and lives for the session; it sees the marker and must treat the
+issuance as seed-less (it can re-issue). The completion is the one-time seed
+delivery point; connecting the SSE stream before starting the flow is therefore
+required for seed-bearing issuance. Nothing is added to the Redis session store,
+which holds only session bookkeeping. Other secret members of the completion
+(`refresh_token`, `dpop_jwk`) are, as before, still replayable from the ring.
+
+
 ### Session Model
 
 | Engine | WMP | Gap |
