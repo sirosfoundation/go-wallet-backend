@@ -40,7 +40,7 @@ func NewPKCS11Signer(cfg *PKCS11Config) (*PKCS11Signer, error) {
 
 	signer, err := pkcs11pool.NewSigner(pool, pkcs11pool.KeyByLabel(cfg.KeyLabel))
 	if err != nil {
-		pool.Close()
+		_ = pool.Close()
 		return nil, err
 	}
 

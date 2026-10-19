@@ -369,7 +369,11 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 	if err != nil {
 		return nil, err
 	}
-	return val.(*ResolveResult), nil
+	result, ok := val.(*ResolveResult)
+	if !ok {
+		return nil, fmt.Errorf("issuer metadata resolver: unexpected singleflight result type %T", val)
+	}
+	return result, nil
 }
 
 func (r *Resolver) validateURL(issuerURL string) error {

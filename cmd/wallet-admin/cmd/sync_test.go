@@ -105,7 +105,7 @@ tenants:
 	})
 
 	t.Run("non-existent file", func(t *testing.T) {
-		_, err := loadSyncConfig("/tmp/this-file-does-not-exist-12345.yaml")
+		_, err := loadSyncConfig(filepath.Join(t.TempDir(), "missing.yaml"))
 		if err == nil {
 			t.Error("expected error for non-existent file")
 		}
