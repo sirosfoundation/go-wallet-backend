@@ -355,22 +355,40 @@ func pumpEvents(ctx context.Context, ct *wmp.ChannelTransport, buf *wmpEventBuff
 	}
 }
 
-// wmpCredentialMetadataRedactedKey marks a wmp.flow.complete result, as
-// replayed from the event buffer, whose credential_metadata object (and
-// credential_metadata_encrypted_response flag) was withheld because it may carry
-// secrets such as org.siros.secret_seed. It is only ever set by the replay path.
-const wmpCredentialMetadataRedactedKey = "credential_metadata_redacted"
+// wmpRedactedMembersKey names, in a replayed wmp.flow.complete result, the
+// members that were withheld from the retained copy because they are secrets.
+// It is only ever set by the replay path; the live notification never has it.
+const wmpRedactedMembersKey = "redacted_members"
+
+// wmpSecretResultMembers are the flow-complete result members withheld from the
+// replay copy: the whole credential_metadata object (it may carry
+// org.siros.secret_seed) with its encrypted flag, and the OID4VCI refresh token
+// with the DPoP key it is bound to. credentials[] is deliberately kept.
+var wmpSecretResultMembers = []string{
+	"credential_metadata",
+	"credential_metadata_encrypted_response",
+	"dpop_jwk",
+	"dpop_key_id",
+	"refresh_token",
+}
 
 // splitFlowCompleteSecrets separates a serialised outbound notification into the
 // form safe to retain for replay and the live form. For a wmp.flow.complete whose
-// result carries credential_metadata, replay is the notification with
-// credential_metadata and credential_metadata_encrypted_response removed and
-// credential_metadata_redacted:true added (every other member is preserved
-// byte-for-byte), and live is the original. For anything else replay is data and
-// live is nil. ok is false only when a notification that mentions
-// credential_metadata cannot be parsed, in which case it must not be retained.
+// result carries any wmpSecretResultMembers, replay is the notification with
+// those members removed and "redacted_members": [<names withheld, sorted>] added
+// (every other member is preserved byte-for-byte), and live is the original. For
+// anything else replay is data and live is nil. ok is false only when a
+// notification that mentions one of those members cannot be parsed, in which case
+// it must not be retained.
 func splitFlowCompleteSecrets(data []byte) (replay, live []byte, ok bool) {
-	if !bytes.Contains(data, []byte(`"credential_metadata`)) {
+	mentioned := false
+	for _, k := range wmpSecretResultMembers {
+		if bytes.Contains(data, []byte(`"`+k+`"`)) {
+			mentioned = true
+			break
+		}
+	}
+	if !mentioned {
 		return data, nil, true
 	}
 	var env map[string]json.RawMessage
@@ -389,15 +407,20 @@ func splitFlowCompleteSecrets(data []byte) (replay, live []byte, ok bool) {
 	if json.Unmarshal(params["result"], &result) != nil {
 		return nil, nil, false
 	}
-	if _, has := result["credential_metadata"]; !has {
-		if _, has = result["credential_metadata_encrypted_response"]; !has {
-			return data, nil, true
+	var withheld []string // wmpSecretResultMembers is sorted
+	for _, k := range wmpSecretResultMembers {
+		if _, has := result[k]; has {
+			withheld = append(withheld, k)
+			delete(result, k)
 		}
 	}
-	delete(result, "credential_metadata")
-	delete(result, "credential_metadata_encrypted_response")
-	result[wmpCredentialMetadataRedactedKey] = json.RawMessage("true")
+	if len(withheld) == 0 {
+		return data, nil, true
+	}
 	var err error
+	if result[wmpRedactedMembersKey], err = json.Marshal(withheld); err != nil {
+		return nil, nil, false
+	}
 	if params["result"], err = json.Marshal(result); err != nil {
 		return nil, nil, false
 	}
@@ -828,8 +851,8 @@ func withCallerTAC(ctx context.Context, caller wmpCaller) context.Context {
 // Events returns the session's outbound notifications (retained events, then
 // live ones) on a channel closed when the session ends. A convenience
 // subscription; the SSE handler reads the buffer directly. It sees the replay
-// form: a flow-complete's credential_metadata is withheld (see
-// splitFlowCompleteSecrets); only SSE streams receive it live.
+// form: a flow-complete's secret members are withheld (see
+// splitFlowCompleteSecrets); only SSE streams receive them live.
 func (a *WMPAdapter) Events(sessionID string) (<-chan []byte, error) {
 	a.mu.RLock()
 	_, ok := a.peers[sessionID]

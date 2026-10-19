@@ -614,8 +614,9 @@ shared between replicas:
   session TTL and the resumption tokens),
 - the active flows and their handler goroutines, and
 - the per-session SSE event buffer used for `Last-Event-ID` replay (a replayed
-  `wmp.flow.complete` never carries `credential_metadata`; it is delivered only
-  live, see `docs/wmp-migration-analysis.md`).
+  `wmp.flow.complete` never carries `credential_metadata`, `refresh_token`,
+  `dpop_jwk` or `dpop_key_id`; they are delivered only live, see
+  `docs/wmp-migration-analysis.md`).
 
 The Redis session store does **not** change this: it backs the WebSocket
 engine's persisted session bookkeeping, not the WMP session registry, event

@@ -551,20 +551,25 @@ The object may carry secrets, so it must never be logged. See
 `docs/websocket-protocol-spec.md` for the validation rules.
 
 Replay and the event ring. The SSE event buffer (200 events per session,
-`Last-Event-ID` replay and `wmp.session.resume`) never holds
-`credential_metadata`. The completion is delivered with the object, once, to the
-SSE connection streaming when it is emitted; the copy retained for replay has
-`credential_metadata` and `credential_metadata_encrypted_response` removed (the
-whole object, display data included, matching `FlowCompleteMessage.Redacted()`)
-and carries `"credential_metadata_redacted": true` in `result`. Trade-off: a
-client that is not connected when the completion is emitted never receives the
-seed, since holding it would put a secret in an in-memory buffer that is
-replayable and lives for the session; it sees the marker and must treat the
-issuance as seed-less (it can re-issue). The completion is the one-time seed
-delivery point; connecting the SSE stream before starting the flow is therefore
-required for seed-bearing issuance. Nothing is added to the Redis session store,
-which holds only session bookkeeping. Other secret members of the completion
-(`refresh_token`, `dpop_jwk`) are, as before, still replayable from the ring.
+`Last-Event-ID` replay and `wmp.session.resume`) never holds the secret members
+of a completion: `credential_metadata` (the whole object, display data included,
+matching `FlowCompleteMessage.Redacted()`), `credential_metadata_encrypted_response`,
+`refresh_token`, `dpop_jwk` and `dpop_key_id`. The completion is delivered in
+full, once, to the SSE connection streaming when it is emitted. The copy retained
+for replay has those members removed, keeps `credentials[]` and everything else,
+and carries a single marker `"redacted_members": [...]` in `result` listing, in
+alphabetical order, exactly the members that were withheld. (One general marker
+instead of a flag per member: it needs no new name for each secret and tells the
+client precisely what is unrecoverable.) Trade-off: a client that is not
+connected when the completion is emitted never receives the seed, the refresh
+token or the DPoP key, since holding them would put secrets in a replayable
+in-memory buffer that lives for the session. It still gets the issued
+credentials, sees the marker, and must treat the withheld members as not
+recoverable (never invent them): an issuance that needed the seed is re-issued,
+and a credential without a refresh token cannot be renewed without re-issuance.
+Connecting the SSE stream before starting the flow is therefore required for
+seed-bearing issuance. Nothing is added to the Redis session store, which holds
+only session bookkeeping.
 
 
 ### Session Model
