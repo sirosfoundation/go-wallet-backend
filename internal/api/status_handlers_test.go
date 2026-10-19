@@ -365,3 +365,30 @@ func TestStatusLists_EndToEnd_NoURIInAnyLog(t *testing.T) {
 		}
 	}
 }
+
+func TestStatusLists_VaryPreservesExistingValues(t *testing.T) {
+	fake := &statusFake{fn: func(context.Context, string) (*statuslist.VerifiedList, error) { return fakeVerified(), nil }}
+	handlers, _ := setupStatusTestHandlers(t, fake, zap.NewNop(), nil)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Header("Vary", "Origin")
+		c.Set("user_id", "user-1234")
+		c.Set("tenant_id", "tenant-x")
+	})
+	router.POST("/status/v1/lists", handlers.StatusLists)
+	w := postStatus(router, `{"lists":[{"uri":"https://a.example/l"}]}`)
+	got := strings.Join(w.Header().Values("Vary"), ",")
+	if !strings.Contains(got, "Origin") || !strings.Contains(got, "Authorization") {
+		t.Fatalf("Vary = %q, want both Origin and Authorization", got)
+	}
+}
+
+func TestAddHeaderToken(t *testing.T) {
+	h := http.Header{}
+	h.Add("Vary", "Origin, Accept-Encoding")
+	addHeaderToken(h, "Vary", "authorization")
+	addHeaderToken(h, "Vary", "Authorization")
+	if got := h.Get("Vary"); got != "Origin, Accept-Encoding, authorization" {
+		t.Fatalf("Vary = %q", got)
+	}
+}

@@ -319,3 +319,27 @@ func TestAuthRateLimiter_LockoutExpiry(t *testing.T) {
 	// Note: token bucket is still depleted, but lockout should be reset
 	// The limiter may still reject due to rate limiting vs lockout
 }
+
+func TestAuthRateLimit429ExposesRetryAfter(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rl := NewAuthRateLimiter(config.AuthRateLimitConfig{Enabled: true, MaxAttempts: 1, WindowSeconds: 60, LockoutSeconds: 30}, zap.NewNop())
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Header("Access-Control-Expose-Headers", "X-Private-Data-ETag") })
+	router.POST("/a", AuthRateLimitMiddlewareWithResponse(rl, func(*gin.Context) string { return "u" }, gin.H{"error": "x"}), func(c *gin.Context) { c.String(200, "ok") })
+	var w *httptest.ResponseRecorder
+	for i := 0; i < 5; i++ {
+		w = httptest.NewRecorder()
+		req, _ := http.NewRequest("POST", "/a", nil)
+		router.ServeHTTP(w, req)
+	}
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("code = %d", w.Code)
+	}
+	got := w.Header().Get("Access-Control-Expose-Headers")
+	if got != "X-Private-Data-ETag, Retry-After" {
+		t.Fatalf("expose = %q", got)
+	}
+	if w.Header().Get("Retry-After") != "30" {
+		t.Fatalf("Retry-After = %q", w.Header().Get("Retry-After"))
+	}
+}
