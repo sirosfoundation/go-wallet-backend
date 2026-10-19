@@ -143,8 +143,13 @@ type databaseProvider interface {
 }
 
 // NewRevocationStore picks the RevocationStore for cfg.Backend. A nil store
-// means the in-memory one.
+// means the in-memory one, which is also what a disabled blacklist gets.
 func NewRevocationStore(ctx context.Context, cfg config.TokenBlacklistConfig, store storage.Store, logger *zap.Logger) (RevocationStore, error) {
+	if !cfg.Enabled {
+		// Disabled: nothing is kept in a shared store, so a failed MongoDB
+		// setup must not install an unavailable store (and fail readiness).
+		return nil, nil
+	}
 	dbp, hasMongo := store.(databaseProvider)
 	switch cfg.Backend {
 	case "":
