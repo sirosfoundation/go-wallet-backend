@@ -373,11 +373,24 @@ func (h *Handlers) RefreshToken(c *gin.Context) {
 // the exact value legacy tokens' own "did" claim already carried, so
 // existing stored credentials stay reachable.
 func (h *Handlers) getHolderDID(c *gin.Context) (string, bool) {
-	userID, exists := c.Get("user_id")
+	userID, ok := contextUserID(c)
+	if !ok {
+		return "", false
+	}
+	return domain.HolderDID(userID), true
+}
+
+// contextUserID returns the authenticated user ID set on the gin context by
+// the auth middleware. It reports false when the value is missing or is not a
+// string, so callers fail closed (401) rather than panicking on a bad
+// assertion.
+func contextUserID(c *gin.Context) (string, bool) {
+	v, exists := c.Get("user_id")
 	if !exists {
 		return "", false
 	}
-	return domain.HolderDID(userID.(string)), true
+	userID, ok := v.(string)
+	return userID, ok
 }
 
 // getTenantID retrieves the tenant ID from context.
@@ -771,13 +784,13 @@ func (h *Handlers) GenerateKeyAttestation(c *gin.Context) {
 
 // GetPrivateData retrieves the user's private data
 func (h *Handlers) GetPrivateData(c *gin.Context) {
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
 
-	data, etag, err := h.services.User.GetPrivateData(c.Request.Context(), domain.UserIDFromString(userID.(string)))
+	data, etag, err := h.services.User.GetPrivateData(c.Request.Context(), domain.UserIDFromString(userID))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "User not found"})
@@ -806,8 +819,8 @@ func (h *Handlers) GetPrivateData(c *gin.Context) {
 
 // UpdatePrivateData updates the user's private data
 func (h *Handlers) UpdatePrivateData(c *gin.Context) {
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
@@ -832,7 +845,7 @@ func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 
 	newEtag, err := h.services.User.UpdatePrivateData(
 		c.Request.Context(),
-		domain.UserIDFromString(userID.(string)),
+		domain.UserIDFromString(userID),
 		[]byte(privateData),
 		ifMatch,
 	)
@@ -995,7 +1008,12 @@ func (h *Handlers) Logout(c *gin.Context) {
 	}
 
 	// Parse the token to get claims (we need jti, exp, and sid)
-	token, _ := jwt.Parse(tokenString.(string), func(token *jwt.Token) (interface{}, error) {
+	tokenStr, ok := tokenString.(string)
+	if !ok {
+		c.JSON(401, gin.H{"error": "Unauthorized"})
+		return
+	}
+	token, _ := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
 		return []byte(h.cfg.JWT.Secret), nil
 	})
 
@@ -1047,8 +1065,8 @@ func (h *Handlers) Logout(c *gin.Context) {
 
 // DeleteUser deletes the current user and all associated data
 func (h *Handlers) DeleteUser(c *gin.Context) {
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
@@ -1061,7 +1079,7 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 
 	if err := h.services.User.DeleteUser(
 		c.Request.Context(),
-		domain.UserIDFromString(userID.(string)),
+		domain.UserIDFromString(userID),
 		holderDID,
 	); err != nil {
 		h.logger.Error("Failed to delete user", zap.Error(err))
@@ -1096,13 +1114,13 @@ type WebauthnCredentialInfo struct {
 
 // GetAccountInfo returns account information for the current user
 func (h *Handlers) GetAccountInfo(c *gin.Context) {
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
 
-	user, err := h.services.User.GetUserByID(c.Request.Context(), domain.UserIDFromString(userID.(string)))
+	user, err := h.services.User.GetUserByID(c.Request.Context(), domain.UserIDFromString(userID))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(403, gin.H{})
@@ -1146,8 +1164,8 @@ type UpdateSettingsRequest struct {
 
 // UpdateSettings updates user settings
 func (h *Handlers) UpdateSettings(c *gin.Context) {
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
@@ -1158,7 +1176,7 @@ func (h *Handlers) UpdateSettings(c *gin.Context) {
 		return
 	}
 
-	user, err := h.services.User.GetUserByID(c.Request.Context(), domain.UserIDFromString(userID.(string)))
+	user, err := h.services.User.GetUserByID(c.Request.Context(), domain.UserIDFromString(userID))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(403, gin.H{})
@@ -1193,13 +1211,13 @@ func (h *Handlers) StartAddWebAuthnCredential(c *gin.Context) {
 		return
 	}
 
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
 
-	resp, err := h.services.WebAuthn.BeginAddCredential(c.Request.Context(), domain.UserIDFromString(userID.(string)))
+	resp, err := h.services.WebAuthn.BeginAddCredential(c.Request.Context(), domain.UserIDFromString(userID))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(403, gin.H{})
@@ -1220,8 +1238,8 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 		return
 	}
 
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
@@ -1237,7 +1255,7 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 
 	resp, err := h.services.WebAuthn.FinishAddCredential(
 		c.Request.Context(),
-		domain.UserIDFromString(userID.(string)),
+		domain.UserIDFromString(userID),
 		&req,
 		ifMatch,
 	)
@@ -1254,7 +1272,7 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 			c.JSON(403, gin.H{"error": "Authenticator not allowed"})
 		case errors.Is(err, service.ErrPrivateDataConflict):
 			// Get current ETag
-			user, _ := h.services.User.GetUserByID(c.Request.Context(), domain.UserIDFromString(userID.(string)))
+			user, _ := h.services.User.GetUserByID(c.Request.Context(), domain.UserIDFromString(userID))
 			if user != nil {
 				c.Header("X-Private-Data-ETag", user.PrivateDataETag)
 			}
@@ -1280,8 +1298,8 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 		return
 	}
 
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
@@ -1298,7 +1316,7 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 
 	newEtag, err := h.services.User.DeleteWebAuthnCredential(
 		c.Request.Context(),
-		domain.UserIDFromString(userID.(string)),
+		domain.UserIDFromString(userID),
 		credentialID,
 		[]byte(req.PrivateData),
 		ifMatch,
@@ -1334,8 +1352,8 @@ func (h *Handlers) RenameWebAuthnCredential(c *gin.Context) {
 		return
 	}
 
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
@@ -1350,7 +1368,7 @@ func (h *Handlers) RenameWebAuthnCredential(c *gin.Context) {
 
 	if err := h.services.User.RenameWebAuthnCredential(
 		c.Request.Context(),
-		domain.UserIDFromString(userID.(string)),
+		domain.UserIDFromString(userID),
 		credentialID,
 		req.Nickname,
 	); err != nil {
@@ -1379,13 +1397,13 @@ func (h *Handlers) WebSocketKeystore(c *gin.Context) {
 
 // KeystoreStatus checks if a user's keystore client is connected
 func (h *Handlers) KeystoreStatus(c *gin.Context) {
-	userID, exists := c.Get("user_id")
-	if !exists {
+	userID, ok := contextUserID(c)
+	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
 		return
 	}
 
-	connected := h.services.Keystore.IsClientConnected(userID.(string))
+	connected := h.services.Keystore.IsClientConnected(userID)
 	c.JSON(200, gin.H{
 		"connected": connected,
 	})

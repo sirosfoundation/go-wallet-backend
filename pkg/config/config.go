@@ -590,7 +590,7 @@ func (c HTTPClientConfig) newHTTPClient(timeoutOverride time.Duration, trustedHo
 		timeout = timeoutOverride
 	}
 
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport := cloneDefaultTransport()
 
 	if c.InsecureSkipVerify {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
@@ -1696,7 +1696,7 @@ func (c *TrustConfig) NewPDPHTTPClient(timeoutOverride time.Duration) (*http.Cli
 		tlsCfg.RootCAs = pool
 	}
 
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport := cloneDefaultTransport()
 	transport.TLSClientConfig = tlsCfg
 	// No proxy — PDP is an internal service reached directly.
 	transport.Proxy = nil
@@ -2908,4 +2908,28 @@ func (c StatusCheckConfig) validate() error {
 		return fmt.Errorf("invalid status_check.max_list_bytes %d: must not be negative", c.MaxListBytes)
 	}
 	return nil
+}
+
+// cloneDefaultTransport returns a private copy of http.DefaultTransport so
+// callers can customise TLS/proxy settings without mutating the shared
+// default. http.DefaultTransport is a mutable package variable; if something
+// has replaced it with a non-*http.Transport RoundTripper, fall back to a
+// fresh Transport carrying the same defaults as the standard library's,
+// instead of panicking on a failed type assertion.
+func cloneDefaultTransport() *http.Transport {
+	if t, ok := http.DefaultTransport.(*http.Transport); ok && t != nil {
+		return t.Clone()
+	}
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 }
