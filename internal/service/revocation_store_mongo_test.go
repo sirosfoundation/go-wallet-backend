@@ -230,28 +230,33 @@ func TestNewRevocationStore_Selection(t *testing.T) {
 	plain := memory.NewStore()
 	dead := mongoStoreFake{Store: plain, db: deadMongoDB(t)}
 
+	t.Run("disabled never touches MongoDB", func(t *testing.T) {
+		s, err := NewRevocationStore(ctx, config.TokenBlacklistConfig{Backend: "storage"}, dead, logger)
+		require.NoError(t, err)
+		require.Nil(t, s)
+	})
 	t.Run("default with non-MongoDB storage is memory", func(t *testing.T) {
-		s, err := NewRevocationStore(ctx, config.TokenBlacklistConfig{}, plain, logger)
+		s, err := NewRevocationStore(ctx, config.TokenBlacklistConfig{Enabled: true}, plain, logger)
 		require.NoError(t, err)
 		require.Nil(t, s)
 	})
 	t.Run("explicit memory with MongoDB storage is memory", func(t *testing.T) {
-		s, err := NewRevocationStore(ctx, config.TokenBlacklistConfig{Backend: "memory"}, dead, logger)
+		s, err := NewRevocationStore(ctx, config.TokenBlacklistConfig{Enabled: true, Backend: "memory"}, dead, logger)
 		require.NoError(t, err)
 		require.Nil(t, s)
 	})
 	t.Run("storage needs MongoDB", func(t *testing.T) {
-		_, err := NewRevocationStore(ctx, config.TokenBlacklistConfig{Backend: "storage"}, plain, logger)
+		_, err := NewRevocationStore(ctx, config.TokenBlacklistConfig{Enabled: true, Backend: "storage"}, plain, logger)
 		require.Error(t, err)
 	})
 	t.Run("unknown backend", func(t *testing.T) {
-		_, err := NewRevocationStore(ctx, config.TokenBlacklistConfig{Backend: "redis"}, plain, logger)
+		_, err := NewRevocationStore(ctx, config.TokenBlacklistConfig{Enabled: true, Backend: "redis"}, plain, logger)
 		require.Error(t, err)
 	})
 	t.Run("default with MongoDB storage uses MongoDB", func(t *testing.T) {
 		// The dead database cannot create its index, which proves the
 		// MongoDB store was selected without a server.
-		_, err := NewRevocationStore(ctx, config.TokenBlacklistConfig{}, dead, logger)
+		_, err := NewRevocationStore(ctx, config.TokenBlacklistConfig{Enabled: true}, dead, logger)
 		require.Error(t, err)
 		require.True(t, strings.Contains(err.Error(), revokedTokensCollection), err.Error())
 	})
@@ -270,6 +275,19 @@ func TestNewServices_RevocationStoreFailureIsReported(t *testing.T) {
 	_, err = svc.TokenBlacklist.IsUserRevoked(ctx, "any")
 	require.Error(t, err)
 	require.Error(t, svc.TokenBlacklist.Add(ctx, "any", time.Now().Add(time.Hour)))
+}
+
+// A disabled blacklist must not make readiness fail because its (unused)
+// shared store could not be set up.
+func TestNewServices_DisabledBlacklistWithFailedStoreIsReady(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.TokenBlacklist = config.TokenBlacklistConfig{Enabled: false, Backend: "storage"}
+	cfg.Server.RPID = "localhost"
+	cfg.Server.RPOrigin = "http://localhost"
+	// Storage is not MongoDB, so backend=storage cannot be honoured.
+	svc := NewServices(memory.NewStore(), cfg, zap.NewNop())
+	require.NoError(t, svc.TokenBlacklist.Ready())
+	require.False(t, svc.TokenBlacklist.IsBlacklisted(context.Background(), "any"))
 }
 
 func TestMongoRevocationStore_Remove(t *testing.T) {
