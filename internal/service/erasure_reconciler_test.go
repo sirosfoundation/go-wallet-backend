@@ -106,7 +106,9 @@ func TestReconcileUser_LeavesAUserWithALiveInstanceInAnotherTenantAlone(t *testi
 func TestReconcileUser_UnrecognizedStatusFailsClosed(t *testing.T) {
 	svc, store, userID, holder := twoTenantFixture(t)
 	ctx := context.Background()
-	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "inst-"+string(tenantA), tenantA, domain.InstanceStatusRevoked, "seed"))
+	// Revoke both fixture instances so the unrecognized status is the only
+	// reason reconciliation can refuse.
+	revokeSilently(t, store, userID)
 	seedRawInstance(t, store, tenantB, "inst-raw", userID, "", unknownInstanceStatus)
 
 	out, err := svc.ReconcileUser(ctx, userID, inTheFuture())
