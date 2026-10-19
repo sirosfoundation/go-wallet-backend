@@ -30,3 +30,20 @@ func TestSanitizeSecretSeedAdvertisement(t *testing.T) {
 	assert.Contains(t, string(out), `"org.siros.secret_seed":{"namespaces":["x"]}`)
 	sanitizeSecretSeedAdvertisement(map[string]interface{}{}) // no panic
 }
+
+func TestSanitizeSecretSeedAdvertisement_DropsSignedJWTOnlyWhenConfigRemoved(t *testing.T) {
+	mk := func(adv string) map[string]interface{} {
+		var md map[string]interface{}
+		require.NoError(t, json.Unmarshal([]byte(`{"signed_metadata":"JWT-WITH-PAYLOAD","credential_configurations_supported":{
+			"a":{"credential_metadata":{"org.siros.secret_seed":`+adv+`}}}}`), &md))
+		return md
+	}
+	md := mk(`{"namespaces":["x"]}`)
+	sanitizeSecretSeedAdvertisement(md)
+	assert.Equal(t, "JWT-WITH-PAYLOAD", md["signed_metadata"], "valid advertisement keeps the JWT")
+
+	md = mk(`{"ns":"deadbeef"}`)
+	sanitizeSecretSeedAdvertisement(md)
+	_, has := md["signed_metadata"]
+	assert.False(t, has, "removing a configuration also drops the original JWT")
+}

@@ -755,7 +755,9 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 		h.inlineLogos(ctx, result.Metadata)
 	}
 	// A valid org.siros.secret_seed advertisement (names only) stays; a
-	// malformed one makes the configuration "not offered" (5A.3).
+	// malformed one makes the configuration "not offered" (5A.3). This runs
+	// after key extraction and the trust decision above, so dropping the
+	// original signed_metadata JWT here cannot change that decision.
 	sanitizeSecretSeedAdvertisement(result.Metadata)
 
 	// Step 6: Evaluate whether this provider is entitled to issue what it is
@@ -989,6 +991,14 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 // A credential configuration whose org.siros.secret_seed member is malformed
 // (carrying hex or any other non-list content) is treated as not offered: the
 // whole configuration is removed, so no such value reaches the wallet.
+//
+// When a configuration is removed, the original signed_metadata JWT (kept by
+// the resolver for legacy signed metadata) is also dropped from the served
+// document: its base64url payload still carries the rejected configuration,
+// and editing the payload would invalidate the signature. The wallet then
+// receives the sanitized claims without that JWT. The signature was verified
+// and the trust decision taken before this runs; the effect is only that the
+// wallet cannot re-verify the (by now modified) document itself.
 func sanitizeSecretSeedAdvertisement(metadata map[string]interface{}) {
 	ccs, ok := metadata["credential_configurations_supported"].(map[string]interface{})
 	if !ok {
@@ -1009,10 +1019,12 @@ func sanitizeSecretSeedAdvertisement(metadata map[string]interface{}) {
 		raw, err := json.Marshal(cm)
 		if err != nil {
 			delete(ccs, id)
+			delete(metadata, "signed_metadata")
 			continue
 		}
 		if present, valid := engine.SecretSeedAdvertisement(raw); present && !valid {
 			delete(ccs, id)
+			delete(metadata, "signed_metadata")
 		}
 	}
 }

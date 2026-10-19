@@ -7,11 +7,7 @@
 <!-- release-notes:v0.23.0:start -->
 ## [v0.23.0] - 2026-10-15
 
-No changes in this release.
-<!-- release-notes:v0.23.0:end -->
-
-<!-- release-notes:v0.22.4:start -->
-## [v0.22.4] - 2026-10-15
+> v0.23.0 is the same commit as v0.22.4. v0.22.4 was tagged as a patch release but contains breaking changes, so it was re-released under a version that signals the break; v0.22.4 is superseded and should not be deployed. The notes below were first generated under v0.22.4.
 
 ### Security
 
@@ -64,6 +60,12 @@ No changes in this release.
 - **BREAKING: AS audiences now required.** `as.audiences` must be set when the AS is enabled. Legacy HMAC tokens require `server.rp_id` in the audience list. (#414, go-tokenauth v0.5.0)
 - **BREAKING: Registry tokens validated against explicit audiences.** The registry now requires `as.audiences` when auth is enabled, following go-tokenauth v0.5.0. (#431)
 - **API: `hasPassword` removed from account info response.** Clients must tolerate the field's absence. (#420, #162)
+<!-- release-notes:v0.23.0:end -->
+
+<!-- release-notes:v0.22.4:start -->
+## [v0.22.4] - 2026-10-15
+
+**Superseded by [v0.23.0](https://github.com/sirosfoundation/go-wallet-backend/releases/tag/v0.23.0).** This release was tagged as a patch release but contains breaking changes (see the v0.23.0 notes above). It is the same commit as v0.23.0. The `0.22` image tag points at a build of v0.22.3, not at this release.
 <!-- release-notes:v0.22.4:end -->
 
 <!-- release-notes:v0.22.3:start -->

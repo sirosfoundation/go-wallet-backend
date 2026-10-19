@@ -599,6 +599,12 @@ to every credential in `credentials[]`:
   (privatedata-spec 5A.3): the engine drops it when decoding issuer metadata
   (logging only the configuration id) and the resolve endpoint removes the whole
   configuration from the metadata it serves, so no value reaches the wallet.
+  For legacy signed metadata the resolver also keeps the original
+  `signed_metadata` JWT, whose payload still carries the rejected configuration;
+  when a configuration is removed that JWT is dropped from the served document
+  too (editing the payload would break the signature). Signature verification
+  and the trust decision happen before this, so they are unaffected; the wallet
+  just cannot re-verify the modified document itself.
 - A valid advertisement is public names-only data and is served to the wallet
   unchanged in the issuer metadata; the wallet needs it to request encryption.
   The engine never merges `org.siros.secret_seed`, from issuer metadata or from
@@ -608,7 +614,8 @@ to every credential in `credentials[]`:
 - The engine never logs or persists these values. Any buffer of completion
   messages (e.g. a WMP event ring) must store `FlowCompleteMessage.Redacted()`,
   which drops the whole `credential_metadata` object (display data included, not
-  only the seed) and the encrypted flag. Only seed delivery requires encryption:
+  only the seed) and the encrypted flag. It is for buffering only, not for
+  logging: the copy still holds the credentials, refresh token and DPoP key. Only seed delivery requires encryption:
   a plain response without the seed member and with display-only
   `credential_metadata` is relayed as usual (flag absent). Absent member: no
   field. The same `flow_complete` payload is what `wmp.flow.complete` carries.

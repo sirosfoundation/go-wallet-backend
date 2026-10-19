@@ -421,7 +421,9 @@ func decryptJWEResponse(jweString string, privKey *ecdsa.PrivateKey) (*Credentia
 
 	var credResp CredentialResponse
 	if err := json.Unmarshal(plaintext, &credResp); err != nil {
-		return nil, fmt.Errorf("failed to parse decrypted credential response: %w", err)
+		// The decoder's error can quote response content (e.g. an
+		// out-of-range number); never include it.
+		return nil, errors.New("failed to parse decrypted credential response")
 	}
 	credResp.Encrypted = true
 	return &credResp, nil
@@ -2743,7 +2745,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 
 		var credResp CredentialResponse
 		if err := json.Unmarshal(body, &credResp); err != nil {
-			return nil, fmt.Errorf("failed to parse credential response: %w", err)
+			return nil, errors.New("failed to parse credential response")
 		}
 
 		return &credResp, nil
@@ -2818,7 +2820,7 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 			// Credential is ready
 			var credResp CredentialResponse
 			if err := json.Unmarshal(body, &credResp); err != nil {
-				return nil, fmt.Errorf("failed to parse deferred credential response: %w", err)
+				return nil, errors.New("failed to parse deferred credential response")
 			}
 			h.Logger.Info("Deferred credential received", zap.String("transaction_id", transactionID))
 			return &credResp, nil
@@ -3047,6 +3049,7 @@ func checkCredentialMetadataShape(raw json.RawMessage) error {
 		keys      map[string]struct{}
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber() // numbers are relayed verbatim; no float64 range limit (1e400)
 	var stack []frame
 	valueDone := func() {
 		if n := len(stack); n > 0 && stack[n-1].obj {

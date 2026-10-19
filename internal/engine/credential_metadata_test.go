@@ -87,6 +87,7 @@ func TestCredentialMetadataRelay_ValidShapes(t *testing.T) {
 		"max key length":           `{"` + strings.Repeat("k", maxCredentialMetadataKeyLen) + `":1}`,
 		"max seed namespaces":      `{"org.siros.secret_seed":{` + seedNS(maxSeedNamespaces, maxSeedNamespaceBytes) + `}}`,
 		"same key in separate obj": `{"a":{"x":1},"b":{"x":2}}`,
+		"huge number":              `{"org.example.ext":{"n":1e400,"big":123456789012345678901234567890,"m":1.50,"neg":-1E-999}}`,
 		"nested duplicate names":   `{"display":[{"name":"a","name":"b"}]}`,
 		"display data with logo":   `{"display":[{"name":"A","locale":"en","logo":{"uri":"data:image/png;base64,AAAA","alt_text":"x"},"background_image":{"uri":"data:image/png;base64,BBBB"}}],"claims":[{"path":["a"],"display":[{"name":"A"}]}]}`,
 	} {
@@ -778,4 +779,59 @@ func TestFinishIssuance_SeedRequiresNotificationID(t *testing.T) {
 			assert.Equal(t, `{"display":[{"name":"A"}]}`, string(m["credential_metadata"]))
 		})
 	}
+}
+
+func TestCredentialMetadataRelay_NumbersRelayedVerbatim(t *testing.T) {
+	md := `{"org.example.ext":{"n":1e400,"big":123456789012345678901234567890,"m":1.50,"neg":-1E-999},"org.siros.secret_seed":{"ns":"` + secretSeedA + `"}}`
+	relay, err := credentialMetadataRelay(parseResp(t, bodyWithMD(md)))
+	require.NoError(t, err)
+	assert.Equal(t, md, string(relay.Metadata))
+}
+
+// Decoding errors for the raw response must not quote response content, on
+// the plain, JWE and deferred paths.
+func TestCredentialResponseDecodeErrors_DoNotQuoteContent(t *testing.T) {
+	const marker = "9e4004004"
+	body := `{"credentials":[` + marker + `],"credential_metadata":{"org.siros.secret_seed":{"n":"` + secretSeedA + `"}}}`
+	check := func(t *testing.T, err error) {
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), marker)
+		assert.NotContains(t, err.Error(), secretSeedA)
+	}
+	tok := &TokenResponse{AccessToken: "t", TokenType: "Bearer"}
+	cfg := &CredentialConfig{Format: "mso_mdoc"}
+
+	t.Run("plain", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+		}))
+		defer srv.Close()
+		h, cleanup := testOID4VCIHandler(t, srv.Client())
+		defer cleanup()
+		_, err := h.requestCredential(context.Background(), &IssuerMetadata{CredentialEndpoint: srv.URL}, tok, "", cfg, nil)
+		check(t, err)
+	})
+	t.Run("jwe", func(t *testing.T) {
+		srv := encryptedRawServer(t, body)
+		defer srv.Close()
+		h, cleanup := testOID4VCIHandler(t, srv.Client())
+		defer cleanup()
+		_, err := h.requestCredential(context.Background(), issuerEnc(srv.URL), tok, "", cfg, nil)
+		check(t, err)
+	})
+	t.Run("deferred", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("deferred polling waits one 5s interval")
+		}
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(body))
+		}))
+		defer srv.Close()
+		h, cleanup := testOID4VCIHandler(t, srv.Client())
+		defer cleanup()
+		_, err := h.pollDeferredCredential(context.Background(), &IssuerMetadata{CredentialIssuer: srv.URL}, tok, "tx1")
+		check(t, err)
+	})
 }

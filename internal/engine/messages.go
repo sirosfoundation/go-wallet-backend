@@ -354,9 +354,13 @@ type CredentialMetadataRelay struct {
 	Encrypted bool
 }
 
-// Redacted returns a copy of the message safe to buffer or log: the
-// credential_metadata object (which may hold secrets) is removed. Use this before putting a
-// completion message in any event buffer or log.
+// Redacted returns a copy of the message with the credential_metadata object
+// (which may hold secrets) removed, together with its encrypted flag. It is
+// meant for event buffering only. It is NOT safe to log: the copy still carries
+// Credentials, RefreshToken and DPoPJWK (a private key); logging requires
+// redacting those as well. Whether a buffered completion message must also
+// drop credentials, the refresh token and the DPoP key is up to the buffering
+// party's replay semantics.
 func (m FlowCompleteMessage) Redacted() FlowCompleteMessage {
 	m.CredentialMetadata = nil
 	m.CredentialMetadataEncryptedResponse = false

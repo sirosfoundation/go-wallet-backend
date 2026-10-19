@@ -2207,6 +2207,58 @@ func TestResolve_URLSubject_SignedMetadata_VerificationFailed_Error(t *testing.T
 	}
 }
 
+func TestResolve_URLSubject_SignedMetadata_MalformedSeedConfigAndJWTNotServed(t *testing.T) {
+	// A legacy signed document keeps the original JWT in signed_metadata; its
+	// payload still carries a rejected configuration (with a seed value). When
+	// sanitisation removes the configuration the JWT must not be served either.
+	const seedHex = "00112233445566778899aabbccddeeff"
+	pdpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(gotrust.EvaluationResponse{Decision: true})
+	}))
+	defer pdpServer.Close()
+
+	cc := `{"leaky":{"format":"vc+sd-jwt","credential_metadata":{"org.siros.secret_seed":{"ns":"` + seedHex + `"}}}}`
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"credential_issuer":"https://signed.example.com","credential_configurations_supported":` + cc + `}`))
+	// No embedded key in the header: key material falls through to inline jwks.
+	jwt := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"ES256"}`)) + "." + payload + ".sig"
+	var ccs map[string]interface{}
+	if err := json.Unmarshal([]byte(cc), &ccs); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver := &mockMetadataResolver{result: &issuermetadata.ResolveResult{
+		Signed: true,
+		Metadata: map[string]interface{}{
+			"credential_issuer":                   "https://signed.example.com",
+			"jwks":                                map[string]interface{}{"keys": []interface{}{map[string]interface{}{"kty": "EC"}}},
+			"signed_metadata":                     jwt,
+			"credential_configurations_supported": ccs,
+		},
+	}}
+	cfg := &config.AuthZENProxyConfig{Enabled: true, PDPURL: pdpServer.URL, Timeout: 30, AllowResolution: true}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, http.DefaultClient, zap.NewNop())
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set("tenant_id", "test-tenant"); c.Next() })
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{"subject_id": "https://signed.example.com", "subject_type": "url"})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	out := w.Body.String()
+	for _, bad := range []string{seedHex, payload, "leaky", "signed_metadata"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("response must not contain %q", bad)
+		}
+	}
+}
+
 // mockIssuerLookup implements IssuerLookup for testing.
 type mockIssuerLookup struct {
 	issuer *domain.CredentialIssuer
