@@ -753,7 +753,17 @@ func (p *BackendProvider) CheckReady(ctx context.Context) error {
 	// Use a short timeout for readiness checks
 	checkCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
-	return p.store.Ping(checkCtx)
+	if err := p.store.Ping(checkCtx); err != nil {
+		return err
+	}
+	// A revocation store that failed to initialize refuses every
+	// authenticated request until restart; do not report ready meanwhile.
+	if p.auth != nil && p.auth.services != nil {
+		if err := p.auth.services.TokenBlacklist.Ready(); err != nil {
+			return fmt.Errorf("token revocation store unavailable: %w", err)
+		}
+	}
+	return nil
 }
 
 // Store returns the underlying storage backend
