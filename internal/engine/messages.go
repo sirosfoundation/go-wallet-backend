@@ -358,6 +358,26 @@ func (m *FlowStartMessage) Supports(feature string) bool {
 	return false
 }
 
+// CredentialMetadataRelay is a validated response-level credential_metadata
+// and whether the issuer response carrying it was JWE-encrypted.
+type CredentialMetadataRelay struct {
+	Metadata  json.RawMessage
+	Encrypted bool
+}
+
+// Redacted returns a copy of the message with the credential_metadata object
+// (which may hold secrets) removed, together with its encrypted flag. It is
+// meant for event buffering only. It is NOT safe to log: the copy still carries
+// Credentials, RefreshToken and DPoPJWK (a private key); logging requires
+// redacting those as well. Whether a buffered completion message must also
+// drop credentials, the refresh token and the DPoP key is up to the buffering
+// party's replay semantics.
+func (m FlowCompleteMessage) Redacted() FlowCompleteMessage {
+	m.CredentialMetadata = nil
+	m.CredentialMetadataEncryptedResponse = false
+	return m
+}
+
 // authorizationDetailTypeOpenIDCredential is the only `type` OID4VCI 1.0
 // §5.1.1 defines for a credential authorization detail.
 const authorizationDetailTypeOpenIDCredential = "openid_credential"
@@ -434,6 +454,17 @@ type FlowCompleteMessage struct {
 	// The client stores it with RefreshToken and presents it back as
 	// FlowStartMessage.DPoPKeyID on renewal.
 	DPoPKeyID string `json:"dpop_key_id,omitempty"`
+	// CredentialMetadata is the OID4VCI 1.1 response-level credential_metadata
+	// object of the issuer's Credential (or Deferred Credential) Response,
+	// relayed verbatim (compacted) and applying to every credential in
+	// Credentials. Unknown members are preserved. It may carry secrets
+	// (org.siros.secret_seed): never log it, and use Redacted before buffering.
+	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
+	// CredentialMetadataEncryptedResponse is true only when CredentialMetadata
+	// came in a JWE-encrypted issuer response. Absent alongside a
+	// CredentialMetadata means it arrived as plain TLS-protected JSON (always
+	// the case for deferred issuance), so a client should refuse secret values.
+	CredentialMetadataEncryptedResponse bool `json:"credential_metadata_encrypted_response,omitempty"`
 }
 
 // CredentialNotificationMessage carries an OID4VCI §10 credential lifecycle

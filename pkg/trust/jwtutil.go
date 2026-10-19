@@ -18,6 +18,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/sirosfoundation/go-cryptoutil"
+
 	jwkutil "github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 )
 
