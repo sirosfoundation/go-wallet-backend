@@ -22,6 +22,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
@@ -599,7 +600,8 @@ func (h *AuthZENProxyHandler) resolveCredentialOfferURI(c *gin.Context, ctx cont
 	}
 
 	// Validate the document contains the required OID4VCI credential offer fields.
-	if _, ok := offer["credential_issuer"].(string); !ok {
+	credentialIssuer, ok := offer["credential_issuer"].(string)
+	if !ok {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "credential offer missing required field: credential_issuer"})
 		return
 	}
@@ -610,7 +612,7 @@ func (h *AuthZENProxyHandler) resolveCredentialOfferURI(c *gin.Context, ctx cont
 
 	h.logger.Info("credential offer URI resolved",
 		zap.String("offer_uri", offerURI),
-		zap.String("credential_issuer", offer["credential_issuer"].(string)),
+		zap.String("credential_issuer", credentialIssuer),
 	)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -752,6 +754,11 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	if !metadataIsSigned || trustResp.Decision {
 		h.inlineLogos(ctx, result.Metadata)
 	}
+	// A valid org.siros.secret_seed advertisement (names only) stays; a
+	// malformed one makes the configuration "not offered" (5A.3). This runs
+	// after key extraction and the trust decision above, so dropping the
+	// original signed_metadata JWT here cannot change that decision.
+	sanitizeSecretSeedAdvertisement(result.Metadata)
 
 	// Step 6: Evaluate whether this provider is entitled to issue what it is
 	// offering. Distinct from the PDP decision above, which answers whether the
@@ -975,6 +982,51 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 
 	// No key material available
 	return nil, false
+}
+
+// sanitizeSecretSeedAdvertisement enforces privatedata-spec 5A.3/5A.4 on the
+// issuer metadata served to the wallet, in place. A valid advertisement
+// ({"org.siros.secret_seed":{"namespaces":[...]}}, names only) is public and is
+// served unchanged, because the wallet needs it to request response encryption.
+// A credential configuration whose org.siros.secret_seed member is malformed
+// (carrying hex or any other non-list content) is treated as not offered: the
+// whole configuration is removed, so no such value reaches the wallet.
+//
+// When a configuration is removed, the original signed_metadata JWT (kept by
+// the resolver for legacy signed metadata) is also dropped from the served
+// document: its base64url payload still carries the rejected configuration,
+// and editing the payload would invalidate the signature. The wallet then
+// receives the sanitized claims without that JWT. The signature was verified
+// and the trust decision taken before this runs; the effect is only that the
+// wallet cannot re-verify the (by now modified) document itself.
+func sanitizeSecretSeedAdvertisement(metadata map[string]interface{}) {
+	ccs, ok := metadata["credential_configurations_supported"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	for id, ccRaw := range ccs {
+		cc, ok := ccRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		cm, ok := cc["credential_metadata"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if _, has := cm["org.siros.secret_seed"]; !has {
+			continue
+		}
+		raw, err := json.Marshal(cm)
+		if err != nil {
+			delete(ccs, id)
+			delete(metadata, "signed_metadata")
+			continue
+		}
+		if present, valid := engine.SecretSeedAdvertisement(raw); present && !valid {
+			delete(ccs, id)
+			delete(metadata, "signed_metadata")
+		}
+	}
 }
 
 // inlineLogos walks the metadata tree and replaces logo URIs with data: URIs.

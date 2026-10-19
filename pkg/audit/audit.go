@@ -14,6 +14,7 @@ import (
 
 	"github.com/sirosfoundation/go-siros-set/emit"
 	"github.com/sirosfoundation/go-siros-set/set"
+
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 

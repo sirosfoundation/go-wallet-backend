@@ -20,13 +20,14 @@ type WalletInstanceStore struct {
 
 func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.WalletInstance) error {
 	filter := bson.M{"_id": instance.ID}
+	set := bson.M{
+		"tenant_id":          instance.TenantID,
+		"attestation_source": instance.AttestationSource,
+		"last_attested_at":   instance.LastAttestedAt,
+		"updated_at":         instance.UpdatedAt,
+	}
 	update := bson.M{
-		"$set": bson.M{
-			"tenant_id":          instance.TenantID,
-			"attestation_source": instance.AttestationSource,
-			"last_attested_at":   instance.LastAttestedAt,
-			"updated_at":         instance.UpdatedAt,
-		},
+		"$set": set,
 		// Status is only ever set here for a brand-new document (via $setOnInsert).
 		// An existing instance's status must only change through UpdateStatus —
 		// otherwise a routine re-attestation would silently reactivate a
@@ -40,10 +41,10 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 		},
 	}
 	if instance.UserID != nil {
-		update["$set"].(bson.M)["user_id"] = instance.UserID
+		set["user_id"] = instance.UserID
 	}
 	if instance.DeviceInfo != nil {
-		update["$set"].(bson.M)["device_info"] = instance.DeviceInfo
+		set["device_info"] = instance.DeviceInfo
 	}
 
 	opts := options.Update().SetUpsert(true)
@@ -121,15 +122,14 @@ func (s *WalletInstanceStore) UpdateStatus(ctx context.Context, id string, statu
 		return fmt.Errorf("%w: unknown wallet instance status %q", domain.ErrInvalidStatusTransition, status)
 	}
 
-	update := bson.M{
-		"$set": bson.M{
-			"status":              status,
-			"deactivation_reason": reason,
-			"updated_at":          now,
-		},
+	set := bson.M{
+		"status":              status,
+		"deactivation_reason": reason,
+		"updated_at":          now,
 	}
+	update := bson.M{"$set": set}
 	if status == domain.InstanceStatusSuspended || status == domain.InstanceStatusRevoked {
-		update["$set"].(bson.M)["deactivated_at"] = now
+		set["deactivated_at"] = now
 	} else {
 		update["$unset"] = bson.M{"deactivated_at": "", "deactivation_reason": ""}
 	}
