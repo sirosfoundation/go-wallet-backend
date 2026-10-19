@@ -599,7 +599,8 @@ func (h *AuthZENProxyHandler) resolveCredentialOfferURI(c *gin.Context, ctx cont
 	}
 
 	// Validate the document contains the required OID4VCI credential offer fields.
-	if _, ok := offer["credential_issuer"].(string); !ok {
+	credentialIssuer, ok := offer["credential_issuer"].(string)
+	if !ok {
 		c.JSON(http.StatusBadGateway, gin.H{"error": "credential offer missing required field: credential_issuer"})
 		return
 	}
@@ -610,7 +611,7 @@ func (h *AuthZENProxyHandler) resolveCredentialOfferURI(c *gin.Context, ctx cont
 
 	h.logger.Info("credential offer URI resolved",
 		zap.String("offer_uri", offerURI),
-		zap.String("credential_issuer", offer["credential_issuer"].(string)),
+		zap.String("credential_issuer", credentialIssuer),
 	)
 
 	c.JSON(http.StatusOK, gin.H{

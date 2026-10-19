@@ -24,12 +24,13 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	// Tenant-scoped: a mismatch inserts a duplicate _id, and that duplicate-key
 	// error is how "another tenant's record" reaches the caller.
 	filter := bson.M{"_id": instance.ID, "tenant_id": instance.TenantID}
+	set := bson.M{
+		"attestation_source": instance.AttestationSource,
+		"last_attested_at":   instance.LastAttestedAt,
+		"updated_at":         instance.UpdatedAt,
+	}
 	update := bson.M{
-		"$set": bson.M{
-			"attestation_source": instance.AttestationSource,
-			"last_attested_at":   instance.LastAttestedAt,
-			"updated_at":         instance.UpdatedAt,
-		},
+		"$set": set,
 		// Status and tenant are fixed at insert: re-attestation must not reactivate
 		// a revoked instance or move it to another tenant.
 		"$setOnInsert": bson.M{
@@ -44,7 +45,7 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 		},
 	}
 	if instance.DeviceInfo != nil {
-		update["$set"].(bson.M)["device_info"] = instance.DeviceInfo
+		set["device_info"] = instance.DeviceInfo
 	}
 
 	// Bind and link are scoped to the generation this upsert wrote or matched.
@@ -308,14 +309,13 @@ func (s *WalletInstanceStore) updateStatus(ctx context.Context, match bson.M, st
 		return fmt.Errorf("%w: cannot set wallet instance status to %q", domain.ErrInvalidStatusTransition, status)
 	}
 
-	update := bson.M{
-		"$set": bson.M{
-			"status":              status,
-			"deactivation_reason": reason,
-			"updated_at":          now,
-		},
+	set := bson.M{
+		"status":              status,
+		"deactivation_reason": reason,
+		"updated_at":          now,
 	}
-	update["$set"].(bson.M)["deactivated_at"] = now
+	set["deactivated_at"] = now
+	update := bson.M{"$set": set}
 
 	res, err := s.collection.UpdateOne(ctx, filter, update)
 	if err != nil {

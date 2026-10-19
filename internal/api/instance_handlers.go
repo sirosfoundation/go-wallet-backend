@@ -25,12 +25,12 @@ func (h *Handlers) ListMyWalletInstances(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "LIFECYCLE_NOT_SUPPORTED"})
 		return
 	}
-	uid, exists := c.Get("user_id")
-	if !exists {
+	uid, ok := contextUserID(c)
+	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return
 	}
-	userID := domain.UserIDFromString(uid.(string))
+	userID := domain.UserIDFromString(uid)
 	tenantID, _ := h.getTenantID(c)
 
 	instances, err := h.services.WalletLifecycle.ListForUser(c.Request.Context(), tenantID, userID)
@@ -46,12 +46,12 @@ func (h *Handlers) ListMyWalletInstances(c *gin.Context) {
 // and refuse already-issued bearer tokens (SID-AUTH-06), including the
 // caller's own. Nothing is erased.
 func (h *Handlers) LogoutEverywhere(c *gin.Context) {
-	uid, exists := c.Get("user_id")
-	if !exists {
+	uid, ok := contextUserID(c)
+	if !ok {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
 		return
 	}
-	userID := domain.UserIDFromString(uid.(string))
+	userID := domain.UserIDFromString(uid)
 
 	if err := h.services.User.LogoutEverywhere(c.Request.Context(), userID); err != nil {
 		if abortIfTokenRevoked(c, err) {
