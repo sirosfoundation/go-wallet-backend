@@ -202,8 +202,59 @@ type parsedList struct {
 	km      *trust.KeyMaterial
 }
 
-// size is what the entry costs against the cache byte limit.
-func (p parsedList) size() int { return len(p.list) + len(p.lst) }
+// size is what the entry costs against the cache byte limit: the bitmap, the
+// compressed list and the retained signer material, which an accepted token
+// can pad with unused JWK members.
+func (p parsedList) size() int {
+	return len(p.list) + len(p.lst) + len(p.subject) + keyMaterialSize(p.km)
+}
+
+// keyMaterialSize approximates the memory km retains: the lengths of its
+// strings, map keys and certificates, walked rather than marshalled.
+func keyMaterialSize(km *trust.KeyMaterial) int {
+	if km == nil {
+		return 0
+	}
+	n := len(km.Type) + len(km.CredentialType)
+	for _, c := range km.X5C {
+		n += len(c)
+	}
+	return n + jwkSize(km.JWK, 0)
+}
+
+func jwkSize(v any, depth int) int {
+	if depth > 16 {
+		return 0
+	}
+	switch t := v.(type) {
+	case string:
+		return len(t)
+	case map[string]any:
+		n := 0
+		for k, e := range t {
+			n += len(k) + jwkSize(e, depth+1)
+		}
+		return n
+	case []any:
+		n := 0
+		for _, e := range t {
+			n += jwkSize(e, depth+1)
+		}
+		return n
+	case []map[string]any:
+		n := 0
+		for _, e := range t {
+			n += jwkSize(e, depth+1)
+		}
+		return n
+	case json.RawMessage:
+		return len(t)
+	case []byte:
+		return len(t)
+	default:
+		return 8
+	}
+}
 
 type cachedList = parsedList
 
@@ -512,7 +563,7 @@ func (c *Checker) store(key string, pl parsedList, f *flight) parsedList {
 		if had {
 			c.cacheBytes -= old.size()
 		}
-		if len(c.cache) >= maxCacheEntries || c.cacheBytes+pl.size() > c.cacheLimit {
+		if (!had && len(c.cache) >= maxCacheEntries) || c.cacheBytes+pl.size() > c.cacheLimit {
 			c.cache = map[string]cachedList{}
 			c.cacheBytes = 0
 		}

@@ -3137,3 +3137,39 @@ func TestNewStrictHTTPClient_IgnoresGlobalOptOuts(t *testing.T) {
 		}
 	}
 }
+
+// An operator-configured proxy on a private address must be dialable while
+// destinations stay guarded.
+func TestNewHTTPClient_PrivateProxyIsDialable(t *testing.T) {
+	var gotURL string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURL = r.URL.String()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer proxy.Close() // listens on 127.0.0.1
+
+	cfg := HTTPClientConfig{ProxyURL: proxy.URL, AllowHTTP: true}
+	resp, err := cfg.NewHTTPClient(5 * time.Second).Get("http://93.184.216.34/list")
+	if err != nil {
+		t.Fatalf("request through the private proxy failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if gotURL != "http://93.184.216.34/list" {
+		t.Fatalf("proxy saw %q", gotURL)
+	}
+
+	// The destination itself is still checked, even through the proxy.
+	if resp, err := cfg.NewHTTPClient(5 * time.Second).Get("http://10.1.2.3/list"); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("private destination reached through the proxy")
+	}
+
+	// And the proxy's address does not open up the rest of the network.
+	other := httptest.NewServer(http.NotFoundHandler())
+	defer other.Close()
+	noProxy := HTTPClientConfig{AllowHTTP: true}
+	if resp, err := noProxy.NewHTTPClient(5 * time.Second).Get(other.URL); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("loopback destination reached directly")
+	}
+}

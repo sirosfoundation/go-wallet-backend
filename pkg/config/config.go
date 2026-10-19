@@ -596,10 +596,12 @@ func (c HTTPClientConfig) newHTTPClient(timeoutOverride time.Duration, trustedHo
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 	}
 
+	var proxyAddr string
 	if c.ProxyURL != "" {
 		proxyURL, err := url.Parse(c.ProxyURL)
 		if err == nil {
 			transport.Proxy = http.ProxyURL(proxyURL)
+			proxyAddr = proxyDialAddr(proxyURL)
 		}
 	}
 
@@ -610,7 +612,18 @@ func (c HTTPClientConfig) newHTTPClient(timeoutOverride time.Duration, trustedHo
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}
-		transport.DialContext = guardedDial(defaultLookupIP, baseDialer.DialContext, trustedHosts)
+		guarded := guardedDial(defaultLookupIP, baseDialer.DialContext, trustedHosts)
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// The operator-configured proxy is authorised by configuration and
+			// may sit on a private network; every other address is a
+			// destination a counterparty chose and stays guarded. Destinations
+			// reached through the proxy are checked by ssrfGuard below, since
+			// this dialer only sees the proxy.
+			if proxyAddr != "" && strings.EqualFold(addr, proxyAddr) {
+				return baseDialer.DialContext(ctx, network, addr)
+			}
+			return guarded(ctx, network, addr)
+		}
 		roundTripper = ssrfGuard{
 			base:      transport,
 			proxy:     transport.Proxy,
@@ -624,6 +637,23 @@ func (c HTTPClientConfig) newHTTPClient(timeoutOverride time.Duration, trustedHo
 		Timeout:   timeout,
 		Transport: roundTripper,
 	}
+}
+
+// proxyDialAddr is the host:port net/http dials for proxyURL, with the
+// scheme's default port filled in.
+func proxyDialAddr(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		switch u.Scheme {
+		case "https":
+			port = "443"
+		case "socks5", "socks5h":
+			port = "1080"
+		default:
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(u.Hostname(), port)
 }
 
 // GuardedDialContext returns a dial function applying the same address policy

@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -604,4 +605,43 @@ func x5cTokenEncoded(t *testing.T, key *ecdsa.PrivateKey, listURL, jwkMode strin
 		t.Fatal(err)
 	}
 	return s
+}
+
+func TestCache_SignerMaterialCountsAgainstBudget(t *testing.T) {
+	c := newTestChecker(http.DefaultClient, false, nil)
+	c.cacheLimit = 1 << 20
+	pad := strings.Repeat("A", 2<<20) // unused JWK member, bigger than the whole budget
+	pl := parsedList{
+		list: []byte{0}, lst: []byte{0}, iat: 1, expires: c.now().Add(time.Minute),
+		km: &trust.KeyMaterial{Type: "jwk", JWK: map[string]any{"kty": "EC", "x-pad": pad}},
+	}
+	c.store("k", pl, nil)
+	if len(c.cache) != 0 || c.cacheBytes != 0 {
+		t.Fatalf("entry padded by signer material was cached: entries=%d bytes=%d", len(c.cache), c.cacheBytes)
+	}
+
+	pl.km = &trust.KeyMaterial{Type: "jwk", JWK: map[string]any{"kty": "EC"}}
+	c.store("k", pl, nil)
+	if c.cacheBytes <= 2 {
+		t.Fatalf("signer material not accounted: %d bytes", c.cacheBytes)
+	}
+}
+
+func TestCache_RefreshAtEntryLimitKeepsOthers(t *testing.T) {
+	c := newTestChecker(http.DefaultClient, false, nil)
+	exp := c.now().Add(time.Minute)
+	for i := 0; i < maxCacheEntries; i++ {
+		c.store(fmt.Sprintf("k%d", i), parsedList{list: []byte{0}, lst: []byte{0}, iat: 1, expires: exp}, nil)
+	}
+	if len(c.cache) != maxCacheEntries {
+		t.Fatalf("setup: %d entries", len(c.cache))
+	}
+	c.store("k0", parsedList{list: []byte{0}, lst: []byte{0}, iat: 2, expires: exp}, nil)
+	if len(c.cache) != maxCacheEntries {
+		t.Fatalf("refreshing an existing entry evicted others: %d left", len(c.cache))
+	}
+	c.store("new", parsedList{list: []byte{0}, lst: []byte{0}, iat: 1, expires: exp}, nil)
+	if len(c.cache) != 1 {
+		t.Fatalf("a new key at the limit should reset the cache, have %d", len(c.cache))
+	}
 }
