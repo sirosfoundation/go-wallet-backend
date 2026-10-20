@@ -196,6 +196,8 @@ type IssuerMetadata struct {
 	CredentialConfigurationsSupported CredentialConfigurations `json:"credential_configurations_supported,omitempty"`
 	// Credential response encryption configuration
 	CredentialResponseEncryption *CredentialResponseEncryptionConfig `json:"credential_response_encryption,omitempty"`
+	// Credential request encryption configuration (OID4VCI 1.0 §10, §12.2.4)
+	CredentialRequestEncryption *CredentialRequestEncryptionConfig `json:"credential_request_encryption,omitempty"`
 	// Batch credential issuance configuration (OID4VCI §E.1)
 	BatchCredentialIssuance *BatchCredentialIssuance `json:"batch_credential_issuance,omitempty"`
 	// mDOC IACA certificates URL
@@ -407,7 +409,7 @@ func (c *CredentialResponseEncryptionConfig) supportsEnc(enc string) bool {
 // the ephemeral ECDH-ES private key.
 func decryptJWEResponse(jweString string, privKey *ecdsa.PrivateKey) (*CredentialResponse, error) {
 	jwe, err := jose.ParseEncrypted(jweString,
-		[]jose.KeyAlgorithm{jose.ECDH_ES},
+		[]jose.KeyAlgorithm{jose.ECDH_ES, jose.ECDH_ES_A128KW, jose.ECDH_ES_A192KW, jose.ECDH_ES_A256KW},
 		[]jose.ContentEncryption{jose.A128CBC_HS256, jose.A256CBC_HS512, jose.A128GCM, jose.A256GCM},
 	)
 	if err != nil {
@@ -2627,6 +2629,12 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			{"ECDH-ES", "A128GCM"},
 			{"ECDH-ES", "A256CBC-HS512"},
 			{"ECDH-ES", "A128CBC-HS256"},
+			{"ECDH-ES+A256KW", "A256GCM"},
+			{"ECDH-ES+A256KW", "A128GCM"},
+			{"ECDH-ES+A256KW", "A256CBC-HS512"},
+			{"ECDH-ES+A256KW", "A128CBC-HS256"},
+			{"ECDH-ES+A128KW", "A256GCM"},
+			{"ECDH-ES+A128KW", "A128GCM"},
 		}
 		var selectedAlg, selectedEnc string
 		for _, c := range candidates {
@@ -2664,6 +2672,29 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 	}
 
 	bodyBytes, _ := json.Marshal(reqBody)
+	reqContentType := "application/json"
+
+	// Credential request encryption (OID4VCI 1.0 §8.2, §10). An issuer may
+	// refuse a request carrying credential_response_encryption unless the
+	// request itself is encrypted, so encrypt whenever the issuer requires it
+	// or we are asking for an encrypted response. Seed delivery and
+	// encryption_required fail closed: never downgrade to a plain request.
+	if reqEnc := metadata.CredentialRequestEncryption; reqEnc != nil {
+		if reqEnc.EncryptionRequired || encKey != nil {
+			jwe, err := reqEnc.encryptRequest(bodyBytes)
+			switch {
+			case err == nil:
+				bodyBytes = []byte(jwe)
+				reqContentType = "application/jwt"
+			case seedAdvertised || reqEnc.EncryptionRequired:
+				h.Logger.Warn("cannot encrypt credential request", zap.Error(err))
+				_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Cannot encrypt the credential request for this issuer")
+				return nil, fmt.Errorf("cannot encrypt credential request: %w", err)
+			default:
+				h.Logger.Warn("sending credential request unencrypted", zap.Error(err))
+			}
+		}
+	}
 
 	// Credential request with DPoP nonce retry (RFC 9449 §8)
 	for attempt := 0; attempt < 2; attempt++ {
@@ -2671,7 +2702,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", reqContentType)
 		h.setAuthorizationHeader(req, token)
 		if strings.EqualFold(token.TokenType, "DPoP") {
 			auth, err := h.resolveClientAuth(ctx, clientAuthNeeds{dpop: true, htm: "POST", htu: metadata.CredentialEndpoint, accessToken: token.AccessToken})
@@ -2780,12 +2811,23 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 			"transaction_id": transactionID,
 		}
 		bodyBytes, _ := json.Marshal(reqBody)
+		contentType := "application/json"
+		// OID4VCI 1.0 §9.1: the deferred request is encrypted like the
+		// credential request when the issuer requires it.
+		if reqEnc := metadata.CredentialRequestEncryption; reqEnc != nil && reqEnc.EncryptionRequired {
+			jwe, err := reqEnc.encryptRequest(bodyBytes)
+			if err != nil {
+				return nil, fmt.Errorf("cannot encrypt deferred credential request: %w", err)
+			}
+			bodyBytes = []byte(jwe)
+			contentType = "application/jwt"
+		}
 
 		req, err := http.NewRequestWithContext(ctx, "POST", deferredEndpoint, strings.NewReader(string(bodyBytes)))
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Content-Type", contentType)
 		h.setAuthorizationHeader(req, token)
 		if strings.EqualFold(token.TokenType, "DPoP") {
 			auth, err := h.resolveClientAuth(ctx, clientAuthNeeds{dpop: true, htm: "POST", htu: deferredEndpoint, accessToken: token.AccessToken})
