@@ -759,6 +759,7 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	// after key extraction and the trust decision above, so dropping the
 	// original signed_metadata JWT here cannot change that decision.
 	sanitizeSecretSeedAdvertisement(result.Metadata)
+	sanitizeHolderCommitmentsAdvertisement(result.Metadata)
 
 	// Step 6: Evaluate whether this provider is entitled to issue what it is
 	// offering. Distinct from the PDP decision above, which answers whether the
@@ -1023,6 +1024,41 @@ func sanitizeSecretSeedAdvertisement(metadata map[string]interface{}) {
 			continue
 		}
 		if present, valid := engine.SecretSeedAdvertisement(raw); present && !valid {
+			delete(ccs, id)
+			delete(metadata, "signed_metadata")
+		}
+	}
+}
+
+// sanitizeHolderCommitmentsAdvertisement removes, in place, every credential
+// configuration whose org.siros.holder_commitments member is malformed (not
+// {"commitments": [1..4 short names]}, or carrying hex-looking values), so no
+// such value reaches the wallet; signed_metadata is dropped when that happens,
+// for the same reason as in sanitizeSecretSeedAdvertisement.
+func sanitizeHolderCommitmentsAdvertisement(metadata map[string]interface{}) {
+	ccs, ok := metadata["credential_configurations_supported"].(map[string]interface{})
+	if !ok {
+		return
+	}
+	for id, ccRaw := range ccs {
+		cc, ok := ccRaw.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		cm, ok := cc["credential_metadata"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		if _, has := cm["org.siros.holder_commitments"]; !has {
+			continue
+		}
+		raw, err := json.Marshal(cm)
+		if err != nil {
+			delete(ccs, id)
+			delete(metadata, "signed_metadata")
+			continue
+		}
+		if present, _, valid := engine.HolderCommitmentsAdvertisement(raw); present && !valid {
 			delete(ccs, id)
 			delete(metadata, "signed_metadata")
 		}
