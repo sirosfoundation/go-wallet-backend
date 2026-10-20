@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -234,4 +235,63 @@ func TestEncryptRequest_GDCAdvertisedKeyInterop(t *testing.T) {
 	pt, err := jwe.Decrypt(priv)
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"credential_configuration_id":"x"}`, string(pt))
+}
+
+func TestSelectKey_SkipsMislabeledNonECKey(t *testing.T) {
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	bad := jose.JSONWebKey{Key: &rsaKey.PublicKey, Use: "enc", Algorithm: "ECDH-ES+A256KW", KeyID: "bad"}
+	_, goodJWKS := issuerEncKey(t, "ECDH-ES+A256KW", "enc")
+	var good struct{ Keys []json.RawMessage }
+	require.NoError(t, json.Unmarshal(goodJWKS, &good))
+	badJSON, _ := bad.MarshalJSON()
+	jwks, _ := json.Marshal(map[string]any{"keys": []json.RawMessage{badJSON, good.Keys[0]}})
+	cfg := &CredentialRequestEncryptionConfig{JWKS: jwks, EncValuesSupported: []string{"A256GCM"}}
+	_, err = cfg.encryptRequest([]byte(`{}`))
+	require.NoError(t, err)
+}
+
+func TestRequestCredential_ResponseEncA128KWWithCBC(t *testing.T) {
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"credential":"c"}`))
+	}))
+	defer srv.Close()
+	h, cleanup := testOID4VCIHandler(t, srv.Client())
+	defer cleanup()
+	md := &IssuerMetadata{CredentialEndpoint: srv.URL, CredentialResponseEncryption: &CredentialResponseEncryptionConfig{
+		AlgValuesSupported: []string{"ECDH-ES+A128KW"}, EncValuesSupported: []string{"A128CBC-HS256"}}}
+	_, err := h.requestCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", &CredentialConfig{Format: "vc+sd-jwt"}, nil)
+	require.NoError(t, err)
+	re := body["credential_response_encryption"].(map[string]any)
+	assert.Equal(t, "ECDH-ES+A128KW", re["alg"])
+	assert.Equal(t, "A128CBC-HS256", re["enc"])
+}
+
+func TestRequestCredential_UnusableRequestKeyDropsOptionalResponseEncryption(t *testing.T) {
+	var ct string
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ct = r.Header.Get("Content-Type")
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"credential":"c"}`))
+	}))
+	defer srv.Close()
+	h, cleanup := testOID4VCIHandler(t, srv.Client())
+	defer cleanup()
+	md := &IssuerMetadata{CredentialEndpoint: srv.URL, CredentialResponseEncryption: respEnc(),
+		CredentialRequestEncryption: &CredentialRequestEncryptionConfig{EncValuesSupported: []string{"A256GCM"}}}
+	resp, err := h.requestCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", &CredentialConfig{Format: "vc+sd-jwt"}, nil)
+	require.NoError(t, err)
+	assert.False(t, resp.Encrypted)
+	assert.Equal(t, "application/json", ct)
+	assert.NotContains(t, body, "credential_response_encryption")
+
+	// Issuer demands response encryption: fail instead.
+	md.CredentialResponseEncryption.EncryptionRequired = true
+	_, err = h.requestCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", &CredentialConfig{Format: "vc+sd-jwt"}, nil)
+	require.Error(t, err)
 }

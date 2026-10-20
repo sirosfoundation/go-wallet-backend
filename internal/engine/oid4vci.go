@@ -2624,17 +2624,11 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 	if encCfg != nil {
 		// Negotiate a mutually supported alg/enc pair (prefer stronger encryption)
 		type algEnc struct{ alg, enc string }
-		candidates := []algEnc{
-			{"ECDH-ES", "A256GCM"},
-			{"ECDH-ES", "A128GCM"},
-			{"ECDH-ES", "A256CBC-HS512"},
-			{"ECDH-ES", "A128CBC-HS256"},
-			{"ECDH-ES+A256KW", "A256GCM"},
-			{"ECDH-ES+A256KW", "A128GCM"},
-			{"ECDH-ES+A256KW", "A256CBC-HS512"},
-			{"ECDH-ES+A256KW", "A128CBC-HS256"},
-			{"ECDH-ES+A128KW", "A256GCM"},
-			{"ECDH-ES+A128KW", "A128GCM"},
+		var candidates []algEnc
+		for _, alg := range []string{"ECDH-ES", "ECDH-ES+A256KW", "ECDH-ES+A192KW", "ECDH-ES+A128KW"} {
+			for _, enc := range []string{"A256GCM", "A128GCM", "A256CBC-HS512", "A128CBC-HS256"} {
+				candidates = append(candidates, algEnc{alg, enc})
+			}
 		}
 		var selectedAlg, selectedEnc string
 		for _, c := range candidates {
@@ -2691,7 +2685,18 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 				_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Cannot encrypt the credential request for this issuer")
 				return nil, fmt.Errorf("cannot encrypt credential request: %w", err)
 			default:
-				h.Logger.Warn("sending credential request unencrypted", zap.Error(err))
+				// Not required and no seed: drop the response encryption
+				// (the issuer would refuse it in a plain request) unless the
+				// issuer demands it, then fail.
+				if metadata.CredentialResponseEncryption != nil && metadata.CredentialResponseEncryption.EncryptionRequired {
+					h.Logger.Warn("cannot encrypt credential request", zap.Error(err))
+					_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Cannot encrypt the credential request for this issuer")
+					return nil, fmt.Errorf("cannot encrypt credential request: %w", err)
+				}
+				h.Logger.Warn("sending credential request without encryption", zap.Error(err))
+				delete(reqBody, "credential_response_encryption")
+				encKey = nil
+				bodyBytes, _ = json.Marshal(reqBody)
 			}
 		}
 	}

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"crypto/ecdsa"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -37,6 +38,9 @@ func (c *CredentialRequestEncryptionConfig) selectKey() (jose.JSONWebKey, jose.K
 		for _, k := range raw.Keys {
 			var jwk jose.JSONWebKey
 			if json.Unmarshal(k, &jwk) != nil || !jwk.Valid() || !jwk.IsPublic() {
+				continue
+			}
+			if pub, ok := jwk.Key.(*ecdsa.PublicKey); !ok || pub == nil {
 				continue
 			}
 			if jwk.KeyID == "" || jwk.Algorithm != string(alg) || (jwk.Use != "" && jwk.Use != "enc") {
