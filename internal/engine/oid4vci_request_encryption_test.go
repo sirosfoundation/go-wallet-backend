@@ -2,13 +2,16 @@ package engine
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/go-jose/go-jose/v4"
@@ -194,4 +197,41 @@ func TestPollDeferredCredential_EncryptedWhenRequired(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "application/jwt", ct)
 	assert.Equal(t, "tx1", body["transaction_id"])
+}
+
+// Interop with the gdc/vc advertisement: one EC P-256 key, use enc,
+// ECDH-ES+A256KW, kid = RFC 7638 thumbprint, enc A256GCM only. The JWE must
+// carry exactly alg, enc, kid in its protected header (no zip) and decrypt
+// with go-jose using only that key.
+func TestEncryptRequest_GDCAdvertisedKeyInterop(t *testing.T) {
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	jwk := jose.JSONWebKey{Key: &priv.PublicKey, Use: "enc", Algorithm: "ECDH-ES+A256KW"}
+	tp, err := jwk.Thumbprint(crypto.SHA256)
+	require.NoError(t, err)
+	jwk.KeyID = base64.RawURLEncoding.EncodeToString(tp)
+	jwks, err := json.Marshal(map[string]any{"keys": []jose.JSONWebKey{jwk}})
+	require.NoError(t, err)
+
+	cfg := &CredentialRequestEncryptionConfig{JWKS: jwks, EncValuesSupported: []string{"A256GCM"}}
+	compact, err := cfg.encryptRequest([]byte(`{"credential_configuration_id":"x"}`))
+	require.NoError(t, err)
+
+	parts := strings.Split(compact, ".")
+	require.Len(t, parts, 5)
+	hdrJSON, err := base64.RawURLEncoding.DecodeString(parts[0])
+	require.NoError(t, err)
+	var hdr map[string]any
+	require.NoError(t, json.Unmarshal(hdrJSON, &hdr))
+	assert.Equal(t, "ECDH-ES+A256KW", hdr["alg"])
+	assert.Equal(t, "A256GCM", hdr["enc"])
+	assert.Equal(t, jwk.KeyID, hdr["kid"])
+	assert.NotContains(t, hdr, "zip")
+	assert.Contains(t, hdr, "epk")
+
+	jwe, err := jose.ParseEncrypted(compact, []jose.KeyAlgorithm{jose.ECDH_ES_A256KW}, []jose.ContentEncryption{jose.A256GCM})
+	require.NoError(t, err)
+	pt, err := jwe.Decrypt(priv)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"credential_configuration_id":"x"}`, string(pt))
 }
