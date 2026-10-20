@@ -1001,6 +1001,17 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 // and the trust decision taken before this runs; the effect is only that the
 // wallet cannot re-verify the (by now modified) document itself.
 func sanitizeSecretSeedAdvertisement(metadata map[string]interface{}) {
+	sanitizeAdvertisement(metadata, "org.siros.secret_seed", func(raw []byte) bool {
+		present, valid := engine.SecretSeedAdvertisement(raw)
+		return present && !valid
+	})
+}
+
+// sanitizeAdvertisement removes every credential configuration whose
+// credential_metadata[member] is judged malformed by malformed (which receives
+// the whole credential_metadata object, JSON encoded), and drops
+// signed_metadata when it removed one.
+func sanitizeAdvertisement(metadata map[string]interface{}, member string, malformed func(raw []byte) bool) {
 	ccs, ok := metadata["credential_configurations_supported"].(map[string]interface{})
 	if !ok {
 		return
@@ -1014,16 +1025,11 @@ func sanitizeSecretSeedAdvertisement(metadata map[string]interface{}) {
 		if !ok {
 			continue
 		}
-		if _, has := cm["org.siros.secret_seed"]; !has {
+		if _, has := cm[member]; !has {
 			continue
 		}
 		raw, err := json.Marshal(cm)
-		if err != nil {
-			delete(ccs, id)
-			delete(metadata, "signed_metadata")
-			continue
-		}
-		if present, valid := engine.SecretSeedAdvertisement(raw); present && !valid {
+		if err != nil || malformed(raw) {
 			delete(ccs, id)
 			delete(metadata, "signed_metadata")
 		}
@@ -1036,33 +1042,10 @@ func sanitizeSecretSeedAdvertisement(metadata map[string]interface{}) {
 // such value reaches the wallet; signed_metadata is dropped when that happens,
 // for the same reason as in sanitizeSecretSeedAdvertisement.
 func sanitizeHolderCommitmentsAdvertisement(metadata map[string]interface{}) {
-	ccs, ok := metadata["credential_configurations_supported"].(map[string]interface{})
-	if !ok {
-		return
-	}
-	for id, ccRaw := range ccs {
-		cc, ok := ccRaw.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		cm, ok := cc["credential_metadata"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if _, has := cm["org.siros.holder_commitments"]; !has {
-			continue
-		}
-		raw, err := json.Marshal(cm)
-		if err != nil {
-			delete(ccs, id)
-			delete(metadata, "signed_metadata")
-			continue
-		}
-		if present, _, valid := engine.HolderCommitmentsAdvertisement(raw); present && !valid {
-			delete(ccs, id)
-			delete(metadata, "signed_metadata")
-		}
-	}
+	sanitizeAdvertisement(metadata, "org.siros.holder_commitments", func(raw []byte) bool {
+		present, _, valid := engine.HolderCommitmentsAdvertisement(raw)
+		return present && !valid
+	})
 }
 
 // inlineLogos walks the metadata tree and replaces logo URIs with data: URIs.

@@ -1102,6 +1102,9 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 			nonce = n
 		}
 	}
+	if err := h.checkPSCNeedsProof(selectedConfig); err != nil {
+		return err
+	}
 	var credential *CredentialResponse
 	for retries := 0; retries <= 1; retries++ {
 		var proofs []ProofObject
@@ -2721,6 +2724,11 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		// Check for DPoP nonce requirement — retry once with server-provided nonce
 		if attempt == 0 && isDPoPNonceError(resp) {
 			h.updateDPoPNonce(resp)
+			// A psc conflict is terminal even when the response also carries a
+			// DPoP-Nonce header: never retry it, never hide it.
+			if conflictErr := h.relayPSCConflict(resp); conflictErr != nil {
+				return nil, conflictErr
+			}
 			_ = resp.Body.Close()
 			continue
 		}
@@ -2733,9 +2741,8 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 
 			// A holder commitment conflict is a final, user-actionable outcome:
 			// relay it as its own flow error code (never retried).
-			if msg, ok := pscConflictMessage(resp.StatusCode, body); ok {
-				_ = h.Error(StepRequestingCredential, ErrCodePSCConflict, msg)
-				return nil, parseOAuthError(resp.StatusCode, body)
+			if conflictErr := h.pscConflictError(resp.StatusCode, body); conflictErr != nil {
+				return nil, conflictErr
 			}
 
 			// Check whether the error response contains a refreshed c_nonce so the
@@ -3330,9 +3337,51 @@ func verifyProofCarriesPSC(proof ProofObject) error {
 	if json.Unmarshal(rawClaim, &val) != nil {
 		return fmt.Errorf("%s in the proof is not a string", PSCProofClaim)
 	}
+	// Re-encoding must reproduce the input: the decoder ignores CR/LF and
+	// accepts nonzero trailing bits, neither of which is canonical base64url.
 	dec, err := base64.RawURLEncoding.DecodeString(val)
-	if err != nil || len(dec) != 32 {
+	if err != nil || len(dec) != 32 || base64.RawURLEncoding.EncodeToString(dec) != val {
 		return fmt.Errorf("%s in the proof is not a 32-byte base64url value", PSCProofClaim)
+	}
+	return nil
+}
+
+// checkPSCNeedsProof fails the flow when the configuration advertises a psc
+// commitment but declares no proof type, since the commitment can only travel
+// in a proof: sending a credential request without it would bypass the binding.
+func (h *OID4VCIHandler) checkPSCNeedsProof(config *CredentialConfig) error {
+	adv, err := holderCommitmentPSCAdvertised(config)
+	if err == nil && adv && !h.needsProof(config) {
+		err = errors.New("issuer advertises a holder commitment but declares no proof type to carry it")
+	}
+	if err != nil {
+		_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+	}
+	return err
+}
+
+// pscConflictError relays the issuer's psc conflict, if body is one, as a
+// PSC_CONFLICT flow error and returns the error to fail the flow with; nil when
+// the response is not a conflict.
+func (h *OID4VCIHandler) pscConflictError(status int, body []byte) error {
+	msg, ok := pscConflictMessage(status, body)
+	if !ok {
+		return nil
+	}
+	_ = h.Error(StepRequestingCredential, ErrCodePSCConflict, msg)
+	return parseOAuthError(status, body)
+}
+
+// relayPSCConflict reads (and closes) the body of a 400 response and relays it
+// as a psc conflict if it is one. Other responses are left for the caller.
+func (h *OID4VCIHandler) relayPSCConflict(resp *http.Response) error {
+	if resp.StatusCode != http.StatusBadRequest {
+		return nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+	if err := h.pscConflictError(resp.StatusCode, body); err != nil {
+		_ = resp.Body.Close()
+		return err
 	}
 	return nil
 }

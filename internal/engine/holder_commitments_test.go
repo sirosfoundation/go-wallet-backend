@@ -164,15 +164,17 @@ func TestRequestProofs_HolderCommitmentPSC(t *testing.T) {
 
 	pad := base64.URLEncoding.EncodeToString(make([]byte, 32))
 	for name, claims := range map[string]map[string]interface{}{
-		"claim omitted":  {"nonce": "n"},
-		"31 bytes":       {PSCProofClaim: b64(31)},
-		"33 bytes":       {PSCProofClaim: b64(33)},
-		"padded":         {PSCProofClaim: pad},
-		"std alphabet":   {PSCProofClaim: strings.Repeat("+", 43)},
-		"not a string":   {PSCProofClaim: 5},
-		"empty":          {PSCProofClaim: ""},
-		"hex 64 chars":   {PSCProofClaim: strings.Repeat("ab", 32)},
-		"wrong claim nm": {"psc": b64(32)},
+		"claim omitted":         {"nonce": "n"},
+		"31 bytes":              {PSCProofClaim: b64(31)},
+		"33 bytes":              {PSCProofClaim: b64(33)},
+		"padded":                {PSCProofClaim: pad},
+		"std alphabet":          {PSCProofClaim: strings.Repeat("+", 43)},
+		"not a string":          {PSCProofClaim: 5},
+		"empty":                 {PSCProofClaim: ""},
+		"hex 64 chars":          {PSCProofClaim: strings.Repeat("ab", 32)},
+		"embedded newline":      {PSCProofClaim: b64(32)[:20] + "\r\n" + b64(32)[20:]},
+		"nonzero trailing bits": {PSCProofClaim: strings.Repeat("A", 42) + "B"},
+		"wrong claim nm":        {"psc": b64(32)},
 	} {
 		t.Run("wallet misbehaves/"+name, func(t *testing.T) {
 			_, proofs, err := runProofs(t, hcCfg(hcAdv), fakeJWT(claims))
@@ -193,9 +195,19 @@ func TestRequestProofs_HolderCommitmentPSC(t *testing.T) {
 
 func TestPSCConflict_Relayed(t *testing.T) {
 	const desc = "org.siros.psc_conflict: this subject is bound to a different wallet secret; ask the issuer operator to approve a reset"
-	run := func(t *testing.T, status int, body string) (*ErrorCodeAndMsg, error) {
+	run := func(t *testing.T, status int, body string, hdr ...string) (*ErrorCodeAndMsg, error) {
+		calls := 0
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls++
 			w.Header().Set("Content-Type", "application/json")
+			if len(hdr) > 0 && calls > 1 {
+				// A retry would succeed: only the first answer is the conflict.
+				_, _ = w.Write([]byte(`{"credentials":[{"credential":"x"}]}`))
+				return
+			}
+			if len(hdr) > 0 {
+				w.Header().Set("DPoP-Nonce", hdr[0])
+			}
 			w.WriteHeader(status)
 			_, _ = w.Write([]byte(body))
 		}))
@@ -234,6 +246,12 @@ func TestPSCConflict_Relayed(t *testing.T) {
 		assert.Equal(t, ErrCodePSCConflict, e.Code)
 		assert.Equal(t, desc, e.Msg)
 	})
+	t.Run("conflict carrying a DPoP-Nonce header is still terminal", func(t *testing.T) {
+		e, err := run(t, 400, `{"error":"invalid_request","error_description":"`+desc+`"}`, "n1")
+		require.Error(t, err)
+		require.NotNil(t, e)
+		assert.Equal(t, ErrCodePSCConflict, e.Code)
+	})
 	t.Run("other 400 stays CREDENTIAL_ERROR", func(t *testing.T) {
 		e, err := run(t, 400, `{"error":"invalid_request","error_description":"something else"}`)
 		require.Error(t, err)
@@ -260,3 +278,15 @@ type ErrorCodeAndMsg struct {
 }
 
 func timeAfter() <-chan time.Time { return time.After(3 * time.Second) }
+
+func TestCheckPSCNeedsProof(t *testing.T) {
+	h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+	defer cleanup()
+	cfg := hcCfg(hcAdv)
+	require.NoError(t, h.checkPSCNeedsProof(cfg))
+	cfg.ProofTypesSupported = nil
+	require.Error(t, h.checkPSCNeedsProof(cfg), "psc advertised but no proof type: refuse")
+	cfg = hcCfg("")
+	cfg.ProofTypesSupported = nil
+	require.NoError(t, h.checkPSCNeedsProof(cfg), "no advertisement: unchanged")
+}
