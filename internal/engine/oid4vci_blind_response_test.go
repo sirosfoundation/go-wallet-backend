@@ -1082,3 +1082,14 @@ func normaliseEnvelope(b []byte) string {
 	j, _ := json.Marshal(out)
 	return string(j)
 }
+
+// The client may reject what it decrypted and then reports credential_failure:
+// the notification context exists even though the client answered with error.
+func TestBlind_NotificationContextSurvivesClientRejection(t *testing.T) {
+	st := newIssuerStub(t, seedResponse)
+	fc := &fakeClient{t: t, decryptErr: true}
+	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
+	defer cleanup()
+	require.Error(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", seedConfig(), nil, ""))
+	assert.True(t, h.Flow.Session.notifications.hasValid("f-blind", secretNotif))
+}

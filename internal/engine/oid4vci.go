@@ -2734,7 +2734,11 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		mediaType, _, _ := mime.ParseMediaType(contentType)
 		if respEnc != nil && (mediaType == "application/jwt" || mediaType == "application/jose") {
 			// The engine cannot decrypt this: relay it to the client, which
-			// holds the key, and keep only what it reports back.
+			// holds the key, and keep only what it reports back. The client may
+			// reject what it decrypts (a seed that fails its checks) and then
+			// owes the issuer a credential_failure notification, so the
+			// notification context must exist before the client answers.
+			h.registerNotificationContext(metadata, token, &CredentialResponse{Encrypted: true})
 			return h.relayEncryptedResponse(ctx, string(body), false, respEnc)
 		}
 
