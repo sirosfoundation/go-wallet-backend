@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"encoding/json"
 	"sync"
 	"time"
 
@@ -21,6 +22,11 @@ type TrustCacheRecord struct {
 	TrustStatus    domain.TrustStatus
 	TrustFramework string
 	Trusted        bool
+	// Context is the PDP response context (incl. verifier_ids) the verdict
+	// came with, replayed on cache hits. The cache is in-memory and
+	// process-local, so every entry is written by code that stores it;
+	// nil means the PDP returned no context, not that it was lost.
+	Context json.RawMessage
 }
 
 // TrustCache is a tenant-aware, in-memory TTL cache for verifier trust

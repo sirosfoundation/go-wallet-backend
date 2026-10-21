@@ -8,6 +8,7 @@ package trust
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"sync"
@@ -113,6 +114,10 @@ type TrustInfo struct {
 	Framework    string   `json:"framework,omitempty"`
 	Reason       string   `json:"reason,omitempty"`
 	Certificates []string `json:"certificates,omitempty"`
+	// Context is the PDP's response context object, verbatim as JSON,
+	// including context.verifier_ids when the PDP policy enables it. Nil when
+	// the PDP returned no context. Never serialised with TrustInfo itself.
+	Context json.RawMessage `json:"-"`
 }
 
 // EvaluatorFactory creates a TrustEvaluator for a given PDP endpoint.
@@ -424,6 +429,7 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 		Trusted:   resp.Decision,
 		Framework: "authzen",
 		Reason:    resp.Reason,
+		Context:   resp.Context,
 	}, nil
 }
 

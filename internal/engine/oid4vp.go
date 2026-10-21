@@ -910,6 +910,9 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			if clientID := h.getAdminClientID(ctx, canonicalURL); clientID != "" {
 				verifier.ClientID = clientID
 			}
+			// Same progress as a fresh evaluation, including the PDP
+			// context the verdict was cached with.
+			h.sendVerifierTrustProgress(authReq.ClientID, verifier, cached.Context)
 			if !verifier.Trusted {
 				return nil, fmt.Errorf("untrusted verifier %s (cached)", authReq.ClientID)
 			}
@@ -1000,13 +1003,7 @@ func (h *OID4VPHandler) evaluateVerifierTrustViaPDP(ctx context.Context, authReq
 		zap.String("framework", verifier.Framework))
 
 	// Send result to frontend/SDK as informational progress
-	_ = h.Progress(StepTrustEvaluated, map[string]interface{}{
-		"verifier_trust_evaluated": true,
-		"verifier":                 authReq.ClientID,
-		"trusted":                  verifier.Trusted,
-		"framework":                verifier.Framework,
-		"reason":                   verifier.Reason,
-	})
+	h.sendVerifierTrustProgress(authReq.ClientID, verifier, directResult.Context)
 
 	// Cache the PDP-backed verdict. This is the only call site that ever
 	// populates the trust cache. An empty cacheKey means the caller decided
@@ -1014,7 +1011,7 @@ func (h *OID4VPHandler) evaluateVerifierTrustViaPDP(ctx context.Context, authReq
 	// cacheable/cacheKey computation) - skip writing rather than caching
 	// under an empty/ambiguous key.
 	if cacheKey != "" {
-		h.cacheVerifierTrust(cacheKey, verifier)
+		h.cacheVerifierTrust(cacheKey, verifier, directResult.Context)
 	}
 
 	// Look up admin-configured ClientID for VP audience (read-only)
@@ -1416,7 +1413,7 @@ func (h *OID4VPHandler) getAdminClientID(ctx context.Context, verifierURL string
 // function: caching it would let a single attacker-controlled answer stand
 // in as ground truth for every subsequent request against this identity for
 // the whole cache TTL, without ever consulting the PDP again.
-func (h *OID4VPHandler) cacheVerifierTrust(cacheKey string, verifier *VerifierInfo) {
+func (h *OID4VPHandler) cacheVerifierTrust(cacheKey string, verifier *VerifierInfo, pdpContext json.RawMessage) {
 	if h.TrustCache == nil {
 		return
 	}
@@ -1440,7 +1437,28 @@ func (h *OID4VPHandler) cacheVerifierTrust(cacheKey string, verifier *VerifierIn
 		TrustStatus:    trustStatus,
 		TrustFramework: verifier.Framework,
 		Trusted:        verifier.Trusted,
+		Context:        pdpContext,
 	})
+}
+
+// sendVerifierTrustProgress emits the verifier_trust_evaluated flow progress
+// for a PDP-backed verdict, fresh or replayed from the trust cache. When the
+// PDP returned a response context it is included verbatim as "context" -
+// notably context.verifier_ids, which the wallet needs as the prefixed
+// verifier identifier (x509_san_dns:<dns>, semantic_id:<value>, ...) for its
+// pseudonym function. The member is omitted when the PDP gave none.
+func (h *OID4VPHandler) sendVerifierTrustProgress(clientID string, verifier *VerifierInfo, pdpContext json.RawMessage) {
+	payload := map[string]interface{}{
+		"verifier_trust_evaluated": true,
+		"verifier":                 clientID,
+		"trusted":                  verifier.Trusted,
+		"framework":                verifier.Framework,
+		"reason":                   verifier.Reason,
+	}
+	if len(pdpContext) > 0 {
+		payload["context"] = pdpContext
+	}
+	_ = h.Progress(StepTrustEvaluated, payload)
 }
 
 // extractDomain extracts a domain name from a client_id (URL or DID).

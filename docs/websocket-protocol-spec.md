@@ -817,6 +817,47 @@ Client → Server:
 **Note**: The `match_request`/`match_response` pattern uses `message_id` for
 correlation (same as `sign_request`/`sign_response`), with a 30-second timeout.
 
+#### Verifier trust result (`verifier_trust_evaluated`)
+
+When the engine evaluates verifier trust itself (a verifier PDP is configured)
+it sends a `flow_progress` whose payload has `verifier_trust_evaluated: true`,
+for a fresh evaluation and identically when the verdict is served from the
+engine's trust cache:
+
+```
+{
+  "type": "flow_progress",
+  "flow_id": "<uuid>",
+  "step": "trust_evaluated",
+  "payload": {
+    "verifier_trust_evaluated": true,
+    "verifier": "x509_san_dns:verifier.example.com",
+    "trusted": true,
+    "framework": "authzen",
+    "reason": "trust evaluation successful",
+    "context": {
+      "verifier_ids": [
+        { "verifier_id_type": "semantic",     "verifier_id": "semantic_id:VATSE-556000000101", "basis": "x5c-chain" },
+        { "verifier_id_type": "x509_san_dns", "verifier_id": "verifier.example.com",           "basis": "client-id-binding" }
+      ]
+    }
+  }
+}
+```
+
+`context` is the PDP's response `context` object, passed through as JSON
+(`verifier_ids`, and whatever else the PDP put there such as `reason` and
+`trust_metadata`). It is omitted when the PDP returned none. `verifier_ids` is
+present only when the PDP policy enables it and the identifier was verified;
+`verifier_id_type` is an opaque string, `verifier_id` is in the canonical form
+the PDP defines for that type (`semantic_id:<value>`, the lower-case A-label
+DNS name for `x509_san_dns`, the SAN URI byte for byte for `x509_san_uri`, the
+full DID, or the OpenID Federation entity id), and `basis` says how it was
+verified. A wallet that needs a stable verifier identifier (for example as
+input to a pseudonym function) reads it from here. Clients MUST ignore members
+they do not understand. The progress is informational: an untrusted verdict is
+still followed by a flow error.
+
 #### Verifier `client_metadata` (optional)
 
 The `credential_selection` progress message, the `match_request` message and
