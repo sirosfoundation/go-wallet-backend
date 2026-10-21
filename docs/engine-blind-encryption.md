@@ -59,7 +59,12 @@ an encrypted issuer response, which made that exposure unavoidable.
 7. `flow_complete.credentials[i]` keeps `format`, `vct` and `type_metadata` but
    has no `credential` value; top-level `credential_response_encrypted: true`
    marks it. The client fills entry i from the i-th decrypted credential; a
-   count mismatch is an error. `flow_complete` carries no `credential_metadata`.
+   count mismatch is an error. For an encrypted response `flow_complete` carries
+   no `credential_metadata`. For a plain response the engine may relay only the
+   display-only members (`display`, `claims`); extension members such as
+   `org.siros.secret_seed` are never relayed from a plain response (the engine
+   drops them, and a plain response carrying a seed fails the issuance). Clients
+   ignore extension members arriving in `flow_complete`.
 8. The client sends the `notification_id` itself in `credential_notification`;
    the engine's notification context holds an empty id, which already matches
    any.
