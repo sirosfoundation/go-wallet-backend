@@ -94,7 +94,8 @@ func TestRequestCredential_EncryptedRequestRoundTrip(t *testing.T) {
 	var ct, kid string
 	srv := encryptingIssuer(t, priv, &got, &ct, &kid)
 	defer srv.Close()
-	h, cleanup := testOID4VCIHandler(t, srv.Client())
+	fc := &fakeClient{t: t}
+	h, _, cleanup := newBlindHandler(t, fc, srv.Client())
 	defer cleanup()
 
 	md := &IssuerMetadata{
@@ -103,13 +104,14 @@ func TestRequestCredential_EncryptedRequestRoundTrip(t *testing.T) {
 		CredentialRequestEncryption:  &CredentialRequestEncryptionConfig{JWKS: jwks, EncValuesSupported: []string{"A256GCM"}},
 	}
 	cfg := &CredentialConfig{Format: "vc+sd-jwt", CredentialMetadata: json.RawMessage(seedMetadata)}
-	resp, err := h.requestCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", cfg, nil)
-	require.NoError(t, err)
-	assert.True(t, resp.Encrypted)
+	require.NoError(t, h.issueCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", cfg, nil, ""))
 	assert.Equal(t, "application/jwt", ct)
 	assert.NotEmpty(t, kid)
 	assert.Equal(t, "cfg", got["credential_configuration_id"])
 	assert.Contains(t, got, "credential_response_encryption")
+	// The client key, not an engine key, is what the issuer encrypted to.
+	require.Len(t, fc.decrypted, 1)
+	assert.JSONEq(t, `true`, string(completion(t, fc)["credential_response_encrypted"]))
 }
 
 func TestRequestCredential_RequestEncryptionFailsClosed(t *testing.T) {
@@ -131,7 +133,7 @@ func TestRequestCredential_RequestEncryptionFailsClosed(t *testing.T) {
 			defer cleanup()
 			md := &IssuerMetadata{CredentialEndpoint: srv.URL, CredentialResponseEncryption: respEnc(), CredentialRequestEncryption: rc}
 			cfg := &CredentialConfig{Format: "vc+sd-jwt", CredentialMetadata: json.RawMessage(seedMetadata)}
-			_, err := h.requestCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", cfg, nil)
+			_, err := h.requestCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", cfg, nil, clientRE(t))
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "cannot encrypt credential request")
 			assert.False(t, hit, "no plain request may reach the issuer")
@@ -146,7 +148,7 @@ func TestRequestCredential_EncryptionRequiredWithoutKeyFails(t *testing.T) {
 	h, cleanup := testOID4VCIHandler(t, srv.Client())
 	defer cleanup()
 	md := &IssuerMetadata{CredentialEndpoint: srv.URL, CredentialRequestEncryption: &CredentialRequestEncryptionConfig{EncryptionRequired: true}}
-	_, err := h.requestCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", &CredentialConfig{Format: "vc+sd-jwt"}, nil)
+	_, err := h.requestCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", &CredentialConfig{Format: "vc+sd-jwt"}, nil, nil)
 	require.Error(t, err)
 	assert.False(t, hit)
 }
@@ -164,13 +166,14 @@ func TestRequestCredential_NoRequestEncryptionAdvertisedStaysPlain(t *testing.T)
 	h, cleanup := testOID4VCIHandler(t, srv.Client())
 	defer cleanup()
 	md := &IssuerMetadata{CredentialEndpoint: srv.URL, CredentialResponseEncryption: respEnc()}
-	_, err := h.requestCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", &CredentialConfig{Format: "vc+sd-jwt"}, nil)
+	_, err := h.requestCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", &CredentialConfig{Format: "vc+sd-jwt"}, nil, clientRE(t))
 	require.NoError(t, err)
 	assert.Equal(t, "application/json", ct)
 	assert.Contains(t, body, "credential_response_encryption")
 }
 
 func TestPollDeferredCredential_EncryptedWhenRequired(t *testing.T) {
+	fastDeferredPolling(t)
 	priv, jwks := issuerEncKey(t, "ECDH-ES+A256KW", "enc")
 	var ct string
 	var body map[string]any
@@ -194,7 +197,7 @@ func TestPollDeferredCredential_EncryptedWhenRequired(t *testing.T) {
 		CredentialIssuer:            srv.URL,
 		CredentialRequestEncryption: &CredentialRequestEncryptionConfig{JWKS: jwks, EncValuesSupported: []string{"A256GCM"}, EncryptionRequired: true},
 	}
-	_, err := h.pollDeferredCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "tx1")
+	_, err := h.pollDeferredCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "tx1", 0, nil)
 	require.NoError(t, err)
 	assert.Equal(t, "application/jwt", ct)
 	assert.Equal(t, "tx1", body["transaction_id"])
@@ -251,25 +254,6 @@ func TestSelectKey_SkipsMislabeledNonECKey(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestRequestCredential_ResponseEncA128KWWithCBC(t *testing.T) {
-	var body map[string]any
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"credential":"c"}`))
-	}))
-	defer srv.Close()
-	h, cleanup := testOID4VCIHandler(t, srv.Client())
-	defer cleanup()
-	md := &IssuerMetadata{CredentialEndpoint: srv.URL, CredentialResponseEncryption: &CredentialResponseEncryptionConfig{
-		AlgValuesSupported: []string{"ECDH-ES+A128KW"}, EncValuesSupported: []string{"A128CBC-HS256"}}}
-	_, err := h.requestCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", &CredentialConfig{Format: "vc+sd-jwt"}, nil)
-	require.NoError(t, err)
-	re := body["credential_response_encryption"].(map[string]any)
-	assert.Equal(t, "ECDH-ES+A128KW", re["alg"])
-	assert.Equal(t, "A128CBC-HS256", re["enc"])
-}
-
 func TestRequestCredential_UnusableRequestKeyDropsOptionalResponseEncryption(t *testing.T) {
 	var ct string
 	var body map[string]any
@@ -280,18 +264,32 @@ func TestRequestCredential_UnusableRequestKeyDropsOptionalResponseEncryption(t *
 		_, _ = w.Write([]byte(`{"credential":"c"}`))
 	}))
 	defer srv.Close()
-	h, cleanup := testOID4VCIHandler(t, srv.Client())
+	fc := &fakeClient{t: t}
+	h, _, cleanup := newBlindHandler(t, fc, srv.Client())
 	defer cleanup()
+	re := &responseEncryption{Alg: "ECDH-ES+A256KW", Enc: "A256GCM"}
+	k := fc.newKey()
+	jwk, err := clientResponseEncryptionJWK(mustJWK(t, k), re.Alg)
+	require.NoError(t, err)
+	re = re.withJWK(jwk)
 	md := &IssuerMetadata{CredentialEndpoint: srv.URL, CredentialResponseEncryption: respEnc(),
 		CredentialRequestEncryption: &CredentialRequestEncryptionConfig{EncValuesSupported: []string{"A256GCM"}}}
-	resp, err := h.requestCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", &CredentialConfig{Format: "vc+sd-jwt"}, nil)
+	resp, err := h.requestCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", &CredentialConfig{Format: "vc+sd-jwt"}, nil, re)
 	require.NoError(t, err)
 	assert.False(t, resp.Encrypted)
+	assert.Nil(t, resp.ResponseEncryption, "the dropped encryption is not carried to deferred requests")
 	assert.Equal(t, "application/json", ct)
 	assert.NotContains(t, body, "credential_response_encryption")
 
 	// Issuer demands response encryption: fail instead.
 	md.CredentialResponseEncryption.EncryptionRequired = true
-	_, err = h.requestCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", &CredentialConfig{Format: "vc+sd-jwt"}, nil)
+	_, err = h.requestCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", &CredentialConfig{Format: "vc+sd-jwt"}, nil, re)
 	require.Error(t, err)
+}
+
+func mustJWK(t *testing.T, k *ecdsa.PrivateKey) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(jose.JSONWebKey{Key: &k.PublicKey})
+	require.NoError(t, err)
+	return b
 }

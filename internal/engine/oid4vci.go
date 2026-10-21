@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -15,11 +14,9 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strings"
 	"time"
 
-	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -356,18 +353,22 @@ type CredentialResponse struct {
 	CNonce          string        `json:"c_nonce,omitempty"`
 	CNonceExpiresIn int           `json:"c_nonce_expires_in,omitempty"`
 	TransactionID   string        `json:"transaction_id,omitempty"`
+	Interval        int           `json:"interval,omitempty"`
 	NotificationID  string        `json:"notification_id,omitempty"`
 
-	// CredentialMetadata is the OID4VCI 1.1 response-level credential_metadata
-	// object (openid/OpenID4VCI#721), kept as received. It applies to every
-	// credential in the response and may carry secrets (org.siros.secret_seed):
-	// never log it. Validated by parseCredentialMetadata before relay.
-	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
+	// The fields below are local state, never part of the wire format.
 
-	// Encrypted records that this response arrived as a JWE (OID4VCI
-	// credential_response_encryption) and was decrypted by us. It is local
-	// state, never part of the wire format.
+	// Encrypted records that the issuer answered with a JWE encrypted to the
+	// client's key. The engine relayed it unread: Credential, Credentials,
+	// CNonce and NotificationID are then empty, and only TransactionID,
+	// Interval and CredentialCount (what the client reported) are set.
 	Encrypted bool `json:"-"`
+	// CredentialCount is the number of credentials in an encrypted response,
+	// as reported by the client.
+	CredentialCount int `json:"-"`
+	// ResponseEncryption is the encryption the request asked for, when it was
+	// actually sent, so deferred requests ask for the same.
+	ResponseEncryption *responseEncryption `json:"-"`
 }
 
 // AvailableCredential represents a credential available for selection
@@ -403,32 +404,6 @@ func (c *CredentialResponseEncryptionConfig) supportsEnc(enc string) bool {
 		}
 	}
 	return false
-}
-
-// decryptJWEResponse decrypts a JWE compact-serialized credential response using
-// the ephemeral ECDH-ES private key.
-func decryptJWEResponse(jweString string, privKey *ecdsa.PrivateKey) (*CredentialResponse, error) {
-	jwe, err := jose.ParseEncrypted(jweString,
-		[]jose.KeyAlgorithm{jose.ECDH_ES, jose.ECDH_ES_A128KW, jose.ECDH_ES_A192KW, jose.ECDH_ES_A256KW},
-		[]jose.ContentEncryption{jose.A128CBC_HS256, jose.A256CBC_HS512, jose.A128GCM, jose.A256GCM},
-	)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse JWE: %w", err)
-	}
-
-	plaintext, err := jwe.Decrypt(privKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decrypt credential response: %w", err)
-	}
-
-	var credResp CredentialResponse
-	if err := json.Unmarshal(plaintext, &credResp); err != nil {
-		// The decoder's error can quote response content (e.g. an
-		// out-of-range number); never include it.
-		return nil, errors.New("failed to parse decrypted credential response")
-	}
-	credResp.Encrypted = true
-	return &credResp, nil
 }
 
 // generateDPoPKey creates an ephemeral P-256 key pair for DPoP proofs (RFC 9449).
@@ -1085,6 +1060,12 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		return err
 	}
 
+	return h.issueCredential(ctx, metadata, token, selectedConfigID, selectedConfig, trust, msg.ReissuanceKid)
+}
+
+// issueCredential runs steps 6 to 9: the proofs and the credential request
+// (with a full retry on a c_nonce refresh), deferred polling, and completion.
+func (h *OID4VCIHandler) issueCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, selectedConfigID string, selectedConfig *CredentialConfig, trust *TrustInfo, reissuanceKid string) error {
 	// Step 6 + 7: Request proofs and credential, with full retry on c_nonce refresh.
 	// OID4VCI 1.0: prefer Nonce Endpoint (§7) over token response c_nonce.
 	// Fall back to token.CNonce for backward compatibility with pre-1.0 issuers.
@@ -1099,12 +1080,20 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 			nonce = n
 		}
 	}
+	// Credential response encryption is decided from the issuer metadata
+	// before any proof is requested: the client generates the key in its
+	// generate_proof answer. The engine never holds a response key.
+	respOffer, err := h.negotiateResponseEncryption(metadata, selectedConfig)
+	if err != nil {
+		return err
+	}
 	var credential *CredentialResponse
 	for retries := 0; retries <= 1; retries++ {
 		var proofs []ProofObject
-		if h.needsProof(selectedConfig) {
+		var respEnc *responseEncryption
+		if h.needsProof(selectedConfig) || respOffer != nil {
 			var proofErr error
-			proofs, proofErr = h.requestProofs(ctx, metadata, selectedConfig, nonce, msg.ReissuanceKid)
+			proofs, respEnc, proofErr = h.requestProofs(ctx, metadata, selectedConfig, nonce, reissuanceKid, respOffer)
 			if proofErr != nil {
 				h.Logger.Debug("failed to request proofs", zap.Error(proofErr))
 				_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
@@ -1113,7 +1102,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		}
 
 		var credErr error
-		credential, credErr = h.requestCredential(ctx, metadata, token, selectedConfigID, selectedConfig, proofs)
+		credential, credErr = h.requestCredential(ctx, metadata, token, selectedConfigID, selectedConfig, proofs, respEnc)
 		if credErr != nil {
 			var cNonceErr *CNonceRequiredError
 			if retries == 0 && errors.As(credErr, &cNonceErr) {
@@ -1155,7 +1144,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		})
 
 		// Poll for deferred credential
-		deferredResp, err := h.pollDeferredCredential(ctx, metadata, token, credential.TransactionID)
+		deferredResp, err := h.pollDeferredCredential(ctx, metadata, token, credential.TransactionID, credential.Interval, credential.ResponseEncryption)
 		if err != nil {
 			h.Logger.Debug("deferred polling failed", zap.Error(err))
 			_ = h.Error(StepDeferred, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
@@ -1163,38 +1152,21 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		}
 
 		// Complete with the issued credential
-		return h.finishIssuance(ctx, StepDeferred, deferredResp, selectedConfig, trust, metadata, token)
+		return h.finishIssuance(ctx, deferredResp, selectedConfig, trust, metadata, token)
 	}
 
 	// Step 9: Complete with issued credential (fetch VCTM for display)
-	return h.finishIssuance(ctx, StepRequestingCredential, credential, selectedConfig, trust, metadata, token)
+	return h.finishIssuance(ctx, credential, selectedConfig, trust, metadata, token)
 }
 
-// finishIssuance validates the response-level credential_metadata (failing the
-// flow cleanly with CREDENTIAL_ERROR when malformed), builds the results and
-// completes the flow, relaying credential_metadata on the completion message.
-func (h *OID4VCIHandler) finishIssuance(ctx context.Context, step FlowStep, resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo, metadata *IssuerMetadata, token *TokenResponse) error {
-	relay, err := credentialMetadataRelay(resp)
-	if err == nil && relay != nil && !relay.Encrypted {
-		// A plain response never delivers a seed, advertised or not
-		// (privatedata-spec 5A.4); deferred responses are always plain.
-		if hasSecretSeedMember(relay.Metadata) {
-			err = errors.New("secret seed credential_metadata arrived in a plain response")
-		}
-	}
-	if err == nil && relay != nil && hasSecretSeedMember(relay.Metadata) && resp.NotificationID == "" {
-		// privatedata-spec 5A.2: a delivered seed needs the response-level
-		// notification_id, so the issuer can be told if the wallet rejects it.
-		err = errors.New("secret seed credential_metadata without a notification_id")
-	}
-	if err != nil {
-		h.Logger.Warn("rejecting credential response", zap.Error(err))
-		_ = h.Error(step, ErrCodeCredentialError, "Issuer returned malformed credential metadata")
-		return err
-	}
+// finishIssuance builds the results and completes the flow. When the response
+// was encrypted to the client's key the results carry no credential value and
+// the completion says so (credential_response_encrypted): the client already
+// holds the credentials and the response-level credential_metadata.
+func (h *OID4VCIHandler) finishIssuance(ctx context.Context, resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo, metadata *IssuerMetadata, token *TokenResponse) error {
 	results := h.buildCredentialResults(ctx, resp, config, trust)
 	h.registerNotificationContext(metadata, token, resp)
-	return h.Flow.Session.sendFlowComplete(h.Flow.ID, results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token), h.dpopKeyIDForRefreshToken(token), relay)
+	return h.Flow.Session.sendFlowComplete(h.Flow.ID, results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token), h.dpopKeyIDForRefreshToken(token), resp.Encrypted)
 }
 
 // dpopJWKForRefreshToken exports h.dpopKey as a private JWK for relay to the
@@ -1219,13 +1191,16 @@ func (h *OID4VCIHandler) dpopJWKForRefreshToken(token *TokenResponse) string {
 // registerNotificationContext captures the ephemeral state needed to forward an
 // OID4VCI §10 notification for this credential, keyed by flow ID. It is a no-op
 // unless the issuer advertised a notification endpoint and returned a
-// notification_id. The stored context is short-lived, in-memory, and one-shot;
-// no credential data is retained.
+// notification_id. For an encrypted response the engine cannot see the
+// notification_id: the context is registered with an empty id, which matches
+// whatever id the client then supplies in credential_notification (the client
+// read it from the decrypted response). The stored context is short-lived,
+// in-memory, and one-shot; no credential data is retained.
 func (h *OID4VCIHandler) registerNotificationContext(metadata *IssuerMetadata, token *TokenResponse, resp *CredentialResponse) {
 	if metadata == nil || token == nil || resp == nil {
 		return
 	}
-	if metadata.NotificationEndpoint == "" || resp.NotificationID == "" {
+	if metadata.NotificationEndpoint == "" || (resp.NotificationID == "" && !resp.Encrypted) {
 		return
 	}
 	if h.Flow == nil || h.Flow.Session == nil || h.Flow.Session.notifications == nil {
@@ -2420,23 +2395,47 @@ func credentialBatchSize(metadata *IssuerMetadata) int {
 // one, so the issuer can match it against the original credential's cnf.jwk
 // as same-wallet-unit evidence (mirrors sirosfoundation/wallet-frontend#70's
 // Tier 2 "same-key re-signing" design - see SignRequestParams.ReissuanceKid).
-func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMetadata, config *CredentialConfig, nonce string, reissuanceKid string) ([]ProofObject, error) {
+//
+// offer, when non-nil, asks the client for a fresh response-encryption key in
+// the same round trip; the returned *responseEncryption carries the client's
+// validated public JWK, or is nil when the client declined an optional
+// encryption. A configuration without proof types still makes this request
+// when response encryption is wanted: it is then for the key alone, with no
+// proof_types_supported, and no proofs are expected back.
+func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMetadata, config *CredentialConfig, nonce string, reissuanceKid string, offer *responseEncryption) ([]ProofObject, *responseEncryption, error) {
 	count := credentialBatchSize(metadata)
-
-	resp, err := h.RequestSign(ctx, SignActionGenerateProof, SignRequestParams{
+	params := SignRequestParams{
 		Audience:            metadata.CredentialIssuer,
 		Nonce:               nonce,
 		Issuer:              h.clientID,
 		ProofTypesSupported: config.ProofTypesSupported,
 		Count:               count,
 		ReissuanceKid:       reissuanceKid,
-	})
+	}
+	if offer != nil {
+		params.CredentialResponseEncryption = offer.params()
+	}
+	resp, err := h.RequestSign(ctx, SignActionGenerateProof, params)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	if resp.Error != "" {
+		return nil, nil, errors.New("client failed the proof request")
+	}
+
+	var respEnc *responseEncryption
+	if offer != nil {
+		respEnc, err = resolveClientEncryptionKey(offer, resp.CredentialResponseEncryptionJWK)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	if !h.needsProof(config) {
+		return nil, respEnc, nil
 	}
 
 	if len(resp.Proofs) == 0 {
-		return nil, errors.New("frontend returned no proofs")
+		return nil, nil, errors.New("frontend returned no proofs")
 	}
 
 	// Determine proof type from first proof
@@ -2446,21 +2445,21 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 	// - 'attestation': one proof can cover multiple credentials (batch attestation)
 	// - 'jwt' or other: need one proof per credential in the batch
 	if proofType != "attestation" && len(resp.Proofs) != count {
-		return nil, fmt.Errorf("frontend returned %d %s proofs (expected %d)", len(resp.Proofs), proofType, count)
+		return nil, nil, fmt.Errorf("frontend returned %d %s proofs (expected %d)", len(resp.Proofs), proofType, count)
 	}
 
 	// Validate that every returned proof type is listed in proof_types_supported
 	// and that all proofs are the same type
 	for _, proof := range resp.Proofs {
 		if proof.ProofType != proofType {
-			return nil, fmt.Errorf("mixed proof types not allowed: got %q and %q", proofType, proof.ProofType)
+			return nil, nil, fmt.Errorf("mixed proof types not allowed: got %q and %q", proofType, proof.ProofType)
 		}
 		if _, ok := config.ProofTypesSupported[proof.ProofType]; !ok {
-			return nil, fmt.Errorf("unsupported proof type %q: not listed in proof_types_supported", proof.ProofType)
+			return nil, nil, fmt.Errorf("unsupported proof type %q: not listed in proof_types_supported", proof.ProofType)
 		}
 	}
 
-	return resp.Proofs, nil
+	return resp.Proofs, respEnc, nil
 }
 
 // authorizationRequestNamesACredential reports whether an Authorization
@@ -2562,7 +2561,7 @@ func grantedCredentialIdentifier(token *TokenResponse, configID string) string {
 	return ""
 }
 
-func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, configID string, config *CredentialConfig, proofs []ProofObject) (*CredentialResponse, error) {
+func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, configID string, config *CredentialConfig, proofs []ProofObject, respEnc *responseEncryption) (*CredentialResponse, error) {
 	_ = h.ProgressMessage(StepRequestingCredential, "Requesting credential from issuer")
 
 	reqBody := map[string]interface{}{
@@ -2601,7 +2600,9 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 	}
 
 	// Seed delivery needs an encrypted response: the credential_metadata then
-	// carries secret material that must not travel as plain JSON.
+	// carries secret material that must not travel as plain JSON. The pair was
+	// negotiated and the client's key obtained before this call (see
+	// negotiateResponseEncryption); the engine holds no response key.
 	seedAdvertised, seedErr := secretSeedAdvertised(config)
 	if seedErr != nil {
 		h.Logger.Warn("rejecting issuer metadata", zap.Error(seedErr))
@@ -2614,55 +2615,13 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer cannot deliver the secret seed over an encrypted response")
 		return nil, err
 	}
-
-	// Credential response encryption (OID4VCI §7.3)
-	var encKey *ecdsa.PrivateKey
-	encCfg := metadata.CredentialResponseEncryption
-	if seedAdvertised && encCfg == nil {
-		return refuseSeed("issuer advertises secret seed delivery but no credential response encryption")
+	if seedAdvertised && (respEnc == nil || len(respEnc.JWK) == 0) {
+		return refuseSeed("issuer advertises secret seed delivery but no response encryption key is available")
 	}
-	if encCfg != nil {
-		// Negotiate a mutually supported alg/enc pair (prefer stronger encryption)
-		type algEnc struct{ alg, enc string }
-		var candidates []algEnc
-		for _, alg := range []string{"ECDH-ES", "ECDH-ES+A256KW", "ECDH-ES+A192KW", "ECDH-ES+A128KW"} {
-			for _, enc := range []string{"A256GCM", "A128GCM", "A256CBC-HS512", "A128CBC-HS256"} {
-				candidates = append(candidates, algEnc{alg, enc})
-			}
-		}
-		var selectedAlg, selectedEnc string
-		for _, c := range candidates {
-			if encCfg.supportsAlg(c.alg) && encCfg.supportsEnc(c.enc) {
-				selectedAlg = c.alg
-				selectedEnc = c.enc
-				break
-			}
-		}
-		if selectedAlg == "" || selectedEnc == "" {
-			if seedAdvertised {
-				return refuseSeed("issuer advertises secret seed delivery but no mutually supported alg/enc pair is available")
-			}
-			if encCfg.EncryptionRequired {
-				return nil, fmt.Errorf("issuer requires credential response encryption but no mutually supported alg/enc pair is available")
-			}
-		} else {
-			var err error
-			encKey, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-			if err != nil {
-				return nil, fmt.Errorf("failed to generate encryption key: %w", err)
-			}
-			encJWK, err := ecPublicKeyJWK(&encKey.PublicKey)
-			if err != nil {
-				return nil, fmt.Errorf("failed to build encryption JWK: %w", err)
-			}
-			encJWK["use"] = "enc"
-			encJWK["alg"] = selectedAlg
-			reqBody["credential_response_encryption"] = map[string]interface{}{
-				"alg": selectedAlg,
-				"enc": selectedEnc,
-				"jwk": encJWK,
-			}
-		}
+
+	// Credential response encryption (OID4VCI §7.3): the client's public key.
+	if respEnc != nil && len(respEnc.JWK) > 0 {
+		reqBody["credential_response_encryption"] = respEnc.requestMember()
 	}
 
 	bodyBytes, _ := json.Marshal(reqBody)
@@ -2674,7 +2633,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 	// or we are asking for an encrypted response. Seed delivery and
 	// encryption_required fail closed: never downgrade to a plain request.
 	if reqEnc := metadata.CredentialRequestEncryption; reqEnc != nil {
-		if reqEnc.EncryptionRequired || encKey != nil {
+		if reqEnc.EncryptionRequired || respEnc != nil {
 			jwe, err := reqEnc.encryptRequest(bodyBytes)
 			switch {
 			case err == nil:
@@ -2695,7 +2654,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 				}
 				h.Logger.Warn("sending credential request without encryption", zap.Error(err))
 				delete(reqBody, "credential_response_encryption")
-				encKey = nil
+				respEnc = nil
 				bodyBytes, _ = json.Marshal(reqBody)
 			}
 		}
@@ -2761,12 +2720,10 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		// Detect encrypted response (JWE compact serialization)
 		contentType := resp.Header.Get("Content-Type")
 		mediaType, _, _ := mime.ParseMediaType(contentType)
-		if encKey != nil && (mediaType == "application/jwt" || mediaType == "application/jose") {
-			credResp, err := decryptJWEResponse(string(body), encKey)
-			if err != nil {
-				return nil, err
-			}
-			return credResp, nil
+		if respEnc != nil && (mediaType == "application/jwt" || mediaType == "application/jose") {
+			// The engine cannot decrypt this: relay it to the client, which
+			// holds the key, and keep only what it reports back.
+			return h.relayEncryptedResponse(ctx, string(body), false, respEnc)
 		}
 
 		if seedAdvertised {
@@ -2779,6 +2736,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		if err := json.Unmarshal(body, &credResp); err != nil {
 			return nil, errors.New("failed to parse credential response")
 		}
+		credResp.ResponseEncryption = respEnc
 
 		return &credResp, nil
 	}
@@ -2786,21 +2744,38 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 	return nil, errors.New("credential request failed after DPoP nonce retry")
 }
 
+// Deferred polling timing. The unit is a variable only so tests need not wait
+// whole seconds.
+var (
+	deferredPollDefaultInterval = 5 * time.Second
+	deferredPollIntervalUnit    = time.Second
+)
+
 // pollDeferredCredential polls the deferred credential endpoint until the credential is ready
 // or the polling times out.
-func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, transactionID string) (*CredentialResponse, error) {
+//
+// interval is the polling interval in seconds the issuer (or, for an
+// encrypted response, the client) reported, 0 for the default. respEnc, when
+// non-nil, is the response encryption the credential request used: the
+// deferred request asks for the same (OID4VCI 1.0 §9.1), and an encrypted
+// answer goes to the client exactly like the first response, with
+// deferred=true.
+func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, transactionID string, interval int, respEnc *responseEncryption) (*CredentialResponse, error) {
 	// Determine deferred endpoint (OpenID4VCI spec: {credential_issuer}/deferred_credential or from metadata)
 	deferredEndpoint := strings.TrimSuffix(metadata.CredentialIssuer, "/") + "/deferred_credential"
 
 	// Default polling interval and max attempts
-	interval := 5 * time.Second
+	wait := deferredPollDefaultInterval
+	if interval > 0 {
+		wait = time.Duration(interval) * deferredPollIntervalUnit
+	}
 	maxAttempts := 60 // 5 minutes at 5 second intervals
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(interval):
+		case <-time.After(wait):
 		}
 
 		// Send progress update
@@ -2815,11 +2790,17 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 		reqBody := map[string]interface{}{
 			"transaction_id": transactionID,
 		}
+		if respEnc != nil {
+			// The client keeps its key for the whole flow; without this the
+			// issuer answers the deferred request in clear (§9.1).
+			reqBody["credential_response_encryption"] = respEnc.requestMember()
+		}
 		bodyBytes, _ := json.Marshal(reqBody)
 		contentType := "application/json"
 		// OID4VCI 1.0 §9.1: the deferred request is encrypted like the
-		// credential request when the issuer requires it.
-		if reqEnc := metadata.CredentialRequestEncryption; reqEnc != nil && reqEnc.EncryptionRequired {
+		// credential request when the issuer requires it, or when it asks for
+		// an encrypted response (an issuer may refuse that in a plain request).
+		if reqEnc := metadata.CredentialRequestEncryption; reqEnc != nil && (reqEnc.EncryptionRequired || respEnc != nil) {
 			jwe, err := reqEnc.encryptRequest(bodyBytes)
 			if err != nil {
 				return nil, fmt.Errorf("cannot encrypt deferred credential request: %w", err)
@@ -2860,6 +2841,28 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 
 		switch resp.StatusCode {
 		case http.StatusOK:
+			mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+			if respEnc != nil && (mediaType == "application/jwt" || mediaType == "application/jose") {
+				// Encrypted to the client's key: relay it unread.
+				answer, err := h.relayEncryptedResponse(ctx, string(body), true, respEnc)
+				if err != nil {
+					return nil, err
+				}
+				if answer.TransactionID != "" {
+					// Still not ready: keep polling.
+					transactionID = answer.TransactionID
+					if answer.Interval > 0 {
+						wait = time.Duration(answer.Interval) * deferredPollIntervalUnit
+					}
+					continue
+				}
+				h.Logger.Info("Deferred credential received", zap.String("transaction_id", transactionID))
+				return answer, nil
+			}
+			if respEnc != nil && respEnc.Seed {
+				// A seed is never delivered in clear: refuse unread.
+				return nil, errors.New("issuer answered a secret seed deferred request without encrypting the response")
+			}
 			// Credential is ready
 			var credResp CredentialResponse
 			if err := json.Unmarshal(body, &credResp); err != nil {
@@ -2875,7 +2878,7 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 				Interval int `json:"interval,omitempty"`
 			}
 			if err := json.Unmarshal(body, &pendingResp); err == nil && pendingResp.Interval > 0 {
-				interval = time.Duration(pendingResp.Interval) * time.Second
+				wait = time.Duration(pendingResp.Interval) * deferredPollIntervalUnit
 			}
 			h.Logger.Debug("Deferred credential still pending",
 				zap.String("transaction_id", transactionID),
@@ -2906,12 +2909,24 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 		typeMetadata = h.Registry.FetchTypeMetadataJSON(ctx, config.VCT)
 	}
 
+	if resp.Encrypted {
+		// The engine cannot read the response: one entry per credential the
+		// client reported, carrying the configuration's public metadata only.
+		// The client pairs entry i with the i-th decrypted credential.
+		for i := 0; i < resp.CredentialCount; i++ {
+			results = append(results, CredentialResult{
+				Format:       config.Format,
+				VCT:          config.VCT,
+				TypeMetadata: typeMetadata,
+			})
+		}
+		return results
+	}
+
 	// appendResult normalizes one issuer-returned credential entry
 	// (which may be a string or a wrapped object) and appends it. Per OID4VCI
 	// §8.3/§11 there is a single notification_id per Credential Response, so the
 	// same resp.NotificationID applies to every credential in the response.
-	// The response-level credential_metadata is relayed separately on the
-	// flow-complete message (see credentialMetadataRelay).
 	appendResult := func(cred interface{}) {
 		results = append(results, CredentialResult{
 			Format:         config.Format,
@@ -2932,25 +2947,14 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 	return results
 }
 
-// Limits for the response-level credential_metadata relay. The object is
-// primarily display metadata (display[], locale, logo.uri which the 1.1 draft's
-// own example sets to a data: URI, background_image, claims[]) and is relayed
-// verbatim, so the caps only stop abuse, they must not reject a conformant
-// issuer. Strict validation applies only to org.siros.secret_seed.
 const (
-	// 1 MiB: a few embedded data: URI logos / background images (each typically
-	// tens to a few hundred KiB once base64-encoded) fit comfortably, while a
-	// hostile issuer cannot make the engine relay or buffer megabytes per
-	// response. The raw HTTP body is separately capped at MaxHTTPResponseBodyBytes.
-	maxCredentialMetadataBytes   = 1 << 20
-	maxCredentialMetadataDepth   = 16  // nesting of objects/arrays (display[].logo.* needs about 4); the top-level object is depth 1
-	maxCredentialMetadataMembers = 256 // sanity cap on the members of any one object
-	maxCredentialMetadataKeyLen  = 256 // bytes of any member name
-	maxSeedNamespaces            = 8   // privatedata-spec 5A.1/5A.4: 1..8 namespaces
-	maxSeedNamespaceBytes        = 64  // privatedata-spec 5A.1: 1..64 UTF-8 bytes
+	maxSeedNamespaces     = 8  // privatedata-spec 5A.1/5A.4: 1..8 namespaces
+	maxSeedNamespaceBytes = 64 // privatedata-spec 5A.1: 1..64 UTF-8 bytes
 
-	// secretSeedMember is the SIROS extension member of credential_metadata:
-	// {"<namespace>": "<lowercase hex>", ...}.
+	// secretSeedMember is the SIROS extension member of credential_metadata.
+	// The engine only reads the issuer-metadata advertisement of it
+	// ({"namespaces": [...]}); a delivered seed travels in the encrypted
+	// response and is handled by the client alone.
 	secretSeedMember = "org.siros.secret_seed"
 )
 
@@ -3008,187 +3012,10 @@ func secretSeedAdvertised(config *CredentialConfig) (bool, error) {
 	return ok, nil
 }
 
-func hasSecretSeedMember(md json.RawMessage) bool {
-	var m map[string]json.RawMessage
-	if json.Unmarshal(md, &m) != nil {
-		return false
-	}
-	_, ok := m[secretSeedMember]
-	return ok
-}
-
-// A seed is exactly 32 lowercase hex characters (16 bytes), privatedata-spec 5A.1.
-var secretSeedHexRE = regexp.MustCompile(`^[0-9a-f]{32}$`)
-
 // validSeedNamespace: 1..64 bytes, and not the name "namespaces", which is
 // reserved for the issuer-metadata advertisement (5A.1).
 func validSeedNamespace(n string) bool {
 	return n != "" && n != "namespaces" && len(n) <= maxSeedNamespaceBytes
-}
-
-// credentialMetadataRelay validates the response-level credential_metadata of
-// an issuer response and returns what to relay (nil when absent). Errors never
-// include contents (they may be secrets).
-func credentialMetadataRelay(resp *CredentialResponse) (*CredentialMetadataRelay, error) {
-	if resp == nil || len(resp.CredentialMetadata) == 0 {
-		return nil, nil
-	}
-	md, err := parseCredentialMetadata(resp.CredentialMetadata)
-	if err != nil {
-		return nil, err
-	}
-	return &CredentialMetadataRelay{Metadata: md, Encrypted: resp.Encrypted}, nil
-}
-
-// parseCredentialMetadata validates the OID4VCI 1.1 response-level
-// credential_metadata: a JSON object, within the size/depth/member/key caps,
-// without duplicate member names. Unknown members are preserved verbatim. If
-// the org.siros.secret_seed member is present it must be an object of
-// non-empty namespaces mapping to non-empty lowercase hex strings. The result
-// is the object compacted (insignificant whitespace removed), otherwise as
-// received.
-func parseCredentialMetadata(raw json.RawMessage) (json.RawMessage, error) {
-	if len(raw) > maxCredentialMetadataBytes {
-		return nil, fmt.Errorf("credential_metadata exceeds %d bytes", maxCredentialMetadataBytes)
-	}
-	if err := enforceCredentialMetadataLimits(raw); err != nil {
-		return nil, err
-	}
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &members); err != nil || members == nil {
-		return nil, errors.New("credential_metadata is not an object")
-	}
-	if seed, ok := members[secretSeedMember]; ok {
-		var ns map[string]string
-		if err := json.Unmarshal(seed, &ns); err != nil || len(ns) == 0 || len(ns) > maxSeedNamespaces {
-			return nil, fmt.Errorf("credential_metadata %s is not an object of 1..%d string seeds", secretSeedMember, maxSeedNamespaces)
-		}
-		// The advertisement form ("namespaces") is not a delivery and is
-		// rejected here: "namespaces" is not a valid seed namespace.
-		for k, v := range ns {
-			if !validSeedNamespace(k) || !secretSeedHexRE.MatchString(v) {
-				return nil, fmt.Errorf("credential_metadata %s has an invalid namespace or a seed that is not 32 lowercase hex characters", secretSeedMember)
-			}
-		}
-	}
-	var buf bytes.Buffer
-	if err := json.Compact(&buf, raw); err != nil {
-		return nil, errors.New("credential_metadata is not valid JSON")
-	}
-	return json.RawMessage(buf.Bytes()), nil
-}
-
-// metadataLimitsFrame is one open object or array while walking credential_metadata.
-type metadataLimitsFrame struct {
-	obj       bool
-	expectKey bool
-	members   int
-	lastKey   string
-	unique    bool // duplicate member names rejected: top level and the secret seed object
-	keys      map[string]struct{}
-}
-
-// metadataLimitsWalker tracks the open containers of a credential_metadata token stream.
-type metadataLimitsWalker struct {
-	stack []metadataLimitsFrame
-}
-
-// valueDone marks the enclosing object (if any) as ready for its next key.
-func (w *metadataLimitsWalker) valueDone() {
-	if n := len(w.stack); n > 0 && w.stack[n-1].obj {
-		w.stack[n-1].expectKey = true
-	}
-}
-
-// open pushes a container, enforcing the depth cap and selecting the objects
-// whose member names must be unique (top level and the secret seed object).
-func (w *metadataLimitsWalker) open(d json.Delim) error {
-	if len(w.stack)+1 > maxCredentialMetadataDepth {
-		return fmt.Errorf("credential_metadata nests deeper than %d", maxCredentialMetadataDepth)
-	}
-	f := metadataLimitsFrame{obj: d == '{', expectKey: d == '{'}
-	if f.obj {
-		top := len(w.stack) == 0
-		seed := len(w.stack) == 1 && w.stack[0].obj && w.stack[0].lastKey == secretSeedMember
-		if top || seed {
-			f.unique = true
-			f.keys = map[string]struct{}{}
-		}
-	}
-	w.stack = append(w.stack, f)
-	return nil
-}
-
-// expectingKey reports whether the next non-delimiter token is a member name.
-func (w *metadataLimitsWalker) expectingKey() bool {
-	n := len(w.stack)
-	return n > 0 && w.stack[n-1].obj && w.stack[n-1].expectKey
-}
-
-// key records a member name of the innermost object, enforcing the key-length,
-// uniqueness and member-count caps.
-func (w *metadataLimitsWalker) key(key string) error {
-	f := &w.stack[len(w.stack)-1]
-	if len(key) > maxCredentialMetadataKeyLen {
-		return fmt.Errorf("credential_metadata member name exceeds %d bytes", maxCredentialMetadataKeyLen)
-	}
-	if f.unique {
-		if _, dup := f.keys[key]; dup {
-			return errors.New("credential_metadata has a duplicate member name")
-		}
-		f.keys[key] = struct{}{}
-	}
-	f.lastKey = key
-	f.members++
-	if f.members > maxCredentialMetadataMembers {
-		return fmt.Errorf("credential_metadata object has more than %d members", maxCredentialMetadataMembers)
-	}
-	f.expectKey = false
-	return nil
-}
-
-// token consumes one token of the stream.
-func (w *metadataLimitsWalker) token(tok json.Token) error {
-	if d, ok := tok.(json.Delim); ok {
-		if d == '{' || d == '[' {
-			return w.open(d)
-		}
-		w.stack = w.stack[:len(w.stack)-1]
-		w.valueDone()
-		return nil
-	}
-	if w.expectingKey() {
-		key, _ := tok.(string)
-		return w.key(key)
-	}
-	w.valueDone()
-	return nil
-}
-
-// enforceCredentialMetadataLimits walks the token stream enforcing the depth,
-// per-object member and key-length caps everywhere, and rejecting duplicate
-// member names at the top level and inside the org.siros.secret_seed object
-// (elsewhere the object is display data that is relayed as received).
-func enforceCredentialMetadataLimits(raw json.RawMessage) error {
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.UseNumber() // numbers are relayed verbatim; no float64 range limit (1e400)
-	var w metadataLimitsWalker
-	for {
-		tok, err := dec.Token()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return errors.New("credential_metadata is not valid JSON")
-		}
-		if err := w.token(tok); err != nil {
-			return err
-		}
-	}
-	if len(w.stack) != 0 {
-		return errors.New("credential_metadata is not valid JSON")
-	}
-	return nil
 }
 
 // credentialToString normalizes an issuer-returned credential value into the
