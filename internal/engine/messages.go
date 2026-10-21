@@ -122,8 +122,14 @@ const (
 	// the client cannot process (it did not declare FeatureTransactionDataV1, or the type
 	// is unsupported). The wallet refuses rather than present without the hashes.
 	ErrCodeUnsupportedTransactionData ErrorCode = "UNSUPPORTED_TRANSACTION_DATA"
-	ErrCodeInternalError              ErrorCode = "INTERNAL_ERROR"
-	ErrCodeTooManyRequests            ErrorCode = "TOO_MANY_REQUESTS"
+	// ErrCodeSignRefused is the client's answer to a sign_request it will not
+	// fulfil on purpose: the user declined at the consent step, the wallet
+	// distrusts the verifier, or a value the signature must bind is missing.
+	// It rides in sign_response.error_code and ends the OID4VP flow at once
+	// with access_denied to the verifier; see OID4VPHandler.failSign.
+	ErrCodeSignRefused     ErrorCode = "SIGN_REFUSED"
+	ErrCodeInternalError   ErrorCode = "INTERNAL_ERROR"
+	ErrCodeTooManyRequests ErrorCode = "TOO_MANY_REQUESTS"
 )
 
 // UserFacingMessage returns a generic user-facing message for an error code.
@@ -619,8 +625,10 @@ type SignResponseMessage struct {
 	// Error is set when the client failed the sign request (for WMP, a
 	// wmp.flow.error); RequestSign returns it instead of waiting for a timeout.
 	Error string `json:"error,omitempty"`
-	// ErrorCode classifies Error. Only ErrCodeUnsupportedTransactionData is acted
-	// on: the client refused the request's transaction_data.
+	// ErrorCode classifies Error. Two values are acted on:
+	// ErrCodeUnsupportedTransactionData (the client refused the request's
+	// transaction_data) and ErrCodeSignRefused (the client refuses to sign at
+	// all; Error is then optional and is never sent to the verifier).
 	ErrorCode ErrorCode `json:"error_code,omitempty"`
 }
 

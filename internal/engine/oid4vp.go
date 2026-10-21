@@ -2538,7 +2538,28 @@ func (h *OID4VPHandler) failSign(ctx context.Context, authReq *AuthorizationRequ
 		h.failTransactionData(ctx, authReq, &transactionDataError{code: ErrCodeUnsupportedTransactionData, err: err})
 		return
 	}
+	if errors.As(err, &signErr) && signErr.Code == ErrCodeSignRefused {
+		h.failSignRefused(ctx, authReq, signErr)
+		return
+	}
 	_ = h.Error(StepSubmittingResponse, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+}
+
+// failSignRefused ends the flow when the client refused the sign request: the
+// verifier gets access_denied at once, as for a decline at consent, and the
+// client gets the same decline error with the verifier's redirect, if any.
+//
+// The verifier is sent no error_description. The client's own text (signErr)
+// may carry the reason for the refusal - an untrusted verifier, a missing
+// thumbprint - which is the wallet's business, so it is only logged here.
+func (h *OID4VPHandler) failSignRefused(ctx context.Context, authReq *AuthorizationRequest, signErr *SignError) {
+	h.Logger.Info("client refused to sign the presentation", zap.String("client_reason", signErr.Message))
+	if redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", ""); redirectURI != "" {
+		_ = h.ErrorWithDetails(StepSubmittingResponse, ErrCodePresentationError, "User declined the request",
+			map[string]interface{}{"redirect_uri": redirectURI})
+		return
+	}
+	_ = h.Error(StepSubmittingResponse, ErrCodePresentationError, "User declined the request")
 }
 
 // failTransactionData ends the flow: the verifier is told (as for a decline) and the

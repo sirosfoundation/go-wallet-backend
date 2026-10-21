@@ -2116,6 +2116,11 @@ func (h *wmpEngineHandler) FlowError(ctx context.Context, params *wmp.FlowErrorP
 		if params.Code == wmp.ErrCapabilityNotSupported {
 			resp.ErrorCode = ErrCodeUnsupportedTransactionData
 		}
+		// The wallet declined (WMP Core 6.2, data.reason "rejected"): not a
+		// failure, so the OID4VP flow answers the verifier with access_denied.
+		if flowErrorRejected(params.Data) {
+			resp.ErrorCode = ErrCodeSignRefused
+		}
 		select {
 		case h.session.signCh <- resp:
 			delivered = true
@@ -2138,6 +2143,15 @@ func (h *wmpEngineHandler) FlowError(ctx context.Context, params *wmp.FlowErrorP
 			zap.String("child_flow_id", params.FlowID))
 		h.registerChildFlow(params.FlowID, info.parentFlowID, info.messageID, info.flowType)
 	}
+}
+
+// flowErrorRejected reports whether a wmp.flow.error's data carries the
+// well-known reason "rejected" (WMP Core 6.2: the responder declined).
+func flowErrorRejected(data json.RawMessage) bool {
+	var d struct {
+		Reason string `json:"reason"`
+	}
+	return len(data) > 0 && json.Unmarshal(data, &d) == nil && d.Reason == "rejected"
 }
 
 // CapabilityList returns the negotiated capabilities for this session.

@@ -1567,7 +1567,7 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 	}
 
 	// Wait for response
-	timer := time.NewTimer(3 * time.Minute)
+	timer := time.NewTimer(signResponseTimeout)
 	defer timer.Stop()
 	for {
 		wake := s.stash.waitChan()
@@ -1592,6 +1592,10 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 	}
 }
 
+// signResponseTimeout is how long RequestSign waits for the client's
+// sign_response. A variable so a test can shorten it.
+var signResponseTimeout = 3 * time.Minute
+
 // SignError is a sign failure reported by the client, with the client's
 // classification of it.
 type SignError struct {
@@ -1599,11 +1603,17 @@ type SignError struct {
 	Code    ErrorCode
 }
 
-func (e *SignError) Error() string { return e.Message }
+func (e *SignError) Error() string {
+	if e.Message == "" {
+		return "client reported a sign failure"
+	}
+	return e.Message
+}
 
 // signResult turns a client-reported sign failure into an error.
 func signResult(resp *SignResponseMessage) (*SignResponseMessage, error) {
-	if resp.Error != "" {
+	// A refusal needs no text: the code alone ends the wait.
+	if resp.Error != "" || resp.ErrorCode == ErrCodeSignRefused {
 		return nil, &SignError{Message: resp.Error, Code: resp.ErrorCode}
 	}
 	return resp, nil
