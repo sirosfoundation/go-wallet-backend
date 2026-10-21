@@ -35,8 +35,10 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		existing.LastAttestedAt = instance.LastAttestedAt
 		existing.UpdatedAt = instance.UpdatedAt
 		existing.AttestationCount++
+		// Bind and link only while live: a revocation landing between the caller's
+		// status check and this write must not gain an owner or a passkey link.
 		// First user binding wins (see the Mongo implementation and WIAService.signWIA).
-		if existing.UserID == nil && instance.UserID != nil {
+		if existing.UserID == nil && instance.UserID != nil && existing.Status.IsLive() {
 			// Copied so a caller's later mutation cannot re-parent the instance.
 			u := *instance.UserID
 			existing.UserID = &u
@@ -50,7 +52,7 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		// instance past per-instance login gating (SID-AUTH-06). An authenticated
 		// attestation may write it only onto a record it owns, so a racer whose bind
 		// lost cannot set it; an unauthenticated one keeps plain first-link-wins.
-		if existing.CredentialID == "" && instance.CredentialID != "" &&
+		if existing.Status.IsLive() && existing.CredentialID == "" && instance.CredentialID != "" &&
 			(instance.UserID == nil || (existing.UserID != nil && *existing.UserID == *instance.UserID)) {
 			existing.CredentialID = instance.CredentialID
 		}

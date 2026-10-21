@@ -343,10 +343,12 @@ var ErrDeletionOperatorRequired = errors.New("account deletion stalled after the
 //   - ErrDeletionOperatorRequired: the second cleaner run or final holder sweep
 //     failed after the blacklist revocation took effect; without it these stay
 //     ErrDeletionIncomplete.
-//   - The cut-off (User.AuthInvalidBefore) advances durably before the
-//     revocations, by compare-and-set against the request's token
-//     (UserStore.InvalidateAuthBeforeForToken); a concurrent revocation answers
-//     tokengate.ErrRevoked with nothing irreversible done.
+//   - The cut-off (User.AuthInvalidBefore) advances durably before anything is
+//     erased, by compare-and-set against the request's token
+//     (UserStore.InvalidateAuthBeforeForToken); a revocation that landed first
+//     answers tokengate.ErrRevoked with nothing removed, and one landing later
+//     cannot undo the admission. The request's own token is refused after the
+//     advance, so a retry needs a fresh login.
 //   - The sweeps after the advance and after the record's removal pair with
 //     tokengate.ConfirmWrite; failure of the latter is ErrDeletionCleanupPending.
 //   - Best-effort, logged only: pending challenges, invite used_by, membership
@@ -391,9 +393,17 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	if err != nil && !errors.Is(err, storage.ErrNotFound) {
 		return fmt.Errorf("%w: list wallet instances: %w", ErrDeletionIncomplete, err)
 	}
+	// A tombstone from an earlier attempt remembers tenants whose memberships and
+	// instances are already gone; a retry must still sweep them.
+	var tombstoneTenants []domain.TenantID
+	if ts, terr := s.store.Users().GetDeletionTombstone(ctx, userID.String()); terr == nil {
+		tombstoneTenants = ts.TenantIDs
+	} else if !errors.Is(terr, storage.ErrNotFound) {
+		return fmt.Errorf("%w: look up deletion tombstone: %w", ErrDeletionIncomplete, terr)
+	}
 	seen := map[domain.TenantID]bool{}
-	tenantIDs := make([]domain.TenantID, 0, len(memberships)+len(instances)+1)
-	for _, tid := range append([]domain.TenantID{domain.DefaultTenantID}, memberships...) {
+	tenantIDs := make([]domain.TenantID, 0, len(memberships)+len(instances)+len(tombstoneTenants)+1)
+	for _, tid := range append(append([]domain.TenantID{domain.DefaultTenantID}, memberships...), tombstoneTenants...) {
 		if !seen[tid] {
 			seen[tid] = true
 			tenantIDs = append(tenantIDs, tid)
@@ -425,6 +435,23 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	}
 	if err := putTombstone(); err != nil {
 		return err
+	}
+
+	// Admit the deletion against the lifecycle before anything is erased: advance
+	// the token cut-off durably by compare-and-set against the request's token. A
+	// revocation that landed since the check above answers 401 with nothing
+	// removed; one landing afterwards only moves the cut-off further, so it cannot
+	// strand a half-erased account behind a 401. The request's own token is
+	// refused from here on; a retry after ErrDeletionIncomplete needs a fresh
+	// login (a token issued after the cut-off passes). The tombstone cannot carry
+	// the cut-off, since the gate reads only the record's while it exists.
+	if err := s.store.Users().InvalidateAuthBeforeForToken(ctx, userID, s.now().UTC(), requestIssuedAt(ctx)); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		if errors.Is(err, storage.ErrStaleWrite) {
+			return fmt.Errorf("%w: a lifecycle revocation landed before the deletion", tokengate.ErrRevoked)
+		}
+		s.logger.Error("Account deletion incomplete: token cut-off could not be advanced",
+			zap.Error(err), zap.String("user_id", userID.String()))
+		return fmt.Errorf("%w: advance token cut-off: %w", ErrDeletionIncomplete, err)
 	}
 
 	// Delete legacy credentials and presentations per tenant; failures count.
@@ -498,19 +525,6 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 				zap.Error(err), zap.String("user_id", userID.String()))
 			return fmt.Errorf("%w: drop sessions: %w", ErrDeletionIncomplete, err)
 		}
-	}
-
-	// Advance the token cut-off durably before the first irreversible step; the
-	// tombstone cannot, since the gate reads only the record's cut-off while it
-	// exists. Compare-and-set against the request's token, so a concurrent
-	// revocation answers 401 with nothing irreversible done.
-	if err := s.store.Users().InvalidateAuthBeforeForToken(ctx, userID, s.now().UTC(), requestIssuedAt(ctx)); err != nil && !errors.Is(err, storage.ErrNotFound) {
-		if errors.Is(err, storage.ErrStaleWrite) {
-			return fmt.Errorf("%w: a lifecycle revocation landed during the deletion", tokengate.ErrRevoked)
-		}
-		s.logger.Error("Account deletion incomplete: token cut-off could not be advanced",
-			zap.Error(err), zap.String("user_id", userID.String()))
-		return fmt.Errorf("%w: advance token cut-off: %w", ErrDeletionIncomplete, err)
 	}
 
 	// Revoke all previously-issued tokens for this user (#383) BEFORE

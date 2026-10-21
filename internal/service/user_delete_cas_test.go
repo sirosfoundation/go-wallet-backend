@@ -39,8 +39,8 @@ func (u *beforeAdvanceUsers) InvalidateAuthBeforeForToken(ctx context.Context, i
 }
 
 // A revocation landing between the last cut-off look and the advance is refused
-// by the compare-and-set (401-class): no permanent revocation, no user removal,
-// and the independent cut-off stands.
+// by the compare-and-set (401-class): nothing is erased, no permanent
+// revocation, no user removal, and the independent cut-off stands.
 func TestDeleteUser_CompareAndSetRefusesRevocationLandingBeforeTheAdvance(t *testing.T) {
 	ctx := context.Background()
 	inner := memory.NewStore()
@@ -51,8 +51,7 @@ func TestDeleteUser_CompareAndSetRefusesRevocationLandingBeforeTheAdvance(t *tes
 	svc.AddUserRevoker(ur)
 	cleaner := &scriptedCleaner{}
 	svc.SetSessionCleaner(cleaner)
-	uid := domain.NewUserID()
-	require.NoError(t, inner.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:key:" + uid.String()}))
+	uid := seedWalletUser(t, inner, domain.DefaultTenantID, "acme")
 
 	independent := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
 	hs.beforeAdvance = func() {
@@ -63,7 +62,17 @@ func TestDeleteUser_CompareAndSetRefusesRevocationLandingBeforeTheAdvance(t *tes
 	require.ErrorIs(t, err, tokengate.ErrRevoked)
 	assert.Zero(t, bl.calls, "no permanent revocation")
 	assert.Zero(t, ur.calls)
-	assert.Equal(t, 1, cleaner.calls, "the post-revocation cleaner pass never ran")
+	assert.Zero(t, cleaner.calls, "no session was dropped")
+	// The admission happens before the destructive phase, so a losing request
+	// leaves everything in place: a 401 must not hide a half-erased account.
+	for _, tid := range []domain.TenantID{domain.DefaultTenantID, "acme"} {
+		creds, pres := countHolderData(t, inner, tid, uid)
+		assert.Equal(t, 1, creds, "credential in %s kept", tid)
+		assert.Equal(t, 1, pres, "presentation in %s kept", tid)
+	}
+	insts, ierr := inner.WalletInstances().GetAllByUser(ctx, uid)
+	require.NoError(t, ierr)
+	assert.Len(t, insts, 1, "the wallet instance is kept")
 	_, gerr := inner.Users().GetByID(ctx, uid)
 	assert.NoError(t, gerr, "the account is kept")
 	cutoff, err := inner.Users().GetAuthCutoff(ctx, uid)
