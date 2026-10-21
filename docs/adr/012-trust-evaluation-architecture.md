@@ -262,7 +262,7 @@ trust checks because of it).
 | deadline exceeded | 504 |
 
 The 4xx body is `{"error": <PDP "error" string or a generic message>, "details": <PDP JSON object, or a truncated string>}`,
-bounded to 2 KiB.
+the serialized response is bounded to 2 KiB. Requests that fail local validation before reaching the PDP (e.g. mismatched `resource.id`/`subject.id`) are also 400.
 
 ### SPOCP Authorization
 
