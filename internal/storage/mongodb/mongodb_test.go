@@ -1236,3 +1236,25 @@ func TestUserStore_InvalidateAuthBeforeForToken(t *testing.T) {
 	require.NoError(t, store.Users().InvalidateAuthBeforeForToken(ctx, uid, later.Add(time.Hour), time.Time{}), "no token: unconditional")
 	assert.ErrorIs(t, store.Users().InvalidateAuthBeforeForToken(ctx, domain.NewUserID(), later, tokenIat), storage.ErrNotFound)
 }
+
+func TestUserStore_TombstoneHolderDIDKeptUntilCleared(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	users := store.Users()
+	id := "tomb-did-" + domain.NewUserID().String()
+	now := time.Now().UTC()
+	put := func(did string) {
+		require.NoError(t, users.PutDeletionTombstone(ctx, &domain.DeletionTombstone{UserID: id, HolderDID: did, DeletedAt: now, ExpiresAt: now.Add(time.Hour)}))
+	}
+	put("did:example:a")
+	put("") // a retry without a DID must not erase the stored one
+	got, err := users.GetDeletionTombstone(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, "did:example:a", got.HolderDID)
+
+	require.NoError(t, users.ClearDeletionTombstoneHolderDID(ctx, id))
+	got, err = users.GetDeletionTombstone(ctx, id)
+	require.NoError(t, err)
+	require.Empty(t, got.HolderDID)
+	require.NoError(t, users.ClearDeletionTombstoneHolderDID(ctx, "missing-"+id))
+}
