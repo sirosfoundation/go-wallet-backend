@@ -653,6 +653,9 @@ response in clear. Every key lives in the client.
    registers its notification context with an empty id, which matches any id the
    client sends (the engine never sees the real one; the client sends it to the
    issuer's own endpoint through the engine, which adds the issuer access token).
+   The context is registered before the first JWE is relayed, so a
+   `credential_failure` still reaches the issuer when the client rejects what it
+   decrypted (for example a seed that fails its checks).
 
 What the engine still sees: the proof JWTs (holder public key; the `psc`
 commitment is hiding by design), DPoP traffic, the issuer metadata, timing and
