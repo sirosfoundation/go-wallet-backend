@@ -1176,17 +1176,17 @@ func (s *Session) SendProgress(flowID string, step FlowStep, payload interface{}
 
 // SendFlowComplete sends a flow completion message
 func (s *Session) SendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string) error {
-	return s.sendFlowComplete(flowID, credentials, redirectURI, "", "", "", false)
+	return s.sendFlowComplete(flowID, credentials, redirectURI, "", "", "", false, nil)
 }
 
 // SendFlowCompleteWithRefreshToken is SendFlowComplete plus an OID4VCI
 // refresh_token (and the DPoP key it's bound to) to relay to the client -
 // see FlowCompleteMessage.RefreshToken/DPoPJWK.
 func (s *Session) SendFlowCompleteWithRefreshToken(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string, dpopKeyID string) error {
-	return s.sendFlowComplete(flowID, credentials, redirectURI, refreshToken, dpopJWK, dpopKeyID, false)
+	return s.sendFlowComplete(flowID, credentials, redirectURI, refreshToken, dpopJWK, dpopKeyID, false, nil)
 }
 
-func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string, dpopKeyID string, responseEncrypted bool) error {
+func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string, dpopKeyID string, responseEncrypted bool, displayMD json.RawMessage) error {
 	s.flowsMu.RLock()
 	flow := s.flows[flowID]
 	s.flowsMu.RUnlock()
@@ -1203,6 +1203,7 @@ func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult
 		DPoPJWK:                     dpopJWK,
 		DPoPKeyID:                   dpopKeyID,
 		CredentialResponseEncrypted: responseEncrypted,
+		CredentialMetadata:          displayMD,
 	}
 	if flow != nil {
 		flow.mu.RLock()

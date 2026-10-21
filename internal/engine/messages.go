@@ -407,6 +407,13 @@ type FlowCompleteMessage struct {
 	// decrypt_credential_response and pairs Credentials[i] with the i-th
 	// decrypted credential. A count mismatch is an error on the client.
 	CredentialResponseEncrypted bool `json:"credential_response_encrypted,omitempty"`
+	// CredentialMetadata is set only for a PLAIN (unencrypted) issuer
+	// response: the display members (see displayMetadataMembers) of its
+	// response-level credential_metadata, applying to every credential in
+	// Credentials. Every other member, in particular the namespaced
+	// org.siros.secret_seed, is dropped by the engine and never relayed or
+	// logged. Never present when CredentialResponseEncrypted is true.
+	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
 }
 
 // CredentialNotificationMessage carries an OID4VCI §10 credential lifecycle

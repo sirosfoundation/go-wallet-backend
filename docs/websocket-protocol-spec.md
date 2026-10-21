@@ -554,8 +554,16 @@ a count mismatch is an error on the client. The response-level
 `org.siros.secret_seed`, is never relayed by the engine: the client already holds
 it from its own decryption. An issuer that does not encrypt its response is
 visible to the engine, which relays its credentials as before (no
-`credential_response_encrypted`, `credential` present); the engine does not parse
-or relay a plain response's `credential_metadata` either.
+`credential_response_encrypted`, `credential` present). For such a plain
+response `flow_complete` also carries a top-level `credential_metadata`
+containing ONLY the display-only members `display` and `claims` of the
+response-level `credential_metadata` (omitted when it has neither); every other
+member (extensions) is dropped by the engine and never relayed or logged. A plain
+response whose `credential_metadata` carries `org.siros.secret_seed` is refused
+with `CREDENTIAL_ERROR` and no `flow_complete`, advertised or not (privatedata-spec
+5A.4); errors and logs contain no values. Clients ignore extension members
+arriving in `flow_complete`. An encrypted response never yields `credential_metadata`
+on `flow_complete`.
 
 #### Credential response encryption (engine-blind)
 

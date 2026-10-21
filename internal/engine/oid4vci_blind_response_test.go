@@ -988,18 +988,73 @@ func TestFlowComplete_PlainResponseUnchanged(t *testing.T) {
 	assert.Equal(t, "n-1", creds[0].NotificationID)
 }
 
-// A plain response carrying credential_metadata is not parsed or relayed:
-// the object no longer exists on the engine's types.
-func TestPlainResponseCredentialMetadataIsNotRelayed(t *testing.T) {
+// A plain response carrying the seed is refused, whatever else it carries.
+func TestPlainResponse_SeedRefused(t *testing.T) {
+	core, logs := observer.New(zap.DebugLevel)
 	h, ch, cleanup := captureHandler(t)
 	defer cleanup()
+	h.Logger = zap.New(core)
 	var resp CredentialResponse
-	require.NoError(t, json.Unmarshal([]byte(`{"credentials":["c0"],"credential_metadata":{"display":[{"name":"MARKER-DISPLAY"}]}}`), &resp))
+	body := `{"credentials":["c0"],"credential_metadata":{"display":[{"name":"D"}],"claims":[],"org.example.x":"EXT",` +
+		`"org.siros.secret_seed":{"ns":"` + secretSeedA + `"}}}`
+	require.NoError(t, json.Unmarshal([]byte(body), &resp))
+	err := h.finishIssuance(context.Background(), &resp, &CredentialConfig{Format: "x"}, nil, nil, &TokenResponse{})
+	require.Error(t, err)
+	assertNoSecrets(t, "error", err.Error())
+	m := nextMsg(t, ch)
+	assert.JSONEq(t, `"flow_error"`, string(m["type"]))
+	assertNoSecrets(t, "logs", logDump(logs))
+	select {
+	case extra := <-ch:
+		t.Fatalf("unexpected %s", extra["type"])
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// Plain response without a seed: only display and claims are relayed; every
+// extension member is dropped.
+func TestPlainResponse_OnlyDisplayMetadataRelayed(t *testing.T) {
+	core, logs := observer.New(zap.DebugLevel)
+	h, ch, cleanup := captureHandler(t)
+	defer cleanup()
+	h.Logger = zap.New(core)
+	var resp CredentialResponse
+	body := `{"credentials":["c0"],"credential_metadata":{"display":[{"name":"MARKER-DISPLAY"}],` +
+		`"claims":[{"path":["a"]}],"org.example.x":"OTHER-MEMBER"}}`
+	require.NoError(t, json.Unmarshal([]byte(body), &resp))
 	require.NoError(t, h.finishIssuance(context.Background(), &resp, &CredentialConfig{Format: "x"}, nil, nil, &TokenResponse{}))
-	wire, err := json.Marshal(nextMsg(t, ch))
+	m := nextMsg(t, ch)
+	assert.JSONEq(t, `{"display":[{"name":"MARKER-DISPLAY"}],"claims":[{"path":["a"]}]}`, string(m["credential_metadata"]))
+	wire, err := json.Marshal(m)
 	require.NoError(t, err)
-	assert.NotContains(t, string(wire), "MARKER-DISPLAY")
-	assert.NotContains(t, string(wire), "credential_metadata")
+	assertNoSecrets(t, "flow_complete", string(wire))
+	assert.NotContains(t, string(wire), "OTHER-MEMBER")
+	assertNoSecrets(t, "logs", logDump(logs))
+	assert.NotContains(t, m, "credential_response_encrypted")
+}
+
+func TestPlainResponse_NoDisplayMembersMeansNoField(t *testing.T) {
+	for _, md := range []string{`{"org.example.x":"OTHER-MEMBER"}`, `"str"`, `[1]`, `null`} {
+		h, ch, cleanup := captureHandler(t)
+		var resp CredentialResponse
+		require.NoError(t, json.Unmarshal([]byte(`{"credentials":["c0"],"credential_metadata":`+md+`}`), &resp))
+		require.NoError(t, h.finishIssuance(context.Background(), &resp, &CredentialConfig{Format: "x"}, nil, nil, &TokenResponse{}))
+		m := nextMsg(t, ch)
+		assert.NotContains(t, m, "credential_metadata")
+		wire, _ := json.Marshal(m)
+		assertNoSecrets(t, "flow_complete", string(wire))
+		cleanup()
+	}
+}
+
+// Encrypted: never any credential_metadata, even if a (buggy) path set it.
+func TestEncryptedResponse_NeverCredentialMetadata(t *testing.T) {
+	h, ch, cleanup := captureHandler(t)
+	defer cleanup()
+	resp := &CredentialResponse{Encrypted: true, CredentialCount: 1,
+		CredentialMetadata: json.RawMessage(`{"display":[{"name":"X"}]}`)}
+	require.NoError(t, h.finishIssuance(context.Background(), resp, &CredentialConfig{Format: "x"}, nil, nil, &TokenResponse{}))
+	assert.NotContains(t, nextMsg(t, ch), "credential_metadata")
 }
 
 func TestSignRequestWire_DecryptAndGenerateProofShapes(t *testing.T) {

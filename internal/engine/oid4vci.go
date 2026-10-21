@@ -355,6 +355,10 @@ type CredentialResponse struct {
 	TransactionID   string        `json:"transaction_id,omitempty"`
 	Interval        int           `json:"interval,omitempty"`
 	NotificationID  string        `json:"notification_id,omitempty"`
+	// CredentialMetadata is the raw response-level credential_metadata of a
+	// PLAIN response. It may carry a secret (org.siros.secret_seed): never log
+	// it; only displayMetadata(...) of it may leave the engine.
+	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
 
 	// The fields below are local state, never part of the wire format.
 
@@ -1164,9 +1168,17 @@ func (h *OID4VCIHandler) issueCredential(ctx context.Context, metadata *IssuerMe
 // the completion says so (credential_response_encrypted): the client already
 // holds the credentials and the response-level credential_metadata.
 func (h *OID4VCIHandler) finishIssuance(ctx context.Context, resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo, metadata *IssuerMetadata, token *TokenResponse) error {
+	// A plain response never delivers a seed (privatedata-spec 5A.4), whether
+	// advertised or not: refuse it, without quoting any content.
+	if !resp.Encrypted && hasSecretSeedMember(resp.CredentialMetadata) {
+		err := errors.New("secret seed credential_metadata arrived in a plain response")
+		h.Logger.Warn("rejecting credential response", zap.Error(err))
+		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer returned malformed credential metadata")
+		return err
+	}
 	results := h.buildCredentialResults(ctx, resp, config, trust)
 	h.registerNotificationContext(metadata, token, resp)
-	return h.Flow.Session.sendFlowComplete(h.Flow.ID, results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token), h.dpopKeyIDForRefreshToken(token), resp.Encrypted)
+	return h.Flow.Session.sendFlowComplete(h.Flow.ID, results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token), h.dpopKeyIDForRefreshToken(token), resp.Encrypted, displayMetadata(resp))
 }
 
 // dpopJWKForRefreshToken exports h.dpopKey as a private JWK for relay to the
@@ -3036,4 +3048,15 @@ func credentialToString(cred interface{}) string {
 		b, _ := json.Marshal(v)
 		return string(b)
 	}
+}
+
+// hasSecretSeedMember reports whether a response-level credential_metadata
+// object has the org.siros.secret_seed member.
+func hasSecretSeedMember(md json.RawMessage) bool {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(md, &m) != nil {
+		return false
+	}
+	_, ok := m[secretSeedMember]
+	return ok
 }

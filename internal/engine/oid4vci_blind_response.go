@@ -209,3 +209,38 @@ func (h *OID4VCIHandler) relayEncryptedResponse(ctx context.Context, jwe string,
 	}
 	return out, nil
 }
+
+// displayMetadataMembers are the members of a plain response's response-level
+// credential_metadata (OpenID4VCI 1.1) the engine relays: the display-only
+// ones. Everything else, in particular the namespaced org.siros.secret_seed,
+// is dropped.
+var displayMetadataMembers = []string{"display", "claims"}
+
+// displayMetadata returns the allow-listed display members of a PLAIN
+// response's credential_metadata, compacted, or nil. An encrypted response
+// never yields any: the engine has no plaintext, and the client holds the
+// metadata. A value that is not an object yields nil; no error or log ever
+// quotes the content.
+func displayMetadata(resp *CredentialResponse) json.RawMessage {
+	if resp == nil || resp.Encrypted || len(resp.CredentialMetadata) == 0 {
+		return nil
+	}
+	var members map[string]json.RawMessage
+	if json.Unmarshal(resp.CredentialMetadata, &members) != nil {
+		return nil
+	}
+	out := make(map[string]json.RawMessage, len(displayMetadataMembers))
+	for _, k := range displayMetadataMembers {
+		if v, ok := members[k]; ok {
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(out)
+	if err != nil {
+		return nil
+	}
+	return b
+}
