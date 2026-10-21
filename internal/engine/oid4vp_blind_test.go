@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -208,6 +209,30 @@ type blindFixture struct {
 	verifier *ecdsa.PrivateKey
 	logs     *observer.ObservedLogs
 	cleanup  func()
+
+	mu   sync.Mutex
+	sent []string // every message the engine sent the client, as JSON
+}
+
+func (f *blindFixture) record(m map[string]any) {
+	b, _ := json.Marshal(m)
+	f.mu.Lock()
+	f.sent = append(f.sent, string(b))
+	f.mu.Unlock()
+}
+
+// allSent returns everything the engine sent the client so far.
+func (f *blindFixture) allSent() string {
+	for {
+		select {
+		case m := <-f.received:
+			f.record(m)
+		default:
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			return strings.Join(f.sent, "\n")
+		}
+	}
 }
 
 func newBlindFixture(t *testing.T) *blindFixture {
@@ -237,6 +262,7 @@ func (f *blindFixture) answer(t *testing.T, reply func(params map[string]any) *S
 		for {
 			select {
 			case msg := <-f.received:
+				f.record(msg)
 				if msg["type"] != "sign_request" {
 					continue
 				}
@@ -315,13 +341,9 @@ func TestRequestVPSignature_DirectPostJWT_ClientEncrypts(t *testing.T) {
 
 	// (a) The engine never held the vp_token: not in anything it sent to the
 	// client, logged, or kept in flow state.
-	close(f.received)
-	var sent []string
-	for m := range f.received {
-		b, _ := json.Marshal(m)
-		sent = append(sent, string(b))
-	}
-	assert.NotContains(t, strings.Join(sent, "\n"), blindSentinel)
+	sent := f.allSent()
+	assert.Contains(t, sent, "sign_request", "the check covers the sign request")
+	assert.NotContains(t, sent, blindSentinel)
 	for _, e := range f.logs.All() {
 		assert.NotContains(t, fmt.Sprintf("%v %v", e.Message, e.ContextMap()), blindSentinel)
 	}
