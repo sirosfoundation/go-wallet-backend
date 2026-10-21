@@ -2,10 +2,16 @@ package engine
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -84,6 +90,40 @@ func TestEvaluateVerifierTrust_RedirectURI_BadSignatureFailsClosed(t *testing.T)
 	require.Error(t, err)
 	assert.Nil(t, verifier)
 	assert.Empty(t, pdp.subjects, "an unverified request object must not reach the PDP at all")
+}
+
+// A verdict reached with a proven key must not be served to a later request
+// for the same client_id that does not prove that key (or proves a different
+// one): the cache identity is bound to the verified key.
+func TestEvaluateVerifierTrust_RedirectURI_CacheBoundToVerifiedKey(t *testing.T) {
+	signedA, _ := makeSignedJWTWithX5C(t)
+	signedB, _ := makeSignedJWTWithX5C(t)
+	h, pdp := newKeyRecordingHandler(t)
+
+	req := func(jwtStr string) *AuthorizationRequest {
+		return &AuthorizationRequest{
+			ClientID:       "https://verifier.example.com",
+			ClientIDScheme: ClientIDSchemeRedirectURI,
+			Nonce:          "n",
+			ResponseURI:    "https://verifier.example.com/response",
+			RequestJWT:     jwtStr,
+		}
+	}
+	_, err := h.evaluateVerifierTrust(context.Background(), req(signedA))
+	require.NoError(t, err)
+	require.Len(t, pdp.subjects, 1)
+
+	_, err = h.evaluateVerifierTrust(context.Background(), req(""))
+	require.NoError(t, err)
+	assert.Len(t, pdp.subjects, 2, "an unsigned request must not reuse the verdict of a key-proven one")
+
+	_, err = h.evaluateVerifierTrust(context.Background(), req(signedB))
+	require.NoError(t, err)
+	assert.Len(t, pdp.subjects, 3, "a different proven key must not reuse another key's verdict")
+
+	_, err = h.evaluateVerifierTrust(context.Background(), req(signedA))
+	require.NoError(t, err)
+	assert.Len(t, pdp.subjects, 3, "the same proven key is still served from cache")
 }
 
 // Control for the test above: the same request with a VALID signature still
@@ -200,7 +240,6 @@ func TestEvaluateVerifierTrust_SignedSchemes_BadOrMissingSignatureFailClosed(t *
 		{"x509_san_dns:verifier.example.com", ClientIDSchemeX509SANDNS},
 		{"x509_san_uri:https://verifier.example.com", ClientIDSchemeX509SANURI},
 		{"x509_hash:abc", ClientIDSchemeX509Hash},
-		{"verifier_attestation:verifier.example.com", ClientIDSchemeVerifierAttestation},
 	} {
 		for name, jwtStr := range map[string]string{"bad-signature": tamperJWTSignature(t, good), "absent": ""} {
 			t.Run(tc.scheme+"/"+name, func(t *testing.T) {
@@ -217,4 +256,59 @@ func TestEvaluateVerifierTrust_SignedSchemes_BadOrMissingSignatureFailClosed(t *
 			})
 		}
 	}
+}
+
+// makeAttestedRequestJWT builds a verifier_attestation request object: an
+// attestation JWT (in the "jwt" header) binding cnfKey, and a request JWT
+// signed with signKey. The attestation's own signature is the PDP's concern.
+func makeAttestedRequestJWT(t *testing.T, sub string, cnfKey, signKey *ecdsa.PrivateKey) string {
+	t.Helper()
+	b64 := func(v interface{}) string {
+		raw, err := json.Marshal(v)
+		require.NoError(t, err)
+		return base64.RawURLEncoding.EncodeToString(raw)
+	}
+	attestation := b64(map[string]interface{}{"alg": "ES256"}) + "." +
+		b64(map[string]interface{}{
+			"iss": "https://attester.example.com",
+			"sub": sub,
+			"cnf": map[string]interface{}{"jwk": ecPublicJWK(&cnfKey.PublicKey, "k")},
+		}) + ".c2ln"
+	signingInput := b64(map[string]interface{}{"alg": "ES256", "kid": "k", "jwt": attestation}) + "." +
+		b64(map[string]interface{}{"iss": sub})
+	sig, err := jwt.SigningMethodES256.Sign(signingInput, signKey)
+	require.NoError(t, err)
+	return signingInput + "." + base64.RawURLEncoding.EncodeToString([]byte(sig))
+}
+
+// verifier_attestation: a request object not signed by the attestation's cnf
+// key must be refused; the same request signed by it is accepted (control,
+// so the refusal is about the signature and nothing else).
+func TestEvaluateVerifierTrust_VerifierAttestation_RequestSignatureMustMatchCnf(t *testing.T) {
+	cnf, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	other, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	const sub = "verifier.example.com"
+
+	eval := func(jwtStr string) (*keyRecordingPDP, error) {
+		h, pdp := newKeyRecordingHandler(t)
+		_, err := h.evaluateVerifierTrust(context.Background(), &AuthorizationRequest{
+			ClientID:       "verifier_attestation:" + sub,
+			ClientIDScheme: ClientIDSchemeVerifierAttestation,
+			Nonce:          "n",
+			ResponseURI:    "https://verifier.example.com/response",
+			RequestJWT:     jwtStr,
+		})
+		return pdp, err
+	}
+
+	pdp, err := eval(makeAttestedRequestJWT(t, sub, cnf, other))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "does not match attestation cnf key")
+	assert.Empty(t, pdp.subjects)
+
+	pdp, err = eval(makeAttestedRequestJWT(t, sub, cnf, cnf))
+	require.NoError(t, err)
+	assert.Len(t, pdp.subjects, 1)
 }
