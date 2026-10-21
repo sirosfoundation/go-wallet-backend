@@ -476,7 +476,10 @@ deletion tombstone then refuses every write), so it cannot hold the record
 back. If it fails, the answer is `202` with `DELETION_CLEANUP_PENDING` and
 `"result": "DELETED"`: the account **is** deleted, repeating the request is
 pointless (the token is refused and the account is unknown), and an operator
-clears the remainder. The leftover is not served to any token.
+clears the remainder. The leftover is not served to any token. The deletion
+tombstone remembers the user's tenants and canonical holder DID (cleared once
+the final sweep succeeds), so a repeat of the deletion that finds no user record
+still sweeps the DID-keyed credentials and presentations in every tenant.
 
 ### Credential Management
 

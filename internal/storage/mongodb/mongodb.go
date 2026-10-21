@@ -329,9 +329,19 @@ func (s *UserStore) PutDeletionTombstone(ctx context.Context, t *domain.Deletion
 	if len(t.TenantIDs) > 0 {
 		update["$addToSet"] = bson.M{"tenant_ids": bson.M{"$each": t.TenantIDs}}
 	}
+	if t.HolderDID != "" {
+		update["$set"] = bson.M{"holder_did": t.HolderDID}
+	}
 	_, err := s.tombstones.UpdateOne(ctx, bson.M{"_id": t.UserID}, update, options.Update().SetUpsert(true))
 	if err != nil {
 		return fmt.Errorf("%w: put deletion tombstone: %v", storage.ErrDatabase, err)
+	}
+	return nil
+}
+
+func (s *UserStore) ClearDeletionTombstoneHolderDID(ctx context.Context, userID string) error {
+	if _, err := s.tombstones.UpdateOne(ctx, bson.M{"_id": userID}, bson.M{"$unset": bson.M{"holder_did": ""}}); err != nil {
+		return fmt.Errorf("%w: clear deletion tombstone holder did: %v", storage.ErrDatabase, err)
 	}
 	return nil
 }

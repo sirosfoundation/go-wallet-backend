@@ -206,6 +206,13 @@ type DeletionTombstone struct {
 	// TenantIDs are the tenants the account had data or memberships in.
 	// Informational; the user id is global, so the gate does not consult it.
 	TenantIDs []TenantID `json:"tenant_ids,omitempty" bson:"tenant_ids,omitempty"`
+	// HolderDID is the user's canonical holder DID (User.DID), under which
+	// credentials and presentations are keyed. A repeat of the deletion after the
+	// record is gone can no longer derive it, so it is kept here only while
+	// cleanup may still be pending and cleared once the final sweep completes
+	// (DeletionTombstoneStore.ClearDeletionTombstoneHolderDID). It is an
+	// identifier of the deleted account: never log it.
+	HolderDID string `json:"holder_did,omitempty" bson:"holder_did,omitempty"`
 	// DeletedAt is when the deletion was first recorded (earliest on retry).
 	DeletedAt time.Time `json:"deleted_at" bson:"deleted_at"`
 	// ExpiresAt is when the tombstone may be removed.

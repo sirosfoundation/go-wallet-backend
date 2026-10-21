@@ -351,6 +351,10 @@ var ErrDeletionOperatorRequired = errors.New("account deletion stalled after the
 //     advance, so a retry needs a fresh login.
 //   - The sweeps after the advance and after the record's removal pair with
 //     tokengate.ConfirmWrite; failure of the latter is ErrDeletionCleanupPending.
+//   - The tombstone records the user's canonical holder DID before anything is
+//     erased, so a repeat after the record is gone (ErrDeletionCleanupPending)
+//     still sweeps the DID-keyed data; it is cleared when the last sweep
+//     succeeds and is never logged.
 //   - Best-effort, logged only: pending challenges, invite used_by, membership
 //     removal, blacklist RevokeUser. A failing final Users().Delete answers a
 //     plain error.
@@ -361,7 +365,9 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 
 	// Credentials are stored under User.DID, not the bare uuid the handler
 	// passes.
+	userFound := false
 	if user, err := s.store.Users().GetByID(ctx, userID); err == nil {
+		userFound = true
 		// Cut-off check (SID-AUTH-06): a request admitted before a logout must
 		// not erase the account.
 		if err := refuseIfCutOff(ctx, user); err != nil {
@@ -398,6 +404,11 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	var tombstoneTenants []domain.TenantID
 	if ts, terr := s.store.Users().GetDeletionTombstone(ctx, userID.String()); terr == nil {
 		tombstoneTenants = ts.TenantIDs
+		// Without the record the canonical DID survives only in the tombstone;
+		// the caller can name just the bare uuid.
+		if !userFound && ts.HolderDID != "" {
+			holderDID = ts.HolderDID
+		}
 	} else if !errors.Is(terr, storage.ErrNotFound) {
 		return fmt.Errorf("%w: look up deletion tombstone: %w", ErrDeletionIncomplete, terr)
 	}
@@ -423,6 +434,7 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	putTombstone := func() error {
 		if err := s.store.Users().PutDeletionTombstone(ctx, &domain.DeletionTombstone{
 			UserID:    userID.String(),
+			HolderDID: holderDID,
 			TenantIDs: tenantIDs,
 			DeletedAt: deletedAt,
 			ExpiresAt: deletedAt.Add(s.cfg.DeletionTombstoneRetention()),
@@ -609,6 +621,13 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		s.logger.Error("Account deleted but holder data written during the deletion could not be removed",
 			zap.Error(errors.Join(lastErrs...)), zap.String("user_id", userID.String()))
 		return fmt.Errorf("%w: sweep after user removal: %w", ErrDeletionCleanupPending, errors.Join(lastErrs...))
+	}
+
+	// Cleanup is complete: the DID is no longer needed, so minimise what the
+	// tombstone keeps. A failure only leaves it until the tombstone expires.
+	if err := s.store.Users().ClearDeletionTombstoneHolderDID(ctx, userID.String()); err != nil {
+		s.logger.Warn("Deletion tombstone holder DID could not be cleared",
+			zap.Error(err), zap.String("user_id", userID.String()))
 	}
 
 	s.logger.Info("User deleted")

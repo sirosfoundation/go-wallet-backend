@@ -548,14 +548,21 @@ cp wallet.db.backup wallet.db
 Deleting a user removes the record that carries the user's token cut-off
 (`AuthInvalidBefore`). Bearer tokens are stateless, so a token issued before
 the deletion would otherwise stay valid until it expires. `DeleteUser`
-therefore writes a **deletion tombstone** (user id, tenants, deleted-at,
-expires-at) as soon as it knows which tenants the account touches, before it
+therefore writes a **deletion tombstone** (user id, tenants, the user's canonical
+holder DID, deleted-at, expires-at) as soon as it knows which tenants the account touches, before it
 removes any holder credential, presentation or wallet instance, and stops with
 `account deletion incomplete` (nothing deleted, safe to retry) if the write
 fails. Repeating a deletion rewrites the tombstone idempotently (earliest
 deleted-at, latest expiry, union of tenants). A tenant that only a late
 re-list of the wallet instances reveals is added to the tombstone before
 anything in it is removed.
+
+The holder DID is stored because credentials and presentations are keyed by it
+and a repeat of the deletion, after the user record is gone, could not derive
+it. It is needed only while cleanup may still be pending, so it is removed from
+the tombstone (`ClearDeletionTombstoneHolderDID`) once the final sweep
+succeeds, and it is never logged. If the clearing write fails, the DID remains
+until the tombstone expires.
 
 The token gate (both bearer middlewares, and the WIA attestation path) refuses
 every token whose user has no record but has a tombstone, whenever the token
