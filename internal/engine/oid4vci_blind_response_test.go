@@ -291,6 +291,11 @@ type issuerStub struct {
 	deferredBodies []string
 	plainDeferred  bool // answer deferred in clear although a key was given
 	deferredHits   int
+	// encPendingBody, when set, makes a pending poll an ENCRYPTED 202 with this
+	// plaintext; malformedPending makes it a 202 jwt that is not a compact JWE.
+	encPendingBody   string
+	malformedPending bool
+	times            []time.Time
 }
 
 func newIssuerStub(t *testing.T, credentialBody string, deferredBodies ...string) *issuerStub {
@@ -301,6 +306,7 @@ func newIssuerStub(t *testing.T, credentialBody string, deferredBodies ...string
 		_ = json.Unmarshal(raw, &req)
 		st.mu.Lock()
 		st.requests = append(st.requests, req)
+		st.times = append(st.times, time.Now())
 		deferred := strings.HasSuffix(r.URL.Path, "/deferred_credential")
 		body := st.credentialBody
 		pending := false
@@ -315,8 +321,20 @@ func newIssuerStub(t *testing.T, credentialBody string, deferredBodies ...string
 		plain := deferred && st.plainDeferred
 		st.mu.Unlock()
 		if pending {
-			w.WriteHeader(http.StatusAccepted)
-			_, _ = w.Write([]byte(`{"interval":1}`))
+			enc, hasKey := req["credential_response_encryption"].(map[string]any)
+			switch {
+			case st.malformedPending:
+				w.Header().Set("Content-Type", "application/jwt")
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = w.Write([]byte("not-a-jwe"))
+			case st.encPendingBody != "" && hasKey:
+				w.Header().Set("Content-Type", "application/jwt")
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = w.Write([]byte(jweTo(t, enc, st.encPendingBody)))
+			default:
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = w.Write([]byte(`{"interval":1}`))
+			}
 			return
 		}
 		enc, ok := req["credential_response_encryption"].(map[string]any)
@@ -492,13 +510,14 @@ func TestBlind_DeferredIssuance_SameClientPath(t *testing.T) {
 	st := newIssuerStub(t, `{"transaction_id":"`+secretTx+`","interval":1}`,
 		"", // first poll: pending
 		seedResponse)
+	st.encPendingBody = `{"transaction_id":"` + secretTx + `","interval":1}`
 	fc := &fakeClient{t: t}
 	h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
 	require.NoError(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", seedConfig(), nil, ""))
 
-	assert.Equal(t, []SignAction{SignActionGenerateProof, SignActionDecryptCredentialResponse, SignActionDecryptCredentialResponse}, fc.actions())
-	// First relay: deferred=false, second: deferred=true.
+	assert.Equal(t, []SignAction{SignActionGenerateProof, SignActionDecryptCredentialResponse, SignActionDecryptCredentialResponse, SignActionDecryptCredentialResponse}, fc.actions())
+	// First relay: deferred=false, then the encrypted pending 202 and the final answer: deferred=true.
 	var deferredFlags []string
 	for _, m := range fc.outboundMessages() {
 		if string(m["type"]) != `"sign_request"` || !strings.Contains(string(m["action"]), "decrypt") {
@@ -508,7 +527,7 @@ func TestBlind_DeferredIssuance_SameClientPath(t *testing.T) {
 		require.NoError(t, json.Unmarshal(m["params"], &p))
 		deferredFlags = append(deferredFlags, string(p["deferred"]))
 	}
-	assert.Equal(t, []string{"false", "true"}, deferredFlags, "deferred is sent explicitly, false included")
+	assert.Equal(t, []string{"false", "true", "true"}, deferredFlags, "deferred is sent explicitly, false included")
 
 	// The deferred request repeated credential_response_encryption with the
 	// same key (OID4VCI 1.0 §9.1): otherwise the issuer answers in clear.
@@ -528,6 +547,64 @@ func TestBlind_DeferredIssuance_SameClientPath(t *testing.T) {
 	var creds []map[string]any
 	require.NoError(t, json.Unmarshal(done["credentials"], &creds))
 	assert.Len(t, creds, 2)
+}
+
+// An encrypted 202 pending answer is relayed to the client, and the
+// transaction_id and interval the client reports replace the engine's own.
+func TestBlind_DeferredEncryptedPending202_ClientUpdatesTxAndInterval(t *testing.T) {
+	oldD, oldU := deferredPollDefaultInterval, deferredPollIntervalUnit
+	deferredPollDefaultInterval, deferredPollIntervalUnit = time.Millisecond, 60*time.Millisecond
+	t.Cleanup(func() { deferredPollDefaultInterval, deferredPollIntervalUnit = oldD, oldU })
+
+	st := newIssuerStub(t, `{"transaction_id":"tx1"}`,
+		"", // first poll: encrypted pending 202
+		seedResponse)
+	st.encPendingBody = `{"transaction_id":"tx2","interval":3}`
+	fc := &fakeClient{t: t}
+	h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
+	defer cleanup()
+	require.NoError(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", seedConfig(), nil, ""))
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	require.Len(t, st.requests, 3, "credential request, pending poll, final poll")
+	assert.Equal(t, "tx1", st.requests[1]["transaction_id"])
+	assert.Equal(t, "tx2", st.requests[2]["transaction_id"], "the client-reported transaction_id is used")
+	assert.GreaterOrEqual(t, st.times[2].Sub(st.times[1]), 3*deferredPollIntervalUnit-20*time.Millisecond,
+		"the client-reported interval (3 units) is waited, not the default")
+	// The pending JWE was relayed, so the client decrypted it.
+	require.Len(t, fc.decrypted, 3)
+	assert.Contains(t, fc.decrypted[1], "tx2")
+	assertNoSecrets(t, "outbound", fc.engineSaw())
+	assertNoSecrets(t, "logs", logDump(logs))
+}
+
+// An encrypted 202 that is not a compact JWE fails closed.
+func TestBlind_DeferredEncrypted202MalformedJWE_Fails(t *testing.T) {
+	fastDeferredPolling(t)
+	st := newIssuerStub(t, `{"transaction_id":"tx1"}`, "")
+	st.malformedPending = true
+	fc := &fakeClient{t: t}
+	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
+	defer cleanup()
+	err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", seedConfig(), nil, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "malformed encrypted")
+	st.mu.Lock()
+	assert.Len(t, st.requests, 2, "no further polling after a malformed answer")
+	st.mu.Unlock()
+}
+
+// A plain 202 to a seed-advertising request is refused like a plain 200.
+func TestBlind_DeferredPlain202ToSeedRefused(t *testing.T) {
+	fastDeferredPolling(t)
+	st := newIssuerStub(t, `{"transaction_id":"tx1"}`, "")
+	fc := &fakeClient{t: t}
+	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
+	defer cleanup()
+	err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", seedConfig(), nil, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "without encrypting")
 }
 
 // The engine used to read a deferred answer as plain JSON whatever it was.

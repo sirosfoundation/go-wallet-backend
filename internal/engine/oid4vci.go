@@ -2855,30 +2855,42 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))
 		_ = resp.Body.Close()
 
-		switch resp.StatusCode {
-		case http.StatusOK:
+		// An issuer answers a request that asked for an encrypted response
+		// with a JWE whatever the status: 200 carries the credentials, 202 a
+		// still-pending answer (transaction_id, interval) that is just as
+		// encrypted. Handle that before any status-specific JSON parsing,
+		// which would silently drop it.
+		if respEnc != nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted) {
 			mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-			if respEnc != nil && (mediaType == "application/jwt" || mediaType == "application/jose") {
+			if mediaType == "application/jwt" || mediaType == "application/jose" {
 				// Encrypted to the client's key: relay it unread.
 				answer, err := h.relayEncryptedResponse(ctx, string(body), true, respEnc)
 				if err != nil {
 					return nil, err
 				}
 				if answer.TransactionID != "" {
-					// Still not ready: keep polling.
+					// Still not ready: keep polling with what the client reported.
 					transactionID = answer.TransactionID
 					if answer.Interval > 0 {
 						wait = time.Duration(answer.Interval) * deferredPollIntervalUnit
 					}
 					continue
 				}
+				if resp.StatusCode == http.StatusAccepted {
+					// 202 means "not ready": credentials in it are a protocol violation.
+					return nil, errors.New("issuer answered a pending deferred request with credentials")
+				}
 				h.Logger.Info("Deferred credential received", zap.String("transaction_id", transactionID))
 				return answer, nil
 			}
-			if respEnc != nil && respEnc.Seed {
+			if respEnc.Seed {
 				// A seed is never delivered in clear: refuse unread.
 				return nil, errors.New("issuer answered a secret seed deferred request without encrypting the response")
 			}
+		}
+
+		switch resp.StatusCode {
+		case http.StatusOK:
 			// Credential is ready
 			var credResp CredentialResponse
 			if err := json.Unmarshal(body, &credResp); err != nil {
