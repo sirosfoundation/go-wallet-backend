@@ -102,3 +102,75 @@ func TestWMP_ClientMetadata_OmittedWhenAbsent(t *testing.T) {
 	_, match := runClientMetadataFlow(t, nil)
 	assert.NotContains(t, match, "client_metadata")
 }
+
+// signClientMetadataFlowHandler issues a sign request whose params carry cm
+// (when non-nil), exercising the SignRequestMessage -> SignSubFlowParams
+// translation.
+type signClientMetadataFlowHandler struct {
+	flow *Flow
+	cm   json.RawMessage
+}
+
+func (h *signClientMetadataFlowHandler) Execute(ctx context.Context, msg *FlowStartMessage) error {
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	_, _ = h.flow.Session.RequestSign(ctx, h.flow.ID, SignActionSignPresentation,
+		SignRequestParams{Nonce: "n", Audience: "a", ClientMetadata: h.cm})
+	return nil
+}
+
+func (h *signClientMetadataFlowHandler) Cancel() {}
+
+func runSignClientMetadataFlow(t *testing.T, cm json.RawMessage) map[string]json.RawMessage {
+	t.Helper()
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+
+	m.RegisterFlowHandler("cm_sign_test", func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
+		return &signClientMetadataFlowHandler{flow: flow, cm: cm}, nil
+	})
+	sessionID := createWMPSession(t, a)
+	_, err := a.HandleRPC(context.Background(), sessionID, "", "", wmpRequest("2", "wmp.flow.start", wmp.FlowStartParams{
+		WMP:      wmp.Metadata{Version: wmp.Version, SessionID: sessionID},
+		FlowType: "cm_sign_test",
+		FlowID:   "flow-cm-sign",
+	}))
+	require.NoError(t, err)
+
+	events, err := a.Events(sessionID)
+	require.NoError(t, err)
+	timeout := time.After(3 * time.Second)
+	for {
+		select {
+		case ev := <-events:
+			var n struct {
+				Method string `json:"method"`
+				Params struct {
+					FlowType string                     `json:"flow_type"`
+					Params   map[string]json.RawMessage `json:"params"`
+				} `json:"params"`
+			}
+			if json.Unmarshal(ev, &n) != nil {
+				continue
+			}
+			if n.Method == wmp.MethodFlowStart && n.Params.FlowType == string(wmp.FlowTypeSign) {
+				return n.Params.Params
+			}
+		case <-timeout:
+			t.Fatal("timeout waiting for sign sub-flow start")
+		}
+	}
+}
+
+func TestWMP_ClientMetadata_ForwardedOnSignSubFlow(t *testing.T) {
+	params := runSignClientMetadataFlow(t, json.RawMessage(testClientMetadata))
+	require.Contains(t, params, "client_metadata", "sign sub-flow params must carry client_metadata")
+	assert.JSONEq(t, testClientMetadata, string(params["client_metadata"]))
+	assert.Contains(t, params, "nonce")
+}
+
+func TestWMP_ClientMetadata_OmittedOnSignSubFlowWhenAbsent(t *testing.T) {
+	params := runSignClientMetadataFlow(t, nil)
+	assert.NotContains(t, params, "client_metadata")
+	assert.Contains(t, params, "nonce")
+}

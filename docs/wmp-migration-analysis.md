@@ -733,12 +733,8 @@ The optional verifier `client_metadata` object (verbatim; see "Verifier
 - `wmp.flow.progress` with `step: "credential_selection"`: as
   `payload.client_metadata` (the payload is forwarded unchanged).
 - the `match` sub-flow's `wmp.flow.start` `params.client_metadata`.
-- the `sign` sub-flow's `params.client_metadata`: **not yet carried.**
-  `openid4x.SignSubFlowParams` is defined in the `go-wmp` module (v0.6.2 has no
-  such field), so the adapter cannot forward it until go-wmp adds
-  a `client_metadata` (json.RawMessage, omitempty) member and
-  this module bumps the dependency. Until then a WMP client takes it from the
-  `credential_selection` progress / `match` params.
+- the `sign` sub-flow's `params.client_metadata` (`openid4x.SignSubFlowParams.ClientMetadata`,
+  added in go-wmp v0.7.0; omitted when the request had none).
 
 For `direct_post.jwt` the engine no longer sends an empty
 `verifier_jwk_thumbprint`: if the verifier's response-encryption key cannot be

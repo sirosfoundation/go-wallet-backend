@@ -2376,6 +2376,7 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 			ATH:                   m.Params.ATH,
 			KeyID:                 m.Params.KeyID,
 			AttestationChallenge:  m.Params.AttestationChallenge,
+			ClientMetadata:        m.Params.ClientMetadata,
 		}
 		paramsJSON, err := json.Marshal(subFlowParams)
 		if err != nil {
