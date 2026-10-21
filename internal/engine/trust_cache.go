@@ -24,10 +24,10 @@ type TrustCacheRecord struct {
 	Trusted        bool
 	// Reason is the PDP's explanation for the verdict, replayed on cache hits.
 	Reason string
-	// Context is the PDP response context (incl. verifier_ids) the verdict
-	// came with, replayed on cache hits. The cache is in-memory and
-	// process-local, so every entry is written by code that stores it;
-	// nil means the PDP returned no context, not that it was lost.
+	// Context is the already-narrowed wallet-facing context
+	// ({"verifier_ids":[...]} only, see narrowVerifierContext) replayed on
+	// cache hits. Admin-only PDP context (reason, trust_metadata) is never
+	// stored. nil means there were no verifier_ids.
 	Context json.RawMessage
 }
 

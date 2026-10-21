@@ -93,7 +93,7 @@ func trustProgressHarness(t *testing.T, pdpCtx json.RawMessage) (eval func() err
 	return eval, payloads, pdp
 }
 
-// Fresh evaluation and cache hit both carry the PDP context verbatim.
+// Fresh evaluation and cache hit both carry the narrowed verifier_ids context.
 func TestEvaluateVerifierTrust_ProgressCarriesPDPContext_FreshAndCacheHit(t *testing.T) {
 	eval, payloads, pdp := trustProgressHarness(t, json.RawMessage(verifierIDsContext))
 
@@ -123,6 +123,49 @@ func TestEvaluateVerifierTrust_ProgressOmitsContextWhenPDPGaveNone(t *testing.T)
 		_, has := p["context"]
 		assert.False(t, has, "payload %d must not carry an empty context", i)
 	}
+}
+
+const adminContext = `{"reason":{"admin":"secret detail"},"trust_metadata":{"k":"v"},"extra":1,"verifier_ids":[` +
+	`{"verifier_id_type":"x509_san_dns","verifier_id":"verifier.example.com","basis":"client-id-binding","internal":"x"}]}`
+
+// reason and trust_metadata (and any other member) must never be forwarded,
+// fresh or cached, nor retained in the cache record.
+func TestEvaluateVerifierTrust_ProgressDoesNotForwardAdminContext(t *testing.T) {
+	eval, payloads, _ := trustProgressHarness(t, json.RawMessage(adminContext))
+
+	require.NoError(t, eval())
+	require.NoError(t, eval())
+
+	want := `{"verifier_ids":[{"verifier_id_type":"x509_san_dns","verifier_id":"verifier.example.com","basis":"client-id-binding"}]}`
+	ps := payloads()
+	require.Len(t, ps, 2)
+	for i, p := range ps {
+		assert.JSONEq(t, want, string(p["context"]), "payload %d", i)
+		assert.NotContains(t, string(p["context"]), "secret detail")
+		assert.NotContains(t, string(p["context"]), "trust_metadata")
+	}
+}
+
+// A context with no verifier_ids (only admin members) yields no context member.
+func TestEvaluateVerifierTrust_ProgressOmitsContextWithoutVerifierIDs(t *testing.T) {
+	eval, payloads, _ := trustProgressHarness(t, json.RawMessage(`{"reason":{"a":1},"trust_metadata":{}}`))
+	require.NoError(t, eval())
+	require.NoError(t, eval())
+	ps := payloads()
+	require.Len(t, ps, 2)
+	for i, p := range ps {
+		_, has := p["context"]
+		assert.False(t, has, "payload %d", i)
+	}
+}
+
+func TestNarrowVerifierContext(t *testing.T) {
+	assert.Nil(t, narrowVerifierContext(nil))
+	assert.Nil(t, narrowVerifierContext(json.RawMessage(`not json`)))
+	assert.Nil(t, narrowVerifierContext(json.RawMessage(`{"verifier_ids":[]}`)))
+	assert.Nil(t, narrowVerifierContext(json.RawMessage(`{"verifier_ids":[{"verifier_id_type":"x"}]}`)))
+	assert.JSONEq(t, `{"verifier_ids":[{"verifier_id_type":"a","verifier_id":"b"}]}`,
+		string(narrowVerifierContext(json.RawMessage(`{"reason":1,"verifier_ids":[{"verifier_id_type":"a","verifier_id":"b","z":1}]}`))))
 }
 
 // The cache stores the context it was given, so a hit can replay it.

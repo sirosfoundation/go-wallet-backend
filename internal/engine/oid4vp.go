@@ -1016,7 +1016,10 @@ func (h *OID4VPHandler) evaluateVerifierTrustViaPDP(ctx context.Context, authReq
 		zap.String("framework", verifier.Framework))
 
 	// Send result to frontend/SDK as informational progress
-	h.sendVerifierTrustProgress(authReq.ClientID, verifier, directResult.Context)
+	// Narrow once: the progress and the cache both see only verifier_ids,
+	// so admin-visible context members are not retained or forwarded.
+	pdpContext := narrowVerifierContext(directResult.Context)
+	h.sendVerifierTrustProgress(authReq.ClientID, verifier, pdpContext)
 
 	// Cache the PDP-backed verdict. This is the only call site that ever
 	// populates the trust cache. An empty cacheKey means the caller decided
@@ -1024,7 +1027,7 @@ func (h *OID4VPHandler) evaluateVerifierTrustViaPDP(ctx context.Context, authReq
 	// cacheable/cacheKey computation) - skip writing rather than caching
 	// under an empty/ambiguous key.
 	if cacheKey != "" {
-		h.cacheVerifierTrust(cacheKey, verifier, directResult.Context)
+		h.cacheVerifierTrust(cacheKey, verifier, pdpContext)
 	}
 
 	// Look up admin-configured ClientID for VP audience (read-only)
@@ -1456,12 +1459,12 @@ func (h *OID4VPHandler) cacheVerifierTrust(cacheKey string, verifier *VerifierIn
 }
 
 // sendVerifierTrustProgress emits the verifier_trust_evaluated flow progress
-// for a PDP-backed verdict, fresh or replayed from the trust cache. When the
-// PDP returned a response context it is included verbatim as "context" -
-// notably context.verifier_ids, which the wallet needs as the prefixed
-// verifier identifier (x509_san_dns:<dns>, semantic_id:<value>, ...) for its
-// pseudonym function. The member is omitted when the PDP gave none.
-func (h *OID4VPHandler) sendVerifierTrustProgress(clientID string, verifier *VerifierInfo, pdpContext json.RawMessage) {
+// for a PDP-backed verdict, fresh or replayed from the trust cache. The
+// "context" member carries only verifier_ids (see narrowVerifierContext),
+// which the wallet needs as the verifier identifier for its pseudonym
+// function. verifierContext must already be narrowed; the member is omitted
+// when it is empty.
+func (h *OID4VPHandler) sendVerifierTrustProgress(clientID string, verifier *VerifierInfo, verifierContext json.RawMessage) {
 	payload := map[string]interface{}{
 		"verifier_trust_evaluated": true,
 		"verifier":                 clientID,
@@ -1469,10 +1472,50 @@ func (h *OID4VPHandler) sendVerifierTrustProgress(clientID string, verifier *Ver
 		"framework":                verifier.Framework,
 		"reason":                   verifier.Reason,
 	}
-	if len(pdpContext) > 0 {
-		payload["context"] = pdpContext
+	if len(verifierContext) > 0 {
+		payload["context"] = verifierContext
 	}
 	_ = h.Progress(StepTrustEvaluated, payload)
+}
+
+// verifierIDEntry is one verifier_ids element the wallet is given.
+type verifierIDEntry struct {
+	VerifierIDType string `json:"verifier_id_type"`
+	VerifierID     string `json:"verifier_id"`
+	Basis          string `json:"basis,omitempty"`
+}
+
+// narrowVerifierContext reduces a PDP response context to the only part the
+// wallet is meant to see, {"verifier_ids":[{verifier_id_type,verifier_id,basis?}]}.
+// Every other member (reason, trust_metadata, anything else) is admin-visible
+// and is dropped, as are unknown members of each entry. It returns nil when
+// there is no usable verifier_ids, so the progress omits "context" entirely.
+func narrowVerifierContext(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	var in struct {
+		VerifierIDs []verifierIDEntry `json:"verifier_ids"`
+	}
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return nil
+	}
+	ids := make([]verifierIDEntry, 0, len(in.VerifierIDs))
+	for _, e := range in.VerifierIDs {
+		if e.VerifierIDType != "" && e.VerifierID != "" {
+			ids = append(ids, e)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	out, err := json.Marshal(struct {
+		VerifierIDs []verifierIDEntry `json:"verifier_ids"`
+	}{ids})
+	if err != nil {
+		return nil
+	}
+	return out
 }
 
 // extractDomain extracts a domain name from a client_id (URL or DID).

@@ -845,9 +845,11 @@ engine's trust cache:
 }
 ```
 
-`context` is the PDP's response `context` object, passed through as JSON
-(`verifier_ids`, and whatever else the PDP put there such as `reason` and
-`trust_metadata`). It is omitted when the PDP returned none. `verifier_ids` is
+`context` contains only `verifier_ids` from the PDP response; every other
+member of the PDP context (such as `reason` and `trust_metadata`, which are
+admin-visible) is never forwarded, and unknown members of each entry are
+dropped. Each entry is `{verifier_id_type, verifier_id, basis?}`. `context` is
+omitted when there are no `verifier_ids`. `verifier_ids` is
 present only when the PDP policy enables it and the identifier was verified;
 `verifier_id_type` is an opaque string, `verifier_id` is in the canonical form
 the PDP defines for that type (`semantic_id:<value>`, the lower-case A-label
