@@ -312,3 +312,30 @@ func TestEvaluateVerifierTrust_VerifierAttestation_RequestSignatureMustMatchCnf(
 	require.NoError(t, err)
 	assert.Len(t, pdp.subjects, 1)
 }
+
+// A signed client_id must not be able to forge the cache key of an unsigned
+// request: with response_uri R and key fingerprint F, signed client_id
+// "R|client_id:X" and unsigned client_id "X:F" used to produce one key.
+func TestEvaluateVerifierTrust_RedirectURI_SignedCacheKeyCannotCollideWithUnsigned(t *testing.T) {
+	signed, _ := makeSignedJWTWithX5C(t)
+	km := trust.ExtractKeyMaterialFromJWT(signed)
+	fp := keyMaterialFingerprint(&KeyMaterial{Type: km.Type, X5C: km.X5C})
+	require.NotEmpty(t, fp)
+	const resp = "https://verifier.example.com/response"
+	const x = "https://victim.example.com"
+	h, pdp := newKeyRecordingHandler(t)
+
+	_, err := h.evaluateVerifierTrust(context.Background(), &AuthorizationRequest{
+		ClientID: resp + "|client_id:" + x, ClientIDScheme: ClientIDSchemeRedirectURI,
+		Nonce: "n", ResponseURI: resp, RequestJWT: signed,
+	})
+	require.NoError(t, err)
+	require.Len(t, pdp.subjects, 1)
+
+	_, err = h.evaluateVerifierTrust(context.Background(), &AuthorizationRequest{
+		ClientID: x + ":" + fp, ClientIDScheme: ClientIDSchemeRedirectURI,
+		Nonce: "n", ResponseURI: resp,
+	})
+	require.NoError(t, err)
+	assert.Len(t, pdp.subjects, 2, "the unsigned request must reach the PDP itself, not reuse the signed verdict")
+}
