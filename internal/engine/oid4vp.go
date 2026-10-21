@@ -2518,9 +2518,16 @@ func dcqlCredentialIDs(dcql json.RawMessage) map[string]bool {
 	if err := json.Unmarshal(dcql, &q); err != nil || len(q.Credentials) == 0 {
 		return nil
 	}
+	// A missing, null or empty id is not an identifier a credential_ids entry
+	// can name: it decodes to "" and would otherwise match credential_ids:[""].
 	ids := make(map[string]bool, len(q.Credentials))
 	for _, c := range q.Credentials {
-		ids[c.ID] = true
+		if c.ID != "" {
+			ids[c.ID] = true
+		}
+	}
+	if len(ids) == 0 {
+		return nil
 	}
 	return ids
 }
