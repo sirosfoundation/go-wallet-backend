@@ -817,6 +817,44 @@ Client → Server:
 **Note**: The `match_request`/`match_response` pattern uses `message_id` for
 correlation (same as `sign_request`/`sign_response`), with a 30-second timeout.
 
+#### Verifier `client_metadata` (optional)
+
+The `credential_selection` progress message, the `match_request` message and
+the `sign_request` params of a `sign_presentation` action may carry an optional
+`client_metadata` member: the verifier's `client_metadata` JSON object, passed
+verbatim from the validated request object (inline, or fetched from
+`client_metadata_uri`). It is omitted when the request had none. Clients MUST
+ignore members they do not understand.
+
+The engine only models the members it uses itself, so this object is how a
+wallet sees the rest, notably `vp_formats_supported`. For a `zkp_req`
+presentation (typically `response_mode=direct_post.jwt`) that carries the
+`system_id_values` and `proof_system_values` the wallet chooses its circuit
+and proof system from:
+
+```
+{
+  "type": "match_request",
+  "flow_id": "<uuid>",
+  "message_id": "<uuid>",
+  "dcql_query": { "credentials": [ { "id": "zkp", "format": "zkp_req", "_req": [ ... ] } ] },
+  "client_metadata": {
+    "jwks": { "keys": [ ... ] },
+    "vp_formats_supported": {
+      "zkp_req": {
+        "system_id_values": ["longfellow-libzk-v1"],
+        "proof_system_values": ["vega"]
+      }
+    }
+  }
+}
+```
+
+For `direct_post.jwt`, `sign_request` params also carry `verifier_jwk_thumbprint`:
+the unpadded base64url SHA-256 JWK Thumbprint (RFC 7638) of the verifier's
+response-encryption key. If that key cannot be read the engine fails the flow
+with a `SIGN_ERROR` flow error instead of sending an empty value.
+
 #### User Consent
 
 Server prompts for user consent with the matched credentials:
