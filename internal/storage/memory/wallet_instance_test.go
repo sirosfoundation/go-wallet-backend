@@ -277,36 +277,33 @@ func TestWalletInstanceStore_UpdateStatus_RevocationIsTerminal(t *testing.T) {
 	}
 }
 
-func TestWalletInstanceStore_Upsert_RecordsCredentialIDWithoutTouchingStatus(t *testing.T) {
+// A revocation that landed after the caller's status check must not gain a
+// passkey link or an owner from the late upsert, nor be reactivated by it.
+func TestWalletInstanceStore_Upsert_RevokedRecordGainsNoLinkOrOwner(t *testing.T) {
 	store := NewStore()
 	ctx := context.Background()
-	inst := &domain.WalletInstance{ID: "inst-cred", TenantID: "acme", Status: domain.InstanceStatusActive}
-	if err := store.WalletInstances().Upsert(ctx, inst); err != nil {
+	if err := store.WalletInstances().Upsert(ctx, &domain.WalletInstance{ID: "inst-cred", TenantID: "acme", Status: domain.InstanceStatusActive}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.WalletInstances().UpdateStatus(ctx, "inst-cred", "acme", domain.InstanceStatusRevoked, "x"); err != nil {
 		t.Fatal(err)
 	}
-	// Naming the passkey later records the link without reactivating.
-	if err := store.WalletInstances().Upsert(ctx, &domain.WalletInstance{ID: "inst-cred", TenantID: "acme", Status: domain.InstanceStatusActive, CredentialID: "pk-1"}); err != nil {
+	u := domain.UserIDFromString("u1")
+	if err := store.WalletInstances().Upsert(ctx, &domain.WalletInstance{ID: "inst-cred", TenantID: "acme", UserID: &u, Status: domain.InstanceStatusActive, CredentialID: "pk-1"}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := store.WalletInstances().GetByID(ctx, "inst-cred")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.CredentialID != "pk-1" {
-		t.Errorf("credential id not recorded: %q", got.CredentialID)
+	if got.CredentialID != "" {
+		t.Errorf("a revoked record must not gain a passkey link: %q", got.CredentialID)
+	}
+	if got.UserID != nil {
+		t.Errorf("a revoked record must not gain an owner: %v", got.UserID)
 	}
 	if got.Status != domain.InstanceStatusRevoked {
 		t.Errorf("status must be untouched by upsert, got %s", got.Status)
-	}
-	if err := store.WalletInstances().Upsert(ctx, &domain.WalletInstance{ID: "inst-cred", TenantID: "acme", Status: domain.InstanceStatusActive}); err != nil {
-		t.Fatal(err)
-	}
-	got, _ = store.WalletInstances().GetByID(ctx, "inst-cred")
-	if got.CredentialID != "pk-1" {
-		t.Errorf("credential id must persist, got %q", got.CredentialID)
 	}
 }
 

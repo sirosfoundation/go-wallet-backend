@@ -220,7 +220,7 @@ func TestDeleteUser_CutoffAdvanceFailureIsRetryableAndIrreversibleFree(t *testin
 	require.ErrorIs(t, svc.DeleteUser(ctx, uid, uid.String()), ErrDeletionIncomplete)
 	assert.Zero(t, bl.calls)
 	assert.Zero(t, ur.calls)
-	assert.Equal(t, 1, cleaner.calls, "only the pre-revocation cleaner run happened")
+	assert.Zero(t, cleaner.calls, "the cut-off is advanced before the cleaner runs")
 	cutoff, err := fs.Store.Users().GetAuthCutoff(ctx, uid)
 	require.NoError(t, err)
 	assert.True(t, cutoff.IsZero(), "no cut-off, so the caller's token still works")

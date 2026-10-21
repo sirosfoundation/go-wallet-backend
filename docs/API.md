@@ -320,10 +320,12 @@ advance A followed by its sweep S. If R sees A, W removes itself. Otherwise
 R < A, so W < A < S and S, which lists after A, finds W and deletes it.
 `DELETE /user` additionally takes the cut-off with a compare-and-set
 (`UserStore.InvalidateAuthBeforeForToken`, one conditional write in the store):
-a lifecycle revocation that lands between the request's last check and the
-advance makes the deletion answer `401` and delete nothing irreversible, while
-a cut-off left by an earlier attempt of the same deletion (a replaced token)
-still lets a fresh login retry.
+the advance happens before anything is erased, so a lifecycle revocation that
+landed since the request's last check makes the deletion answer `401` with
+nothing removed, and one landing later cannot turn the admitted deletion into a
+`401` over a half-erased account. The request's own token is refused once the
+cut-off is advanced; a retry after an incomplete deletion needs a fresh login
+(a token issued after the cut-off passes).
 
 What is **not** guaranteed:
 

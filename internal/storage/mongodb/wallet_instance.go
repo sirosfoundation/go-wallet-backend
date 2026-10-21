@@ -107,12 +107,15 @@ func generationCond(gen string) bson.M {
 	return bson.M{"generation": gen}
 }
 
-// upsertBindFilter is Upsert's owner-bind filter: id, tenant, unowned and generation.
+// upsertBindFilter is Upsert's owner-bind filter: id, tenant, generation, live and unowned.
 func upsertBindFilter(instance *domain.WalletInstance) bson.M {
 	return bson.M{"$and": []bson.M{
 		{"_id": instance.ID},
 		{"tenant_id": instance.TenantID},
 		generationCond(instance.Generation),
+		// Live only: a revocation that landed after the caller's status check must
+		// not gain an owner.
+		{"status": domain.InstanceStatusActive},
 		{"$or": []bson.M{
 			{"user_id": bson.M{"$exists": false}},
 			{"user_id": nil},
@@ -126,6 +129,9 @@ func upsertLinkFilter(instance *domain.WalletInstance) bson.M {
 		{"_id": instance.ID},
 		{"tenant_id": instance.TenantID},
 		generationCond(instance.Generation),
+		// Live only: a revoked record must not gain the passkey link, which would
+		// then fail that passkey's login over a refused WIA request.
+		{"status": domain.InstanceStatusActive},
 		{"$or": []bson.M{
 			{"credential_id": bson.M{"$exists": false}},
 			{"credential_id": ""},

@@ -30,30 +30,28 @@ func (c *hookCleaner) DeleteByUser(context.Context, string) error {
 	return nil
 }
 
-// A lifecycle revocation landing during the deletion advances the cut-off
-// independently; the earlier token must be refused before the permanent
-// revocations, not have the cut-off silently overwritten.
-func TestDeleteUser_RefusesATokenCutOffByALifecycleRevocationMidDeletion(t *testing.T) {
+// A lifecycle revocation landing after the deletion was admitted must not turn
+// it into a 401 over a half-erased account: the cut-off was advanced up front,
+// so the deletion runs to completion and the later cut-off stands.
+func TestDeleteUser_RevocationAfterAdmissionDoesNotStrandAHalfErasedAccount(t *testing.T) {
 	ctx := context.Background()
 	store := memory.NewStore()
 	svc := NewUserService(store, testConfig(), zap.NewNop())
-	bl, ur := &countingRevoker{}, &countingUserRevoker{}
-	svc.SetTokenBlacklist(bl)
-	svc.AddUserRevoker(ur)
-	uid := domain.NewUserID()
-	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:key:" + uid.String()}))
+	uid := seedWalletUser(t, store, domain.DefaultTenantID, "acme")
 
-	iat := time.Now().Add(-time.Minute)
+	later := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
 	svc.SetSessionCleaner(&hookCleaner{onCall: func() {
-		require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, time.Now()))
+		require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, later))
 	}})
 
-	err := svc.DeleteUser(tokengate.WithIssuedAt(ctx, iat), uid, uid.String())
-	require.ErrorIs(t, err, tokengate.ErrRevoked)
-	assert.Zero(t, bl.calls, "no permanent revocation")
-	assert.Zero(t, ur.calls)
+	err := svc.DeleteUser(tokengate.WithIssuedAt(ctx, time.Now().Add(-time.Minute)), uid, uid.String())
+	require.NoError(t, err)
 	_, gerr := store.Users().GetByID(ctx, uid)
-	assert.NoError(t, gerr, "the account is not deleted")
+	assert.ErrorIs(t, gerr, storage.ErrNotFound, "the admitted deletion completes")
+	for _, tid := range []domain.TenantID{domain.DefaultTenantID, "acme"} {
+		creds, pres := countHolderData(t, store, tid, uid)
+		assert.Zero(t, creds+pres, "holder data in %s erased", tid)
+	}
 }
 
 // The deletion's own cut-off advance must not refuse its own token: a normal

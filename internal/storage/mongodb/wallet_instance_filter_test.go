@@ -33,6 +33,7 @@ func TestUpsertBindAndLinkFiltersAreGenerationScoped(t *testing.T) {
 		require.True(t, ok, name)
 		require.Contains(t, conds, bson.M{"generation": "gen-1"}, name)
 		require.Contains(t, conds, bson.M{"tenant_id": domain.TenantID("t")}, name)
+		require.Contains(t, conds, bson.M{"status": domain.InstanceStatusActive}, name, "bind and link need a live record")
 	}
 	require.Contains(t, upsertLinkFilter(inst)["$and"], bson.M{"user_id": u})
 

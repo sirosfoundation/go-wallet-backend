@@ -135,3 +135,23 @@ func TestWalletInstanceStore_Upsert_CredentialLinkNeedsTheBoundUser(t *testing.T
 	require.NoError(t, err)
 	require.Equal(t, "pk-winner", got.CredentialID)
 }
+
+// A revocation landing after the caller's status check must not gain a passkey
+// link or an owner from the late upsert, nor be reactivated by it.
+func TestWalletInstanceStore_Upsert_RevokedRecordGainsNoLinkOrOwner(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	wis := store.WalletInstances()
+	id := "inst-revoked-link-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "acme", Status: domain.InstanceStatusActive}))
+	require.NoError(t, wis.UpdateStatus(ctx, id, "acme", domain.InstanceStatusRevoked, "x"))
+
+	u := domain.UserIDFromString("u1")
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: "acme", UserID: &u, Status: domain.InstanceStatusActive, CredentialID: "pk-1"}))
+	got, err := wis.GetByID(ctx, id)
+	require.NoError(t, err)
+	require.Empty(t, got.CredentialID, "a revoked record must not gain a passkey link")
+	require.Nil(t, got.UserID, "a revoked record must not gain an owner")
+	require.Equal(t, domain.InstanceStatusRevoked, got.Status)
+}
