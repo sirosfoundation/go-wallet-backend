@@ -1043,6 +1043,60 @@ Client → Server:
 }
 ```
 
+#### Encrypted response (`direct_post.jwt`)
+
+For `response_mode=direct_post.jwt` the engine does not see the `vp_token`: the
+`sign_request` params additionally carry the recipient the client encrypts to,
+and the client answers with a finished JWE (see
+[engine-blind-encryption.md](engine-blind-encryption.md)).
+
+```
+Server → Client:
+{
+  "type": "sign_request",
+  "flow_id": "<uuid>",
+  "message_id": "<uuid>",
+  "action": "sign_presentation",
+  "params": {
+    "audience": "x509_san_dns:verifier.example.com",
+    "nonce": "verifier-nonce-123",
+    "credentials_to_include": [ { "credential_id": "local-cred-id-1", "credential_query_id": "q" } ],
+    "verified_request": { "client_id": "x509_san_dns:verifier.example.com", "response_mode": "direct_post.jwt", "response_uri": "https://verifier.example.com/response", "signed": true, "signature_verification": "verified" },
+    "response_encryption": {
+      "jwk": { "kty": "EC", "crv": "P-256", "x": "...", "y": "...", "kid": "verifier-enc-1", "use": "enc" },
+      "alg": "ECDH-ES",
+      "enc": "A128GCM"
+    },
+    "state": "state-1"
+  }
+}
+```
+
+```
+Client → Server:
+{
+  "type": "sign_response",
+  "flow_id": "<uuid>",
+  "message_id": "<uuid>",
+  "response_jwe": "<compact JWE>"
+}
+```
+
+The client builds the `vp_token` (for DCQL an object keyed by credential query
+id), the JARM claims (`iss` `https://self-issued.me/v2`, `aud` from
+`verified_request.client_id`, `iat`, `exp` = `iat` + 300, `vp_token`, `state`
+when present) and the compact JWE (`alg`/`enc` as requested, `kid` and
+`cty: "JWT"` in the protected header). The engine POSTs `response=<jwe>` to the
+validated `response_uri` and relays the verifier's `redirect_uri`. It refuses an
+empty, oversized, non-compact or mismatching `response_jwe`, and a
+`sign_response` that also carries `vp_token`, with a `SIGN_ERROR` flow error and
+an `access_denied` response to the verifier; it never encrypts for the client.
+The key and algorithms are resolved by the engine (`client_metadata.jwks`
+`use=enc`, else the request JWT's `x5c`; `alg` from `client_metadata`, else the
+JWK, else the key type; `enc` defaults to `A128GCM`); when none can be resolved
+no `sign_request` is sent. Plain `direct_post`, `query` and `fragment` are
+unchanged: the client returns `vp_token`.
+
 #### Response Submission
 
 ```

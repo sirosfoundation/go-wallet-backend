@@ -224,15 +224,16 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	}
 
 	// Step 4: Request VP signing from client (use configured ClientID for audience if set)
-	vpToken, err := h.requestVPSignature(ctx, authReq, selectedCredentials, verifier.ClientID)
+	submission, err := h.requestVPSignature(ctx, authReq, selectedCredentials, verifier.ClientID)
 	if err != nil {
 		h.Logger.Debug("VP signature failed", zap.Error(err))
+		h.refuseVerifierOnEncryptionError(ctx, authReq, err)
 		_ = h.Error(StepSubmittingResponse, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
 		return err
 	}
 
 	// Step 5: Submit VP response to verifier
-	redirectURI, err := h.submitResponse(ctx, authReq, vpToken)
+	redirectURI, err := h.submitResponse(ctx, authReq, submission)
 	if err != nil {
 		h.Logger.Debug("VP submission failed", zap.Error(err))
 		_ = h.Error(StepSubmittingResponse, ErrCodePresentationError, ErrCodePresentationError.UserFacingMessage())
@@ -1823,7 +1824,24 @@ func requestedCredentialTypes(dcql json.RawMessage) []string {
 	return types
 }
 
-func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *AuthorizationRequest, selected []ConsentSelection, audience string) (string, error) {
+// vpSubmission is what the client produced for the verifier: either a vp_token
+// the engine submits as is (plain direct_post, query, fragment: the verifier
+// chose to receive it in clear) or, for direct_post.jwt, the finished
+// compact JWE the engine only relays. Exactly one member is set.
+type vpSubmission struct {
+	vpToken     string
+	responseJWE string
+}
+
+// responseEncryptionError marks a failure of the direct_post.jwt encryption
+// contract (no usable verifier key, or a response_jwe that is not what the
+// request asked for). Its text never carries response content.
+type responseEncryptionError struct{ err error }
+
+func (e *responseEncryptionError) Error() string { return e.err.Error() }
+func (e *responseEncryptionError) Unwrap() error { return e.err }
+
+func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *AuthorizationRequest, selected []ConsentSelection, audience string) (*vpSubmission, error) {
 	credRefs := make([]CredentialRef, len(selected))
 	for i, s := range selected {
 		credRefs[i] = CredentialRef(s)
@@ -1840,10 +1858,10 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 
 	verifierJwkThumbprint, err := h.computeVerifierJWKThumbprint(authReq)
 	if err != nil {
-		return "", err
+		return nil, &responseEncryptionError{err}
 	}
 
-	resp, err := h.RequestSign(ctx, SignActionSignPresentation, SignRequestParams{
+	params := SignRequestParams{
 		Audience:              audience,
 		Nonce:                 authReq.Nonce,
 		CredentialsToInclude:  credRefs,
@@ -1853,16 +1871,201 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 		TransactionData:       authReq.TransactionData,
 		ClientMetadata:        authReq.ClientMetadataRaw,
 		VerifiedRequest:       verifiedInputs(authReq),
-	})
+	}
+
+	// direct_post.jwt: the client builds the JARM response and encrypts it to
+	// the verifier itself, so the engine never holds the vp_token. The engine
+	// resolves the key and algorithms (its existing selection) and relays the
+	// finished JWE.
+	jwtMode := authReq.ResponseMode == ResponseModeDirectPostJWT
+	var respEnc *ResponseEncryption
+	if jwtMode {
+		respEnc, err = h.resolveResponseEncryption(authReq)
+		if err != nil {
+			return nil, &responseEncryptionError{err}
+		}
+		params.ResponseEncryption = respEnc
+		params.State = authReq.State
+	}
+
+	resp, err := h.RequestSign(ctx, SignActionSignPresentation, params)
 	if err != nil {
-		return "", err
+		return nil, err
+	}
+
+	if jwtMode {
+		// A client that still answers with a vp_token (or without a
+		// response_jwe) is refused: falling back to encrypting here would put
+		// the vp_token back in the engine.
+		if resp.VPToken != "" {
+			return nil, &responseEncryptionError{errors.New("direct_post.jwt: the client answered with a vp_token instead of response_jwe")}
+		}
+		if err := validateResponseJWE(resp.ResponseJWE, respEnc); err != nil {
+			return nil, &responseEncryptionError{err}
+		}
+		return &vpSubmission{responseJWE: resp.ResponseJWE}, nil
+	}
+	if resp.ResponseJWE != "" {
+		return nil, errors.New("client answered with a response_jwe for a response mode that does not encrypt")
 	}
 
 	if len(authReq.DCQLQuery) > 0 {
-		return buildDCQLVPToken(resp.VPToken, selected)
+		vpToken, err := buildDCQLVPToken(resp.VPToken, selected)
+		if err != nil {
+			return nil, err
+		}
+		return &vpSubmission{vpToken: vpToken}, nil
 	}
 
-	return resp.VPToken, nil
+	return &vpSubmission{vpToken: resp.VPToken}, nil
+}
+
+// refuseVerifierOnEncryptionError tells the verifier its session is over when
+// the direct_post.jwt contract failed: no usable key, or a response_jwe that is
+// not what was asked for. It sends the description every refusal carries and
+// nothing about why. Any other error (a sign refusal included) is left alone.
+func (h *OID4VPHandler) refuseVerifierOnEncryptionError(ctx context.Context, authReq *AuthorizationRequest, err error) {
+	var encErr *responseEncryptionError
+	if errors.As(err, &encErr) {
+		_ = h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)
+	}
+}
+
+// maxResponseJWEBytes caps the response_jwe the engine relays.
+const maxResponseJWEBytes = 4 << 20
+
+// validateResponseJWE checks that the client's response_jwe is a compact JWE
+// shaped as the sign request asked: five base64url segments, the requested
+// alg and enc (and the verifier key's kid, when it has one) in the protected
+// header. The engine cannot decrypt it and does not try. Errors never include
+// the value.
+func validateResponseJWE(jwe string, want *ResponseEncryption) error {
+	if want == nil {
+		return errors.New("direct_post.jwt: no response encryption was requested")
+	}
+	if jwe == "" {
+		return errors.New("direct_post.jwt: the client returned no response_jwe")
+	}
+	if len(jwe) > maxResponseJWEBytes {
+		return errors.New("direct_post.jwt: response_jwe is too large")
+	}
+	parts := strings.Split(jwe, ".")
+	if len(parts) != 5 {
+		return errors.New("direct_post.jwt: response_jwe is not a compact JWE")
+	}
+	decoded := make([][]byte, len(parts))
+	for i, p := range parts {
+		b, err := base64.RawURLEncoding.DecodeString(p)
+		if err != nil {
+			return errors.New("direct_post.jwt: response_jwe is not a compact JWE")
+		}
+		decoded[i] = b
+	}
+	// The encrypted key is empty only for direct ECDH-ES agreement.
+	for i, b := range decoded {
+		if len(b) == 0 && (i != 1 || want.Alg != "ECDH-ES") {
+			return errors.New("direct_post.jwt: response_jwe is not a compact JWE")
+		}
+	}
+	var header struct {
+		Alg string `json:"alg"`
+		Enc string `json:"enc"`
+		Kid string `json:"kid"`
+	}
+	if err := json.Unmarshal(decoded[0], &header); err != nil {
+		return errors.New("direct_post.jwt: response_jwe has an unreadable protected header")
+	}
+	if header.Alg != want.Alg || header.Enc != want.Enc {
+		return errors.New("direct_post.jwt: response_jwe does not use the requested alg and enc")
+	}
+	var jwk struct {
+		Kid string `json:"kid"`
+	}
+	_ = json.Unmarshal(want.JWK, &jwk)
+	if jwk.Kid != "" && header.Kid != jwk.Kid {
+		return errors.New("direct_post.jwt: response_jwe does not name the verifier key")
+	}
+	return nil
+}
+
+// resolveResponseEncryption picks the verifier's response-encryption key and
+// the JWE algorithms for a direct_post.jwt request: the key from
+// client_metadata.jwks (use=enc preferred) or the request JWT's x5c, alg from
+// client_metadata, else the JWK's own JARM alg, else the key type; enc
+// defaults to A128GCM. Anything unusable fails closed.
+func (h *OID4VPHandler) resolveResponseEncryption(authReq *AuthorizationRequest) (*ResponseEncryption, error) {
+	var encAlg, encEnc string
+	if authReq.ClientMetadata != nil {
+		encAlg = authReq.ClientMetadata.AuthorizationEncryptedResponseAlg
+		encEnc = authReq.ClientMetadata.AuthorizationEncryptedResponseEnc
+	}
+
+	jwk, err := h.extractVerifierEncryptionJWK(authReq)
+	if err != nil {
+		if encAlg == "" {
+			return nil, fmt.Errorf("direct_post.jwt requires authorization_encrypted_response_alg in client_metadata (key inference also failed: %w)", err)
+		}
+		return nil, fmt.Errorf("failed to extract verifier encryption key: %w", err)
+	}
+	if !jwk.Valid() || !jwk.IsPublic() {
+		return nil, errors.New("direct_post.jwt: the verifier's response-encryption key is not a usable public key")
+	}
+
+	// Per spec, authorization_encrypted_response_alg is required for direct_post.jwt.
+	// When absent (e.g. x509_san_dns verifiers that omit client_metadata), infer a
+	// sensible default from the available public key material rather than failing hard:
+	//   EC key  -> ECDH-ES  (RFC 7518 section 4.6)
+	//   RSA key -> RSA-OAEP (RFC 7518 section 4.3)
+	// This allows interoperability with verifiers that embed their key in the request
+	// JWT x5c header but do not explicitly declare JARM encryption parameters.
+	if encAlg == "" {
+		// Only honor the JWK's declared "alg" when it is a JARM key-management
+		// algorithm we support.
+		if jwk.Algorithm != "" {
+			if _, err := mapKeyAlgorithm(jwk.Algorithm); err == nil {
+				encAlg = jwk.Algorithm
+			}
+		}
+		if encAlg == "" {
+			switch jwk.Key.(type) {
+			case *ecdsa.PublicKey:
+				encAlg = "ECDH-ES"
+			case *rsa.PublicKey:
+				encAlg = "RSA-OAEP"
+			default:
+				return nil, fmt.Errorf("direct_post.jwt: cannot infer encryption algorithm from key type %T; set authorization_encrypted_response_alg in client_metadata", jwk.Key)
+			}
+		}
+		h.Logger.Info("direct_post.jwt: selected encryption algorithm",
+			zap.String("alg", encAlg),
+			zap.String("verifier", authReq.ClientID))
+	}
+	if encEnc == "" {
+		// A128CBC-HS256 is RFC 7518's first mandatory-to-implement JWE
+		// "enc" algorithm, but it is not universally implemented in
+		// practice: confirmed live against verifier.multipaz.org, whose
+		// own JsonWebEncryption decrypter (multipaz/src/commonMain/kotlin/
+		// org/multipaz/crypto/JsonWebEncryption.kt) only implements the
+		// GCM family (A128GCM/A192GCM/A256GCM) and rejects CBC-HS256
+		// outright with "No algorithm with JOSE identifier A128CBC-HS256" -
+		// despite not declaring encrypted_response_enc_values_supported to
+		// signal that restriction. GCM is an equally spec-valid default
+		// choice absent an explicit verifier preference and has broader
+		// real-world interop, so prefer it.
+		encEnc = "A128GCM"
+	}
+	if _, err := mapKeyAlgorithm(encAlg); err != nil {
+		return nil, err
+	}
+	if _, err := mapContentEncryption(encEnc); err != nil {
+		return nil, err
+	}
+
+	jwkJSON, err := jwk.MarshalJSON()
+	if err != nil {
+		return nil, errors.New("direct_post.jwt: cannot serialize the verifier's response-encryption key")
+	}
+	return &ResponseEncryption{JWK: jwkJSON, Alg: encAlg, Enc: encEnc}, nil
 }
 
 // computeVerifierJWKThumbprint returns the verifier JWK thumbprint for
@@ -1935,7 +2138,8 @@ func sanitizeEndpointURL(endpoint string) (string, error) {
 	return clean.String(), nil
 }
 
-func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *AuthorizationRequest, vpToken string) (string, error) {
+func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *AuthorizationRequest, sub *vpSubmission) (string, error) {
+	vpToken := sub.vpToken
 	_ = h.ProgressMessage(StepSubmittingResponse, "Submitting VP response")
 
 	// Determine response endpoint
@@ -1963,7 +2167,7 @@ func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *Authorizati
 	case ResponseModeDirectPost:
 		return h.submitDirectPost(ctx, sanitizedEndpoint, authReq, vpToken)
 	case ResponseModeDirectPostJWT:
-		return h.submitDirectPostJWT(ctx, sanitizedEndpoint, authReq, vpToken)
+		return h.submitDirectPostJWT(ctx, sanitizedEndpoint, sub.responseJWE)
 	case ResponseModeFragment:
 		return h.buildFragmentRedirect(sanitizedEndpoint, authReq, vpToken), nil
 	case ResponseModeQuery:
@@ -2459,123 +2663,11 @@ func validateTransactionData(authReq *AuthorizationRequest) error {
 	return nil
 }
 
-func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string, authReq *AuthorizationRequest, vpToken string) (string, error) {
-	now := time.Now()
-
-	var vpTokenValue interface{} = vpToken
-	if json.Valid([]byte(vpToken)) {
-		var parsed interface{}
-		if err := json.Unmarshal([]byte(vpToken), &parsed); err == nil {
-			vpTokenValue = parsed
-		}
-	}
-
-	// Build JWT claims per OID4VP §6.2 / JARM §4.1
-	claims := map[string]interface{}{
-		"iss":      "https://self-issued.me/v2",
-		"aud":      authReq.ClientID,
-		"exp":      now.Add(5 * time.Minute).Unix(),
-		"iat":      now.Unix(),
-		"vp_token": vpTokenValue,
-	}
-	if authReq.State != "" {
-		claims["state"] = authReq.State
-	}
-
-	claimsJSON, err := json.Marshal(claims)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal JARM claims: %w", err)
-	}
-
-	// Determine JARM mode from client_metadata
-	var encAlg, encEnc string
-	if authReq.ClientMetadata != nil {
-		encAlg = authReq.ClientMetadata.AuthorizationEncryptedResponseAlg
-		encEnc = authReq.ClientMetadata.AuthorizationEncryptedResponseEnc
-	}
-
-	// Per spec, authorization_encrypted_response_alg is required for direct_post.jwt.
-	// When absent (e.g. x509_san_dns verifiers that omit client_metadata), infer a
-	// sensible default from the available public key material rather than failing hard:
-	//   EC key  → ECDH-ES  (RFC 7518 §4.6)
-	//   RSA key → RSA-OAEP (RFC 7518 §4.3)
-	// This allows interoperability with verifiers that embed their key in the request
-	// JWT x5c header but do not explicitly declare JARM encryption parameters.
-	if encAlg == "" {
-		inferredKey, _, jwkAlg, keyErr := h.extractVerifierEncryptionKey(authReq)
-		if keyErr != nil {
-			return "", fmt.Errorf("direct_post.jwt requires authorization_encrypted_response_alg in client_metadata (key inference also failed: %w)", keyErr)
-		}
-		// Only honor the JWK's declared "alg" when it is a JARM key-management
-		// algorithm we support.
-		if jwkAlg != "" {
-			if _, err := mapKeyAlgorithm(jwkAlg); err == nil {
-				encAlg = jwkAlg
-			}
-		}
-		if encAlg == "" {
-			switch inferredKey.(type) {
-			case *ecdsa.PublicKey:
-				encAlg = "ECDH-ES"
-			case *rsa.PublicKey:
-				encAlg = "RSA-OAEP"
-			default:
-				return "", fmt.Errorf("direct_post.jwt: cannot infer encryption algorithm from key type %T; set authorization_encrypted_response_alg in client_metadata", inferredKey)
-			}
-		}
-		h.Logger.Info("direct_post.jwt: selected encryption algorithm",
-			zap.String("alg", encAlg),
-			zap.String("verifier", authReq.ClientID))
-	}
-	if encEnc == "" {
-		// A128CBC-HS256 is RFC 7518's first mandatory-to-implement JWE
-		// "enc" algorithm, but it is not universally implemented in
-		// practice: confirmed live against verifier.multipaz.org, whose
-		// own JsonWebEncryption decrypter (multipaz/src/commonMain/kotlin/
-		// org/multipaz/crypto/JsonWebEncryption.kt) only implements the
-		// GCM family (A128GCM/A192GCM/A256GCM) and rejects CBC-HS256
-		// outright with "No algorithm with JOSE identifier A128CBC-HS256" -
-		// despite not declaring encrypted_response_enc_values_supported to
-		// signal that restriction. GCM is an equally spec-valid default
-		// choice absent an explicit verifier preference and has broader
-		// real-world interop, so prefer it.
-		encEnc = "A128GCM"
-	}
-
-	// Extract verifier's public key for encryption
-	verifierKey, kid, _, err := h.extractVerifierEncryptionKey(authReq)
-	if err != nil {
-		return "", fmt.Errorf("failed to extract verifier encryption key: %w", err)
-	}
-
-	// Map algorithm strings to go-jose constants
-	keyAlg, err := mapKeyAlgorithm(encAlg)
-	if err != nil {
-		return "", err
-	}
-	contentEnc, err := mapContentEncryption(encEnc)
-	if err != nil {
-		return "", err
-	}
-
-	// Build JWE
-	encrypter, err := jose.NewEncrypter(
-		contentEnc,
-		jose.Recipient{Algorithm: keyAlg, Key: verifierKey, KeyID: kid},
-		(&jose.EncrypterOptions{}).WithContentType("JWT"),
-	)
-	if err != nil {
-		return "", fmt.Errorf("failed to create JWE encrypter: %w", err)
-	}
-
-	jweObj, err := encrypter.Encrypt(claimsJSON)
-	if err != nil {
-		return "", fmt.Errorf("failed to encrypt JARM response: %w", err)
-	}
-
-	jweString, err := jweObj.CompactSerialize()
-	if err != nil {
-		return "", fmt.Errorf("failed to serialize JWE: %w", err)
+// submitDirectPostJWT POSTs the client-built, client-encrypted JARM response to
+// the verifier. The engine cannot read it: it relays the compact JWE.
+func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string, jweString string) (string, error) {
+	if jweString == "" {
+		return "", errors.New("direct_post.jwt: no response_jwe to submit")
 	}
 
 	// POST response=<jwe> per OID4VP §6.2
@@ -2618,76 +2710,6 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 	}
 
 	return "", fmt.Errorf("JARM response submission failed with status %d: %s", resp.StatusCode, string(respBody))
-}
-
-func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationRequest) (interface{}, string, string, error) {
-	// Prefer client_metadata.jwks — this is where verifiers put their
-	// ephemeral encryption key for JARM (ECDH-ES key agreement).
-	if authReq.ClientMetadata != nil && len(authReq.ClientMetadata.JWKS) > 0 {
-		var jwks struct {
-			Keys []json.RawMessage `json:"keys"`
-		}
-		if err := json.Unmarshal(authReq.ClientMetadata.JWKS, &jwks); err == nil && len(jwks.Keys) > 0 {
-			// Select the best key for encryption: prefer use="enc", else fall
-			// back to the first parseable key. The JWK's own "alg" is returned
-			// so the caller can honor the verifier's declared algorithm instead
-			// of inferring one from the key type.
-			var fallbackKey *jose.JSONWebKey
-			for _, raw := range jwks.Keys {
-				var jwk jose.JSONWebKey
-				if err := jwk.UnmarshalJSON(raw); err != nil {
-					continue
-				}
-				if jwk.Use == "enc" {
-					return jwk.Key, jwk.KeyID, jwk.Algorithm, nil
-				}
-				if fallbackKey == nil {
-					k := jwk // copy
-					fallbackKey = &k
-				}
-			}
-			if fallbackKey != nil {
-				return fallbackKey.Key, fallbackKey.KeyID, fallbackKey.Algorithm, nil
-			}
-		}
-	}
-
-	// Fallback: x5c from request JWT header (signing key, used when no
-	// dedicated encryption key is provided in client_metadata). The x5c
-	// certificate carries no JARM key-management alg, so none is returned
-	// and the caller infers one from the key type.
-	if authReq.RequestJWT != "" {
-		parts := strings.Split(authReq.RequestJWT, ".")
-		var kid string
-		if len(parts) >= 2 {
-			headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
-			if err == nil {
-				var header struct {
-					Kid string `json:"kid"`
-				}
-				_ = json.Unmarshal(headerBytes, &header)
-				kid = header.Kid
-			}
-		}
-
-		km := trust.ExtractKeyMaterialFromJWT(authReq.RequestJWT)
-		if km != nil && km.Type == "x5c" && len(km.X5C) > 0 {
-			certDER, err := base64.StdEncoding.DecodeString(km.X5C[0])
-			if err != nil {
-				certDER, err = base64.RawURLEncoding.DecodeString(km.X5C[0])
-				if err != nil {
-					return nil, "", "", fmt.Errorf("failed to decode x5c certificate: %w", err)
-				}
-			}
-			cert, err := x509.ParseCertificate(certDER)
-			if err != nil {
-				return nil, "", "", fmt.Errorf("failed to parse x5c certificate: %w", err)
-			}
-			return cert.PublicKey, kid, "", nil
-		}
-	}
-
-	return nil, "", "", errors.New("no verifier encryption key found in client_metadata.jwks or request JWT x5c")
 }
 
 // Returns the verifier's encryption key as a JSONWebKey.
