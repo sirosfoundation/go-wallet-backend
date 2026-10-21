@@ -4,6 +4,23 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.24.0:start -->
+## [v0.24.0] - 2026-10-19
+
+### Added
+- Engine now relays `credential_metadata` from OID4VCI responses, both at the response level (OID4VCI 1.1) and per-credential, preserving extra members verbatim for downstream consumers (#463)
+- Engine requires `notification_id` when `credential_metadata` contains a secret seed, ensuring proper tracking of seed delivery (#463)
+- Engine enforces encrypted response delivery when advertising `secret_seed` capability, preventing accidental plaintext seed transmission (#463)
+
+### Fixed
+- Type assertions throughout codebase are now checked for safety, enabled via errcheck's `check-type-assertions` linter option (#459)
+- Engine serves valid `secret_seed` advertisements and drops malformed ones, with capability alignment matching spec 5A requirements (#463)
+- Engine relays credential metadata display data with more generous field capitalization handling to accommodate issuer variations (#463)
+
+### Changed
+- Dependency updates for go modules and GitHub Actions (#464, #465)
+<!-- release-notes:v0.24.0:end -->
+
 <!-- release-notes:v0.23.0:start -->
 ## [v0.23.0] - 2026-10-15
 
