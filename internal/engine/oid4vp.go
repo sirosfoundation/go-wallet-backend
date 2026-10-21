@@ -823,6 +823,15 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			switch {
 			case verifyErr == nil:
 				keyMaterial = km
+				// A verdict reached with a proven key must never be served
+				// to a request that did not prove it (and vice versa), so
+				// bind the cache identity to that key, as the x509 schemes
+				// do. No fingerprint means no caching at all.
+				if fp := keyMaterialFingerprint(km); fp != "" {
+					verifiedIdentity = pdpSubjectID(authReq) + ":" + fp
+				} else {
+					cacheable = false
+				}
 			case errors.Is(verifyErr, trust.ErrNoEmbeddedKey):
 				// Nothing to verify against and nothing to forward: the
 				// name-only evaluation above is all that happens.
