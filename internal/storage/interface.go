@@ -68,8 +68,13 @@ type UserTenantStore interface {
 // user's tokens stay refused.
 type DeletionTombstoneStore interface {
 	// PutDeletionTombstone records a deletion idempotently: earliest DeletedAt
-	// kept, expiry only moves later, tenant ids merged.
+	// kept, expiry only moves later, tenant ids merged, and a non-empty holder DID
+	// recorded (an empty one never erases a stored one).
 	PutDeletionTombstone(ctx context.Context, t *domain.DeletionTombstone) error
+
+	// ClearDeletionTombstoneHolderDID drops the stored holder DID once cleanup
+	// is complete (data minimisation). A missing tombstone is not an error.
+	ClearDeletionTombstoneHolderDID(ctx context.Context, userID string) error
 
 	// GetDeletionTombstone returns the tombstone or ErrNotFound; an expired but
 	// unswept one is still returned.

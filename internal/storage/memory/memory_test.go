@@ -2619,3 +2619,31 @@ func TestUserStore_InvalidateAuthBeforeForToken(t *testing.T) {
 		t.Fatalf("unknown user: want ErrNotFound, got %v", err)
 	}
 }
+
+func TestUserStore_TombstoneHolderDIDKeptUntilCleared(t *testing.T) {
+	ctx := context.Background()
+	users := NewStore().Users()
+	now := time.Now().UTC()
+	put := func(did string) {
+		t.Helper()
+		if err := users.PutDeletionTombstone(ctx, &domain.DeletionTombstone{UserID: "u1", HolderDID: did, DeletedAt: now, ExpiresAt: now.Add(time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("did:example:a")
+	put("") // a retry without a DID must not erase the stored one
+	got, _ := users.GetDeletionTombstone(ctx, "u1")
+	if got.HolderDID != "did:example:a" {
+		t.Fatalf("holder did = %q, want kept", got.HolderDID)
+	}
+	if err := users.ClearDeletionTombstoneHolderDID(ctx, "u1"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := users.GetDeletionTombstone(ctx, "u1")
+	if err != nil || got.HolderDID != "" {
+		t.Fatalf("after clear: %v, %q", err, got.HolderDID)
+	}
+	if err := users.ClearDeletionTombstoneHolderDID(ctx, "missing"); err != nil {
+		t.Fatalf("clearing a missing tombstone must not fail: %v", err)
+	}
+}

@@ -268,8 +268,20 @@ func (s *UserStore) PutDeletionTombstone(_ context.Context, t *domain.DeletionTo
 			}
 		}
 		cp.TenantIDs = merged
+		if cp.HolderDID == "" {
+			cp.HolderDID = existing.HolderDID
+		}
 	}
 	s.tombstones[t.UserID] = &cp
+	return nil
+}
+
+func (s *UserStore) ClearDeletionTombstoneHolderDID(_ context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t, ok := s.tombstones[userID]; ok {
+		t.HolderDID = ""
+	}
 	return nil
 }
 
