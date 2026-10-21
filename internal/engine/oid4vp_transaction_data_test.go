@@ -307,6 +307,11 @@ func TestValidateTransactionData_StructuralChecks(t *testing.T) {
 		"no dcql: refused, nothing for credential_ids to name": {`{"type":"x","credential_ids":["anything"]}`, nil, "no dcql_query"},
 		"unreadable dcql: refused":                             {`{"type":"x","credential_ids":["anything"]}`, json.RawMessage(`{"credentials":[]}`), "no dcql_query"},
 		"id in dcql":                                           {`{"type":"x","credential_ids":["age"]}`, dcql, ""},
+		"dcql credential without id: refused":                  {`{"type":"x","credential_ids":[""]}`, json.RawMessage(`{"credentials":[{}]}`), "no dcql_query"},
+		"dcql credential with null id: refused":                {`{"type":"x","credential_ids":[""]}`, json.RawMessage(`{"credentials":[{"id":null}]}`), "no dcql_query"},
+		"dcql credential with empty id: refused":               {`{"type":"x","credential_ids":[""]}`, json.RawMessage(`{"credentials":[{"id":""}]}`), "no dcql_query"},
+		"empty id beside a valid one: empty not nameable":      {`{"type":"x","credential_ids":[""]}`, json.RawMessage(`{"credentials":[{"id":"pay"},{"id":""}]}`), `references ""`},
+		"valid id beside an empty one: still accepted":         {`{"type":"x","credential_ids":["pay"]}`, json.RawMessage(`{"credentials":[{"id":""},{"id":"pay"}]}`), ""},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
