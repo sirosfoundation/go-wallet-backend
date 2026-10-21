@@ -509,6 +509,9 @@ type SignRequestParams struct {
 	// vp_formats_supported, which for a zkp_req presentation holds the
 	// system_id_values / proof_system_values. Absent when the request had none.
 	ClientMetadata json.RawMessage `json:"client_metadata,omitempty"`
+	// VerifiedRequest is the same VerifiedRequestInputs credential_selection
+	// carried (sign_presentation only).
+	VerifiedRequest *VerifiedRequestInputs `json:"verified_request,omitempty"`
 	// TransactionData carries TS12 transaction data from the verifier's OID4VP request.
 	// The frontend must hash each item and include transaction_data_hashes in the KB-JWT.
 	TransactionData []TransactionData `json:"transaction_data,omitempty"`
@@ -591,6 +594,9 @@ type MatchRequestMessage struct {
 	// ClientMetadata is the verifier's client_metadata object, verbatim from
 	// the validated request object. Optional; absent when the request had none.
 	ClientMetadata json.RawMessage `json:"client_metadata,omitempty"`
+	// VerifiedRequest carries the validated request inputs (see
+	// VerifiedRequestInputs). Optional.
+	VerifiedRequest *VerifiedRequestInputs `json:"verified_request,omitempty"`
 }
 
 // MatchResponseMessage is the client's matching response

@@ -898,6 +898,64 @@ the unpadded base64url SHA-256 JWK Thumbprint (RFC 7638) of the verifier's
 response-encryption key. If that key cannot be read the engine fails the flow
 with a `SIGN_ERROR` flow error instead of sending an empty value.
 
+#### Verified request inputs (`verified_request`)
+
+The `credential_selection` progress message, the `match_request` message and
+the `sign_request` params of a `sign_presentation` action carry the same
+optional `verified_request` object: the OpenID4VP request as the engine
+validated it. It is built once per flow and emitted identically at all three
+points, so a wallet applies one policy over the whole flow and over every
+transport (including a redirect flow, not only the DC API). It carries no
+trust verdict; the wallet MUST still require `verifier.trusted`. The members
+are additive, and clients MUST ignore members they do not understand.
+
+| Member | Meaning |
+|--------|---------|
+| `client_id` | The request's own `client_id`, after the client_id match and scheme-prefix checks. Not the admin-configured VP audience that `verifier.client_id` carries. |
+| `client_id_scheme` | `x509_san_dns`, `x509_san_uri`, `x509_hash`, `did`/`decentralized_identifier`, `verifier_attestation`, `redirect_uri`. |
+| `response_mode` | `direct_post`, `direct_post.jwt`, `query`, `fragment`. A wallet refuses a `zkp_req` presentation over a non-encrypted mode; the engine does not do that itself. |
+| `response_uri` | The validated `response_uri` (the `redirect_uri` when the request has no `response_uri`). |
+| `signed` | `true` only when `signature_verification` is `"verified"`. A client that does not know the field reads it as not signed. |
+| `signature_verification` | `"verified"`, `"deferred"` or `"none"`. |
+| `client_metadata` | The verifier's `client_metadata`, verbatim, as below. |
+
+`signature_verification` states what the engine itself established: that the
+request object's signature verified against a key the scheme binds to
+`client_id`.
+
+| Scheme | `verified` when | Otherwise |
+|--------|-----------------|-----------|
+| `x509_san_dns`, `x509_san_uri`, `x509_hash` | the JWT signature verified against the header `x5c` | the flow fails |
+| `did`, `decentralized_identifier` | the signature verified against a key resolved for the DID (verifier PDP configured) | `deferred` with no verifier PDP: resolution and verification are left to the frontend |
+| `verifier_attestation` | the signature verified against the attestation's `cnf` key and the PDP is configured to validate the attestation | `deferred` with no verifier PDP: nothing has checked the attestation that binds `cnf` to `client_id` |
+| `redirect_uri` | never | `none`: a valid embedded key proves possession only |
+
+`deferred` MUST NOT be treated as verified. For the x509 schemes the SAN or
+hash binding to `client_id` is the PDP's check, which is why `verifier.trusted`
+stays mandatory.
+
+```
+"verified_request": {
+  "client_id": "x509_san_dns:verifier.example.com",
+  "client_id_scheme": "x509_san_dns",
+  "response_mode": "direct_post.jwt",
+  "response_uri": "https://verifier.example.com/response",
+  "signed": true,
+  "signature_verification": "verified",
+  "client_metadata": { "vp_formats_supported": { ... } }
+}
+```
+
+`"client_id": "did:web:verifier.example.com"` with no PDP gives
+`"signed": false, "signature_verification": "deferred"`; a `redirect_uri`
+request gives `"signed": false, "signature_verification": "none"`.
+
+The OID4VP handler does not send `match_request`: it hands the DCQL query to the
+client inside `credential_selection`, where the client matches and asks for
+consent in one step. `match_request` stays for flows that match first, and
+carries the same `verified_request` when sent. The top-level `client_metadata`
+member of all three messages is unchanged.
+
 #### User Consent
 
 Server prompts for user consent with the matched credentials:

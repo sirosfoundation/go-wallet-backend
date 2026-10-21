@@ -137,6 +137,12 @@ type AuthorizationRequest struct {
 	// from that implementation's author. Empty for non-ZK presentations or
 	// request URIs that never carried a sessionId to begin with.
 	VerifierSessionID string `json:"-"`
+	// Verified is the single VerifiedRequestInputs built by
+	// evaluateVerifierTrust once the request has been validated and its
+	// signature handled. Every message that hands request inputs to the
+	// client (credential_selection, match_request, sign_presentation) emits
+	// this one value. Never read directly: use verifiedInputs.
+	Verified *VerifiedRequestInputs `json:"-"`
 }
 
 // ClientMetadata represents verifier/client metadata
@@ -587,6 +593,9 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	// falling back to a weaker key a different key's request could collide
 	// with.
 	cacheable := true
+	// sigState is what the engine itself established about the request
+	// object's signature; see VerifiedRequestInputs.SignatureVerification.
+	sigState := SignatureNone
 
 	switch authReq.ClientIDScheme {
 	case ClientIDSchemeDID, ClientIDSchemeDecentralizedIdentifier:
@@ -622,6 +631,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			requiresResolution = true
 			requestJWT = authReq.RequestJWT
 			cacheable = false
+			sigState = SignatureDeferred
 			break
 		}
 
@@ -656,6 +666,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			Type: "jwk",
 			JWK:  matchedJWK,
 		}
+		sigState = SignatureVerified
 		// Cache identity is the resolved, JWT-verified DID itself - but a
 		// DID document can list multiple active verification methods (key
 		// rotation overlap), and the PDP evaluates trust against this
@@ -688,6 +699,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			return nil, errors.New("x509_san_dns scheme requires x5c in JWT header")
 		}
 		keyMaterial = km
+		sigState = SignatureVerified
 		// The request JWT's signature proves possession of the embedded
 		// x5c's private key, but a SAN DNS name is not unique to one
 		// certificate - a different cert naming the same domain would claim
@@ -716,6 +728,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			return nil, errors.New("x509_san_uri scheme requires x5c in JWT header")
 		}
 		keyMaterial = km
+		sigState = SignatureVerified
 		// The request JWT's signature proves possession of the embedded
 		// x5c's private key, but a SAN URI entry is not unique to one
 		// certificate - a different cert naming the same URI would claim
@@ -746,6 +759,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			return nil, errors.New("x509_hash scheme requires x5c in JWT header")
 		}
 		keyMaterial = km
+		sigState = SignatureVerified
 		// client_id is SUPPOSED to be the certificate's own hash under this
 		// scheme, but this handler never itself checks that binding - only
 		// go-trust's PDP does. Without a fingerprint here, a request
@@ -802,6 +816,17 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		// Store attestation context for the trust evaluation request.
 		// The raw JWT is forwarded so the PDP can verify the attestation
 		// signature and validate claims (exp, aud, scope).
+		// ExtractVerifierAttestation has already verified the request JWT
+		// against the attestation's cnf key (a mismatch is an error above).
+		// That key is bound to client_id only through the attestation's
+		// sub, whose issuer signature the engine never checks itself: only
+		// the PDP does. Without a PDP nothing has, so the binding is
+		// deferred rather than claimed.
+		if h.Config.Trust.GetVerifierPDPURL() != "" {
+			sigState = SignatureVerified
+		} else {
+			sigState = SignatureDeferred
+		}
 		attestationContext = map[string]interface{}{
 			"attestation_issuer":  attestation.Issuer,
 			"attestation_subject": attestation.Subject,
@@ -858,6 +883,10 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			}
 		}
 	}
+
+	// Build the request inputs the client is told about exactly once, from
+	// the validated request and what the switch above established.
+	authReq.Verified = newVerifiedRequestInputs(authReq, sigState)
 
 	canonicalURL := getCanonicalVerifierURL(authReq)
 
@@ -1605,6 +1634,7 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 	if len(authReq.ClientMetadataRaw) > 0 {
 		selection["client_metadata"] = authReq.ClientMetadataRaw
 	}
+	selection["verified_request"] = verifiedInputs(authReq)
 	_ = h.Progress(StepCredentialSelection, selection)
 
 	action, err := h.waitForSelectionAction(ctx, authReq)
@@ -1822,6 +1852,7 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 		VerifierSessionID:     authReq.VerifierSessionID,
 		TransactionData:       authReq.TransactionData,
 		ClientMetadata:        authReq.ClientMetadataRaw,
+		VerifiedRequest:       verifiedInputs(authReq),
 	})
 	if err != nil {
 		return "", err

@@ -1406,8 +1406,14 @@ func (s *Session) RequestMatch(ctx context.Context, flowID string, dcql json.Raw
 }
 
 // RequestMatchWithClientMetadata is RequestMatch that also hands the client the
-// verifier's client_metadata object (verbatim; nil omits it).
-func (s *Session) RequestMatchWithClientMetadata(ctx context.Context, flowID string, dcql, clientMetadata json.RawMessage) (*MatchResponseMessage, error) {
+// validated request inputs (nil omits them), including the verifier's
+// client_metadata object verbatim, which is also kept at its original
+// top-level member for older clients.
+func (s *Session) RequestMatchWithClientMetadata(ctx context.Context, flowID string, dcql json.RawMessage, request *VerifiedRequestInputs) (*MatchResponseMessage, error) {
+	var clientMetadata json.RawMessage
+	if request != nil {
+		clientMetadata = request.ClientMetadata
+	}
 	messageID := uuid.New().String()
 
 	msg := MatchRequestMessage{
@@ -1417,8 +1423,9 @@ func (s *Session) RequestMatchWithClientMetadata(ctx context.Context, flowID str
 			MessageID: messageID,
 			Timestamp: Now(),
 		},
-		DCQLQuery:      dcql,
-		ClientMetadata: clientMetadata,
+		DCQLQuery:       dcql,
+		ClientMetadata:  clientMetadata,
+		VerifiedRequest: request,
 	}
 
 	if err := s.Send(&msg); err != nil {
