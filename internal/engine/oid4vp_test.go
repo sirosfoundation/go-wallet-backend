@@ -2188,7 +2188,9 @@ func TestComputeVerifierJWKThumbprint_NonJWTMode(t *testing.T) {
 	authReq := &AuthorizationRequest{
 		ResponseMode: ResponseModeDirectPost,
 	}
-	assert.Equal(t, "", h.computeVerifierJWKThumbprint(authReq))
+	got, err := h.computeVerifierJWKThumbprint(authReq)
+	require.NoError(t, err)
+	assert.Equal(t, "", got)
 }
 
 func TestComputeVerifierJWKThumbprint_JWTMode(t *testing.T) {
@@ -2207,7 +2209,8 @@ func TestComputeVerifierJWKThumbprint_JWTMode(t *testing.T) {
 			JWKS: jwksBytes,
 		},
 	}
-	result := h.computeVerifierJWKThumbprint(authReq)
+	result, err := h.computeVerifierJWKThumbprint(authReq)
+	require.NoError(t, err)
 	assert.NotEmpty(t, result, "should return a non-empty thumbprint")
 }
 
@@ -2216,9 +2219,12 @@ func TestComputeVerifierJWKThumbprint_JWTModeNoKeys(t *testing.T) {
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 	authReq := &AuthorizationRequest{
 		ResponseMode: ResponseModeDirectPostJWT,
-		// No client metadata — should warn and return empty
+		// No client metadata: must fail, not send an empty thumbprint
 	}
-	assert.Equal(t, "", h.computeVerifierJWKThumbprint(authReq))
+	got, err := h.computeVerifierJWKThumbprint(authReq)
+	require.Error(t, err)
+	assert.Equal(t, "", got)
+	assert.Contains(t, err.Error(), "direct_post.jwt")
 }
 
 // --- Test for validateAuthorizationRequest with all known schemes ---

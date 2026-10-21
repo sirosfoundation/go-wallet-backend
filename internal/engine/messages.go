@@ -535,6 +535,11 @@ type SignRequestParams struct {
 	// session rather than the verifier's static identity. Empty for
 	// non-ZK presentations.
 	VerifierSessionID string `json:"verifier_session_id,omitempty"`
+	// ClientMetadata is the verifier's client_metadata object, verbatim from
+	// the validated request object (sign_presentation only). Notably carries
+	// vp_formats_supported, which for a zkp_req presentation holds the
+	// system_id_values / proof_system_values. Absent when the request had none.
+	ClientMetadata json.RawMessage `json:"client_metadata,omitempty"`
 	// TransactionData carries the verifier's OID4VP transaction_data (EC TS12), one
 	// entry per request element, in order. Sent only to a client that declared
 	// FeatureTransactionDataV1. The client hashes each entry's Raw string into the
@@ -625,6 +630,9 @@ type SignResponseMessage struct {
 type MatchRequestMessage struct {
 	Message
 	DCQLQuery json.RawMessage `json:"dcql_query,omitempty"`
+	// ClientMetadata is the verifier's client_metadata object, verbatim from
+	// the validated request object. Optional; absent when the request had none.
+	ClientMetadata json.RawMessage `json:"client_metadata,omitempty"`
 }
 
 // MatchResponseMessage is the client's matching response

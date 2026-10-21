@@ -1620,6 +1620,12 @@ var ErrMatchTimeout = errors.New("credential matching timed out")
 // This is the privacy-preserving credential matching protocol where the client
 // matches credentials locally against the DCQL query.
 func (s *Session) RequestMatch(ctx context.Context, flowID string, dcql json.RawMessage) (*MatchResponseMessage, error) {
+	return s.RequestMatchWithClientMetadata(ctx, flowID, dcql, nil)
+}
+
+// RequestMatchWithClientMetadata is RequestMatch that also hands the client the
+// verifier's client_metadata object (verbatim; nil omits it).
+func (s *Session) RequestMatchWithClientMetadata(ctx context.Context, flowID string, dcql, clientMetadata json.RawMessage) (*MatchResponseMessage, error) {
 	messageID := uuid.New().String()
 
 	msg := MatchRequestMessage{
@@ -1629,7 +1635,8 @@ func (s *Session) RequestMatch(ctx context.Context, flowID string, dcql json.Raw
 			MessageID: messageID,
 			Timestamp: Now(),
 		},
-		DCQLQuery: dcql,
+		DCQLQuery:      dcql,
+		ClientMetadata: clientMetadata,
 	}
 
 	if err := s.Send(&msg); err != nil {

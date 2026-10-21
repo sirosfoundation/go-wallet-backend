@@ -93,6 +93,12 @@ func (h *BaseHandler) RequestMatch(ctx context.Context, dcql json.RawMessage) (*
 	return h.Flow.Session.RequestMatch(ctx, h.Flow.ID, dcql)
 }
 
+// RequestMatchWithClientMetadata is RequestMatch that also passes the
+// verifier's client_metadata object (verbatim) to the client.
+func (h *BaseHandler) RequestMatchWithClientMetadata(ctx context.Context, dcql, clientMetadata json.RawMessage) (*MatchResponseMessage, error) {
+	return h.Flow.Session.RequestMatchWithClientMetadata(ctx, h.Flow.ID, dcql, clientMetadata)
+}
+
 // WaitForAction waits for a client action
 func (h *BaseHandler) WaitForAction(ctx context.Context, expectedActions ...string) (*FlowActionMessage, error) {
 	return h.Flow.Session.WaitForAction(ctx, h.Flow.ID, expectedActions...)

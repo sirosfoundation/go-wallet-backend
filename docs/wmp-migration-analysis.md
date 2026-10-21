@@ -712,7 +712,8 @@ Server → Client: wmp.flow.start request (blocks until the client acks it,
     "proof_type": "jwt"
   }
 }
-// match: params = {"dcql_query": {...}, "parent_flow_id": "flow-123"}
+// match: params = {"dcql_query": {...}, "parent_flow_id": "flow-123",
+//                   "client_metadata": {...}}   // client_metadata optional
 
 Client → Server: result of flow.start (acknowledges the child flow)
 
@@ -723,6 +724,26 @@ Client → Server: wmp.flow.complete notification for the CHILD flow_id
   "result": { "proof_jwt": "eyJ..." }   // match: {"matches": [...]}
 }
 ```
+
+#### Verifier `client_metadata` over WMP
+
+The optional verifier `client_metadata` object (verbatim; see "Verifier
+`client_metadata`" in `websocket-protocol-spec.md`) reaches a WMP client on:
+
+- `wmp.flow.progress` with `step: "credential_selection"`: as
+  `payload.client_metadata` (the payload is forwarded unchanged).
+- the `match` sub-flow's `wmp.flow.start` `params.client_metadata`.
+- the `sign` sub-flow's `params.client_metadata`: **not yet carried.**
+  `openid4x.SignSubFlowParams` is defined in the `go-wmp` module (v0.6.2 has no
+  such field), so the adapter cannot forward it until go-wmp adds
+  a `client_metadata` (json.RawMessage, omitempty) member and
+  this module bumps the dependency. Until then a WMP client takes it from the
+  `credential_selection` progress / `match` params.
+
+For `direct_post.jwt` the engine no longer sends an empty
+`verifier_jwk_thumbprint`: if the verifier's response-encryption key cannot be
+read or thumbprinted the flow fails with a `SIGN_ERROR` flow error
+(`wmp.flow.error`), so a WMP sign sub-flow never starts with an empty value.
 
 `FlowComplete` looks the child flow ID up, tags the result with the parent
 flow and message IDs, and delivers it to the engine's blocking

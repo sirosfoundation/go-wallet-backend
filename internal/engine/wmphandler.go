@@ -2393,6 +2393,11 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 			"dcql_query":     m.DCQLQuery,
 			"parent_flow_id": m.FlowID,
 		}
+		// Verifier client_metadata, verbatim and only when the request had one
+		// (e.g. vp_formats_supported for a zkp_req presentation).
+		if len(m.ClientMetadata) > 0 {
+			matchParams["client_metadata"] = m.ClientMetadata
+		}
 		paramsJSON, err := json.Marshal(matchParams)
 		if err != nil {
 			t.handler.popChildFlow(childFlowID)

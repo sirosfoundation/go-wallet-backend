@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -151,6 +152,14 @@ type AuthorizationRequest struct {
 	DCQLQuery         json.RawMessage `json:"dcql_query,omitempty"`
 	ClientMetadata    *ClientMetadata `json:"client_metadata,omitempty"`
 	ClientMetadataURI string          `json:"client_metadata_uri,omitempty"`
+	// ClientMetadataRaw is the client_metadata JSON object exactly as the
+	// verifier sent it (inline in the request object, or fetched from
+	// client_metadata_uri). The typed ClientMetadata above only keeps the
+	// members the engine itself uses and drops the rest - notably
+	// vp_formats_supported, which for a zkp_req presentation carries the
+	// system_id_values / proof_system_values the wallet must pick from - so
+	// the wallet is handed this instead. Empty when the verifier sent none.
+	ClientMetadataRaw json.RawMessage `json:"-"`
 	// TransactionData carries TS12 transaction data from the verifier (OID4VP draft §7.4).
 	// Per spec, this is an array of base64url-encoded JSON strings in the request.
 	TransactionDataRaw json.RawMessage `json:"transaction_data,omitempty"`
@@ -435,6 +444,7 @@ func (h *OID4VPHandler) parseRequestFromURL(u *url.URL) (*AuthorizationRequest, 
 			return nil, fmt.Errorf("invalid client_metadata: %w", err)
 		}
 		authReq.ClientMetadata = &cm
+		authReq.ClientMetadataRaw = rawObject(json.RawMessage(cmStr))
 	}
 	authReq.ClientMetadataURI = q.Get("client_metadata_uri")
 
@@ -463,6 +473,8 @@ func (h *OID4VPHandler) parseRequestJWT(jwtStr string) (*AuthorizationRequest, e
 	if err := json.Unmarshal(payload, &authReq); err != nil {
 		return nil, fmt.Errorf("failed to parse JWT payload: %w", err)
 	}
+
+	authReq.ClientMetadataRaw = extractRawClientMetadata(payload)
 
 	// Store the raw JWT so we can extract key material from its header later
 	authReq.RequestJWT = jwtStr
@@ -552,6 +564,8 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 		err = json.Unmarshal([]byte(bodyStr), authReq)
 		if err != nil {
 			err = fmt.Errorf("failed to parse request: %w", err)
+		} else {
+			authReq.ClientMetadataRaw = extractRawClientMetadata([]byte(bodyStr))
 		}
 	} else {
 		// Likely a JWT
@@ -573,7 +587,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	if authReq.ClientMetadata != nil {
 		clientMeta = authReq.ClientMetadata
 	} else if authReq.ClientMetadataURI != "" {
-		cm, err := h.fetchClientMetadata(ctx, authReq.ClientMetadataURI)
+		cm, raw, err := h.fetchClientMetadata(ctx, authReq.ClientMetadataURI)
 		if err != nil {
 			h.Logger.Warn("Failed to fetch client metadata", zap.Error(err))
 		} else {
@@ -581,6 +595,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			// Store fetched metadata on the request so downstream steps
 			// (e.g. submitDirectPostJWT) can access JARM parameters.
 			authReq.ClientMetadata = cm
+			authReq.ClientMetadataRaw = raw
 		}
 	}
 
@@ -1542,10 +1557,10 @@ func (h *OID4VPHandler) extractVerifierKeyMaterial(ctx context.Context, clientMe
 	return nil
 }
 
-func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*ClientMetadata, error) {
+func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*ClientMetadata, json.RawMessage, error) {
 	req, err := http.NewRequestWithContext(ctx, "GET", uri, nil)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	// codeql[go/request-forgery]: h.httpClient is constructed via
@@ -1554,20 +1569,45 @@ func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*C
 	// attacker-supplied client_metadata_uri is inherent to OID4VP §5.7.
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("metadata fetch returned status %d", resp.StatusCode)
+		return nil, nil, fmt.Errorf("metadata fetch returned status %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))
+	if err != nil {
+		return nil, nil, err
 	}
 
 	var cm ClientMetadata
-	if err := json.NewDecoder(resp.Body).Decode(&cm); err != nil {
-		return nil, err
+	if err := json.Unmarshal(body, &cm); err != nil {
+		return nil, nil, err
 	}
 
-	return &cm, nil
+	return &cm, rawObject(json.RawMessage(body)), nil
+}
+
+// rawObject returns raw when it is a JSON object and nil otherwise.
+func rawObject(raw json.RawMessage) json.RawMessage {
+	if t := bytes.TrimSpace(raw); len(t) > 0 && t[0] == '{' {
+		return json.RawMessage(t)
+	}
+	return nil
+}
+
+// extractRawClientMetadata returns the request object's client_metadata
+// member verbatim, or nil when it is absent or not an object.
+func extractRawClientMetadata(requestObject []byte) json.RawMessage {
+	var probe struct {
+		ClientMetadata json.RawMessage `json:"client_metadata"`
+	}
+	if err := json.Unmarshal(requestObject, &probe); err != nil {
+		return nil
+	}
+	return rawObject(probe.ClientMetadata)
 }
 
 // requestCredentialSelection sends dcql_query + verifier to the client in a single
@@ -1580,10 +1620,14 @@ func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*C
 // silence until the user-interaction timeout, which is what a wallet missing
 // the PID an issuer demands used to hit.
 func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq *AuthorizationRequest, verifier *VerifierInfo) ([]ConsentSelection, error) {
-	_ = h.Progress(StepCredentialSelection, map[string]interface{}{
+	selection := map[string]interface{}{
 		"dcql_query": authReq.DCQLQuery,
 		"verifier":   verifier,
-	})
+	}
+	if len(authReq.ClientMetadataRaw) > 0 {
+		selection["client_metadata"] = authReq.ClientMetadataRaw
+	}
+	_ = h.Progress(StepCredentialSelection, selection)
 
 	action, err := h.waitForSelectionAction(ctx, authReq)
 	if err != nil {
@@ -1786,7 +1830,10 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 		responseURI = authReq.RedirectURI
 	}
 
-	verifierJwkThumbprint := h.computeVerifierJWKThumbprint(authReq)
+	verifierJwkThumbprint, err := h.computeVerifierJWKThumbprint(authReq)
+	if err != nil {
+		return "", err
+	}
 
 	params := SignRequestParams{
 		Audience:              audience,
@@ -1796,6 +1843,7 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 		VerifierJwkThumbprint: verifierJwkThumbprint,
 		VerifierSessionID:     authReq.VerifierSessionID,
 		TransactionData:       authReq.TransactionData,
+		ClientMetadata:        authReq.ClientMetadataRaw,
 	}
 	// EC TS12 puts response_mode in the KB-JWT of an SCA presentation; sent only with
 	// transaction data.
@@ -1823,23 +1871,28 @@ func effectiveResponseMode(authReq *AuthorizationRequest) string {
 	return authReq.ResponseMode
 }
 
-// computeVerifierJWKThumbprint returns the verifier JWK thumbprint for direct_post.jwt,
-// or empty string for other response modes.
-func (h *OID4VPHandler) computeVerifierJWKThumbprint(authReq *AuthorizationRequest) string {
+// computeVerifierJWKThumbprint returns the verifier JWK thumbprint for
+// direct_post.jwt, or "" (and no error) for other response modes.
+//
+// The value is the unpadded base64url SHA-256 JWK Thumbprint (RFC 7638) of the
+// verifier's response-encryption key, which the wallet feeds into the
+// OpenID4VPHandover session transcript. For direct_post.jwt an empty value is
+// never acceptable: the wallet would build a transcript over an empty
+// thumbprint that the verifier cannot reproduce, so the failure surfaces as a
+// confusing verification error at the verifier. Fail the flow here instead.
+func (h *OID4VPHandler) computeVerifierJWKThumbprint(authReq *AuthorizationRequest) (string, error) {
 	if authReq.ResponseMode != ResponseModeDirectPostJWT {
-		return ""
+		return "", nil
 	}
 	jwk, err := h.extractVerifierEncryptionJWK(authReq)
 	if err != nil {
-		h.Logger.Warn("could not extract verifier encryption JWK for mdoc session transcript", zap.Error(err))
-		return ""
+		return "", fmt.Errorf("direct_post.jwt: cannot read the verifier's response-encryption key: %w", err)
 	}
 	thumbBytes, err := jwk.Thumbprint(crypto.SHA256)
 	if err != nil {
-		h.Logger.Warn("could not compute JWK thumbprint for mdoc session transcript", zap.Error(err))
-		return ""
+		return "", fmt.Errorf("direct_post.jwt: cannot compute the verifier key's JWK thumbprint: %w", err)
 	}
-	return base64.RawURLEncoding.EncodeToString(thumbBytes)
+	return base64.RawURLEncoding.EncodeToString(thumbBytes), nil
 }
 
 // buildDCQLVPToken restructures a newline-separated vp_token into a JSON object
