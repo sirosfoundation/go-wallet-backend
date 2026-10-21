@@ -2399,6 +2399,11 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		if len(m.ClientMetadata) > 0 {
 			matchParams["client_metadata"] = m.ClientMetadata
 		}
+		// The validated request inputs, verbatim and only when the engine sent
+		// them. No go-wmp type is involved: the match params are a plain map.
+		if m.VerifiedRequest != nil {
+			matchParams["verified_request"] = m.VerifiedRequest
+		}
 		paramsJSON, err := json.Marshal(matchParams)
 		if err != nil {
 			t.handler.popChildFlow(childFlowID)

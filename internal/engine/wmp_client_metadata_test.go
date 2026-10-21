@@ -27,11 +27,21 @@ type clientMetadataFlowHandler struct {
 
 func (h *clientMetadataFlowHandler) Execute(ctx context.Context, msg *FlowStartMessage) error {
 	payload := map[string]interface{}{"dcql_query": json.RawMessage(`{}`)}
+	var vr *VerifiedRequestInputs
 	if h.cm != nil {
 		payload["client_metadata"] = h.cm
+		vr = &VerifiedRequestInputs{
+			ClientID:              "x509_san_dns:verifier.example.com",
+			ClientIDScheme:        ClientIDSchemeX509SANDNS,
+			ResponseMode:          "direct_post.jwt",
+			Signed:                true,
+			SignatureVerification: SignatureVerified,
+			ClientMetadata:        h.cm,
+		}
+		payload["verified_request"] = vr
 	}
 	_ = h.flow.Session.SendProgress(h.flow.ID, StepCredentialSelection, payload)
-	_, _ = h.flow.Session.RequestMatchWithClientMetadata(ctx, h.flow.ID, json.RawMessage(`{"credentials":[]}`), h.cm)
+	_, _ = h.flow.Session.RequestMatchWithClientMetadata(ctx, h.flow.ID, json.RawMessage(`{"credentials":[]}`), vr)
 	return nil
 }
 
@@ -96,11 +106,23 @@ func TestWMP_ClientMetadata_ForwardedOnMatchAndCredentialSelection(t *testing.T)
 
 	require.Contains(t, progress, "client_metadata", "credential_selection progress must carry client_metadata")
 	assert.JSONEq(t, testClientMetadata, string(progress["client_metadata"]))
+
+	// verified_request reaches the same two messages, identically.
+	require.Contains(t, match, "verified_request", "match sub-flow params must carry verified_request")
+	require.Contains(t, progress, "verified_request", "credential_selection progress must carry verified_request")
+	assert.JSONEq(t, string(progress["verified_request"]), string(match["verified_request"]))
+	var vr VerifiedRequestInputs
+	require.NoError(t, json.Unmarshal(match["verified_request"], &vr))
+	assert.Equal(t, "direct_post.jwt", vr.ResponseMode)
+	assert.True(t, vr.Signed)
+	assert.Equal(t, SignatureVerified, vr.SignatureVerification)
+	assert.JSONEq(t, testClientMetadata, string(vr.ClientMetadata))
 }
 
 func TestWMP_ClientMetadata_OmittedWhenAbsent(t *testing.T) {
 	_, match := runClientMetadataFlow(t, nil)
 	assert.NotContains(t, match, "client_metadata")
+	assert.NotContains(t, match, "verified_request")
 }
 
 // signClientMetadataFlowHandler issues a sign request whose params carry cm

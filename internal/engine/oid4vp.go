@@ -177,6 +177,12 @@ type AuthorizationRequest struct {
 	// from that implementation's author. Empty for non-ZK presentations or
 	// request URIs that never carried a sessionId to begin with.
 	VerifierSessionID string `json:"-"`
+	// Verified is the single VerifiedRequestInputs built by
+	// evaluateVerifierTrust once the request has been validated and its
+	// signature handled. Every message that hands request inputs to the
+	// client (credential_selection, match_request, sign_presentation) emits
+	// this one value. Never read directly: use verifiedInputs.
+	Verified *VerifiedRequestInputs `json:"-"`
 }
 
 // ClientMetadata represents verifier/client metadata
@@ -648,6 +654,9 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	// falling back to a weaker key a different key's request could collide
 	// with.
 	cacheable := true
+	// sigState is what the engine itself established about the request
+	// object's signature; see VerifiedRequestInputs.SignatureVerification.
+	sigState := SignatureNone
 
 	switch authReq.ClientIDScheme {
 	case ClientIDSchemeDID, ClientIDSchemeDecentralizedIdentifier:
@@ -683,6 +692,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			requiresResolution = true
 			requestJWT = authReq.RequestJWT
 			cacheable = false
+			sigState = SignatureDeferred
 			break
 		}
 
@@ -717,6 +727,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			Type: "jwk",
 			JWK:  matchedJWK,
 		}
+		sigState = SignatureVerified
 		// Cache identity is the resolved, JWT-verified DID itself - but a
 		// DID document can list multiple active verification methods (key
 		// rotation overlap), and the PDP evaluates trust against this
@@ -749,6 +760,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			return nil, errors.New("x509_san_dns scheme requires x5c in JWT header")
 		}
 		keyMaterial = km
+		sigState = SignatureVerified
 		// The request JWT's signature proves possession of the embedded
 		// x5c's private key, but a SAN DNS name is not unique to one
 		// certificate - a different cert naming the same domain would claim
@@ -777,6 +789,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			return nil, errors.New("x509_san_uri scheme requires x5c in JWT header")
 		}
 		keyMaterial = km
+		sigState = SignatureVerified
 		// The request JWT's signature proves possession of the embedded
 		// x5c's private key, but a SAN URI entry is not unique to one
 		// certificate - a different cert naming the same URI would claim
@@ -807,6 +820,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			return nil, errors.New("x509_hash scheme requires x5c in JWT header")
 		}
 		keyMaterial = km
+		sigState = SignatureVerified
 		// client_id is SUPPOSED to be the certificate's own hash under this
 		// scheme, but this handler never itself checks that binding - only
 		// go-trust's PDP does. Without a fingerprint here, a request
@@ -863,6 +877,17 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		// Store attestation context for the trust evaluation request.
 		// The raw JWT is forwarded so the PDP can verify the attestation
 		// signature and validate claims (exp, aud, scope).
+		// ExtractVerifierAttestation has already verified the request JWT
+		// against the attestation's cnf key (a mismatch is an error above).
+		// That key is bound to client_id only through the attestation's
+		// sub, whose issuer signature the engine never checks itself: only
+		// the PDP does. Without a PDP nothing has, so the binding is
+		// deferred rather than claimed.
+		if h.Config.Trust.GetVerifierPDPURL() != "" {
+			sigState = SignatureVerified
+		} else {
+			sigState = SignatureDeferred
+		}
 		attestationContext = map[string]interface{}{
 			"attestation_issuer":  attestation.Issuer,
 			"attestation_subject": attestation.Subject,
@@ -882,23 +907,47 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		verifiedIdentity = clientIDSchemeVerifierAttestationPrefix + attestation.Subject + ":" + sha256Hex(attestation.RawJWT)
 
 	default:
-		// redirect_uri and other schemes: extract key material best-effort
-		if clientMeta != nil {
-			keyMaterial = h.extractVerifierKeyMaterial(ctx, clientMeta)
-		}
-		// Fallback: extract key material from the request JWT header
-		if keyMaterial == nil && authReq.RequestJWT != "" {
-			// Verify JWT signature if present (opportunistic verification)
+		// redirect_uri (the only other scheme validateAuthorizationRequest
+		// lets through): the client_id is not cryptographically
+		// authenticated, so the PDP is asked about the name alone UNLESS the
+		// request object carries a signature that actually verifies.
+		//
+		// Key material is only ever forwarded to the PDP as evidence of the
+		// verifier's identity when the requester has proven possession of
+		// it. That rules out client_metadata keys (jwks, jwks_uri, x5c are
+		// plain attacker-supplied data here) and any header key of a request
+		// object whose signature failed: a replayed copy of a trusted
+		// verifier's public key/certificate chain would otherwise be
+		// evaluated as if it belonged to the requester.
+		if authReq.RequestJWT != "" {
 			km, verifyErr := trust.VerifyJWTWithEmbeddedKey(authReq.RequestJWT)
-			if verifyErr != nil {
-				h.Logger.Warn("Request JWT signature verification failed, falling back to header extraction",
-					zap.Error(verifyErr))
-				keyMaterial = trust.ExtractKeyMaterialFromJWT(authReq.RequestJWT)
-			} else {
+			switch {
+			case verifyErr == nil:
 				keyMaterial = km
+				// A verdict reached with a proven key must never be served
+				// to a request that did not prove it (and vice versa), so
+				// bind the cache identity to that key, as the x509 schemes
+				// do. No fingerprint means no caching at all.
+				if fp := keyMaterialFingerprint(km); fp != "" {
+					// client_id is hashed so it cannot inject delimiters
+					// into the key, and the namespace keeps this identity
+					// distinct from the unsigned fallback key below.
+					verifiedIdentity = "redirect_uri:signed:" + sha256Hex(authReq.ClientID) + ":" + fp
+				} else {
+					cacheable = false
+				}
+			case errors.Is(verifyErr, trust.ErrNoEmbeddedKey):
+				// Nothing to verify against and nothing to forward: the
+				// name-only evaluation above is all that happens.
+			default:
+				return nil, fmt.Errorf("request JWT signature verification failed: %w", verifyErr)
 			}
 		}
 	}
+
+	// Build the request inputs the client is told about exactly once, from
+	// the validated request and what the switch above established.
+	authReq.Verified = newVerifiedRequestInputs(authReq, sigState)
 
 	canonicalURL := getCanonicalVerifierURL(authReq)
 
@@ -939,7 +988,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	// itself can't be hashed.
 	cacheKey := verifiedIdentity
 	if cacheKey == "" && cacheable {
-		cacheKey = canonicalURL + "|client_id:" + authReq.ClientID
+		cacheKey = "unsigned|" + canonicalURL + "|client_id:" + authReq.ClientID
 	}
 	if cacheKey != "" && contextHash != "" {
 		cacheKey += "|ctx:" + contextHash
@@ -956,6 +1005,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		if cached := h.getCachedVerifierTrust(cacheKey); cached != nil {
 			verifier.Trusted = cached.Trusted
 			verifier.Framework = cached.TrustFramework
+			verifier.Reason = cached.Reason
 			verifier.TrustedStatus = string(cached.TrustStatus)
 			if cached.Name != "" {
 				verifier.Name = cached.Name
@@ -963,6 +1013,9 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 			if clientID := h.getAdminClientID(ctx, canonicalURL); clientID != "" {
 				verifier.ClientID = clientID
 			}
+			// Same progress as a fresh evaluation, including the PDP
+			// context the verdict was cached with.
+			h.sendVerifierTrustProgress(authReq.ClientID, verifier, cached.Context)
 			if !verifier.Trusted {
 				return nil, fmt.Errorf("untrusted verifier %s (cached)", authReq.ClientID)
 			}
@@ -1053,13 +1106,10 @@ func (h *OID4VPHandler) evaluateVerifierTrustViaPDP(ctx context.Context, authReq
 		zap.String("framework", verifier.Framework))
 
 	// Send result to frontend/SDK as informational progress
-	_ = h.Progress(StepTrustEvaluated, map[string]interface{}{
-		"verifier_trust_evaluated": true,
-		"verifier":                 authReq.ClientID,
-		"trusted":                  verifier.Trusted,
-		"framework":                verifier.Framework,
-		"reason":                   verifier.Reason,
-	})
+	// Narrow once: the progress and the cache both see only verifier_ids,
+	// so admin-visible context members are not retained or forwarded.
+	pdpContext := narrowVerifierContext(directResult.Context)
+	h.sendVerifierTrustProgress(authReq.ClientID, verifier, pdpContext)
 
 	// Cache the PDP-backed verdict. This is the only call site that ever
 	// populates the trust cache. An empty cacheKey means the caller decided
@@ -1067,7 +1117,7 @@ func (h *OID4VPHandler) evaluateVerifierTrustViaPDP(ctx context.Context, authReq
 	// cacheable/cacheKey computation) - skip writing rather than caching
 	// under an empty/ambiguous key.
 	if cacheKey != "" {
-		h.cacheVerifierTrust(cacheKey, verifier)
+		h.cacheVerifierTrust(cacheKey, verifier, pdpContext)
 	}
 
 	// Look up admin-configured ClientID for VP audience (read-only)
@@ -1469,7 +1519,7 @@ func (h *OID4VPHandler) getAdminClientID(ctx context.Context, verifierURL string
 // function: caching it would let a single attacker-controlled answer stand
 // in as ground truth for every subsequent request against this identity for
 // the whole cache TTL, without ever consulting the PDP again.
-func (h *OID4VPHandler) cacheVerifierTrust(cacheKey string, verifier *VerifierInfo) {
+func (h *OID4VPHandler) cacheVerifierTrust(cacheKey string, verifier *VerifierInfo, pdpContext json.RawMessage) {
 	if h.TrustCache == nil {
 		return
 	}
@@ -1493,7 +1543,69 @@ func (h *OID4VPHandler) cacheVerifierTrust(cacheKey string, verifier *VerifierIn
 		TrustStatus:    trustStatus,
 		TrustFramework: verifier.Framework,
 		Trusted:        verifier.Trusted,
+		Reason:         verifier.Reason,
+		Context:        pdpContext,
 	})
+}
+
+// sendVerifierTrustProgress emits the verifier_trust_evaluated flow progress
+// for a PDP-backed verdict, fresh or replayed from the trust cache. The
+// "context" member carries only verifier_ids (see narrowVerifierContext),
+// which the wallet needs as the verifier identifier for its pseudonym
+// function. verifierContext must already be narrowed; the member is omitted
+// when it is empty.
+func (h *OID4VPHandler) sendVerifierTrustProgress(clientID string, verifier *VerifierInfo, verifierContext json.RawMessage) {
+	payload := map[string]interface{}{
+		"verifier_trust_evaluated": true,
+		"verifier":                 clientID,
+		"trusted":                  verifier.Trusted,
+		"framework":                verifier.Framework,
+		"reason":                   verifier.Reason,
+	}
+	if len(verifierContext) > 0 {
+		payload["context"] = verifierContext
+	}
+	_ = h.Progress(StepTrustEvaluated, payload)
+}
+
+// verifierIDEntry is one verifier_ids element the wallet is given.
+type verifierIDEntry struct {
+	VerifierIDType string `json:"verifier_id_type"`
+	VerifierID     string `json:"verifier_id"`
+	Basis          string `json:"basis,omitempty"`
+}
+
+// narrowVerifierContext reduces a PDP response context to the only part the
+// wallet is meant to see, {"verifier_ids":[{verifier_id_type,verifier_id,basis?}]}.
+// Every other member (reason, trust_metadata, anything else) is admin-visible
+// and is dropped, as are unknown members of each entry. It returns nil when
+// there is no usable verifier_ids, so the progress omits "context" entirely.
+func narrowVerifierContext(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return nil
+	}
+	var in struct {
+		VerifierIDs []verifierIDEntry `json:"verifier_ids"`
+	}
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return nil
+	}
+	ids := make([]verifierIDEntry, 0, len(in.VerifierIDs))
+	for _, e := range in.VerifierIDs {
+		if e.VerifierIDType != "" && e.VerifierID != "" {
+			ids = append(ids, e)
+		}
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	out, err := json.Marshal(struct {
+		VerifierIDs []verifierIDEntry `json:"verifier_ids"`
+	}{ids})
+	if err != nil {
+		return nil
+	}
+	return out
 }
 
 // extractDomain extracts a domain name from a client_id (URL or DID).
@@ -1515,46 +1627,6 @@ func extractDomain(clientID string) string {
 		return u.Host
 	}
 	return ""
-}
-
-// extractVerifierKeyMaterial extracts key material from client metadata for trust evaluation.
-// Priority: x5c > jwks > jwks_uri (for DIDs where client_id starts with did:, returns nil)
-func (h *OID4VPHandler) extractVerifierKeyMaterial(ctx context.Context, clientMeta *ClientMetadata) *KeyMaterial {
-	// X5C certificate chain takes priority
-	if len(clientMeta.X5C) > 0 {
-		return &KeyMaterial{
-			Type: "x5c",
-			X5C:  clientMeta.X5C,
-		}
-	}
-
-	// Inline JWKS
-	if len(clientMeta.JWKS) > 0 {
-		var jwks interface{}
-		if err := json.Unmarshal(clientMeta.JWKS, &jwks); err == nil {
-			return &KeyMaterial{
-				Type: "jwk",
-				JWK:  jwks,
-			}
-		}
-		h.Logger.Warn("Failed to parse inline JWKS", zap.Error(fmt.Errorf("invalid JSON")))
-	}
-
-	// Fetch from jwks_uri
-	if clientMeta.JWKsURI != "" {
-		jwks, err := trust.FetchJWKS(ctx, clientMeta.JWKsURI, h.httpClient)
-		if err != nil {
-			h.Logger.Warn("Failed to fetch JWKS from URI", zap.String("uri", clientMeta.JWKsURI), zap.Error(err))
-		} else {
-			return &KeyMaterial{
-				Type: "jwk",
-				JWK:  jwks,
-			}
-		}
-	}
-
-	// No key material available - will use resolution-only mode (for DIDs)
-	return nil
 }
 
 func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*ClientMetadata, json.RawMessage, error) {
@@ -1627,6 +1699,7 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 	if len(authReq.ClientMetadataRaw) > 0 {
 		selection["client_metadata"] = authReq.ClientMetadataRaw
 	}
+	selection["verified_request"] = verifiedInputs(authReq)
 	_ = h.Progress(StepCredentialSelection, selection)
 
 	action, err := h.waitForSelectionAction(ctx, authReq)
@@ -1844,6 +1917,7 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 		VerifierSessionID:     authReq.VerifierSessionID,
 		TransactionData:       authReq.TransactionData,
 		ClientMetadata:        authReq.ClientMetadataRaw,
+		VerifiedRequest:       verifiedInputs(authReq),
 	}
 	// EC TS12 puts response_mode in the KB-JWT of an SCA presentation; sent only with
 	// transaction data.
@@ -2264,6 +2338,16 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 		return fmt.Errorf("unsupported client_id_scheme: %s", authReq.ClientIDScheme)
 	}
 
+	// A client_id that itself carries a signed-required scheme prefix must be
+	// evaluated under exactly that scheme. client_id_scheme is a separate,
+	// requester-controlled member; without this, declaring redirect_uri for
+	// "x509_san_dns:<victim>" would skip every signature check the prefixed
+	// scheme requires, while the PDP (which parses the prefix out of the
+	// subject itself) still treats the client_id as a certificate-bound one.
+	if err := validateSchemeMatchesClientIDPrefix(authReq); err != nil {
+		return err
+	}
+
 	// OID4VP §5: For direct_post, response_uri must be present
 	if isDirectPost && authReq.ResponseURI == "" {
 		return errors.New("response_uri is required for direct_post response mode")
@@ -2345,6 +2429,29 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 
 	// OID4VP §7.4: Decode and validate transaction_data if present.
 	return validateTransactionData(authReq, msg)
+}
+
+// validateSchemeMatchesClientIDPrefix rejects a request whose client_id
+// carries a scheme prefix that requires a signed request object (x509_*,
+// verifier_attestation, did / decentralized_identifier) but whose declared
+// client_id_scheme is a different one. did: and decentralized_identifier: are
+// two spellings of one scheme and may be mixed. A bare client_id with a
+// separately declared scheme (the draft-era form) is not affected.
+func validateSchemeMatchesClientIDPrefix(authReq *AuthorizationRequest) error {
+	prefixScheme := inferClientIDScheme(authReq.ClientID)
+	switch prefixScheme {
+	case ClientIDSchemeDID, ClientIDSchemeDecentralizedIdentifier:
+		if authReq.ClientIDScheme == ClientIDSchemeDID || authReq.ClientIDScheme == ClientIDSchemeDecentralizedIdentifier {
+			return nil
+		}
+	case ClientIDSchemeX509SANDNS, ClientIDSchemeX509SANURI, ClientIDSchemeX509Hash, ClientIDSchemeVerifierAttestation:
+		if authReq.ClientIDScheme == prefixScheme {
+			return nil
+		}
+	default:
+		return nil
+	}
+	return fmt.Errorf("client_id_scheme %q does not match the scheme prefix of client_id (%s)", authReq.ClientIDScheme, prefixScheme)
 }
 
 // validateClientIDMatch checks that client_id in the URL matches the JWT request object.

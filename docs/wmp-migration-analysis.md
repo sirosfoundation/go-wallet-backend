@@ -713,7 +713,8 @@ Server → Client: wmp.flow.start request (blocks until the client acks it,
   }
 }
 // match: params = {"dcql_query": {...}, "parent_flow_id": "flow-123",
-//                   "client_metadata": {...}}   // client_metadata optional
+//                   "client_metadata": {...},    // optional
+//                   "verified_request": {...}}   // optional
 
 Client → Server: result of flow.start (acknowledges the child flow)
 
@@ -735,6 +736,23 @@ The optional verifier `client_metadata` object (verbatim; see "Verifier
 - the `match` sub-flow's `wmp.flow.start` `params.client_metadata`.
 - the `sign` sub-flow's `params.client_metadata` (`openid4x.SignSubFlowParams.ClientMetadata`,
   added in go-wmp v0.7.0; omitted when the request had none).
+
+#### `verified_request` over WMP
+
+The optional `verified_request` object (the request as the engine validated it;
+see "Verified request inputs" in `websocket-protocol-spec.md` and WMP OpenID4X
+profile Section 7.5) reaches a WMP client on:
+
+- `wmp.flow.progress` with `step: "credential_selection"`: as
+  `payload.verified_request` (the payload is forwarded unchanged).
+- the `match` sub-flow's `wmp.flow.start` `params.verified_request`.
+
+It does NOT yet reach the `sign` sub-flow: go-wmp v0.7.0's
+`openid4x.SignSubFlowParams` has no `VerifiedRequest` member. That is blocked
+on a go-wmp release containing https://github.com/sirosfoundation/go-wmp/pull/34;
+the translation must then set `VerifiedRequest` from `m.Params.VerifiedRequest`.
+Until then a WMP wallet sees no `verified_request` on sign, and per the profile
+MUST fail closed for a `zkp_req` presentation that lacks it.
 
 For `direct_post.jwt` the engine no longer sends an empty
 `verifier_jwk_thumbprint`: if the verifier's response-encryption key cannot be
