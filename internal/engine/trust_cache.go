@@ -22,6 +22,8 @@ type TrustCacheRecord struct {
 	TrustStatus    domain.TrustStatus
 	TrustFramework string
 	Trusted        bool
+	// Reason is the PDP's explanation for the verdict, replayed on cache hits.
+	Reason string
 	// Context is the PDP response context (incl. verifier_ids) the verdict
 	// came with, replayed on cache hits. The cache is in-memory and
 	// process-local, so every entry is written by code that stores it;

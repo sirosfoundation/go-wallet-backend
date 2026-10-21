@@ -22,7 +22,7 @@ type contextPDP struct {
 
 func (p *contextPDP) Evaluate(_ context.Context, _ *trust.EvaluationRequest) (*trust.EvaluationResponse, error) {
 	p.calls++
-	return &trust.EvaluationResponse{Decision: true, Context: p.ctx}, nil
+	return &trust.EvaluationResponse{Decision: true, Reason: "pdp says yes", Context: p.ctx}, nil
 }
 func (p *contextPDP) Name() string { return "context-pdp" }
 func (p *contextPDP) SupportedResourceTypes() []trust.ResourceType {
@@ -106,6 +106,7 @@ func TestEvaluateVerifierTrust_ProgressCarriesPDPContext_FreshAndCacheHit(t *tes
 	for i, p := range ps {
 		assert.JSONEq(t, verifierIDsContext, string(p["context"]), "payload %d", i)
 		assert.JSONEq(t, `true`, string(p["trusted"]))
+		assert.JSONEq(t, `"pdp says yes"`, string(p["reason"]), "payload %d: reason survives a cache hit", i)
 	}
 }
 

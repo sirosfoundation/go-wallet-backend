@@ -912,6 +912,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		if cached := h.getCachedVerifierTrust(cacheKey); cached != nil {
 			verifier.Trusted = cached.Trusted
 			verifier.Framework = cached.TrustFramework
+			verifier.Reason = cached.Reason
 			verifier.TrustedStatus = string(cached.TrustStatus)
 			if cached.Name != "" {
 				verifier.Name = cached.Name
@@ -1446,6 +1447,7 @@ func (h *OID4VPHandler) cacheVerifierTrust(cacheKey string, verifier *VerifierIn
 		TrustStatus:    trustStatus,
 		TrustFramework: verifier.Framework,
 		Trusted:        verifier.Trusted,
+		Reason:         verifier.Reason,
 		Context:        pdpContext,
 	})
 }
