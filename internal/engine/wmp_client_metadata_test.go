@@ -131,25 +131,26 @@ func TestWMP_ClientMetadata_OmittedWhenAbsent(t *testing.T) {
 type signClientMetadataFlowHandler struct {
 	flow *Flow
 	cm   json.RawMessage
+	vr   *VerifiedRequestInputs
 }
 
 func (h *signClientMetadataFlowHandler) Execute(ctx context.Context, msg *FlowStartMessage) error {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	_, _ = h.flow.Session.RequestSign(ctx, h.flow.ID, SignActionSignPresentation,
-		SignRequestParams{Nonce: "n", Audience: "a", ClientMetadata: h.cm})
+		SignRequestParams{Nonce: "n", Audience: "a", ClientMetadata: h.cm, VerifiedRequest: h.vr})
 	return nil
 }
 
 func (h *signClientMetadataFlowHandler) Cancel() {}
 
-func runSignClientMetadataFlow(t *testing.T, cm json.RawMessage) map[string]json.RawMessage {
+func runSignClientMetadataFlow(t *testing.T, cm json.RawMessage, vr *VerifiedRequestInputs) map[string]json.RawMessage {
 	t.Helper()
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
 
 	m.RegisterFlowHandler("cm_sign_test", func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
-		return &signClientMetadataFlowHandler{flow: flow, cm: cm}, nil
+		return &signClientMetadataFlowHandler{flow: flow, cm: cm, vr: vr}, nil
 	})
 	sessionID := createWMPSession(t, a)
 	_, err := a.HandleRPC(context.Background(), sessionID, "", "", wmpRequest("2", "wmp.flow.start", wmp.FlowStartParams{
@@ -185,14 +186,39 @@ func runSignClientMetadataFlow(t *testing.T, cm json.RawMessage) map[string]json
 }
 
 func TestWMP_ClientMetadata_ForwardedOnSignSubFlow(t *testing.T) {
-	params := runSignClientMetadataFlow(t, json.RawMessage(testClientMetadata))
+	params := runSignClientMetadataFlow(t, json.RawMessage(testClientMetadata), nil)
 	require.Contains(t, params, "client_metadata", "sign sub-flow params must carry client_metadata")
 	assert.JSONEq(t, testClientMetadata, string(params["client_metadata"]))
 	assert.Contains(t, params, "nonce")
 }
 
 func TestWMP_ClientMetadata_OmittedOnSignSubFlowWhenAbsent(t *testing.T) {
-	params := runSignClientMetadataFlow(t, nil)
+	params := runSignClientMetadataFlow(t, nil, nil)
 	assert.NotContains(t, params, "client_metadata")
+	assert.Contains(t, params, "nonce")
+}
+
+func TestWMP_VerifiedRequest_ForwardedOnSignSubFlow(t *testing.T) {
+	vr := &VerifiedRequestInputs{
+		ClientID:              "x509_san_dns:verifier.example.com",
+		ClientIDScheme:        ClientIDSchemeX509SANDNS,
+		ResponseMode:          "direct_post.jwt",
+		Signed:                true,
+		SignatureVerification: SignatureVerified,
+		ClientMetadata:        json.RawMessage(testClientMetadata),
+	}
+	params := runSignClientMetadataFlow(t, json.RawMessage(testClientMetadata), vr)
+	require.Contains(t, params, "verified_request", "sign sub-flow params must carry verified_request")
+	var got VerifiedRequestInputs
+	require.NoError(t, json.Unmarshal(params["verified_request"], &got))
+	assert.Equal(t, "direct_post.jwt", got.ResponseMode)
+	assert.True(t, got.Signed)
+	assert.Equal(t, SignatureVerified, got.SignatureVerification)
+	assert.JSONEq(t, testClientMetadata, string(got.ClientMetadata))
+}
+
+func TestWMP_VerifiedRequest_OmittedOnSignSubFlowWhenAbsent(t *testing.T) {
+	params := runSignClientMetadataFlow(t, nil, nil)
+	assert.NotContains(t, params, "verified_request")
 	assert.Contains(t, params, "nonce")
 }

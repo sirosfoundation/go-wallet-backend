@@ -2354,6 +2354,18 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 		childFlowID := uuid.New().String()
 		t.handler.registerChildFlow(childFlowID, m.FlowID, m.MessageID, "sign")
 
+		// The validated request inputs, verbatim and only when the engine sent
+		// them (omitted from the wire when nil).
+		var verifiedRequest json.RawMessage
+		if m.Params.VerifiedRequest != nil {
+			vrJSON, err := json.Marshal(m.Params.VerifiedRequest)
+			if err != nil {
+				t.handler.popChildFlow(childFlowID)
+				return err
+			}
+			verifiedRequest = vrJSON
+		}
+
 		subFlowParams := openid4x.SignSubFlowParams{
 			Action:                string(m.Action),
 			Nonce:                 m.Params.Nonce,
@@ -2377,6 +2389,7 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 			KeyID:                 m.Params.KeyID,
 			AttestationChallenge:  m.Params.AttestationChallenge,
 			ClientMetadata:        m.Params.ClientMetadata,
+			VerifiedRequest:       verifiedRequest,
 		}
 		paramsJSON, err := json.Marshal(subFlowParams)
 		if err != nil {

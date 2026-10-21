@@ -746,13 +746,9 @@ profile Section 7.5) reaches a WMP client on:
 - `wmp.flow.progress` with `step: "credential_selection"`: as
   `payload.verified_request` (the payload is forwarded unchanged).
 - the `match` sub-flow's `wmp.flow.start` `params.verified_request`.
-
-It does NOT yet reach the `sign` sub-flow: go-wmp v0.7.0's
-`openid4x.SignSubFlowParams` has no `VerifiedRequest` member. That is blocked
-on a go-wmp release containing https://github.com/sirosfoundation/go-wmp/pull/34;
-the translation must then set `VerifiedRequest` from `m.Params.VerifiedRequest`.
-Until then a WMP wallet sees no `verified_request` on sign, and per the profile
-MUST fail closed for a `zkp_req` presentation that lacks it.
+- the `sign` sub-flow's `params.verified_request`
+  (`openid4x.SignSubFlowParams.VerifiedRequest`, added in go-wmp v0.8.0; omitted
+  when the engine sent none).
 
 For `direct_post.jwt` the engine no longer sends an empty
 `verifier_jwk_thumbprint`: if the verifier's response-encryption key cannot be
