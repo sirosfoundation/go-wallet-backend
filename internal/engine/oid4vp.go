@@ -828,7 +828,10 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 				// bind the cache identity to that key, as the x509 schemes
 				// do. No fingerprint means no caching at all.
 				if fp := keyMaterialFingerprint(km); fp != "" {
-					verifiedIdentity = pdpSubjectID(authReq) + ":" + fp
+					// client_id is hashed so it cannot inject delimiters
+					// into the key, and the namespace keeps this identity
+					// distinct from the unsigned fallback key below.
+					verifiedIdentity = "redirect_uri:signed:" + sha256Hex(authReq.ClientID) + ":" + fp
 				} else {
 					cacheable = false
 				}
@@ -880,7 +883,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	// itself can't be hashed.
 	cacheKey := verifiedIdentity
 	if cacheKey == "" && cacheable {
-		cacheKey = canonicalURL + "|client_id:" + authReq.ClientID
+		cacheKey = "unsigned|" + canonicalURL + "|client_id:" + authReq.ClientID
 	}
 	if cacheKey != "" && contextHash != "" {
 		cacheKey += "|ctx:" + contextHash
