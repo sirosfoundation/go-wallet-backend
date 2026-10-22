@@ -109,7 +109,7 @@ Environment prefix: `WALLET_JWT`
 | `jwt.secret_path` | `WALLET_JWT_SECRET_PATH` | string | Path to file containing JWT secret |
 | `jwt.expiry_hours` | `WALLET_JWT_EXPIRY_HOURS` | integer |  |
 | `jwt.refresh_days` | `WALLET_JWT_REFRESH_DAYS` | integer |  |
-| `jwt.issuer` | `WALLET_JWT_ISSUER` | string | Issuer is the "iss" claim of legacy (HMAC) tokens. Required (non-empty) when as.legacy.enabled is true: legacy tokens are issued and validated with it. Defaults to "wallet-backend"; if it is blanked while as.legacy.enabled is true, that default is re-applied before validation. |
+| `jwt.issuer` | `WALLET_JWT_ISSUER` | string | Issuer is the "iss" of legacy HMAC session tokens, and the only issuer accepted on them. Default: "wallet-backend". May be empty only when as.legacy.enabled=false. |
 
 ## as
 
@@ -119,7 +119,12 @@ Environment prefix: `WALLET_AS`
 |----------|-------------|------|-------------|
 | `as.enabled` | `WALLET_AS_ENABLED` | boolean | Enabled controls whether the new AS is active. |
 | `as.signing_key_path` | `WALLET_AS_SIGNING_KEY_PATH` | string | SigningKeyPath is the path to a PEM-encoded private key (ECDSA P-256, P-384, or Ed25519) used to sign access tokens. Mutually exclusive with SigningKeyPKCS11. |
-| `as.signing_key_pkcs11` | `WALLET_AS_SIGNING_KEY_PKCS11` | string | SigningKeyPKCS11 is a PKCS#11 URI for HSM-backed signing. Mutually exclusive with SigningKeyPath. |
+| `as.signing_key_pkcs11.module_path` | `WALLET_AS_SIGNING_KEY_PKCS11_MODULE_PATH` | string |  |
+| `as.signing_key_pkcs11.slot_id` | `WALLET_AS_SIGNING_KEY_PKCS11_SLOT_ID` | uint |  |
+| `as.signing_key_pkcs11.pin` | `WALLET_AS_SIGNING_KEY_PKCS11_PIN` | string |  |
+| `as.signing_key_pkcs11.pin_path` | `WALLET_AS_SIGNING_KEY_PKCS11_PIN_PATH` | string | Path to file containing PIN (preferred over inline PIN). Read at startup by Load for wallet_provider.pkcs11; for as.signing_key_pkcs11 it is read only when the AS signer is constructed, not by Load. |
+| `as.signing_key_pkcs11.key_label` | `WALLET_AS_SIGNING_KEY_PKCS11_KEY_LABEL` | string |  |
+| `as.signing_key_pkcs11.pool_size` | `WALLET_AS_SIGNING_KEY_PKCS11_POOL_SIZE` | integer | Session pool size (default 4) |
 | `as.issuer` | `WALLET_AS_ISSUER` | string | Issuer is the value of the "iss" claim in issued access tokens. Defaults to JWT.Issuer if not set. |
 | `as.default_token_ttl` | `WALLET_AS_DEFAULT_TOKEN_TTL` | duration | DefaultTokenTTL is the default access token lifetime. Default: 2m |
 | `as.audience_ttls` | `WALLET_AS_AUDIENCE_TTLS` | map[string]time.Duration | AudienceTTLs allows per-audience TTL overrides. Keys are audience strings, values are durations. |
@@ -129,9 +134,9 @@ Environment prefix: `WALLET_AS`
 | `as.session_store` | `WALLET_AS_SESSION_STORE` | string | SessionStore selects where AS sessions (the cookie-bound server-side sessions that mint access tokens) are kept: "mongodb", "memory" or "auto". "auto" (the default when empty) means "mongodb" when the storage backend is MongoDB and "memory" otherwise. Memory sessions are lost on restart and are not shared between instances; use "mongodb" for high availability. |
 | `as.default_max_tac` | `WALLET_AS_DEFAULT_MAX_TAC` | string | DefaultMaxTAC is the default maximum TAC for sessions created via passkey auth. Admin sessions (e.g. via OIDC) may get a different MaxTAC per policy. Default: "rwl" (read, write, list) |
 | `as.legacy.enabled` | `WALLET_AS_LEGACY_ENABLED` | boolean | Enabled controls whether legacy HMAC tokens are accepted. Default: true (for backward compatibility) |
-| `as.legacy.deprecation_header` | `WALLET_AS_LEGACY_DEPRECATION_HEADER` | boolean | DeprecationHeader controls whether Deprecation + Sunset headers are sent on legacy token responses. |
-| `as.legacy.sunset_date` | `WALLET_AS_LEGACY_SUNSET_DATE` | string | SunsetDate is the date after which legacy tokens will no longer be supported. Used in the Sunset HTTP header. Format: RFC 3339 date (e.g. "2027-10-01T00:00:00Z"). |
-| `as.external_url` | `WALLET_AS_EXTERNAL_URL` | string | ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com"). Used to construct OIDC redirect URIs. Required when OIDC is used. |
+| `as.legacy.deprecation_header` | `WALLET_AS_LEGACY_DEPRECATION_HEADER` | boolean | DeprecationHeader is not acted on: the middleware is not mounted. |
+| `as.legacy.sunset_date` | `WALLET_AS_LEGACY_SUNSET_DATE` | string | SunsetDate is ignored (a startup warning is logged); sunset the legacy AS with as.legacy.enabled=false.  Deprecated: ignored; remove it from the configuration. |
+| `as.external_url` | `WALLET_AS_EXTERNAL_URL` | string | ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com"). Used for OIDC redirect URIs and, in an isolated wallet-provider or standalone engine, to locate the AS JWKS. Must be an absolute http(s) URL without a query or fragment; a path prefix is allowed.  A standalone engine (--mode=engine) has no revocation source: a token stays valid there until it expires, even after logout. Use short access token TTLs, or co-host the engine with the backend. |
 | `as.insecure_cookies` | `WALLET_AS_INSECURE_COOKIES` | boolean | InsecureCookies disables the __Host- prefix and Secure flag on session cookies. Required for local development over HTTP. NEVER enable in production. |
 
 ## wallet_provider
@@ -146,7 +151,7 @@ Environment prefix: `WALLET_WALLET_PROVIDER`
 | `wallet_provider.pkcs11.module_path` | `WALLET_WALLET_PROVIDER_PKCS11_MODULE_PATH` | string |  |
 | `wallet_provider.pkcs11.slot_id` | `WALLET_WALLET_PROVIDER_PKCS11_SLOT_ID` | uint |  |
 | `wallet_provider.pkcs11.pin` | `WALLET_WALLET_PROVIDER_PKCS11_PIN` | string |  |
-| `wallet_provider.pkcs11.pin_path` | `WALLET_WALLET_PROVIDER_PKCS11_PIN_PATH` | string | Path to file containing PIN (preferred over inline PIN) |
+| `wallet_provider.pkcs11.pin_path` | `WALLET_WALLET_PROVIDER_PKCS11_PIN_PATH` | string | Path to file containing PIN (preferred over inline PIN). Read at startup by Load for wallet_provider.pkcs11; for as.signing_key_pkcs11 it is read only when the AS signer is constructed, not by Load. |
 | `wallet_provider.pkcs11.key_label` | `WALLET_WALLET_PROVIDER_PKCS11_KEY_LABEL` | string |  |
 | `wallet_provider.pkcs11.pool_size` | `WALLET_WALLET_PROVIDER_PKCS11_POOL_SIZE` | integer | Session pool size (default 4) |
 | `wallet_provider.wia.enabled` | `WALLET_WALLET_PROVIDER_WIA_ENABLED` | boolean | Enabled controls whether WIA endpoints are registered |

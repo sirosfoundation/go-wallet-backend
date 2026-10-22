@@ -968,16 +968,24 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 		return result.UserID, result.TenantID, result.TAC, nil
 	}
 
-	// Legacy path: direct HMAC validation. Unlike the go-tokenauth branch
-	// above, nothing else in this path ever checks revocation at all, so
-	// both checks below are needed, not just the user-level one (#391
-	// review, round 2).
+	// Legacy path: direct HMAC validation, only while legacy is enabled.
+	if !m.cfg.LegacyEnabled() {
+		return "", "", "", errors.New("legacy tokens are disabled")
+	}
+
+	// Nothing else on this path checks revocation, so both checks below are
+	// needed.
+	// Pin iss = jwt.issuer; an empty value would disable the check
+	// (golang-jwt), so fail closed.
+	if m.cfg.JWT.Issuer == "" {
+		return "", "", "", errors.New("jwt issuer not configured")
+	}
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, errors.New("unexpected signing method")
 		}
 		return []byte(m.cfg.JWT.Secret), nil
-	}, jwt.WithLeeway(config.JWTLeeway))
+	}, jwt.WithLeeway(config.JWTLeeway), jwt.WithIssuer(m.cfg.JWT.Issuer))
 
 	if err != nil {
 		return "", "", "", err
@@ -1274,17 +1282,17 @@ func (s *Session) SendProgress(flowID string, step FlowStep, payload interface{}
 
 // SendFlowComplete sends a flow completion message
 func (s *Session) SendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string) error {
-	return s.sendFlowComplete(flowID, credentials, redirectURI, "", "", "")
+	return s.sendFlowComplete(flowID, credentials, redirectURI, "", "", "", nil)
 }
 
 // SendFlowCompleteWithRefreshToken is SendFlowComplete plus an OID4VCI
 // refresh_token (and the DPoP key it's bound to) to relay to the client -
 // see FlowCompleteMessage.RefreshToken/DPoPJWK.
 func (s *Session) SendFlowCompleteWithRefreshToken(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string, dpopKeyID string) error {
-	return s.sendFlowComplete(flowID, credentials, redirectURI, refreshToken, dpopJWK, dpopKeyID)
+	return s.sendFlowComplete(flowID, credentials, redirectURI, refreshToken, dpopJWK, dpopKeyID, nil)
 }
 
-func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string, dpopKeyID string) error {
+func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string, dpopKeyID string, md *CredentialMetadataRelay) error {
 	s.flowsMu.RLock()
 	flow := s.flows[flowID]
 	s.flowsMu.RUnlock()
@@ -1300,6 +1308,10 @@ func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult
 		RefreshToken: refreshToken,
 		DPoPJWK:      dpopJWK,
 		DPoPKeyID:    dpopKeyID,
+	}
+	if md != nil {
+		msg.CredentialMetadata = md.Metadata
+		msg.CredentialMetadataEncryptedResponse = md.Encrypted
 	}
 	if flow != nil {
 		flow.mu.RLock()
