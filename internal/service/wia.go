@@ -347,7 +347,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	// Without this check, a wallet that still holds its instance key could simply
 	// request a fresh challenge/PoP and obtain a brand-new valid WIA, completely
 	// bypassing revocation.
-	firstAttestation, created := false, false
+	firstAttestation := false
 	if s.instances != nil {
 		existing, err := s.instances.GetByID(ctx, jkt)
 		switch {
@@ -374,7 +374,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 				}
 			}
 		case errors.Is(err, storage.ErrNotFound):
-			firstAttestation, created = true, true
+			firstAttestation = true
 			// A first attestation must not revive a deactivated wallet (SID-AUTH-06).
 			if err := s.refuseIfWalletDeactivated(ctx, tenantID, userID); err != nil {
 				return "", err
@@ -416,7 +416,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	}
 
 	// Step 4: Generate WIA JWT
-	return s.signWIA(ctx, cnfJWK, jkt, tenantID, userID, attestationSource, req.ClientID, req.CredentialID, firstAttestation, created)
+	return s.signWIA(ctx, cnfJWK, jkt, tenantID, userID, attestationSource, req.ClientID, req.CredentialID, firstAttestation)
 }
 
 // validatePop validates the WIA-PoP JWT and extracts the cnf key.
@@ -516,8 +516,7 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 // jkt is the JWK Thumbprint of cnfJWK, precomputed by the caller (GenerateWIA)
 // so it can also be used for the instance-status guard before signing.
 // firstAttestation: the record did not exist at the lifecycle check (or was anonymous); re-checked after the write.
-// created: the record did not exist at all.
-func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, attestationSource string, clientID string, credentialID string, firstAttestation, created bool) (string, error) {
+func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, attestationSource string, clientID string, credentialID string, firstAttestation bool) (string, error) {
 	now := time.Now()
 
 	lifetime := s.wiaLifetime()
@@ -684,7 +683,7 @@ func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{},
 			return "", err
 		}
 		written = instance
-		if err := s.fenceInstanceWrite(ctx, instance, created); err != nil {
+		if err := s.fenceInstanceWrite(ctx, instance); err != nil {
 			return "", err
 		}
 	}
@@ -692,7 +691,7 @@ func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{},
 	// A cut-off landing after the fence must still stop the token, and undo the
 	// record this request wrote.
 	if written != nil {
-		if err := s.fenceInstanceWrite(ctx, written, created); err != nil {
+		if err := s.fenceInstanceWrite(ctx, written); err != nil {
 			return "", err
 		}
 	} else if err := tokengate.RefuseNow(ctx, s.users); err != nil {
@@ -741,16 +740,17 @@ func checkInstanceBinding(existing *domain.WalletInstance, tenantID domain.Tenan
 }
 
 // fenceInstanceWrite refuses the request if the cut-off landed during the
-// Upsert, removing the record it wrote. A record this request created is always
-// removed; a pre-existing one only when the account was deleted, since the
+// Upsert, removing the record it wrote. A record this request's Upsert inserted
+// (written.Inserted, reported by the store, not inferred from an earlier read
+// that another replica may have raced) is always removed; a pre-existing one only when the account was deleted, since the
 // deletion sweep may have run before the Upsert recreated it. The removal is
 // conditional on the written binding, so a record replaced since is untouched.
-func (s *WIAService) fenceInstanceWrite(ctx context.Context, written *domain.WalletInstance, created bool) error {
+func (s *WIAService) fenceInstanceWrite(ctx context.Context, written *domain.WalletInstance) error {
 	err := tokengate.RefuseNow(ctx, s.users)
 	if err == nil {
 		return nil
 	}
-	if !created && !errors.Is(err, tokengate.ErrAccountDeleted) {
+	if !written.Inserted && !errors.Is(err, tokengate.ErrAccountDeleted) {
 		return err
 	}
 	id, tenantID, binding := written.ID, written.TenantID, written.Binding()

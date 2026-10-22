@@ -191,3 +191,64 @@ func TestWIAService_GenerateWIA_CutoffAfterTheFenceRemovesOnlyANewInstance(t *te
 		}
 	}
 }
+
+// raceInstances plays another replica creating the same instance after this
+// request's GetByID returned not-found but before its Upsert runs.
+type raceInstances struct {
+	storage.WalletInstanceStore
+	before func()
+	after  func()
+}
+
+func (r *raceInstances) Upsert(ctx context.Context, inst *domain.WalletInstance) error {
+	if r.before != nil {
+		r.before()
+	}
+	if err := r.WalletInstanceStore.Upsert(ctx, inst); err != nil {
+		return err
+	}
+	if r.after != nil {
+		r.after()
+	}
+	return nil
+}
+
+// A record that another replica created between GetByID and Upsert is not this
+// request's write: a cut-off landing during the write must not delete it.
+func TestWIAService_GenerateWIA_CutoffDoesNotDeleteARecordAnotherReplicaCreatedFirst(t *testing.T) {
+	store := memory.NewStore()
+	uid := domain.NewUserID()
+	ctx := context.Background()
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:key:" + uid.String()}); err != nil {
+		t.Fatal(err)
+	}
+	race := &raceInstances{WalletInstanceStore: store.WalletInstances()}
+	svc := newTestWIAServiceUsingStores(t, race, store.Users())
+	tok := tokengate.WithSubject(ctx, uid.String(), time.Now().Add(-time.Minute))
+
+	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pop, key := createTestPop(t, challenge)
+	jkt := expectedThumbprint(t, &key.PublicKey)
+
+	race.before = func() {
+		other := &domain.WalletInstance{ID: jkt, TenantID: domain.DefaultTenantID, UserID: &uid, Status: domain.InstanceStatusActive}
+		if err := store.WalletInstances().Upsert(ctx, other); err != nil {
+			t.Errorf("other replica: %v", err)
+		}
+		if !other.Inserted {
+			t.Error("the other replica's Upsert must report the insert")
+		}
+	}
+	race.after = advanceCutoff(t, store, uid)
+
+	_, err = svc.GenerateWIA(tok, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge})
+	if !errors.Is(err, tokengate.ErrRevoked) {
+		t.Fatalf("err = %v, want ErrRevoked", err)
+	}
+	if _, gerr := store.WalletInstances().GetByID(ctx, jkt); gerr != nil {
+		t.Fatalf("another replica's record must survive this request's cut-off, GetByID = %v", gerr)
+	}
+}

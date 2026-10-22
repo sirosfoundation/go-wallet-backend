@@ -752,3 +752,15 @@ func TestWalletInstanceStore_Upsert_ReportsGeneration(t *testing.T) {
 	require.NoError(t, s.Upsert(ctx, re))
 	require.NotEqual(t, first.Generation, re.Generation)
 }
+
+func TestWalletInstanceStore_Upsert_ReportsInserted(t *testing.T) {
+	ctx := context.Background()
+	s := NewStore().WalletInstances()
+	first := &domain.WalletInstance{ID: "i1", TenantID: "t", Status: domain.InstanceStatusActive}
+	require.NoError(t, s.Upsert(ctx, first))
+	require.True(t, first.Inserted)
+
+	again := &domain.WalletInstance{ID: "i1", TenantID: "t", Inserted: true}
+	require.NoError(t, s.Upsert(ctx, again))
+	require.False(t, again.Inserted, "matching an existing record is not an insert")
+}
