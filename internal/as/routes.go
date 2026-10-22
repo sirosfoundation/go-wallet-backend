@@ -14,6 +14,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
@@ -22,9 +23,12 @@ import (
 // ASModule is the top-level authorization server module that wires together
 // all AS components and registers routes.
 type ASModule struct {
-	KeyManager     *KeyManager
-	TokenIssuer    *TokenIssuer
-	Sessions       SessionStore
+	KeyManager  *KeyManager
+	TokenIssuer *TokenIssuer
+	Sessions    SessionStore
+	// TokenGate refuses delegating tokens issued before the user's
+	// SID-AUTH-06 cut-off (see internal/tokengate); nil enforces nothing.
+	TokenGate      *tokengate.Gate
 	Policy         PolicyEngine
 	PasskeyHandler *PasskeyHandlers
 	OIDCHandler    *OIDCHandlers
@@ -130,6 +134,7 @@ func NewASModule(
 		KeyManager:     km,
 		TokenIssuer:    tokenIssuer,
 		Sessions:       sessions,
+		TokenGate:      tokengate.New(store.Users()),
 		Policy:         policy,
 		PasskeyHandler: passkeyHandler,
 		OIDCHandler:    oidcHandler,
@@ -183,6 +188,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 		TTLFunc:         func(aud string) time.Duration { return m.Config.GetTokenTTL(aud) },
 		Audiences:       m.Config.Audiences,
 		Blacklist:       m.Blacklist,
+		Gate:            m.TokenGate,
 		InsecureCookies: m.Config.InsecureCookies,
 		Logger:          m.Logger,
 	})

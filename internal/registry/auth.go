@@ -12,6 +12,7 @@ import (
 	"github.com/sirosfoundation/go-tokenauth/validator"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
@@ -56,6 +57,9 @@ func (anyTenant) GetByID(_ context.Context, id domain.TenantID) (*domain.Tenant,
 //
 // After a successful validation the context has AuthenticatedKey=true and,
 // when the token has a tenant_id claim, TenantIDKey set to it.
+//
+// The registry has no user database, so its token chain uses
+// tokengate.NoUserRecords (an explicit no-op SID-AUTH-06 lookup).
 func AuthMiddlewares(cfg AuthConfig) []gin.HandlerFunc {
 	logger := cfg.Logger
 	if logger == nil {
@@ -70,7 +74,7 @@ func AuthMiddlewares(cfg AuthConfig) []gin.HandlerFunc {
 	if tenants == nil {
 		tenants = anyTenant{}
 	}
-	strict := middleware.TokenAuthMiddleware(cfg.Validator, tenants, cfg.Blacklist, logger)
+	strict := middleware.TokenAuthMiddleware(cfg.Validator, tenants, cfg.Blacklist, tokengate.NoUserRecords{}, logger)
 	return []gin.HandlerFunc{
 		strict,
 		func(c *gin.Context) {

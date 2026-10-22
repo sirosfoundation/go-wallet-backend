@@ -9,6 +9,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
 // VerifierService handles verifier operations
@@ -33,6 +34,11 @@ func (s *VerifierService) Create(ctx context.Context, tenantID domain.TenantID, 
 	}
 	if verifier.URL == "" {
 		return fmt.Errorf("verifier URL is required")
+	}
+
+	// SID-AUTH-06: judge the token against the cut-off as of now.
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return err
 	}
 
 	// Set tenant ID
@@ -72,6 +78,11 @@ func (s *VerifierService) GetAll(ctx context.Context, tenantID domain.TenantID) 
 
 // Update updates an existing verifier
 func (s *VerifierService) Update(ctx context.Context, verifier *domain.Verifier) error {
+	// SID-AUTH-06: judge the token against the cut-off as of now.
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return err
+	}
+
 	if err := s.store.Verifiers().Update(ctx, verifier); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return storage.ErrNotFound
@@ -88,6 +99,11 @@ func (s *VerifierService) Update(ctx context.Context, verifier *domain.Verifier)
 
 // Delete removes a verifier
 func (s *VerifierService) Delete(ctx context.Context, tenantID domain.TenantID, id int64) error {
+	// SID-AUTH-06: judge the token against the cut-off as of now.
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return err
+	}
+
 	if err := s.store.Verifiers().Delete(ctx, tenantID, id); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return storage.ErrNotFound

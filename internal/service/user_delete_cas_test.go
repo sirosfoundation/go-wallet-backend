@@ -1,0 +1,143 @@
+package service
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
+)
+
+// beforeAdvanceStore runs beforeAdvance immediately before DeleteUser's cut-off
+// advance: the window a read-then-advance would leave open.
+type beforeAdvanceStore struct {
+	storage.Store
+	beforeAdvance func()
+}
+
+type beforeAdvanceUsers struct {
+	storage.UserStore
+	s *beforeAdvanceStore
+}
+
+func (s *beforeAdvanceStore) Users() storage.UserStore {
+	return &beforeAdvanceUsers{s.Store.Users(), s}
+}
+
+func (u *beforeAdvanceUsers) InvalidateAuthBeforeForToken(ctx context.Context, id domain.UserID, t, iat time.Time) error {
+	if u.s.beforeAdvance != nil {
+		u.s.beforeAdvance()
+	}
+	return u.UserStore.InvalidateAuthBeforeForToken(ctx, id, t, iat)
+}
+
+// A revocation landing between the last cut-off look and the advance is refused
+// by the compare-and-set (401-class): nothing is erased, no permanent
+// revocation, no user removal, and the independent cut-off stands.
+func TestDeleteUser_CompareAndSetRefusesRevocationLandingBeforeTheAdvance(t *testing.T) {
+	ctx := context.Background()
+	inner := memory.NewStore()
+	hs := &beforeAdvanceStore{Store: inner}
+	svc := NewUserService(hs, testConfig(), zap.NewNop())
+	bl, ur := &countingRevoker{}, &countingUserRevoker{}
+	svc.SetTokenBlacklist(bl)
+	svc.AddUserRevoker(ur)
+	cleaner := &scriptedCleaner{}
+	svc.SetSessionCleaner(cleaner)
+	uid := seedWalletUser(t, inner, domain.DefaultTenantID, "acme")
+
+	independent := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	hs.beforeAdvance = func() {
+		require.NoError(t, inner.Users().InvalidateAuthBefore(ctx, uid, independent))
+	}
+
+	err := svc.DeleteUser(tokengate.WithIssuedAt(ctx, time.Now().Add(-time.Minute)), uid, uid.String())
+	require.ErrorIs(t, err, tokengate.ErrRevoked)
+	assert.Zero(t, bl.calls, "no permanent revocation")
+	assert.Zero(t, ur.calls)
+	assert.Zero(t, cleaner.calls, "no session was dropped")
+	// The admission happens before the destructive phase, so a losing request
+	// leaves everything in place: a 401 must not hide a half-erased account.
+	for _, tid := range []domain.TenantID{domain.DefaultTenantID, "acme"} {
+		creds, pres := countHolderData(t, inner, tid, uid)
+		assert.Equal(t, 1, creds, "credential in %s kept", tid)
+		assert.Equal(t, 1, pres, "presentation in %s kept", tid)
+	}
+	insts, ierr := inner.WalletInstances().GetAllByUser(ctx, uid)
+	require.NoError(t, ierr)
+	assert.Len(t, insts, 1, "the wallet instance is kept")
+	_, gerr := inner.Users().GetByID(ctx, uid)
+	assert.NoError(t, gerr, "the account is kept")
+	cutoff, err := inner.Users().GetAuthCutoff(ctx, uid)
+	require.NoError(t, err)
+	assert.True(t, cutoff.Equal(independent), "the independent cut-off stands")
+}
+
+// Reverse of the above: no independent revocation, a token issued after a
+// cut-off left by an earlier attempt passes the compare-and-set.
+func TestDeleteUser_CompareAndSetPassesAFreshTokenAfterAnEarlierAttemptsCutoff(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	svc := NewUserService(store, testConfig(), zap.NewNop())
+	svc.SetSessionCleaner(&scriptedCleaner{})
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:key:" + uid.String()}))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, time.Now().Add(-time.Minute)))
+
+	fresh := tokengate.WithIssuedAt(ctx, time.Now().Add(-time.Second))
+	require.NoError(t, svc.DeleteUser(fresh, uid, uid.String()))
+	_, gerr := store.Users().GetByID(ctx, uid)
+	assert.ErrorIs(t, gerr, storage.ErrNotFound)
+}
+
+// LogoutEverywhere advances the cut-off with the same compare-and-set: a
+// revocation landing between its check and its write is refused (401-class),
+// the newer cut-off stands and no session is dropped.
+func TestLogoutEverywhere_CompareAndSetRefusesRevocationLandingBeforeTheAdvance(t *testing.T) {
+	ctx := context.Background()
+	inner := memory.NewStore()
+	hs := &beforeAdvanceStore{Store: inner}
+	svc := NewUserService(hs, testConfig(), zap.NewNop())
+	cleaner := &scriptedCleaner{}
+	svc.SetSessionCleaner(cleaner)
+	uid := domain.NewUserID()
+	require.NoError(t, inner.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:key:" + uid.String()}))
+
+	independent := time.Now().Add(time.Hour).UTC().Truncate(time.Second)
+	hs.beforeAdvance = func() {
+		require.NoError(t, inner.Users().InvalidateAuthBefore(ctx, uid, independent))
+	}
+
+	err := svc.LogoutEverywhere(tokengate.WithIssuedAt(ctx, time.Now().Add(-time.Minute)), uid)
+	require.ErrorIs(t, err, tokengate.ErrRevoked)
+	assert.Zero(t, cleaner.calls, "sessions must not be dropped")
+	cutoff, err := inner.Users().GetAuthCutoff(ctx, uid)
+	require.NoError(t, err)
+	assert.True(t, cutoff.Equal(independent), "the independent cut-off stands")
+}
+
+// A token without an iat (the legacy path admits one) is not an internal
+// caller: a revocation landing before the cut-off advance must refuse it, not
+// be treated as unconditional.
+func TestDeleteUser_TokenWithoutIatIsRefusedWhenARevocationLandsBeforeTheAdvance(t *testing.T) {
+	ctx := tokengate.WithIssuedAt(context.Background(), time.Time{})
+	inner := memory.NewStore()
+	hs := &beforeAdvanceStore{Store: inner}
+	svc := NewUserService(hs, testConfig(), zap.NewNop())
+	uid := seedWalletUser(t, inner, domain.DefaultTenantID, "acme")
+	hs.beforeAdvance = func() {
+		require.NoError(t, inner.Users().InvalidateAuthBefore(context.Background(), uid, time.Now().Add(time.Hour).UTC().Truncate(time.Second)))
+	}
+
+	err := svc.DeleteUser(ctx, uid, uid.String())
+	require.ErrorIs(t, err, tokengate.ErrRevoked)
+	_, gerr := inner.Users().GetByID(context.Background(), uid)
+	assert.NoError(t, gerr, "nothing was deleted")
+}

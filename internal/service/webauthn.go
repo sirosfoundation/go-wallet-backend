@@ -117,6 +117,51 @@ func subjectHash(issuer, subject string) string {
 // ErrAAGUIDBlacklisted indicates the authenticator's AAGUID is blocked
 var ErrAAGUIDBlacklisted = errors.New("authenticator not allowed")
 
+// ErrWalletInstanceRevoked refuses a login whose passkey belongs to a revoked
+// instance (SID-AUTH-06). ErrWalletDeactivated, which wraps it (match it first),
+// refuses every passkey of a wallet whose instances are all revoked.
+var (
+	ErrWalletInstanceRevoked = errors.New("wallet instance revoked")
+	ErrWalletDeactivated     = fmt.Errorf("wallet deactivated: %w", ErrWalletInstanceRevoked)
+)
+
+// LifecycleScopeInstance and LifecycleScopeWallet are the `scope` values of a
+// login refusal: "instance" leaves other devices unaffected, "wallet" means no
+// instance is left in the tenant and a new enrollment is required.
+const (
+	LifecycleScopeInstance = "instance"
+	LifecycleScopeWallet   = "wallet"
+)
+
+// LifecycleRefusalDetail is a login refusal as it appears on the wire.
+type LifecycleRefusalDetail struct {
+	// Code is WALLET_REVOKED.
+	Code string
+	// Scope is LifecycleScopeInstance or LifecycleScopeWallet.
+	Scope string
+	// Message is for display only; clients must not decide on it.
+	Message string
+}
+
+// LifecycleRefusalDetails maps a login refusal to its wire form, shared by all
+// login handlers.
+func LifecycleRefusalDetails(err error) LifecycleRefusalDetail {
+	switch {
+	case errors.Is(err, ErrWalletDeactivated):
+		return LifecycleRefusalDetail{
+			Code:    "WALLET_REVOKED",
+			Scope:   LifecycleScopeWallet,
+			Message: "This wallet has been deactivated; a new enrollment is required",
+		}
+	default:
+		return LifecycleRefusalDetail{
+			Code:    "WALLET_REVOKED",
+			Scope:   LifecycleScopeInstance,
+			Message: "This wallet instance has been revoked; other devices enrolled to this wallet keep their own status",
+		}
+	}
+}
+
 // NewWebAuthnService creates a new WebAuthnService
 func NewWebAuthnService(store storage.Store, cfg *config.Config, logger *zap.Logger) (*WebAuthnService, error) {
 	return NewWebAuthnServiceWithValidator(store, cfg, logger, nil)
@@ -1237,6 +1282,12 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		return nil, ErrVerificationFailed
 	}
 
+	// SID-AUTH-06 login gate, after verification so a forged assertion cannot
+	// probe lifecycle state.
+	if err := s.checkWalletLifecycle(ctx, tenantID, userID, matchedCred.ID); err != nil {
+		return nil, err
+	}
+
 	// Keep the assertion's reported counter in a LOCAL value for
 	// logging/the atomic persist call below, rather than mutating
 	// matchedCred/the stored user object directly. This is the same
@@ -1541,6 +1592,9 @@ func (s *WebAuthnService) BeginAddCredential(ctx context.Context, userID domain.
 	if err != nil {
 		return nil, err
 	}
+	if err := refuseIfCutOff(ctx, user); err != nil {
+		return nil, err
+	}
 
 	waUser := &WebAuthnUser{user: user}
 
@@ -1649,6 +1703,9 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 	// Get the user
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
+		return nil, err
+	}
+	if err := refuseIfCutOff(ctx, user); err != nil {
 		return nil, err
 	}
 
@@ -1927,4 +1984,56 @@ func (u *TenantWebAuthnUser) WebAuthnCredentials() []webauthn.Credential {
 		}
 	}
 	return creds
+}
+
+// checkWalletLifecycle enforces instance status at login (SID-AUTH-06): the
+// instance linked to this passkey must not be revoked, and if the user has
+// instances at least one must be live, else the wallet is deactivated. A user
+// with no instances is unaffected.
+//
+// Not redundant with the WIA gate: after login a token carries no instance
+// identity and this backend never requires a WIA, so a blocked instance able
+// to log in could still issue and present. The cost is that ARF v3's "revoked
+// unit keeps read access" is not possible (see cutOffTokens).
+func (s *WebAuthnService) checkWalletLifecycle(ctx context.Context, tenantID domain.TenantID, userID domain.UserID, credentialID string) error {
+	instances, err := s.store.WalletInstances().GetByUser(ctx, tenantID, userID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("check wallet lifecycle: %w", err)
+	}
+	if len(instances) == 0 {
+		return nil
+	}
+	// Deactivation is decided first; a passkey may link several instances, so
+	// the most restrictive status wins.
+	anyLive := false
+	linkedRevoked := false
+	var unknown *domain.WalletInstance
+	for _, inst := range instances {
+		if inst.Status.IsLive() {
+			anyLive = true
+		} else if !inst.Status.IsKnownNonLive() {
+			unknown = inst
+			continue
+		}
+		if inst.CredentialID == "" || inst.CredentialID != credentialID {
+			continue
+		}
+		if inst.Status.IsKnownNonLive() {
+			linkedRevoked = true
+		}
+	}
+	if unknown != nil {
+		// Unrecognized status: refuse without claiming a lifecycle state.
+		return fmt.Errorf("check wallet lifecycle: instance %s has unrecognized status %q", unknown.ID, unknown.Status)
+	}
+	if !anyLive {
+		return ErrWalletDeactivated
+	}
+	if linkedRevoked {
+		return ErrWalletInstanceRevoked
+	}
+	return nil
 }
