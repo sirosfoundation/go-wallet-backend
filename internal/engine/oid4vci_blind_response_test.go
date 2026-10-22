@@ -1241,3 +1241,30 @@ func TestBlind_ImmediateMalformedJWESendsTerminalError(t *testing.T) {
 	assert.Equal(t, ErrCodeCredentialError, errs[0].Error.Code)
 	assert.NotContains(t, fc.actions(), SignActionDecryptCredentialResponse)
 }
+
+// A plain initial response carrying a transaction_id followed by an encrypted
+// deferred response the client rejects: the client still owes the issuer a
+// credential_failure, so the notification context must exist.
+func TestBlind_DeferredRelayRejection_NotificationContextExists(t *testing.T) {
+	fastDeferredPolling(t)
+	st := newIssuerStub(t, "", seedResponse)
+	inner := st.srv.Config.Handler
+	st.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/deferred_credential") {
+			inner.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"transaction_id":"tx-plain","interval":1}`))
+	})
+	md := st.metadata(gcmCfg(false))
+	fc := &fakeClient{t: t, decryptErr: true}
+	h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
+	defer cleanup()
+	cfg := &CredentialConfig{Format: "vc+sd-jwt", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}
+	require.Error(t, h.issueCredential(context.Background(), md, tokenBearer(), "cfg", cfg, nil, ""))
+	require.Contains(t, fc.actions(), SignActionDecryptCredentialResponse, "the deferred JWE was relayed")
+	assert.True(t, h.Flow.Session.notifications.hasValid("f-blind", "id-the-client-read"))
+	assertNoSecrets(t, "logs", logDump(logs))
+	assertNoSecrets(t, "outbound", fc.engineSaw())
+}

@@ -2874,7 +2874,12 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 		if respEnc != nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted) {
 			mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 			if mediaType == "application/jwt" || mediaType == "application/jose" {
-				// Encrypted to the client's key: relay it unread.
+				// Encrypted to the client's key: relay it unread. The initial
+				// response may have been plain (no notification context yet),
+				// and the client may reject what it decrypts and then owes the
+				// issuer a credential_failure notification, so the context
+				// must exist before the client answers.
+				h.registerNotificationContext(metadata, token, &CredentialResponse{Encrypted: true})
 				answer, err := h.relayEncryptedResponse(ctx, string(body), true, respEnc)
 				if err != nil {
 					return nil, err
