@@ -4,14 +4,27 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.24.0:start -->
+## [v0.24.0] - 2026-10-19
+
+### Added
+- Engine now relays `credential_metadata` from OID4VCI responses, both at the response level (OID4VCI 1.1) and per-credential, preserving extra members verbatim for downstream consumers (#463)
+- Engine requires `notification_id` when `credential_metadata` contains a secret seed, ensuring proper tracking of seed delivery (#463)
+- Engine enforces encrypted response delivery when advertising `secret_seed` capability, preventing accidental plaintext seed transmission (#463)
+
+### Fixed
+- Type assertions throughout codebase are now checked for safety, enabled via errcheck's `check-type-assertions` linter option (#459)
+- Engine serves valid `secret_seed` advertisements and drops malformed ones, with capability alignment matching spec 5A requirements (#463)
+- Engine relays credential metadata display data with more generous field capitalization handling to accommodate issuer variations (#463)
+
+### Changed
+- Dependency updates for go modules and GitHub Actions (#464, #465)
+<!-- release-notes:v0.24.0:end -->
+
 <!-- release-notes:v0.23.0:start -->
 ## [v0.23.0] - 2026-10-15
 
-No changes in this release.
-<!-- release-notes:v0.23.0:end -->
-
-<!-- release-notes:v0.22.4:start -->
-## [v0.22.4] - 2026-10-15
+> v0.23.0 is the same commit as v0.22.4. v0.22.4 was tagged as a patch release but contains breaking changes, so it was re-released under a version that signals the break; v0.22.4 is superseded and should not be deployed. The notes below were first generated under v0.22.4.
 
 ### Security
 
@@ -64,6 +77,12 @@ No changes in this release.
 - **BREAKING: AS audiences now required.** `as.audiences` must be set when the AS is enabled. Legacy HMAC tokens require `server.rp_id` in the audience list. (#414, go-tokenauth v0.5.0)
 - **BREAKING: Registry tokens validated against explicit audiences.** The registry now requires `as.audiences` when auth is enabled, following go-tokenauth v0.5.0. (#431)
 - **API: `hasPassword` removed from account info response.** Clients must tolerate the field's absence. (#420, #162)
+<!-- release-notes:v0.23.0:end -->
+
+<!-- release-notes:v0.22.4:start -->
+## [v0.22.4] - 2026-10-15
+
+**Superseded by [v0.23.0](https://github.com/sirosfoundation/go-wallet-backend/releases/tag/v0.23.0).** This release was tagged as a patch release but contains breaking changes (see the v0.23.0 notes above). It is the same commit as v0.23.0. The `0.22` image tag points at a build of v0.22.3, not at this release.
 <!-- release-notes:v0.22.4:end -->
 
 <!-- release-notes:v0.22.3:start -->

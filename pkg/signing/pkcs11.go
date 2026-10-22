@@ -10,6 +10,12 @@ import (
 	"github.com/sirosfoundation/go-cryptoutil/pkcs11pool"
 )
 
+// PKCS11Supported reports whether this binary can load PKCS#11 modules.
+const PKCS11Supported = true
+
+// PKCS11Hint is empty here; it exists so both builds expose the same API.
+const PKCS11Hint = ""
+
 // PKCS11Config holds configuration for a PKCS#11 token.
 type PKCS11Config struct {
 	ModulePath string `yaml:"module_path" envconfig:"MODULE_PATH"`
