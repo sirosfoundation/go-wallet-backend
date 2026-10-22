@@ -807,4 +807,11 @@ func TestLoadRegistryOnly_RejectsBadRevocationBackend(t *testing.T) {
 	assert.ErrorContains(t, load("b.yaml", "security:\n  token_blacklist:\n    backend: storage\n"), "requires storage.type=mongodb")
 	require.NoError(t, load("c.yaml", "security:\n  token_blacklist:\n    backend: memory\n"))
 	require.NoError(t, load("d.yaml", ""))
+
+	// A storage.type typo would silently select the per-process blacklist
+	// through the default backend; the registry-only load must refuse it.
+	assert.ErrorContains(t, load("e.yaml", "storage:\n  type: mongdb\n"), "invalid storage.type")
+	require.NoError(t, load("f.yaml", "storage:\n  type: mongodb\n"))
+	require.NoError(t, load("g.yaml", "storage:\n  type: mongdb\nsecurity:\n  token_blacklist:\n    backend: memory\n"),
+		"an explicit backend does not depend on storage.type")
 }
