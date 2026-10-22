@@ -547,7 +547,9 @@ func (s *WalletProviderService) keyAttestationTrustsBatch(ctx context.Context, w
 			return false
 		}
 		// Evidence recorded for another instance does not vouch for this one.
-		if walletInstanceID != "" && rec.WalletInstanceID != walletInstanceID {
+		// Fail closed when the caller omitted the instance ID too: evidence
+		// bound to an instance is unusable without proof of that instance.
+		if rec.WalletInstanceID != walletInstanceID {
 			return false
 		}
 	}
