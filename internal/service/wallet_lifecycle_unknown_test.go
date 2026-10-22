@@ -52,7 +52,7 @@ func TestWalletLifecycle_UnknownStatusInstanceFailsClosed(t *testing.T) {
 		_, err = svc.ChangeStatus(ctx, actor, tenantA, "inst-"+string(tenantA), domain.InstanceStatusRevoked, "lost")
 		require.ErrorIs(t, err, ErrErasureIncomplete)
 		assert.Equal(t, 2, holderDataCount(t, store, tenantA, holder))
-		assert.Equal(t, 2, holderDataCount(t, store, tenantB, holder))
+		assert.Zero(t, holderDataCount(t, store, tenantB, holder), "tenant B's own revocation erased its holder data")
 		user, err := store.Users().GetByID(ctx, userID)
 		require.NoError(t, err)
 		assert.NotNil(t, user.PrivateData)
