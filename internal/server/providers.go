@@ -442,7 +442,7 @@ func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger, b
 		Audiences: cfg.SessionAudiences(),
 	}
 	if blacklist != nil {
-		vcfg.Revocation = blacklistRevocationChecker{blacklist: blacklist}
+		vcfg.Revocation = blacklistRevocationChecker{blacklist: blacklist, logger: logger}
 	}
 	v := tokenvalidator.New(vcfg)
 	v.Start(context.Background())
@@ -501,11 +501,24 @@ func (p *EngineProvider) CheckReady(ctx context.Context) error {
 // (IsRevoked vs IsBlacklisted), so Logout/DeleteUser revocation applies to AS-issued tokens.
 type blacklistRevocationChecker struct {
 	blacklist *service.TokenBlacklist
+	logger    *zap.Logger // optional
 }
 
-// IsRevoked implements revocation.Checker.
+// IsRevoked implements revocation.Checker. The interface has no error
+// return, so a store failure is reported as "revoked": the Validator then
+// rejects the token (401) rather than accepting it unchecked.
 func (c blacklistRevocationChecker) IsRevoked(ctx context.Context, jti string) bool {
-	return c.blacklist.IsBlacklisted(ctx, jti)
+	revoked, err := c.blacklist.IsBlacklisted(ctx, jti)
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Error("Revocation check failed; rejecting token", zap.Error(err))
+		}
+		return true
+	}
+	// A logout call may present a token whose jti is already revoked, to
+	// complete a logout that was interrupted (see middleware.IsLogout). Only
+	// a definite "revoked" answer is relaxed; a store error still rejects.
+	return revoked && !middleware.IsLogoutCompletion(ctx)
 }
 
 // =============================================================================
@@ -652,7 +665,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 			Issuer:    issuer,
 			Audiences: cfg.AS.Audiences,
 			// Same blacklist as the rest of the process: the Validator has its own validation path that would not consult it.
-			Revocation: blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist},
+			Revocation: blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist, logger: logger},
 		})
 		tv.Start(context.Background())
 		logger.Info("Authorization Server module initialized",
@@ -1201,7 +1214,7 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 		Audiences: cfg.SessionAudiences(),
 		// Same wiring as NewBackendProvider; this provider's own TokenBlacklist is used as-is (it is never
 		// co-hosted with BackendProvider).
-		Revocation: blacklistRevocationChecker{blacklist: services.TokenBlacklist},
+		Revocation: blacklistRevocationChecker{blacklist: services.TokenBlacklist, logger: logger},
 	})
 	tv.Start(context.Background())
 

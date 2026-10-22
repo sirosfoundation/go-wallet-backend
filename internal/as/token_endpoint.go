@@ -19,9 +19,18 @@ import (
 // TokenBlacklistChecker's read methods plus service.TokenBlacklist's own
 // Add; *service.TokenBlacklist satisfies this.
 type TokenBlacklistChecker interface {
-	IsBlacklisted(ctx context.Context, jti string) bool
-	IsUserRevoked(ctx context.Context, userID string) bool
+	IsBlacklisted(ctx context.Context, jti string) (bool, error)
+	IsUserRevoked(ctx context.Context, userID string) (bool, error)
 	Add(ctx context.Context, jti string, expiry time.Time) error
+}
+
+// refuseRevocationUnavailable answers 503 when the revocation store cannot say
+// whether a token is revoked. Only the error is logged, never token content.
+func refuseRevocationUnavailable(c *gin.Context, logger *zap.Logger, err error) {
+	if logger != nil {
+		logger.Error("token request refused: revocation check failed", zap.Error(err))
+	}
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "revocation check unavailable"})
 }
 
 // tokenDeps groups the shared dependencies for token issuance handlers.
@@ -305,11 +314,24 @@ func handleDelegationTokenRequest(
 	// ever nil in tests that don't care.
 	if deps.blacklist != nil {
 		ctx := c.Request.Context()
-		if parentClaims.ID != "" && deps.blacklist.IsBlacklisted(ctx, parentClaims.ID) {
+		jtiRevoked := false
+		var err error
+		if parentClaims.ID != "" {
+			if jtiRevoked, err = deps.blacklist.IsBlacklisted(ctx, parentClaims.ID); err != nil {
+				refuseRevocationUnavailable(c, deps.logger, err)
+				return
+			}
+		}
+		if jtiRevoked {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token has been revoked"})
 			return
 		}
-		if deps.blacklist.IsUserRevoked(ctx, parentClaims.Subject) {
+		userRevoked, err := deps.blacklist.IsUserRevoked(ctx, parentClaims.Subject)
+		if err != nil {
+			refuseRevocationUnavailable(c, deps.logger, err)
+			return
+		}
+		if userRevoked {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token's user has been revoked"})
 			return
 		}
