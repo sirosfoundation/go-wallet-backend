@@ -2099,6 +2099,17 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 			!s.verifyOwnAssertion(ctx, user, userID, challenge.AssertionChallenge, req.Authorization) {
 			return nil, ErrEnrollmentAuthorizationFailed
 		}
+		// verifyOwnAssertion persisted the authorising passkey's counter and any
+		// clone warning; the snapshot loaded above predates that, and the full
+		// Update below would write it back over them. Continue from the stored
+		// record (cut-off judged again against it).
+		user, err = s.store.Users().GetByID(ctx, userID)
+		if err != nil {
+			return nil, err
+		}
+		if err := refuseIfCutOff(ctx, user); err != nil {
+			return nil, err
+		}
 	}
 
 	waUser := &WebAuthnUser{user: user}

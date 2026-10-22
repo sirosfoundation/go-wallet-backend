@@ -425,3 +425,31 @@ func TestStepUp_AuthorisedPasskeyAcceptedForDeletion(t *testing.T) {
 	require.Len(t, resp.PublicKey.AllowCredentials, 2)
 	require.NoError(t, setup.service.VerifyDeleteAccountStepUp(setup.ctx, alice.id, resp.ChallengeID, added.assertFor(t, setup, resp)))
 }
+
+// The authorising passkey's counter advance and latched clone warning,
+// persisted while verifying the authorisation, must survive the enrolment's
+// own write of the user record.
+func TestEnrollment_KeepsTheAuthorisingPasskeysCounterAndCloneWarning(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+	alice := registerStepUpUser(t, setup, "Alice")
+
+	// A prior use leaves a high stored counter, so the next assertion (lower)
+	// latches the clone warning.
+	alice.credential.Counter = 50
+	resp, err := setup.service.BeginDeleteAccountStepUp(setup.ctx, alice.id)
+	require.NoError(t, err)
+	require.NoError(t, setup.service.VerifyDeleteAccountStepUp(setup.ctx, alice.id, resp.ChallengeID, alice.assertFor(t, setup, resp)))
+
+	alice.credential.Counter = 3
+	e := beginEnrol(t, setup, alice)
+	e.authorizeWith(t, setup, alice)
+	_, err = setup.service.FinishAddCredential(setup.ctx, alice.id, e.finish, "")
+	require.NoError(t, err)
+
+	user, err := setup.store.Users().GetByID(setup.ctx, alice.id)
+	require.NoError(t, err)
+	require.Len(t, user.WebauthnCredentials, 2)
+	first := user.WebauthnCredentials[0].Authenticator
+	assert.True(t, first.CloneWarning, "the clone warning latched by the authorising assertion must survive the enrolment")
+	assert.Greater(t, first.SignCount, uint32(0), "the authorising passkey's counter must survive the enrolment")
+}
