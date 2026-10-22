@@ -129,6 +129,13 @@ including how to request a token with the `tac` your client needs.
 Clients SHOULD send ping frames every 30 seconds. Servers MUST respond with pong.
 Connections idle for >60 seconds without ping/pong MAY be terminated.
 
+The engine's own cadence is reported in `handshake_complete.config.ping_interval_ms`
+(default 3000 ms). The engine pings at that interval and closes the connection
+when it has seen no sign of life for `ping_interval + pong_timeout` (default
+3 s + 5 s = 8 s). A pong, a client ping (answered with a pong) or any inbound
+data frame counts as a sign of life and restarts that window; the engine's
+pings are sent independently of any in-flight data write.
+
 ### Reconnection
 
 On unexpected disconnect:

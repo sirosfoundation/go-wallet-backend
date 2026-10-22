@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -349,11 +350,7 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	// keeping the connection alive across idle periods. Browser WebSocket
 	// implementations respond to protocol-level pings automatically.
 	pingInterval, pongTimeout := m.wsKeepalive()
-	_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongTimeout))
-	conn.SetPongHandler(func(string) error {
-		_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongTimeout))
-		return nil
-	})
+	configureKeepalive(conn, pingInterval+pongTimeout)
 
 	// Create session
 	sessionID := uuid.New().String()
@@ -419,6 +416,33 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	m.handleSession(session)
 }
 
+// configureKeepalive arms conn's read deadline and makes any sign of life
+// from the peer - a pong, a ping (which gorilla's default handler answers
+// but does not count), or (see handleSession) a data frame - push it out by
+// window. Without this a peer that is demonstrably alive but whose pongs are
+// delayed (shared uplink, tunnelled connection) is dropped.
+func configureKeepalive(conn *websocket.Conn, window time.Duration) {
+	extend := func() { _ = conn.SetReadDeadline(time.Now().Add(window)) }
+	extend()
+	conn.SetPongHandler(func(string) error {
+		extend()
+		return nil
+	})
+	conn.SetPingHandler(func(appData string) error {
+		extend()
+		// Same reply as gorilla's default ping handler.
+		err := conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Second))
+		if errors.Is(err, websocket.ErrCloseSent) {
+			return nil
+		}
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return nil
+		}
+		return err
+	})
+}
+
 // pingLoop sends WebSocket ping frames at s.pingInterval.
 // Browser WebSocket implementations respond with pong automatically.
 func (s *Session) pingLoop() {
@@ -428,9 +452,12 @@ func (s *Session) pingLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			s.sendMu.Lock()
+			// Deliberately not under sendMu: WriteControl may be called
+			// concurrently with any other write (gorilla's contract, see
+			// closeWithReason), and sendMu is held across WriteJSON, which has
+			// no write deadline. A blocked data write must not be able to
+			// starve the keepalive ping and so get the session timed out.
 			err := s.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(s.pongTimeout))
-			s.sendMu.Unlock()
 			if err != nil {
 				return // connection is dead; ReadMessage will surface the error
 			}
@@ -462,6 +489,9 @@ func (m *Manager) handleSession(session *Session) {
 			}
 			return
 		}
+		// Any inbound frame proves the peer is alive: push the read deadline
+		// out, not only on pongs.
+		_ = session.conn.SetReadDeadline(time.Now().Add(session.pingInterval + session.pongTimeout))
 
 		var msg Message
 		if err := json.Unmarshal(message, &msg); err != nil {
