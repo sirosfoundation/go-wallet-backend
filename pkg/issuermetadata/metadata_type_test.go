@@ -182,7 +182,7 @@ func TestResolve_MetadataTypeMatrix(t *testing.T) {
 			}))
 			defer server.Close()
 
-			r, err := New(Config{AllowHTTP: true, MetadataType: tc.mode})
+			r, err := New(Config{AllowHTTP: true, UnsafeAllowPrivateAddressesForTesting: true, MetadataType: tc.mode})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -211,7 +211,7 @@ func TestResolve_PreferModes_TerminalStatuses(t *testing.T) {
 				n++
 				w.WriteHeader(status)
 			}))
-			r, _ := New(Config{AllowHTTP: true, MetadataType: mode})
+			r, _ := New(Config{AllowHTTP: true, UnsafeAllowPrivateAddressesForTesting: true, MetadataType: mode})
 			if _, err := r.Resolve(context.Background(), server.URL); err == nil || n != 1 {
 				t.Errorf("%s/%d: err=%v requests=%d, want error and 1 request", mode, status, err, n)
 			}
@@ -262,7 +262,7 @@ func TestResolve_DeprecatedPreferSignedFalseAsksJSONFirst(t *testing.T) {
 		_, _ = w.Write([]byte(`{"credential_issuer":"` + server.URL + `"}`))
 	}))
 	defer server.Close()
-	r, err := New(Config{AllowHTTP: true, PreferSigned: &no})
+	r, err := New(Config{AllowHTTP: true, UnsafeAllowPrivateAddressesForTesting: true, PreferSigned: &no})
 	if err != nil {
 		t.Fatal(err)
 	}

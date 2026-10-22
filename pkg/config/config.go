@@ -16,8 +16,6 @@ import (
 
 	"github.com/kelseyhightower/envconfig"
 	"gopkg.in/yaml.v3"
-
-	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 )
 
 // Config represents the application configuration
@@ -1081,6 +1079,7 @@ func (c *CORSConfig) SetDefaults() {
 			"If-None-Match", "X-Private-Data-If-Match", "X-Private-Data-If-None-Match",
 			"Upgrade", "Connection", "Sec-WebSocket-Key",
 			"Sec-WebSocket-Version", "Sec-WebSocket-Protocol",
+			"Wmp-Session-Id", "Last-Event-ID",
 		}
 	}
 	if len(c.ExposedHeaders) == 0 {
@@ -1097,7 +1096,7 @@ type ExternalURLsConfig struct {
 	// BackendURL is the external URL for the backend service (for engine → backend calls)
 	BackendURL string `yaml:"backend_url" envconfig:"BACKEND_URL"`
 
-	// EngineURL is the external URL for the engine service (for WebSocket connections)
+	// EngineURL is the external URL for the engine service (for WebSocket connections). WMP discovery requires wss:// (or https://); ws:// and http:// are accepted only for loopback hosts. WMP session state is process-local: with more than one engine replica, the load balancer must keep each client on one replica, keyed on a hash of the Authorization header (the only identifier on every WMP request), otherwise a request reaching another replica gets session not found (404). A refreshed token may land on another replica, where the session and its process-local resumption token are lost, so the client must create a new session. The Redis session store does not share this state (see issue 432)
 	EngineURL string `yaml:"engine_url" envconfig:"ENGINE_URL"`
 
 	// RegistryURL is the external URL for the registry service (for VCTM lookups)
@@ -2261,8 +2260,8 @@ func defaultConfig() *Config {
 			},
 		},
 		HTTPClient: HTTPClientConfig{
-			Timeout:      30,                                              // 30 seconds default
-			MetadataType: string(issuermetadata.MetadataTypePreferSigned), // signed first, unsigned on 406
+			Timeout:      30,                            // 30 seconds default
+			MetadataType: DefaultHTTPClientMetadataType, // signed first, unsigned on 406
 			// AllowPrivateIPs defaults to false — SSRF protection blocks private/loopback IPs.
 			// Set allow_private_ips: true in config when issuers are on internal networks.
 		},
@@ -2326,6 +2325,26 @@ func (c ServerConfig) validateTrustedProxies() error {
 		}
 	}
 	return nil
+}
+
+// DefaultHTTPClientMetadataType is the default http_client.metadata_type.
+const DefaultHTTPClientMetadataType = "prefer-signed"
+
+// HTTPClientMetadataTypes lists the valid http_client.metadata_type values. It mirrors
+// issuermetadata.MetadataType, duplicated to avoid an import cycle; a test in
+// pkg/issuermetadata keeps them in sync.
+var HTTPClientMetadataTypes = []string{"any", "prefer-signed", "require-signed", "prefer-unsigned", "require-unsigned"}
+
+func isValidHTTPClientMetadataType(s string) bool {
+	if s == "" {
+		return true
+	}
+	for _, v := range HTTPClientMetadataTypes {
+		if s == v {
+			return true
+		}
+	}
+	return false
 }
 
 // Validate validates the configuration
@@ -2609,8 +2628,8 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if _, err := issuermetadata.ParseMetadataType(c.HTTPClient.MetadataType); err != nil {
-		return fmt.Errorf("http_client.metadata_type: %w", err)
+	if !isValidHTTPClientMetadataType(c.HTTPClient.MetadataType) {
+		return fmt.Errorf("http_client.metadata_type: unknown value %q (want one of %s)", c.HTTPClient.MetadataType, strings.Join(HTTPClientMetadataTypes, ", "))
 	}
 
 	if err := c.Presentation.DCQLConsentCheck.validate(); err != nil {

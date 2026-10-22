@@ -2874,6 +2874,22 @@ func TestNewIdPHTTPClient_TrustedHostSet(t *testing.T) {
 	}
 }
 
+func TestCORSConfig_SetDefaults_WMPHeaders(t *testing.T) {
+	cfg := CORSConfig{}
+	cfg.SetDefaults()
+	for _, want := range []string{"Wmp-Session-Id", "Last-Event-ID"} {
+		found := false
+		for _, h := range cfg.AllowedHeaders {
+			if h == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("default AllowedHeaders missing %q (needed for WMP SSE reconnects)", want)
+		}
+	}
+}
+
 // An https JWKS endpoint that redirects to plain http must be refused at the
 // redirect hop: the guard sits on the transport every hop passes through.
 func TestSSRFGuard_RefusesHTTPSToHTTPRedirect(t *testing.T) {

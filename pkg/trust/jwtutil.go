@@ -255,6 +255,13 @@ func VerifyJWTWithEmbeddedKey(jwtStr string, ext ...*cryptoutil.Extensions) (*Ke
 		pubKey = cert.PublicKey
 		km = &KeyMaterial{Type: "x5c", X5C: header.X5C}
 	} else if len(header.JWK) > 0 {
+		// A JWK is a single key. Downstream code normalises JWK material with
+		// NormalizeJWKS, which prefers a nonempty "keys" member; accepting one
+		// here would let a signature by the top-level key vouch for a
+		// different, unproven key hidden in "keys".
+		if _, ok := header.JWK["keys"]; ok {
+			return nil, errors.New("embedded JWK must be a single key, not a key set")
+		}
 		// Convert JWK to crypto.PublicKey
 		key, err := jwkToPublicKey(header.JWK)
 		if err != nil {
@@ -486,6 +493,10 @@ func FetchJWKS(ctx context.Context, uri string, client *http.Client) (interface{
 	}
 	req.Header.Set("Accept", "application/json")
 
+	// codeql[go/request-forgery]: FetchJWKS is a shared utility; every
+	// in-repo caller passes a client built via cfg.HTTPClient.NewHTTPClient(),
+	// whose DialContext blocks private/loopback/link-local IPs by default
+	// (SSRF protection). Callers must continue to pass a guarded client.
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
