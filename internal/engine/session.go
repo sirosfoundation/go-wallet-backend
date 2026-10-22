@@ -668,6 +668,10 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	logger.Info("Flow completed")
 }
 
+// revocationLookupTimeout bounds the shared-store revocation lookup made when
+// registering a session.
+var revocationLookupTimeout = 5 * time.Second
+
 // registerSession adds session to the manager's live-session bookkeeping
 // and returns true, unless userID was revoked between validateToken's own
 // check (in handleNewConnection, immediately before this call) and this
@@ -702,14 +706,20 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 // and closes existing sessions, so there's no ordering to get wrong);
 // registering before it is caught by that same scan.
 func (m *Manager) registerSession(session *Session) bool {
+	// The shared revocation store may be remote, so it is consulted before
+	// taking the lock and bounded; a lookup that fails or times out counts
+	// as revoked. The engine's own revokedUsers is rechecked under the lock.
+	storeRevoked := false
+	if session.UserID != "" && m.blacklist != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), revocationLookupTimeout)
+		storeRevoked = m.blacklist.IsUserRevoked(ctx, session.UserID)
+		cancel()
+	}
+
 	m.sessionsMu.Lock()
 
 	if session.UserID != "" {
-		revoked := m.isUserRevoked(session.UserID)
-		if !revoked && m.blacklist != nil {
-			revoked = m.blacklist.IsUserRevoked(context.Background(), session.UserID)
-		}
-		if revoked {
+		if storeRevoked || m.isUserRevoked(session.UserID) {
 			m.sessionsMu.Unlock()
 			session.closeWithReason("account deleted")
 			return false

@@ -1646,3 +1646,50 @@ func TestRequireSessionAuthMechanism(t *testing.T) {
 		t.Errorf("AS enabled must be accepted: %v", err)
 	}
 }
+
+// A revocation store that failed to initialize refuses every authenticated
+// request until restart, so readiness must not report healthy meanwhile even
+// though the database itself answers its ping.
+func TestBackendProvider_CheckReady_RevocationStoreUnavailable(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := &config.Config{}
+	cfg.Security.TokenBlacklist = config.TokenBlacklistConfig{Enabled: true, Backend: "storage"}
+	store := &mockBackend{healthy: true}
+
+	// mockBackend is not MongoDB, so the "storage" revocation backend cannot
+	// be built and NewServices installs the failing stand-in.
+	provider := &BackendProvider{
+		store:  store,
+		logger: logger,
+		auth:   &AuthProvider{services: service.NewServices(store, cfg, logger)},
+	}
+	err := provider.CheckReady(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "revocation store unavailable") {
+		t.Fatalf("expected revocation store unavailable error, got %v", err)
+	}
+}
+
+// The isolated wallet-provider authenticates through the same revocation
+// store, so a store that failed to initialize must make it not ready.
+func TestWalletProviderProvider_CheckReady_RevocationStoreUnavailable(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := &config.Config{}
+	cfg.Security.TokenBlacklist = config.TokenBlacklistConfig{Enabled: true, Backend: "storage"}
+	store := &mockBackend{healthy: true}
+
+	p := &WalletProviderProvider{store: store, logger: logger, services: service.NewServices(store, cfg, logger)}
+	err := p.CheckReady(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "revocation store unavailable") {
+		t.Fatalf("expected revocation store unavailable error, got %v", err)
+	}
+
+	cfg.Security.TokenBlacklist.Backend = "memory"
+	p.services = service.NewServices(store, cfg, logger)
+	if err := p.CheckReady(context.Background()); err != nil {
+		t.Fatalf("memory backend must be ready, got %v", err)
+	}
+}
+
+// Manager.AddProvider only registers a readiness check for providers that
+// implement ReadinessCheckProvider.
+var _ ReadinessCheckProvider = (*WalletProviderProvider)(nil)

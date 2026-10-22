@@ -45,6 +45,21 @@ type TokenBlacklist struct {
 	wg       sync.WaitGroup
 }
 
+// Ready returns the error that left the configured revocation store
+// unusable (for example a failed TTL-index setup), or nil. While it is
+// non-nil every authenticated request is refused, so readiness must report it
+// rather than only pinging the database: the process cannot recover without a
+// restart even once MongoDB is reachable again.
+func (b *TokenBlacklist) Ready() error {
+	if b == nil {
+		return nil
+	}
+	if u, ok := b.store.(interface{ Unavailable() error }); ok {
+		return u.Unavailable()
+	}
+	return nil
+}
+
 // NewTokenBlacklist creates a new token blacklist
 func NewTokenBlacklist(cfg config.TokenBlacklistConfig, logger *zap.Logger) *TokenBlacklist {
 	return NewTokenBlacklistWithStore(cfg, logger, nil)
