@@ -200,28 +200,22 @@ func TestMemoryRevocationStore_Remove(t *testing.T) {
 	}
 }
 
-// With a custom store the local map holds only ConsumeOnce entries: Count,
-// the cleanup sweep and ConsumeOnce neither see nor touch the store's jtis.
+// With a custom store the local map stays empty: Count and the cleanup sweep
+// neither see nor touch the store's jtis.
 func TestTokenBlacklist_LocalStateIsSeparateFromStore(t *testing.T) {
 	ctx := context.Background()
 	rs := &recordingStore{has: map[string]bool{}}
 	b := NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop(), rs)
 
-	_ = b.Add(ctx, "revoked", time.Now().Add(time.Hour))
+	_ = b.Add(ctx, "revoked", time.Now().Add(-time.Second))
+	if len(rs.added) != 1 {
+		t.Errorf("store saw %v, want the one added jti", rs.added)
+	}
 	if b.Count() != 0 {
 		t.Errorf("Count = %d, want 0: store entries are not counted locally", b.Count())
 	}
-	if first, _ := b.ConsumeOnce(ctx, "refresh", time.Now().Add(-time.Second)); !first {
-		t.Fatal("first ConsumeOnce must win")
-	}
-	if len(rs.added) != 1 {
-		t.Errorf("ConsumeOnce must not write to the store, store saw %v", rs.added)
-	}
-	if b.Count() != 1 {
-		t.Fatalf("Count = %d, want 1 ConsumeOnce entry", b.Count())
-	}
 	b.cleanup()
-	if b.Count() != 0 {
-		t.Errorf("cleanup must sweep expired ConsumeOnce entries, Count = %d", b.Count())
+	if len(rs.added) != 1 {
+		t.Errorf("cleanup must not touch the store, store saw %v", rs.added)
 	}
 }

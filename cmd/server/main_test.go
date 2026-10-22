@@ -145,7 +145,8 @@ func TestColocatedEngineClientReachesRegistry(t *testing.T) {
 	cfg.Registry.Cache.Path = filepath.Join(dir, "cache.json")
 	cfg.Registry.Source.LocalOverrides = []string{filepath.Join(dir, "vctm.json")}
 	cfg.Registry.Source.URL = "http://127.0.0.1:1/x.json"
-	cfg.Registry.RequireAuth = true // internal calls bypass auth and rate limiting
+	cfg.Registry.RequireAuth = true            // internal calls bypass auth and rate limiting
+	cfg.AS.ExternalURL = "https://127.0.0.1:1" // JWKS source (never contacted by the in-process handler)
 
 	p, err := server.NewRegistryProvider(cfg, zap.NewNop())
 	require.NoError(t, err)
@@ -165,11 +166,9 @@ func TestColocatedEngineClientReachesRegistry(t *testing.T) {
 	assert.Nil(t, md)
 }
 
-// Deprecated registry.yaml (HMAC secret, no server.rp_id, no as.external_url)
-// on a registry-only process: it must start, and the registry accepts a valid
-// legacy token whatever its audience while rejecting bad issuer / expired /
-// revoked tokens. The new config shape with the same secret fails startup.
-func TestDeprecatedRegistryConfigLegacyTokensEndToEnd(t *testing.T) {
+// Deprecated registry.yaml HMAC secret on a registry-only process: ignored with a warning;
+// jwt.require_auth then needs as.external_url or startup fails.
+func TestDeprecatedRegistryConfigHMACSecretIgnored(t *testing.T) {
 	const secret = "0123456789abcdef0123456789abcdef"
 	dir := t.TempDir()
 	old := filepath.Join(dir, "registry.yaml")
@@ -177,11 +176,21 @@ func TestDeprecatedRegistryConfigLegacyTokensEndToEnd(t *testing.T) {
 		"source:\n  url: http://127.0.0.1:1/x.json\n"+
 		"jwt:\n  secret: \""+secret+"\"\n  issuer: wallet-backend\n  require_auth: true\n"), 0o600))
 
+	// No as.external_url: startup fails.
 	cfg, err := config.LoadRegistryOnly("")
 	require.NoError(t, err)
+	_, err = setupRegistryConfig(cfg, old, true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "as.external_url")
+
+	// With the AS JWKS configured it starts; the secret is ignored.
+	cfg, err = config.LoadRegistryOnly("")
+	require.NoError(t, err)
+	cfg.AS.ExternalURL = "https://127.0.0.1:1" // never reachable (SSRF guard); only HMAC tokens are probed
 	w, err := setupRegistryConfig(cfg, old, true)
-	require.NoError(t, err, "deprecated HMAC-only config keeps starting")
-	assert.Contains(t, strings.Join(w, "\n"), "WITHOUT an audience")
+	require.NoError(t, err)
+	assert.Contains(t, strings.Join(w, "\n"), "IGNORED")
+	assert.Empty(t, cfg.JWT.Secret, "the old secret is not adopted")
 	cfg.Registry.DynamicCache.Enabled = false
 
 	p, err := server.NewRegistryProvider(cfg, zap.NewNop())
@@ -189,9 +198,9 @@ func TestDeprecatedRegistryConfigLegacyTokensEndToEnd(t *testing.T) {
 	require.NoError(t, p.Start(context.Background()))
 	t.Cleanup(func() { _ = p.Close() })
 
-	mk := func(mod func(jwt.MapClaims)) string {
+	hmac := func(mod func(jwt.MapClaims)) string {
 		c := jwt.MapClaims{"iss": "wallet-backend", "user_id": "u", "tenant_id": "acme", "jti": "j1",
-			"aud": "rp.of-some-backend.example", "exp": time.Now().Add(time.Hour).Unix()}
+			"aud": "wallet-registry", "exp": time.Now().Add(time.Hour).Unix()}
 		if mod != nil {
 			mod(c)
 		}
@@ -211,31 +220,15 @@ func TestDeprecatedRegistryConfigLegacyTokensEndToEnd(t *testing.T) {
 		r.ServeHTTP(rec, req)
 		return rec.Code
 	}
-
-	assert.Equal(t, http.StatusOK, get(mk(nil)), "any audience")
-	assert.Equal(t, http.StatusOK, get(mk(func(c jwt.MapClaims) { c["aud"] = "totally-different" })))
-	assert.Equal(t, http.StatusOK, get(mk(func(c jwt.MapClaims) { delete(c, "aud") })))
 	assert.Equal(t, http.StatusUnauthorized, get(""))
-	assert.Equal(t, http.StatusUnauthorized, get(mk(func(c jwt.MapClaims) { c["iss"] = "evil" })))
-	assert.Equal(t, http.StatusUnauthorized, get(mk(func(c jwt.MapClaims) { c["exp"] = time.Now().Add(-time.Hour).Unix() })))
+	assert.Equal(t, http.StatusUnauthorized, get(hmac(nil)), "a valid HMAC token signed with the old secret is rejected")
 
-	// Revoked (jti): same token, now blacklisted.
-	p.SetTokenBlacklist(revokedJTI("j1"))
-	assert.Equal(t, http.StatusUnauthorized, get(mk(nil)))
-	assert.Equal(t, http.StatusOK, get(mk(func(c jwt.MapClaims) { c["jti"] = "j2" })), "other jti unaffected")
-
-	// New config shape: same secret, no rp_id -> clear startup error.
+	// as.legacy.enabled=true is refused for a registry-only process too.
 	n, err := config.LoadRegistryOnly("")
 	require.NoError(t, err)
-	n.AS.Legacy.Enabled = true
-	n.JWT.Secret = secret
+	yes := true
+	n.AS.Legacy.Enabled = &yes
 	_, err = setupRegistryConfig(n, "", true)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "server.rp_id")
+	assert.Contains(t, err.Error(), "as.legacy.enabled=true")
 }
-
-type revokedJTI string
-
-func (r revokedJTI) IsBlacklisted(_ context.Context, jti string) bool { return jti == string(r) }
-func (revokedJTI) IsUserRevoked(context.Context, string) bool         { return false }
-func (revokedJTI) IsFamilyRevoked(context.Context, string) bool       { return false }

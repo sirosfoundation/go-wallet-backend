@@ -2,6 +2,8 @@ package as
 
 import (
 	"context"
+	"crypto"
+	"crypto/ecdsa"
 	"fmt"
 	"net/http"
 	"time"
@@ -14,23 +16,18 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
 // ASModule is the top-level authorization server module that wires together
 // all AS components and registers routes.
 type ASModule struct {
-	KeyManager   *KeyManager
-	TokenIssuer  *TokenIssuer
-	LegacyIssuer *LegacyTokenIssuer
-	// LogoutSIDParser is a signature-only legacy HMAC parser used by
-	// LogoutHandler to find the refresh-token family of a pre-#402 session.
-	// Built whenever jwt.secret is set, regardless of as.legacy.enabled; it
-	// is never used to authenticate requests. Nil when no secret is set.
-	LogoutSIDParser *LegacyTokenIssuer
-	Sessions        SessionStore
-	Policy          PolicyEngine
-	PasskeyHandler  *PasskeyHandlers
-	OIDCHandler     *OIDCHandlers
+	KeyManager     *KeyManager
+	TokenIssuer    *TokenIssuer
+	Sessions       SessionStore
+	Policy         PolicyEngine
+	PasskeyHandler *PasskeyHandlers
+	OIDCHandler    *OIDCHandlers
 	// Blacklist checks whether a token has been revoked (via Logout/user
 	// deletion - see #382/#383). Used by the delegation-exchange path in
 	// TokenEndpointHandler so a revoked parent token can't be re-delegated
@@ -38,11 +35,6 @@ type ASModule struct {
 	Blacklist TokenBlacklistChecker
 	Logger    *zap.Logger
 	Config    *config.ASConfig
-	// FamilyRetention is how long LogoutHandler keeps a refresh-token
-	// family revocation marker (the longest configured access/refresh
-	// token lifetime plus a safety margin, #402).
-	FamilyRetention time.Duration
-
 	// store and validatorCache back the tenant-header and OIDC-gate
 	// middleware mounted on /auth/passkey/* (see RegisterRoutes). This is the
 	// only AS route group that operates on tenant-scoped data before the
@@ -51,6 +43,8 @@ type ASModule struct {
 	// OIDCGateMiddleware, wired identically in internal/server/providers.go).
 	store          storage.Store
 	validatorCache *middleware.ValidatorCache
+	// cancel stops the module's background goroutines (session cleanup).
+	cancel context.CancelFunc
 	// gateLimit, when set, rate limits token-bearing requests to the passkey
 	// OIDC gates (see SetOIDCGateRateLimiter). nil means unlimited.
 	gateLimit gin.HandlerFunc
@@ -76,12 +70,21 @@ func NewASModule(
 	blacklist TokenBlacklistChecker,
 	httpClient *http.Client,
 	logger *zap.Logger,
-) (*ASModule, error) {
+) (module *ASModule, err error) {
 	// Key manager.
-	km, err := NewKeyManager(cfg.SigningKeyPath)
+	km, err := newConfiguredKeyManager(cfg)
 	if err != nil {
 		return nil, err
 	}
+	// Child context so Close or a failed construction can stop the goroutines.
+	ctx, cancel := context.WithCancel(ctx)
+	// Release HSM sessions and goroutines on any later failure.
+	defer func() {
+		if err != nil {
+			cancel()
+			_ = km.Close()
+		}
+	}()
 
 	// Token issuer.
 	issuer := cfg.Issuer
@@ -91,34 +94,6 @@ func NewASModule(
 	tokenIssuer := NewTokenIssuer(km, issuer, func(aud string) time.Duration {
 		return cfg.GetTokenTTL(aud)
 	})
-
-	// Legacy issuer (uses existing HMAC secret). Deliberately jwtCfg.Issuer,
-	// NOT the `issuer` var above: legacy appTokens are always minted by
-	// UserService/WebAuthnService's own generateToken with "iss":
-	// jwtCfg.Issuer, regardless of what cfg.AS.Issuer is separately
-	// configured as (the AS's own asymmetric tokenIssuer's identity). Using
-	// `issuer` here previously meant an operator who set cfg.AS.Issuer
-	// differently from cfg.JWT.Issuer got every legacy token rejected by
-	// this issuer, including - silently - LogoutHandler's legacy-token
-	// blacklisting fallback (#391 review, round 3).
-	var legacyIssuer *LegacyTokenIssuer
-	if cfg.Legacy.Enabled {
-		legacyIssuer = NewLegacyTokenIssuer(
-			[]byte(jwtCfg.Secret),
-			jwtCfg.Issuer,
-			time.Duration(jwtCfg.ExpiryHours)*time.Hour,
-		)
-	}
-
-	// Signature-only parser for LogoutHandler's pre-#402 family fallback,
-	// available even when legacy authentication is disabled (the refresh
-	// route is mounted on jwt.refresh_days, not as.legacy.enabled). With no
-	// jwt.secret there is nothing to verify against, so the fallback is
-	// unavailable (an empty HMAC key must never be used).
-	var logoutSIDParser *LegacyTokenIssuer
-	if jwtCfg.Secret != "" {
-		logoutSIDParser = NewLegacyTokenIssuer([]byte(jwtCfg.Secret), jwtCfg.Issuer, 0)
-	}
 
 	// Session store: MongoDB when the storage backend is MongoDB (sessions
 	// survive restarts and are shared across instances, #324), memory
@@ -141,11 +116,9 @@ func NewASModule(
 	}
 
 	// Passkey handlers.
-	passkeyHandler := NewPasskeyHandlers(webauthnSvc, sessions, legacyIssuer, cfg, logger)
+	passkeyHandler := NewPasskeyHandlers(webauthnSvc, sessions, cfg, logger)
 
-	// OIDC handlers. The state-binding cookie (go-wallet-backend#385) reuses
-	// the JWT secret rather than requiring a new one; pkg/config.Config.Validate
-	// already requires it to be present and >=32 bytes.
+	// OIDC handlers; the state-binding cookie is keyed by jwt.secret (validated >=32 bytes).
 	oidcHandler := NewOIDCHandlers(store, sessions, cfg, []byte(jwtCfg.Secret), httpClient, logger)
 
 	// Shared cache of OIDC validators for the passkey gate (see
@@ -154,20 +127,18 @@ func NewASModule(
 	validatorCache := middleware.NewValidatorCache(httpClient, logger)
 
 	return &ASModule{
-		KeyManager:      km,
-		TokenIssuer:     tokenIssuer,
-		LegacyIssuer:    legacyIssuer,
-		LogoutSIDParser: logoutSIDParser,
-		Sessions:        sessions,
-		Policy:          policy,
-		PasskeyHandler:  passkeyHandler,
-		OIDCHandler:     oidcHandler,
-		Blacklist:       blacklist,
-		Logger:          logger,
-		Config:          cfg,
-		FamilyRetention: jwtCfg.FamilyRetention() + time.Hour,
-		store:           store,
-		validatorCache:  validatorCache,
+		KeyManager:     km,
+		TokenIssuer:    tokenIssuer,
+		Sessions:       sessions,
+		Policy:         policy,
+		PasskeyHandler: passkeyHandler,
+		OIDCHandler:    oidcHandler,
+		Blacklist:      blacklist,
+		Logger:         logger,
+		Config:         cfg,
+		store:          store,
+		validatorCache: validatorCache,
+		cancel:         cancel,
 	}, nil
 }
 
@@ -195,30 +166,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	// JWKS endpoint (public, no auth).
 	RegisterJWKSRoute(auth.Group(""), m.KeyManager)
 
-	// Passkey authentication (public, no auth — but tenant-scoped).
-	// Tenant comes from the validated X-Tenant-ID header, never from the
-	// request body, mirroring the /user/* routes (see providers.go's
-	// AuthProvider.RegisterRoutes). Without this, a caller could pick any
-	// tenant's data via a body field with no validation at all (issue #374).
-	passkey := auth.Group("/passkey")
-	passkey.Use(middleware.TenantHeaderMiddleware(m.store))
-	{
-		// Registration routes (with OIDC registration gate).
-		registration := passkey.Group("")
-		registration.Use(m.gateLimitMiddleware(), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeRegistration, m.Logger))
-		{
-			registration.POST("/register/begin", m.PasskeyHandler.RegisterBegin)
-			registration.POST("/register/finish", m.PasskeyHandler.RegisterFinish)
-		}
-
-		// Login routes (with OIDC login gate).
-		login := passkey.Group("")
-		login.Use(m.gateLimitMiddleware(), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeLogin, m.Logger))
-		{
-			login.POST("/login/begin", m.PasskeyHandler.LoginBegin)
-			login.POST("/login/finish", m.PasskeyHandler.LoginFinish)
-		}
-	}
+	RegisterPasskeyRoutes(auth, m.store, m.PasskeyHandler, m.validatorCache, m.gateLimitMiddleware(), m.Logger)
 
 	// OIDC authentication (public, no auth — redirects to IdP).
 	oidcGroup := auth.Group("/oidc")
@@ -240,7 +188,30 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	})
 
 	// Logout (requires session cookie).
-	auth.DELETE("/session", LogoutHandler(m.Sessions, m.TokenIssuer, m.LegacyIssuer, m.LogoutSIDParser, m.Blacklist, m.FamilyRetention, m.Config.InsecureCookies, m.Logger))
+	auth.DELETE("/session", LogoutHandler(m.Sessions, m.TokenIssuer, m.Blacklist, m.Config.InsecureCookies, m.Logger))
+}
+
+// RegisterPasskeyRoutes mounts the /passkey routes on the AS group: tenant-scoped from the validated
+// X-Tenant-ID header (never the body, #374), session-mode gated, with the OIDC registration and login gates.
+func RegisterPasskeyRoutes(auth *gin.RouterGroup, store storage.Store, h *PasskeyHandlers,
+	validators *middleware.ValidatorCache, gateLimit gin.HandlerFunc, logger *zap.Logger) {
+	passkey := auth.Group("/passkey")
+	passkey.Use(middleware.TenantHeaderMiddleware(store))
+	{
+		registration := passkey.Group("")
+		registration.Use(gateLimit, sessionModeGate(), middleware.OIDCGateMiddleware(validators, middleware.GateTypeRegistration, logger))
+		{
+			registration.POST("/register/begin", h.RegisterBegin)
+			registration.POST("/register/finish", h.RegisterFinish)
+		}
+
+		login := passkey.Group("")
+		login.Use(gateLimit, sessionModeGate(), middleware.OIDCGateMiddleware(validators, middleware.GateTypeLogin, logger))
+		{
+			login.POST("/login/begin", h.LoginBegin)
+			login.POST("/login/finish", h.LoginFinish)
+		}
+	}
 }
 
 // mongoDatabaseProvider is implemented by the MongoDB storage backend.
@@ -281,4 +252,72 @@ func newMemorySessionStoreWithCleanup(ctx context.Context) *MemorySessionStore {
 	sessions := NewMemorySessionStore()
 	sessions.StartCleanup(ctx, 5*time.Minute)
 	return sessions
+}
+
+// newConfiguredKeyManager builds the KeyManager from the PEM key file or the
+// PKCS#11 key; exactly one must be configured.
+func newConfiguredKeyManager(cfg *config.ASConfig) (*KeyManager, error) {
+	switch {
+	case cfg.SigningKeyPath != "" && cfg.SigningKeyPKCS11 != nil:
+		return nil, fmt.Errorf("as: signing_key_path and signing_key_pkcs11 are mutually exclusive")
+	case cfg.SigningKeyPKCS11 != nil:
+		p := cfg.SigningKeyPKCS11
+		// Read here, not in config.Load: standalone engines sharing the config
+		// need not have the file.
+		pin, err := p.ResolvePIN()
+		if err != nil {
+			return nil, fmt.Errorf("as: signing_key_pkcs11: %w", err)
+		}
+		signer, err := newPKCS11Signer(&signing.PKCS11Config{
+			ModulePath: p.ModulePath,
+			SlotID:     p.SlotID,
+			PIN:        pin,
+			KeyLabel:   p.KeyLabel,
+			PoolSize:   p.PoolSize,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("as: pkcs11 signing key: %w", err)
+		}
+		km, err := newPKCS11KeyManager(signer)
+		if err != nil {
+			if c, ok := signer.(interface{ Close() error }); ok {
+				_ = c.Close()
+			}
+			return nil, err
+		}
+		return km, nil
+	default:
+		return NewKeyManager(cfg.SigningKeyPath)
+	}
+}
+
+// newPKCS11Signer is a seam so tests can inject a fake HSM signer.
+var newPKCS11Signer = func(cfg *signing.PKCS11Config) (crypto.Signer, error) {
+	return signing.NewPKCS11Signer(cfg)
+}
+
+// Close releases resources held by the module (HSM sessions).
+func (m *ASModule) Close() error {
+	if m == nil {
+		return nil
+	}
+	if m.cancel != nil {
+		m.cancel()
+	}
+	if m.KeyManager == nil {
+		return nil
+	}
+	return m.KeyManager.Close()
+}
+
+// newPKCS11KeyManager builds a KeyManager from an HSM signer, accepting only ECDSA keys
+// (checked on the actual key type; the config carries no algorithm).
+func newPKCS11KeyManager(signer crypto.Signer) (*KeyManager, error) {
+	if signer == nil {
+		return nil, fmt.Errorf("as: pkcs11 signing key: nil signer")
+	}
+	if _, ok := signer.Public().(*ecdsa.PublicKey); !ok {
+		return nil, fmt.Errorf("as: signing_key_pkcs11 supports only ECDSA P-256/P-384 keys, got %T (Ed25519 and RSA are not supported for PKCS#11; use signing_key_path for Ed25519)", signer.Public())
+	}
+	return NewKeyManagerFromSigner(signer)
 }
