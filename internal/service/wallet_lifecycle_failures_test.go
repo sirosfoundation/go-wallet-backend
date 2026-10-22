@@ -335,7 +335,7 @@ func TestWalletLifecycle_Cascade_UnownedInstanceAndErrors(t *testing.T) {
 func TestWalletLifecycle_Erasure_IsScopedToTheTenant(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("live instance in another tenant keeps everything", func(t *testing.T) {
+	t.Run("live instance in another tenant: only the revoked tenant's holder data goes", func(t *testing.T) {
 		store := memory.NewStore()
 		svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
 		uid := seedWalletUser(t, store, domain.DefaultTenantID, "acme")
@@ -348,8 +348,8 @@ func TestWalletLifecycle_Erasure_IsScopedToTheTenant(t *testing.T) {
 		assert.Equal(t, 1, n)
 
 		c, p := countHolderData(t, store, domain.DefaultTenantID, uid)
-		assert.Equal(t, 1, c, "default-tenant credentials kept while acme is live")
-		assert.Equal(t, 1, p, "default-tenant presentations kept while acme is live")
+		assert.Zero(t, c, "default-tenant credentials erased: no live instance left there")
+		assert.Zero(t, p, "default-tenant presentations erased: no live instance left there")
 		c, p = countHolderData(t, store, "acme", uid)
 		assert.Equal(t, 1, c, "acme credentials untouched")
 		assert.Equal(t, 1, p, "acme presentations untouched")

@@ -498,13 +498,17 @@ func holderDataCount(t *testing.T, store storage.Store, tid domain.TenantID, hol
 	return len(creds) + len(pres)
 }
 
-// Revoking in tenant A while tenant B has a live instance erases nothing.
-func TestWalletLifecycle_RevokeInOneTenantErasesNothingWhileAnotherIsLive(t *testing.T) {
-	svc, store, _, holder := twoTenantFixture(t)
+// Revoking the last instance in tenant A while tenant B is live erases tenant
+// A's holder data (docs/API.md) but nothing user-level, and nothing in B.
+func TestWalletLifecycle_RevokeInOneTenantErasesOnlyThatTenantWhileAnotherIsLive(t *testing.T) {
+	svc, store, userID, holder := twoTenantFixture(t)
 	_, err := svc.ChangeStatus(context.Background(), LifecycleActor{Kind: "provider"}, tenantA, "inst-"+string(tenantA), domain.InstanceStatusRevoked, "lost")
 	require.NoError(t, err)
-	assert.Equal(t, 2, holderDataCount(t, store, tenantA, holder), "tenant A data must survive while tenant B is live")
-	assert.Equal(t, 2, holderDataCount(t, store, tenantB, holder))
+	assert.Zero(t, holderDataCount(t, store, tenantA, holder), "tenant A has no live instance: its holder data is erased")
+	assert.Equal(t, 2, holderDataCount(t, store, tenantB, holder), "tenant B is live: untouched")
+	u, err := store.Users().GetByID(context.Background(), userID)
+	require.NoError(t, err)
+	assert.NotNil(t, u.PrivateData, "the vault serves the live tenant B instance")
 }
 
 // With no live instance anywhere, the holder data of every tenant is erased.
