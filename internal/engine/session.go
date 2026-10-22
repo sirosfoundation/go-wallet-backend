@@ -117,8 +117,15 @@ type Session struct {
 	// Channels for flow coordination
 	actionCh chan *FlowActionMessage
 	signCh   chan *SignResponseMessage
-	matchCh  chan *MatchResponseMessage
-	closeCh  chan struct{}
+	// signWaiters maps the message ID of each pending RequestSign to its own
+	// reply channel. Several RequestSign calls can be pending at once (a flow
+	// waiting on a decryption while a notification worker asks for a DPoP
+	// proof), and they all read signCh: a waiter that reads another waiter's
+	// reply hands it over instead of discarding it.
+	signWaitersMu sync.Mutex
+	signWaiters   map[string]chan *SignResponseMessage
+	matchCh       chan *MatchResponseMessage
+	closeCh       chan struct{}
 
 	// notifications holds ephemeral, TTL-bounded OID4VCI §10 notification
 	// contexts keyed by flow ID. It lets the backend forward a client-reported
@@ -1365,6 +1372,20 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 		Params: params,
 	}
 
+	// Register before sending, so a reply read by another waiter always finds us.
+	mine := make(chan *SignResponseMessage, 1)
+	s.signWaitersMu.Lock()
+	if s.signWaiters == nil {
+		s.signWaiters = make(map[string]chan *SignResponseMessage)
+	}
+	s.signWaiters[messageID] = mine
+	s.signWaitersMu.Unlock()
+	defer func() {
+		s.signWaitersMu.Lock()
+		delete(s.signWaiters, messageID)
+		s.signWaitersMu.Unlock()
+	}()
+
 	if err := s.Send(&msg); err != nil {
 		return nil, err
 	}
@@ -1380,11 +1401,22 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 			return nil, ErrSignTimeout
 		case <-s.closeCh:
 			return nil, errors.New("session closed")
+		case resp := <-mine:
+			return resp, nil
 		case resp := <-s.signCh:
 			if resp.MessageID == messageID {
 				return resp, nil
 			}
-			// Wrong message ID, keep waiting
+			// Another pending request's reply: hand it to its owner.
+			s.signWaitersMu.Lock()
+			other := s.signWaiters[resp.MessageID]
+			s.signWaitersMu.Unlock()
+			if other != nil {
+				select {
+				case other <- resp:
+				default: // a duplicate reply for the same ID: drop it
+				}
+			}
 		}
 	}
 }
