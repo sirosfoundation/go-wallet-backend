@@ -137,8 +137,7 @@ func TestTokenBlacklist_StartStop_Enabled(t *testing.T) {
 
 func TestTokenBlacklist_StartStop_Disabled(t *testing.T) {
 	// Start() on a disabled blacklist still launches the cleanup goroutine
-	// (see Start's doc comment - ConsumeOnce needs it regardless of
-	// config.Enabled) and logs accordingly; Stop() must be safe to call
+	// (see Start's doc comment) and logs accordingly; Stop() must be safe to call
 	// afterward either way.
 	b := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop())
 	b.Start()
