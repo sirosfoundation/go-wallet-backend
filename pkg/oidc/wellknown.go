@@ -3,6 +3,7 @@ package oidc
 import (
 	"fmt"
 	"net/url"
+	"strings"
 )
 
 // WellKnownURL constructs a well-known URI per RFC 8615.
@@ -39,6 +40,11 @@ func NormalizeIssuerURL(rawURL string) string {
 		// Clear only the parsed root path so a "/" in the query or fragment is untouched.
 		parsed.Path = ""
 		parsed.RawPath = ""
+		// url.Parse lowercases the scheme; keep the identifier's own spelling so
+		// the root-slash and no-slash forms of "HTTPS://host" stay the same string.
+		if i := strings.Index(rawURL, ":"); i > 0 {
+			parsed.Scheme = rawURL[:i]
+		}
 		return parsed.String()
 	}
 	return rawURL
