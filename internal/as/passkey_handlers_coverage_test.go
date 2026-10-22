@@ -64,7 +64,7 @@ func newTestPasskeyHandlers(webauthn WebAuthnProvider) (*PasskeyHandlers, *Memor
 		SessionTTL:      24 * time.Hour,
 		InsecureCookies: true,
 	}
-	return NewPasskeyHandlers(webauthn, store, nil, cfg, zap.NewNop()), store
+	return NewPasskeyHandlers(webauthn, store, cfg, zap.NewNop()), store
 }
 
 func gatedTenant(bindIdentity bool, regOP *domain.OIDCProviderConfig) *domain.Tenant {

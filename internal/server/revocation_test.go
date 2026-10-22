@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	gojwt "github.com/golang-jwt/jwt/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
@@ -127,6 +126,7 @@ func walletProviderMongoConfig(t *testing.T, backend string) *config.Config {
 	keyPath, certPath := writeTestECKeyAndCert(t, t.TempDir(), "wallet-provider")
 	cfg.Server = config.ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"}
 	cfg.JWT = config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"}
+	cfg.AS = config.ASConfig{Enabled: true, ExternalURL: "https://as.example.com"}
 	cfg.WalletProvider.PrivateKeyPath = keyPath
 	cfg.WalletProvider.CertificatePath = certPath
 	cfg.WalletProvider.WIA.RateLimit = config.AuthRateLimitConfig{Enabled: false}
@@ -182,10 +182,8 @@ func TestStandaloneRegistry_SharedBlacklist(t *testing.T) {
 
 	cfg := registryTestConfig(t)
 	cfg.Registry.RequireAuth = true
-	cfg.AS.ExternalURL = newRegAS(t).srv.URL
-	cfg.AS.Legacy.Enabled = true
-	cfg.Server.RPID = regTestRPID
-	cfg.JWT.Secret = regTestSecret
+	as := newRegAS(t)
+	cfg.AS.ExternalURL = as.srv.URL
 	require.NoError(t, cfg.ValidateRegistry())
 	p, err := NewRegistryProvider(cfg, zap.NewNop())
 	require.NoError(t, err)
@@ -194,11 +192,7 @@ func TestStandaloneRegistry_SharedBlacklist(t *testing.T) {
 	p.SetTokenBlacklist(shared)
 
 	withJTI := func(jti string) string {
-		s, err := gojwt.NewWithClaims(gojwt.SigningMethodHS256, gojwt.MapClaims{
-			"iss": "wallet-backend", "aud": regTestRPID, "user_id": "u", "tenant_id": "acme", "jti": jti,
-			"exp": time.Now().Add(time.Hour).Unix()}).SignedString([]byte(regTestSecret))
-		require.NoError(t, err)
-		return "Bearer " + s
+		return "Bearer " + as.tokenWithJTI(t, []string{"wallet-registry"}, jti)
 	}
 
 	assert.Equal(t, http.StatusOK, doRegistryGet(t, p, withJTI("fine")))

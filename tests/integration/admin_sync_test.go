@@ -288,7 +288,7 @@ func TestCLISyncValidationErrors(t *testing.T) {
 	})
 
 	t.Run("non-existent config file", func(t *testing.T) {
-		cli.Run("sync", "--config", "/tmp/nonexistent-file-12345.yaml").Failure()
+		cli.Run("sync", "--config", filepath.Join(t.TempDir(), "nonexistent.yaml")).Failure()
 	})
 
 	t.Run("empty tenants list", func(t *testing.T) {

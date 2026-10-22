@@ -3,6 +3,7 @@ package integration
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -52,7 +53,7 @@ type AuthenticatorSelectionCriteria struct {
 func TestWebAuthnRegistrationBegin(t *testing.T) {
 	h := NewTestHarness(t)
 
-	resp := h.POST("/user/register-webauthn-begin", map[string]interface{}{})
+	resp := h.SessionPOST("/auth/passkey/register/begin", map[string]interface{}{})
 	resp.Status(http.StatusOK)
 
 	var result BeginRegistrationResponse
@@ -121,7 +122,7 @@ func TestWebAuthnRegistrationBegin(t *testing.T) {
 func TestWebAuthnRegistrationBeginWithDisplayName(t *testing.T) {
 	h := NewTestHarness(t)
 
-	resp := h.POST("/user/register-webauthn-begin", map[string]interface{}{
+	resp := h.SessionPOST("/auth/passkey/register/begin", map[string]interface{}{
 		"display_name": "Test User",
 	})
 	resp.Status(http.StatusOK)
@@ -141,7 +142,7 @@ func TestWebAuthnRegistrationBeginWithDisplayName(t *testing.T) {
 func TestWebAuthnResponseFormat(t *testing.T) {
 	h := NewTestHarness(t)
 
-	resp := h.POST("/user/register-webauthn-begin", map[string]interface{}{})
+	resp := h.SessionPOST("/auth/passkey/register/begin", map[string]interface{}{})
 	resp.Status(http.StatusOK)
 
 	// Parse raw JSON to validate structure
@@ -204,7 +205,7 @@ type PublicKeyCredentialRequestOptions struct {
 func TestWebAuthnLoginBegin(t *testing.T) {
 	h := NewTestHarness(t)
 
-	resp := h.POST("/user/login-webauthn-begin", map[string]interface{}{})
+	resp := h.SessionPOST("/auth/passkey/login/begin", map[string]interface{}{})
 	resp.Status(http.StatusOK)
 
 	var result BeginLoginResponse
@@ -232,5 +233,17 @@ func TestWebAuthnLoginBegin(t *testing.T) {
 
 	if t.Failed() {
 		resp.Debug()
+	}
+}
+
+// Without X-Token-Mode: session the passkey routes answer 410, as in production.
+func TestPasskeyRoutesRequireSessionMode(t *testing.T) {
+	h := NewTestHarness(t)
+	for _, p := range []string{"register/begin", "register/finish", "login/begin", "login/finish"} {
+		resp := h.POST("/auth/passkey/"+p, map[string]interface{}{})
+		resp.Status(http.StatusGone)
+		if !strings.Contains(string(resp.Body()), "legacy_tokens_disabled") {
+			t.Errorf("%s: body %s", p, resp.Body())
+		}
 	}
 }

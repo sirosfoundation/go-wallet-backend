@@ -137,6 +137,16 @@ func TestRedirectURI(t *testing.T) {
 	if got := h.redirectURI(); got != expected {
 		t.Errorf("expected %s, got %s (trailing slash)", expected, got)
 	}
+
+	h.cfg.ExternalURL = "https://auth.example.com/wallet/"
+	if got, want := h.redirectURI(), "https://auth.example.com/wallet/auth/oidc/callback"; got != want {
+		t.Errorf("expected %s, got %s (path prefix)", want, got)
+	}
+
+	h.cfg.ExternalURL = "https://auth.example.com/#frag"
+	if got := h.redirectURI(); got != "" {
+		t.Errorf("fragment external_url must yield no redirect URI, got %s", got)
+	}
 }
 
 func TestHashNonce(t *testing.T) {

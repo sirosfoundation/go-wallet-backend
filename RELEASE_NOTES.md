@@ -4,6 +4,87 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.24.0:start -->
+## [v0.24.0] - 2026-10-19
+
+### Added
+- Engine now relays `credential_metadata` from OID4VCI responses, both at the response level (OID4VCI 1.1) and per-credential, preserving extra members verbatim for downstream consumers (#463)
+- Engine requires `notification_id` when `credential_metadata` contains a secret seed, ensuring proper tracking of seed delivery (#463)
+- Engine enforces encrypted response delivery when advertising `secret_seed` capability, preventing accidental plaintext seed transmission (#463)
+
+### Fixed
+- Type assertions throughout codebase are now checked for safety, enabled via errcheck's `check-type-assertions` linter option (#459)
+- Engine serves valid `secret_seed` advertisements and drops malformed ones, with capability alignment matching spec 5A requirements (#463)
+- Engine relays credential metadata display data with more generous field capitalization handling to accommodate issuer variations (#463)
+
+### Changed
+- Dependency updates for go modules and GitHub Actions (#464, #465)
+<!-- release-notes:v0.24.0:end -->
+
+<!-- release-notes:v0.23.0:start -->
+## [v0.23.0] - 2026-10-15
+
+> v0.23.0 is the same commit as v0.22.4. v0.22.4 was tagged as a patch release but contains breaking changes, so it was re-released under a version that signals the break; v0.22.4 is superseded and should not be deployed. The notes below were first generated under v0.22.4.
+
+### Security
+
+- **Token revocation now enforced.** The token blacklist (written by logout) is now actually checked on every authenticated request. Previously, `AuthMiddleware` hardcoded a nil blacklist, and the `/user/session/logout` route was never registered, so revoked tokens remained valid until expiry. Both the legacy HMAC path and the AS-issued JWT path now honor revocation. (#391)
+- **Refresh-token family revocation.** Logging out now revokes every token in the same refresh-token family (all tokens descended from the same original login), not just the one presented. Deleting a user revokes all their tokens immediately. (#391, #402, #414)
+- **Verifier trust now PDP-first, fail-closed.** When a verifier PDP is configured, `evaluateVerifierTrust` calls it directly instead of asking the frontend. A PDP error (e.g. evaluator construction failure) now fails closed (untrusted) and never falls back to client-asserted trust. Only PDP-backed verdicts are cached; client-asserted verdicts are never written to the cache. The cache is now keyed by verified identity (DID, x5c-verified client_id, attested sub) instead of a bare URL, so one verifier's cached entry cannot answer for a different verifier sharing the same response_uri. The cache lookup now happens *after* request-object signature verification. (#389, M-3 HIGH)
+- **Issuer trust fail-closed on PDP error.** `evaluateTrust` in `oid4vci.go` no longer downgrades to frontend-mediated trust when a configured issuer PDP errors. Plain-JSON issuer metadata's `credential_issuer` claim is now validated against the requested issuer URL. (#387, M-5 MEDIUM)
+- **Passkey routes now tenant-gated.** `/auth/passkey/{login,register}/*` previously derived the tenant from the request body with no validation. These routes now enforce `X-Tenant-ID` via `TenantHeaderMiddleware` and honor `oidc_gate` configuration. Registration enforces `bind_identity` up front; login re-validates audience and required claims against the credential's real tenant. `FinishRegistration` rejects if the header tenant doesn't match the tenant recorded on the challenge. (#386, M-2 HIGH)
+- **OIDC login hardened.** The AS's OIDC RP flow now validates that the discovery document's `issuer` matches the requested issuer, uses PKCE (S256) end-to-end, requires `https://` issuer URLs (unless `http_client.allow_http` is set), and binds the `state` parameter to a signed `HttpOnly`/`SameSite=Lax` cookie to prevent login CSRF. The `admin` claim (groups/roles containing "admin") only mints elevated permissions when `oidc_gate.trust_admin_claim: true` is explicitly set. Both `Login` and `Callback` now reject disabled tenants. (#390, M-1 HIGH / M-4 MEDIUM / T-4 LOW)
+- **DID resolution and x509 verification gaps closed.** The DID-scheme frontend fallback now sets `requires_resolution: true` and `request_jwt` correctly. `x509_san_uri` request-object verification now runs before the metadata fetch. `x509_san_dns`/`x509_san_uri`/`x509_hash` now send the properly prefixed `client_id_scheme:` subject to go-trust's PDP so certificate SAN/hash binding is actually verified. (#401, #413, follow-ups to #389)
+- **WebSocket sessions closed on account deletion.** `DeleteUser` now closes live WebSocket connections for that user immediately, not just the persisted session bookkeeping. (#399, #393)
+- **Atomic challenge and invite consumption.** One-time WebAuthn challenges and invite codes are now consumed atomically (find-and-delete), closing a TOCTOU window where concurrent requests could reuse the same challenge or invite. `FinishRegistration` now marks the invite completed *before* creating the user account. Clone-authenticator warnings (sign-count regression) are now logged and emitted as audit events. (#388, W-2 HIGH / W-1 MEDIUM / W-3 LOW)
+- **Tenant-mismatch gap in `/user/*` registration closed.** `FinishWebAuthnRegistration` now rejects if the header tenant doesn't match the tenant recorded on the challenge. (#400, #395)
+- **OIDC gate audience and required-claims binding for `/user/*` login.** `FinishWebAuthnLogin` now populates `OIDCGateBinding.Audience` and `OIDCGateBinding.Claims`, so `FinishLogin` re-validates against the credential's real tenant's audience and required claims, closing a gap where a token valid for one tenant's app could satisfy another tenant's login gate if they shared an issuer. (#412, #408 / #409)
+- **Delegation token exchange now audience-checked.** The parent token in a delegation request is now verified against `cfg.AS.Audiences` and checked against the blacklist before a fresh token is minted. (#391, T-1 MEDIUM)
+- **OIDC discovery and token exchange now SSRF-guarded.** The AS's OIDC login flow and passkey OIDC gate now use `HTTPClientConfig.NewIdPHTTPClient`, which enforces the same address/scheme policy as other outbound requests plus a new `http_client.trusted_idp_hosts` allowlist for IdPs that resolve to private addresses. Cloud metadata and unspecified addresses remain blocked. (#419, #349)
+- **Rate limiting for OIDC gates.** New per-IP (30 attempts/60s, 60s lockout) and per-tenant (300 attempts/60s, 60s lockout) rate limits protect the OIDC gate middleware. Enabled by default; configure via `security.oidc_gate_rate_limit`. A request carrying a bearer token that the gate refuses costs the client three tokens total. (#425, #65)
+- **Opt-in audit events for identity binding.** New `audit.identity_events` config (comma-separated: `bound`, `verified`, `mismatch`, `gate_bypass`) emits SET events for enterprise identity binding flows. Subjects are hashed. Default empty (no events). (#424, #66)
+
+### Added
+
+- **Configurable WebSocket ping interval.** `server.engine_ws_ping_interval` / `engine_ws_pong_timeout` (default 3s/5s) replace the hardcoded 30s interval. The server tells the client the interval in `HandshakeCompleteMessage.config.ping_interval_ms`. (#367)
+- **Verifier trust cache can be disabled.** `trust.cache_disabled` and `trust.cache_ttl_seconds` allow turning off the verifier trust cache or overriding the one-hour TTL, useful for testing environments where a PDP is briefly unreachable or a whitelist is being fixed. (#350, #344)
+- **Refresh token route wired up.** `POST /user/session/refresh` is now registered and reachable (previously dead code). (#400, #392)
+- **DCQL consent-level subset check.** New `presentation.dcql_consent_check` (`off` / `warn` (default) / `enforce`) validates that the client's `consent` response fits within the DCQL query sent. In `enforce` mode, violations block presentation and return `access_denied` to the verifier. (#428, #140 part A)
+- **Registry role reintegrated.** The registry can now run as a role within the combined binary (`--role registry` or `WALLET_ROLE=registry`), sharing configuration with the wallet/AS. Standalone registry-only mode is still supported. (#431, #430)
+- **Issuer metadata type policy.** `issuer_metadata.metadata_type` (`prefer-signed` (default) / `prefer-unsigned` / `signed-only` / `unsigned-only` / `any`) replaces the deprecated `prefer_signed` boolean and `metadata_fallback_on_4xx` flag. Retries the other media type only on HTTP 406 unless `any` is set. (#433, #372, #371)
+- **Trusted IdP host allowlist.** `http_client.trusted_idp_hosts` (comma-separated hostnames) allows IdPs that resolve to private addresses. (#419, #349)
+- **Required-claims CLI support.** `wallet-admin tenant configure-oidc-gate --required-claims` accepts JSON or `key=value` pairs. (#421, #51 / #52 / #55)
+- **Validator cache now bounded.** `ValidatorCache` evicts idle entries after 1h and uses LRU eviction at 256 entries, preventing unbounded growth in long-running processes. (#422, #64)
+- **Authentication rejection logging.** Both auth middlewares now log rejections at warn level with machine-readable reason, method, path, and client IP. The token itself is never logged. (#416, #301)
+- **Session close logging includes session_id.** `"Session closed"` log lines now include an explicit `session_id` field, matching `"Session established"`, so rapid reconnects can be distinguished from server-side bugs. (#293)
+
+### Fixed
+
+- **Holder DID resolution unified.** `getHolderDID` now consistently prefers `user_id` over the legacy `did` claim (AS-issued tokens carry only `sub`/`user_id`). (#391, #384 W-5 INFO)
+- **Issuer metadata tolerates malformed credential configurations.** `credential_configurations_supported` is now decoded one entry at a time; one undecodable configuration is skipped with a warning instead of failing the whole document. The legacy top-level `claims` field (when an array) no longer breaks decoding. (#417, #370)
+- **Dependency updates.** Bumped `github.com/gin-contrib/cors` to 1.7.9 (Trivy security findings) and `github.com/go-webauthn/webauthn` to 0.18.2 (attestation trust path, SafetyNet/TPM/FIDO U2F validation, UV authorization). (#369)
+- **Legacy password authentication removed.** `User.PasswordHash`, `RegisterRequest.Password`, bcrypt hashing, and the deprecated `UserService.Login()` are gone. `hasPassword` no longer appears in account info responses. Existing `password_hash` values in MongoDB are ignored on read and dropped on the next write. (#420, #162)
+- **Verifier `credential_types` context preserved.** `pkg/trust` now sends `credential_types` to go-trust so it is not dropped from the evaluation context. (#442)
+- **Reproducible builds.** Dropped build-time version injection in favor of runtime resolution to keep builds reproducible. (#443)
+- **Verifier IDs passed through to PDP.** `context.verifier_ids` from the authorization request is now preserved in `/v1/evaluate` and `/v1/resolve` calls to go-trust. (#455)
+
+### Changed
+
+- **BREAKING: PKCE now required for OIDC login.** Any tenant IdP client that doesn't support PKCE will fail token exchange. (#390, #373 M-1 HIGH)
+- **BREAKING: Admin-claim gating now opt-in.** Tenants relying on an IdP's `admin` group/role claim to auto-mint elevated permissions must now explicitly set `oidc_gate.trust_admin_claim: true`. No automated migration is included. (#390, #376 M-4 MEDIUM)
+- **BREAKING: HTTPS-only OIDC issuers.** Tenant OIDC issuer URLs must now be `https://` unless `http_client.allow_http` is set. Existing `http://` issuers are grandfathered until the next config write. (#390, #373 M-1 HIGH)
+- **BREAKING: Trusted proxies must be configured for per-IP rate limiting.** `server.trusted_proxies` (IPs/CIDRs or `["none"]`) controls whose `X-Forwarded-For` is believed. Unset keeps gin's trust-everything default (so upgrades don't break) but logs a startup warning while per-IP limiting is enabled. Without it, a direct caller can rotate `X-Forwarded-For` to dodge the per-IP bucket. (#425, #65)
+- **BREAKING: AS audiences now required.** `as.audiences` must be set when the AS is enabled. Legacy HMAC tokens require `server.rp_id` in the audience list. (#414, go-tokenauth v0.5.0)
+- **BREAKING: Registry tokens validated against explicit audiences.** The registry now requires `as.audiences` when auth is enabled, following go-tokenauth v0.5.0. (#431)
+- **API: `hasPassword` removed from account info response.** Clients must tolerate the field's absence. (#420, #162)
+<!-- release-notes:v0.23.0:end -->
+
+<!-- release-notes:v0.22.4:start -->
+## [v0.22.4] - 2026-10-15
+
+**Superseded by [v0.23.0](https://github.com/sirosfoundation/go-wallet-backend/releases/tag/v0.23.0).** This release was tagged as a patch release but contains breaking changes (see the v0.23.0 notes above). It is the same commit as v0.23.0. The `0.22` image tag points at a build of v0.22.3, not at this release.
+<!-- release-notes:v0.22.4:end -->
+
 <!-- release-notes:v0.22.3:start -->
 ## [v0.22.3] - 2026-09-24
 

@@ -35,6 +35,20 @@ jobs:
   # Transition helper image: the main server binary with --mode=registry as its
   # entrypoint (see Dockerfile.registry). The registry is a role of the main
   # binary; the image name is kept so existing deployments keep working.
+  # PKCS#11-capable variant (CGO, -tags pkcs11) for HSM-backed signing keys.
+  # Production target only; the SoftHSM dev target is never published.
+  server-pkcs11:
+    uses: sirosfoundation/.github/.github/workflows/docker-build-push.yml@main
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    with:
+      image-name: sirosfoundation/go-wallet-backend-pkcs11
+      dockerfile: ./Dockerfile.pkcs11
+      custom-ref: ${{ github.event_name == 'workflow_dispatch' && inputs.git_ref || '' }}
+      custom-tag: ${{ github.event_name == 'workflow_dispatch' && inputs.image_tag || '' }}
+
   registry:
     uses: sirosfoundation/.github/.github/workflows/docker-build-push.yml@main
     permissions:

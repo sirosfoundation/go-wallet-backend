@@ -46,9 +46,8 @@ func setupPasskeyTenantTest(t *testing.T) (*gin.Engine, *memory.Store) {
 			RPOrigin: "http://localhost:8080",
 		},
 		JWT: config.JWTConfig{
-			Secret:      "test-jwt-secret-that-is-long-enough-32",
-			Issuer:      "test-issuer",
-			ExpiryHours: 24,
+			Secret: "test-jwt-secret-that-is-long-enough-32",
+			Issuer: "test-issuer",
 		},
 	}
 	webauthnSvc, err := service.NewWebAuthnService(store, webauthnCfg, logger)
@@ -63,7 +62,7 @@ func setupPasskeyTenantTest(t *testing.T) (*gin.Engine, *memory.Store) {
 	}
 
 	m := &ASModule{
-		PasskeyHandler: NewPasskeyHandlers(webauthnSvc, NewMemorySessionStore(), nil, asCfg, logger),
+		PasskeyHandler: NewPasskeyHandlers(webauthnSvc, NewMemorySessionStore(), asCfg, logger),
 		Sessions:       NewMemorySessionStore(),
 		Logger:         logger,
 		Config:         asCfg,
@@ -100,6 +99,7 @@ func TestPasskeyRegisterBegin_HeaderTenantWinsOverBody(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/begin", body)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", "tenant-a")
+	req.Header.Set("X-Token-Mode", "session")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -143,6 +143,7 @@ func TestPasskeyRegisterFinish_RejectsHeaderChallengeTenantMismatch(t *testing.T
 		beginReq := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/begin", strings.NewReader(`{}`))
 		beginReq.Header.Set("Content-Type", "application/json")
 		beginReq.Header.Set("X-Tenant-ID", "tenant-a")
+		beginReq.Header.Set("X-Token-Mode", "session")
 		beginW := httptest.NewRecorder()
 		router.ServeHTTP(beginW, beginReq)
 		if beginW.Code != http.StatusOK {
@@ -165,6 +166,7 @@ func TestPasskeyRegisterFinish_RejectsHeaderChallengeTenantMismatch(t *testing.T
 		finishReq := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/finish", strings.NewReader(finishBody))
 		finishReq.Header.Set("Content-Type", "application/json")
 		finishReq.Header.Set("X-Tenant-ID", "tenant-b")
+		finishReq.Header.Set("X-Token-Mode", "session")
 		finishW := httptest.NewRecorder()
 		router.ServeHTTP(finishW, finishReq)
 
@@ -195,6 +197,7 @@ func TestPasskeyRegisterFinish_RejectsHeaderChallengeTenantMismatch(t *testing.T
 		finishReq := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/finish", strings.NewReader(finishBody))
 		finishReq.Header.Set("Content-Type", "application/json")
 		finishReq.Header.Set("X-Tenant-ID", "tenant-a")
+		finishReq.Header.Set("X-Token-Mode", "session")
 		finishW := httptest.NewRecorder()
 		router.ServeHTTP(finishW, finishReq)
 
@@ -228,6 +231,7 @@ func TestPasskeyRegisterBegin_InviteRequiredCannotBeBypassedByBody(t *testing.T)
 			req := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/begin", strings.NewReader(tc.body))
 			req.Header.Set("Content-Type", "application/json")
 			req.Header.Set("X-Tenant-ID", "invite-tenant")
+			req.Header.Set("X-Token-Mode", "session")
 			w := httptest.NewRecorder()
 			router.ServeHTTP(w, req)
 
@@ -278,6 +282,7 @@ func TestPasskeyRoutes_OIDCGateApplies(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/begin", strings.NewReader(`{}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Tenant-ID", "gated-registration")
+		req.Header.Set("X-Token-Mode", "session")
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 
@@ -292,6 +297,7 @@ func TestPasskeyRoutes_OIDCGateApplies(t *testing.T) {
 	t.Run("login gate blocks without Authorization header", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/auth/passkey/login/begin", nil)
 		req.Header.Set("X-Tenant-ID", "gated-login")
+		req.Header.Set("X-Token-Mode", "session")
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 
@@ -308,6 +314,7 @@ func TestPasskeyRoutes_OIDCGateApplies(t *testing.T) {
 		// must proceed without an Authorization header.
 		req := httptest.NewRequest(http.MethodPost, "/auth/passkey/login/begin", nil)
 		req.Header.Set("X-Tenant-ID", "gated-registration")
+		req.Header.Set("X-Token-Mode", "session")
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 
@@ -320,6 +327,7 @@ func TestPasskeyRoutes_OIDCGateApplies(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/begin", strings.NewReader(`{}`))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Tenant-ID", "ungated")
+		req.Header.Set("X-Token-Mode", "session")
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, req)
 
@@ -337,6 +345,7 @@ func TestPasskeyRegisterBegin_UnknownHeaderTenantRejected(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/begin", strings.NewReader(`{}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", "does-not-exist")
+	req.Header.Set("X-Token-Mode", "session")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 
@@ -377,7 +386,7 @@ func TestNewASModule_WiresPasskeyTenantPerimeter(t *testing.T) {
 
 	webauthnSvc, err := service.NewWebAuthnService(store, &config.Config{
 		Server: config.ServerConfig{RPName: "Test App", RPID: "localhost", RPOrigin: "http://localhost:8080"},
-		JWT:    config.JWTConfig{Secret: "test-jwt-secret-that-is-long-enough-32", Issuer: "test-issuer", ExpiryHours: 24},
+		JWT:    config.JWTConfig{Secret: "test-jwt-secret-that-is-long-enough-32", Issuer: "test-issuer"},
 	}, zap.NewNop())
 	if err != nil {
 		t.Fatalf("failed to create webauthn service: %v", err)
@@ -407,6 +416,7 @@ func TestNewASModule_WiresPasskeyTenantPerimeter(t *testing.T) {
 	req := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/begin", strings.NewReader(`{}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", "does-not-exist")
+	req.Header.Set("X-Token-Mode", "session")
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusNotFound {
@@ -416,9 +426,41 @@ func TestNewASModule_WiresPasskeyTenantPerimeter(t *testing.T) {
 	req = httptest.NewRequest(http.MethodPost, "/auth/passkey/register/begin", strings.NewReader(`{}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Tenant-ID", "tenant-a")
+	req.Header.Set("X-Token-Mode", "session")
 	w = httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200 for known tenant, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// Requests without X-Token-Mode: session get 410 before the OIDC gate; session-mode requests reach it.
+func TestPasskeyRoutes_SessionModeRequired410BeforeOIDCGate(t *testing.T) {
+	router, store := setupPasskeyTenantTest(t)
+	mustCreateTenant(t, store, &domain.Tenant{
+		ID: "gated", Name: "Gated", Enabled: true,
+		OIDCGate: domain.OIDCGateConfig{
+			Mode:           domain.OIDCGateModeBoth,
+			RegistrationOP: &domain.OIDCProviderConfig{Issuer: "https://idp.example.com", ClientID: "c"},
+			LoginOP:        &domain.OIDCProviderConfig{Issuer: "https://idp.example.com", ClientID: "c"},
+		},
+	})
+	for _, path := range []string{"/auth/passkey/register/begin", "/auth/passkey/register/finish", "/auth/passkey/login/begin", "/auth/passkey/login/finish"} {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		req.Header.Set("X-Tenant-ID", "gated")
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusGone || !strings.Contains(w.Body.String(), "legacy_tokens_disabled") {
+			t.Errorf("%s without X-Token-Mode: expected 410 legacy_tokens_disabled before the OIDC gate, got %d: %s", path, w.Code, w.Body.String())
+		}
+
+		req = httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		req.Header.Set("X-Tenant-ID", "gated")
+		req.Header.Set("X-Token-Mode", "session")
+		w = httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized || !strings.Contains(w.Body.String(), "oidc_gate_required") {
+			t.Errorf("%s session-mode: expected the OIDC gate answer, got %d: %s", path, w.Code, w.Body.String())
+		}
 	}
 }

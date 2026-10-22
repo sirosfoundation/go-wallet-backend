@@ -7,11 +7,15 @@ import (
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
+	"github.com/go-jose/go-jose/v4/jwt"
+	"github.com/sirosfoundation/go-tokenauth/claims"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
@@ -36,18 +40,30 @@ func TestMongoOutage_RealWiringRefuses(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = client.Disconnect(context.Background()) })
 
-	const secret = "outage-test-secret"
-	cfg := createTestConfig(secret)
+	cfg := &config.Config{}
 	cfg.Server.RPID = "localhost"
 	cfg.Server.RPOrigin = "http://localhost"
 	cfg.Security.TokenBlacklist = config.TokenBlacklistConfig{Enabled: true} // default backend: MongoDB here
 
 	store := unreachableMongoStore{Store: memory.NewStore(), db: client.Database("unreachable")}
 	svc := service.NewServices(store, cfg, zap.NewNop())
-	router := createBlacklistTestRouter(cfg, store, svc.TokenBlacklist, zap.NewNop())
+
+	v, key, issuer := setupTokenAuthTest(t)
+	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{
+		"test-tenant": {ID: "test-tenant", Enabled: true},
+	}}
+	token := signToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   jwt.Claims{Subject: "user-1", Audience: jwt.Audience{testTokenAudience}},
+		TenantID: "test-tenant",
+		TAC:      "rwl",
+	})
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(TokenAuthMiddleware(v, tenants, svc.TokenBlacklist, zap.NewNop()))
+	router.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req.Header.Set("Authorization", "Bearer "+createTokenWithJTI(secret, "user-1", "jti-1", time.Now()))
+	req.Header.Set("Authorization", "Bearer "+token)
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
 	require.Equal(t, http.StatusServiceUnavailable, w.Code, w.Body.String())
