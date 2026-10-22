@@ -14,6 +14,9 @@ import (
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
 
+	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audience"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -123,6 +126,9 @@ type Manager struct {
 
 	clientsMu sync.RWMutex
 	clients   map[string]*clientConnection // userID -> connection
+
+	// tokenValidator, when set, authenticates the handshake token.
+	tokenValidator *tokenvalidator.Validator
 
 	// activeConnections counts every upgraded connection, handshaked or not.
 	// The connection limit must be enforced against this, not len(clients):
@@ -303,13 +309,49 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 	}
 }
 
+// SetTokenValidator makes the handshake use the shared validator instead of the
+// bare HMAC path. Call before serving connections.
+func (m *Manager) SetTokenValidator(v *tokenvalidator.Validator) {
+	m.tokenValidator = v
+}
+
 func (m *Manager) validateToken(tokenString string) (string, error) {
+	if m.tokenValidator != nil {
+		result, err := m.tokenValidator.Validate(context.Background(), tokenString)
+		if err != nil {
+			return "", err
+		}
+		// User-facing surface: beyond as.audiences, a new-style token must carry
+		// wallet-backend (registry-only tokens are refused). Legacy HMAC tokens
+		// are exempt, as in middleware.RequireAudience.
+		if !audience.Allowed(result, true, "wallet-backend") {
+			return "", errors.New("token audience not accepted")
+		}
+		// Per-user socket: an identity-free token has nothing to bind to.
+		if result.UserID == "" {
+			return "", errors.New("invalid token claims")
+		}
+		return result.UserID, nil
+	}
+
+	// No validator (AS disabled): HMAC only, and refused when legacy is off.
+	if !m.cfg.LegacyEnabled() {
+		return "", errors.New("legacy tokens are disabled")
+	}
+	if m.cfg.JWT.Secret == "" {
+		return "", errors.New("jwt secret not configured")
+	}
+	// Pin iss = jwt.issuer; an empty value would disable the check
+	// (golang-jwt), so fail closed.
+	if m.cfg.JWT.Issuer == "" {
+		return "", errors.New("jwt issuer not configured")
+	}
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, errors.New("unexpected signing method")
 		}
 		return []byte(m.cfg.JWT.Secret), nil
-	}, jwt.WithLeeway(config.JWTLeeway))
+	}, jwt.WithLeeway(config.JWTLeeway), jwt.WithIssuer(m.cfg.JWT.Issuer))
 
 	if err != nil {
 		return "", err
