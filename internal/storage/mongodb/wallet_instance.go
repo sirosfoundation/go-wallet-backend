@@ -25,7 +25,9 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	// error is how "another tenant's record" reaches the caller.
 	filter := bson.M{"_id": instance.ID, "tenant_id": instance.TenantID}
 	newGeneration := uuid.NewString()
+	writeToken := uuid.NewString()
 	set := bson.M{
+		"write_token":        writeToken,
 		"attestation_source": instance.AttestationSource,
 		"last_attested_at":   instance.LastAttestedAt,
 		"updated_at":         instance.UpdatedAt,
@@ -64,6 +66,7 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 		return fmt.Errorf("%w: upsert wallet instance: %v", storage.ErrDatabase, err)
 	}
 	instance.Generation = written.Generation
+	instance.WriteToken = writeToken
 	// $setOnInsert wrote our fresh generation only if this call inserted the record.
 	instance.Inserted = written.Generation == newGeneration
 
@@ -389,21 +392,49 @@ func (s *WalletInstanceStore) DeleteIfRemovable(ctx context.Context, id string, 
 	return nil
 }
 
-// RestoreAttestation undoes an Upsert that matched an existing record.
+// RestoreAttestation undoes an Upsert that matched an existing record. Every
+// step is conditional on the Upsert's write token, so a newer attestation (which
+// replaces the token) makes the rest a no-op instead of being clobbered.
 func (s *WalletInstanceStore) RestoreAttestation(ctx context.Context, before, written *domain.WalletInstance) error {
+	if written.WriteToken == "" {
+		return storage.ErrBindingChanged
+	}
 	filter := bson.M{"$and": []bson.M{
-		{"_id": written.ID}, {"tenant_id": written.TenantID}, generationCond(written.Generation),
+		{"_id": written.ID}, {"tenant_id": written.TenantID}, generationCond(written.Generation), {"write_token": written.WriteToken},
 	}}
+	// Clear the owner and link first, only while still the values this request wrote.
+	if before.UserID == nil && written.UserID != nil {
+		if _, err := s.collection.UpdateOne(ctx, bson.M{"$and": []bson.M{filter, {"user_id": *written.UserID}}},
+			bson.M{"$unset": bson.M{"user_id": ""}}); err != nil {
+			return fmt.Errorf("%w: restore wallet instance owner: %v", storage.ErrDatabase, err)
+		}
+	}
+	if before.CredentialID == "" && written.CredentialID != "" {
+		if _, err := s.collection.UpdateOne(ctx, bson.M{"$and": []bson.M{filter, {"credential_id": written.CredentialID}}},
+			bson.M{"$unset": bson.M{"credential_id": ""}}); err != nil {
+			return fmt.Errorf("%w: restore wallet instance credential link: %v", storage.ErrDatabase, err)
+		}
+	}
 	set := bson.M{
 		"attestation_source": before.AttestationSource,
 		"last_attested_at":   before.LastAttestedAt,
 		"updated_at":         before.UpdatedAt,
 	}
+	if before.WriteToken != "" {
+		set["write_token"] = before.WriteToken
+	}
 	update := bson.M{"$set": set, "$inc": bson.M{"attestation_count": -1}}
+	unset := bson.M{}
+	if before.WriteToken == "" {
+		unset["write_token"] = ""
+	}
 	if before.DeviceInfo != nil {
 		set["device_info"] = before.DeviceInfo
 	} else {
-		update["$unset"] = bson.M{"device_info": ""}
+		unset["device_info"] = ""
+	}
+	if len(unset) > 0 {
+		update["$unset"] = unset
 	}
 	res, err := s.collection.UpdateOne(ctx, filter, update)
 	if err != nil {
@@ -418,19 +449,6 @@ func (s *WalletInstanceStore) RestoreAttestation(ctx context.Context, before, wr
 			return storage.ErrBindingChanged
 		}
 		return storage.ErrNotFound
-	}
-	// Clear the owner and link only while still the values this request wrote.
-	if before.UserID == nil && written.UserID != nil {
-		if _, err := s.collection.UpdateOne(ctx, bson.M{"$and": []bson.M{filter, {"user_id": *written.UserID}}},
-			bson.M{"$unset": bson.M{"user_id": ""}}); err != nil {
-			return fmt.Errorf("%w: restore wallet instance owner: %v", storage.ErrDatabase, err)
-		}
-	}
-	if before.CredentialID == "" && written.CredentialID != "" {
-		if _, err := s.collection.UpdateOne(ctx, bson.M{"$and": []bson.M{filter, {"credential_id": written.CredentialID}}},
-			bson.M{"$unset": bson.M{"credential_id": ""}}); err != nil {
-			return fmt.Errorf("%w: restore wallet instance credential link: %v", storage.ErrDatabase, err)
-		}
 	}
 	return nil
 }
