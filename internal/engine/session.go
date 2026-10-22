@@ -311,6 +311,9 @@ func (m *Manager) SetTokenGate(g *tokengate.Gate) {
 
 // recheckToken re-applies the cut-off to an established session.
 func (m *Manager) recheckToken(session *Session) error {
+	if m.tokenGate == nil {
+		return nil // no persistent storage: no cut-off to apply
+	}
 	return m.tokenGate.Check(context.Background(), session.UserID, session.tokenIssuedAt)
 }
 
@@ -962,8 +965,10 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 			}
 		}
 		// UserID may be empty for anonymous tokens — that is acceptable.
-		if err := m.tokenGate.Check(ctx, result.UserID, tokengate.IssuedAt(tokenString)); err != nil {
-			return "", "", "", err
+		if m.tokenGate != nil {
+			if err := m.tokenGate.Check(ctx, result.UserID, tokengate.IssuedAt(tokenString)); err != nil {
+				return "", "", "", err
+			}
 		}
 		return result.UserID, result.TenantID, result.TAC, nil
 	}
@@ -1021,8 +1026,10 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 		if m.isUserRevoked(userID) {
 			return "", "", "", errors.New("token has been revoked")
 		}
-		if err := m.tokenGate.Check(ctx, userID, tokengate.IssuedAtFromClaims(mapClaims)); err != nil {
-			return "", "", "", err
+		if m.tokenGate != nil {
+			if err := m.tokenGate.Check(ctx, userID, tokengate.IssuedAtFromClaims(mapClaims)); err != nil {
+				return "", "", "", err
+			}
 		}
 		return userID, tenantID, "", nil
 	}
