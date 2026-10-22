@@ -2739,7 +2739,18 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			// owes the issuer a credential_failure notification, so the
 			// notification context must exist before the client answers.
 			h.registerNotificationContext(metadata, token, &CredentialResponse{Encrypted: true})
-			return h.relayEncryptedResponse(ctx, string(body), false, respEnc)
+			answer, relayErr := h.relayEncryptedResponse(ctx, string(body), false, respEnc)
+			if relayErr != nil {
+				// A malformed JWE, a client that could not decrypt or
+				// validate it, or invalid control fields all end the flow.
+				// The caller only logs a returned error, so the client would
+				// otherwise get neither completion nor a terminal message.
+				// The text is generic: relayErr and any client text stay out.
+				h.Logger.Debug("encrypted credential response relay failed", zap.Error(relayErr))
+				_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
+				return nil, relayErr
+			}
+			return answer, nil
 		}
 
 		if seedAdvertised {

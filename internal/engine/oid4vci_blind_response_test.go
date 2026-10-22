@@ -1170,3 +1170,74 @@ func TestBlind_NotificationContextSurvivesClientRejection(t *testing.T) {
 	require.Error(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", seedConfig(), nil, ""))
 	assert.True(t, h.Flow.Session.notifications.hasValid("f-blind", secretNotif))
 }
+
+// terminalErrors returns the flow_error messages the engine sent.
+func terminalErrors(t *testing.T, fc *fakeClient) []FlowErrorMessage {
+	t.Helper()
+	var out []FlowErrorMessage
+	for _, m := range fc.outboundMessages() {
+		if string(m["type"]) != `"flow_error"` {
+			continue
+		}
+		raw, err := json.Marshal(m)
+		require.NoError(t, err)
+		var em FlowErrorMessage
+		require.NoError(t, json.Unmarshal(raw, &em))
+		out = append(out, em)
+	}
+	return out
+}
+
+// Every way the immediate-response relay can fail must end the flow with one
+// generic CREDENTIAL_ERROR: the session runner only logs a returned error, so
+// without it the client would get neither completion nor a terminal message.
+func TestBlind_ImmediateRelayFailureSendsTerminalError(t *testing.T) {
+	cases := map[string]*fakeClient{
+		"client decrypt error": {decryptErr: true},
+		"neither field":        {reply: func([]byte) (SignResponseMessage, bool) { return SignResponseMessage{}, true }},
+		"both fields": {reply: func([]byte) (SignResponseMessage, bool) {
+			return SignResponseMessage{TransactionID: "t", CredentialCount: 1}, true
+		}},
+		"count over the cap": {reply: func([]byte) (SignResponseMessage, bool) {
+			return SignResponseMessage{CredentialCount: maxEncryptedCredentialCount + 1}, true
+		}},
+	}
+	for name, fc := range cases {
+		t.Run(name, func(t *testing.T) {
+			fc.t = t
+			st := newIssuerStub(t, seedResponse)
+			h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
+			defer cleanup()
+			err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", seedConfig(), nil, "")
+			require.Error(t, err)
+			fc.settle()
+			errs := terminalErrors(t, fc)
+			require.Len(t, errs, 1, "exactly one terminal flow_error")
+			assert.Equal(t, ErrCodeCredentialError, errs[0].Error.Code)
+			assert.Equal(t, ErrCodeCredentialError.UserFacingMessage(), errs[0].Error.Message)
+			assert.NotContains(t, completionTypes(fc), "flow_complete")
+			assertNoSecrets(t, "outbound", fc.engineSaw())
+			assertNoSecrets(t, "logs", logDump(logs))
+			assert.NotContains(t, fc.engineSaw(), "client failed on")
+		})
+	}
+}
+
+func TestBlind_ImmediateMalformedJWESendsTerminalError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/jwt")
+		_, _ = w.Write([]byte("not-a-jwe"))
+	}))
+	defer srv.Close()
+	fc := &fakeClient{t: t}
+	h, _, cleanup := newBlindHandler(t, fc, srv.Client())
+	defer cleanup()
+	md := &IssuerMetadata{CredentialIssuer: srv.URL, CredentialEndpoint: srv.URL, CredentialResponseEncryption: gcmCfg(false)}
+	cfg := &CredentialConfig{Format: "vc+sd-jwt", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}
+	require.Error(t, h.issueCredential(context.Background(), md, tokenBearer(), "cfg", cfg, nil, ""))
+	fc.settle()
+	errs := terminalErrors(t, fc)
+	require.Len(t, errs, 1)
+	assert.Equal(t, ErrCodeCredentialError, errs[0].Error.Code)
+	assert.NotContains(t, fc.actions(), SignActionDecryptCredentialResponse)
+}
