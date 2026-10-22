@@ -282,15 +282,20 @@ func TestValidateTransactionData_StructuralChecks(t *testing.T) {
 		dcql  json.RawMessage
 		want  string
 	}{
-		"missing type":             {`{"credential_ids":["pay"]}`, dcql, "missing type"},
-		"no credential_ids":        {`{"type":"x"}`, dcql, "credential_ids must be a non-empty array"},
-		"empty credential_ids":     {`{"type":"x","credential_ids":[]}`, dcql, "credential_ids must be a non-empty array"},
-		"id not in dcql":           {`{"type":"x","credential_ids":["nope"]}`, dcql, `"nope"`},
-		"one of several unknown":   {`{"type":"x","credential_ids":["pay","nope"]}`, dcql, `"nope"`},
-		"no dcql: fail closed":     {`{"type":"x","credential_ids":["anything"]}`, nil, "requires a dcql_query"},
-		"dcql without credentials": {`{"type":"x","credential_ids":["anything"]}`, json.RawMessage(`{"credentials":[]}`), "requires a dcql_query"},
-		"unreadable dcql":          {`{"type":"x","credential_ids":["anything"]}`, json.RawMessage(`"nope"`), "requires a dcql_query"},
-		"id in dcql":               {`{"type":"x","credential_ids":["age"]}`, dcql, ""},
+		"missing type":                                    {`{"credential_ids":["pay"]}`, dcql, "missing type"},
+		"no credential_ids":                               {`{"type":"x"}`, dcql, "credential_ids must be a non-empty array"},
+		"empty credential_ids":                            {`{"type":"x","credential_ids":[]}`, dcql, "credential_ids must be a non-empty array"},
+		"id not in dcql":                                  {`{"type":"x","credential_ids":["nope"]}`, dcql, `"nope"`},
+		"one of several unknown":                          {`{"type":"x","credential_ids":["pay","nope"]}`, dcql, `"nope"`},
+		"no dcql: fail closed":                            {`{"type":"x","credential_ids":["anything"]}`, nil, "requires a dcql_query"},
+		"dcql without credentials":                        {`{"type":"x","credential_ids":["anything"]}`, json.RawMessage(`{"credentials":[]}`), "requires a dcql_query"},
+		"unreadable dcql":                                 {`{"type":"x","credential_ids":["anything"]}`, json.RawMessage(`"nope"`), "requires a dcql_query"},
+		"id in dcql":                                      {`{"type":"x","credential_ids":["age"]}`, dcql, ""},
+		"dcql credential without id: refused":             {`{"type":"x","credential_ids":[""]}`, json.RawMessage(`{"credentials":[{}]}`), "requires a dcql_query"},
+		"dcql credential with null id: refused":           {`{"type":"x","credential_ids":[""]}`, json.RawMessage(`{"credentials":[{"id":null}]}`), "requires a dcql_query"},
+		"dcql credential with empty id: refused":          {`{"type":"x","credential_ids":[""]}`, json.RawMessage(`{"credentials":[{"id":""}]}`), "requires a dcql_query"},
+		"empty id beside a valid one: empty not nameable": {`{"type":"x","credential_ids":[""]}`, json.RawMessage(`{"credentials":[{"id":"pay"},{"id":""}]}`), `references ""`},
+		"valid id beside an empty one: still accepted":    {`{"type":"x","credential_ids":["pay"]}`, json.RawMessage(`{"credentials":[{"id":""},{"id":"pay"}]}`), ""},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {

@@ -89,7 +89,7 @@ func TestRequestMatchWithClientMetadata_SendsIt(t *testing.T) {
 	defer cleanup()
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	_, _ = h.RequestMatchWithClientMetadata(ctx, json.RawMessage(`{"credentials":[]}`), json.RawMessage(zkpClientMetadata))
+	_, _ = h.RequestMatchWithClientMetadata(ctx, json.RawMessage(`{"credentials":[]}`), &VerifiedRequestInputs{ClientMetadata: json.RawMessage(zkpClientMetadata)})
 
 	msg := awaitMessage(t, received, "match_request")
 	cm, ok := msg["client_metadata"].(map[string]any)

@@ -252,8 +252,26 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	heartbeat := time.NewTicker(wmpSSEHeartbeatInterval)
 	defer heartbeat.Stop()
 
+	// The bearer token was only checked when the stream opened. It expires, or is
+	// revoked (per jti, per user, per refresh-token family), while the stream is
+	// open, so it is validated again with the same checks before every batch of
+	// events and on every heartbeat. Fail closed: any failure ends the stream (the
+	// session and its replayable events stay; the client reconnects with a valid
+	// token).
+	stillAuthorized := func() bool {
+		cur, err := a.manager.validateTokenAuth(ctx, token)
+		if err != nil || cur.UserID != id.UserID || cur.TenantID != id.TenantID || cur.JTI != id.JTI {
+			a.logger.Info("WMP SSE closed - token no longer valid", zap.String("session_id", shortID(sessionID)))
+			return false
+		}
+		return true
+	}
+
 	for {
 		events, wake := buf.after(cursor)
+		if len(events) > 0 && !stillAuthorized() {
+			return
+		}
 		for _, ev := range events {
 			// A superseded or closed stream must not keep replaying: each write
 			// gets a fresh deadline, so a slow reader could drag a long batch on.
@@ -290,6 +308,9 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 		case <-heartbeat.C:
 			// Comment frame: ignored by SSE clients, but forces a write so
 			// a dead socket is detected within the bounded write deadline.
+			if !stillAuthorized() {
+				return
+			}
 			armWrite()
 			if _, err := io.WriteString(w, ": keepalive\n\n"); err != nil {
 				return
@@ -376,13 +397,16 @@ func (a *WMPAdapter) tokenCoversSession(sessionID string, tac claims.TAC, enforc
 		return false
 	}
 	sess := ws.session
-	if sess.TACEnforced || sess.TAC != "" {
-		return sess.TAC.IsSubsetOf(tac)
-	}
-	// Legacy-created session.
+	// A legacy token has no TAC concept and, exactly like authorizeProtocol, is
+	// exempt from the session's permissions: it must not be refused here while the
+	// same token may drive the session.
 	if !enforce && tac == "" {
 		return true
 	}
+	if sess.TACEnforced || sess.TAC != "" {
+		return sess.TAC.IsSubsetOf(tac)
+	}
+	// Legacy-created session (a legacy token returned above).
 	return legacySessionEffectiveTAC().IsSubsetOf(tac)
 }
 

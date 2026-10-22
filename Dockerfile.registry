@@ -25,7 +25,7 @@ COPY . .
 # Build the main server binary (the registry role is part of it)
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
-    -o server cmd/server/main.go
+    -o server ./cmd/server
 
 # Data directory for the VCTM cache - copied with correct ownership
 RUN mkdir -p /app/data

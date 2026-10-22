@@ -207,9 +207,14 @@ type Manager struct {
 	sessionsMu sync.RWMutex
 	sessions   map[string]*Session  // sessionID -> session (active connections only)
 	userIndex  map[userKey]*Session // (tenant, user) -> session (last connection wins)
-	// draining is set under sessionsMu by Drain/Close and never cleared: no
-	// connection may register once it is set.
-	draining bool
+	// draining is set by Drain/Close and never cleared: no connection may
+	// register once it is set. Atomic so Drain never waits for sessionsMu, which
+	// a registration holds across session-store I/O.
+	draining atomic.Bool
+	// drainOnce/drainCh: Drain closes drainCh, cancelling the store I/O of
+	// in-flight registrations (see storeCtx) so they release sessionsMu.
+	drainOnce sync.Once
+	drainCh   chan struct{}
 	// beforeRegisterHook (tests only) runs just before registerSession.
 	beforeRegisterHook func()
 
@@ -272,6 +277,7 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 			WriteBufferSize: 4096,
 			CheckOrigin:     ws.CheckOriginFromConfig(cfg),
 		},
+		drainCh:         make(chan struct{}),
 		sessions:        make(map[string]*Session),
 		userIndex:       make(map[userKey]*Session),
 		revokedUsers:    make(map[string]struct{}),
@@ -826,9 +832,9 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 func (m *Manager) registerSession(session *Session) bool {
 	m.sessionsMu.Lock()
 
-	// Drain gate: Close/Drain flip draining under this lock, so a registration
-	// is either closed by Close's sweep or refused here.
-	if m.draining {
+	// Drain gate: a registration that passed this check before Drain is swept by
+	// Close, which takes sessionsMu and so waits for it; any later one is refused.
+	if m.draining.Load() {
 		m.sessionsMu.Unlock()
 		session.closeWithReason("server shutting down")
 		return false
@@ -852,6 +858,10 @@ func (m *Manager) registerSession(session *Session) bool {
 
 	// Close the existing session for this (tenant, user); other tenants are untouched.
 	// Skipped for anonymous sessions.
+	// Store I/O below runs under sessionsMu: it is bounded and ends when the
+	// manager drains, so a stalled store cannot hold up shutdown.
+	storeCtx, storeCancel := m.storeCtx()
+	defer storeCancel()
 	if session.UserID != "" {
 		if existing, ok := m.userIndex[session.userKey()]; ok {
 			superseded = existing
@@ -861,7 +871,7 @@ func (m *Manager) registerSession(session *Session) bool {
 			delete(m.sessions, existing.ID)
 			// Also remove from persistent store
 			if m.sessionStore != nil {
-				_ = m.sessionStore.Delete(context.Background(), existing.ID)
+				_ = m.sessionStore.Delete(storeCtx, existing.ID)
 			}
 		}
 	}
@@ -880,7 +890,7 @@ func (m *Manager) registerSession(session *Session) bool {
 			CreatedAt: time.Now(),
 			ExpiresAt: time.Now().Add(24 * time.Hour), // TODO: configurable
 		}
-		if err := m.sessionStore.Put(context.Background(), sessionData); err != nil {
+		if err := m.sessionStore.Put(storeCtx, sessionData); err != nil {
 			m.logger.Warn("Failed to persist session", zap.Error(err))
 		}
 	}
@@ -1039,16 +1049,24 @@ func (m *Manager) validateTokenFull(ctx context.Context, tokenString string) (us
 		return result.UserID, result.TenantID, result.TAC, result.JTI, result.Mode != claims.ModeLegacy, nil
 	}
 
-	// Legacy path: direct HMAC validation. Unlike the go-tokenauth branch
-	// above, nothing else in this path ever checks revocation at all, so
-	// both checks below are needed, not just the user-level one (#391
-	// review, round 2).
+	// Legacy path: direct HMAC validation, only while legacy is enabled.
+	if !m.cfg.LegacyEnabled() {
+		return "", "", "", "", false, errors.New("legacy tokens are disabled")
+	}
+
+	// Nothing else on this path checks revocation, so both checks below are
+	// needed.
+	// Pin iss = jwt.issuer; an empty value would disable the check
+	// (golang-jwt), so fail closed.
+	if m.cfg.JWT.Issuer == "" {
+		return "", "", "", "", false, errors.New("jwt issuer not configured")
+	}
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, errors.New("unexpected signing method")
 		}
 		return []byte(m.cfg.JWT.Secret), nil
-	}, jwt.WithLeeway(config.JWTLeeway))
+	}, jwt.WithLeeway(config.JWTLeeway), jwt.WithIssuer(m.cfg.JWT.Issuer))
 
 	if err != nil {
 		return "", "", "", "", false, err
@@ -1295,24 +1313,47 @@ func (s *Session) closeWithReason(reason string) {
 // Drain stops accepting new connections and sessions (upgrades get 503,
 // in-flight handshakes are refused). Existing sessions run; Close ends them.
 // Idempotent.
+//
+// Drain never blocks: it takes no lock and cancels the store I/O of in-flight
+// registrations, which hold sessionsMu while they talk to the session store.
 func (m *Manager) Drain() {
-	m.sessionsMu.Lock()
-	m.draining = true
-	m.sessionsMu.Unlock()
+	m.draining.Store(true)
+	if m.drainCh != nil {
+		m.drainOnce.Do(func() { close(m.drainCh) })
+	}
 }
 
 func (m *Manager) isDraining() bool {
-	m.sessionsMu.RLock()
-	defer m.sessionsMu.RUnlock()
-	return m.draining
+	return m.draining.Load()
+}
+
+// sessionStoreOpTimeout bounds one session-store call made under sessionsMu.
+const sessionStoreOpTimeout = 5 * time.Second
+
+// storeCtx returns a context for store I/O made while holding sessionsMu: it
+// expires after sessionStoreOpTimeout and is cancelled as soon as Drain runs.
+func (m *Manager) storeCtx() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), sessionStoreOpTimeout)
+	if m.drainCh == nil {
+		return ctx, cancel
+	}
+	stop := make(chan struct{})
+	go func() {
+		select {
+		case <-m.drainCh:
+			cancel()
+		case <-stop:
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, func() { close(stop); cancel() }
 }
 
 // Close drains the manager, then closes all sessions.
 func (m *Manager) Close() {
+	m.Drain()
 	m.sessionsMu.Lock()
 	defer m.sessionsMu.Unlock()
-
-	m.draining = true
 
 	for _, session := range m.sessions {
 		_ = session.currentTransport().Close()
@@ -1634,8 +1675,14 @@ func (s *Session) RequestMatch(ctx context.Context, flowID string, dcql json.Raw
 }
 
 // RequestMatchWithClientMetadata is RequestMatch that also hands the client the
-// verifier's client_metadata object (verbatim; nil omits it).
-func (s *Session) RequestMatchWithClientMetadata(ctx context.Context, flowID string, dcql, clientMetadata json.RawMessage) (*MatchResponseMessage, error) {
+// validated request inputs (nil omits them), including the verifier's
+// client_metadata object verbatim, which is also kept at its original
+// top-level member for older clients.
+func (s *Session) RequestMatchWithClientMetadata(ctx context.Context, flowID string, dcql json.RawMessage, request *VerifiedRequestInputs) (*MatchResponseMessage, error) {
+	var clientMetadata json.RawMessage
+	if request != nil {
+		clientMetadata = request.ClientMetadata
+	}
 	messageID := uuid.New().String()
 
 	msg := MatchRequestMessage{
@@ -1645,8 +1692,9 @@ func (s *Session) RequestMatchWithClientMetadata(ctx context.Context, flowID str
 			MessageID: messageID,
 			Timestamp: Now(),
 		},
-		DCQLQuery:      dcql,
-		ClientMetadata: clientMetadata,
+		DCQLQuery:       dcql,
+		ClientMetadata:  clientMetadata,
+		VerifiedRequest: request,
 	}
 
 	if err := s.Send(&msg); err != nil {

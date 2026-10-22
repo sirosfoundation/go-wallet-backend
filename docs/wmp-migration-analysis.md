@@ -713,7 +713,8 @@ Server → Client: wmp.flow.start request (blocks until the client acks it,
   }
 }
 // match: params = {"dcql_query": {...}, "parent_flow_id": "flow-123",
-//                   "client_metadata": {...}}   // client_metadata optional
+//                   "client_metadata": {...},    // optional
+//                   "verified_request": {...}}   // optional
 
 Client → Server: result of flow.start (acknowledges the child flow)
 
@@ -733,12 +734,21 @@ The optional verifier `client_metadata` object (verbatim; see "Verifier
 - `wmp.flow.progress` with `step: "credential_selection"`: as
   `payload.client_metadata` (the payload is forwarded unchanged).
 - the `match` sub-flow's `wmp.flow.start` `params.client_metadata`.
-- the `sign` sub-flow's `params.client_metadata`: **not yet carried.**
-  `openid4x.SignSubFlowParams` is defined in the `go-wmp` module (v0.6.2 has no
-  such field), so the adapter cannot forward it until go-wmp adds
-  a `client_metadata` (json.RawMessage, omitempty) member and
-  this module bumps the dependency. Until then a WMP client takes it from the
-  `credential_selection` progress / `match` params.
+- the `sign` sub-flow's `params.client_metadata` (`openid4x.SignSubFlowParams.ClientMetadata`,
+  added in go-wmp v0.7.0; omitted when the request had none).
+
+#### `verified_request` over WMP
+
+The optional `verified_request` object (the request as the engine validated it;
+see "Verified request inputs" in `websocket-protocol-spec.md` and WMP OpenID4X
+profile Section 7.5) reaches a WMP client on:
+
+- `wmp.flow.progress` with `step: "credential_selection"`: as
+  `payload.verified_request` (the payload is forwarded unchanged).
+- the `match` sub-flow's `wmp.flow.start` `params.verified_request`.
+- the `sign` sub-flow's `params.verified_request`
+  (`openid4x.SignSubFlowParams.VerifiedRequest`, added in go-wmp v0.8.0; omitted
+  when the engine sent none).
 
 For `direct_post.jwt` the engine no longer sends an empty
 `verifier_jwk_thumbprint`: if the verifier's response-encryption key cannot be

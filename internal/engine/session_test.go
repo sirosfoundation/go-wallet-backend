@@ -108,7 +108,7 @@ func signEngineToken(t *testing.T, key *ecdsa.PrivateKey, issuer string, cl clai
 // len(m.sessions), which is populated post-handshake — letting an attacker
 // open unlimited unauthenticated connections without ever being counted.
 func TestManager_ConnectionLimit_CountsUnhandshakedConnections(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 
 	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
@@ -139,7 +139,7 @@ func TestManager_ConnectionLimit_CountsUnhandshakedConnections(t *testing.T) {
 // activeConnections is at capacity, new connection attempts are rejected with
 // 503 even if m.sessions is empty (i.e. even if nobody has handshaked yet).
 func TestManager_ConnectionLimit_RejectsAtCapacity(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 	m.activeConnections.Store(maxConnections)
 
@@ -167,7 +167,7 @@ func TestManager_ConnectionLimit_RejectsAtCapacity(t *testing.T) {
 // attempts to fire at once, to maximize genuine concurrent contention on
 // the counter.
 func TestManager_ConnectionLimit_NoOvershootUnderConcurrency(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 
 	const room = 5 // slots left before the limit
@@ -221,12 +221,14 @@ func TestManager_validateToken_UserID(t *testing.T) {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
 			Secret: "test-secret",
+			Issuer: "test-issuer",
 		},
 	}
 	logger := zap.NewNop()
 	m := NewManager(cfg, logger)
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":       "test-issuer",
 		"user_id":   "test-user-123",
 		"tenant_id": "test-tenant",
 		"exp":       time.Now().Add(time.Hour).Unix(),
@@ -249,12 +251,14 @@ func TestManager_validateToken_UUID(t *testing.T) {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
 			Secret: "test-secret",
+			Issuer: "test-issuer",
 		},
 	}
 	logger := zap.NewNop()
 	m := NewManager(cfg, logger)
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":  "test-issuer",
 		"uuid": "uuid-user-456",
 		"v":    1, // wallet-backend-server includes version
 		"exp":  time.Now().Add(time.Hour).Unix(),
@@ -273,12 +277,14 @@ func TestManager_validateToken_UserIDTakesPrecedence(t *testing.T) {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
 			Secret: "test-secret",
+			Issuer: "test-issuer",
 		},
 	}
 	logger := zap.NewNop()
 	m := NewManager(cfg, logger)
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     "test-issuer",
 		"user_id": "native-user",
 		"uuid":    "compat-user",
 		"exp":     time.Now().Add(time.Hour).Unix(),
@@ -295,6 +301,7 @@ func TestManager_validateToken_MissingBothUserIDAndUUID(t *testing.T) {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
 			Secret: "test-secret",
+			Issuer: "test-issuer",
 		},
 	}
 	logger := zap.NewNop()
@@ -302,6 +309,7 @@ func TestManager_validateToken_MissingBothUserIDAndUUID(t *testing.T) {
 
 	// Create token without user_id or uuid
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":              "test-issuer",
 		"some_other_claim": "value",
 		"exp":              time.Now().Add(time.Hour).Unix(),
 	})
@@ -317,6 +325,7 @@ func TestManager_validateToken_InvalidSigningMethod(t *testing.T) {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
 			Secret: "test-secret",
+			Issuer: "test-issuer",
 		},
 	}
 	logger := zap.NewNop()
@@ -337,6 +346,7 @@ func TestManager_validateToken_ExpiredToken(t *testing.T) {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
 			Secret: "test-secret",
+			Issuer: "test-issuer",
 		},
 	}
 	logger := zap.NewNop()
@@ -344,6 +354,7 @@ func TestManager_validateToken_ExpiredToken(t *testing.T) {
 
 	// Create expired token
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     "test-issuer",
 		"user_id": "test-user",
 		"exp":     time.Now().Add(-time.Hour).Unix(),
 	})
@@ -358,12 +369,14 @@ func TestManager_validateToken_WrongSecret(t *testing.T) {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
 			Secret: "correct-secret",
+			Issuer: "test-issuer",
 		},
 	}
 	logger := zap.NewNop()
 	m := NewManager(cfg, logger)
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     "test-issuer",
 		"user_id": "test-user",
 		"exp":     time.Now().Add(time.Hour).Unix(),
 	})
@@ -378,6 +391,7 @@ func TestManager_validateToken_NbfSlightlyInFuture(t *testing.T) {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
 			Secret: "test-secret",
+			Issuer: "test-issuer",
 		},
 	}
 	logger := zap.NewNop()
@@ -385,6 +399,7 @@ func TestManager_validateToken_NbfSlightlyInFuture(t *testing.T) {
 
 	// Token with nbf 2 seconds in the future — within the 5s leeway
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     "test-issuer",
 		"user_id": "test-user",
 		"nbf":     time.Now().Add(2 * time.Second).Unix(),
 		"exp":     time.Now().Add(time.Hour).Unix(),
@@ -401,6 +416,7 @@ func TestManager_validateToken_NbfBeyondLeeway(t *testing.T) {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
 			Secret: "test-secret",
+			Issuer: "test-issuer",
 		},
 	}
 	logger := zap.NewNop()
@@ -408,6 +424,7 @@ func TestManager_validateToken_NbfBeyondLeeway(t *testing.T) {
 
 	// Token with nbf 10 seconds in the future — beyond the 5s leeway
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     "test-issuer",
 		"user_id": "test-user",
 		"nbf":     time.Now().Add(10 * time.Second).Unix(),
 		"exp":     time.Now().Add(time.Hour).Unix(),
@@ -424,7 +441,7 @@ func TestManager_validateToken_NbfBeyondLeeway(t *testing.T) {
 // transport, like the AuthZEN proxy, only needs a wallet-registry or
 // wallet-backend audience.
 func TestManager_validateToken_GoTokenauth_AllowsRegistryAudience(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 	v, key, issuer := setupEngineTokenValidatorTest(t)
 	m.SetTokenValidator(v)
@@ -446,7 +463,7 @@ func TestManager_validateToken_GoTokenauth_AllowsRegistryAudience(t *testing.T) 
 // token scoped to a different audience is not usable on the engine
 // transport, mirroring the AuthZEN proxy restriction.
 func TestManager_validateToken_GoTokenauth_RejectsOtherAudience(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 	v, key, issuer := setupEngineTokenValidatorTest(t)
 	m.SetTokenValidator(v)
@@ -487,7 +504,7 @@ func (f *fakeEngineBlacklist) IsFamilyRevoked(ctx context.Context, sid string) b
 // own Revocation checker only ever sees a jti, never a user_id - so
 // DeleteUser's bulk revocation would otherwise never be consulted here.
 func TestManager_validateToken_GoTokenauth_RevokedUserDenied(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 	v, key, issuer := setupEngineTokenValidatorTest(t)
 	m.SetTokenValidator(v)
@@ -510,11 +527,12 @@ func TestManager_validateToken_GoTokenauth_RevokedUserDenied(t *testing.T) {
 // revocation check at all - a deleted user's (or explicitly logged-out)
 // legacy token could still establish an engine session.
 func TestManager_validateToken_Legacy_RevokedJTIDenied(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 	m.SetTokenBlacklist(&fakeEngineBlacklist{revoked: map[string]bool{"jti-revoked": true}})
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     "test-issuer",
 		"user_id": "test-user-123",
 		"jti":     "jti-revoked",
 		"exp":     time.Now().Add(time.Hour).Unix(),
@@ -527,11 +545,12 @@ func TestManager_validateToken_Legacy_RevokedJTIDenied(t *testing.T) {
 }
 
 func TestManager_validateToken_Legacy_RevokedUserDenied(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 	m.SetTokenBlacklist(&fakeEngineBlacklist{revokedUsers: map[string]bool{"test-user-123": true}})
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     "test-issuer",
 		"user_id": "test-user-123",
 		"jti":     "jti-not-individually-blacklisted",
 		"exp":     time.Now().Add(time.Hour).Unix(),
@@ -547,7 +566,7 @@ func TestManager_validateToken_Legacy_RevokedUserDenied(t *testing.T) {
 // for the two tests above: the same blacklist wiring still allows a
 // non-revoked legacy token through.
 func TestManager_validateToken_Legacy_NonRevokedAllowed(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 	m.SetTokenBlacklist(&fakeEngineBlacklist{
 		revoked:      map[string]bool{"some-other-jti": true},
@@ -555,6 +574,7 @@ func TestManager_validateToken_Legacy_NonRevokedAllowed(t *testing.T) {
 	})
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     "test-issuer",
 		"user_id": "test-user-123",
 		"jti":     "jti-fine",
 		"exp":     time.Now().Add(time.Hour).Unix(),
@@ -645,7 +665,7 @@ func (stubFlowHandler) Cancel()                                                 
 
 func newManagerWithStubOID4VCIHandler(t *testing.T) *Manager {
 	t.Helper()
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 	m.RegisterFlowHandler(ProtocolOID4VCI, func(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
 		return stubFlowHandler{}, nil
@@ -1023,6 +1043,7 @@ func dialAndHandshakeAsUser(t *testing.T, m *Manager, wsURL, userID string) *web
 	t.Helper()
 
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     "test-issuer",
 		"user_id": userID,
 		"exp":     time.Now().Add(time.Hour).Unix(),
 	})
@@ -1064,7 +1085,7 @@ func dialAndHandshakeAsUser(t *testing.T, m *Manager, wsURL, userID string) *web
 // connection is actually closed by the server, not merely that a fresh
 // handshake attempt would now be rejected.
 func TestManager_CloseUserSessions_ClosesLiveConnection(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 
 	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
@@ -1101,7 +1122,7 @@ func TestManager_CloseUserSessions_ClosesLiveConnection(t *testing.T) {
 // not just the single entry Manager.userIndex happens to hold ("last
 // connection wins" - see registerSession).
 func TestManager_CloseUserSessions_ClosesAllOfThatUsersSessions(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 
 	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
@@ -1155,7 +1176,7 @@ func TestManager_CloseUserSessions_ClosesAllOfThatUsersSessions(t *testing.T) {
 // guarding against the most dangerous possible bug in this feature: closing
 // account A's session must never close account B's.
 func TestManager_CloseUserSessions_NeverTouchesOtherUsers(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 
 	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
@@ -1209,7 +1230,7 @@ func TestManager_CloseUserSessions_NeverTouchesOtherUsers(t *testing.T) {
 // SessionStore's own DeleteByUser (see cmd/server/main.go). Manager itself
 // duck-types service.SessionCleaner without engine importing that package.
 func TestManager_DeleteByUser_ClosesLiveConnection(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 
 	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
@@ -1233,7 +1254,7 @@ func TestManager_DeleteByUser_ClosesLiveConnection(t *testing.T) {
 // session also has UserID == "", so matching on an empty string would
 // close all of them.
 func TestManager_CloseUserSessions_EmptyUserIDIsNoOp(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 
 	assert.Zero(t, m.CloseUserSessions("", "account deleted"))
@@ -1254,7 +1275,7 @@ func TestManager_CloseUserSessions_EmptyUserIDIsNoOp(t *testing.T) {
 // than trying to win an actual goroutine race against real handshake
 // timing.
 func TestManager_RegisterSession_RejectsAlreadyRevokedUser(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 	m.SetTokenBlacklist(&fakeEngineBlacklist{revokedUsers: map[string]bool{"already-revoked-user": true}})
 
@@ -1304,7 +1325,7 @@ func TestManager_RegisterSession_RejectsAlreadyRevokedUser(t *testing.T) {
 // TestManager_RegisterSession_RejectsAlreadyRevokedUser, but drives the
 // rejection through RevokeUser instead of a fake blacklist.
 func TestManager_RegisterSession_RejectsRevokedUser_WithoutBlacklistFeature(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 	// Deliberately no SetTokenBlacklist call: m.blacklist stays nil.
 	m.RevokeUser("already-revoked-user")
@@ -1353,7 +1374,7 @@ func TestManager_RegisterSession_RejectsRevokedUser_WithoutBlacklistFeature(t *t
 // all (no SetTokenBlacklist call, legacy HMAC auth path, m.blacklist is
 // nil throughout).
 func TestManager_DeleteByUser_WorksWithoutTokenBlacklistFeature(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 
 	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
@@ -1377,6 +1398,7 @@ func TestManager_DeleteByUser_WorksWithoutTokenBlacklistFeature(t *testing.T) {
 	// A brand new handshake attempt for the same (now-revoked) user must
 	// also be rejected - not just the already-open session closed.
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     "test-issuer",
 		"user_id": userID,
 		"exp":     time.Now().Add(time.Hour).Unix(),
 	})
@@ -1423,7 +1445,7 @@ func TestHandleNewConnection_TACEnforcementByProvenance(t *testing.T) {
 		})
 	}
 	legacy, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id": "u2", "tenant_id": "test-tenant", "exp": time.Now().Add(time.Hour).Unix(),
+		"iss": "test-issuer", "user_id": "u2", "tenant_id": "test-tenant", "exp": time.Now().Add(time.Hour).Unix(),
 	}).SignedString([]byte("test-secret"))
 	require.NoError(t, err)
 
@@ -1608,6 +1630,7 @@ func TestMemorySessionStore_DeleteByUser_AllTenants(t *testing.T) {
 func handshakeNoWait(t *testing.T, m *Manager, wsURL, userID string) *websocket.Conn {
 	t.Helper()
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     "test-issuer",
 		"user_id": userID,
 		"exp":     time.Now().Add(time.Hour).Unix(),
 	})
@@ -1625,7 +1648,7 @@ func handshakeNoWait(t *testing.T, m *Manager, wsURL, userID string) *websocket.
 // A connection authenticated before Close but not yet registered must be
 // refused at registration, not land in the cleared maps.
 func TestManager_Close_ConnectionBetweenCloseAndRegisterDoesNotSurvive(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 
 	reached := make(chan struct{})
