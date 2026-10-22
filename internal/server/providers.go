@@ -46,8 +46,12 @@ type AuthProvider struct {
 }
 
 // NewAuthProvider creates a new auth route provider
+// newServices is a variable so tests can count constructions: each Services may
+// own an HSM-backed wallet-provider signer, so the backend role builds one.
+var newServices = service.NewServices
+
 func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logger, roles []string) *AuthProvider {
-	services := service.NewServices(store, cfg, logger)
+	services := newServices(store, cfg, logger)
 	services.Start()
 	handlers := api.NewHandlers(services, cfg, logger, roles)
 	return &AuthProvider{
@@ -67,6 +71,26 @@ func (p *AuthProvider) Name() string         { return "auth" }
 
 // Services returns the auth provider's service aggregate.
 func (p *AuthProvider) Services() *service.Services { return p.services }
+
+// legacyIssuanceGate answers 410 on the /user/* routes that mint HS256 tokens
+// when as.legacy.enabled=false. It must precede any OIDC gate.
+func (p *AuthProvider) legacyIssuanceGate() gin.HandlerFunc {
+	return middleware.LegacyIssuanceGate(p.cfg.LegacyEnabled())
+}
+
+// LogLegacyTokenStatus logs whether legacy (HMAC) tokens are enabled. It is
+// called once per process from cmd/server/main.go; providers must not call it.
+func LogLegacyTokenStatus(cfg *config.Config, logger *zap.Logger) {
+	for _, name := range cfg.DeprecatedSettings() {
+		logger.Warn("Deprecated configuration setting is ignored and has no effect; sunsetting the legacy AS is done only by as.legacy.enabled=false",
+			zap.String("setting", name))
+	}
+	if cfg.LegacyEnabled() {
+		logger.Info("Legacy HMAC session tokens are enabled (as.legacy.enabled=true)")
+		return
+	}
+	logger.Warn("Legacy HMAC session tokens are DISABLED (as.legacy.enabled=false): HMAC validation is refused and legacy issuance answers 410")
+}
 
 // Close stops background workers in the auth provider.
 func (p *AuthProvider) Close() error {
@@ -92,6 +116,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		registration.Use(
 			middleware.NoCacheMiddleware(),
 			gateLimit,
+			p.legacyIssuanceGate(),
 			middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeRegistration, p.logger),
 		)
 		{
@@ -104,6 +129,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		login.Use(
 			middleware.NoCacheMiddleware(),
 			gateLimit,
+			p.legacyIssuanceGate(),
 			middleware.OIDCGateMiddleware(validatorCache, middleware.GateTypeLogin, p.logger),
 		)
 		{
@@ -134,7 +160,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		// 404, indistinguishable from any other unsupported endpoint.
 		if p.cfg.JWT.RefreshDays > 0 {
 			refresh := userBase.Group("/session")
-			refresh.Use(middleware.NoCacheMiddleware())
+			refresh.Use(middleware.NoCacheMiddleware(), p.legacyIssuanceGate())
 			{
 				refresh.POST("/refresh", p.handlers.RefreshToken)
 			}
@@ -299,7 +325,7 @@ type StorageProvider struct {
 
 // NewStorageProvider creates a new storage route provider
 func NewStorageProvider(cfg *config.Config, store backend.Backend, logger *zap.Logger, roles []string) *StorageProvider {
-	services := service.NewServices(store, cfg, logger)
+	services := newServices(store, cfg, logger)
 	handlers := api.NewHandlers(services, cfg, logger, roles)
 	return &StorageProvider{
 		cfg:      cfg,
@@ -308,6 +334,16 @@ func NewStorageProvider(cfg *config.Config, store backend.Backend, logger *zap.L
 		services: services,
 		handlers: handlers,
 	}
+}
+
+// Close releases the wallet-provider signer (a PKCS#11 session pool with an
+// HSM). It does not call services.Stop(): the blacklist is the auth provider's,
+// which AuthProvider.Close already stops.
+func (p *StorageProvider) Close() error {
+	if p.services != nil && p.services.WalletProvider != nil {
+		p.services.WalletProvider.Close()
+	}
+	return nil
 }
 
 func (p *StorageProvider) Transport() Transport { return TransportHTTP }
@@ -449,6 +485,71 @@ func (p *EngineProvider) Manager() *wsengine.Manager {
 	return p.manager
 }
 
+// StandaloneValidator is a token validator owned by a standalone engine
+// process; Close stops its JWKS refresh.
+type StandaloneValidator struct {
+	*tokenvalidator.Validator
+}
+
+// Close stops the background JWKS refresh.
+func (v StandaloneValidator) Close() error { v.Stop(); return nil }
+
+// legacyValidatorConfig builds the legacy (HMAC) validator settings. The
+// accepted issuer is pinned to jwt.issuer (what legacy tokens carry, and which
+// may differ from as.issuer) because the validator's top-level Issuer gates only
+// asymmetric tokens. Exactly one issuer: go-tokenauth enforces Issuers[0]
+// strictly. Callers must have passed requireLegacyIssuer first.
+func legacyValidatorConfig(cfg *config.Config, enabled bool) tokenvalidator.LegacyConfig {
+	lc := tokenvalidator.LegacyConfig{
+		Enabled:    enabled,
+		HMACSecret: []byte(cfg.JWT.Secret),
+	}
+	if cfg.JWT.Issuer != "" {
+		lc.Issuers = []string{cfg.JWT.Issuer}
+	}
+	return lc
+}
+
+// NewStandaloneEngineTokenValidator builds the validator for an engine without
+// a backend (--mode=engine). The JWKS comes from as.external_url; without it
+// legacy HMAC must be enabled or startup fails. Returns (nil, nil) when no
+// validator is needed.
+//
+// Limitation: a standalone engine has no revocation source (tracked in #407 and
+// #415), so a token stays valid until it expires even after logout.
+func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (*StandaloneValidator, error) {
+	if err := requireLegacyIssuer(cfg, "standalone engine"); err != nil {
+		return nil, err
+	}
+	if cfg.AS.ExternalURL == "" {
+		if !cfg.LegacyEnabled() {
+			return nil, fmt.Errorf("standalone engine with as.legacy.enabled=false needs as.external_url to fetch the AS JWKS; refusing to start with no way to authenticate connections")
+		}
+		return nil, nil
+	}
+	issuer, err := remoteASIssuer(cfg, "standalone engine")
+	if err != nil {
+		return nil, err
+	}
+	jwksURL, err := asJWKSURL(cfg)
+	if err != nil {
+		return nil, err
+	}
+	v := tokenvalidator.New(tokenvalidator.Config{
+		JWKSURL: jwksURL,
+		Issuer:  issuer,
+		// Legacy tokens carry aud = RP ID, which config validation requires in
+		// as.audiences while legacy is enabled.
+		Audiences: cfg.SessionAudiences(),
+		Legacy:    legacyValidatorConfig(cfg, cfg.LegacyEnabled()),
+	})
+	v.Start(context.Background())
+	logger.Warn("Standalone engine has no token revocation source: AS session tokens stay valid at this engine until they expire, even after logout or user revocation. Mitigate with short access token TTLs, or co-host the engine with the backend (shared blacklist).",
+		zap.String("jwks_source", "as.external_url"))
+	logger.Info("Standalone engine token validator started", zap.Bool("legacy_enabled", cfg.LegacyEnabled()))
+	return &StandaloneValidator{Validator: v}, nil
+}
+
 // SetRegistryHandler wires a co-located registry (see
 // RegistryProvider.InProcessHandler) into the engine's VCTM client.
 func (p *EngineProvider) SetRegistryHandler(h http.Handler) { p.manager.SetRegistryHandler(h) }
@@ -498,13 +599,9 @@ func (p *EngineProvider) CheckReady(ctx context.Context) error {
 	return nil
 }
 
-// blacklistRevocationChecker adapts *service.TokenBlacklist to
-// go-tokenauth's revocation.Checker interface (IsRevoked vs. the service
-// package's own IsBlacklisted method name), so a token revoked via
-// Logout/DeleteUser (#382/#383) is honored for AS-issued (and legacy)
-// tokens validated through go-tokenauth's Validator - the path taken
-// whenever AS is enabled - not only for tokens validated through the
-// standalone legacy path (middleware.AuthMiddlewareWithBlacklist).
+// blacklistRevocationChecker adapts *service.TokenBlacklist to go-tokenauth's
+// revocation.Checker so Logout/DeleteUser revocation (#382/#383) is honored by
+// the Validator path.
 type blacklistRevocationChecker struct {
 	blacklist *service.TokenBlacklist
 }
@@ -532,8 +629,45 @@ type BackendProvider struct {
 	logger           *zap.Logger
 }
 
+// requireSessionAuthMechanism refuses to start a role whose protected routes
+// would all return 401: as.enabled=false builds no JWKS validator and
+// as.legacy.enabled=false refuses the HMAC fallback.
+func requireSessionAuthMechanism(cfg *config.Config, role string) error {
+	if !cfg.AS.Enabled && !cfg.LegacyEnabled() {
+		return fmt.Errorf("%s role serves protected routes but as.enabled=false and as.legacy.enabled=false leave no way to authenticate session tokens; enable the AS (as.enabled=true) or set as.legacy.enabled=true", role)
+	}
+	return requireLegacyIssuer(cfg, role)
+}
+
+// requireLegacyIssuer fails closed when legacy HMAC tokens are enabled and
+// jwt.issuer is empty: the validator would accept any token signed with the
+// shared secret whatever its iss. Checked before any resource is opened.
+func requireLegacyIssuer(cfg *config.Config, role string) error {
+	if cfg.LegacyEnabled() && cfg.JWT.Issuer == "" {
+		return fmt.Errorf("%s: jwt.issuer must not be empty while legacy HMAC session tokens are enabled (as.legacy.enabled): without it any token signed with jwt.secret would be accepted regardless of iss; set jwt.issuer or disable legacy tokens", role)
+	}
+	return nil
+}
+
+// remoteASIssuer returns the expected remote-AS issuer (as.issuer, else
+// jwt.issuer) and refuses an empty one, which would leave JWKS-signed tokens'
+// issuer unrestricted.
+func remoteASIssuer(cfg *config.Config, role string) (string, error) {
+	issuer := cfg.AS.Issuer
+	if issuer == "" {
+		issuer = cfg.JWT.Issuer
+	}
+	if issuer == "" {
+		return "", fmt.Errorf("%s: an expected issuer is required to validate tokens from the remote AS JWKS; set as.issuer or jwt.issuer", role)
+	}
+	return issuer, nil
+}
+
 // NewBackendProvider creates a combined auth+storage provider
 func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) (*BackendProvider, error) {
+	if err := requireSessionAuthMechanism(cfg, "backend"); err != nil {
+		return nil, err
+	}
 	// Initialize storage backend
 	initCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	store, err := backend.New(initCtx, cfg)
@@ -581,21 +715,17 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		return nil, fmt.Errorf("failed to initialize AuthZEN proxy: %w", err)
 	}
 
-	// Auth provider is constructed before the AS module and storage provider
-	// below so its Services.TokenBlacklist (created, and Start()-ed, right
-	// here) can be handed to both of them instead of each building its own,
-	// unshared instance - see #382/#383: a token blacklisted via Logout or
-	// DeleteUser (both served by authProvider.handlers) must be honored by
-	// every request path in this process, not only the one that happened to
-	// construct the blacklist it was written to.
+	// Built first so its TokenBlacklist is shared by the AS module and storage
+	// provider (#382/#383).
 	authProvider := NewAuthProvider(cfg, store, logger, roles)
 
 	// Initialize AS module when enabled.
 	var asModule *as.ASModule
 	var tv *tokenvalidator.Validator
 	if cfg.AS.Enabled {
-		services := service.NewServices(store, cfg, logger)
-		services.TokenBlacklist = authProvider.services.TokenBlacklist
+		// Reuse the auth provider's Services: a second NewServices would open
+		// another PKCS#11 signer nothing stops. authProvider.Close() owns it.
+		services := authProvider.services
 		asModule, err = as.NewASModule(
 			context.Background(),
 			&cfg.AS,
@@ -621,16 +751,26 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 		asModule.SetOIDCGateRateLimiter(authProvider.gateRateLimiter)
 
 		// Create go-tokenauth validator for protecting resource endpoints.
-		jwksURL := tokenJWKSURL(cfg)
-		// Same blacklist as everything else in this process (#382/#383) -
-		// without this, AS-issued/legacy tokens validated through
-		// go-tokenauth (the path taken whenever AS is enabled, i.e. the
-		// common case) would never consult the blacklist at all, since
-		// go-tokenauth's Validator has its own independent validation
-		// path that AuthMiddlewareWithBlacklist's check is never reached
-		// by.
-		tv = buildTokenValidator(cfg, cfg.AS.Audiences,
-			blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist})
+		issuer := cfg.AS.Issuer
+		if issuer == "" {
+			issuer = cfg.JWT.Issuer
+		}
+		jwksURL, urlErr := asJWKSURL(cfg)
+		if urlErr != nil {
+			_ = asModule.Close()
+			_ = authProvider.Close()
+			_ = store.Close()
+			return nil, urlErr
+		}
+		tv = tokenvalidator.New(tokenvalidator.Config{
+			JWKSURL:   jwksURL,
+			Issuer:    issuer,
+			Audiences: cfg.AS.Audiences,
+			Legacy:    legacyValidatorConfig(cfg, cfg.AS.Legacy.Enabled),
+			// The validator has its own validation path, so the shared
+			// blacklist must be wired in here (#382/#383).
+			Revocation: blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist},
+		})
 		tv.Start(context.Background())
 		logger.Info("Authorization Server module initialized",
 			zap.String("jwks_url", jwksURL),
@@ -639,6 +779,10 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 	}
 
 	authProvider.tokenValidator = tv
+	if tv != nil {
+		// The keystore websocket handshake uses the same validator.
+		authProvider.services.Keystore.SetTokenValidator(tv)
+	}
 	storageProvider := NewStorageProvider(cfg, store, logger, roles)
 	storageProvider.tokenValidator = tv
 	// Share the auth provider's blacklist instance (see the comment above
@@ -724,8 +868,14 @@ func (p *BackendProvider) Close() error {
 	if p.auth != nil {
 		_ = p.auth.Close()
 	}
+	if p.storage != nil {
+		_ = p.storage.Close() // releases the storage aggregate's HSM sessions
+	}
 	if p.tokenValidator != nil {
 		p.tokenValidator.Stop()
+	}
+	if p.asModule != nil {
+		_ = p.asModule.Close() // releases HSM sessions
 	}
 	if p.store != nil {
 		return p.store.Close()
@@ -911,7 +1061,13 @@ func registryTokenAudiences(cfg *config.Config) []string {
 // secret).
 func registryNeedsValidator(cfg *config.Config) bool {
 	return cfg.Registry.RequireAuth || cfg.AS.ExternalURL != "" ||
-		(cfg.AS.Legacy.Enabled && cfg.JWT.Secret != "")
+		registryLegacyHMAC(cfg)
+}
+
+// registryLegacyHMAC reports whether the registry validates legacy HMAC tokens:
+// legacy is enabled and there is a secret (never validate against an empty key).
+func registryLegacyHMAC(cfg *config.Config) bool {
+	return cfg.AS.Legacy.Enabled && cfg.JWT.Secret != ""
 }
 
 // NewRegistryProvider creates a new registry route provider. Registry
@@ -958,17 +1114,53 @@ func NewRegistryProvider(cfg *config.Config, logger *zap.Logger) (*RegistryProvi
 	}
 
 	if registryNeedsValidator(cfg) {
-		// go-tokenauth v0.5 refuses to validate without an audience list.
-		// The registry's narrower rule (registry.AuthMiddlewares) is still
-		// enforced on top of it.
-		p.validator = buildTokenValidator(cfg, registryTokenAudiences(cfg), nil)
-		logger.Info("Registry token validation configured",
-			zap.String("jwks_url", tokenJWKSURL(cfg)),
-			zap.Bool("legacy_hmac", cfg.AS.Legacy.Enabled && cfg.JWT.Secret != ""),
-			zap.Bool("require_auth", rcfg.RequireAuth))
+		if err := p.buildValidator(); err != nil {
+			return nil, err
+		}
 	}
 
 	return p, nil
+}
+
+// buildValidator builds the registry's validator. Without as.external_url only
+// legacy HMAC tokens can be recognised. go-tokenauth requires an audience list;
+// the registry's narrower rule (registry.AuthMiddlewares) still applies on top.
+func (p *RegistryProvider) buildValidator() error {
+	cfg := p.cfg
+	hmac := registryLegacyHMAC(cfg)
+	if hmac {
+		if err := requireLegacyIssuer(cfg, "registry"); err != nil {
+			return err
+		}
+	}
+	tc := tokenvalidator.Config{
+		Audiences: registryTokenAudiences(cfg),
+		Legacy:    legacyValidatorConfig(cfg, hmac),
+	}
+	jwksSource := ""
+	if cfg.AS.ExternalURL != "" {
+		issuer, err := remoteASIssuer(cfg, "registry")
+		if err != nil {
+			return err
+		}
+		jwksURL, err := asJWKSURL(cfg)
+		if err != nil {
+			return err
+		}
+		tc.JWKSURL, tc.Issuer = jwksURL, issuer
+		jwksSource = "as.external_url"
+	} else {
+		tc.Issuer = cfg.AS.Issuer
+		if tc.Issuer == "" {
+			tc.Issuer = cfg.JWT.Issuer
+		}
+	}
+	p.validator = tokenvalidator.New(tc)
+	p.logger.Info("Registry token validation configured",
+		zap.String("jwks_source", jwksSource),
+		zap.Bool("legacy_hmac", hmac),
+		zap.Bool("require_auth", p.rcfg.RequireAuth))
+	return nil
 }
 
 // SetTenantLookup lets a co-located backend supply its tenant store so tokens
@@ -1116,12 +1308,15 @@ type WalletProviderProvider struct {
 
 // NewWalletProviderProvider creates a new isolated wallet-provider.
 func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletProviderProvider, error) {
+	if err := requireSessionAuthMechanism(cfg, "wallet-provider"); err != nil {
+		return nil, err
+	}
 	store, err := backend.New(context.Background(), cfg)
 	if err != nil {
 		return nil, fmt.Errorf("create backend: %w", err)
 	}
 
-	services := service.NewServices(store, cfg, logger)
+	services := newServices(store, cfg, logger)
 	// HasSigningKey (not IsSupported): a cert-less signing key is a valid
 	// standalone deployment when only "ietf"-mode WIA is needed. Key
 	// Attestation generation (registered unconditionally below) still
@@ -1139,12 +1334,37 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 	// isolated wallet-provider deployments would reject valid AS-issued
 	// access tokens — only legacy HMAC JWTs would work.
 	var tv *tokenvalidator.Validator
-	if cfg.AS.Enabled {
-		// See NewBackendProvider's identical wiring (#382/#383). This
-		// provider's own services.TokenBlacklist is fine used as-is here:
-		// it never runs co-hosted with BackendProvider (see cmd/server).
-		tv = buildTokenValidator(cfg, cfg.AS.Audiences,
-			blacklistRevocationChecker{blacklist: services.TokenBlacklist})
+	//
+	// Without as.external_url there is no JWKS: fall back to HMAC-only
+	// (nil validator) if legacy is enabled, else fail startup.
+	if cfg.AS.Enabled && cfg.AS.ExternalURL == "" {
+		if !cfg.LegacyEnabled() {
+			services.Stop()
+			_ = store.Close()
+			return nil, fmt.Errorf("wallet-provider with as.enabled=true and as.legacy.enabled=false needs as.external_url to fetch the AS JWKS; refusing to start with no way to authenticate session tokens")
+		}
+		logger.Warn("wallet-provider: as.external_url is not set; ES256 session tokens cannot be validated, using legacy HMAC validation only")
+	} else if cfg.AS.Enabled {
+		issuer, issuerErr := remoteASIssuer(cfg, "wallet-provider")
+		if issuerErr != nil {
+			services.Stop()
+			_ = store.Close()
+			return nil, issuerErr
+		}
+		jwksURL, urlErr := asJWKSURL(cfg)
+		if urlErr != nil {
+			services.Stop()
+			_ = store.Close()
+			return nil, urlErr
+		}
+		tv = tokenvalidator.New(tokenvalidator.Config{
+			JWKSURL:   jwksURL,
+			Issuer:    issuer,
+			Audiences: cfg.AS.Audiences,
+			Legacy:    legacyValidatorConfig(cfg, cfg.AS.Legacy.Enabled),
+			// Own blacklist: never co-hosted with BackendProvider (see cmd/server).
+			Revocation: blacklistRevocationChecker{blacklist: services.TokenBlacklist},
+		})
 		tv.Start(context.Background())
 	}
 
@@ -1225,23 +1445,13 @@ func newAuditEmitter(cfg *config.Config, logger *zap.Logger) *audit.Emitter {
 	return audit.NewFromConfig(cfg, logger)
 }
 
-// legacyValidatorConfig builds go-tokenauth's legacy (HMAC) token settings.
-//
-// Issuers is set explicitly to JWT.Issuer: legacy tokens are always minted by
-// UserService/WebAuthnService with "iss": JWT.Issuer, whereas the validator's
-// shared Issuer is the AS issuer (AS.Issuer). go-tokenauth v0.5 falls back to
-// the shared Issuer when Legacy.Issuers is empty, which would reject every
-// legacy token in a deployment that configures the two differently.
-func legacyValidatorConfig(cfg *config.Config) tokenvalidator.LegacyConfig {
-	secret := []byte(cfg.JWT.Secret)
-	var issuers []string
-	if cfg.JWT.Issuer != "" {
-		issuers = []string{cfg.JWT.Issuer}
+// asJWKSURL returns <as.external_url>/auth/.well-known/jwks.json. The AS is
+// infrastructure-internal, so http and https are accepted and no SSRF policy
+// applies to this fetch.
+func asJWKSURL(cfg *config.Config) (string, error) {
+	u, err := cfg.AS.ExternalBaseURL()
+	if err != nil {
+		return "", err
 	}
-	return tokenvalidator.LegacyConfig{
-		// Never validate HMAC tokens against an empty key.
-		Enabled:    cfg.AS.Legacy.Enabled && len(secret) > 0,
-		HMACSecret: secret,
-		Issuers:    issuers,
-	}
+	return u.JoinPath("auth", ".well-known", "jwks.json").String(), nil
 }
