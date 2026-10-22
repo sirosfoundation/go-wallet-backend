@@ -443,6 +443,14 @@ type WalletInstanceStore interface {
 	// if it became a tombstone (which must survive); ErrNotFound if gone or
 	// another tenant's.
 	DeleteIfRemovable(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding) error
+
+	// RestoreAttestation undoes an Upsert that matched an existing record (the
+	// caller was fenced out after it): the attestation counter and fields go back
+	// to before, and the owner or passkey link the Upsert set is cleared when
+	// before had none and the stored value is still the one written. Scoped to
+	// written's tenant and generation (ErrBindingChanged if replaced, ErrNotFound
+	// if gone). Status is never touched.
+	RestoreAttestation(ctx context.Context, before, written *domain.WalletInstance) error
 }
 
 // KeyAttestationStore defines the interface for per-credential-key FIDO2

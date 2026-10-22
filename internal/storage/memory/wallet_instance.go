@@ -266,6 +266,37 @@ func (s *WalletInstanceStore) DeleteIfRemovable(_ context.Context, id string, te
 	return nil
 }
 
+// RestoreAttestation undoes an Upsert that matched an existing record.
+func (s *WalletInstanceStore) RestoreAttestation(_ context.Context, before, written *domain.WalletInstance) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	inst, ok := s.data[written.ID]
+	if !ok || inst.TenantID != written.TenantID {
+		return storage.ErrNotFound
+	}
+	if inst.Generation != written.Generation {
+		return storage.ErrBindingChanged
+	}
+	inst.AttestationCount--
+	inst.AttestationSource = before.AttestationSource
+	inst.LastAttestedAt = before.LastAttestedAt
+	inst.UpdatedAt = before.UpdatedAt
+	if before.DeviceInfo != nil {
+		d := *before.DeviceInfo
+		inst.DeviceInfo = &d
+	} else {
+		inst.DeviceInfo = nil
+	}
+	if before.UserID == nil && inst.UserID != nil && written.UserID != nil && *inst.UserID == *written.UserID {
+		inst.UserID = nil
+	}
+	if before.CredentialID == "" && written.CredentialID != "" && inst.CredentialID == written.CredentialID {
+		inst.CredentialID = ""
+	}
+	return nil
+}
+
 func (s *WalletInstanceStore) Delete(_ context.Context, id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -252,3 +252,52 @@ func TestWIAService_GenerateWIA_CutoffDoesNotDeleteARecordAnotherReplicaCreatedF
 		t.Fatalf("another replica's record must survive this request's cut-off, GetByID = %v", gerr)
 	}
 }
+
+// A cut-off landing after the write must not leave a pre-existing anonymous
+// instance bound to the refused caller, nor with the attestation counted.
+func TestWIAService_GenerateWIA_CutoffAfterTheWriteRestoresAPreExistingInstance(t *testing.T) {
+	store := memory.NewStore()
+	uid := domain.NewUserID()
+	ctx := context.Background()
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:key:" + uid.String()}); err != nil {
+		t.Fatal(err)
+	}
+	wrapped := &fenceHookInstances{WalletInstanceStore: store.WalletInstances(), hook: func() {}}
+	svc := newTestWIAServiceUsingStores(t, wrapped, store.Users())
+	tok := tokengate.WithSubject(ctx, uid.String(), time.Now().Add(-time.Minute))
+
+	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pop, key := createTestPop(t, challenge)
+	jkt := expectedThumbprint(t, &key.PublicKey)
+	if _, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge}); err != nil {
+		t.Fatalf("anonymous seed attestation: %v", err)
+	}
+	seeded, err := store.WalletInstances().GetByID(ctx, jkt)
+	if err != nil || seeded.UserID != nil {
+		t.Fatalf("seed must be an unowned instance: %v %+v", err, seeded)
+	}
+	if challenge, _, err = svc.CreateChallenge(ctx, domain.DefaultTenantID); err != nil {
+		t.Fatal(err)
+	}
+	pop = createTestPopWithKey(t, challenge, key)
+	wrapped.hook = advanceCutoff(t, store, uid)
+	if _, err = svc.GenerateWIA(tok, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge}); !errors.Is(err, tokengate.ErrRevoked) {
+		t.Fatalf("err = %v, want ErrRevoked", err)
+	}
+	got, err := store.WalletInstances().GetByID(ctx, jkt)
+	if err != nil {
+		t.Fatalf("the pre-existing instance must survive: %v", err)
+	}
+	if got.UserID != nil {
+		t.Errorf("a refused request must not leave the instance bound to %v", *got.UserID)
+	}
+	if got.AttestationCount != seeded.AttestationCount {
+		t.Errorf("attestation count = %d, want %d", got.AttestationCount, seeded.AttestationCount)
+	}
+	if !got.LastAttestedAt.Equal(seeded.LastAttestedAt) {
+		t.Errorf("last attested at changed by a refused request")
+	}
+}
