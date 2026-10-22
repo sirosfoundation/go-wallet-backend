@@ -130,6 +130,27 @@ func TestVerifyJWTWithEmbeddedKey(t *testing.T) {
 		}
 	})
 
+	t.Run("jwk that is also a key set is refused", func(t *testing.T) {
+		trusted, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		mixed := map[string]any{
+			"kty": jwk["kty"], "crv": jwk["crv"], "x": jwk["x"], "y": jwk["y"],
+			"keys": []any{map[string]any{
+				"kty": "EC", "crv": "P-256",
+				"x": base64.RawURLEncoding.EncodeToString(trusted.PublicKey.X.Bytes()),
+				"y": base64.RawURLEncoding.EncodeToString(trusted.PublicKey.Y.Bytes()),
+			}},
+		}
+		token := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{"sub": "test"})
+		token.Header["jwk"] = mixed
+		tokenStr, err := token.SignedString(privateKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if km, err := VerifyJWTWithEmbeddedKey(tokenStr); err == nil {
+			t.Fatalf("accepted a jwk carrying a keys array: %+v", km)
+		}
+	})
+
 	t.Run("signature verification failure", func(t *testing.T) {
 		// Create a JWT signed with one key but with a different key in header
 		otherKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

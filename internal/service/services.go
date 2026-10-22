@@ -26,6 +26,7 @@ type Services struct {
 	Helper           *HelperService
 	WalletProvider   *WalletProviderService
 	WIA              *WIAService
+	Status           *StatusService // verified Token Status List API; nil when status_check.enabled is false
 	FIDO2Attestation *FIDO2AttestationService
 	TokenBlacklist   *TokenBlacklist
 	ChallengeCleanup *ChallengeCleanupWorker
@@ -96,6 +97,8 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	// external caller like cmd/server/main.go does for SetSessionCleaner,
 	// since both objects are already owned by this constructor.
 	userSvc.SetTokenBlacklist(tokenBlacklist)
+	trustSvc := engine.NewTrustService(cfg, logger)
+
 	return &Services{
 		User:             userSvc,
 		Tenant:           NewTenantService(store, logger),
@@ -109,7 +112,8 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		Helper:           NewHelperService(logger, cfg.HTTPClient),
 		WalletProvider:   wpSvc,
 		WIA:              wiaSvc,
-		FIDO2Attestation: NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), engine.NewTrustService(cfg, logger), logger),
+		Status:           NewStatusService(cfg, trustSvc, logger.Named("status")),
+		FIDO2Attestation: NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), trustSvc, logger),
 		TokenBlacklist:   tokenBlacklist,
 		ChallengeCleanup: NewChallengeCleanupWorker(cfg.Security.ChallengeCleanup, store, logger),
 		AAGUIDValidator:  aaguidValidator,

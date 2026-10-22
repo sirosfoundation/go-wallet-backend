@@ -40,6 +40,9 @@ type AuthProvider struct {
 	roles          []string
 	tokenValidator *tokenvalidator.Validator
 	wiaRateLimiter *middleware.AuthRateLimiter
+	// statusRateLimiter limits the status list API per caller (user, else tenant);
+	// it holds counters only.
+	statusRateLimiter *middleware.AuthRateLimiter
 	// gateRateLimiter feeds the AS module's passkey OIDC gates (per-IP and per-tenant buckets).
 	gateRateLimiter *middleware.OIDCGateRateLimiter
 }
@@ -62,6 +65,8 @@ func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logg
 		roles:           roles,
 		wiaRateLimiter:  middleware.NewAuthRateLimiter(cfg.WalletProvider.WIA.RateLimit, logger.Named("wia")),
 		gateRateLimiter: middleware.NewOIDCGateRateLimiter(cfg.Security.OIDCGateRateLimit, logger),
+
+		statusRateLimiter: middleware.NewAuthRateLimiter(cfg.StatusCheck.RateLimit, logger.Named("status")),
 	}
 }
 
@@ -121,6 +126,21 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		public.GET("/helper/auth-check", p.handlers.AuthCheck)
 		public.POST("/helper/auth-check", p.handlers.AuthCheck)
 	}
+
+	// Verified status list API. Not in the protected group, whose
+	// NoCacheMiddleware would override this response's own Cache-Control.
+	// Always registered: when disabled the handler answers 503 STATUS_NOT_SUPPORTED.
+	statusGroup := router.Group("/status/v1")
+	statusGroup.Use(p.authMiddleware())
+	statusGroup.Use(middleware.RequireAudience("wallet-backend"))
+	statusGroup.POST("/lists",
+		requireCallerIdentity(),
+		middleware.AuthRateLimitMiddlewareWithResponse(p.statusRateLimiter, wiaCallerIdentifier, gin.H{
+			"error":   "RATE_LIMIT_EXCEEDED",
+			"message": "Too many status list requests, please retry later",
+		}),
+		middleware.MustHaveTAC("r"),
+		p.handlers.StatusLists)
 
 	// Protected auth routes (session management)
 	protected := router.Group("/")
@@ -215,6 +235,22 @@ func wiaCallerIdentifier(c *gin.Context) string {
 		return tenantID
 	}
 	return ""
+}
+
+// requireCallerIdentity refuses a request whose token carries no user or DID.
+// An identity-free anonymous token passes authentication and audience checks
+// but must not reach endpoints that are for identified callers only.
+func requireCallerIdentity() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.GetString("user_id") == "" && c.GetString("did") == "" {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"error":   "FORBIDDEN",
+				"message": "A caller identity is required",
+			})
+			return
+		}
+		c.Next()
+	}
 }
 
 // authMiddleware returns the go-tokenauth middleware validating AS-issued
