@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
@@ -343,4 +344,36 @@ func TestWalletInstanceStore_Upsert_ReportsInserted(t *testing.T) {
 	require.NoError(t, wis.Upsert(ctx, again))
 	require.False(t, again.Inserted, "matching an existing record is not an insert")
 	require.Equal(t, first.Generation, again.Generation)
+}
+
+// The Mongo store must undo an Upsert like the memory one.
+func TestWalletInstanceStore_RestoreAttestation(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	wis := store.WalletInstances()
+	uid := domain.UserIDFromString("owner")
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: "rest-1", TenantID: "acme", Status: domain.InstanceStatusActive, AttestationSource: "a", LastAttestedAt: time.Unix(100, 0)}))
+	before, err := wis.GetByID(ctx, "rest-1")
+	require.NoError(t, err)
+
+	written := &domain.WalletInstance{ID: "rest-1", TenantID: "acme", UserID: &uid, CredentialID: "cred", Status: domain.InstanceStatusActive, AttestationSource: "b", LastAttestedAt: time.Unix(200, 0), UpdatedAt: time.Unix(200, 0), DeviceInfo: &domain.DeviceInfo{OS: "x"}}
+	require.NoError(t, wis.Upsert(ctx, written))
+	require.False(t, written.Inserted)
+	got, err := wis.GetByID(ctx, "rest-1")
+	require.NoError(t, err)
+	require.NotNil(t, got.UserID)
+	require.Equal(t, "cred", got.CredentialID)
+
+	require.NoError(t, wis.RestoreAttestation(ctx, before, written))
+	got, err = wis.GetByID(ctx, "rest-1")
+	require.NoError(t, err)
+	require.Nil(t, got.UserID)
+	require.Empty(t, got.CredentialID)
+	require.Nil(t, got.DeviceInfo)
+	require.Equal(t, before.AttestationCount, got.AttestationCount)
+	require.Equal(t, "a", got.AttestationSource)
+	require.True(t, got.LastAttestedAt.Equal(before.LastAttestedAt))
+
+	require.ErrorIs(t, wis.RestoreAttestation(ctx, before, &domain.WalletInstance{ID: "rest-1", TenantID: "acme", Generation: "other"}), storage.ErrBindingChanged)
+	require.ErrorIs(t, wis.RestoreAttestation(ctx, before, &domain.WalletInstance{ID: "rest-none", TenantID: "acme"}), storage.ErrNotFound)
 }

@@ -348,10 +348,13 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	// request a fresh challenge/PoP and obtain a brand-new valid WIA, completely
 	// bypassing revocation.
 	firstAttestation := false
+	// before is the pre-write record, restored if the cut-off lands after the Upsert.
+	var before *domain.WalletInstance
 	if s.instances != nil {
 		existing, err := s.instances.GetByID(ctx, jkt)
 		switch {
 		case err == nil:
+			before = existing
 			// Ownership before lifecycle: do not leak another wallet's state.
 			if err := checkInstanceBinding(existing, tenantID, userID); err != nil {
 				s.emitAuditFailure("instance_binding_mismatch", err)
@@ -416,7 +419,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	}
 
 	// Step 4: Generate WIA JWT
-	return s.signWIA(ctx, cnfJWK, jkt, tenantID, userID, attestationSource, req.ClientID, req.CredentialID, firstAttestation)
+	return s.signWIA(ctx, cnfJWK, jkt, tenantID, userID, attestationSource, req.ClientID, req.CredentialID, firstAttestation, before)
 }
 
 // validatePop validates the WIA-PoP JWT and extracts the cnf key.
@@ -516,7 +519,8 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 // jkt is the JWK Thumbprint of cnfJWK, precomputed by the caller (GenerateWIA)
 // so it can also be used for the instance-status guard before signing.
 // firstAttestation: the record did not exist at the lifecycle check (or was anonymous); re-checked after the write.
-func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, attestationSource string, clientID string, credentialID string, firstAttestation bool) (string, error) {
+// before: the record as read at that check (nil when absent), restored if the write is fenced out.
+func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, attestationSource string, clientID string, credentialID string, firstAttestation bool, before *domain.WalletInstance) (string, error) {
 	now := time.Now()
 
 	lifetime := s.wiaLifetime()
@@ -683,7 +687,7 @@ func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{},
 			return "", err
 		}
 		written = instance
-		if err := s.fenceInstanceWrite(ctx, instance); err != nil {
+		if err := s.fenceInstanceWrite(ctx, before, instance); err != nil {
 			return "", err
 		}
 	}
@@ -691,7 +695,7 @@ func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{},
 	// A cut-off landing after the fence must still stop the token, and undo the
 	// record this request wrote.
 	if written != nil {
-		if err := s.fenceInstanceWrite(ctx, written); err != nil {
+		if err := s.fenceInstanceWrite(ctx, before, written); err != nil {
 			return "", err
 		}
 	} else if err := tokengate.RefuseNow(ctx, s.users); err != nil {
@@ -745,13 +749,30 @@ func checkInstanceBinding(existing *domain.WalletInstance, tenantID domain.Tenan
 // that another replica may have raced) is always removed; a pre-existing one only when the account was deleted, since the
 // deletion sweep may have run before the Upsert recreated it. The removal is
 // conditional on the written binding, so a record replaced since is untouched.
-func (s *WIAService) fenceInstanceWrite(ctx context.Context, written *domain.WalletInstance) error {
+// A pre-existing record kept after a logout or lifecycle cut-off is restored to
+// before (counter, attestation fields, and the owner or passkey link this
+// request set), so a refused request leaves no link behind.
+func (s *WIAService) fenceInstanceWrite(ctx context.Context, before, written *domain.WalletInstance) error {
 	err := tokengate.RefuseNow(ctx, s.users)
 	if err == nil {
 		return nil
 	}
 	if !written.Inserted && !errors.Is(err, tokengate.ErrAccountDeleted) {
-		return err
+		if before == nil {
+			return err
+		}
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		switch rerr := s.instances.RestoreAttestation(rctx, before, written); {
+		case rerr == nil,
+			errors.Is(rerr, storage.ErrNotFound),
+			errors.Is(rerr, storage.ErrBindingChanged):
+			// Restored, gone, or replaced by another request's record.
+			return err
+		default:
+			s.emitAuditFailure("instance_restore_failed", rerr)
+			return errors.Join(err, fmt.Errorf("%w: %w", tokengate.ErrWriteNotRolledBack, rerr))
+		}
 	}
 	id, tenantID, binding := written.ID, written.TenantID, written.Binding()
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)

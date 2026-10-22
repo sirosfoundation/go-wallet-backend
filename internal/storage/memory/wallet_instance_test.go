@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -763,4 +764,31 @@ func TestWalletInstanceStore_Upsert_ReportsInserted(t *testing.T) {
 	again := &domain.WalletInstance{ID: "i1", TenantID: "t", Inserted: true}
 	require.NoError(t, s.Upsert(ctx, again))
 	require.False(t, again.Inserted, "matching an existing record is not an insert")
+}
+
+func TestWalletInstanceStore_RestoreAttestation(t *testing.T) {
+	ctx := context.Background()
+	store := NewStore().WalletInstances()
+	uid := domain.UserIDFromString("owner")
+	require.NoError(t, store.Upsert(ctx, &domain.WalletInstance{ID: "r1", TenantID: "acme", Status: domain.InstanceStatusActive, AttestationSource: "a", LastAttestedAt: time.Unix(100, 0)}))
+	before, err := store.GetByID(ctx, "r1")
+	require.NoError(t, err)
+
+	written := &domain.WalletInstance{ID: "r1", TenantID: "acme", UserID: &uid, CredentialID: "cred", Status: domain.InstanceStatusActive, AttestationSource: "b", LastAttestedAt: time.Unix(200, 0), UpdatedAt: time.Unix(200, 0), DeviceInfo: &domain.DeviceInfo{OS: "x"}}
+	require.NoError(t, store.Upsert(ctx, written))
+	require.False(t, written.Inserted)
+	require.NoError(t, store.RestoreAttestation(ctx, before, written))
+
+	got, err := store.GetByID(ctx, "r1")
+	require.NoError(t, err)
+	require.Nil(t, got.UserID)
+	require.Empty(t, got.CredentialID)
+	require.Nil(t, got.DeviceInfo)
+	require.Equal(t, before.AttestationCount, got.AttestationCount)
+	require.Equal(t, "a", got.AttestationSource)
+	require.True(t, got.LastAttestedAt.Equal(before.LastAttestedAt))
+
+	// Another record's generation is left alone.
+	require.ErrorIs(t, store.RestoreAttestation(ctx, before, &domain.WalletInstance{ID: "r1", TenantID: "acme", Generation: "other"}), storage.ErrBindingChanged)
+	require.ErrorIs(t, store.RestoreAttestation(ctx, before, &domain.WalletInstance{ID: "nope", TenantID: "acme"}), storage.ErrNotFound)
 }
