@@ -55,6 +55,10 @@ type ErasureReconciler struct {
 	logger    *zap.Logger
 	// now is the clock; tests replace it.
 	now func() time.Time
+	// userTimeout bounds one user's reconciliation, shorter than a run, so a
+	// user that never finishes (a huge wallet, a hung store call) cannot hold
+	// the cursor in place and starve the users after it. Zero: interval/4.
+	userTimeout time.Duration
 
 	// runMu serializes runs and guards cursor, the last user examined. A run
 	// resumes after it and wraps to the start at the end of the user list; a
@@ -162,6 +166,13 @@ func (r *ErasureReconciler) reconcile(ctx context.Context) {
 	}
 }
 
+func (r *ErasureReconciler) perUserTimeout() time.Duration {
+	if r.userTimeout > 0 {
+		return r.userTimeout
+	}
+	return r.interval / 4
+}
+
 // RunOnce examines up to batch users with a revoked instance, from where the
 // previous run stopped, and finishes the erasure of those that need it. A
 // failure for one user is counted and does not stop the others; it is retried
@@ -190,18 +201,26 @@ func (r *ErasureReconciler) RunOnce(ctx context.Context) (ReconcileStats, error)
 		}
 		var outcome ReconcileOutcome
 		var err error
+		uctx, ucancel := context.WithTimeout(ctx, r.perUserTimeout())
 		if r.dryRun {
 			var leftover []string
-			outcome, leftover, err = r.lifecycle.ReconcileUserDryRun(ctx, id, revokedBefore)
+			outcome, leftover, err = r.lifecycle.ReconcileUserDryRun(uctx, id, revokedBefore)
 			if outcome == ReconcileWouldErase {
 				r.logger.Info("Erasure reconciler dry run: would erase", zap.String("user_id", id.String()), zap.Strings("leftover", leftover))
 			}
 		} else {
-			outcome, err = r.lifecycle.ReconcileUser(ctx, id, revokedBefore)
+			outcome, err = r.lifecycle.ReconcileUser(uctx, id, revokedBefore)
 		}
+		budgetSpent := uctx.Err() != nil
+		ucancel()
 		if err != nil {
 			if ctx.Err() != nil {
-				break // interrupted mid-user: examine it again next run
+				break // the run or the process is ending: examine this user again next run
+			}
+			if budgetSpent {
+				// Only this user's budget ran out: count it as a failure (never
+				// clean), move past it, and retry it on a later pass over the list.
+				r.logger.Warn("Erasure reconciliation exceeded the per-user budget; moving on", zap.String("user_id", id.String()), zap.Duration("budget", r.perUserTimeout()))
 			}
 			// The cascade already logged its own failure; a probe failure is logged here.
 			r.logger.Warn("Erasure reconciliation failed", zap.String("user_id", id.String()), zap.Error(err))

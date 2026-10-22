@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -939,4 +940,74 @@ func TestReconcileUser_TenantDiscoveryFailureIsAnErrorNotClean(t *testing.T) {
 	require.Error(t, err)
 	assert.NotEqual(t, ReconcileClean, out)
 	assert.NotEqual(t, ReconcileErased, out)
+}
+
+// hangingUserInstances blocks one user's instance listing until its context
+// ends, as a hung store call or a huge wallet would.
+type hangingUserStore struct {
+	storage.Store
+	bad domain.UserID
+}
+
+func (s *hangingUserStore) WalletInstances() storage.WalletInstanceStore {
+	return &hangingUserInstances{s.Store.WalletInstances(), s}
+}
+
+type hangingUserInstances struct {
+	storage.WalletInstanceStore
+	s *hangingUserStore
+}
+
+func (i *hangingUserInstances) GetAllByUser(ctx context.Context, id domain.UserID) ([]*domain.WalletInstance, error) {
+	if id == i.s.bad {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return i.WalletInstanceStore.GetAllByUser(ctx, id)
+}
+
+// A user that always exhausts its budget must not stall the cursor: the users
+// after it are still reconciled, it is counted failed (never clean) and moved
+// past, and shutdown still retries in place.
+func TestErasureReconciler_SlowUserDoesNotBlockLaterUsers(t *testing.T) {
+	mem := memory.NewStore()
+	ctx := context.Background()
+	var users []domain.UserID
+	for i := 0; i < 4; i++ {
+		u := seedWalletUser(t, mem, domain.DefaultTenantID)
+		revokeSilently(t, mem, u)
+		users = append(users, u)
+	}
+	sort.Slice(users, func(i, j int) bool { return users[i].String() < users[j].String() })
+	store := &hangingUserStore{Store: mem, bad: users[0]} // first in cursor order
+	r := reconcilerFor(store, 10)
+	r.userTimeout = 50 * time.Millisecond
+
+	for pass := 0; pass < 2; pass++ {
+		runCtx, cancel := context.WithTimeout(ctx, 10*time.Second) // far longer than the per-user budget
+		st, err := r.RunOnce(runCtx)
+		cancel()
+		require.NoError(t, err)
+		assert.Equal(t, 1, st.Failed, "the slow user is a failure, not clean")
+		assert.Zero(t, st.Live+st.Grace, "pass %d", pass)
+		if pass == 0 {
+			assert.Equal(t, 3, st.Erased, "later users are reconciled in the same pass")
+		} else {
+			assert.Equal(t, 3, st.Clean, "the slow user is retried on the next pass and the others are already clean")
+		}
+	}
+	for _, u := range users[1:] {
+		assert.Nil(t, userData(t, mem, u).PrivateData)
+	}
+	assert.NotNil(t, userData(t, mem, users[0]).PrivateData, "the slow user's data is untouched")
+
+	// Shutdown (the run context ending) is not a budget expiry: the user is retried in place.
+	runCtx, cancel := context.WithCancel(ctx)
+	r.cursor = domain.UserID{}
+	go func() { time.Sleep(10 * time.Millisecond); cancel() }()
+	r.userTimeout = time.Minute
+	st, err := r.RunOnce(runCtx)
+	require.NoError(t, err)
+	assert.Zero(t, st.Failed)
+	assert.Equal(t, domain.UserID{}, r.cursor, "an interrupted user is not moved past")
 }
