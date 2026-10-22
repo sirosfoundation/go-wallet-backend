@@ -31,7 +31,7 @@ COPY . .
 # Build with version information
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
-    -o server cmd/server/main.go
+    -o server ./cmd/server
 
 # Runtime stage
 FROM gcr.io/distroless/static-debian12
