@@ -89,6 +89,8 @@ func TestNormalizeIssuerURL(t *testing.T) {
 		{"fragment ending in slash is preserved", "https://issuer.example.com/#frag/", "https://issuer.example.com#frag/"},
 		{"query and fragment on root path", "https://issuer.example.com/?a=b/#c/", "https://issuer.example.com?a=b/#c/"},
 		{"meaningful path keeps query", "https://issuer.example.com/tenant/?a=b/", "https://issuer.example.com/tenant/?a=b/"},
+		{"uppercase scheme keeps its spelling", "HTTPS://issuer.example.com/", "HTTPS://issuer.example.com"},
+		{"uppercase scheme without slash unchanged", "HTTPS://issuer.example.com", "HTTPS://issuer.example.com"},
 		{"invalid URL returned unchanged", "://not-a-url", "://not-a-url"},
 	}
 	for _, tt := range tests {
@@ -119,6 +121,7 @@ func TestSameIssuerIdentifier(t *testing.T) {
 		{"query identical", "https://i.example.com/?x=1", "https://i.example.com/?x=1", true},
 		{"query slash value kept", "https://i.example.com?r=https://c/", "https://i.example.com?r=https://c", false},
 		{"query vs none", "https://i.example.com?x=1", "https://i.example.com", false},
+		{"uppercase scheme root slash", "HTTPS://i.example.com/", "HTTPS://i.example.com", true},
 		{"root slash then query equal", "https://i.example.com/?x=1", "https://i.example.com?x=1", true},
 	}
 	for _, tt := range tests {
