@@ -22,6 +22,18 @@ front of it, saw every issued credential, every presentation and every
 delivered seed in clear. Seed delivery (privatedata-spec section 5A) requires
 an encrypted issuer response, which made that exposure unavoidable.
 
+## Threat model
+
+The engine passes the wallet's response-encryption key to the issuer and the
+verifier's key to the wallet, so a compromised engine can substitute either
+one. For issuance and for SD-JWT presentations nothing detects the
+substitution. For mdoc, OID4VP Annex B.2.6.2 makes it detectable, because the
+verifier key's thumbprint is bound into the session transcript, but only after
+the engine has already seen the plaintext. The model is therefore
+honest-but-curious: the engine is trusted to relay the right keys but not to
+read what it relays (OID4VCI section 13.4 covers this setup). It is not a
+defence against an actively malicious engine.
+
 ## What the engine still needs
 
 - Issuance: only `transaction_id` and `interval` from the response (to poll a
@@ -93,7 +105,17 @@ an encrypted issuer response, which made that exposure unavoidable.
   - JARM claims: `iss: "https://self-issued.me/v2"`, `aud`, `iat`,
     `exp: iat + 300`, `vp_token`, `state` when present.
   - A compact JWE with the requested `alg`/`enc`, `kid` in the protected header
-    (when the JWK has one) and `cty: "JWT"`.
+    (when the JWK has one). Clients SHOULD NOT set `cty`: the JWE plaintext is
+    plain JSON claims, not a nested JWT, and RFC 7519 section 5.2 says `cty`
+    must not be set in that case (a strict verifier would parse the plaintext
+    as a nested JWT). OID4VP 1.0 section 8.3 does not use it either. The engine
+    does not validate `cty` (its header checks cover `alg`, `enc` and `kid`), so
+    it accepts a `response_jwe` with or without it.
+- For mdoc, the session-transcript thumbprint is computed by the client from
+  `response_encryption.jwk`, the one source of the verifier key. The engine
+  still sends `verifier_jwk_thumbprint` in `sign_presentation` for
+  compatibility; a client must not rely on it when it disagrees with the
+  thumbprint computed from `response_encryption.jwk`.
 - The engine POSTs `response=<jwe>` (form-urlencoded, nothing else) to the
   validated `response_uri` and relays the verifier's `redirect_uri`.
 - The engine cannot decrypt the JWE and never falls back to building it. It

@@ -896,7 +896,9 @@ and proof system from:
 For `direct_post.jwt`, `sign_request` params also carry `verifier_jwk_thumbprint`:
 the unpadded base64url SHA-256 JWK Thumbprint (RFC 7638) of the verifier's
 response-encryption key. If that key cannot be read the engine fails the flow
-with a `SIGN_ERROR` flow error instead of sending an empty value.
+with a `SIGN_ERROR` flow error instead of sending an empty value. It is kept
+for compatibility: a client computes the mdoc session-transcript thumbprint from
+`response_encryption.jwk` and must not rely on this value when the two disagree.
 
 #### Verified request inputs (`verified_request`)
 
@@ -1085,8 +1087,9 @@ Client → Server:
 The client builds the `vp_token` (for DCQL an object keyed by credential query
 id), the JARM claims (`iss` `https://self-issued.me/v2`, `aud` from
 `verified_request.client_id`, `iat`, `exp` = `iat` + 300, `vp_token`, `state`
-when present) and the compact JWE (`alg`/`enc` as requested, `kid` and
-`cty: "JWT"` in the protected header). The engine POSTs `response=<jwe>` to the
+when present) and the compact JWE (`alg`/`enc` as requested, `kid` in the
+protected header; clients SHOULD NOT set `cty`, the plaintext is plain JSON
+claims, and the engine does not check it). The engine POSTs `response=<jwe>` to the
 validated `response_uri` and relays the verifier's `redirect_uri`. It refuses an
 empty, oversized, non-compact or mismatching `response_jwe`, and a
 `sign_response` that also carries `vp_token`, with a `SIGN_ERROR` flow error and
