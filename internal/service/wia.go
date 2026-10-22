@@ -683,8 +683,17 @@ func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{},
 			s.emitAuditFailure("instance_record_failed", err)
 			return "", fmt.Errorf("record wallet instance: %w", err)
 		}
-		if err := s.recheckLifecycleAfterWrite(ctx, tenantID, userID, jkt, credentialID, firstAttestation); err != nil {
-			return "", err
+		// The compensating revocation of a bound key in a deactivated wallet keeps
+		// the record as a tombstone attributable to its owner: no restore there.
+		if firstAttestation {
+			if err := s.revokeIfWalletDeactivatedMeanwhile(ctx, tenantID, userID, jkt); err != nil {
+				return "", err
+			}
+		}
+		if err := s.recheckLifecycleAfterWrite(ctx, tenantID, userID, jkt, credentialID, false); err != nil {
+			// A refused request must not leave its attestation or passkey link on
+			// a pre-existing record.
+			return "", s.restorePreexisting(ctx, before, instance, err)
 		}
 		written = instance
 		if err := s.fenceInstanceWrite(ctx, before, instance); err != nil {
@@ -758,21 +767,7 @@ func (s *WIAService) fenceInstanceWrite(ctx context.Context, before, written *do
 		return nil
 	}
 	if !written.Inserted && !errors.Is(err, tokengate.ErrAccountDeleted) {
-		if before == nil {
-			return err
-		}
-		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-		defer cancel()
-		switch rerr := s.instances.RestoreAttestation(rctx, before, written); {
-		case rerr == nil,
-			errors.Is(rerr, storage.ErrNotFound),
-			errors.Is(rerr, storage.ErrBindingChanged):
-			// Restored, gone, or replaced by another request's record.
-			return err
-		default:
-			s.emitAuditFailure("instance_restore_failed", rerr)
-			return errors.Join(err, fmt.Errorf("%w: %w", tokengate.ErrWriteNotRolledBack, rerr))
-		}
+		return s.restorePreexisting(ctx, before, written, err)
 	}
 	id, tenantID, binding := written.ID, written.TenantID, written.Binding()
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
@@ -788,6 +783,30 @@ func (s *WIAService) fenceInstanceWrite(ctx context.Context, before, written *do
 		return errors.Join(err, fmt.Errorf("%w: %w", tokengate.ErrWriteNotRolledBack, rerr))
 	}
 	return err
+}
+
+// restorePreexisting undoes this request's Upsert on a record that existed
+// before it (counter, attestation fields, and the owner or passkey link it
+// set), returning cause, joined with ErrWriteNotRolledBack if the restore
+// failed. Status is never touched, so a compensating revocation's tombstone
+// stays. A record this request inserted, or one with no pre-write snapshot, is
+// left to the caller's own handling.
+func (s *WIAService) restorePreexisting(ctx context.Context, before, written *domain.WalletInstance, cause error) error {
+	if before == nil || written.Inserted {
+		return cause
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	switch rerr := s.instances.RestoreAttestation(rctx, before, written); {
+	case rerr == nil,
+		errors.Is(rerr, storage.ErrNotFound),
+		errors.Is(rerr, storage.ErrBindingChanged):
+		// Restored, gone, or a newer write owns the record.
+		return cause
+	default:
+		s.emitAuditFailure("instance_restore_failed", rerr)
+		return errors.Join(cause, fmt.Errorf("%w: %w", tokengate.ErrWriteNotRolledBack, rerr))
+	}
 }
 
 // recheckLifecycleAfterWrite closes the window between GenerateWIA's checks
