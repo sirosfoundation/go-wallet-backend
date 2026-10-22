@@ -158,6 +158,12 @@ type WalletInstance struct {
 	// field existed.
 	Generation string `json:"-" bson:"generation,omitempty"`
 
+	// WriteToken identifies the latest Upsert that touched the record: random,
+	// replaced by every Upsert (insert or re-attestation). Upsert sets it on its
+	// argument too, so RestoreAttestation can undo exactly that write and treat a
+	// newer attestation as a no-op.
+	WriteToken string `json:"-" bson:"write_token,omitempty"`
+
 	// Inserted is an output of WalletInstanceStore.Upsert: true only when that
 	// call itself created the record (never when it matched an existing one,
 	// including one another replica created a moment earlier). Not persisted.

@@ -448,8 +448,9 @@ type WalletInstanceStore interface {
 	// caller was fenced out after it): the attestation counter and fields go back
 	// to before, and the owner or passkey link the Upsert set is cleared when
 	// before had none and the stored value is still the one written. Scoped to
-	// written's tenant and generation (ErrBindingChanged if replaced, ErrNotFound
-	// if gone). Status is never touched.
+	// written's tenant, generation and write token: a newer attestation since
+	// (which replaced the token) is left alone, ErrBindingChanged; ErrNotFound if
+	// gone. Status is never touched.
 	RestoreAttestation(ctx context.Context, before, written *domain.WalletInstance) error
 }
 
