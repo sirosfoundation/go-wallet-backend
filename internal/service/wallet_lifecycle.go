@@ -442,11 +442,7 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	if err != nil {
 		return []error{fmt.Errorf("load user: %w", err)}
 	}
-	// Holder data is keyed by DID, or by user id when there is none.
-	holder := user.DID
-	if holder == "" {
-		holder = userID.String()
-	}
+	holders := holderKeySet(userID, user.DID)
 	// A failed liveness check counts as live (fail closed).
 	tenants, err := s.userTenants(ctx, userID, tenantID)
 	if err != nil {
@@ -465,7 +461,7 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 		return append(errs, fmt.Errorf("advance token cut-off before the holder-data sweep: %w", err))
 	}
 	for _, tid := range tenants {
-		errs = append(errs, s.eraseHolderData(ctx, tid, holder)...)
+		errs = append(errs, s.eraseHolderKeys(ctx, tid, holders)...)
 	}
 	// WIA challenges carry only a tenant and are short-lived; GenerateWIA refuses
 	// a deactivated wallet anyway.
@@ -480,7 +476,7 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	// first advance can pass its post-write re-check until then. Runs even if the
 	// key-material erase failed.
 	for _, tid := range tenants {
-		errs = append(errs, s.eraseHolderData(ctx, tid, holder)...)
+		errs = append(errs, s.eraseHolderKeys(ctx, tid, holders)...)
 	}
 	if len(errs) == 0 {
 		s.logger.Info("wallet data erased: last wallet instance revoked", zap.String("user_id", userID.String()), zap.String("tenant_id", string(tenantID)))
@@ -545,6 +541,15 @@ func (s *WalletLifecycleService) liveInstanceIn(ctx context.Context, tenants []d
 		}
 	}
 	return false
+}
+
+// eraseHolderKeys sweeps every holder key in one tenant, collecting all failures.
+func (s *WalletLifecycleService) eraseHolderKeys(ctx context.Context, tid domain.TenantID, holders []string) []error {
+	var errs []error
+	for _, h := range holders {
+		errs = append(errs, s.eraseHolderData(ctx, tid, h)...)
+	}
+	return errs
 }
 
 // eraseHolderData deletes the holder's credentials and presentations in one

@@ -284,7 +284,8 @@ func TestDeleteUser_FinalSweepFailureAfterBlacklistIsOperatorOnly(t *testing.T) 
 		{"no blacklist: a fresh login can retry", nil, ErrDeletionIncomplete, ErrDeletionOperatorRequired},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			fs := &countingHolderStore{Store: memory.NewStore(), failFrom: 2}
+			// The first sweep reads two holder keys (the DID, which is the canonical one, and the bare id), so the final sweep starts at call 3.
+			fs := &countingHolderStore{Store: memory.NewStore(), failFrom: 3}
 			svc := NewUserService(fs, testConfig(), zap.NewNop())
 			if tc.blacklist != nil {
 				svc.SetTokenBlacklist(tc.blacklist)
