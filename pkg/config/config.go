@@ -942,11 +942,13 @@ func v6(groups ...uint16) netip.Addr {
 // metadataAddrs are the cloud instance-metadata endpoints, named separately
 // from the generic ranges so the refusal says which rule was hit: the
 // link-local endpoint used by AWS, GCP, Azure and others; the IPv6 unique-local
-// endpoint used by AWS; and Alibaba Cloud's endpoint in shared address space.
+// endpoint used by AWS; Alibaba Cloud's endpoint in shared address space; and
+// Oracle Cloud's endpoint in the IETF protocol-assignment block.
 var metadataAddrs = []netip.Addr{
 	v4(169, 254, 169, 254),
 	v6(0xfd00, 0, 0, 0, 0, 0, 0, 1),
 	v4(100, 100, 100, 200),
+	v4(192, 0, 0, 192),
 }
 
 func isMetadataAddr(ip net.IP) bool {
