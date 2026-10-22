@@ -1,0 +1,27 @@
+# EXAMPLE: run the PKCS#11 image against a real HSM. Everything vendor-specific
+# is injected: the module and its libraries (volume), the module's own config
+# (volume + the env var the module reads), and the module path, slot, key
+# label and PIN file (env). Adjust every path and variable to your HSM's docs.
+# Not runnable as is.
+services:
+  wallet-backend:
+    image: ghcr.io/sirosfoundation/go-wallet-backend-pkcs11:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.yaml:/app/configs/config.yaml:ro     # your normal server config
+      - /opt/vendor/hsm:/opt/vendor:ro                # vendor module + its libraries
+      - ./hsm-config:/etc/hsm:ro                      # vendor module configuration
+      - ./secrets/hsm-pin:/run/secrets/hsm-pin:ro     # the PIN, readable by uid 65532
+    environment:
+      # Module-specific: whatever your vendor's module reads to find its config.
+      HSM_MODULE_CONFIG: /etc/hsm/vendor.conf         # name and value are vendor-specific
+      LD_LIBRARY_PATH: /opt/vendor                    # only if the module needs libraries the image lacks
+      # Wallet backend: which module, slot and key the Authorization Server signs with.
+      WALLET_AS_ENABLED: "true"
+      WALLET_AS_SIGNING_KEY_PKCS11_MODULE_PATH: /opt/vendor/libvendor-pkcs11.so
+      WALLET_AS_SIGNING_KEY_PKCS11_SLOT_ID: "0"
+      WALLET_AS_SIGNING_KEY_PKCS11_KEY_LABEL: as-signing
+      WALLET_AS_SIGNING_KEY_PKCS11_PIN_PATH: /run/secrets/hsm-pin
+    # A network HSM or a USB token may also need, for example, a device mapping
+    # (devices: ["/dev/bus/usb:/dev/bus/usb"]) or a socket volume; add what yours needs.

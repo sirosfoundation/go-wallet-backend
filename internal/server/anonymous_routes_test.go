@@ -159,7 +159,7 @@ func TestAnonymousTokens_RefusedOnEveryWalletScopedRoute_Legacy(t *testing.T) {
 
 	mint := func(userID string) string {
 		tok, err := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
-			"user_id": userID, "tenant_id": string(domain.DefaultTenantID),
+			"iss": cfg.JWT.Issuer, "user_id": userID, "tenant_id": string(domain.DefaultTenantID),
 			"iat": time.Now().Add(-time.Minute).Unix(), "exp": time.Now().Add(time.Hour).Unix(),
 		}).SignedString([]byte(cfg.JWT.Secret))
 		if err != nil {
