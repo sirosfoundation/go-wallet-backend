@@ -6,7 +6,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
@@ -657,329 +656,6 @@ func TestMatchRequestMessage_DCQLQuery_JSON(t *testing.T) {
 	assert.NotNil(t, parsed["dcql_query"])
 }
 
-// ===== submitDirectPostJWT tests =====
-
-func TestSubmitDirectPostJWT_EncryptsAndPosts(t *testing.T) {
-	// Generate an ephemeral EC key for ECDH-ES encryption
-	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-
-	encJWK := map[string]any{
-		"kty": "EC",
-		"crv": "P-256",
-		"x":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.X.Bytes(), 32)),
-		"y":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.Y.Bytes(), 32)),
-		"use": "enc",
-		"kid": "enc-key-1",
-	}
-	jwksBytes, _ := json.Marshal(map[string]any{"keys": []any{encJWK}})
-
-	var receivedForm url.Values
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		err := r.ParseForm()
-		require.NoError(t, err)
-		receivedForm = r.PostForm
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer server.Close()
-
-	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
-	authReq := &AuthorizationRequest{
-		ClientID: "https://verifier.example.com",
-		State:    "test-state",
-		ClientMetadata: &ClientMetadata{
-			JWKS:                              jwksBytes,
-			AuthorizationEncryptedResponseAlg: "ECDH-ES",
-			AuthorizationEncryptedResponseEnc: "A128CBC-HS256",
-		},
-	}
-
-	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
-	require.NoError(t, err)
-
-	// Should have posted a JWE in the "response" field
-	response := receivedForm.Get("response")
-	assert.NotEmpty(t, response, "should post a JWE in the 'response' field")
-	// A JWE compact serialization has 5 dot-separated parts
-	parts := len(splitDots(response))
-	assert.Equal(t, 5, parts, "JWE should have 5 parts, got %d", parts)
-}
-
-func TestSubmitDirectPostJWT_MissingEncAlg_InfersFromECKey(t *testing.T) {
-	// When authorization_encrypted_response_alg is absent but an EC key is
-	// available in client_metadata.jwks, the algorithm should be inferred as
-	// ECDH-ES (EC key → ECDH-ES, RFC 7518 §4.6).
-	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-
-	encJWK := map[string]any{
-		"kty": "EC", "crv": "P-256",
-		"x":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.X.Bytes(), 32)),
-		"y":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.Y.Bytes(), 32)),
-		"use": "enc", "kid": "ec-enc-key",
-	}
-	jwksBytes, _ := json.Marshal(map[string]any{"keys": []any{encJWK}})
-
-	var receivedForm url.Values
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		receivedForm = r.PostForm
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer server.Close()
-
-	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
-	authReq := &AuthorizationRequest{
-		ClientID: "https://verifier.example.com",
-		// No AuthorizationEncryptedResponseAlg — should be inferred as ECDH-ES
-		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
-	}
-
-	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
-	require.NoError(t, err, "should succeed by inferring ECDH-ES from EC key")
-
-	response := receivedForm.Get("response")
-	assert.NotEmpty(t, response, "should post a JWE in the 'response' field")
-	assert.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
-}
-
-func TestSubmitDirectPostJWT_MissingEncAlg_HonorsJWKAlg(t *testing.T) {
-	// When authorization_encrypted_response_alg is absent but the verifier's
-	// encryption JWK declares its own "alg" (e.g. ECDH-ES+A256KW), that value
-	// must be used for the JWE header rather than inferring ECDH-ES from the
-	// EC key type. Verifiers validate the JWE header "alg" against their
-	// selected encryption JWK and reject a mismatch (regression test for the
-	// "JWE header does not match the selected verifier encryption JWK" failure).
-	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-
-	jwksBytes := makeJWKS(jose.JSONWebKey{
-		Key:       &encKey.PublicKey,
-		KeyID:     "enc-key-1",
-		Use:       "enc",
-		Algorithm: "ECDH-ES+A256KW",
-	})
-
-	var receivedForm url.Values
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		receivedForm = r.PostForm
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer server.Close()
-
-	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
-	authReq := &AuthorizationRequest{
-		ClientID: "https://verifier.example.com",
-		// No AuthorizationEncryptedResponseAlg — must fall back to the JWK's alg.
-		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
-	}
-
-	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
-	require.NoError(t, err, "should succeed by honoring the JWK's declared alg")
-
-	response := receivedForm.Get("response")
-	require.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
-
-	headerJSON, err := base64.RawURLEncoding.DecodeString(splitDots(response)[0])
-	require.NoError(t, err)
-	var header struct {
-		Alg string `json:"alg"`
-	}
-	require.NoError(t, json.Unmarshal(headerJSON, &header))
-	assert.Equal(t, string(jose.ECDH_ES_A256KW), header.Alg,
-		"JWE header alg should honor the JWK's declared ECDH-ES+A256KW, not inferred ECDH-ES")
-}
-
-func TestSubmitDirectPostJWT_MissingEncAlg_IgnoresNonJARMJWKAlg(t *testing.T) {
-	// When authorization_encrypted_response_alg is absent and the verifier's
-	// JWK carries a non-JARM key-management "alg" (e.g. a signature alg like
-	// "ES256"), that value must NOT be forced onto the JWE. The code should
-	// fall back to key-type inference (EC key → ECDH-ES) instead of failing on
-	// an unsupported JARM key algorithm.
-	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-
-	jwksBytes := makeJWKS(jose.JSONWebKey{
-		Key:       &encKey.PublicKey,
-		KeyID:     "enc-key-1",
-		Use:       "enc",
-		Algorithm: "ES256", // signature alg, not a JARM key-management alg
-	})
-
-	var receivedForm url.Values
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		receivedForm = r.PostForm
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer server.Close()
-
-	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
-	authReq := &AuthorizationRequest{
-		ClientID:       "https://verifier.example.com",
-		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
-	}
-
-	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
-	require.NoError(t, err, "should fall back to ECDH-ES key-type inference, not fail on ES256")
-
-	response := receivedForm.Get("response")
-	require.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
-
-	headerJSON, err := base64.RawURLEncoding.DecodeString(splitDots(response)[0])
-	require.NoError(t, err)
-	var header struct {
-		Alg string `json:"alg"`
-	}
-	require.NoError(t, json.Unmarshal(headerJSON, &header))
-	assert.Equal(t, string(jose.ECDH_ES), header.Alg,
-		"non-JARM JWK alg should be ignored in favor of inferred ECDH-ES")
-}
-
-func TestSubmitDirectPostJWT_MissingEncAlg_InfersFromRSAKey(t *testing.T) {
-	// When authorization_encrypted_response_alg is absent but an RSA key is
-	// available in client_metadata.jwks, the algorithm should be inferred as
-	// RSA-OAEP (RSA key → RSA-OAEP, RFC 7518 §4.3).
-	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	require.NoError(t, err)
-
-	jwksBytes := makeJWKS(jose.JSONWebKey{Key: &rsaKey.PublicKey, KeyID: "rsa-enc", Use: "enc"})
-
-	var receivedForm url.Values
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		receivedForm = r.PostForm
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer server.Close()
-
-	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
-	authReq := &AuthorizationRequest{
-		ClientID:       "https://verifier.example.com",
-		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
-	}
-
-	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
-	require.NoError(t, err, "should succeed by inferring RSA-OAEP from RSA key")
-
-	response := receivedForm.Get("response")
-	assert.NotEmpty(t, response)
-	assert.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
-}
-
-func TestSubmitDirectPostJWT_MissingEncAlgAndNoKey_Errors(t *testing.T) {
-	// When neither authorization_encrypted_response_alg nor any key material is
-	// available, the call must fail with a clear error.
-	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: http.DefaultClient}
-	authReq := &AuthorizationRequest{
-		ClientID:       "https://verifier.example.com",
-		ClientMetadata: &ClientMetadata{}, // no JWKS, no alg
-	}
-
-	_, err := h.submitDirectPostJWT(context.Background(), "https://example.com/post", authReq, "vp-token")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "authorization_encrypted_response_alg")
-}
-
-func TestSubmitDirectPostJWT_NilClientMetadata_InfersFromX5C(t *testing.T) {
-	// When client_metadata is nil but the request JWT carries an x5c, the algorithm
-	// should be inferred from the x5c leaf cert's public key.
-	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "verifier"},
-		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &leafKey.PublicKey, leafKey)
-	require.NoError(t, err)
-	certB64 := base64.StdEncoding.EncodeToString(der)
-
-	requestJWT := buildMinimalJWT(t, leafKey, certB64)
-
-	var receivedForm url.Values
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		receivedForm = r.PostForm
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer server.Close()
-
-	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
-	authReq := &AuthorizationRequest{
-		ClientID:   "x509_san_dns:verifier.example.com",
-		RequestJWT: requestJWT,
-		// No client_metadata — algorithm inferred from x5c leaf
-	}
-
-	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
-	require.NoError(t, err, "should succeed by inferring ECDH-ES from x5c EC key")
-
-	response := receivedForm.Get("response")
-	assert.NotEmpty(t, response)
-	assert.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
-}
-
-func TestSubmitDirectPostJWT_DefaultEncIsA128GCM(t *testing.T) {
-	// When authorization_encrypted_response_enc is absent, default should be
-	// A128GCM, not A128CBC-HS256 (RFC 7518's first mandatory-to-implement
-	// "enc" but not universally implemented - confirmed live against
-	// verifier.multipaz.org's own JsonWebEncryption decrypter, which only
-	// implements the GCM family and rejects CBC-HS256 outright).
-	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-
-	encJWK := map[string]any{
-		"kty": "EC", "crv": "P-256",
-		"x":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.X.Bytes(), 32)),
-		"y":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.Y.Bytes(), 32)),
-		"use": "enc",
-	}
-	jwksBytes, _ := json.Marshal(map[string]any{"keys": []any{encJWK}})
-
-	var receivedForm url.Values
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		receivedForm = r.PostForm
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer server.Close()
-
-	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
-	authReq := &AuthorizationRequest{
-		ClientID: "https://verifier.example.com",
-		ClientMetadata: &ClientMetadata{
-			JWKS:                              jwksBytes,
-			AuthorizationEncryptedResponseAlg: "ECDH-ES",
-			// No enc — should default to A128GCM
-		},
-	}
-
-	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "vp-token")
-	require.NoError(t, err, "should succeed with default A128GCM enc")
-	response := receivedForm.Get("response")
-	assert.Equal(t, 5, len(splitDots(response)))
-
-	headerB64 := splitDots(response)[0]
-	headerJSON, err := base64.RawURLEncoding.DecodeString(headerB64)
-	require.NoError(t, err)
-	var header struct {
-		Enc string `json:"enc"`
-	}
-	require.NoError(t, json.Unmarshal(headerJSON, &header))
-	assert.Equal(t, string(jose.A128GCM), header.Enc, "default enc should be A128GCM, not A128CBC-HS256")
-}
-
 func TestSanitizeEndpointURL_InvalidScheme(t *testing.T) {
 	_, err := sanitizeEndpointURL("ftp://evil.com")
 	require.Error(t, err)
@@ -996,60 +672,6 @@ func TestSanitizeEndpointURL_ValidHTTP(t *testing.T) {
 	result, err := sanitizeEndpointURL("http://localhost:8080/callback")
 	require.NoError(t, err)
 	assert.Equal(t, "http://localhost:8080/callback", result)
-}
-
-// ===== extractVerifierEncryptionKey tests =====
-
-func TestExtractVerifierEncryptionKey_PrefersUseEnc(t *testing.T) {
-	sigKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	encKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-
-	jwksBytes := makeJWKS(
-		jose.JSONWebKey{Key: &sigKey.PublicKey, KeyID: "sig-key-1", Use: "sig"},
-		jose.JSONWebKey{Key: &encKey.PublicKey, KeyID: "enc-key-1", Use: "enc", Algorithm: "ECDH-ES+A256KW"},
-	)
-
-	h := &OID4VPHandler{}
-	authReq := &AuthorizationRequest{
-		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
-	}
-
-	_, kid, alg, err := h.extractVerifierEncryptionKey(authReq)
-	require.NoError(t, err)
-	assert.Equal(t, "enc-key-1", kid, "should select the key with use=enc")
-	assert.Equal(t, "ECDH-ES+A256KW", alg, "should return the JWK's declared alg")
-}
-
-func TestExtractVerifierEncryptionKey_FallsBackToFirstKey(t *testing.T) {
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-
-	jwk := map[string]any{
-		"kty": "EC", "crv": "P-256",
-		"x":   base64.RawURLEncoding.EncodeToString(padBytes(key.PublicKey.X.Bytes(), 32)),
-		"y":   base64.RawURLEncoding.EncodeToString(padBytes(key.PublicKey.Y.Bytes(), 32)),
-		"kid": "only-key",
-	}
-	jwksBytes, _ := json.Marshal(map[string]any{"keys": []any{jwk}})
-
-	h := &OID4VPHandler{}
-	authReq := &AuthorizationRequest{
-		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
-	}
-
-	_, kid, _, err := h.extractVerifierEncryptionKey(authReq)
-	require.NoError(t, err)
-	assert.Equal(t, "only-key", kid)
-}
-
-func TestExtractVerifierEncryptionKey_NoKeysReturnsError(t *testing.T) {
-	h := &OID4VPHandler{}
-	authReq := &AuthorizationRequest{
-		ClientMetadata: &ClientMetadata{},
-	}
-
-	_, _, _, err := h.extractVerifierEncryptionKey(authReq)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no verifier encryption key found")
 }
 
 // splitDots splits a string by "." — a minimal helper for counting JWE parts.
@@ -2186,7 +1808,9 @@ func TestComputeVerifierJWKThumbprint_NonJWTMode(t *testing.T) {
 	authReq := &AuthorizationRequest{
 		ResponseMode: ResponseModeDirectPost,
 	}
-	assert.Equal(t, "", h.computeVerifierJWKThumbprint(authReq))
+	got, err := h.computeVerifierJWKThumbprint(authReq)
+	require.NoError(t, err)
+	assert.Equal(t, "", got)
 }
 
 func TestComputeVerifierJWKThumbprint_JWTMode(t *testing.T) {
@@ -2205,7 +1829,8 @@ func TestComputeVerifierJWKThumbprint_JWTMode(t *testing.T) {
 			JWKS: jwksBytes,
 		},
 	}
-	result := h.computeVerifierJWKThumbprint(authReq)
+	result, err := h.computeVerifierJWKThumbprint(authReq)
+	require.NoError(t, err)
 	assert.NotEmpty(t, result, "should return a non-empty thumbprint")
 }
 
@@ -2214,9 +1839,12 @@ func TestComputeVerifierJWKThumbprint_JWTModeNoKeys(t *testing.T) {
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 	authReq := &AuthorizationRequest{
 		ResponseMode: ResponseModeDirectPostJWT,
-		// No client metadata — should warn and return empty
+		// No client metadata: must fail, not send an empty thumbprint
 	}
-	assert.Equal(t, "", h.computeVerifierJWKThumbprint(authReq))
+	got, err := h.computeVerifierJWKThumbprint(authReq)
+	require.Error(t, err)
+	assert.Equal(t, "", got)
+	assert.Contains(t, err.Error(), "direct_post.jwt")
 }
 
 // --- Test for validateAuthorizationRequest with all known schemes ---

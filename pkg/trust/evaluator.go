@@ -11,6 +11,7 @@ package trust
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 
 	"github.com/sirosfoundation/go-trust/pkg/trustapi"
 )
@@ -130,6 +131,9 @@ type EvaluationResponse struct {
 	TrustMetadata interface{}
 	// Chain contains the validated certificate chain, if applicable.
 	Chain []*x509.Certificate
+	// Context is the PDP's response context object, verbatim as JSON (reason,
+	// trust_metadata, verifier_ids, ...). Nil when the PDP returned none.
+	Context json.RawMessage
 }
 
 // ToTrustDecision converts EvaluationResponse to trustapi.TrustDecision.
