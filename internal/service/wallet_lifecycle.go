@@ -472,7 +472,7 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	if err != nil {
 		return []error{fmt.Errorf("load user: %w", err)}
 	}
-	holder := holderKey(user, userID)
+	holders := holderKeys(user, userID)
 	// A failed liveness check counts as live (fail closed).
 	tenants, err := s.userTenants(ctx, userID, tenantID)
 	if err != nil {
@@ -491,7 +491,7 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 		return append(errs, fmt.Errorf("advance token cut-off before the holder-data sweep: %w", err))
 	}
 	for _, tid := range tenants {
-		errs = append(errs, s.eraseHolderData(ctx, tid, holder)...)
+		errs = append(errs, s.eraseHolderDataAll(ctx, tid, holders)...)
 	}
 	// WIA challenges carry only a tenant and are short-lived; GenerateWIA refuses
 	// a deactivated wallet anyway.
@@ -506,7 +506,7 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	// first advance can pass its post-write re-check until then. Runs even if the
 	// key-material erase failed.
 	for _, tid := range tenants {
-		errs = append(errs, s.eraseHolderData(ctx, tid, holder)...)
+		errs = append(errs, s.eraseHolderDataAll(ctx, tid, holders)...)
 	}
 	if len(errs) == 0 {
 		s.logger.Info("wallet data erased: last wallet instance revoked", zap.String("user_id", userID.String()), zap.String("tenant_id", string(tenantID)))
@@ -517,13 +517,34 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	return errs
 }
 
-// holderKey is the key holder data is stored under: the user's DID, or the
-// user id when there is none.
-func holderKey(user *domain.User, userID domain.UserID) string {
-	if user.DID != "" {
-		return user.DID
+// holderKeys lists every key the user's holder data may be stored under, deduped:
+// the stored DID, the canonical domain.HolderDID(userID) the HTTP credential
+// handlers write under (the stored DID can be empty or differ), and the bare
+// user id (legacy fallback). Probes and sweeps must use the same list.
+func holderKeys(user *domain.User, userID domain.UserID) []string {
+	var keys []string
+	for _, k := range []string{user.DID, domain.HolderDID(userID.String()), userID.String()} {
+		if k == "" {
+			continue
+		}
+		dup := false
+		for _, e := range keys {
+			dup = dup || e == k
+		}
+		if !dup {
+			keys = append(keys, k)
+		}
 	}
-	return userID.String()
+	return keys
+}
+
+// eraseHolderDataAll sweeps every holder key, collecting all failures.
+func (s *WalletLifecycleService) eraseHolderDataAll(ctx context.Context, tenantID domain.TenantID, holders []string) []error {
+	var errs []error
+	for _, h := range holders {
+		errs = append(errs, s.eraseHolderData(ctx, tenantID, h)...)
+	}
+	return errs
 }
 
 // userTenants lists the tenants holding the user's wallet data (memberships,

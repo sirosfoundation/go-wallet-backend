@@ -158,19 +158,21 @@ func (s *WalletLifecycleService) leftoverData(ctx context.Context, userID domain
 	if err != nil {
 		return nil, err
 	}
-	holder := holderKey(user, userID)
+	holders := holderKeys(user, userID)
 	var hasCreds, hasPres bool
 	for _, tid := range tenants {
-		creds, err := s.store.Credentials().GetAllByHolder(ctx, tid, holder)
-		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			return nil, fmt.Errorf("list credentials: %w", err)
+		for _, holder := range holders {
+			creds, err := s.store.Credentials().GetAllByHolder(ctx, tid, holder)
+			if err != nil && !errors.Is(err, storage.ErrNotFound) {
+				return nil, fmt.Errorf("list credentials: %w", err)
+			}
+			pres, err := s.store.Presentations().GetAllByHolder(ctx, tid, holder)
+			if err != nil && !errors.Is(err, storage.ErrNotFound) {
+				return nil, fmt.Errorf("list presentations: %w", err)
+			}
+			hasCreds = hasCreds || len(creds) > 0
+			hasPres = hasPres || len(pres) > 0
 		}
-		pres, err := s.store.Presentations().GetAllByHolder(ctx, tid, holder)
-		if err != nil && !errors.Is(err, storage.ErrNotFound) {
-			return nil, fmt.Errorf("list presentations: %w", err)
-		}
-		hasCreds = hasCreds || len(creds) > 0
-		hasPres = hasPres || len(pres) > 0
 	}
 	if hasCreds {
 		found = append(found, leftoverCredentials)

@@ -797,3 +797,66 @@ func TestReconcileUser_LiveInstanceAppearingDuringCascadeIsNotReportedErased(t *
 	assert.Equal(t, 2, holderDataCount(t, mem, tenantA, holder), "nothing is erased for a live wallet")
 	assert.NotNil(t, userData(t, mem, userID).PrivateData)
 }
+
+// HTTP credential writes use domain.HolderDID(userID), but the stored user.DID
+// can be empty or differ; with no vault or keys left, the probe and both cascade
+// sweeps must still find data stored under the canonical DID.
+func TestReconcileUser_FindsHolderDataUnderTheCanonicalDID(t *testing.T) {
+	ctx := context.Background()
+	for name, storedDID := range map[string]string{
+		"empty stored DID":     "",
+		"different stored DID": "did:example:something-else",
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := memory.NewStore()
+			svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
+			userID := domain.NewUserID()
+			canonical := domain.HolderDID(userID.String())
+			require.NotEqual(t, canonical, storedDID)
+			require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: userID, DID: storedDID}))
+			require.NoError(t, store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+				ID: "inst-canon", TenantID: domain.DefaultTenantID, UserID: &userID, Status: domain.InstanceStatusActive,
+			}))
+			require.NoError(t, store.Credentials().Create(ctx, &domain.VerifiableCredential{
+				TenantID: domain.DefaultTenantID, HolderDID: canonical, CredentialIdentifier: "c", Credential: "jwt", Format: domain.CredentialFormat("jwt_vc"),
+			}))
+			require.NoError(t, store.Presentations().Create(ctx, &domain.VerifiablePresentation{
+				TenantID: domain.DefaultTenantID, HolderDID: canonical, PresentationIdentifier: "p", Presentation: "jwt",
+			}))
+			revokeSilently(t, store, userID)
+
+			out, left, err := svc.ReconcileUserDryRun(ctx, userID, inTheFuture())
+			require.NoError(t, err)
+			require.Equal(t, ReconcileWouldErase, out, "the probe must see canonical-DID data")
+			assert.ElementsMatch(t, []string{leftoverCredentials, leftoverPresentations}, left)
+
+			out, err = svc.ReconcileUser(ctx, userID, inTheFuture())
+			require.NoError(t, err)
+			assert.Equal(t, ReconcileErased, out)
+			assert.Zero(t, holderDataCount(t, store, domain.DefaultTenantID, canonical))
+
+			out, err = svc.ReconcileUser(ctx, userID, inTheFuture())
+			require.NoError(t, err)
+			assert.Equal(t, ReconcileClean, out)
+		})
+	}
+}
+
+// The revoke cascade (not only the reconciler) sweeps the canonical DID.
+func TestWalletLifecycle_ErasureSweepsTheCanonicalDIDWhenStoredDIDDiffers(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
+	userID := domain.NewUserID()
+	canonical := domain.HolderDID(userID.String())
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: userID, DID: "did:example:other", PrivateData: []byte("v")}))
+	require.NoError(t, store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-c2", TenantID: domain.DefaultTenantID, UserID: &userID, Status: domain.InstanceStatusActive,
+	}))
+	require.NoError(t, store.Credentials().Create(ctx, &domain.VerifiableCredential{
+		TenantID: domain.DefaultTenantID, HolderDID: canonical, CredentialIdentifier: "c", Credential: "jwt", Format: domain.CredentialFormat("jwt_vc"),
+	}))
+	_, err := svc.RevokeAllForUser(ctx, userActor(userID), domain.DefaultTenantID, userID, "deactivate")
+	require.NoError(t, err)
+	assert.Zero(t, holderDataCount(t, store, domain.DefaultTenantID, canonical))
+}
