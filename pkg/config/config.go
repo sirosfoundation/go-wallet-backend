@@ -2165,7 +2165,14 @@ func (c *Config) loadSecretsFromFiles() error {
 // shared revocations off.
 func (c *Config) validateTokenBlacklistBackend() error {
 	switch c.Security.TokenBlacklist.Backend {
-	case "", TokenBlacklistBackendMemory:
+	case "":
+		// The default follows storage.type, so a typo there would silently
+		// select the per-process blacklist; a registry-only process does not
+		// run the full storage validation.
+		if c.Security.TokenBlacklist.Enabled && c.Storage.Type != "mongodb" && c.Storage.Type != "memory" && c.Storage.Type != "" {
+			return fmt.Errorf("invalid storage.type: %q (must be memory or mongodb); it selects the default token revocation backend", c.Storage.Type)
+		}
+	case TokenBlacklistBackendMemory:
 	case TokenBlacklistBackendStorage:
 		if c.Storage.Type != "mongodb" {
 			return fmt.Errorf("security.token_blacklist.backend=storage requires storage.type=mongodb")
