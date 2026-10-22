@@ -33,9 +33,8 @@ func setupIssuerMetadataTest(t *testing.T) (*Handlers, *gin.Engine, *memory.Stor
 			RPName:   "Test Wallet",
 		},
 		JWT: config.JWTConfig{
-			Secret:      "test-secret",
-			ExpiryHours: 24,
-			Issuer:      "test-wallet",
+			Secret: "test-secret",
+			Issuer: "test-wallet",
 		},
 		// Allow loopback so tests using httptest.NewServer can reach mock
 		// servers. InsecureSkipVerify because embed.IsImageURL only accepts
