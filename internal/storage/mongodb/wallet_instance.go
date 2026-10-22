@@ -389,6 +389,52 @@ func (s *WalletInstanceStore) DeleteIfRemovable(ctx context.Context, id string, 
 	return nil
 }
 
+// RestoreAttestation undoes an Upsert that matched an existing record.
+func (s *WalletInstanceStore) RestoreAttestation(ctx context.Context, before, written *domain.WalletInstance) error {
+	filter := bson.M{"$and": []bson.M{
+		{"_id": written.ID}, {"tenant_id": written.TenantID}, generationCond(written.Generation),
+	}}
+	set := bson.M{
+		"attestation_source": before.AttestationSource,
+		"last_attested_at":   before.LastAttestedAt,
+		"updated_at":         before.UpdatedAt,
+	}
+	update := bson.M{"$set": set, "$inc": bson.M{"attestation_count": -1}}
+	if before.DeviceInfo != nil {
+		set["device_info"] = before.DeviceInfo
+	} else {
+		update["$unset"] = bson.M{"device_info": ""}
+	}
+	res, err := s.collection.UpdateOne(ctx, filter, update)
+	if err != nil {
+		return fmt.Errorf("%w: restore wallet instance attestation: %v", storage.ErrDatabase, err)
+	}
+	if res.MatchedCount == 0 {
+		count, cerr := s.collection.CountDocuments(ctx, bson.M{"_id": written.ID, "tenant_id": written.TenantID})
+		if cerr != nil {
+			return fmt.Errorf("%w: restore wallet instance attestation: %v", storage.ErrDatabase, cerr)
+		}
+		if count > 0 {
+			return storage.ErrBindingChanged
+		}
+		return storage.ErrNotFound
+	}
+	// Clear the owner and link only while still the values this request wrote.
+	if before.UserID == nil && written.UserID != nil {
+		if _, err := s.collection.UpdateOne(ctx, bson.M{"$and": []bson.M{filter, {"user_id": *written.UserID}}},
+			bson.M{"$unset": bson.M{"user_id": ""}}); err != nil {
+			return fmt.Errorf("%w: restore wallet instance owner: %v", storage.ErrDatabase, err)
+		}
+	}
+	if before.CredentialID == "" && written.CredentialID != "" {
+		if _, err := s.collection.UpdateOne(ctx, bson.M{"$and": []bson.M{filter, {"credential_id": written.CredentialID}}},
+			bson.M{"$unset": bson.M{"credential_id": ""}}); err != nil {
+			return fmt.Errorf("%w: restore wallet instance credential link: %v", storage.ErrDatabase, err)
+		}
+	}
+	return nil
+}
+
 func (s *WalletInstanceStore) Delete(ctx context.Context, id string) error {
 	res, err := s.collection.DeleteOne(ctx, bson.M{"_id": id})
 	if err != nil {
