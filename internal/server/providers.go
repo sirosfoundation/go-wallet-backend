@@ -442,7 +442,7 @@ func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger, b
 		Audiences: cfg.SessionAudiences(),
 	}
 	if blacklist != nil {
-		vcfg.Revocation = blacklistRevocationChecker{blacklist: blacklist}
+		vcfg.Revocation = blacklistRevocationChecker{blacklist: blacklist, logger: logger}
 	}
 	v := tokenvalidator.New(vcfg)
 	v.Start(context.Background())
