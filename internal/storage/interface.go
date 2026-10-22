@@ -185,6 +185,12 @@ type CredentialStore interface {
 	// GetAllByHolder retrieves all credentials for a holder within a tenant
 	GetAllByHolder(ctx context.Context, tenantID domain.TenantID, holderDID string) ([]*domain.VerifiableCredential, error)
 
+	// TenantsByHolders returns the distinct tenants (sorted) holding records for
+	// any of the holder keys. Read-only; uses the holder index. Erasure and its
+	// reconcile probe use it to find data in tenants the user no longer has a
+	// membership or instance in.
+	TenantsByHolders(ctx context.Context, holderDIDs []string) ([]domain.TenantID, error)
+
 	// Update updates a credential
 	Update(ctx context.Context, credential *domain.VerifiableCredential) error
 
@@ -213,6 +219,12 @@ type PresentationStore interface {
 
 	// GetAllByHolder retrieves all presentations for a holder within a tenant
 	GetAllByHolder(ctx context.Context, tenantID domain.TenantID, holderDID string) ([]*domain.VerifiablePresentation, error)
+
+	// TenantsByHolders returns the distinct tenants (sorted) holding records for
+	// any of the holder keys. Read-only; uses the holder index. Erasure and its
+	// reconcile probe use it to find data in tenants the user no longer has a
+	// membership or instance in.
+	TenantsByHolders(ctx context.Context, holderDIDs []string) ([]domain.TenantID, error)
 
 	// DeleteByCredentialID deletes all presentations containing a specific credential
 	DeleteByCredentialID(ctx context.Context, tenantID domain.TenantID, holderDID, credentialID string) error
@@ -427,6 +439,11 @@ type WalletInstanceStore interface {
 	// expected (owner and generation); errors as UpdateStatusIfUnchanged minus
 	// the transition one.
 	DeleteIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding) error
+
+	// ListUsersWithRevokedInstances returns up to limit distinct owners of
+	// revoked instances, in ascending id order, starting after the given id
+	// (zero value for the start); it is the cursor of the erasure reconciler.
+	ListUsersWithRevokedInstances(ctx context.Context, after domain.UserID, limit int) ([]domain.UserID, error)
 
 	// IncrementAttestation atomically increments the attestation count and updates last_attested_at.
 	IncrementAttestation(ctx context.Context, id string) error

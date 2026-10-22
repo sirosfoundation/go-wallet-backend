@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -91,4 +93,29 @@ func TestPresentationStore_DeleteByID(t *testing.T) {
 	require.NoError(t, err, "the replacement survives")
 	assert.ErrorIs(t, s.DeleteByID(ctx, "other", fresh.ID), storage.ErrNotFound)
 	assert.NoError(t, s.DeleteByID(ctx, domain.DefaultTenantID, fresh.ID))
+}
+
+func TestTenantsByHolders(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	uniq := uuid.NewString()
+	h1, h2, other := "did:tbh-1-"+uniq, "did:tbh-2-"+uniq, "did:tbh-other-"+uniq
+	t1, t2, t3 := domain.TenantID("tbh-b-"+uniq), domain.TenantID("tbh-a-"+uniq), domain.TenantID("tbh-c-"+uniq)
+	require.NoError(t, store.Credentials().Create(ctx, &domain.VerifiableCredential{TenantID: t1, HolderDID: h1, CredentialIdentifier: "c1", Credential: "x", Format: domain.FormatJWTVC}))
+	require.NoError(t, store.Credentials().Create(ctx, &domain.VerifiableCredential{TenantID: t1, HolderDID: h2, CredentialIdentifier: "c2", Credential: "x", Format: domain.FormatJWTVC}))
+	require.NoError(t, store.Presentations().Create(ctx, &domain.VerifiablePresentation{TenantID: t2, HolderDID: h2, PresentationIdentifier: "p1", Presentation: "x"}))
+	require.NoError(t, store.Credentials().Create(ctx, &domain.VerifiableCredential{TenantID: t3, HolderDID: other, CredentialIdentifier: "c3", Credential: "x", Format: domain.FormatJWTVC}))
+
+	got, err := store.Credentials().TenantsByHolders(ctx, []string{h1, h2})
+	require.NoError(t, err)
+	assert.Equal(t, []domain.TenantID{t1}, got, "distinct and only the named holders")
+	got, err = store.Presentations().TenantsByHolders(ctx, []string{h1, h2})
+	require.NoError(t, err)
+	assert.Equal(t, []domain.TenantID{t2}, got)
+	got, err = store.Credentials().TenantsByHolders(ctx, []string{"did:none-" + uniq})
+	require.NoError(t, err)
+	assert.Empty(t, got)
+	got, err = store.Credentials().TenantsByHolders(ctx, nil)
+	require.NoError(t, err)
+	assert.Empty(t, got)
 }

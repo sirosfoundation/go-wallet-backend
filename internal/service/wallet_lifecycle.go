@@ -44,6 +44,7 @@ type WalletLifecycleService struct {
 	store          storage.Store
 	logger         *zap.Logger
 	audit          *audit.Emitter
+	cleanerMu      sync.RWMutex
 	sessionCleaner SessionCleaner
 	// locks serializes, per user and process, an attestation's instance write
 	// against the cascade's "anything live? then erase" step; across processes
@@ -58,31 +59,45 @@ type userLocks struct {
 }
 
 type userLockEntry struct {
-	mu   sync.Mutex
+	sem  chan struct{} // holds one token while the lock is taken
 	refs int
 }
 
 func (l *userLocks) lock(id domain.UserID) func() {
+	release, _ := l.lockCtx(context.Background(), id)
+	return release
+}
+
+// lockCtx is lock, giving up with ctx's error if ctx ends first.
+func (l *userLocks) lockCtx(ctx context.Context, id domain.UserID) (func(), error) {
 	l.mu.Lock()
 	if l.m == nil {
 		l.m = map[domain.UserID]*userLockEntry{}
 	}
 	e := l.m[id]
 	if e == nil {
-		e = &userLockEntry{}
+		e = &userLockEntry{sem: make(chan struct{}, 1)}
 		l.m[id] = e
 	}
 	e.refs++
 	l.mu.Unlock()
-	e.mu.Lock()
-	return func() {
-		e.mu.Unlock()
+	drop := func() {
 		l.mu.Lock()
 		if e.refs--; e.refs == 0 {
 			delete(l.m, id)
 		}
 		l.mu.Unlock()
 	}
+	select {
+	case e.sem <- struct{}{}:
+	case <-ctx.Done():
+		drop()
+		return nil, ctx.Err()
+	}
+	return func() {
+		<-e.sem
+		drop()
+	}, nil
 }
 
 // LockUser takes the user's lifecycle lock and returns its release. Not
@@ -91,13 +106,28 @@ func (s *WalletLifecycleService) LockUser(userID domain.UserID) func() {
 	return s.locks.lock(userID)
 }
 
+// lockUserCtx is LockUser, abandoned with ctx's error if ctx ends first.
+func (s *WalletLifecycleService) lockUserCtx(ctx context.Context, userID domain.UserID) (func(), error) {
+	return s.locks.lockCtx(ctx, userID)
+}
+
 // NewWalletLifecycleService creates a WalletLifecycleService. auditor may be nil.
 func NewWalletLifecycleService(store storage.Store, logger *zap.Logger, auditor *audit.Emitter) *WalletLifecycleService {
 	return &WalletLifecycleService{store: store, logger: logger.Named("wallet-lifecycle"), audit: auditor}
 }
 
 // SetSessionCleaner wires the session store dropped on revocation.
-func (s *WalletLifecycleService) SetSessionCleaner(sc SessionCleaner) { s.sessionCleaner = sc }
+func (s *WalletLifecycleService) SetSessionCleaner(sc SessionCleaner) {
+	s.cleanerMu.Lock()
+	defer s.cleanerMu.Unlock()
+	s.sessionCleaner = sc
+}
+
+func (s *WalletLifecycleService) cleaner() SessionCleaner {
+	s.cleanerMu.RLock()
+	defer s.cleanerMu.RUnlock()
+	return s.sessionCleaner
+}
 
 // ListForUser returns the wallet instances registered for a user in a tenant.
 func (s *WalletLifecycleService) ListForUser(ctx context.Context, tenantID domain.TenantID, userID domain.UserID) ([]*domain.WalletInstance, error) {
@@ -368,8 +398,8 @@ func (s *WalletLifecycleService) cascadeLocked(ctx context.Context, tenantID dom
 	if err := s.ensureCutoff(ctx, userID, inst); err != nil {
 		return s.incomplete(userID, []error{err})
 	}
-	if s.sessionCleaner != nil {
-		if err := s.sessionCleaner.DeleteByUser(ctx, userID.String()); err != nil {
+	if sc := s.cleaner(); sc != nil {
+		if err := sc.DeleteByUser(ctx, userID.String()); err != nil {
 			errs = append(errs, fmt.Errorf("drop sessions: %w", err))
 		}
 	}
@@ -444,7 +474,7 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	}
 	holders := holderKeySet(userID, user.DID)
 	// A failed liveness check counts as live (fail closed).
-	tenants, err := s.userTenants(ctx, userID, tenantID)
+	tenants, err := s.userTenants(ctx, userID, tenantID, holders)
 	if err != nil {
 		return []error{err}
 	}
@@ -527,9 +557,12 @@ func (s *WalletLifecycleService) eraseTenantHolderData(ctx context.Context, tid 
 }
 
 // userTenants lists the tenants holding the user's wallet data (memberships,
-// instances, default and current tenant). A failed lookup is an error: erasing
-// on a guess could destroy a wallet still in use.
-func (s *WalletLifecycleService) userTenants(ctx context.Context, userID domain.UserID, include domain.TenantID) ([]domain.TenantID, error) {
+// instances, default and current tenant, and every tenant still holding
+// credentials or presentations under one of the holder keys, which covers a
+// membership removed while holder data remained). A failed lookup is an error:
+// erasing on a guess could destroy a wallet still in use, and a probe must
+// never report clean on a guess.
+func (s *WalletLifecycleService) userTenants(ctx context.Context, userID domain.UserID, include domain.TenantID, holders []string) ([]domain.TenantID, error) {
 	memberships, err := s.store.UserTenants().GetUserTenants(ctx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("list tenant memberships: %w", err)
@@ -552,6 +585,20 @@ func (s *WalletLifecycleService) userTenants(ctx context.Context, userID domain.
 		if !seen[inst.TenantID] {
 			seen[inst.TenantID] = true
 			out = append(out, inst.TenantID)
+		}
+	}
+	credTenants, err := s.store.Credentials().TenantsByHolders(ctx, holders)
+	if err != nil {
+		return nil, fmt.Errorf("list tenants holding credentials: %w", err)
+	}
+	presTenants, err := s.store.Presentations().TenantsByHolders(ctx, holders)
+	if err != nil {
+		return nil, fmt.Errorf("list tenants holding presentations: %w", err)
+	}
+	for _, tid := range append(credTenants, presTenants...) {
+		if !seen[tid] {
+			seen[tid] = true
+			out = append(out, tid)
 		}
 	}
 	return out, nil

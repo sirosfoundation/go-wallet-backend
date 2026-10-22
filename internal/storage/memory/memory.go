@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"sort"
 	"sync"
 	"time"
 
@@ -632,6 +633,28 @@ func (s *CredentialStore) GetAllByHolder(ctx context.Context, tenantID domain.Te
 	return credentials, nil
 }
 
+func (s *CredentialStore) TenantsByHolders(ctx context.Context, holderDIDs []string) ([]domain.TenantID, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	want := make(map[string]bool, len(holderDIDs))
+	for _, h := range holderDIDs {
+		want[h] = true
+	}
+	seen := map[domain.TenantID]bool{}
+	for _, rec := range s.data {
+		if want[rec.HolderDID] {
+			seen[rec.TenantID] = true
+		}
+	}
+	out := make([]domain.TenantID, 0, len(seen))
+	for t := range seen {
+		out = append(out, t)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
+}
+
 func (s *CredentialStore) Update(ctx context.Context, credential *domain.VerifiableCredential) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -744,6 +767,28 @@ func (s *PresentationStore) GetAllByHolder(ctx context.Context, tenantID domain.
 		}
 	}
 	return presentations, nil
+}
+
+func (s *PresentationStore) TenantsByHolders(ctx context.Context, holderDIDs []string) ([]domain.TenantID, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	want := make(map[string]bool, len(holderDIDs))
+	for _, h := range holderDIDs {
+		want[h] = true
+	}
+	seen := map[domain.TenantID]bool{}
+	for _, rec := range s.data {
+		if want[rec.HolderDID] {
+			seen[rec.TenantID] = true
+		}
+	}
+	out := make([]domain.TenantID, 0, len(seen))
+	for t := range seen {
+		out = append(out, t)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
 }
 
 func (s *PresentationStore) DeleteByCredentialID(ctx context.Context, tenantID domain.TenantID, holderDID, credentialID string) error {
