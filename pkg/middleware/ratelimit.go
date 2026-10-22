@@ -229,7 +229,7 @@ func exposeRetryAfter(h http.Header) {
 	for _, v := range vals {
 		for _, t := range strings.Split(v, ",") {
 			t = strings.TrimSpace(t)
-			if t == "*" || strings.EqualFold(t, "Retry-After") {
+			if strings.EqualFold(t, "Retry-After") {
 				return
 			}
 			if t != "" {

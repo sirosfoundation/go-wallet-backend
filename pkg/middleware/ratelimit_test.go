@@ -343,3 +343,25 @@ func TestAuthRateLimit429ExposesRetryAfter(t *testing.T) {
 		t.Fatalf("Retry-After = %q", w.Header().Get("Retry-After"))
 	}
 }
+
+func TestExposeRetryAfter(t *testing.T) {
+	tests := []struct{ name, in, want string }{
+		{"no cors", "", ""},
+		{"append", "X-A", "X-A, Retry-After"},
+		{"wildcard still gets explicit", "*", "*, Retry-After"},
+		{"wildcard among others", "X-A, *", "X-A, *, Retry-After"},
+		{"already explicit", "X-A, retry-after", "X-A, retry-after"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := http.Header{}
+			if tt.in != "" {
+				h.Set("Access-Control-Expose-Headers", tt.in)
+			}
+			exposeRetryAfter(h)
+			if got := h.Get("Access-Control-Expose-Headers"); got != tt.want {
+				t.Fatalf("got %q, want %q", got, tt.want)
+			}
+		})
+	}
+}

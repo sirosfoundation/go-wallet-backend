@@ -922,6 +922,13 @@ func checkAddressesFor(host string, ips []net.IP, trusted map[string]struct{}) e
 		return fmt.Errorf("no addresses found for %s", host)
 	}
 	for _, ip := range ips {
+		// A well-known NAT64 address is only a wrapper: the gateway connects
+		// to the embedded IPv4 address, so that is the destination to judge.
+		// Rejecting the whole prefix would also refuse every public IPv4-only
+		// host on a DNS64 network.
+		if embedded, ok := nat64Embedded(ip); ok {
+			ip = embedded
+		}
 		// Block cloud metadata endpoints before the generic private/link-local check for a clearer message.
 		if isMetadataAddr(ip) {
 			return fmt.Errorf("connection to cloud metadata endpoint %s (%s) is not allowed", host, ip)
@@ -982,14 +989,30 @@ func isMetadataAddr(ip net.IP) bool {
 //     Alibaba's metadata service
 //   - IETF protocol assignments (RFC 6890), which hold Oracle's metadata service
 //   - benchmarking space (RFC 2544)
-//   - the NAT64 well-known prefix (RFC 6052) and local-use prefix (RFC 8215),
-//     whose embedded IPv4 address a gateway would connect to
+//   - the NAT64 local-use prefix (RFC 8215), which is operator-internal by
+//     definition and whose embedded address layout depends on the prefix
+//     length, so it is refused outright rather than decoded. The well-known
+//     prefix 64:ff9b::/96 (RFC 6052) is not listed: nat64Embedded unwraps it
+//     and the embedded IPv4 address is judged instead.
 var internalRanges = []netip.Prefix{
 	netip.PrefixFrom(v4(100, 64, 0, 0), 10),
 	netip.PrefixFrom(v4(192, 0, 0, 0), 24),
 	netip.PrefixFrom(v4(198, 18, 0, 0), 15),
-	netip.PrefixFrom(v6(0x64, 0xff9b), 96),
 	netip.PrefixFrom(v6(0x64, 0xff9b, 1), 48),
+}
+
+var nat64WellKnown = netip.PrefixFrom(v6(0x64, 0xff9b), 96)
+
+// nat64Embedded returns the IPv4 address carried by an address in the NAT64
+// well-known prefix 64:ff9b::/96 (RFC 6052), where it occupies the last four
+// bytes.
+func nat64Embedded(ip net.IP) (net.IP, bool) {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok || addr.Is4() || addr.Is4In6() || !nat64WellKnown.Contains(addr) {
+		return nil, false
+	}
+	b := addr.As16()
+	return net.IPv4(b[12], b[13], b[14], b[15]), true
 }
 
 func inInternalRange(ip net.IP) bool {

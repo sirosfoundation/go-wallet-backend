@@ -2268,7 +2268,12 @@ func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
 		{"alibaba metadata", "100.100.100.200", "cloud metadata"},
 		{"oracle metadata", "192.0.0.192", "private/loopback"},
 		{"benchmarking", "198.19.1.1", "private/loopback"},
-		{"nat64", "64:ff9b::7f00:1", "private/loopback"},
+		{"nat64 loopback", "64:ff9b::7f00:1", "private/loopback"},
+		{"nat64 rfc1918", "64:ff9b::a00:5", "private/loopback"},
+		{"nat64 link-local", "64:ff9b::a9fe:a00", "private/loopback"},
+		{"nat64 metadata", "64:ff9b::a9fe:a9fe", "cloud metadata"},
+		{"nat64 cgnat metadata", "64:ff9b::6464:64c8", "cloud metadata"},
+		{"nat64 unspecified", "64:ff9b::", "unspecified"},
 		{"nat64 local-use", "64:ff9b:1::1", "private/loopback"},
 		{"v4-mapped metadata", "::ffff:169.254.169.254", "cloud metadata"},
 		{"cloud metadata", "169.254.169.254", "cloud metadata"},
@@ -2293,6 +2298,19 @@ func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
 				t.Fatalf("connected to %v after refusing", dialed)
 			}
 		})
+	}
+}
+
+// A well-known NAT64 address that embeds a public IPv4 address is a normal
+// destination on a DNS64 network and must not be refused.
+func TestGuardedDial_AllowsNAT64WithPublicEmbeddedAddress(t *testing.T) {
+	var dialed []string
+	dial := guardedDial(staticLookup("64:ff9b::5db8:d822"), recordingDial(&dialed), nil)
+	if _, err := dial(context.Background(), "tcp", "v4only.example.com:443"); err != nil {
+		t.Fatalf("dial refused: %v", err)
+	}
+	if len(dialed) != 1 {
+		t.Fatalf("dialed %v, want one connection", dialed)
 	}
 }
 
