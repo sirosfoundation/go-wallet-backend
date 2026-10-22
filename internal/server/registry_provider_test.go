@@ -115,9 +115,6 @@ func TestRegistryProvider_ProtectedRoutes(t *testing.T) {
 	cfg.Registry.RequireAuth = true
 	cfg.AS.Enabled = false // registry-only: validates, does not run the AS
 	cfg.AS.ExternalURL = as.srv.URL
-	cfg.AS.Legacy.Enabled = true
-	cfg.Server.RPID = regTestRPID
-	cfg.JWT.Secret = regTestSecret
 	require.NoError(t, cfg.ValidateRegistry())
 
 	p, err := NewRegistryProvider(cfg, zap.NewNop())
@@ -131,23 +128,33 @@ func TestRegistryProvider_ProtectedRoutes(t *testing.T) {
 	assert.Equal(t, http.StatusOK, doRegistryGet(t, p, "Bearer "+as.token(t, []string{"wallet-registry"})))
 	// An AS token for another audience is refused by the validator (v0.5).
 	assert.Equal(t, http.StatusUnauthorized, doRegistryGet(t, p, "Bearer "+as.token(t, []string{"wallet-backend"})))
-	assert.Equal(t, http.StatusOK, doRegistryGet(t, p, "Bearer "+regHMAC(t)), "legacy HMAC accepted while enabled")
+	// HMAC tokens are never accepted, whatever secret/issuer they were signed with.
+	assert.Equal(t, http.StatusUnauthorized, doRegistryGet(t, p, "Bearer "+regHMAC(t)))
+}
 
-	// Legacy HMAC from a different issuer is rejected (jwt.issuer is enforced).
-	badIss, err := gojwt.NewWithClaims(gojwt.SigningMethodHS256, gojwt.MapClaims{
-		"iss": "someone-else", "aud": regTestRPID, "user_id": "u", "tenant_id": "acme",
-		"exp": time.Now().Add(time.Hour).Unix()}).SignedString([]byte(regTestSecret))
+// A deprecated registry.yaml HMAC secret is not used: with registry.require_auth the registry starts
+// (JWKS from as.external_url) but rejects HMAC tokens signed with it.
+func TestRegistryProvider_DeprecatedHMACSecretIgnored(t *testing.T) {
+	as := newRegAS(t)
+	cfg := registryTestConfig(t)
+	cfg.Registry.RequireAuth = true
+	cfg.AS.ExternalURL = as.srv.URL
+	cfg.JWT.Secret = regTestSecret
+	require.NoError(t, cfg.ValidateRegistry())
+	p, err := NewRegistryProvider(cfg, zap.NewNop())
 	require.NoError(t, err)
-	assert.Equal(t, http.StatusUnauthorized, doRegistryGet(t, p, "Bearer "+badIss))
+	require.NoError(t, p.Start(context.Background()))
+	t.Cleanup(func() { _ = p.Close() })
+	assert.Equal(t, http.StatusUnauthorized, doRegistryGet(t, p, "Bearer "+regHMAC(t)))
+	assert.Equal(t, http.StatusOK, doRegistryGet(t, p, "Bearer "+as.token(t, []string{"wallet-registry"})))
 
-	// Legacy off: HMAC no longer accepted.
-	cfg.AS.Legacy.Enabled = false
+	// Optional auth: the HMAC token is simply treated as unauthenticated.
+	cfg.Registry.RequireAuth = false
 	p2, err := NewRegistryProvider(cfg, zap.NewNop())
 	require.NoError(t, err)
 	require.NoError(t, p2.Start(context.Background()))
 	t.Cleanup(func() { _ = p2.Close() })
-	assert.Equal(t, http.StatusUnauthorized, doRegistryGet(t, p2, "Bearer "+regHMAC(t)))
-	assert.Equal(t, http.StatusOK, doRegistryGet(t, p2, "Bearer "+as.token(t, []string{"wallet-registry"})))
+	assert.Equal(t, http.StatusOK, doRegistryGet(t, p2, "Bearer "+regHMAC(t)))
 }
 
 func TestRegistryProvider_UnauthenticatedModeAndSetters(t *testing.T) {
@@ -171,12 +178,8 @@ func TestRegistryProvider_UnauthenticatedModeAndSetters(t *testing.T) {
 
 func TestRegistryNeedsValidator(t *testing.T) {
 	c := baseRegistryConfig(t)
-	c.AS.Legacy.Enabled = true
-	c.JWT.Secret = ""
-	assert.False(t, registryNeedsValidator(c))
 	c.JWT.Secret = regTestSecret
-	assert.True(t, registryNeedsValidator(c))
-	c.JWT.Secret = ""
+	assert.False(t, registryNeedsValidator(c), "a jwt.secret alone is not a token source any more")
 	c.AS.ExternalURL = "https://as.example.org"
 	assert.True(t, registryNeedsValidator(c))
 	c.AS.ExternalURL = ""
@@ -184,44 +187,21 @@ func TestRegistryNeedsValidator(t *testing.T) {
 	assert.True(t, registryNeedsValidator(c))
 }
 
-// The registry's validator is built through the same guarded path as the other
-// roles; this pins the legacy HMAC settings it derives from the config.
-func TestRegistryProvider_BuildValidatorLegacy(t *testing.T) {
+// require_auth without as.external_url must fail closed.
+func TestRegistryProvider_RequireAuthWithoutJWKSFails(t *testing.T) {
 	c := registryTestConfig(t)
 	c.Registry.RequireAuth = true
-	c.AS.Legacy.Enabled = true
-	c.Server.RPID = regTestRPID
-
-	// Legacy HMAC is never validated against an empty key.
-	c.JWT.Secret = ""
-	p, err := NewRegistryProvider(c, zap.NewNop())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = p.Close() })
-	_, err = p.validator.Validate(context.Background(), regHMAC(t))
-	assert.Error(t, err)
-
-	// An empty jwt.issuer with a secret would accept any issuer: refused.
 	c.JWT.Secret = regTestSecret
-	c.JWT.Issuer = ""
+	_, err := NewRegistryProvider(c, zap.NewNop())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "as.external_url")
+
+	// An empty expected issuer with a JWKS is refused as well.
+	c.AS.ExternalURL = "http://127.0.0.1:1"
+	c.AS.Issuer, c.JWT.Issuer = "", ""
 	_, err = NewRegistryProvider(c, zap.NewNop())
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "jwt.issuer")
-
-	c.JWT.Issuer = "wallet-backend"
-	p2, err := NewRegistryProvider(c, zap.NewNop())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = p2.Close() })
-	_, err = p2.validator.Validate(context.Background(), regHMAC(t))
-	assert.NoError(t, err)
-
-	// as.legacy.enabled=false refuses HMAC even with a secret.
-	c.AS.Legacy.Enabled = false
-	c.AS.ExternalURL = "http://127.0.0.1:1"
-	p3, err := NewRegistryProvider(c, zap.NewNop())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = p3.Close() })
-	_, err = p3.validator.Validate(context.Background(), regHMAC(t))
-	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "issuer")
 }
 
 func TestRegistryProvider_RootAliases(t *testing.T) {
@@ -236,7 +216,6 @@ func TestRegistryProvider_RootAliases(t *testing.T) {
 	cfg := registryTestConfig(t)
 	cfg.Registry.RequireAuth = true
 	cfg.AS.ExternalURL = "http://127.0.0.1:1"
-	cfg.AS.Legacy.Enabled = false
 	p, err := NewRegistryProvider(cfg, zap.NewNop())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = p.Close() })
@@ -265,7 +244,6 @@ func TestRegistryProvider_InProcessHandler(t *testing.T) {
 	cfg := registryTestConfig(t)
 	cfg.Registry.RequireAuth = true // in-process callers are trusted: no auth, no rate limit
 	cfg.AS.ExternalURL = "http://127.0.0.1:1"
-	cfg.AS.Legacy.Enabled = false
 	p, err := NewRegistryProvider(cfg, zap.NewNop())
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = p.Close() })

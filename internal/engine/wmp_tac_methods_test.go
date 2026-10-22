@@ -342,10 +342,13 @@ func TestWMP_HTTP_ModernEmptyTAC_Refused(t *testing.T) {
 func TestWMP_SSE_LegacySessionRequiresEffectivePermissionsFromModernToken(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
-	sid, _, _ := createSessionFull(t, a, "u", "t", nil) // legacy HMAC token
+	sid, _, _ := createSessionFull(t, a, "u", "t", nil)
 	a.mu.RLock()
 	sess := a.peers[sid].session
 	a.mu.RUnlock()
+	// The HMAC token path is gone, so no token mints a legacy session any more;
+	// the adapter still handles one (TAC not applicable), so build its state here.
+	sess.TAC, sess.TACEnforced = "", false
 	require.False(t, sess.TACEnforced)
 	require.Empty(t, sess.TAC)
 

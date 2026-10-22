@@ -40,6 +40,7 @@ server:
       - "Authorization"
       - "Content-Type"
       - "X-Tenant-ID"
+      - "X-Token-Mode"   # mandatory on /auth/passkey/* (session mode)
       - "If-None-Match"
       - "X-Private-Data-If-Match"
       - "X-Private-Data-If-None-Match"
@@ -113,8 +114,7 @@ registry:
     unauthenticated_rpm: 100
     burst_multiplier: 3
   # true: all registry requests need a valid access token (audience
-  # "wallet-registry" for ES256 tokens; legacy HMAC tokens while
-  # as.legacy.enabled). false: unauthenticated access allowed.
+  # "wallet-registry"). false: unauthenticated access allowed.
   require_auth: false
 
 # Authorization Server with its access-token signing key in a PKCS#11 token.
@@ -123,6 +123,12 @@ registry:
 as:
   enabled: true
   rules_dir: "/app/rules"   # baseline SPOCP policy shipped in the image
+  # Base URL the AS JWKS is fetched from (<external_url>/auth/.well-known/jwks.json); required.
+  external_url: "http://localhost:8080"
+  # This sample is served over plain HTTP: without this, login sets a Secure
+  # (__Host-) session cookie that the browser will not send back over http.
+  # Remove it (the default is false) once served over HTTPS.
+  insecure_cookies: true
   signing_key_pkcs11:
     module_path: "__SOFTHSM_MODULE__"
     slot_id: __SOFTHSM_SLOT_ID__
