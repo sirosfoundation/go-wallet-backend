@@ -994,8 +994,8 @@ func TestGenerateKeyAttestation_SecurityProperties_ClampedWhenEvidenceBelongsToA
 	}
 }
 
-// Omitting wallet_instance_id must not let evidence bound to an instance lift
-// the batch (fail closed); unbound evidence keeps working without an ID.
+// Omitting wallet_instance_id must not let any per-key evidence lift the batch
+// (fail closed), including legacy evidence with no instance recorded.
 func TestKeyAttestationTrustsBatch_OmittedInstanceID(t *testing.T) {
 	svc, instances, keyAttestations := newTestWalletProviderServiceWithInstances(t)
 	ctx := context.Background()
@@ -1025,7 +1025,10 @@ func TestKeyAttestationTrustsBatch_OmittedInstanceID(t *testing.T) {
 	if !svc.keyAttestationTrustsBatch(ctx, "inst-x", bound) {
 		t.Fatal("matching instance ID must still be trusted")
 	}
-	if !svc.keyAttestationTrustsBatch(ctx, "", unbound) {
-		t.Fatal("evidence with an empty WalletInstanceID must stay trusted without an ID")
+	if svc.keyAttestationTrustsBatch(ctx, "", unbound) {
+		t.Fatal("legacy evidence with an empty WalletInstanceID must not be trusted when the instance ID is omitted")
+	}
+	if svc.keyAttestationTrustsBatch(ctx, "inst-x", unbound) {
+		t.Fatal("legacy evidence with an empty WalletInstanceID must not vouch for a named instance")
 	}
 }
