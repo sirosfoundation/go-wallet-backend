@@ -127,8 +127,16 @@ defence against an actively malicious engine.
   names the requested `alg` and `enc`, and the JWK's `kid` when it has one; the
   `sign_response` carries no `vp_token`. The same refusal applies when the
   engine cannot resolve a usable public verifier key or algorithms: it then
-  sends no `sign_request` at all. A client that still answers with a plain
-  `vp_token` is refused, never encrypted for.
+  sends no `sign_request` at all. "Usable" includes that the key suits the
+  `alg`: `ECDH-ES`, `ECDH-ES+A128KW` and `ECDH-ES+A256KW` need an EC key on
+  P-256, P-384 or P-521; `RSA-OAEP` and `RSA-OAEP-256` need an RSA key of at
+  least 2048 bits; `enc` must be one of `A128GCM`, `A256GCM`, `A128CBC-HS256`
+  or `A256CBC-HS512`. Any other pairing is refused the same way. A client that
+  still answers with a plain `vp_token` is refused, never encrypted for.
+- When the verifier answers that `access_denied` POST with a `redirect_uri`, the
+  `SIGN_ERROR` flow error carries it as `details.redirect_uri` (the same detail
+  the decline and no-matching-credential errors carry); without one, there are
+  no details. Nothing else the verifier sent is passed on.
 - A `sign_response` that carries `error` or `error_code` (a sign refusal)
   carries no `response_jwe`; the refusal path is unchanged and is not an
   encryption failure.

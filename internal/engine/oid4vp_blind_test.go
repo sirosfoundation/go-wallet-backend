@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -400,6 +401,95 @@ func TestRequestVPSignature_DirectPostJWT_Refusals(t *testing.T) {
 			assert.Equal(t, verifierRefusedDescription, form.Get("error_description"))
 			assert.Empty(t, form.Get("response"))
 		})
+	}
+}
+
+func TestFailSign_RedirectURIReachesFlowError(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body string
+		want any
+	}{
+		"redirect":    {`{"redirect_uri":"https://verifier.example/done"}`, "https://verifier.example/done"},
+		"no redirect": {`{}`, nil},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newBlindFixture(t)
+			defer f.cleanup()
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				require.NoError(t, r.ParseForm())
+				assert.Equal(t, "access_denied", r.PostForm.Get("error"))
+				assert.Equal(t, verifierRefusedDescription, r.PostForm.Get("error_description"))
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+			f.authReq.ResponseURI = srv.URL
+			f.h.httpClient = srv.Client()
+
+			f.h.failSign(context.Background(), f.authReq, &responseEncryptionError{errors.New("SECRET detail")})
+			msg := awaitMessage(t, f.received, string(TypeFlowError))
+			flowErr := msg["error"].(map[string]any)
+			assert.Equal(t, string(ErrCodeSignError), flowErr["code"])
+			details, _ := flowErr["details"].(map[string]any)
+			assert.Equal(t, tc.want, details["redirect_uri"])
+			if tc.want == nil {
+				assert.Empty(t, details)
+			}
+			b, _ := json.Marshal(msg)
+			assert.NotContains(t, string(b), "SECRET")
+		})
+	}
+}
+
+func TestResolveResponseEncryption_KeyAlgMismatch(t *testing.T) {
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}}
+	ec := func(c elliptic.Curve) json.RawMessage {
+		k, err := ecdsa.GenerateKey(c, rand.Reader)
+		require.NoError(t, err)
+		return makeJWKS(jose.JSONWebKey{Key: &k.PublicKey, KeyID: "k", Use: "enc"})
+	}
+	rsaKey := func(bits int) json.RawMessage {
+		k, err := rsa.GenerateKey(rand.Reader, bits)
+		require.NoError(t, err)
+		return makeJWKS(jose.JSONWebKey{Key: &k.PublicKey, KeyID: "k", Use: "enc"})
+	}
+	resolve := func(jwks json.RawMessage, alg string) (*ResponseEncryption, error) {
+		return h.resolveResponseEncryption(&AuthorizationRequest{ClientMetadata: &ClientMetadata{
+			JWKS: jwks, AuthorizationEncryptedResponseAlg: alg}})
+	}
+	p256, p384, p521, rsa2048 := ec(elliptic.P256()), ec(elliptic.P384()), ec(elliptic.P521()), rsaKey(2048)
+
+	for _, alg := range []string{"ECDH-ES", "ECDH-ES+A128KW", "ECDH-ES+A256KW"} {
+		for name, jwks := range map[string]json.RawMessage{"P-256": p256, "P-384": p384, "P-521": p521} {
+			got, err := resolve(jwks, alg)
+			require.NoError(t, err, "%s with %s", alg, name)
+			assert.Equal(t, alg, got.Alg)
+		}
+		_, err := resolve(rsa2048, alg)
+		assert.Error(t, err, "%s must refuse an RSA key", alg)
+	}
+	for _, alg := range []string{"RSA-OAEP", "RSA-OAEP-256"} {
+		got, err := resolve(rsa2048, alg)
+		require.NoError(t, err)
+		assert.Equal(t, alg, got.Alg)
+		_, err = resolve(p256, alg)
+		assert.Error(t, err, "%s must refuse an EC key", alg)
+		_, err = resolve(rsaKey(1024), alg)
+		assert.Error(t, err, "%s must refuse a short RSA key", alg)
+	}
+}
+
+func TestRequestVPSignature_DirectPostJWT_KeyAlgMismatchNeverReachesTheClient(t *testing.T) {
+	f := newBlindFixture(t)
+	defer f.cleanup()
+	f.authReq.ClientMetadata.AuthorizationEncryptedResponseAlg = "RSA-OAEP" // the fixture key is EC
+	_, err := f.sign(t)
+	require.Error(t, err)
+	var encErr *responseEncryptionError
+	require.ErrorAs(t, err, &encErr)
+	select {
+	case m := <-f.received:
+		t.Fatalf("no sign_request may be sent: %v", m)
+	case <-time.After(150 * time.Millisecond):
 	}
 }
 

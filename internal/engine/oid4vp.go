@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
@@ -227,8 +228,7 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	submission, err := h.requestVPSignature(ctx, authReq, selectedCredentials, verifier.ClientID)
 	if err != nil {
 		h.Logger.Debug("VP signature failed", zap.Error(err))
-		h.refuseVerifierOnEncryptionError(ctx, authReq, err)
-		_ = h.Error(StepSubmittingResponse, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+		h.failSign(ctx, authReq, err)
 		return err
 	}
 
@@ -1924,11 +1924,60 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 // the direct_post.jwt contract failed: no usable key, or a response_jwe that is
 // not what was asked for. It sends the description every refusal carries and
 // nothing about why. Any other error (a sign refusal included) is left alone.
-func (h *OID4VPHandler) refuseVerifierOnEncryptionError(ctx context.Context, authReq *AuthorizationRequest, err error) {
+// It returns the redirect_uri the verifier answered with, if any, so the caller
+// can hand it to the wallet like every other refusal path does.
+func (h *OID4VPHandler) refuseVerifierOnEncryptionError(ctx context.Context, authReq *AuthorizationRequest, err error) string {
 	var encErr *responseEncryptionError
 	if errors.As(err, &encErr) {
-		_ = h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)
+		return h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)
 	}
+	return ""
+}
+
+// failSign reports a failed VP signature to the wallet as SIGN_ERROR. When the
+// failure was the direct_post.jwt contract, the verifier is refused first and
+// the redirect_uri it answered with (if any) travels in details, as it does for
+// every other refusal.
+func (h *OID4VPHandler) failSign(ctx context.Context, authReq *AuthorizationRequest, err error) {
+	if redirectURI := h.refuseVerifierOnEncryptionError(ctx, authReq, err); redirectURI != "" {
+		_ = h.ErrorWithDetails(StepSubmittingResponse, ErrCodeSignError, ErrCodeSignError.UserFacingMessage(),
+			map[string]interface{}{"redirect_uri": redirectURI})
+		return
+	}
+	_ = h.Error(StepSubmittingResponse, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+}
+
+// minResponseEncryptionRSABits is the smallest RSA modulus accepted for a
+// verifier's response-encryption key.
+const minResponseEncryptionRSABits = 2048
+
+// checkResponseEncryptionKey verifies that the key-management algorithm can be
+// used with the verifier's key, so the client is never sent a sign request it
+// cannot fulfil: ECDH-ES* needs an EC key on P-256/384/521, RSA-OAEP* an RSA
+// key of at least 2048 bits. Anything else is refused.
+func checkResponseEncryptionKey(alg string, key interface{}) error {
+	switch alg {
+	case "ECDH-ES", "ECDH-ES+A128KW", "ECDH-ES+A256KW":
+		pub, ok := key.(*ecdsa.PublicKey)
+		if !ok {
+			return fmt.Errorf("direct_post.jwt: %s needs an EC response-encryption key", alg)
+		}
+		switch pub.Curve {
+		case elliptic.P256(), elliptic.P384(), elliptic.P521():
+			return nil
+		}
+		return fmt.Errorf("direct_post.jwt: %s does not support the verifier key's curve", alg)
+	case "RSA-OAEP", "RSA-OAEP-256":
+		pub, ok := key.(*rsa.PublicKey)
+		if !ok {
+			return fmt.Errorf("direct_post.jwt: %s needs an RSA response-encryption key", alg)
+		}
+		if pub.N.BitLen() < minResponseEncryptionRSABits {
+			return fmt.Errorf("direct_post.jwt: the verifier's RSA key is shorter than %d bits", minResponseEncryptionRSABits)
+		}
+		return nil
+	}
+	return fmt.Errorf("unsupported JARM key algorithm: %s", alg)
 }
 
 // maxResponseJWEBytes caps the response_jwe the engine relays.
@@ -2058,6 +2107,9 @@ func (h *OID4VPHandler) resolveResponseEncryption(authReq *AuthorizationRequest)
 		return nil, err
 	}
 	if _, err := mapContentEncryption(encEnc); err != nil {
+		return nil, err
+	}
+	if err := checkResponseEncryptionKey(encAlg, jwk.Key); err != nil {
 		return nil, err
 	}
 
