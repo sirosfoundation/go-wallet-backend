@@ -1268,3 +1268,22 @@ func TestBlind_DeferredRelayRejection_NotificationContextExists(t *testing.T) {
 	assertNoSecrets(t, "logs", logDump(logs))
 	assertNoSecrets(t, "outbound", fc.engineSaw())
 }
+
+// An advertised batch_size above what an encrypted response can carry is
+// capped when response encryption is offered, so the proof count never exceeds
+// what the relay accepts.
+func TestBlind_BatchSizeCappedWhenResponseEncrypted(t *testing.T) {
+	st := newIssuerStub(t, `{"credentials":[{"credential":"c"}]}`)
+	fc := &fakeClient{t: t}
+	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
+	defer cleanup()
+	md := st.metadata(gcmCfg(false))
+	md.BatchCredentialIssuance = &BatchCredentialIssuance{BatchSize: maxEncryptedCredentialCount + 1}
+	cfg := &CredentialConfig{Format: "vc+sd-jwt", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}
+	require.NoError(t, h.issueCredential(context.Background(), md, tokenBearer(), "cfg", cfg, nil, ""))
+	require.Len(t, st.requests, 1)
+	proofs, _ := st.requests[0]["proofs"].(map[string]any)
+	jwts, _ := proofs["jwt"].([]any)
+	assert.Len(t, jwts, maxEncryptedCredentialCount)
+	_ = completion(t, fc)
+}

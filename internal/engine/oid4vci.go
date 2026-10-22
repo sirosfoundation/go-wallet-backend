@@ -2416,6 +2416,11 @@ func credentialBatchSize(metadata *IssuerMetadata) int {
 // proof_types_supported, and no proofs are expected back.
 func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMetadata, config *CredentialConfig, nonce string, reissuanceKid string, offer *responseEncryption) ([]ProofObject, *responseEncryption, error) {
 	count := credentialBatchSize(metadata)
+	if offer != nil && count > maxEncryptedCredentialCount {
+		// An encrypted response is validated against this limit by the
+		// relay: do not request more credentials than it can accept.
+		count = maxEncryptedCredentialCount
+	}
 	params := SignRequestParams{
 		Audience:            metadata.CredentialIssuer,
 		Nonce:               nonce,
