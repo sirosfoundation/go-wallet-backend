@@ -280,3 +280,18 @@ func TestWalletInstanceStore_Conditional_LegacyRecordWithoutGeneration(t *testin
 	require.ErrorIs(t, wis.UpdateStatusIfUnchanged(ctx, "cond-legacy", "acme", domain.InstanceBinding{Generation: "g"}, domain.InstanceStatusRevoked, "x"), storage.ErrBindingChanged)
 	require.NoError(t, wis.UpdateStatusIfUnchanged(ctx, "cond-legacy", "acme", b, domain.InstanceStatusRevoked, "x"))
 }
+
+func TestWalletInstanceStore_Upsert_ReportsInserted(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	wis := store.WalletInstances()
+
+	first := &domain.WalletInstance{ID: "inst-inserted", TenantID: "acme", Status: domain.InstanceStatusActive}
+	require.NoError(t, wis.Upsert(ctx, first))
+	require.True(t, first.Inserted)
+
+	again := &domain.WalletInstance{ID: "inst-inserted", TenantID: "acme", Inserted: true}
+	require.NoError(t, wis.Upsert(ctx, again))
+	require.False(t, again.Inserted, "matching an existing record is not an insert")
+	require.Equal(t, first.Generation, again.Generation)
+}

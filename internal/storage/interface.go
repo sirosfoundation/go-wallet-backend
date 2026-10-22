@@ -391,7 +391,8 @@ type WalletInstanceStore interface {
 	// An existing instance keeps its Status and first non-empty CredentialID. On
 	// success instance.Generation is that of the record written; the bind and
 	// link are conditional on it, so a record re-created mid-call yields
-	// ErrBindingChanged.
+	// ErrBindingChanged. instance.Inserted reports whether this call created the
+	// record (false when it matched one, however recently another writer made it).
 	Upsert(ctx context.Context, instance *domain.WalletInstance) error
 
 	// GetByID retrieves a wallet instance by its JWK Thumbprint ID.

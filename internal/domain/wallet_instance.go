@@ -158,6 +158,11 @@ type WalletInstance struct {
 	// field existed.
 	Generation string `json:"-" bson:"generation,omitempty"`
 
+	// Inserted is an output of WalletInstanceStore.Upsert: true only when that
+	// call itself created the record (never when it matched an existing one,
+	// including one another replica created a moment earlier). Not persisted.
+	Inserted bool `json:"-" bson:"-"`
+
 	// CreatedAt is when this instance was first seen (first WIA issuance).
 	CreatedAt time.Time `json:"created_at" bson:"created_at"`
 

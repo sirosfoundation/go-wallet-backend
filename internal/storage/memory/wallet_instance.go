@@ -57,8 +57,10 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		}
 		// Reported as the Mongo store does: bind and link ran against this generation.
 		instance.Generation = existing.Generation
+		instance.Inserted = false
 	} else {
 		instance.AttestationCount = 1
+		instance.Inserted = true
 		// Fresh generation per insert: a re-attested record is a different record to a conditional write.
 		instance.Generation = uuid.NewString()
 		if instance.CreatedAt.IsZero() {
