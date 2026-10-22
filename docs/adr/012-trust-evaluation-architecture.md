@@ -246,6 +246,24 @@ trust:
   verifier_pdp_url: ""  # Per-flow override for verifiers
 ```
 
+### PDP Error Mapping
+
+When the PDP call behind `/v1/evaluate` or `/v1/resolve` fails, the proxy
+distinguishes a rejected request from an unavailable backend. Clients MUST NOT
+treat a 4xx as "backend unreachable" (and must not fall back to weaker local
+trust checks because of it).
+
+| PDP outcome | Proxy response |
+|---|---|
+| 422 | 422, PDP body under `details` |
+| other request-level 4xx (400, 405, 409, 413, 415, ...) | 400, PDP body under `details` |
+| 401, 403, 404, 408, 429 (proxy-to-PDP credentials/routing/throttling) | 502 |
+| 5xx, transport error | 502 (generic message; PDP body is not echoed) |
+| deadline exceeded | 504 |
+
+The 4xx body is `{"error": <PDP "error" string or a generic message>, "details": <PDP JSON object, or a truncated string>}`,
+the serialized response is bounded to 2 KiB. Requests that fail local validation before reaching the PDP (e.g. mismatched `resource.id`/`subject.id`) are also 400.
+
 ### SPOCP Authorization
 
 All `/v1/evaluate` and `/v1/resolve` queries are authorized via SPOCP rules:

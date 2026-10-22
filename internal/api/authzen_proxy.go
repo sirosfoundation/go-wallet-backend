@@ -304,6 +304,9 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 	}
 
 	// Forward the request to the PDP
+	if !validateEvaluationRequest(c, &req) {
+		return
+	}
 	resp, err := client.Evaluate(ctx, &req)
 	if err != nil {
 		h.logger.Error("PDP evaluation failed",
@@ -311,7 +314,7 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 			zap.String("pdp_url", pdpURL),
 			zap.Error(err),
 		)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "trust evaluation service unavailable"})
+		h.writePDPError(c, ctx, err, "trust evaluation service unavailable")
 		return
 	}
 
@@ -726,6 +729,9 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 		trustReq.Resource.Type = "resolution"
 	}
 
+	if !validateEvaluationRequest(c, trustReq) {
+		return
+	}
 	trustResp, err := client.Evaluate(ctx, trustReq)
 	if err != nil {
 		h.logger.Error("PDP trust evaluation failed",
@@ -733,7 +739,7 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 			zap.String("pdp_url", pdpURL),
 			zap.Error(err),
 		)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "trust evaluation service unavailable"})
+		h.writePDPError(c, ctx, err, "trust evaluation service unavailable")
 		return
 	}
 
@@ -912,13 +918,112 @@ func (h *AuthZENProxyHandler) proxyToPDP(c *gin.Context, ctx context.Context, te
 		return
 	}
 
+	if !validateEvaluationRequest(c, evalReq) {
+		return
+	}
 	resp, err := client.Evaluate(ctx, evalReq)
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "resolution service unavailable"})
+		h.logger.Error("PDP resolution failed",
+			zap.String("tenant_id", tenantID),
+			zap.String("pdp_url", pdpURL),
+			zap.Error(err),
+		)
+		h.writePDPError(c, ctx, err, "resolution service unavailable")
 		return
 	}
 
 	c.JSON(http.StatusOK, resp)
+}
+
+// maxPDPErrorBodyBytes bounds how much of a PDP error body is echoed to callers.
+const maxPDPErrorBodyBytes = 2048
+
+// writePDPError maps a failed PDP call to an HTTP response.
+//
+// Error contract:
+//   - PDP answered 422 -> 422; any other PDP 4xx that signals a bad request
+//     (400, 405, 409, 413, 415, ...) -> 400. The PDP's error body is passed
+//     through under "details" (parsed JSON if it is JSON, else a truncated
+//     string; bounded to maxPDPErrorBodyBytes) so callers can tell a rejected
+//     request from an unreachable backend and must NOT fall back to weaker checks.
+//   - PDP 401/403/404/408/429 describe the proxy-to-PDP relationship (credentials,
+//     routing, throttling), not the caller's request -> 502.
+//   - PDP 5xx and transport errors -> 502; deadline exceeded -> 504.
+func (h *AuthZENProxyHandler) writePDPError(c *gin.Context, ctx context.Context, err error, unavailableMsg string) {
+	var evalErr *authzenclient.EvaluationError
+	if errors.As(err, &evalErr) {
+		switch sc := evalErr.StatusCode; {
+		case sc == http.StatusUnprocessableEntity:
+			c.JSON(sc, pdpErrorBody("trust evaluation request rejected by PDP", evalErr.Body))
+			return
+		case sc >= 400 && sc < 500 &&
+			sc != http.StatusUnauthorized && sc != http.StatusForbidden &&
+			sc != http.StatusNotFound && sc != http.StatusRequestTimeout &&
+			sc != http.StatusTooManyRequests:
+			c.JSON(http.StatusBadRequest, pdpErrorBody("trust evaluation request rejected by PDP", evalErr.Body))
+			return
+		}
+	} else if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "trust evaluation service timed out"})
+		return
+	}
+	c.JSON(http.StatusBadGateway, gin.H{"error": unavailableMsg})
+}
+
+// pdpErrorBody builds a structured error response embedding the PDP's own
+// error body. The serialized response is guaranteed to be at most
+// maxPDPErrorBodyBytes: a JSON object body is embedded as-is when it fits;
+// otherwise (non-JSON, or too large once serialized) a truncated string is
+// embedded, shrunk until the serialized response fits.
+func pdpErrorBody(msg, pdpBody string) gin.H {
+	pdpBody = strings.TrimSpace(pdpBody)
+	if pdpBody == "" {
+		return gin.H{"error": msg}
+	}
+	var parsed map[string]interface{}
+	if json.Unmarshal([]byte(pdpBody), &parsed) == nil {
+		out := gin.H{"error": msg, "details": parsed}
+		if e, ok := parsed["error"].(string); ok && e != "" && len(e) <= 256 {
+			out["error"] = e
+		}
+		if serializedLen(out) <= maxPDPErrorBodyBytes {
+			return out
+		}
+	}
+	for n := maxPDPErrorBodyBytes; n > 0; n /= 2 {
+		out := gin.H{"error": msg, "details": strings.ToValidUTF8(truncateString(pdpBody, n), "")}
+		if serializedLen(out) <= maxPDPErrorBodyBytes {
+			return out
+		}
+	}
+	return gin.H{"error": msg}
+}
+
+func serializedLen(v interface{}) int {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return maxPDPErrorBodyBytes + 1
+	}
+	return len(b)
+}
+
+func truncateString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+// validateEvaluationRequest performs the same local validation the AuthZEN
+// client does before sending, so that an invalid request (e.g. mismatched
+// subject/resource IDs) is reported as 400 rather than being folded into a
+// 502 "unavailable" by the PDP error path. Returns false after responding.
+func validateEvaluationRequest(c *gin.Context, req *gotrust.EvaluationRequest) bool {
+	if err := req.Validate(); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid evaluation request: " + err.Error()})
+		return false
+	}
+	return true
 }
 
 // extractKeyMaterial extracts cryptographic key material from issuer metadata.
