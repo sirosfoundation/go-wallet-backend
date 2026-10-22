@@ -417,11 +417,14 @@ func (v StandaloneValidator) Close() error { v.Stop(); return nil }
 // provider (--mode=engine). The JWKS comes from as.external_url; without it every connection would be
 // rejected, so it returns an error and startup fails.
 //
-// Revocation comes from the shared revocation store when the configuration
-// selects it (see NewSharedBlacklist, wired by the caller). Without it a
-// standalone engine has no revocation source: a token stays valid until it
-// expires, even after logout or user revocation. A warning is logged.
-func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (*StandaloneValidator, error) {
+// blacklist is the shared revocation store (see NewSharedBlacklist) when the
+// configuration selects it: the validator then checks every token's jti against
+// it, so a logged-out token (anonymous ones included) cannot open a connection.
+// User-level revocation is checked by the engine itself (see
+// EngineProvider.SetTokenBlacklist). With a nil blacklist a standalone engine
+// has no revocation source: a token stays valid until it expires, even after
+// logout or user revocation. A warning is logged.
+func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger, blacklist *service.TokenBlacklist) (*StandaloneValidator, error) {
 	if cfg.AS.ExternalURL == "" {
 		return nil, fmt.Errorf("standalone engine needs as.external_url to fetch the AS JWKS; refusing to start with no way to authenticate connections (legacy HMAC tokens no longer exist)")
 	}
@@ -433,13 +436,17 @@ func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (
 	if err != nil {
 		return nil, err
 	}
-	v := tokenvalidator.New(tokenvalidator.Config{
+	vcfg := tokenvalidator.Config{
 		JWKSURL:   jwksURL,
 		Issuer:    issuer,
 		Audiences: cfg.SessionAudiences(),
-	})
+	}
+	if blacklist != nil {
+		vcfg.Revocation = blacklistRevocationChecker{blacklist: blacklist}
+	}
+	v := tokenvalidator.New(vcfg)
 	v.Start(context.Background())
-	if !cfg.UsesSharedRevocationStore() {
+	if blacklist == nil {
 		logger.Warn("Standalone engine has no token revocation source: AS session tokens stay valid at this engine until they expire, even after logout or user revocation. Mitigate with short access token TTLs, use the shared MongoDB revocation store, or co-host the engine with the backend.",
 			zap.String("jwks_source", "as.external_url"))
 	}

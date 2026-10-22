@@ -314,7 +314,11 @@ func main() {
 		}
 		// Standalone engine: a JWKS-backed validator is the only way to authenticate handshakes.
 		if backendProvider == nil {
-			sv, err := server.NewStandaloneEngineTokenValidator(backendCfg, logger)
+			var rev *service.TokenBlacklist
+			if sharedBlacklist != nil {
+				rev = sharedBlacklist.TokenBlacklist
+			}
+			sv, err := server.NewStandaloneEngineTokenValidator(backendCfg, logger, rev)
 			if err != nil {
 				logger.Fatal("Failed to create standalone engine token validator", zap.Error(err))
 			}
