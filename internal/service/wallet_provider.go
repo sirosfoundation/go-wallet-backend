@@ -536,6 +536,13 @@ func (s *WalletProviderService) keyAttestationTrustsBatch(ctx context.Context, w
 	if s.keyAttestations == nil || len(jwks) == 0 {
 		return false
 	}
+	// Per-key evidence is always recorded against a live instance (see
+	// FIDO2AttestationService.Verify), so without a named instance there is
+	// nothing to prove it against: fail closed, including for legacy records
+	// with an empty WalletInstanceID.
+	if walletInstanceID == "" {
+		return false
+	}
 	for _, j := range jwks {
 		thumbprint, err := jwk.Thumbprint(j)
 		if err != nil {
@@ -546,9 +553,8 @@ func (s *WalletProviderService) keyAttestationTrustsBatch(ctx context.Context, w
 		if err != nil {
 			return false
 		}
-		// Evidence recorded for another instance does not vouch for this one.
-		// Fail closed when the caller omitted the instance ID too: evidence
-		// bound to an instance is unusable without proof of that instance.
+		// Evidence recorded for another instance (or, for a legacy record, none)
+		// does not vouch for this one.
 		if rec.WalletInstanceID != walletInstanceID {
 			return false
 		}

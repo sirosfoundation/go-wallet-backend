@@ -450,9 +450,17 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	}
 	var errs []error
 	if s.liveInstanceIn(ctx, tenants, tenantID, userID, &errs) {
-		s.logger.Info("wallet data kept: a live instance remains in another tenant",
+		// The deactivated tenant's credentials and presentations are erased (the
+		// caller verified it has no live instance); the user-level data (vault,
+		// keys, challenges) is shared with the live tenant and stays.
+		s.logger.Info("wallet data erased in this tenant only: a live instance remains in another tenant",
 			zap.String("user_id", userID.String()), zap.String("tenant_id", string(tenantID)))
-		return errs
+		if len(errs) > 0 {
+			// The liveness picture is incomplete (listing failure or unrecognized
+			// status elsewhere): fail closed, erase nothing.
+			return errs
+		}
+		return s.eraseTenantHolderData(ctx, tenantID, userID, holders)
 	}
 	// Advance the cut-off before the first holder sweep: the holder-write fence
 	// (tokengate.ConfirmWrite) is only sound if every erasure does, or a token
@@ -485,6 +493,37 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 			zap.String("user_id", userID.String()), zap.String("tenant_id", string(tenantID)), zap.Error(errors.Join(errs...)))
 	}
 	return errs
+}
+
+// eraseTenantHolderData is the tenant-scoped erasure: holder data in one tenant
+// only. The cut-off is advanced before the first sweep and again before the
+// last, as in the full erasure, so a write admitted by an older token cannot
+// outlive it.
+func (s *WalletLifecycleService) eraseTenantHolderData(ctx context.Context, tid domain.TenantID, userID domain.UserID, holders []string) []error {
+	// A retry with nothing left leaves the cut-off alone.
+	found := false
+	for _, h := range holders {
+		creds, err := s.store.Credentials().GetAllByHolder(ctx, tid, h)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return []error{fmt.Errorf("list credentials: %w", err)}
+		}
+		pres, err := s.store.Presentations().GetAllByHolder(ctx, tid, h)
+		if err != nil && !errors.Is(err, storage.ErrNotFound) {
+			return []error{fmt.Errorf("list presentations: %w", err)}
+		}
+		found = found || len(creds)+len(pres) > 0
+	}
+	if !found {
+		return nil
+	}
+	if err := s.store.Users().InvalidateAuthBefore(ctx, userID, time.Now()); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		return []error{fmt.Errorf("advance token cut-off before the holder-data sweep: %w", err)}
+	}
+	errs := s.eraseHolderKeys(ctx, tid, holders)
+	if err := s.store.Users().InvalidateAuthBefore(ctx, userID, time.Now()); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		errs = append(errs, fmt.Errorf("advance token cut-off before the final holder-data sweep: %w", err))
+	}
+	return append(errs, s.eraseHolderKeys(ctx, tid, holders)...)
 }
 
 // userTenants lists the tenants holding the user's wallet data (memberships,
