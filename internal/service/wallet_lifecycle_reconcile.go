@@ -158,7 +158,7 @@ func (s *WalletLifecycleService) leftoverData(ctx context.Context, userID domain
 	if err != nil {
 		return nil, err
 	}
-	holders := holderKeys(user, userID)
+	holders := holderKeySet(userID, user.DID)
 	var hasCreds, hasPres bool
 	for _, tid := range tenants {
 		for _, holder := range holders {

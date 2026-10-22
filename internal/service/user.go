@@ -402,8 +402,10 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// A tombstone from an earlier attempt remembers tenants whose memberships and
 	// instances are already gone; a retry must still sweep them.
 	var tombstoneTenants []domain.TenantID
+	var tombstoneDID string
 	if ts, terr := s.store.Users().GetDeletionTombstone(ctx, userID.String()); terr == nil {
 		tombstoneTenants = ts.TenantIDs
+		tombstoneDID = ts.HolderDID
 		// Without the record the canonical DID survives only in the tombstone;
 		// the caller can name just the bare uuid.
 		if !userFound && ts.HolderDID != "" {
@@ -412,6 +414,9 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	} else if !errors.Is(terr, storage.ErrNotFound) {
 		return fmt.Errorf("%w: look up deletion tombstone: %w", ErrDeletionIncomplete, terr)
 	}
+	// Every key holder data may sit under: the stored (or named) DID, the one a
+	// prior attempt's tombstone kept, the canonical DID and the bare user id.
+	holders := holderKeySet(userID, holderDID, tombstoneDID)
 	seen := map[domain.TenantID]bool{}
 	tenantIDs := make([]domain.TenantID, 0, len(memberships)+len(instances)+len(tombstoneTenants)+1)
 	for _, tid := range append(append([]domain.TenantID{domain.DefaultTenantID}, memberships...), tombstoneTenants...) {
@@ -468,7 +473,7 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 
 	// Delete legacy credentials and presentations per tenant; failures count.
 	for _, tenantID := range tenantIDs {
-		dataErrs = append(dataErrs, s.eraseHolderData(ctx, tenantID, holderDID)...)
+		dataErrs = append(dataErrs, s.eraseHolderKeys(ctx, tenantID, holders)...)
 	}
 
 	// Remove the user's wallet instances; failures keep the record for a retry
@@ -517,7 +522,7 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 		}
 	}
 	for _, tid := range lateTenants {
-		dataErrs = append(dataErrs, s.eraseHolderData(ctx, tid, holderDID)...)
+		dataErrs = append(dataErrs, s.eraseHolderKeys(ctx, tid, holders)...)
 	}
 	instanceErrs = append(instanceErrs, s.deleteWalletInstances(ctx, userID)...)
 
@@ -587,7 +592,7 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// Fails closed.
 	var finalErrs []error
 	for _, tenantID := range tenantIDs {
-		finalErrs = append(finalErrs, s.eraseHolderData(ctx, tenantID, holderDID)...)
+		finalErrs = append(finalErrs, s.eraseHolderKeys(ctx, tenantID, holders)...)
 	}
 	if len(finalErrs) > 0 {
 		s.logger.Error("Account deletion incomplete: holder data could not be removed after the token cut-off",
@@ -615,7 +620,7 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// user, hence ErrDeletionCleanupPending.
 	var lastErrs []error
 	for _, tenantID := range tenantIDs {
-		lastErrs = append(lastErrs, s.eraseHolderData(ctx, tenantID, holderDID)...)
+		lastErrs = append(lastErrs, s.eraseHolderKeys(ctx, tenantID, holders)...)
 	}
 	if len(lastErrs) > 0 {
 		s.logger.Error("Account deleted but holder data written during the deletion could not be removed",
@@ -650,6 +655,15 @@ func (s *UserService) listWalletInstances(ctx context.Context, userID domain.Use
 		return nil, []error{fmt.Errorf("list wallet instances: %w", err)}
 	}
 	return instances, nil
+}
+
+// eraseHolderKeys sweeps every holder key in one tenant, collecting all failures.
+func (s *UserService) eraseHolderKeys(ctx context.Context, tenantID domain.TenantID, holders []string) []error {
+	var errs []error
+	for _, h := range holders {
+		errs = append(errs, s.eraseHolderData(ctx, tenantID, h)...)
+	}
+	return errs
 }
 
 // eraseHolderData removes the holder's credentials and presentations in one

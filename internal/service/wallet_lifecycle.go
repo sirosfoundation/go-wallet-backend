@@ -472,7 +472,7 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	if err != nil {
 		return []error{fmt.Errorf("load user: %w", err)}
 	}
-	holders := holderKeys(user, userID)
+	holders := holderKeySet(userID, user.DID)
 	// A failed liveness check counts as live (fail closed).
 	tenants, err := s.userTenants(ctx, userID, tenantID)
 	if err != nil {
@@ -491,7 +491,7 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 		return append(errs, fmt.Errorf("advance token cut-off before the holder-data sweep: %w", err))
 	}
 	for _, tid := range tenants {
-		errs = append(errs, s.eraseHolderDataAll(ctx, tid, holders)...)
+		errs = append(errs, s.eraseHolderKeys(ctx, tid, holders)...)
 	}
 	// WIA challenges carry only a tenant and are short-lived; GenerateWIA refuses
 	// a deactivated wallet anyway.
@@ -506,43 +506,13 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	// first advance can pass its post-write re-check until then. Runs even if the
 	// key-material erase failed.
 	for _, tid := range tenants {
-		errs = append(errs, s.eraseHolderDataAll(ctx, tid, holders)...)
+		errs = append(errs, s.eraseHolderKeys(ctx, tid, holders)...)
 	}
 	if len(errs) == 0 {
 		s.logger.Info("wallet data erased: last wallet instance revoked", zap.String("user_id", userID.String()), zap.String("tenant_id", string(tenantID)))
 	} else {
 		s.logger.Error("wallet data erasure incomplete: last wallet instance revoked but some data remains",
 			zap.String("user_id", userID.String()), zap.String("tenant_id", string(tenantID)), zap.Error(errors.Join(errs...)))
-	}
-	return errs
-}
-
-// holderKeys lists every key the user's holder data may be stored under, deduped:
-// the stored DID, the canonical domain.HolderDID(userID) the HTTP credential
-// handlers write under (the stored DID can be empty or differ), and the bare
-// user id (legacy fallback). Probes and sweeps must use the same list.
-func holderKeys(user *domain.User, userID domain.UserID) []string {
-	var keys []string
-	for _, k := range []string{user.DID, domain.HolderDID(userID.String()), userID.String()} {
-		if k == "" {
-			continue
-		}
-		dup := false
-		for _, e := range keys {
-			dup = dup || e == k
-		}
-		if !dup {
-			keys = append(keys, k)
-		}
-	}
-	return keys
-}
-
-// eraseHolderDataAll sweeps every holder key, collecting all failures.
-func (s *WalletLifecycleService) eraseHolderDataAll(ctx context.Context, tenantID domain.TenantID, holders []string) []error {
-	var errs []error
-	for _, h := range holders {
-		errs = append(errs, s.eraseHolderData(ctx, tenantID, h)...)
 	}
 	return errs
 }
@@ -601,6 +571,15 @@ func (s *WalletLifecycleService) liveInstanceIn(ctx context.Context, tenants []d
 		}
 	}
 	return false
+}
+
+// eraseHolderKeys sweeps every holder key in one tenant, collecting all failures.
+func (s *WalletLifecycleService) eraseHolderKeys(ctx context.Context, tid domain.TenantID, holders []string) []error {
+	var errs []error
+	for _, h := range holders {
+		errs = append(errs, s.eraseHolderData(ctx, tid, h)...)
+	}
+	return errs
 }
 
 // eraseHolderData deletes the holder's credentials and presentations in one
