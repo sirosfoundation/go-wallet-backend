@@ -301,3 +301,57 @@ func TestWIAService_GenerateWIA_CutoffAfterTheWriteRestoresAPreExistingInstance(
 		t.Errorf("last attested at changed by a refused request")
 	}
 }
+
+// A revocation landing after the write makes the post-write recheck refuse the
+// request; the pre-existing record must not keep this request's owner bind or
+// attestation count, and the revocation's status stays.
+func TestWIAService_GenerateWIA_RecheckFailureRestoresAPreExistingInstance(t *testing.T) {
+	store := memory.NewStore()
+	uid := domain.NewUserID()
+	ctx := context.Background()
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:key:" + uid.String()}); err != nil {
+		t.Fatal(err)
+	}
+	wrapped := &fenceHookInstances{WalletInstanceStore: store.WalletInstances(), hook: func() {}}
+	svc := newTestWIAServiceUsingStores(t, wrapped, store.Users())
+	tok := tokengate.WithSubject(ctx, uid.String(), time.Now().Add(-time.Minute))
+
+	challenge, _, err := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pop, key := createTestPop(t, challenge)
+	jkt := expectedThumbprint(t, &key.PublicKey)
+	if _, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge}); err != nil {
+		t.Fatalf("anonymous seed attestation: %v", err)
+	}
+	seeded, err := store.WalletInstances().GetByID(ctx, jkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if challenge, _, err = svc.CreateChallenge(ctx, domain.DefaultTenantID); err != nil {
+		t.Fatal(err)
+	}
+	pop = createTestPopWithKey(t, challenge, key)
+	wrapped.hook = func() {
+		if err := store.WalletInstances().UpdateStatus(ctx, jkt, domain.DefaultTenantID, domain.InstanceStatusRevoked, "revoked meanwhile"); err != nil {
+			t.Errorf("revoke: %v", err)
+		}
+	}
+	if _, err = svc.GenerateWIA(tok, domain.DefaultTenantID, &uid, &WIARequest{Pop: pop, Challenge: challenge}); !errors.Is(err, ErrWIAInstanceDeactivated) {
+		t.Fatalf("err = %v, want ErrWIAInstanceDeactivated", err)
+	}
+	got, err := store.WalletInstances().GetByID(ctx, jkt)
+	if err != nil {
+		t.Fatalf("the record must survive: %v", err)
+	}
+	if got.Status != domain.InstanceStatusRevoked {
+		t.Errorf("status = %s, the revocation must stand", got.Status)
+	}
+	if got.UserID != nil {
+		t.Errorf("a refused request left the instance bound to %v", *got.UserID)
+	}
+	if got.AttestationCount != seeded.AttestationCount {
+		t.Errorf("attestation count = %d, want %d", got.AttestationCount, seeded.AttestationCount)
+	}
+}
