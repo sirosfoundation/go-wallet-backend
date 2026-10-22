@@ -792,3 +792,25 @@ func TestWalletInstanceStore_RestoreAttestation(t *testing.T) {
 	require.ErrorIs(t, store.RestoreAttestation(ctx, before, &domain.WalletInstance{ID: "r1", TenantID: "acme", Generation: "other"}), storage.ErrBindingChanged)
 	require.ErrorIs(t, store.RestoreAttestation(ctx, before, &domain.WalletInstance{ID: "nope", TenantID: "acme"}), storage.ErrNotFound)
 }
+
+func TestWalletInstanceStore_RestoreAttestation_NewerAttestationIsNotClobbered(t *testing.T) {
+	ctx := context.Background()
+	store := NewStore().WalletInstances()
+
+	uid := domain.UserIDFromString("owner-newer")
+	require.NoError(t, store.Upsert(ctx, &domain.WalletInstance{ID: "rn-memory", TenantID: "acme", Status: domain.InstanceStatusActive, AttestationSource: "a", LastAttestedAt: time.Unix(100, 0)}))
+	before, err := store.GetByID(ctx, "rn-memory")
+	require.NoError(t, err)
+	mine := &domain.WalletInstance{ID: "rn-memory", TenantID: "acme", UserID: &uid, CredentialID: "cred", Status: domain.InstanceStatusActive, AttestationSource: "b", LastAttestedAt: time.Unix(200, 0), UpdatedAt: time.Unix(200, 0)}
+	require.NoError(t, store.Upsert(ctx, mine))
+	// A second attestation lands after this request's write.
+	require.NoError(t, store.Upsert(ctx, &domain.WalletInstance{ID: "rn-memory", TenantID: "acme", UserID: &uid, CredentialID: "cred", Status: domain.InstanceStatusActive, AttestationSource: "c", LastAttestedAt: time.Unix(300, 0), UpdatedAt: time.Unix(300, 0)}))
+
+	require.ErrorIs(t, store.RestoreAttestation(ctx, before, mine), storage.ErrBindingChanged, "a newer attestation makes the rollback a no-op")
+	got, err := store.GetByID(ctx, "rn-memory")
+	require.NoError(t, err)
+	require.NotNil(t, got.UserID, "the newer attestation's owner is kept")
+	require.Equal(t, "cred", got.CredentialID, "the newer attestation's link is kept")
+	require.Equal(t, "c", got.AttestationSource)
+	require.Equal(t, before.AttestationCount+2, got.AttestationCount, "the newer attestation's count is kept")
+}

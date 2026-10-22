@@ -31,6 +31,8 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		}
 		// Status and tenant are left untouched: lifecycle changes go through
 		// UpdateStatus, so re-attestation cannot reactivate or re-parent an instance.
+		existing.WriteToken = uuid.NewString()
+		instance.WriteToken = existing.WriteToken
 		existing.AttestationSource = instance.AttestationSource
 		existing.LastAttestedAt = instance.LastAttestedAt
 		existing.UpdatedAt = instance.UpdatedAt
@@ -61,6 +63,7 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		instance.Inserted = false
 	} else {
 		instance.AttestationCount = 1
+		instance.WriteToken = uuid.NewString()
 		instance.Inserted = true
 		// Fresh generation per insert: a re-attested record is a different record to a conditional write.
 		instance.Generation = uuid.NewString()
@@ -279,6 +282,11 @@ func (s *WalletInstanceStore) RestoreAttestation(_ context.Context, before, writ
 	if inst.Generation != written.Generation {
 		return storage.ErrBindingChanged
 	}
+	if written.WriteToken == "" || inst.WriteToken != written.WriteToken {
+		// A newer attestation (or none of ours) wrote last: nothing to undo.
+		return storage.ErrBindingChanged
+	}
+	inst.WriteToken = before.WriteToken
 	inst.AttestationCount--
 	inst.AttestationSource = before.AttestationSource
 	inst.LastAttestedAt = before.LastAttestedAt
