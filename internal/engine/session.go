@@ -1049,16 +1049,24 @@ func (m *Manager) validateTokenFull(ctx context.Context, tokenString string) (us
 		return result.UserID, result.TenantID, result.TAC, result.JTI, result.Mode != claims.ModeLegacy, nil
 	}
 
-	// Legacy path: direct HMAC validation. Unlike the go-tokenauth branch
-	// above, nothing else in this path ever checks revocation at all, so
-	// both checks below are needed, not just the user-level one (#391
-	// review, round 2).
+	// Legacy path: direct HMAC validation, only while legacy is enabled.
+	if !m.cfg.LegacyEnabled() {
+		return "", "", "", "", false, errors.New("legacy tokens are disabled")
+	}
+
+	// Nothing else on this path checks revocation, so both checks below are
+	// needed.
+	// Pin iss = jwt.issuer; an empty value would disable the check
+	// (golang-jwt), so fail closed.
+	if m.cfg.JWT.Issuer == "" {
+		return "", "", "", "", false, errors.New("jwt issuer not configured")
+	}
 	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, errors.New("unexpected signing method")
 		}
 		return []byte(m.cfg.JWT.Secret), nil
-	}, jwt.WithLeeway(config.JWTLeeway))
+	}, jwt.WithLeeway(config.JWTLeeway), jwt.WithIssuer(m.cfg.JWT.Issuer))
 
 	if err != nil {
 		return "", "", "", "", false, err

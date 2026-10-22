@@ -17,12 +17,17 @@ import (
 
 // Shared helpers for the WMP HTTP tests.
 
-const testSecret = "test-secret-for-wmp"
+const (
+	testSecret = "test-secret-for-wmp"
+	// Legacy tokens are only accepted when pinned to jwt.issuer.
+	testIssuer = "test-issuer"
+)
 
 func testManager() *Manager {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
 			Secret: testSecret,
+			Issuer: testIssuer,
 		},
 	}
 	return NewManager(cfg, zap.NewNop())
@@ -30,6 +35,7 @@ func testManager() *Manager {
 
 func testToken(userID, tenantID string) string {
 	claims := jwt.MapClaims{
+		"iss":     testIssuer,
 		"user_id": userID,
 		"exp":     time.Now().Add(time.Hour).Unix(),
 	}
@@ -43,6 +49,7 @@ func testToken(userID, tenantID string) string {
 
 func expiredToken(userID string) string {
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"iss":     testIssuer,
 		"user_id": userID,
 		"exp":     time.Now().Add(-time.Hour).Unix(),
 	})

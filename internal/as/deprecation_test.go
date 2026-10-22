@@ -17,8 +17,7 @@ func TestDeprecationMiddleware_LegacyClient(t *testing.T) {
 		c.Next()
 	})
 	router.Use(DeprecationMiddleware(DeprecationConfig{
-		Enabled:    true,
-		SunsetDate: "2027-10-01T00:00:00Z",
+		Enabled: true,
 	}))
 	router.GET("/test", func(c *gin.Context) {
 		c.Status(http.StatusOK)
@@ -31,13 +30,8 @@ func TestDeprecationMiddleware_LegacyClient(t *testing.T) {
 	if w.Header().Get("Deprecation") != "true" {
 		t.Errorf("expected Deprecation: true, got %q", w.Header().Get("Deprecation"))
 	}
-	sunset := w.Header().Get("Sunset")
-	if sunset == "" {
-		t.Fatal("expected Sunset header")
-	}
-	// Should be HTTP-date format.
-	if sunset != "Fri, 01 Oct 2027 00:00:00 GMT" {
-		t.Errorf("unexpected Sunset value: %s", sunset)
+	if got := w.Header().Get("Sunset"); got != "" {
+		t.Errorf("Sunset header must not be sent, got %q", got)
 	}
 }
 
@@ -49,8 +43,7 @@ func TestDeprecationMiddleware_NewClient(t *testing.T) {
 		c.Next()
 	})
 	router.Use(DeprecationMiddleware(DeprecationConfig{
-		Enabled:    true,
-		SunsetDate: "2027-10-01T00:00:00Z",
+		Enabled: true,
 	}))
 	router.GET("/test", func(c *gin.Context) {
 		c.Status(http.StatusOK)
