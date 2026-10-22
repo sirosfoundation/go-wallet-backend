@@ -73,7 +73,7 @@ func TestCredentialMetadataRelay_Absent(t *testing.T) {
 	assert.Nil(t, relay)
 }
 
-func TestCredentialMetadataRelay_ValidShapes(t *testing.T) {
+func TestCredentialMetadataRelay_WithinLimits(t *testing.T) {
 	deep := strings.Repeat(`{"a":`, maxCredentialMetadataDepth) + `1` + strings.Repeat(`}`, maxCredentialMetadataDepth)
 	var many []string
 	for i := 0; i < maxCredentialMetadataMembers; i++ {
@@ -834,4 +834,74 @@ func TestCredentialResponseDecodeErrors_DoNotQuoteContent(t *testing.T) {
 		_, err := h.pollDeferredCredential(context.Background(), &IssuerMetadata{CredentialIssuer: srv.URL}, tok, "tx1")
 		check(t, err)
 	})
+}
+
+// TestEnforceCredentialMetadataLimits pins every branch of the token walker,
+// including the exact rejection reason, independently of the later decode.
+func TestEnforceCredentialMetadataLimits(t *testing.T) {
+	const (
+		invalid = "credential_metadata is not valid JSON"
+		dup     = "credential_metadata has a duplicate member name"
+	)
+	depthMsg := fmt.Sprintf("credential_metadata nests deeper than %d", maxCredentialMetadataDepth)
+	keyMsg := fmt.Sprintf("credential_metadata member name exceeds %d bytes", maxCredentialMetadataKeyLen)
+	memMsg := fmt.Sprintf("credential_metadata object has more than %d members", maxCredentialMetadataMembers)
+	members := func(n int) string {
+		var m []string
+		for i := 0; i < n; i++ {
+			m = append(m, fmt.Sprintf(`"k%d":%d`, i, i))
+		}
+		return `{` + strings.Join(m, ",") + `}`
+	}
+	longKey := strings.Repeat("k", maxCredentialMetadataKeyLen+1)
+	rep := func(s string, n int) string { return strings.Repeat(s, n) }
+
+	cases := []struct {
+		name, in, want string // want "" = accepted
+	}{
+		{"empty object", `{}`, ""},
+		{"depth at cap objects", rep(`{"a":`, maxCredentialMetadataDepth) + `1` + rep(`}`, maxCredentialMetadataDepth), ""},
+		{"depth over cap objects", rep(`{"a":`, maxCredentialMetadataDepth+1) + `1` + rep(`}`, maxCredentialMetadataDepth+1), depthMsg},
+		{"depth at cap arrays", `{"a":` + rep(`[`, maxCredentialMetadataDepth-1) + rep(`]`, maxCredentialMetadataDepth-1) + `}`, ""},
+		{"depth over cap arrays", `{"a":` + rep(`[`, maxCredentialMetadataDepth) + rep(`]`, maxCredentialMetadataDepth) + `}`, depthMsg},
+		{"members at cap", members(maxCredentialMetadataMembers), ""},
+		{"members over cap", members(maxCredentialMetadataMembers + 1), memMsg},
+		{"nested members over cap", `{"x":` + members(maxCredentialMetadataMembers+1) + `}`, memMsg},
+		{"members counted per object", `{"a":` + members(maxCredentialMetadataMembers) + `,"b":` + members(maxCredentialMetadataMembers) + `}`, ""},
+		{"key at cap", `{"` + strings.Repeat("k", maxCredentialMetadataKeyLen) + `":1}`, ""},
+		{"key over cap", `{"` + longKey + `":1}`, keyMsg},
+		{"nested key over cap", `{"x":[{"` + longKey + `":1}]}`, keyMsg},
+		{"duplicate top level", `{"x":1,"x":2}`, dup},
+		{"duplicate top level after nested value", `{"x":{"a":1},"y":[1],"x":2}`, dup},
+		{"duplicate in seed object", `{"org.siros.secret_seed":{"n":"a","n":"b"}}`, dup},
+		{"duplicate in seed object after other member", `{"q":1,"org.siros.secret_seed":{"m":1,"n":2,"n":3}}`, dup},
+		{"same key in distinct top-level objects", `{"a":{"x":1},"b":{"x":2}}`, ""},
+		{"nested duplicate allowed", `{"display":[{"name":"a","name":"b"}]}`, ""},
+		{"nested duplicate in object allowed", `{"a":{"x":1,"x":2}}`, ""},
+		{"duplicate under a non-seed key allowed", `{"a":{"org.siros.secret_seed":{"n":1,"n":2}}}`, ""},
+		{"duplicate inside array under seed key allowed", `{"org.siros.secret_seed":[{"n":1,"n":2}]}`, ""},
+		{"duplicate deeper inside seed object allowed", `{"org.siros.secret_seed":{"n":{"a":1,"a":2}}}`, ""},
+		{"seed key does not leak to later sibling", `{"org.siros.secret_seed":1,"x":{"a":1,"a":2}}`, ""},
+		{"top-level array: objects not unique", `[{"a":1,"a":2}]`, ""},
+		{"scalar top level", `7`, ""},
+		{"numbers verbatim (UseNumber)", `{"n":1e400,"b":123456789012345678901234567890,"m":-1E-999}`, ""},
+		{"empty input", ``, ""},
+		{"truncated object", `{"a":1`, invalid},
+		{"truncated array", `{"a":[1,2`, invalid},
+		{"truncated mid-token", `{"a":`, invalid},
+		{"bad token", `{"a":nul}`, invalid},
+		{"trailing garbage", `{"a":1} x`, invalid},
+		{"unquoted key", `{a:1}`, invalid},
+		{"unbalanced close", `{"a":1}}`, invalid},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := enforceCredentialMetadataLimits(json.RawMessage(tc.in))
+			if tc.want == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.EqualError(t, err, tc.want)
+		})
+	}
 }

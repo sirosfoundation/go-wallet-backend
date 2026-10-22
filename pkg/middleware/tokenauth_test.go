@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -594,6 +595,24 @@ func TestExtractBearer(t *testing.T) {
 				t.Errorf("extractBearer() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestLegacyIssuanceGate(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	run := func(enabled bool) (int, string) {
+		w := httptest.NewRecorder()
+		_, r := gin.CreateTestContext(w)
+		r.POST("/login", LegacyIssuanceGate(enabled), func(c *gin.Context) { c.Status(200) })
+		r.ServeHTTP(w, httptest.NewRequest("POST", "/login", nil))
+		return w.Code, w.Body.String()
+	}
+	if code, _ := run(true); code != 200 {
+		t.Error("gate must pass when legacy is enabled")
+	}
+	code, body := run(false)
+	if code != 410 || !strings.Contains(body, "legacy_tokens_disabled") {
+		t.Errorf("gate must answer 410 legacy_tokens_disabled when legacy is off, got %d %s", code, body)
 	}
 }
 

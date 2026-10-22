@@ -19,13 +19,11 @@
 package legacytoken
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
+	"github.com/go-jose/go-jose/v4"
 	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/sirosfoundation/go-tokenauth/claims"
@@ -86,28 +84,10 @@ func SID(secret, rawToken string) string {
 // algorithm, i.e. whether it is a legacy token rather than a new-style
 // asymmetric one. Nothing about the token is trusted by this; it only routes.
 func IsHMAC(rawToken string) bool {
-	// Read only the JOSE header's "alg" for routing. This deliberately does
-	// not go through a JWT parser: no claims are read and nothing is trusted,
-	// and every token routed here is signature-verified (HS* only) later.
-	header, _, ok := strings.Cut(rawToken, ".")
-	if !ok {
-		return false
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(header)
-	if err != nil {
-		return false
-	}
-	var h struct {
-		Alg string `json:"alg"`
-	}
-	if json.Unmarshal(raw, &h) != nil {
-		return false
-	}
-	switch h.Alg {
-	case "HS256", "HS384", "HS512":
-		return true
-	}
-	return false
+	// Parsing only (no verification): an error covers malformed tokens and any
+	// non-HMAC alg. Every token routed here is verified (HS* only) later.
+	_, err := jose.ParseSigned(rawToken, []jose.SignatureAlgorithm{jose.HS256, jose.HS384, jose.HS512})
+	return err == nil
 }
 
 // legacyLeeway matches go-tokenauth's default clock-skew allowance.

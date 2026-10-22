@@ -2,6 +2,8 @@ package as
 
 import (
 	"context"
+	"crypto"
+	"crypto/ecdsa"
 	"fmt"
 	"net/http"
 	"time"
@@ -14,6 +16,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
 // ASModule is the top-level authorization server module that wires together
@@ -51,6 +54,8 @@ type ASModule struct {
 	// OIDCGateMiddleware, wired identically in internal/server/providers.go).
 	store          storage.Store
 	validatorCache *middleware.ValidatorCache
+	// cancel stops the module's background goroutines (session cleanup).
+	cancel context.CancelFunc
 	// gateLimit, when set, rate limits token-bearing requests to the passkey
 	// OIDC gates (see SetOIDCGateRateLimiter). nil means unlimited.
 	gateLimit gin.HandlerFunc
@@ -76,12 +81,21 @@ func NewASModule(
 	blacklist TokenBlacklistChecker,
 	httpClient *http.Client,
 	logger *zap.Logger,
-) (*ASModule, error) {
+) (module *ASModule, err error) {
 	// Key manager.
-	km, err := NewKeyManager(cfg.SigningKeyPath)
+	km, err := newConfiguredKeyManager(cfg)
 	if err != nil {
 		return nil, err
 	}
+	// Child context so Close or a failed construction can stop the goroutines.
+	ctx, cancel := context.WithCancel(ctx)
+	// Release HSM sessions and goroutines on any later failure.
+	defer func() {
+		if err != nil {
+			cancel()
+			_ = km.Close()
+		}
+	}()
 
 	// Token issuer.
 	issuer := cfg.Issuer
@@ -168,6 +182,7 @@ func NewASModule(
 		FamilyRetention: jwtCfg.FamilyRetention() + time.Hour,
 		store:           store,
 		validatorCache:  validatorCache,
+		cancel:          cancel,
 	}, nil
 }
 
@@ -205,7 +220,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 	{
 		// Registration routes (with OIDC registration gate).
 		registration := passkey.Group("")
-		registration.Use(m.gateLimitMiddleware(), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeRegistration, m.Logger))
+		registration.Use(m.gateLimitMiddleware(), legacyModeGate(m.Config.Legacy.Enabled), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeRegistration, m.Logger))
 		{
 			registration.POST("/register/begin", m.PasskeyHandler.RegisterBegin)
 			registration.POST("/register/finish", m.PasskeyHandler.RegisterFinish)
@@ -213,7 +228,7 @@ func (m *ASModule) RegisterRoutes(auth *gin.RouterGroup) {
 
 		// Login routes (with OIDC login gate).
 		login := passkey.Group("")
-		login.Use(m.gateLimitMiddleware(), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeLogin, m.Logger))
+		login.Use(m.gateLimitMiddleware(), legacyModeGate(m.Config.Legacy.Enabled), middleware.OIDCGateMiddleware(m.validatorCache, middleware.GateTypeLogin, m.Logger))
 		{
 			login.POST("/login/begin", m.PasskeyHandler.LoginBegin)
 			login.POST("/login/finish", m.PasskeyHandler.LoginFinish)
@@ -281,4 +296,87 @@ func newMemorySessionStoreWithCleanup(ctx context.Context) *MemorySessionStore {
 	sessions := NewMemorySessionStore()
 	sessions.StartCleanup(ctx, 5*time.Minute)
 	return sessions
+}
+
+// newConfiguredKeyManager builds the KeyManager from the PEM key file or the
+// PKCS#11 key; exactly one must be configured.
+func newConfiguredKeyManager(cfg *config.ASConfig) (*KeyManager, error) {
+	switch {
+	case cfg.SigningKeyPath != "" && cfg.SigningKeyPKCS11 != nil:
+		return nil, fmt.Errorf("as: signing_key_path and signing_key_pkcs11 are mutually exclusive")
+	case cfg.SigningKeyPKCS11 != nil:
+		p := cfg.SigningKeyPKCS11
+		// Read here, not in config.Load: standalone engines sharing the config
+		// need not have the file.
+		pin, err := p.ResolvePIN()
+		if err != nil {
+			return nil, fmt.Errorf("as: signing_key_pkcs11: %w", err)
+		}
+		signer, err := newPKCS11Signer(&signing.PKCS11Config{
+			ModulePath: p.ModulePath,
+			SlotID:     p.SlotID,
+			PIN:        pin,
+			KeyLabel:   p.KeyLabel,
+			PoolSize:   p.PoolSize,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("as: pkcs11 signing key: %w", err)
+		}
+		km, err := newPKCS11KeyManager(signer)
+		if err != nil {
+			if c, ok := signer.(interface{ Close() error }); ok {
+				_ = c.Close()
+			}
+			return nil, err
+		}
+		return km, nil
+	default:
+		return NewKeyManager(cfg.SigningKeyPath)
+	}
+}
+
+// newPKCS11Signer is a seam so tests can inject a fake HSM signer.
+var newPKCS11Signer = func(cfg *signing.PKCS11Config) (crypto.Signer, error) {
+	return signing.NewPKCS11Signer(cfg)
+}
+
+// Close releases resources held by the module (HSM sessions).
+func (m *ASModule) Close() error {
+	if m == nil {
+		return nil
+	}
+	if m.cancel != nil {
+		m.cancel()
+	}
+	if m.KeyManager == nil {
+		return nil
+	}
+	return m.KeyManager.Close()
+}
+
+// legacyModeGate answers 410 to legacy-mode clients when legacy is disabled.
+// It sits before the OIDC gate so they do not get an unrelated OIDC error.
+func legacyModeGate(enabled bool) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if enabled || DetectClientMode(c) == ClientModeSession {
+			c.Next()
+			return
+		}
+		c.AbortWithStatusJSON(http.StatusGone, gin.H{
+			"error":   "legacy_tokens_disabled",
+			"message": "legacy HMAC session tokens are no longer issued; send X-Token-Mode: session",
+		})
+	}
+}
+
+// newPKCS11KeyManager accepts only ECDSA keys: the pkcs11pool signer handles
+// CKK_EC and CKK_RSA only (not CKK_EC_EDWARDS), and RSA is not an AS algorithm.
+func newPKCS11KeyManager(signer crypto.Signer) (*KeyManager, error) {
+	if signer == nil {
+		return nil, fmt.Errorf("as: pkcs11 signing key: nil signer")
+	}
+	if _, ok := signer.Public().(*ecdsa.PublicKey); !ok {
+		return nil, fmt.Errorf("as: signing_key_pkcs11 supports only ECDSA P-256/P-384 keys, got %T (Ed25519 and RSA are not supported for PKCS#11; use signing_key_path for Ed25519)", signer.Public())
+	}
+	return NewKeyManagerFromSigner(signer)
 }
