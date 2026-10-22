@@ -122,3 +122,22 @@ func TestLogoutEverywhere_CompareAndSetRefusesRevocationLandingBeforeTheAdvance(
 	require.NoError(t, err)
 	assert.True(t, cutoff.Equal(independent), "the independent cut-off stands")
 }
+
+// A token without an iat (the legacy path admits one) is not an internal
+// caller: a revocation landing before the cut-off advance must refuse it, not
+// be treated as unconditional.
+func TestDeleteUser_TokenWithoutIatIsRefusedWhenARevocationLandsBeforeTheAdvance(t *testing.T) {
+	ctx := tokengate.WithIssuedAt(context.Background(), time.Time{})
+	inner := memory.NewStore()
+	hs := &beforeAdvanceStore{Store: inner}
+	svc := NewUserService(hs, testConfig(), zap.NewNop())
+	uid := seedWalletUser(t, inner, domain.DefaultTenantID, "acme")
+	hs.beforeAdvance = func() {
+		require.NoError(t, inner.Users().InvalidateAuthBefore(context.Background(), uid, time.Now().Add(time.Hour).UTC().Truncate(time.Second)))
+	}
+
+	err := svc.DeleteUser(ctx, uid, uid.String())
+	require.ErrorIs(t, err, tokengate.ErrRevoked)
+	_, gerr := inner.Users().GetByID(context.Background(), uid)
+	assert.NoError(t, gerr, "nothing was deleted")
+}

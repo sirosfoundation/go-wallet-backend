@@ -292,9 +292,15 @@ func refuseIfCutOff(ctx context.Context, user *domain.User) error {
 	return tokengate.RefuseLoaded(ctx, user.AuthInvalidBefore)
 }
 
-// requestIssuedAt is the request token's iat, or zero for an internal caller.
+// requestIssuedAt is the request token's iat, or zero for an internal caller
+// (no token in the context, so the compare-and-set is unconditional). A token
+// that carries no iat is not an internal caller: it counts as issued at the
+// epoch, so any existing cut-off refuses it, as the gate does (fail closed).
 func requestIssuedAt(ctx context.Context) time.Time {
-	t, _ := tokengate.IssuedAtFrom(ctx)
+	t, ok := tokengate.IssuedAtFrom(ctx)
+	if ok && t.IsZero() {
+		return time.Unix(0, 0)
+	}
 	return t
 }
 
