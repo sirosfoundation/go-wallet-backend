@@ -5,11 +5,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/go-jose/go-jose/v4/jwt"
-	legacyjwt "github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-tokenauth/claims"
@@ -27,8 +25,8 @@ import (
 // bearer token. Every other route must refuse one; an unclassified new route
 // fails the test.
 var anonymousOKPrefixes = []string{
-	"/v1/",                                              // AuthZEN trust evaluation/resolution: registry lookups
-	"/user/register-webauthn-", "/user/login-webauthn-", // no bearer token
+	"/v1/",                          // AuthZEN trust evaluation/resolution: registry lookups
+	"/user/register", "/user/login", // removed legacy endpoints: 410, no token involved
 	"/user/session/refresh",        // the refresh token is the credential
 	"/tenant/", "/api/v1/tenants/", // public tenant configuration
 	"/helper/auth-check",      // checks a token, acts for nobody
@@ -146,34 +144,10 @@ func TestAnonymousTokens_RefusedOnEveryWalletScopedRoute_TokenAuth(t *testing.T)
 	}
 }
 
-func TestAnonymousTokens_RefusedOnEveryWalletScopedRoute_Legacy(t *testing.T) {
-	cfg := anonymousConfig(t)
-	store := newTestMemoryBackend(t)
-
-	authProvider := NewAuthProvider(cfg, store, zap.NewNop(), nil)
-	defer func() { _ = authProvider.Close() }()
-	storageProvider := NewStorageProvider(cfg, store, zap.NewNop(), nil)
-	router := gin.New()
-	authProvider.RegisterRoutes(router)
-	storageProvider.RegisterRoutes(router)
-
-	mint := func(userID string) string {
-		tok, err := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
-			"iss": cfg.JWT.Issuer, "user_id": userID, "tenant_id": string(domain.DefaultTenantID),
-			"iat": time.Now().Add(-time.Minute).Unix(), "exp": time.Now().Add(time.Hour).Unix(),
-		}).SignedString([]byte(cfg.JWT.Secret))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return tok
-	}
-	assertAnonymousRefusedEverywhere(t, router, mint(""), mint("user-123"))
-}
-
 func TestAnonymousTokens_RefusedOnEveryWalletScopedRoute_StandaloneWalletProvider(t *testing.T) {
 	v, key, issuer := setupServerTokenValidatorTest(t)
 	cfg := anonymousConfig(t)
-	cfg.JWT.Secret = "test-secret-that-is-at-least-32-bytes!"
+	cfg.AS.ExternalURL = "https://as.example.com"
 
 	p, err := NewWalletProviderProvider(cfg, zap.NewNop())
 	if err != nil {

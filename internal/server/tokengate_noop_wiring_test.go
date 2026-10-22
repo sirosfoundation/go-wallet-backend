@@ -22,6 +22,6 @@ func TestBackendRolesNeverUseNoUserRecords(t *testing.T) {
 	calls := regexp.MustCompile(`middleware\.TokenAuthMiddleware\([^\n]*\)`).FindAllString(string(src), -1)
 	require.NotEmpty(t, calls, "expected TokenAuthMiddleware call sites in providers.go")
 	for _, c := range calls {
-		assert.Contains(t, c, "p.store.Users()", "call site must pass the real user store: %s", c)
+		assert.Contains(t, c, "store.Users()", "call site must pass the real user store: %s", c)
 	}
 }

@@ -19,6 +19,7 @@ services:
       LD_LIBRARY_PATH: /opt/vendor                    # only if the module needs libraries the image lacks
       # Wallet backend: which module, slot and key the Authorization Server signs with.
       WALLET_AS_ENABLED: "true"
+      WALLET_AS_EXTERNAL_URL: https://wallet.example.com   # required: the AS JWKS is fetched from here
       WALLET_AS_SIGNING_KEY_PKCS11_MODULE_PATH: /opt/vendor/libvendor-pkcs11.so
       WALLET_AS_SIGNING_KEY_PKCS11_SLOT_ID: "0"
       WALLET_AS_SIGNING_KEY_PKCS11_KEY_LABEL: as-signing

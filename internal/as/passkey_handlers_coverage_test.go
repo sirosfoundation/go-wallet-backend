@@ -3,7 +3,6 @@ package as
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,15 +30,19 @@ type capturingWebAuthn struct {
 	mockWebAuthn
 	lastFinishRegReq   *service.FinishRegistrationRequest
 	lastFinishLoginReq *service.FinishLoginRequest
+	// finishedAt is when FinishRegistration/FinishLogin was entered.
+	finishedAt time.Time
 }
 
 func (m *capturingWebAuthn) FinishRegistration(ctx context.Context, req *service.FinishRegistrationRequest) (*service.FinishRegistrationResponse, error) {
 	m.lastFinishRegReq = req
+	m.finishedAt = time.Now()
 	return m.mockWebAuthn.FinishRegistration(ctx, req)
 }
 
 func (m *capturingWebAuthn) FinishLogin(ctx context.Context, req *service.FinishLoginRequest) (*service.FinishLoginResponse, error) {
 	m.lastFinishLoginReq = req
+	m.finishedAt = time.Now()
 	return m.mockWebAuthn.FinishLogin(ctx, req)
 }
 
@@ -63,12 +66,12 @@ func contextInjector(tenant *domain.Tenant, oidcResult *oidc.ValidationResult) g
 func newTestPasskeyHandlers(webauthn WebAuthnProvider) (*PasskeyHandlers, *MemorySessionStore) {
 	gin.SetMode(gin.TestMode)
 	store := NewMemorySessionStore()
-	cfg := &config.ASConfig{Legacy: config.ASLegacyConfig{Enabled: true},
+	cfg := &config.ASConfig{
 		DefaultMaxTAC:   "rwl",
 		SessionTTL:      24 * time.Hour,
 		InsecureCookies: true,
 	}
-	return NewPasskeyHandlers(webauthn, store, nil, cfg, zap.NewNop()), store
+	return NewPasskeyHandlers(webauthn, store, cfg, zap.NewNop()), store
 }
 
 func gatedTenant(bindIdentity bool, regOP *domain.OIDCProviderConfig) *domain.Tenant {
@@ -412,16 +415,12 @@ func TestPasskeyRegisterBegin_ErrorMapping(t *testing.T) {
 	}
 }
 
-// SID-AUTH-06: the registration auto-login session inherits the token's iat, so
-// a cut-off between mint and store refuses it.
-func TestPasskeyRegisterFinish_SessionInheritsTokenIssuedAt(t *testing.T) {
-	iat := time.Now().Add(-10 * time.Second).Truncate(time.Second)
-	hdr := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
-	pl := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"iat":%d}`, iat.Unix())))
-	tok := hdr + "." + pl + ".sig"
-
+// SID-AUTH-06: the registration auto-login session is stamped with the instant
+// before the registration was finished, so a cut-off landing during it refuses
+// the session instead of being outrun by a fresh timestamp.
+func TestPasskeyRegisterFinish_SessionIsStampedBeforeTheRegistrationFinishes(t *testing.T) {
 	mock := &capturingWebAuthn{mockWebAuthn: mockWebAuthn{
-		finishRegResp: &service.FinishRegistrationResponse{UUID: "user-1", TenantID: "t", Token: tok},
+		finishRegResp: &service.FinishRegistrationResponse{UUID: "user-1", TenantID: "t"},
 	}}
 	h, store := newTestPasskeyHandlers(mock)
 	router := gin.New()
@@ -444,20 +443,20 @@ func TestPasskeyRegisterFinish_SessionInheritsTokenIssuedAt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("session not stored: %v", err)
 	}
-	if !sess.AuthenticatedAt.Equal(iat) {
-		t.Fatalf("AuthenticatedAt = %v, want the registration token iat %v", sess.AuthenticatedAt, iat)
+	if sess.AuthenticatedAt.IsZero() || sess.AuthenticatedAt.After(mock.finishedAt) {
+		t.Fatalf("AuthenticatedAt = %v, want a time at or before the registration was finished (%v)", sess.AuthenticatedAt, mock.finishedAt)
 	}
 
-	// A cut-off between the token mint and the session store refuses it.
+	// A cut-off landing while the registration was being finished refuses the session.
 	users := memory.NewStore().Users()
 	uid := domain.NewUserID()
 	if err := users.Create(context.Background(), &domain.User{UUID: uid}); err != nil {
 		t.Fatal(err)
 	}
-	if err := users.InvalidateAuthBefore(context.Background(), uid, iat.Add(5*time.Second)); err != nil {
+	if err := users.InvalidateAuthBefore(context.Background(), uid, mock.finishedAt); err != nil {
 		t.Fatal(err)
 	}
 	if err := tokengate.New(users).Check(context.Background(), uid.String(), sess.authInstant()); !errors.Is(err, tokengate.ErrRevoked) {
-		t.Fatalf("session must be refused after a cut-off past the token iat, got %v", err)
+		t.Fatalf("session must be refused after a cut-off during the registration, got %v", err)
 	}
 }

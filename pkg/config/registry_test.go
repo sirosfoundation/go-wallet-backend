@@ -109,30 +109,30 @@ func TestConfig_ValidateRegistry_Auth(t *testing.T) {
 		c.JWT.Issuer = ""
 		err := c.ValidateRegistry()
 		require.Error(t, err)
-		for _, f := range []string{"as.external_url", "as.issuer", "jwt.secret"} {
+		for _, f := range []string{"as.external_url", "as.issuer"} {
 			assert.Contains(t, err.Error(), f)
 		}
+		assert.NotContains(t, err.Error(), "jwt.secret", "no HMAC secret is needed any more")
 	})
 
-	t.Run("legacy disabled needs no secret", func(t *testing.T) {
+	t.Run("needs no jwt.secret", func(t *testing.T) {
 		c := base()
 		c.AS.ExternalURL = "https://wallet.example.org"
-		c.AS.Legacy.Enabled = false
 		c.JWT.Secret = ""
 		require.NoError(t, c.ValidateRegistry())
 	})
 
-	t.Run("legacy enabled needs a 32 byte secret", func(t *testing.T) {
-		c := base()
-		c.AS.ExternalURL = "https://wallet.example.org"
-		c.AS.Legacy.Enabled = true
-		c.JWT.Secret = "short"
-		err := c.ValidateRegistry()
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "jwt.secret")
-		assert.NotContains(t, err.Error(), "as.external_url")
-		c.JWT.Secret = strings.Repeat("s", 32)
-		require.NoError(t, c.ValidateRegistry())
+	t.Run("as.legacy.enabled=true is refused like Validate does", func(t *testing.T) {
+		yes := true
+		for _, requireAuth := range []bool{false, true} {
+			c := base()
+			c.Registry.RequireAuth = requireAuth
+			c.AS.ExternalURL = "https://wallet.example.org"
+			c.AS.Legacy.Enabled = &yes
+			err := c.ValidateRegistry()
+			require.Error(t, err, "require_auth=%v", requireAuth)
+			assert.Contains(t, err.Error(), "as.legacy.enabled=true")
+		}
 	})
 
 	t.Run("as.enabled false is fine", func(t *testing.T) {
@@ -140,7 +140,8 @@ func TestConfig_ValidateRegistry_Auth(t *testing.T) {
 		c.AS.Enabled = false
 		c.AS.ExternalURL = "https://wallet.example.org"
 		c.AS.Issuer = "https://wallet.example.org"
-		c.AS.Legacy.Enabled = false
+		no := false
+		c.AS.Legacy.Enabled = &no // deprecated but accepted
 		require.NoError(t, c.ValidateRegistry())
 	})
 
@@ -344,12 +345,11 @@ func TestApplyLegacyRegistryConfig_FileMappingStandalone(t *testing.T) {
 	assert.Equal(t, "debug", c.Logging.Level)
 	assert.Equal(t, "text", c.Logging.Format)
 
-	// jwt block keeps validating HMAC tokens through the shared stack
-	assert.Equal(t, "0123456789abcdef0123456789abcdef", c.JWT.Secret)
-	assert.Equal(t, "legacy-issuer", c.JWT.Issuer, "legacy HMAC issuer stays enforced")
+	// the jwt block's HMAC secret and issuer are IGNORED, with a loud warning
+	assert.Empty(t, c.JWT.Secret)
+	assert.Equal(t, "wallet-backend", c.JWT.Issuer, "old jwt.issuer is not adopted")
 	assert.Equal(t, "", c.AS.Issuer)
-	assert.Contains(t, strings.Join(w, "\n"), "jwt")
-	assert.False(t, c.registryLegacyTolerateNoJWKS)
+	assert.Contains(t, strings.Join(w, "\n"), "registry `jwt` block (secret, secret_path, issuer) is IGNORED")
 
 	require.NoError(t, c.ValidateRegistry())
 }
@@ -366,37 +366,38 @@ func TestApplyLegacyRegistryConfig_CombinedIgnoresServerAndJWT(t *testing.T) {
 	assert.Equal(t, "", c.Server.RegistryHost, "server block is not applied in combined mode")
 	assert.Equal(t, "info", c.Logging.Level)
 	assert.Equal(t, "backend-secret-backend-secret-1234", c.JWT.Secret)
-	assert.Contains(t, strings.Join(w, "\n"), "jwt` block is ignored")
+	assert.Contains(t, strings.Join(w, "\n"), "jwt` block (secret, secret_path, issuer) is IGNORED")
 }
 
-func TestApplyLegacyRegistryConfig_RequireAuthWithoutExternalURLIsTolerated(t *testing.T) {
+// A registry.yaml with jwt.require_auth needs as.external_url: startup must fail rather than
+// serve a registry nobody can authenticate to.
+func TestApplyLegacyRegistryConfig_RequireAuthWithoutExternalURLFailsStartup(t *testing.T) {
 	p := writeFile(t, t.TempDir(), "registry.yaml", legacyRegistryYAML)
 	c := defaultConfig()
 	w, err := c.ApplyLegacyRegistryConfig(p, true)
 	require.NoError(t, err)
-	assert.True(t, c.registryLegacyTolerateNoJWKS)
+	assert.True(t, c.Registry.RequireAuth)
 	assert.Contains(t, strings.Join(w, "\n"), "as.external_url")
-	require.NoError(t, c.ValidateRegistry(), "old HMAC-only auth deployments keep starting")
+	assert.ErrorContains(t, c.ValidateRegistry(), "as.external_url")
 
-	// ...but the new section is strict.
-	c2 := defaultConfig()
-	c2.Registry.RequireAuth = true
-	c2.JWT.Secret = strings.Repeat("s", 32)
-	assert.ErrorContains(t, c2.ValidateRegistry(), "as.external_url")
+	// with the AS JWKS configured it starts, the HMAC secret still ignored
+	c.AS.ExternalURL = "https://wallet.example.org"
+	require.NoError(t, c.ValidateRegistry())
+	assert.Empty(t, c.JWT.Secret)
 }
 
-func TestApplyLegacyRegistryConfig_SecretPath(t *testing.T) {
+// The old secret file is never read: a missing or unreadable file must not fail startup.
+func TestApplyLegacyRegistryConfig_SecretPathIgnored(t *testing.T) {
 	dir := t.TempDir()
 	sp := writeFile(t, dir, "secret", "  0123456789abcdef0123456789abcdef\n")
-	p := writeFile(t, dir, "registry.yaml", "jwt:\n  secret_path: "+sp+"\n")
-	c := defaultConfig()
-	_, err := c.ApplyLegacyRegistryConfig(p, true)
-	require.NoError(t, err)
-	assert.Equal(t, "0123456789abcdef0123456789abcdef", c.JWT.Secret)
-
-	p = writeFile(t, dir, "registry2.yaml", "jwt:\n  secret_path: "+filepath.Join(dir, "missing")+"\n")
-	_, err = defaultConfig().ApplyLegacyRegistryConfig(p, true)
-	assert.ErrorContains(t, err, "jwt.secret_path")
+	for _, path := range []string{sp, filepath.Join(dir, "missing")} {
+		p := writeFile(t, dir, "registry.yaml", "jwt:\n  secret_path: "+path+"\n")
+		c := defaultConfig()
+		w, err := c.ApplyLegacyRegistryConfig(p, true)
+		require.NoError(t, err)
+		assert.Empty(t, c.JWT.Secret)
+		assert.Contains(t, strings.Join(w, "\n"), "IGNORED")
+	}
 }
 
 func TestApplyLegacyRegistryConfig_Env(t *testing.T) {
@@ -689,187 +690,54 @@ registry:
 	assert.False(t, cfg.Registry.RequireAuth)
 }
 
-func TestValidateRegistry_ShortSecretAndTolerance(t *testing.T) {
-	c := defaultConfig()
-	c.AS.Legacy.Enabled = true
-	c.JWT.Secret = "short"
-	assert.ErrorContains(t, c.ValidateRegistry(), "at least 32 bytes")
-	c.AS.Legacy.Enabled = false
-	require.NoError(t, c.ValidateRegistry(), "legacy off: secret unused")
-	c.AS.Legacy.Enabled = true
-	c.JWT.Secret = ""
-	require.NoError(t, c.ValidateRegistry(), "no secret: legacy validator not built")
-
-	// the no-JWKS tolerance only applies while legacy validation stays enabled
-	c = defaultConfig()
-	c.Registry.RequireAuth = true
-	c.registryLegacyTolerateNoJWKS = true
-	c.JWT.Secret = strings.Repeat("s", 32)
-	require.NoError(t, c.ValidateRegistry())
-	c.AS.Legacy.Enabled = false
-	assert.ErrorContains(t, c.ValidateRegistry(), "as.external_url")
-}
-
 func TestLoadRegistryOnly_IgnoresBackendOnlySecretFiles(t *testing.T) {
 	dir := t.TempDir()
 	missing := filepath.Join(dir, "missing")
 	p := writeFile(t, dir, "c.yaml", "server:\n  admin_token_path: "+missing+"\n"+
 		"storage:\n  mongodb:\n    password_path: "+missing+"\n"+
 		"wallet_provider:\n  pkcs11:\n    pin_path: "+missing+"\n"+
-		"jwt:\n  secret_path: "+missing+"\n"+
-		"as:\n  legacy:\n    enabled: false\n")
+		"jwt:\n  secret_path: "+missing+"\n")
 	_, err := Load(p)
 	require.Error(t, err, "the full backend load needs those files")
 	cfg, err := LoadRegistryOnly(p)
-	require.NoError(t, err, "registry-only does not read backend secrets nor jwt.secret_path with legacy off")
+	require.NoError(t, err, "registry-only reads no secret files: it validates through the AS JWKS")
 	assert.Empty(t, cfg.JWT.Secret)
-
-	// legacy on: jwt.secret_path is read (and required)
-	p = writeFile(t, dir, "c2.yaml", "jwt:\n  secret_path: "+missing+"\n")
-	_, err = LoadRegistryOnly(p)
-	assert.ErrorContains(t, err, "jwt.secret_path")
-	sp := writeFile(t, dir, "secret", "0123456789abcdef0123456789abcdef\n")
-	p = writeFile(t, dir, "c3.yaml", "jwt:\n  secret_path: "+sp+"\nserver:\n  rp_id: wallet.example.org\n  admin_token_path: "+missing+"\n")
-	cfg, err = LoadRegistryOnly(p)
-	require.NoError(t, err)
-	assert.Equal(t, "0123456789abcdef0123456789abcdef", cfg.JWT.Secret)
 }
 
+// as.legacy.enabled=true is refused by a registry-only process as by Validate.
+func TestRegistryOnly_LegacyEnabledRefusedLikeBackend(t *testing.T) {
+	dir := t.TempDir()
+	p := writeFile(t, dir, "c.yaml", "as:\n  legacy:\n    enabled: true\n")
+	cfg, err := LoadRegistryOnly(p)
+	require.NoError(t, err, "loading alone does not validate the registry section")
+	assert.ErrorContains(t, cfg.ValidateRegistry(), "as.legacy.enabled=true")
+
+	// explicit false is the deprecated, accepted spelling (ignored)
+	p = writeFile(t, dir, "c2.yaml", "as:\n  legacy:\n    enabled: false\n")
+	cfg, err = LoadRegistryOnly(p)
+	require.NoError(t, err)
+	require.NoError(t, cfg.ValidateRegistry())
+	assert.Contains(t, cfg.DeprecatedSettings(), "as.legacy.enabled (WALLET_AS_LEGACY_ENABLED)")
+}
+
+// A combined process never reads the old registry.yaml secret file either.
 func TestApplyLegacyRegistryConfig_CombinedDoesNotReadOldSecretFile(t *testing.T) {
 	dir := t.TempDir()
 	old := writeFile(t, dir, "registry.yaml", "jwt:\n  secret_path: "+filepath.Join(dir, "gone")+"\n")
+	_, err := defaultConfig().ApplyLegacyRegistryConfig(old, false)
+	require.NoError(t, err)
+}
+
+// The old jwt.issuer is not adopted; the expected issuer is as.issuer (fallback: backend jwt.issuer).
+func TestApplyLegacyRegistryConfig_IssuerNotAdopted(t *testing.T) {
+	p := writeFile(t, t.TempDir(), "registry.yaml", "jwt:\n  secret: \"0123456789abcdef0123456789abcdef\"\n  issuer: legacy-issuer\n")
 	c := defaultConfig()
-	_, err := c.ApplyLegacyRegistryConfig(old, false)
-	require.NoError(t, err, "combined mode uses the backend jwt settings")
-	_, err = defaultConfig().ApplyLegacyRegistryConfig(old, true)
-	assert.ErrorContains(t, err, "jwt.secret_path", "standalone still needs it")
-}
-
-func TestConfig_ValidateRegistryStandalone_LegacyRPID(t *testing.T) {
-	c := defaultConfig()
-	c.AS.Legacy.Enabled = true
-	c.JWT.Secret = strings.Repeat("s", 32)
-	err := c.ValidateRegistryStandalone()
-	require.Error(t, err, "default rp_id would reject every legacy token")
-	assert.Contains(t, err.Error(), "server.rp_id")
-
-	c.Server.RPID = ""
-	require.Error(t, c.ValidateRegistryStandalone())
-
-	c.Server.RPID = "wallet.example.org"
-	require.NoError(t, c.ValidateRegistryStandalone())
-
-	c = defaultConfig()
-	c.AS.Legacy.Enabled = false
-	c.JWT.Secret = strings.Repeat("s", 32)
-	require.NoError(t, c.ValidateRegistryStandalone(), "legacy disabled")
-
-	c = defaultConfig()
-	c.AS.Legacy.Enabled = true
-	c.JWT.Secret = ""
-	require.NoError(t, c.ValidateRegistryStandalone(), "no secret, legacy unusable")
-}
-
-func TestApplyLegacyRegistryConfig_OldSecretFileOnlyReadWhenUsable(t *testing.T) {
-	dir := t.TempDir()
-	gone := filepath.Join(dir, "gone-secret-file")
-	old := writeFile(t, dir, "registry.yaml", "jwt:\n  secret_path: "+gone+"\n")
-
-	t.Run("legacy disabled: unreadable file does not fail startup", func(t *testing.T) {
-		c := defaultConfig()
-		c.AS.Legacy.Enabled = false
-		_, err := c.ApplyLegacyRegistryConfig(old, true)
-		require.NoError(t, err)
-		assert.Empty(t, c.JWT.Secret)
-	})
-
-	t.Run("shared secret already loaded: file is not read", func(t *testing.T) {
-		c := defaultConfig()
-		c.AS.Legacy.Enabled = true
-		c.JWT.Secret = strings.Repeat("n", 32)
-		_, err := c.ApplyLegacyRegistryConfig(old, true)
-		require.NoError(t, err)
-		assert.Equal(t, strings.Repeat("n", 32), c.JWT.Secret)
-	})
-
-	t.Run("legacy enabled without a secret: file is read", func(t *testing.T) {
-		sp := writeFile(t, dir, "secret", strings.Repeat("o", 32)+"\n")
-		ok := writeFile(t, dir, "ok.yaml", "jwt:\n  secret_path: "+sp+"\n")
-		c := defaultConfig()
-		c.AS.Legacy.Enabled = true
-		c.JWT.Secret = ""
-		_, err := c.ApplyLegacyRegistryConfig(ok, true)
-		require.NoError(t, err)
-		assert.Equal(t, strings.Repeat("o", 32), c.JWT.Secret)
-	})
-
-	t.Run("legacy enabled, unreadable: clear error without the path", func(t *testing.T) {
-		c := defaultConfig()
-		c.AS.Legacy.Enabled = true
-		c.JWT.Secret = ""
-		_, err := c.ApplyLegacyRegistryConfig(old, true)
-		require.Error(t, err)
-		assert.ErrorContains(t, err, "jwt.secret_path")
-		assert.NotContains(t, err.Error(), gone)
-	})
-}
-
-func TestApplyLegacyRegistryConfig_IssuerPrecedence(t *testing.T) {
-	legacy := "jwt:\n  secret: \"0123456789abcdef0123456789abcdef\"\n  issuer: legacy-issuer\n"
-	backend := func(t *testing.T, yamlBody string) *Config {
-		t.Helper()
-		p := writeFile(t, t.TempDir(), "config.yaml", yamlBody)
-		c, err := LoadRegistryOnly(p)
-		require.NoError(t, err)
-		return c
-	}
-	apply := func(t *testing.T, c *Config) {
-		t.Helper()
-		p := writeFile(t, t.TempDir(), "registry.yaml", legacy)
-		_, err := c.ApplyLegacyRegistryConfig(p, true)
-		require.NoError(t, err)
-	}
-	base := "as:\n  external_url: https://wallet.example.org\n"
-
-	t.Run("only deprecated issuer set is applied", func(t *testing.T) {
-		unsetJWTIssuerEnv(t)
-		c := backend(t, base)
-		apply(t, c)
-		assert.Equal(t, "legacy-issuer", c.JWT.Issuer)
-	})
-	t.Run("explicit file jwt.issuer wins", func(t *testing.T) {
-		unsetJWTIssuerEnv(t)
-		c := backend(t, base+"jwt:\n  issuer: new-issuer\n")
-		apply(t, c)
-		assert.Equal(t, "new-issuer", c.JWT.Issuer)
-	})
-	t.Run("explicit file jwt.issuer equal to default wins", func(t *testing.T) {
-		unsetJWTIssuerEnv(t)
-		c := backend(t, base+"jwt:\n  issuer: wallet-backend\n")
-		apply(t, c)
-		assert.Equal(t, "wallet-backend", c.JWT.Issuer)
-	})
-	t.Run("WALLET_JWT_ISSUER wins", func(t *testing.T) {
-		t.Setenv("WALLET_JWT_ISSUER", "env-issuer")
-		c := backend(t, base)
-		apply(t, c)
-		assert.Equal(t, "env-issuer", c.JWT.Issuer)
-	})
-	t.Run("neither set keeps the default when legacy has none", func(t *testing.T) {
-		unsetJWTIssuerEnv(t)
-		c := backend(t, base)
-		p := writeFile(t, t.TempDir(), "registry.yaml", "jwt:\n  secret: \"0123456789abcdef0123456789abcdef\"\n")
-		_, err := c.ApplyLegacyRegistryConfig(p, true)
-		require.NoError(t, err)
-		assert.Equal(t, "wallet-backend", c.JWT.Issuer)
-	})
-}
-
-// unsetJWTIssuerEnv removes WALLET_JWT_ISSUER for the test (restored on cleanup).
-func unsetJWTIssuerEnv(t *testing.T) {
-	t.Helper()
-	t.Setenv("WALLET_JWT_ISSUER", "")
-	require.NoError(t, os.Unsetenv("WALLET_JWT_ISSUER"))
+	c.JWT.Issuer = "backend-issuer"
+	w, err := c.ApplyLegacyRegistryConfig(p, true)
+	require.NoError(t, err)
+	assert.Equal(t, "backend-issuer", c.JWT.Issuer)
+	assert.Empty(t, c.JWT.Secret)
+	assert.Contains(t, strings.Join(w, "\n"), "IGNORED")
 }
 
 func TestApplyLegacyRegistryConfig_EnvPresenceWarnsRegardlessOfValue(t *testing.T) {
@@ -898,51 +766,4 @@ func TestApplyLegacyRegistryConfig_EnvPresenceWarnsRegardlessOfValue(t *testing.
 			assert.Contains(t, w[0], tc.key)
 		})
 	}
-}
-
-func TestApplyLegacyRegistryConfig_AudienceIndependentLegacyPath(t *testing.T) {
-	p := writeFile(t, t.TempDir(), "registry.yaml", legacyRegistryYAML)
-
-	// Deprecated config, registry-only, HMAC secret, no rp_id: starts, with a
-	// warning that the audience is not checked.
-	c := defaultConfig()
-	w, err := c.ApplyLegacyRegistryConfig(p, true)
-	require.NoError(t, err)
-	assert.True(t, c.RegistryLegacyAudienceIndependent())
-	assert.Contains(t, strings.Join(w, "\n"), "WITHOUT an audience")
-	assert.Contains(t, strings.Join(w, "\n"), "server.rp_id")
-	require.NoError(t, c.ValidateRegistryStandalone(), "deprecated config keeps starting")
-	require.NoError(t, c.ValidateRegistry())
-
-	// Control: the same resulting config WITHOUT the deprecated marker (the
-	// new shape) fails startup with the clear rp_id error.
-	n := defaultConfig()
-	n.AS.Legacy.Enabled = true
-	n.JWT.Secret = "0123456789abcdef0123456789abcdef"
-	err = n.ValidateRegistryStandalone()
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "server.rp_id")
-	assert.False(t, n.RegistryLegacyAudienceIndependent())
-
-	// An explicit rp_id keeps audience checking (new behaviour wins).
-	c2 := defaultConfig()
-	c2.Server.RPID = "wallet.example.org"
-	_, err = c2.ApplyLegacyRegistryConfig(p, true)
-	require.NoError(t, err)
-	assert.False(t, c2.RegistryLegacyAudienceIndependent())
-
-	// Not registry-only, legacy disabled, or no secret: not applicable.
-	c3 := defaultConfig()
-	_, err = c3.ApplyLegacyRegistryConfig(p, false)
-	require.NoError(t, err)
-	assert.False(t, c3.RegistryLegacyAudienceIndependent())
-	c4 := defaultConfig()
-	c4.AS.Legacy.Enabled = false
-	_, err = c4.ApplyLegacyRegistryConfig(p, true)
-	require.NoError(t, err)
-	assert.False(t, c4.RegistryLegacyAudienceIndependent())
-	c5 := defaultConfig()
-	_, err = c5.ApplyLegacyRegistryConfig(writeFile(t, t.TempDir(), "r.yaml", "cache:\n  path: /x\n"), true)
-	require.NoError(t, err)
-	assert.False(t, c5.RegistryLegacyAudienceIndependent(), "no secret in the old config")
 }

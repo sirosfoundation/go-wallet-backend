@@ -347,37 +347,34 @@ func (c *RegistryConfig) Validate() error {
 // carry to be accepted by the registry role.
 const RegistryAudience = "wallet-registry"
 
-// ValidateRegistry validates everything the registry role needs from the
-// backend configuration: the registry section itself and, when
-// registry.require_auth is true, the as.* / jwt.* fields used to build the
-// shared go-tokenauth validator. It is meaningful whether or not the auth
-// role runs in the same process (as.enabled may be false: the registry then
-// only validates tokens issued by a remote authorization server).
+// ValidateRegistry validates what the registry role needs from the backend configuration: the
+// registry section and, with registry.require_auth, the as.* fields for the shared go-tokenauth
+// validator. It applies whether or not the AS runs in this process (as.enabled may be false).
+//
+// The registry accepts AS-issued ES256 tokens only, validated through
+// <as.external_url>/auth/.well-known/jwks.json. as.legacy.enabled=true is refused as in
+// Config.Validate (registry-only processes do not run it), and a deprecated registry.yaml `jwt`
+// secret is ignored with a warning (see ApplyLegacyRegistryConfig).
 func (c *Config) ValidateRegistry() error {
-	if err := c.Registry.Validate(); err != nil {
+	if err := c.rejectLegacyASEnabled(); err != nil {
 		return err
 	}
-	// A legacy HMAC secret that would be used to validate tokens must satisfy
-	// the shared length rule even when authentication is optional.
-	if c.AS.Legacy.Enabled && c.JWT.Secret != "" && len(c.JWT.Secret) < 32 {
-		return fmt.Errorf("jwt.secret must be at least 32 bytes (it validates legacy HMAC tokens while as.legacy.enabled is true; set as.legacy.enabled=false to disable them)")
+	if err := c.Registry.Validate(); err != nil {
+		return err
 	}
 	if !c.Registry.RequireAuth {
 		return nil
 	}
 
 	var missing []string
-	if c.AS.ExternalURL == "" && (!c.registryLegacyTolerateNoJWKS || !c.AS.Legacy.Enabled) {
+	if c.AS.ExternalURL == "" {
 		missing = append(missing, "as.external_url (public base URL of the authorization server; JWKS is fetched from <as.external_url>/auth/.well-known/jwks.json)")
 	}
 	if c.AS.Issuer == "" && c.JWT.Issuer == "" {
 		missing = append(missing, "as.issuer (or jwt.issuer) (expected \"iss\" claim)")
 	}
-	if c.AS.Legacy.Enabled && len(c.JWT.Secret) < 32 {
-		missing = append(missing, "jwt.secret or jwt.secret_path (>= 32 bytes, needed to validate legacy HMAC tokens while as.legacy.enabled is true; or set as.legacy.enabled=false)")
-	}
 	if len(missing) > 0 {
-		return fmt.Errorf("registry.require_auth is true but the token validator is not fully configured; set: %s", strings.Join(missing, "; "))
+		return fmt.Errorf("registry.require_auth is true but the token validator is not fully configured (HMAC tokens are no longer accepted; only AS-issued tokens validated through the AS JWKS); set: %s", strings.Join(missing, "; "))
 	}
 	return nil
 }
@@ -387,28 +384,8 @@ func (c *Config) ValidateRegistry() error {
 // CORS. In this mode the process listens on server.registry_host /
 // server.registry_port (default host:8097), the same default as the retired
 // standalone registry binary.
-//
-// It also fails startup when the process would validate legacy HMAC tokens
-// with server.rp_id unset or default (see validateStandaloneLegacyAudience),
-// unless the deprecated registry.yaml overlay marked the audience-independent
-// compatibility path (RegistryLegacyAudienceIndependent).
 func (c *Config) ValidateRegistryStandalone() error {
-	if err := c.validateRegistryStandaloneServer(); err != nil {
-		return err
-	}
-	return c.validateStandaloneLegacyAudience()
-}
-
-// RegistryLegacyAudienceIndependent reports whether legacy HMAC tokens must be
-// validated without an audience check. It is true only for a registry-only
-// process started from the deprecated registry.yaml / REGISTRY_* alias that
-// has a shared jwt.secret with as.legacy.enabled and no server.rp_id: the old
-// schema never had an rp_id, and go-tokenauth's mandatory audience list would
-// otherwise reject every legacy token (the audience of which is the issuing
-// backend's RP ID). Issuer, expiry, signature and revocation are still
-// enforced. The new configuration shape never takes this path.
-func (c *Config) RegistryLegacyAudienceIndependent() bool {
-	return c.registryLegacyAudienceIndependent
+	return c.validateRegistryStandaloneServer()
 }
 
 func (c *Config) validateRegistryStandaloneServer() error {
@@ -436,40 +413,4 @@ func (c *Config) validateRegistryStandaloneServer() error {
 		}
 	}
 	return c.Server.validateTrustedProxies()
-}
-
-// validateStandaloneLegacyAudience fails startup when a registry-only process
-// would validate legacy HMAC tokens but server.rp_id is still at its default.
-// go-tokenauth applies its audience list to legacy tokens as well, and legacy
-// tokens carry the issuing backend's RP ID as "aud" (the validator has no way
-// to exempt them), so with the default RP ID every token minted by a real
-// backend would be silently rejected.
-func (c *Config) validateStandaloneLegacyAudience() error {
-	if !c.AS.Legacy.Enabled || c.JWT.Secret == "" || c.registryLegacyAudienceIndependent {
-		return nil
-	}
-	if c.Server.RPID == "" || c.Server.RPID == "localhost" {
-		return fmt.Errorf("server.rp_id must be set to the RP ID of the backend that issues the legacy tokens " +
-			"(their \"aud\" claim) when a registry-only process validates legacy HMAC tokens " +
-			"(as.legacy.enabled with jwt.secret); it is unset or the default \"localhost\", which would reject every such token. " +
-			"Set server.rp_id (WALLET_SERVER_RP_ID) or set as.legacy.enabled=false")
-	}
-	return nil
-}
-
-// loadRegistrySecrets loads only the secret files the registry role can use:
-// jwt.secret_path, and only while legacy HMAC validation is enabled. Secret
-// paths of backend-only features (admin token, wallet-provider PKCS#11 and
-// attestation keys, MongoDB password) are not read, so a registry-only
-// process does not need them mounted.
-func (c *Config) loadRegistrySecrets() error {
-	if c.JWT.SecretPath == "" || !c.AS.Legacy.Enabled {
-		return nil
-	}
-	secret, err := readSecretFile(c.JWT.SecretPath)
-	if err != nil {
-		return fmt.Errorf("jwt.secret_path: %w", err)
-	}
-	c.JWT.Secret = secret
-	return nil
 }

@@ -3,16 +3,12 @@ package service
 import (
 	"context"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
-	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
 func seedLifecycleInstance(t *testing.T, s *WebAuthnService, id string, userID domain.UserID, credentialID string, status domain.InstanceStatus) {
@@ -138,73 +134,6 @@ func TestCheckWalletLifecycle(t *testing.T) {
 		assert.ErrorIs(t, err, ErrWalletInstanceRevoked)
 		assert.NotErrorIs(t, err, ErrWalletDeactivated, "the user can still log in from the other device")
 	})
-}
-
-// A lifecycle change landing between the login gate and token hand-out must
-// not yield usable tokens; a same-second cut-off only delays minting.
-func TestMintTokens(t *testing.T) {
-	ctx := context.Background()
-	store := memory.NewStore()
-	s := &WebAuthnService{store: store, logger: zap.NewNop(), cfg: &config.Config{JWT: config.JWTConfig{Secret: "s", ExpiryHours: 1, RefreshDays: 7, Issuer: "t"}}}
-	userID := domain.NewUserID()
-	user := &domain.User{UUID: userID, WebauthnCredentials: []domain.WebauthnCredential{{ID: "pk-1"}}}
-	require.NoError(t, store.Users().Create(ctx, user))
-	seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusActive)
-	seedLifecycleInstance(t, s, "i2", userID, "pk-2", domain.InstanceStatusActive)
-	gate := func() error { return s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1") }
-
-	access, refresh, err := s.mintTokens(ctx, user, domain.DefaultTenantID, "", gate, ErrVerificationFailed)
-	require.NoError(t, err, "no cut-off: tokens issued")
-	require.NotEmpty(t, access)
-	require.NotEmpty(t, refresh)
-
-	// Same-second cut-off: minted again in the next second and passes.
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now()))
-	access, refresh, err = s.mintTokens(ctx, user, domain.DefaultTenantID, "", gate, ErrVerificationFailed)
-	require.NoError(t, err)
-	cutoff, _ := store.Users().GetAuthCutoff(ctx, userID)
-	// Both tokens must postdate the cut-off: the access token is minted first,
-	// so gating on the refresh token alone could let a refused one out when the
-	// mints straddle a second boundary.
-	assert.False(t, tokengate.IssuedBeforeCutoff(tokengate.IssuedAt(access), cutoff), "the re-minted access token postdates the cut-off")
-	require.NotEmpty(t, refresh)
-	assert.False(t, tokengate.IssuedBeforeCutoff(tokengate.IssuedAt(refresh), cutoff), "the re-minted refresh token postdates the cut-off")
-
-	// Future cut-off (a mid-request revocation) with the passkey's instance
-	// revoked: the precise lifecycle refusal.
-	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.DefaultTenantID, domain.InstanceStatusRevoked, "stolen"))
-	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, userID, time.Now().Add(5*time.Second)))
-	_, _, err = s.mintTokens(ctx, user, domain.DefaultTenantID, "", gate, ErrVerificationFailed)
-	assert.ErrorIs(t, err, ErrWalletInstanceRevoked)
-
-	// Same cut-off but the gate passes (other instance active): the caller's
-	// refusal, so the client logs in again.
-	gate2 := func() error { return s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-2") }
-	_, _, err = s.mintTokens(ctx, user, domain.DefaultTenantID, "", gate2, ErrVerificationFailed)
-	assert.ErrorIs(t, err, ErrVerificationFailed)
-	_, _, err = s.mintTokens(ctx, user, domain.DefaultTenantID, "", nil, ErrInvalidRefreshToken)
-	assert.ErrorIs(t, err, ErrInvalidRefreshToken, "refresh flow uses its own refusal")
-}
-
-// The cut-off is recorded before the status is persisted, so a login that
-// passed its check earlier can mint a token past the cut-off mid-revocation;
-// mintTokens' recheck must refuse it.
-func TestMintTokens_RechecksLifecycleOnTheSuccessPath(t *testing.T) {
-	ctx := context.Background()
-	store := memory.NewStore()
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "s", ExpiryHours: 1, RefreshDays: 7, Issuer: "t"}}
-	s := &WebAuthnService{store: store, cfg: cfg, logger: zap.NewNop()}
-	userID := domain.NewUserID()
-	user := &domain.User{UUID: userID, DID: "did:x"}
-	require.NoError(t, store.Users().Create(ctx, user))
-	seedLifecycleInstance(t, s, "i1", userID, "pk-1", domain.InstanceStatusActive)
-
-	// No cut-off: only the recheck can see the revocation.
-	require.NoError(t, store.WalletInstances().UpdateStatus(ctx, "i1", domain.DefaultTenantID, domain.InstanceStatusRevoked, "racing"))
-	_, _, err := s.mintTokens(ctx, user, domain.DefaultTenantID, "", func() error {
-		return s.checkWalletLifecycle(ctx, domain.DefaultTenantID, userID, "pk-1")
-	}, ErrVerificationFailed)
-	assert.ErrorIs(t, err, ErrWalletInstanceRevoked)
 }
 
 // A record left in the legacy "suspended" state must still be refused at
