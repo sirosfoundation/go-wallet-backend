@@ -100,13 +100,6 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	// since both objects are already owned by this constructor.
 	userSvc.SetTokenBlacklist(tokenBlacklist)
 	userSvc.SetAudit(audit.NewFromConfig(cfg, logger), cfg.Audit)
-	// Wire the same blacklist into WebAuthnService so RefreshAccessToken can
-	// consume (single-use) each refresh token as it's exchanged, closing the
-	// replay gap Copilot flagged on #400's newly-exposed refresh route.
-	if webauthnSvc != nil {
-		webauthnSvc.SetTokenBlacklist(tokenBlacklist)
-	}
-
 	lifecycle := NewWalletLifecycleService(store, logger, audit.NewFromConfig(cfg, logger))
 	userSvc.SetUserLocker(lifecycle)
 	if wiaSvc != nil {

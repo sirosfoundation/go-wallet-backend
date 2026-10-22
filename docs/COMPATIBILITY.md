@@ -77,7 +77,6 @@ Example server response:
 ```json
 {
   "uuid": "user-uuid",
-  "appToken": "jwt-token",
   "displayName": "User Name",
   "privateData": {"$b64u": "ZW5jcnlwdGVkLWRhdGE"}
 }
@@ -134,10 +133,14 @@ The WebAuthn responses match the reference implementation's structure:
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/status` | GET | Service status |
-| `/user/register-webauthn-begin` | POST | Begin WebAuthn registration |
-| `/user/register-webauthn-finish` | POST | Complete WebAuthn registration |
-| `/user/login-webauthn-begin` | POST | Begin WebAuthn login |
-| `/user/login-webauthn-finish` | POST | Complete WebAuthn login |
+| `/auth/passkey/register/begin` | POST | Begin WebAuthn registration (`X-Token-Mode: session`) |
+| `/auth/passkey/register/finish` | POST | Complete WebAuthn registration; sets the session cookie, no token in the body |
+| `/auth/passkey/login/begin` | POST | Begin WebAuthn login |
+| `/auth/passkey/login/finish` | POST | Complete WebAuthn login; sets the session cookie, no token in the body |
+| `/auth/token` | POST | Exchange the session for a short-lived access token |
+
+The reference implementation's `/user/{register,login}-webauthn-*` endpoints and the
+`appToken` they returned were removed; those paths answer `410 legacy_tokens_disabled`.
 | `/helper/auth-check` | GET, POST | Relay authentication check |
 
 #### User Session (Authenticated)
