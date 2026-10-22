@@ -558,6 +558,15 @@ func runConcurrentWritersAgainst(t *testing.T, erase func(t *testing.T, store st
 		time.Sleep(time.Millisecond)
 	}
 	erase(t, store, uid, iat)
+	// Once the cut-off is advanced every writer is refused on its next write and
+	// returns. Closing stop right away would let a writer that is between writes
+	// exit unrefused, so wait for them first; stop is only the safety net.
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+	}
 	close(stop)
 	wg.Wait()
 
