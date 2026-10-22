@@ -993,3 +993,39 @@ func TestGenerateKeyAttestation_SecurityProperties_ClampedWhenEvidenceBelongsToA
 		t.Fatal("evidence recorded for another instance must not be trusted")
 	}
 }
+
+// Omitting wallet_instance_id must not let evidence bound to an instance lift
+// the batch (fail closed); unbound evidence keeps working without an ID.
+func TestKeyAttestationTrustsBatch_OmittedInstanceID(t *testing.T) {
+	svc, instances, keyAttestations := newTestWalletProviderServiceWithInstances(t)
+	ctx := context.Background()
+	if err := instances.Upsert(ctx, &domain.WalletInstance{ID: "inst-x", Status: domain.InstanceStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	bound := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "bound", "y": "k1"}}
+	unbound := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "unbound", "y": "k2"}}
+	for jw, inst := range map[int]string{0: "inst-x", 1: ""} {
+		set := bound
+		if jw == 1 {
+			set = unbound
+		}
+		tp, err := jwk.Thumbprint(set[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := keyAttestations.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{
+			KeyThumbprint: tp, WalletInstanceID: inst, VerifiedAt: time.Now().UTC(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if svc.keyAttestationTrustsBatch(ctx, "", bound) {
+		t.Fatal("evidence bound to inst-x must not be trusted when the instance ID is omitted")
+	}
+	if !svc.keyAttestationTrustsBatch(ctx, "inst-x", bound) {
+		t.Fatal("matching instance ID must still be trusted")
+	}
+	if !svc.keyAttestationTrustsBatch(ctx, "", unbound) {
+		t.Fatal("evidence with an empty WalletInstanceID must stay trusted without an ID")
+	}
+}
