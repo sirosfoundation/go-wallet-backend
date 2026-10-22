@@ -21,6 +21,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/logging"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
 var (
@@ -104,11 +105,17 @@ func main() {
 		}
 	}
 
+	checkPKCS11Support(backendCfg, logger)
+
 	logger.Info("Starting Wallet Backend",
 		zap.String("version", version),
 		zap.String("commit", commit),
 		zap.Strings("roles", roleStrings),
+		zap.Bool("pkcs11_supported", signing.PKCS11Supported),
 	)
+
+	// Once per process, whatever its roles.
+	logLegacyStatus(backendCfg, logger)
 
 	// Security configuration validation for production environments
 	// Checks for potentially dangerous configurations and logs warnings
@@ -282,6 +289,17 @@ func main() {
 		if backendProvider != nil && backendProvider.TokenValidator() != nil {
 			provider.SetTokenValidator(backendProvider.TokenValidator())
 		}
+		// Standalone engine: needs its own JWKS-backed validator.
+		if backendProvider == nil {
+			sv, err := server.NewStandaloneEngineTokenValidator(backendCfg, logger)
+			if err != nil {
+				logger.Fatal("Failed to create standalone engine token validator", zap.Error(err))
+			}
+			if sv != nil {
+				provider.SetTokenValidator(sv.Validator)
+				resources = append(resources, sv)
+			}
+		}
 		// Wire the same token blacklist the HTTP auth middlewares use, so a
 		// revoked token (or a deleted user's other tokens) is rejected
 		// during the WebSocket handshake too, on both the go-tokenauth and
@@ -429,4 +447,13 @@ func loggingConfig(backendCfg, registryCfg *config.Config) *logging.Config {
 		return nil
 	}
 	return &logging.Config{Level: src.Logging.Level, Format: src.Logging.Format}
+}
+
+// logLegacyStatus logs the legacy-token status; a nil config (registry-only)
+// logs nothing.
+func logLegacyStatus(cfg *config.Config, logger *zap.Logger) {
+	if cfg == nil {
+		return
+	}
+	server.LogLegacyTokenStatus(cfg, logger)
 }
