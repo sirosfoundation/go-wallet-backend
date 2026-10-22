@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -54,10 +55,8 @@ func minimalTestConfig() *config.Config {
 			RPOrigin: "http://localhost:8080",
 		},
 		JWT: config.JWTConfig{
-			Secret:      "test-secret-key",
-			ExpiryHours: 24,
-			RefreshDays: 7,
-			Issuer:      "test",
+			Secret: "test-secret-key",
+			Issuer: "test",
 		},
 		HTTPClient: config.HTTPClientConfig{
 			Timeout:         5,
@@ -737,46 +736,6 @@ func TestAuthProvider_RequireAudience_AllowsWalletBackendToken(t *testing.T) {
 // requireTACIfEnforced / route-level TAC enforcement tests
 // =============================================================================
 
-func TestRequireTACIfEnforced_NoOpWhenValidatorNil(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	w := httptest.NewRecorder()
-	c, r := gin.CreateTestContext(w)
-
-	// No tokenauth_result set at all - if this enforced anything, it would
-	// 401, matching the legacy AuthMiddleware path having no TAC concept.
-	r.Use(requireTACIfEnforced(nil, "w"))
-	r.GET("/test", func(c *gin.Context) { c.Status(200) })
-
-	c.Request = httptest.NewRequest("GET", "/test", nil)
-	r.ServeHTTP(w, c.Request)
-
-	if w.Code != 200 {
-		t.Fatalf("expected no-op (200) when tokenValidator is nil, got %d: %s", w.Code, w.Body.String())
-	}
-}
-
-func TestRequireTACIfEnforced_EnforcesWhenValidatorSet(t *testing.T) {
-	v, _, _ := setupServerTokenValidatorTest(t)
-
-	gin.SetMode(gin.TestMode)
-	w := httptest.NewRecorder()
-	c, r := gin.CreateTestContext(w)
-
-	r.Use(func(c *gin.Context) {
-		c.Set("tokenauth_result", &claims.Result{TAC: "rl"})
-		c.Next()
-	})
-	r.Use(requireTACIfEnforced(v, "w"))
-	r.GET("/test", func(c *gin.Context) { c.Status(200) })
-
-	c.Request = httptest.NewRequest("GET", "/test", nil)
-	r.ServeHTTP(w, c.Request)
-
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 (tac 'rl' lacks 'w') when tokenValidator is set, got %d: %s", w.Code, w.Body.String())
-	}
-}
-
 // TestStorageProvider_RequireTAC_RejectsInsufficientPermission is an
 // end-to-end proof that requireTACIfEnforced is actually wired into a real
 // route, not just correct in isolation: a token with tac "rl" (read/list,
@@ -886,218 +845,6 @@ func TestAuthProvider_RegisterRoutes_NoCacheCoverage(t *testing.T) {
 	})
 }
 
-// createLegacyRefreshTestToken signs a legacy HMAC refresh token exactly
-// like WebAuthnService.generateRefreshToken - the format
-// WebAuthnService.RefreshAccessToken parses.
-func createLegacyRefreshTestToken(secret, userID, tenantID string) string {
-	now := time.Now()
-	token := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
-		"user_id":   userID,
-		"tenant_id": tenantID,
-		"type":      "refresh",
-		"iat":       now.Unix(),
-		"nbf":       now.Unix(),
-		"exp":       now.AddDate(0, 0, 7).Unix(),
-		"iss":       "test",
-		"aud":       "localhost",
-		"jti":       "refresh-jti-1",
-	})
-	signed, _ := token.SignedString([]byte(secret))
-	return signed
-}
-
-// TestAuthProvider_RegisterRoutes_RefreshTokenReachable is a regression test
-// for issue #392: api.Handlers.RefreshToken existed since refresh tokens
-// were added, but - like Logout before #391 - was never actually mounted on
-// any route, making the whole refresh-token feature unreachable. This
-// proves POST /user/session/refresh is registered, is NOT gated behind a
-// currently-valid access token (the whole point of a refresh token is to
-// recover from an expired one), and actually performs a working refresh:
-// the newly issued access token authenticates a genuinely protected route.
-func TestAuthProvider_RegisterRoutes_RefreshTokenReachable(t *testing.T) {
-	logger := zap.NewNop()
-	cfg := minimalTestConfig()
-	store := newTestMemoryBackend(t)
-
-	ctx := context.Background()
-	user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:refresh-route-test"}
-	if err := store.Users().Create(ctx, user); err != nil {
-		t.Fatalf("failed to create user: %v", err)
-	}
-
-	provider := NewAuthProvider(cfg, store, logger, nil)
-	router := gin.New()
-	provider.RegisterRoutes(router)
-
-	if !hasRoute(router.Routes(), http.MethodPost, "/user/session/refresh") {
-		t.Fatal("expected POST /user/session/refresh to be registered")
-	}
-
-	refreshToken := createLegacyRefreshTestToken(cfg.JWT.Secret, user.UUID.String(), "default")
-
-	body := `{"refreshToken":"` + refreshToken + `"}`
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/user/session/refresh", strings.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("POST /user/session/refresh: status = %d, body = %s", w.Code, w.Body.String())
-	}
-	assertNoCacheHeaders(t, w.Header())
-
-	var resp struct {
-		Token        string `json:"appToken"`
-		RefreshToken string `json:"refreshToken"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-		t.Fatalf("failed to decode refresh response: %v", err)
-	}
-	if resp.Token == "" {
-		t.Fatal("expected a new access token in the response")
-	}
-	if resp.RefreshToken == "" {
-		t.Fatal("expected a rotated refresh token in the response")
-	}
-
-	// Prove the new access token is actually usable end to end, not just
-	// present in the response: it must authenticate a real protected route.
-	w2 := httptest.NewRecorder()
-	req2 := httptest.NewRequest(http.MethodGet, "/user/session/account-info", nil)
-	req2.Header.Set("Authorization", "Bearer "+resp.Token)
-	router.ServeHTTP(w2, req2)
-	if w2.Code != http.StatusOK {
-		t.Fatalf("GET /user/session/account-info with refreshed token: status = %d, body = %s", w2.Code, w2.Body.String())
-	}
-
-	// An expired/garbage access token must NOT be usable in place of a
-	// refresh token - the endpoint must reject it, proving it actually
-	// parses the "type":"refresh" claim rather than accepting any valid
-	// HMAC-signed token from this issuer.
-	accessToken := createLegacyTestToken(cfg.JWT.Secret, user.UUID.String(), "default", "access-jti-1")
-	w3 := httptest.NewRecorder()
-	req3 := httptest.NewRequest(http.MethodPost, "/user/session/refresh", strings.NewReader(`{"refreshToken":"`+accessToken+`"}`))
-	req3.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w3, req3)
-	if w3.Code != http.StatusUnauthorized {
-		t.Fatalf("refresh with an access token instead of a refresh token: status = %d, want %d, body = %s", w3.Code, http.StatusUnauthorized, w3.Body.String())
-	}
-}
-
-// TestAuthProvider_RegisterRoutes_RefreshTokenNotMountedWhenDisabled is a
-// regression test for a Copilot review finding on #400 (two rounds): with
-// JWT.RefreshDays <= 0 (the checked-in default), the route used to still be
-// registered, and a request to it surfaced RefreshAccessToken's
-// ErrRefreshDisabled as a 5xx (first a 500, then - still flagged - a 503).
-// Since the config is fixed at startup, the route is now only registered
-// when refresh tokens are actually enabled; this proves POST
-// /user/session/refresh is absent entirely when they're not, so a caller
-// gets gin's ordinary 404 - indistinguishable from any other unsupported
-// endpoint, never mistaken for a server failure.
-func TestAuthProvider_RegisterRoutes_RefreshTokenNotMountedWhenDisabled(t *testing.T) {
-	logger := zap.NewNop()
-	cfg := minimalTestConfig()
-	cfg.JWT.RefreshDays = 0
-	store := newTestMemoryBackend(t)
-
-	provider := NewAuthProvider(cfg, store, logger, nil)
-	router := gin.New()
-	provider.RegisterRoutes(router)
-
-	if hasRoute(router.Routes(), http.MethodPost, "/user/session/refresh") {
-		t.Fatal("expected POST /user/session/refresh to NOT be registered when refresh tokens are disabled")
-	}
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/user/session/refresh", strings.NewReader(`{"refreshToken":"anything"}`))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("POST /user/session/refresh with refresh disabled: status = %d, want %d, body = %s", w.Code, http.StatusNotFound, w.Body.String())
-	}
-}
-
-// TestAuthProvider_FinishWebAuthnRegistration_RejectsTenantMismatch is a
-// regression test for issue #395: FinishWebAuthnRegistration (/user/*) had
-// the same tenant/challenge mismatch gap that PR #386 fixed on the
-// /auth/passkey/* path (issue #374) - BeginRegistration records whichever
-// tenant the X-Tenant-ID header names at that time on the challenge, but
-// FinishRegistration never checked that the CURRENT request's header still
-// names the same tenant before running bind_identity/invite logic. This
-// proves a mismatched header is rejected (before the bogus credential body
-// is ever processed) and a matching header is not rejected as a mismatch.
-func TestAuthProvider_FinishWebAuthnRegistration_RejectsTenantMismatch(t *testing.T) {
-	logger := zap.NewNop()
-	cfg := minimalTestConfig()
-	cfg.Server.RPName = "Test App" // required by go-webauthn's BeginRegistration
-	store := newTestMemoryBackend(t)
-
-	ctx := context.Background()
-	if err := store.Tenants().Create(ctx, &domain.Tenant{ID: "tenant-a", Name: "Tenant A", Enabled: true}); err != nil {
-		t.Fatalf("failed to create tenant-a: %v", err)
-	}
-	if err := store.Tenants().Create(ctx, &domain.Tenant{ID: "tenant-b", Name: "Tenant B", Enabled: true}); err != nil {
-		t.Fatalf("failed to create tenant-b: %v", err)
-	}
-
-	provider := NewAuthProvider(cfg, store, logger, nil)
-	router := gin.New()
-	provider.RegisterRoutes(router)
-
-	beginUnderTenantA := func(t *testing.T) string {
-		t.Helper()
-		req := httptest.NewRequest(http.MethodPost, "/user/register-webauthn-begin", strings.NewReader(`{}`))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Tenant-ID", "tenant-a")
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("begin: expected 200, got %d: %s", w.Code, w.Body.String())
-		}
-		var resp struct {
-			ChallengeID string `json:"challengeId"`
-		}
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatalf("failed to decode begin response: %v", err)
-		}
-		return resp.ChallengeID
-	}
-
-	t.Run("mismatched header tenant is rejected before the credential is processed", func(t *testing.T) {
-		challengeID := beginUnderTenantA(t)
-
-		finishBody := `{"challengeId":"` + challengeID + `","credential":{}}`
-		req := httptest.NewRequest(http.MethodPost, "/user/register-webauthn-finish", strings.NewReader(finishBody))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Tenant-ID", "tenant-b")
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, req)
-
-		if w.Code != http.StatusForbidden {
-			t.Fatalf("expected 403 tenant mismatch, got %d: %s", w.Code, w.Body.String())
-		}
-		if !strings.Contains(w.Body.String(), "tenant mismatch") {
-			t.Errorf("expected tenant mismatch error, got: %s", w.Body.String())
-		}
-	})
-
-	t.Run("matching header tenant is not rejected as a mismatch", func(t *testing.T) {
-		challengeID := beginUnderTenantA(t)
-
-		finishBody := `{"challengeId":"` + challengeID + `","credential":{}}`
-		req := httptest.NewRequest(http.MethodPost, "/user/register-webauthn-finish", strings.NewReader(finishBody))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Tenant-ID", "tenant-a")
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, req)
-
-		if w.Code == http.StatusForbidden && strings.Contains(w.Body.String(), "tenant mismatch") {
-			t.Errorf("matching header tenant must not be rejected as a tenant mismatch, got: %s", w.Body.String())
-		}
-	})
-}
-
 func TestStorageProvider_RegisterRoutes_NoCacheCoverage(t *testing.T) {
 	logger := zap.NewNop()
 	cfg := minimalTestConfig()
@@ -1160,9 +907,6 @@ func writeTestECKeyAndCert(t *testing.T, dir, prefix string) (string, string) {
 // TestNewWalletProviderProvider_WiresTokenValidatorWhenASEnabled is a
 // regression test: isolated wallet-provider deployments must accept
 // AS-issued access tokens, the same as the co-hosted AuthProvider path.
-// Before this fix, RegisterRoutes hardcoded the legacy HMAC-only
-// AuthMiddleware regardless of cfg.AS.Enabled, so AS-issued tokens were
-// always rejected in isolated mode.
 func TestNewWalletProviderProvider_WiresTokenValidatorWhenASEnabled(t *testing.T) {
 	dir := t.TempDir()
 	keyPath, certPath := writeTestECKeyAndCert(t, dir, "wallet-provider")
@@ -1191,7 +935,7 @@ func TestNewWalletProviderProvider_WiresTokenValidatorWhenASEnabled(t *testing.T
 	}
 }
 
-func walletProviderASConfig(t *testing.T, externalURL string, legacy bool) *config.Config {
+func walletProviderASConfig(t *testing.T, externalURL string) *config.Config {
 	t.Helper()
 	keyPath, certPath := writeTestECKeyAndCert(t, t.TempDir(), "wallet-provider")
 	cfg := &config.Config{
@@ -1201,7 +945,6 @@ func walletProviderASConfig(t *testing.T, externalURL string, legacy bool) *conf
 		AS: config.ASConfig{
 			Enabled:     true,
 			ExternalURL: externalURL,
-			Legacy:      config.ASLegacyConfig{Enabled: legacy},
 		},
 	}
 	cfg.WalletProvider.PrivateKeyPath = keyPath
@@ -1210,67 +953,45 @@ func walletProviderASConfig(t *testing.T, externalURL string, legacy bool) *conf
 	return cfg
 }
 
-// AS enabled, no as.external_url, legacy HMAC on: starts with the HMAC-only
-// middleware (no validator).
-func TestNewWalletProviderProvider_NoExternalURL_LegacyOn_HMACOnly(t *testing.T) {
-	p, err := NewWalletProviderProvider(walletProviderASConfig(t, "", true), zap.NewNop())
+// No as.external_url: nothing can authenticate, so startup must fail whether or not as.enabled is set.
+func TestNewWalletProviderProvider_NoExternalURL_Fails(t *testing.T) {
+	for _, asEnabled := range []bool{true, false} {
+		cfg := walletProviderASConfig(t, "")
+		cfg.AS.Enabled = asEnabled
+		p, err := NewWalletProviderProvider(cfg, zap.NewNop())
+		if err == nil {
+			_ = p.Close()
+			t.Fatalf("as.enabled=%t: expected startup error with no external_url", asEnabled)
+		}
+		if !strings.Contains(err.Error(), "as.external_url") {
+			t.Fatalf("as.enabled=%t: error should name as.external_url, got: %v", asEnabled, err)
+		}
+	}
+}
+
+// The wallet-provider process validates tokens of a remote AS (as.external_url); it does not need as.enabled.
+func TestNewWalletProviderProvider_ASDisabledLocally_ExternalURL_WiresValidator(t *testing.T) {
+	cfg := walletProviderASConfig(t, "https://as.example.com")
+	cfg.AS.Enabled = false
+	p, err := NewWalletProviderProvider(cfg, zap.NewNop())
 	if err != nil {
 		t.Fatalf("NewWalletProviderProvider: %v", err)
 	}
 	defer func() { _ = p.Close() }()
-	if p.tokenValidator != nil {
-		t.Fatal("expected HMAC-only fallback: no token validator")
-	}
-}
-
-// AS enabled, no as.external_url, legacy off: nothing can authenticate tokens.
-func TestNewWalletProviderProvider_NoExternalURL_LegacyOff_Fails(t *testing.T) {
-	p, err := NewWalletProviderProvider(walletProviderASConfig(t, "", false), zap.NewNop())
-	if err == nil {
-		_ = p.Close()
-		t.Fatal("expected startup error with no external_url and legacy disabled")
-	}
-	if !strings.Contains(err.Error(), "as.external_url") {
-		t.Fatalf("error should name as.external_url, got: %v", err)
+	if p.tokenValidator == nil {
+		t.Fatal("expected a token validator")
 	}
 }
 
 // AS enabled with as.external_url: the validator is wired.
 func TestNewWalletProviderProvider_ExternalURL_WiresValidator(t *testing.T) {
-	p, err := NewWalletProviderProvider(walletProviderASConfig(t, "https://as.example.com", true), zap.NewNop())
+	p, err := NewWalletProviderProvider(walletProviderASConfig(t, "https://as.example.com"), zap.NewNop())
 	if err != nil {
 		t.Fatalf("NewWalletProviderProvider: %v", err)
 	}
 	defer func() { _ = p.Close() }()
 	if p.tokenValidator == nil {
 		t.Fatal("expected token validator when as.external_url is set")
-	}
-}
-
-// TestNewWalletProviderProvider_NoTokenValidatorWhenASDisabled documents the
-// counterpart: without AS enabled, isolated wallet-provider mode falls back
-// to legacy HMAC auth, matching AuthProvider's default behavior.
-func TestNewWalletProviderProvider_NoTokenValidatorWhenASDisabled(t *testing.T) {
-	dir := t.TempDir()
-	keyPath, certPath := writeTestECKeyAndCert(t, dir, "wallet-provider")
-
-	cfg := &config.Config{
-		Storage: config.StorageConfig{Type: "memory"},
-		Server:  config.ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
-		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"},
-	}
-	cfg.WalletProvider.PrivateKeyPath = keyPath
-	cfg.WalletProvider.CertificatePath = certPath
-	cfg.WalletProvider.WIA.RateLimit = config.AuthRateLimitConfig{Enabled: false}
-
-	p, err := NewWalletProviderProvider(cfg, zap.NewNop())
-	if err != nil {
-		t.Fatalf("NewWalletProviderProvider: %v", err)
-	}
-	defer func() { _ = p.Close() }()
-
-	if p.tokenValidator != nil {
-		t.Fatal("expected tokenValidator to be nil when cfg.AS.Enabled is false")
 	}
 }
 
@@ -1288,6 +1009,7 @@ func TestWalletProviderProvider_RegisterRoutes_RegistersJWKS(t *testing.T) {
 		Storage: config.StorageConfig{Type: "memory"},
 		Server:  config.ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
 		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"},
+		AS:      config.ASConfig{ExternalURL: "https://as.example.com"},
 	}
 	cfg.WalletProvider.PrivateKeyPath = keyPath
 	cfg.WalletProvider.CertificatePath = certPath
@@ -1458,22 +1180,6 @@ func TestWIARateLimiter_TripsAfterMaxAttempts(t *testing.T) {
 	}
 }
 
-// createLegacyTestToken signs a legacy HMAC token exactly like
-// UserService/WebAuthnService's generateToken - the format
-// AuthMiddlewareWithBlacklist parses.
-func createLegacyTestToken(secret, userID, tenantID, jti string) string {
-	token := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
-		"iss":       "test",
-		"user_id":   userID,
-		"tenant_id": tenantID,
-		"jti":       jti,
-		"iat":       time.Now().Unix(),
-		"exp":       time.Now().Add(time.Hour).Unix(),
-	})
-	signed, _ := token.SignedString([]byte(secret))
-	return signed
-}
-
 // TestBackendProvider_Logout_BlacklistSharedAcrossAuthAndStorage proves
 // #382/#383 end-to-end through the actual production wiring
 // (NewBackendProvider), not a hand-assembled test router with a manually
@@ -1483,12 +1189,29 @@ func createLegacyTestToken(secret, userID, tenantID, jti string) string {
 // TokenBlacklist instance, so this would previously have kept working.
 func TestBackendProvider_Logout_BlacklistSharedAcrossAuthAndStorage(t *testing.T) {
 	logger := zap.NewNop()
-	secret := "test-secret-for-e2e-blacklist"
+	asKeyPath, _ := writeTestECKeyAndCert(t, t.TempDir(), "as")
+	// Serve this process's router (with /auth/.well-known/jwks.json) on a real listener and point external_url at it.
+	var routerRef atomic.Pointer[gin.Engine]
+	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if rt := routerRef.Load(); rt != nil {
+			rt.ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(jwksSrv.Close)
 	cfg := &config.Config{
 		Server: config.ServerConfig{RPID: "localhost", RPOrigin: "http://localhost:8080"},
-		JWT:    config.JWTConfig{Secret: secret, ExpiryHours: 24, Issuer: "test"},
+		JWT:    config.JWTConfig{Secret: "test-secret-for-e2e-blacklist-0123456789", Issuer: "test"},
 		Storage: config.StorageConfig{
 			Type: "memory",
+		},
+		AS: config.ASConfig{
+			Enabled:        true,
+			SigningKeyPath: asKeyPath,
+			ExternalURL:    jwksSrv.URL,
+			Audiences:      []string{"wallet-backend"},
+			DefaultMaxTAC:  "rwlid",
 		},
 		Security: config.SecurityConfig{
 			TokenBlacklist: config.TokenBlacklistConfig{Enabled: true},
@@ -1506,16 +1229,50 @@ func TestBackendProvider_Logout_BlacklistSharedAcrossAuthAndStorage(t *testing.T
 
 	router := gin.New()
 	provider.RegisterRoutes(router)
+	routerRef.Store(router)
 
-	tokenStr := createLegacyTestToken(secret, "user-e2e", "default", "jti-e2e-1")
+	// A real AS session token, validated through the go-tokenauth validator (JWKS fetched from jwksSrv).
+	tokenStr, err := provider.ASModule().TokenIssuer.Issue("user-e2e", "wallet-backend", "default", "rwlid", "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatalf("issuing an AS token: %v", err)
+	}
 
-	// Storage route works before logout.
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/storage/vc", nil)
-	req.Header.Set("Authorization", "Bearer "+tokenStr)
-	router.ServeHTTP(w, req)
+	get := func() *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/storage/vc", nil)
+		req.Header.Set("Authorization", "Bearer "+tokenStr)
+		router.ServeHTTP(w, req)
+		return w
+	}
+
+	// Storage route works before logout (the JWKS loads asynchronously).
+	var w *httptest.ResponseRecorder
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		w = get()
+		if w.Code == http.StatusOK || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	if w.Code != http.StatusOK {
 		t.Fatalf("GET /storage/vc before logout: status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	// The validator accepts no HMAC token: one signed with jwt.secret is refused.
+	hmacToken, err := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
+		"iss": cfg.JWT.Issuer, "aud": "wallet-backend", "user_id": "user-e2e", "tenant_id": "default",
+		"jti": "jti-hmac-e2e", "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte(cfg.JWT.Secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/storage/vc", nil)
+	req.Header.Set("Authorization", "Bearer "+hmacToken)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /storage/vc with an HMAC token: status = %d, want 401", w.Code)
 	}
 
 	// Log out via the auth provider's own route.
@@ -1530,11 +1287,7 @@ func TestBackendProvider_Logout_BlacklistSharedAcrossAuthAndStorage(t *testing.T
 	// The same token must now be rejected on the STORAGE provider's routes,
 	// not just the auth provider's own - proving the blacklist instance is
 	// actually shared between them.
-	w = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/storage/vc", nil)
-	req.Header.Set("Authorization", "Bearer "+tokenStr)
-	router.ServeHTTP(w, req)
-	if w.Code != http.StatusUnauthorized {
+	if w = get(); w.Code != http.StatusUnauthorized {
 		t.Errorf("GET /storage/vc after logout: status = %d, want %d", w.Code, http.StatusUnauthorized)
 	}
 }
@@ -1543,9 +1296,9 @@ func TestBackendProvider_Logout_BlacklistSharedAcrossAuthAndStorage(t *testing.T
 // go-tokenauth revocation.Checker adapter (blacklistRevocationChecker,
 // wired into tokenvalidator.Config.Revocation in NewBackendProvider and
 // NewWalletProviderProvider) correctly reflects a *service.TokenBlacklist's
-// own state. Without this, AS-issued/legacy tokens validated through
-// go-tokenauth - the path taken whenever AS is enabled - would never
-// consult the blacklist at all, even after #382/#383's other fixes.
+// own state. Without this, AS-issued tokens validated through
+// go-tokenauth would never consult the blacklist at all, even after
+// #382/#383's other fixes.
 func TestBlacklistRevocationChecker_AdaptsToServiceBlacklist(t *testing.T) {
 	logger := zap.NewNop()
 	cfg := config.TokenBlacklistConfig{Enabled: true}
@@ -1581,7 +1334,7 @@ func TestNewBackendProvider_ASEnabled_WiresBlacklistAndRevocation(t *testing.T) 
 	cfg := &config.Config{
 		Storage: config.StorageConfig{Type: "memory"},
 		Server:  config.ServerConfig{RPID: "localhost", RPOrigin: "http://localhost:8080"},
-		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", ExpiryHours: 24, Issuer: "test-issuer"},
+		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"},
 		AS: config.ASConfig{
 			Enabled:        true,
 			ExternalURL:    "https://as.example.com",
@@ -1631,7 +1384,7 @@ func TestNewBackendProvider_ASModuleInitFailure_ClosesAuthProviderAndStore(t *te
 	cfg := &config.Config{
 		Storage: config.StorageConfig{Type: "memory"},
 		Server:  config.ServerConfig{RPID: "localhost", RPOrigin: "http://localhost:8080"},
-		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", ExpiryHours: 24, Issuer: "test-issuer"},
+		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"},
 		AS: config.ASConfig{
 			Enabled:        true,
 			SigningKeyPath: filepath.Join(t.TempDir(), "does-not-exist.pem"),
@@ -1677,10 +1430,6 @@ func (fakeEngineBlacklistForProviderTest) IsBlacklisted(ctx context.Context, jti
 }
 
 func (fakeEngineBlacklistForProviderTest) IsUserRevoked(ctx context.Context, userID string) bool {
-	return false
-}
-
-func (fakeEngineBlacklistForProviderTest) IsFamilyRevoked(ctx context.Context, sid string) bool {
 	return false
 }
 
@@ -1734,50 +1483,8 @@ func TestNewBackendProvider_WiresASModuleWhenEnabled(t *testing.T) {
 	}
 }
 
-// A role that serves protected routes must refuse to start when a loaded
-// config disables both the AS and legacy HMAC tokens: it would otherwise
-// answer 401 to every request, valid session tokens included.
-func TestRequireSessionAuthMechanism(t *testing.T) {
-	load := func(t *testing.T, asYAML string) *config.Config {
-		t.Helper()
-		path := filepath.Join(t.TempDir(), "config.yaml")
-		yaml := "server:\n  rp_id: localhost\n  rp_origin: http://localhost:8080\njwt:\n  secret: test-secret-that-is-at-least-32-bytes!\n" + asYAML
-		if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		cfg, err := config.Load(path)
-		if err != nil {
-			t.Fatalf("Load: %v", err)
-		}
-		return cfg
-	}
-
-	bad := load(t, "as:\n  enabled: false\n  external_url: https://as.example.com\n  legacy:\n    enabled: false\n")
-	for _, role := range []string{"backend", "wallet-provider"} {
-		err := requireSessionAuthMechanism(bad, role)
-		if err == nil || !strings.Contains(err.Error(), "as.legacy.enabled") {
-			t.Errorf("%s: expected rejection, got %v", role, err)
-		}
-	}
-	if _, err := NewWalletProviderProvider(bad, zap.NewNop()); err == nil {
-		t.Error("NewWalletProviderProvider must reject as.enabled=false + as.legacy.enabled=false")
-	}
-	if _, err := NewBackendProvider(bad, zap.NewNop(), []string{"backend"}); err == nil {
-		t.Error("NewBackendProvider must reject as.enabled=false + as.legacy.enabled=false")
-	}
-
-	// Legacy on (the default) leaves HMAC usable.
-	if err := requireSessionAuthMechanism(load(t, "as:\n  enabled: false\n"), "backend"); err != nil {
-		t.Errorf("legacy enabled must be accepted: %v", err)
-	}
-	// AS enabled leaves a JWKS validator, whatever legacy says.
-	if err := requireSessionAuthMechanism(&config.Config{AS: config.ASConfig{Enabled: true}}, "backend"); err != nil {
-		t.Errorf("AS enabled must be accepted: %v", err)
-	}
-}
-
-// The combined backend role with the AS enabled builds exactly two Services
-// (auth + storage); a third would leak a wallet-provider HSM signer.
+// Each Services may open its own wallet-provider PKCS#11 signer (HSM session pool); the combined
+// backend role with the AS enabled must construct exactly two (auth + storage), none unmanaged.
 func TestNewBackendProvider_ASEnabled_DoesNotBuildExtraServices(t *testing.T) {
 	keyPath, _ := writeTestECKeyAndCert(t, t.TempDir(), "as-signing")
 
@@ -1866,78 +1573,76 @@ func TestBackendProvider_Close_ClosesBothSignerPools(t *testing.T) {
 	}
 }
 
-// Every validator constructor refuses an empty jwt.issuer while legacy is on
-// (it would accept any token signed with the shared secret).
-func TestConstructors_RefuseLegacyWithEmptyJWTIssuer(t *testing.T) {
-	legacyOn := func() *config.Config {
-		return &config.Config{JWT: config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"}}
-	}
-	for name, ext := range map[string]string{"no external_url": "", "external_url": "https://as.example.org"} {
-		cfg := legacyOn()
-		cfg.AS.ExternalURL = ext
-		if _, err := NewStandaloneEngineTokenValidator(cfg, zap.NewNop()); err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
-			t.Errorf("standalone engine (%s): expected jwt.issuer rejection, got %v", name, err)
+// With no validator the shared auth middleware returns 401 for every request and never reaches the handler.
+func TestSessionAuthMiddleware_NoValidatorFailsClosed(t *testing.T) {
+	reached := false
+	r := gin.New()
+	r.Use(sessionAuthMiddleware(nil, newTestMemoryBackend(t), nil, zap.NewNop()))
+	r.GET("/x", func(c *gin.Context) { reached = true; c.Status(200) })
+
+	for _, authz := range []string{"", "Bearer anything"} {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/x", nil)
+		if authz != "" {
+			req.Header.Set("Authorization", authz)
+		}
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("authorization %q: status = %d, want 401", authz, w.Code)
 		}
 	}
-	if _, err := NewBackendProvider(legacyOn(), zap.NewNop(), []string{"backend"}); err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
-		t.Errorf("NewBackendProvider: expected jwt.issuer rejection, got %v", err)
-	}
-	asOn := legacyOn()
-	asOn.AS.Enabled = true
-	asOn.AS.Legacy.Enabled = true
-	if _, err := NewBackendProvider(asOn, zap.NewNop(), []string{"backend"}); err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
-		t.Errorf("NewBackendProvider (AS on): expected jwt.issuer rejection, got %v", err)
-	}
-	if _, err := NewWalletProviderProvider(legacyOn(), zap.NewNop()); err == nil || !strings.Contains(err.Error(), "jwt.issuer") {
-		t.Errorf("NewWalletProviderProvider: expected jwt.issuer rejection, got %v", err)
-	}
-
-	// Legacy off: no HMAC path, so an empty jwt.issuer is fine.
-	off := legacyOn()
-	off.AS.Enabled = true
-	off.AS.Issuer = "https://as.example.org"
-	if err := requireLegacyIssuer(off, "backend"); err != nil {
-		t.Errorf("legacy off with empty jwt.issuer must be accepted: %v", err)
-	}
-	if _, err := NewStandaloneEngineTokenValidator(off, zap.NewNop()); err != nil && strings.Contains(err.Error(), "jwt.issuer") {
-		t.Errorf("standalone engine, legacy off: must not demand jwt.issuer: %v", err)
-	}
-	// A normal configuration passes.
-	ok := legacyOn()
-	ok.JWT.Issuer = "wallet-backend"
-	if err := requireLegacyIssuer(ok, "backend"); err != nil {
-		t.Errorf("normal config rejected: %v", err)
+	if reached {
+		t.Fatal("handler must not be reached without a validator")
 	}
 }
 
-// A deployment may configure AS.Issuer differently from JWT.Issuer. Legacy
-// tokens are minted with iss=JWT.Issuer, so the validator must be told that
-// explicitly rather than falling back to the AS issuer.
-func TestLegacyValidatorConfig_UsesJWTIssuer(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "https://jwt.example.com"},
-		AS:  config.ASConfig{Issuer: "https://as.example.com", Audiences: []string{"wallet-backend"}, Legacy: config.ASLegacyConfig{Enabled: true}},
-	}
+// An HS256 token signed with jwt.secret is refused on a protected route while a genuine AS token passes.
+func TestProtectedRoute_HMACBearerRejected_ASTokenAccepted(t *testing.T) {
+	v, key, issuer := setupServerTokenValidatorTest(t)
+	provider := newTestBackendProviderWithValidator(t, v)
+	provider.cfg.Features.CredentialStorageEnabled = true
+	router := gin.New()
+	provider.RegisterRoutes(router)
 
-	lc := legacyValidatorConfig(cfg, cfg.AS.Legacy.Enabled)
-	if !lc.Enabled || len(lc.Issuers) != 1 || lc.Issuers[0] != "https://jwt.example.com" {
-		t.Fatalf("legacy issuers = %v, want [JWT.Issuer]", lc.Issuers)
-	}
-
-	v := tokenvalidator.New(tokenvalidator.Config{
-		Issuer:    cfg.AS.Issuer,
-		Audiences: cfg.AS.Audiences,
-		Legacy:    lc,
-	})
-	tok := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
-		"iss": cfg.JWT.Issuer, "aud": "wallet-backend", "sub": "user-1",
-		"tenant_id": "default", "exp": time.Now().Add(time.Hour).Unix(),
-	})
-	raw, err := tok.SignedString([]byte(cfg.JWT.Secret))
+	hmacToken, err := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
+		"iss": issuer, "aud": "wallet-backend", "user_id": "user-1", "tenant_id": "default",
+		"jti": "jti-hmac", "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte(provider.cfg.JWT.Secret))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := v.Validate(context.Background(), raw); err != nil {
-		t.Fatalf("legacy token minted with JWT.Issuer must validate when AS.Issuer differs: %v", err)
+	asToken := signServerToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   jwt.Claims{Subject: "user-1", Audience: jwt.Audience{"wallet-backend"}},
+		TenantID: string(domain.DefaultTenantID),
+		TAC:      "rl",
+		ACR:      "urn:siros:acr:passkey",
+	})
+
+	status := func(token string) int {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/storage/vc", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		router.ServeHTTP(w, req)
+		return w.Code
+	}
+	if got := status(hmacToken); got != http.StatusUnauthorized {
+		t.Errorf("HMAC bearer: status = %d, want 401", got)
+	}
+	if got := status(asToken); got != http.StatusOK {
+		t.Errorf("AS bearer: status = %d, want 200", got)
+	}
+}
+
+// With as.enabled=false the backend role must refuse to start with an actionable message, not 401 everything.
+func TestRequireSessionAuthMechanism(t *testing.T) {
+	err := requireSessionAuthMechanism(&config.Config{}, "backend")
+	if err == nil || !strings.Contains(err.Error(), "as.enabled") || !strings.Contains(err.Error(), "legacy") {
+		t.Fatalf("as.enabled=false must be refused with an actionable error, got %v", err)
+	}
+	if _, err := NewBackendProvider(&config.Config{}, zap.NewNop(), []string{"backend"}); err == nil {
+		t.Error("NewBackendProvider must reject as.enabled=false")
+	}
+	if err := requireSessionAuthMechanism(&config.Config{AS: config.ASConfig{Enabled: true}}, "backend"); err != nil {
+		t.Errorf("AS enabled must be accepted: %v", err)
 	}
 }

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/ecdsa"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -33,8 +34,9 @@ func (r *routeLister) List(context.Context, string) (*statuslist.VerifiedList, e
 
 // statusRouteProvider is an AuthProvider with a fake-backed status service,
 // registered on a fresh router.
-func statusRouteProvider(t *testing.T, mutate func(*config.Config)) (*AuthProvider, *gin.Engine, *routeLister, string) {
+func statusRouteProvider(t *testing.T, mutate func(*config.Config)) (*AuthProvider, *gin.Engine, *routeLister, string, func(sub string) string) {
 	t.Helper()
+	v, key, issuer := setupServerTokenValidatorTest(t)
 	cfg := minimalTestConfig()
 	cfg.StatusCheck = config.StatusCheckConfig{
 		Enabled:   true,
@@ -44,6 +46,7 @@ func statusRouteProvider(t *testing.T, mutate func(*config.Config)) (*AuthProvid
 		mutate(cfg)
 	}
 	provider := NewAuthProvider(cfg, newTestMemoryBackend(t), zap.NewNop(), nil)
+	provider.tokenValidator = v
 	t.Cleanup(func() { _ = provider.Close() })
 	fake := &routeLister{}
 	if cfg.StatusCheck.Enabled {
@@ -51,7 +54,17 @@ func statusRouteProvider(t *testing.T, mutate func(*config.Config)) (*AuthProvid
 	}
 	router := gin.New()
 	provider.RegisterRoutes(router)
-	return provider, router, fake, createLegacyTestToken(cfg.JWT.Secret, "user-status", "default", "jti-status")
+	mint := func(sub string) string { return statusRouteToken(t, key, issuer, sub) }
+	return provider, router, fake, mint("user-status"), mint
+}
+
+// statusRouteToken signs a wallet-backend session token with the "r" TAC for sub.
+func statusRouteToken(t *testing.T, key *ecdsa.PrivateKey, issuer, sub string) string {
+	t.Helper()
+	return signServerToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   jwt.Claims{Subject: sub, Audience: jwt.Audience{"wallet-backend"}},
+		TenantID: string(domain.DefaultTenantID), TAC: "r", ACR: "urn:siros:acr:passkey",
+	})
 }
 
 func postLists(router *gin.Engine, token, body string) *httptest.ResponseRecorder {
@@ -68,7 +81,7 @@ func postLists(router *gin.Engine, token, body string) *httptest.ResponseRecorde
 const oneList = `{"lists":[{"uri":"https://status.example/l/1"}]}`
 
 func TestAuthProvider_StatusRoute_AuthenticatedAndCacheable(t *testing.T) {
-	_, router, fake, token := statusRouteProvider(t, nil)
+	_, router, fake, token, _ := statusRouteProvider(t, nil)
 	if !hasRoute(router.Routes(), http.MethodPost, "/status/v1/lists") {
 		t.Fatal("POST /status/v1/lists is not registered")
 	}
@@ -95,7 +108,7 @@ func TestAuthProvider_StatusRoute_AuthenticatedAndCacheable(t *testing.T) {
 }
 
 func TestAuthProvider_StatusRoute_DisabledIs503(t *testing.T) {
-	_, router, _, token := statusRouteProvider(t, func(c *config.Config) { c.StatusCheck.Enabled = false })
+	_, router, _, token, _ := statusRouteProvider(t, func(c *config.Config) { c.StatusCheck.Enabled = false })
 	w := postLists(router, token, oneList)
 	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "STATUS_NOT_SUPPORTED") {
 		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
@@ -103,7 +116,7 @@ func TestAuthProvider_StatusRoute_DisabledIs503(t *testing.T) {
 }
 
 func TestAuthProvider_StatusRoute_RateLimited(t *testing.T) {
-	_, router, fake, token := statusRouteProvider(t, func(c *config.Config) {
+	_, router, fake, token, mint := statusRouteProvider(t, func(c *config.Config) {
 		c.StatusCheck.RateLimit = config.AuthRateLimitConfig{Enabled: true, MaxAttempts: 2, WindowSeconds: 3600, LockoutSeconds: 60}
 	})
 	var last *httptest.ResponseRecorder
@@ -120,7 +133,7 @@ func TestAuthProvider_StatusRoute_RateLimited(t *testing.T) {
 		t.Fatalf("rate-limited requests reached the service (%d calls)", fake.calls)
 	}
 	// Another caller has its own bucket.
-	other := createLegacyTestToken("test-secret-key", "someone-else", "default", "jti-other")
+	other := mint("someone-else")
 	if w := postLists(router, other, oneList); w.Code != http.StatusOK {
 		t.Fatalf("other caller: %d %s", w.Code, w.Body.String())
 	}
