@@ -2836,6 +2836,37 @@ func TestConfig_Validate_Audit_IdentityEvents(t *testing.T) {
 	}
 }
 
+func TestConfig_Validate_Audit_AccountEvents(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.AccountEvents = []string{"requested"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "requires audit.enabled") {
+		t.Errorf("account_events without audit.enabled must be rejected, got %v", err)
+	}
+
+	cfg = validBaseConfig()
+	cfg.Audit = AuditConfig{Enabled: true, Issuer: "https://w", KeyPath: "/k", KeyID: "k", AccountEvents: []string{"sucess"}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "unknown event") {
+		t.Errorf("a misspelt event name must be rejected, got %v", err)
+	}
+
+	cfg.Audit.AccountEvents = []string{" Requested ", "succeeded", "cleanup_pending"}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("valid names rejected: %v", err)
+	}
+	if !cfg.Audit.AccountEventEnabled("requested") || cfg.Audit.AccountEventEnabled("nope") {
+		t.Error("AccountEventEnabled mismatch")
+	}
+	if (AuditConfig{}).AccountEventEnabled("requested") {
+		t.Error("no event may be enabled by default")
+	}
+}
+
+func TestUserDeleteConfig_RequireStepUpDefaultsOff(t *testing.T) {
+	if (Config{}).User.Delete.RequireStepUp {
+		t.Error("require_step_up must default to false")
+	}
+}
+
 // A trusted IdP host may resolve to a private address (#349); an unlisted
 // host, and the cloud metadata endpoints, may not.
 func TestGuardedDial_TrustedHostMayBePrivate(t *testing.T) {

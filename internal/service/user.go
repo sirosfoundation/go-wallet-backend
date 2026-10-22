@@ -8,9 +8,12 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-siros-set/set"
+
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -86,6 +89,43 @@ type UserService struct {
 	locker UserLocker
 	// now is the clock for tombstone timestamps (replaced in tests).
 	now func() time.Time
+	// audit and auditCfg record the account-deletion events selected by
+	// AuditConfig.AccountEvents. Nil audit emits nothing.
+	audit    *audit.Emitter
+	auditCfg config.AuditConfig
+}
+
+// SetAudit attaches the SET emitter and the selection of account events.
+func (s *UserService) SetAudit(a *audit.Emitter, cfg config.AuditConfig) {
+	s.audit = a
+	s.auditCfg = cfg
+}
+
+// AuditAccountEvent emits the named account-deletion event if it is selected.
+// The subject is a hash of the user id; the data never carries credential
+// content.
+func (s *UserService) AuditAccountEvent(name string, userID domain.UserID, data map[string]any) {
+	if s.audit == nil || !s.auditCfg.AccountEventEnabled(name) {
+		return
+	}
+	event, ok := accountAuditEvents[name]
+	if !ok {
+		return
+	}
+	s.audit.EmitWithSubject(event, subjectHash("urn:siros:user", userID.String()), data)
+}
+
+// Account-deletion audit events, selected by AuditConfig.AccountEvents.
+const (
+	EventAccountDeletionRequested      = set.EventURI("urn:siros:audit:account:deletion_requested")
+	EventAccountDeletionSucceeded      = set.EventURI("urn:siros:audit:account:deletion_succeeded")
+	EventAccountDeletionCleanupPending = set.EventURI("urn:siros:audit:account:deletion_cleanup_pending")
+)
+
+var accountAuditEvents = map[string]set.EventURI{
+	config.AuditAccountRequested:      EventAccountDeletionRequested,
+	config.AuditAccountSucceeded:      EventAccountDeletionSucceeded,
+	config.AuditAccountCleanupPending: EventAccountDeletionCleanupPending,
 }
 
 // NewUserService creates a new UserService
