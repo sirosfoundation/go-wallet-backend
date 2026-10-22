@@ -474,7 +474,7 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 	}
 	holders := holderKeySet(userID, user.DID)
 	// A failed liveness check counts as live (fail closed).
-	tenants, err := s.userTenants(ctx, userID, tenantID)
+	tenants, err := s.userTenants(ctx, userID, tenantID, holders)
 	if err != nil {
 		return []error{err}
 	}
@@ -518,9 +518,12 @@ func (s *WalletLifecycleService) eraseWalletData(ctx context.Context, tenantID d
 }
 
 // userTenants lists the tenants holding the user's wallet data (memberships,
-// instances, default and current tenant). A failed lookup is an error: erasing
-// on a guess could destroy a wallet still in use.
-func (s *WalletLifecycleService) userTenants(ctx context.Context, userID domain.UserID, include domain.TenantID) ([]domain.TenantID, error) {
+// instances, default and current tenant, and every tenant still holding
+// credentials or presentations under one of the holder keys, which covers a
+// membership removed while holder data remained). A failed lookup is an error:
+// erasing on a guess could destroy a wallet still in use, and a probe must
+// never report clean on a guess.
+func (s *WalletLifecycleService) userTenants(ctx context.Context, userID domain.UserID, include domain.TenantID, holders []string) ([]domain.TenantID, error) {
 	memberships, err := s.store.UserTenants().GetUserTenants(ctx, userID)
 	if err != nil {
 		return nil, fmt.Errorf("list tenant memberships: %w", err)
@@ -543,6 +546,20 @@ func (s *WalletLifecycleService) userTenants(ctx context.Context, userID domain.
 		if !seen[inst.TenantID] {
 			seen[inst.TenantID] = true
 			out = append(out, inst.TenantID)
+		}
+	}
+	credTenants, err := s.store.Credentials().TenantsByHolders(ctx, holders)
+	if err != nil {
+		return nil, fmt.Errorf("list tenants holding credentials: %w", err)
+	}
+	presTenants, err := s.store.Presentations().TenantsByHolders(ctx, holders)
+	if err != nil {
+		return nil, fmt.Errorf("list tenants holding presentations: %w", err)
+	}
+	for _, tid := range append(credTenants, presTenants...) {
+		if !seen[tid] {
+			seen[tid] = true
+			out = append(out, tid)
 		}
 	}
 	return out, nil

@@ -3,6 +3,7 @@ package mongodb
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -83,6 +84,24 @@ func (s *CredentialStore) GetAllByHolder(ctx context.Context, tenantID domain.Te
 		return nil, fmt.Errorf("failed to decode credentials: %w", err)
 	}
 	return credentials, nil
+}
+
+func (s *CredentialStore) TenantsByHolders(ctx context.Context, holderDIDs []string) ([]domain.TenantID, error) {
+	if len(holderDIDs) == 0 {
+		return nil, nil
+	}
+	tenants, err := s.collection.Distinct(ctx, "tenant_id", bson.M{"holder_did": bson.M{"$in": holderDIDs}})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list credential tenants: %w", err)
+	}
+	out := make([]domain.TenantID, 0, len(tenants))
+	for _, t := range tenants {
+		if str, ok := t.(string); ok {
+			out = append(out, domain.TenantID(str))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
 }
 
 func (s *CredentialStore) Update(ctx context.Context, credential *domain.VerifiableCredential) error {
@@ -227,6 +246,24 @@ func (s *PresentationStore) GetAllByHolder(ctx context.Context, tenantID domain.
 		return nil, fmt.Errorf("failed to decode presentations: %w", err)
 	}
 	return presentations, nil
+}
+
+func (s *PresentationStore) TenantsByHolders(ctx context.Context, holderDIDs []string) ([]domain.TenantID, error) {
+	if len(holderDIDs) == 0 {
+		return nil, nil
+	}
+	tenants, err := s.collection.Distinct(ctx, "tenant_id", bson.M{"holder_did": bson.M{"$in": holderDIDs}})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list presentation tenants: %w", err)
+	}
+	out := make([]domain.TenantID, 0, len(tenants))
+	for _, t := range tenants {
+		if str, ok := t.(string); ok {
+			out = append(out, domain.TenantID(str))
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out, nil
 }
 
 func (s *PresentationStore) DeleteByCredentialID(ctx context.Context, tenantID domain.TenantID, holderDID, credentialID string) error {

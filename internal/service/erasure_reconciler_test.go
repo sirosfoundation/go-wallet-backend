@@ -860,3 +860,83 @@ func TestWalletLifecycle_ErasureSweepsTheCanonicalDIDWhenStoredDIDDiffers(t *tes
 	require.NoError(t, err)
 	assert.Zero(t, holderDataCount(t, store, domain.DefaultTenantID, canonical))
 }
+
+// A membership removed while holder data remains (admin RemoveUserFromTenant)
+// leaves a tenant with records but neither a membership nor an instance. The
+// probe, the reconcile and the cascade must still visit it.
+func tenantWithOnlyHolderData(t *testing.T, store storage.Store, holder string) (domain.UserID, domain.TenantID) {
+	t.Helper()
+	ctx := context.Background()
+	userID := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: userID, DID: holder}))
+	require.NoError(t, store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-orphan-" + userID.String(), TenantID: tenantA, UserID: &userID, Status: domain.InstanceStatusActive,
+	}))
+	require.NoError(t, store.Credentials().Create(ctx, &domain.VerifiableCredential{
+		TenantID: tenantB, HolderDID: holder, CredentialIdentifier: "c", Credential: "jwt", Format: domain.CredentialFormat("jwt_vc"),
+	}))
+	require.NoError(t, store.Presentations().Create(ctx, &domain.VerifiablePresentation{
+		TenantID: tenantB, HolderDID: holder, PresentationIdentifier: "p", Presentation: "jwt",
+	}))
+	return userID, tenantB
+}
+
+func TestReconcileUser_VisitsATenantHoldingOnlyHolderData(t *testing.T) {
+	ctx := context.Background()
+	for name, mk := range map[string]func(uid domain.UserID) string{
+		"stored DID":    func(uid domain.UserID) string { return "did:example:" + uid.String() },
+		"canonical DID": func(uid domain.UserID) string { return domain.HolderDID(uid.String()) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			store := memory.NewStore()
+			svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
+			uid := domain.NewUserID()
+			holder := mk(uid)
+			require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: uid, DID: holder}))
+			require.NoError(t, store.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+				ID: "inst-o", TenantID: tenantA, UserID: &uid, Status: domain.InstanceStatusActive,
+			}))
+			require.NoError(t, store.Credentials().Create(ctx, &domain.VerifiableCredential{
+				TenantID: tenantB, HolderDID: holder, CredentialIdentifier: "c", Credential: "jwt", Format: domain.CredentialFormat("jwt_vc"),
+			}))
+			require.NoError(t, store.Presentations().Create(ctx, &domain.VerifiablePresentation{
+				TenantID: tenantB, HolderDID: holder, PresentationIdentifier: "p", Presentation: "jwt",
+			}))
+			revokeSilently(t, store, uid)
+
+			out, left, err := svc.ReconcileUserDryRun(ctx, uid, inTheFuture())
+			require.NoError(t, err)
+			require.Equal(t, ReconcileWouldErase, out, "tenant B holds data and must not read as clean")
+			assert.ElementsMatch(t, []string{leftoverCredentials, leftoverPresentations}, left)
+
+			out, err = svc.ReconcileUser(ctx, uid, inTheFuture())
+			require.NoError(t, err)
+			assert.Equal(t, ReconcileErased, out)
+			assert.Zero(t, holderDataCount(t, store, tenantB, holder))
+		})
+	}
+}
+
+func TestWalletLifecycle_CascadeSweepsATenantHoldingOnlyHolderData(t *testing.T) {
+	ctx := context.Background()
+	store := memory.NewStore()
+	svc := NewWalletLifecycleService(store, zap.NewNop(), nil)
+	holder := "did:example:orphan"
+	uid, tb := tenantWithOnlyHolderData(t, store, holder)
+	_, err := svc.ChangeStatus(ctx, LifecycleActor{Kind: "provider"}, tenantA, "inst-orphan-"+uid.String(), domain.InstanceStatusRevoked, "lost")
+	require.NoError(t, err)
+	assert.Zero(t, holderDataCount(t, store, tb, holder))
+}
+
+// A failing tenant discovery must not read as clean.
+func TestReconcileUser_TenantDiscoveryFailureIsAnErrorNotClean(t *testing.T) {
+	ctx := context.Background()
+	f := newFailStore("credentials.TenantsByHolders")
+	svc := NewWalletLifecycleService(f, zap.NewNop(), nil)
+	uid, _ := tenantWithOnlyHolderData(t, f, "did:example:fail")
+	revokeSilently(t, f, uid)
+	out, err := svc.ReconcileUser(ctx, uid, inTheFuture())
+	require.Error(t, err)
+	assert.NotEqual(t, ReconcileClean, out)
+	assert.NotEqual(t, ReconcileErased, out)
+}
