@@ -24,6 +24,7 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	// Tenant-scoped: a mismatch inserts a duplicate _id, and that duplicate-key
 	// error is how "another tenant's record" reaches the caller.
 	filter := bson.M{"_id": instance.ID, "tenant_id": instance.TenantID}
+	newGeneration := uuid.NewString()
 	set := bson.M{
 		"attestation_source": instance.AttestationSource,
 		"last_attested_at":   instance.LastAttestedAt,
@@ -36,7 +37,7 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 		"$setOnInsert": bson.M{
 			"created_at": instance.CreatedAt,
 			// Fresh generation per insert (domain.InstanceBinding).
-			"generation": uuid.NewString(),
+			"generation": newGeneration,
 			"status":     instance.Status,
 			"tenant_id":  instance.TenantID,
 		},
@@ -63,6 +64,8 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 		return fmt.Errorf("%w: upsert wallet instance: %v", storage.ErrDatabase, err)
 	}
 	instance.Generation = written.Generation
+	// $setOnInsert wrote our fresh generation only if this call inserted the record.
+	instance.Inserted = written.Generation == newGeneration
 
 	// Bind only while unowned and scoped to the tenant, so racing attestations
 	// cannot both win and a foreign user is not parked on this record.

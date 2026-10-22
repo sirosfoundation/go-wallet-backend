@@ -329,3 +329,18 @@ func TestRevokedAfterFilter(t *testing.T) {
 	require.Equal(t, domain.InstanceStatusRevoked, f["status"])
 	require.Equal(t, bson.M{"$gt": domain.UserIDFromString("u1")}, f["user_id"])
 }
+
+func TestWalletInstanceStore_Upsert_ReportsInserted(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	wis := store.WalletInstances()
+
+	first := &domain.WalletInstance{ID: "inst-inserted", TenantID: "acme", Status: domain.InstanceStatusActive}
+	require.NoError(t, wis.Upsert(ctx, first))
+	require.True(t, first.Inserted)
+
+	again := &domain.WalletInstance{ID: "inst-inserted", TenantID: "acme", Inserted: true}
+	require.NoError(t, wis.Upsert(ctx, again))
+	require.False(t, again.Inserted, "matching an existing record is not an insert")
+	require.Equal(t, first.Generation, again.Generation)
+}
