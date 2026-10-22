@@ -29,9 +29,8 @@ func TestNewServices(t *testing.T) {
 			RPName:   "Test Wallet",
 		},
 		JWT: config.JWTConfig{
-			Secret:      "test-secret",
-			ExpiryHours: 24,
-			Issuer:      "test-wallet",
+			Secret: "test-secret",
+			Issuer: "test-wallet",
 		},
 	}
 	logger := zap.NewNop()
@@ -83,9 +82,8 @@ func TestNewServices_InvalidWebAuthnConfig(t *testing.T) {
 	cfg := &config.Config{
 		// Missing WebAuthn config (no RPID, etc.)
 		JWT: config.JWTConfig{
-			Secret:      "test-secret",
-			ExpiryHours: 24,
-			Issuer:      "test-wallet",
+			Secret: "test-secret",
+			Issuer: "test-wallet",
 		},
 	}
 	logger := zap.NewNop()
@@ -168,9 +166,8 @@ func TestNewServices_WiresAuditEmitterIntoWIA(t *testing.T) {
 			RPName:   "Test Wallet",
 		},
 		JWT: config.JWTConfig{
-			Secret:      "test-secret-that-is-at-least-32-bytes-long",
-			ExpiryHours: 24,
-			Issuer:      "test-wallet",
+			Secret: "test-secret-that-is-at-least-32-bytes-long",
+			Issuer: "test-wallet",
 		},
 		Audit: config.AuditConfig{
 			Enabled: true,
@@ -222,9 +219,8 @@ func TestNewServices_WIANilWhenSigningKeyButNoCertInETSIMode(t *testing.T) {
 			RPName:   "Test Wallet",
 		},
 		JWT: config.JWTConfig{
-			Secret:      "test-secret-that-is-at-least-32-bytes-long",
-			ExpiryHours: 24,
-			Issuer:      "test-wallet",
+			Secret: "test-secret-that-is-at-least-32-bytes-long",
+			Issuer: "test-wallet",
 		},
 	}
 	cfg.WalletProvider.PrivateKeyPath = wpKeyPath

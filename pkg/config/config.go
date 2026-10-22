@@ -49,34 +49,14 @@ type Config struct {
 	// never configured". Unexported: never (un)marshaled, so it can't leak
 	// into YAML output or be set by config files/env itself.
 	asEnabledExplicit bool
-
 	// registryExplicit records whether the `registry:` section (YAML) or any
 	// WALLET_REGISTRY_* environment variable was present; see
 	// RegistryExplicit and ApplyLegacyRegistryConfig.
 	registryExplicit bool
 
-	// jwtIssuerExplicit records whether jwt.issuer was set by the config file
-	// or WALLET_JWT_ISSUER (as opposed to the built-in default). The deprecated
-	// registry jwt.issuer only applies when it is false, so the shared JWT
-	// config stays a consistent (secret, issuer) pair.
-	jwtIssuerExplicit bool
-
 	// registryYAML is the decoded `registry:` mapping of the config file, used
 	// to tell keys the operator set explicitly from defaults.
 	registryYAML map[string]any
-
-	// registryLegacyTolerateNoJWKS is set by the deprecated registry.yaml
-	// alias when it enabled registry.require_auth from the old HMAC-only
-	// `jwt` block: such deployments have no as.external_url yet, and must
-	// keep starting (HMAC tokens only) until they migrate.
-	registryLegacyTolerateNoJWKS bool
-
-	// registryLegacyAudienceIndependent is set by the deprecated registry.yaml
-	// alias on a registry-only process that validates legacy HMAC tokens while
-	// server.rp_id is unset/default: the old schema has no rp_id, so legacy
-	// tokens are validated without an audience check (see
-	// RegistryLegacyAudienceIndependent).
-	registryLegacyAudienceIndependent bool
 
 	// loadWarnings are non-fatal findings from loading (see Warnings).
 	loadWarnings []string
@@ -127,9 +107,12 @@ type ASConfig struct {
 	// used to sign access tokens. Mutually exclusive with SigningKeyPKCS11.
 	SigningKeyPath string `yaml:"signing_key_path" envconfig:"SIGNING_KEY_PATH"`
 
-	// SigningKeyPKCS11 is a PKCS#11 URI for HSM-backed signing.
+	// SigningKeyPKCS11 configures an HSM-backed (PKCS#11) AS signing key.
+	// ECDSA P-256/P-384 only: RSA is not an AS algorithm and the PKCS#11 pool
+	// cannot handle Ed25519 (CKK_EC_EDWARDS). Requires a binary built with
+	// -tags pkcs11. module_path, key_label and pin or pin_path are required.
 	// Mutually exclusive with SigningKeyPath.
-	SigningKeyPKCS11 string `yaml:"signing_key_pkcs11" envconfig:"SIGNING_KEY_PKCS11"`
+	SigningKeyPKCS11 *PKCS11SigningConfig `yaml:"signing_key_pkcs11,omitempty" envconfig:"SIGNING_KEY_PKCS11"`
 
 	// Issuer is the value of the "iss" claim in issued access tokens.
 	// Defaults to JWT.Issuer if not set.
@@ -147,8 +130,7 @@ type ASConfig struct {
 	// Tokens must contain at least one of these in their "aud" claim.
 	// Required when AS is enabled, but an empty list is filled with the
 	// documented defaults ("wallet-backend", "wallet-engine",
-	// "wallet-registry", plus server.rp_id while as.legacy.enabled is true)
-	// before validation, so configs that never set it keep working.
+	// "wallet-registry") before validation, so configs that never set it keep working.
 	// Validate() rejects an empty list only if that defaulting was skipped.
 	// go-tokenauth v0.5.0 made this mandatory at the validator level too
 	// (both its validation paths now refuse to validate at all when their
@@ -157,9 +139,6 @@ type ASConfig struct {
 	// with no audiences configured would otherwise reject every request
 	// silently at runtime instead of failing to start).
 	// Documented values: "wallet-backend", "wallet-engine", "wallet-registry".
-	// When as.legacy.enabled is true an explicitly configured list must ALSO
-	// include server.rp_id: legacy (HMAC) tokens carry the RP ID as their
-	// audience, and Validate() rejects a configuration that omits it.
 	Audiences []string `yaml:"audiences" envconfig:"AUDIENCES"`
 
 	// RulesDir is the path to a directory containing SPOCP policy rule files.
@@ -179,14 +158,25 @@ type ASConfig struct {
 
 	// DefaultMaxTAC is the default maximum TAC for sessions created via passkey auth.
 	// Admin sessions (e.g. via OIDC) may get a different MaxTAC per policy.
-	// Default: "rwl" (read, write, list)
+	// It is also what /auth/token issues when no tac is requested. Default: "rwlid"
+	// (read, write, list, insert, delete): adding a passkey needs i, and removing a
+	// passkey or deleting the account needs d. Delegation (k) and admin (a) are
+	// never granted by default.
 	DefaultMaxTAC string `yaml:"default_max_tac" envconfig:"DEFAULT_MAX_TAC"`
 
-	// Legacy contains configuration for legacy (HMAC) token compatibility.
+	// Legacy holds the removed as.legacy.* settings; they are still parsed so an existing
+	// configuration gets a clear startup message. See ASLegacyConfig.
 	Legacy ASLegacyConfig `yaml:"legacy" envconfig:"LEGACY"`
 
 	// ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com").
-	// Used to construct OIDC redirect URIs. Required when OIDC is used.
+	// Used for OIDC redirect URIs and, in an isolated wallet-provider or
+	// standalone engine, to locate the AS JWKS. Must be an absolute http(s) URL
+	// without a query or fragment; a path prefix is allowed. Required whenever the
+	// AS is enabled, including the backend role (config validation fails without it).
+	//
+	// A standalone engine (--mode=engine) has no revocation source: a token
+	// stays valid there until it expires, even after logout. Use short access
+	// token TTLs, or co-host the engine with the backend.
 	ExternalURL string `yaml:"external_url" envconfig:"EXTERNAL_URL"`
 
 	// InsecureCookies disables the __Host- prefix and Secure flag on session cookies.
@@ -194,19 +184,72 @@ type ASConfig struct {
 	InsecureCookies bool `yaml:"insecure_cookies" envconfig:"INSECURE_COOKIES"`
 }
 
-// ASLegacyConfig controls the legacy all-in-one HMAC token sunset.
-type ASLegacyConfig struct {
-	// Enabled controls whether legacy HMAC tokens are accepted.
-	// Default: true (for backward compatibility)
-	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+// ExternalBaseURL validates ExternalURL (absolute http(s), no query or
+// fragment, including an empty "?" or "#" that url.Parse would drop) and
+// returns it without a trailing slash. Derive endpoints with JoinPath.
+func (a *ASConfig) ExternalBaseURL() (*url.URL, error) {
+	raw := a.ExternalURL
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" || (u.Scheme != "https" && u.Scheme != "http") {
+		return nil, fmt.Errorf("as.external_url %q is not an absolute http(s) URL", raw)
+	}
+	if strings.ContainsAny(raw, "?#") || u.RawQuery != "" || u.Fragment != "" {
+		return nil, fmt.Errorf("as.external_url %q must not contain a query or fragment", raw)
+	}
+	u.Path = strings.TrimRight(u.Path, "/")
+	u.RawPath = strings.TrimRight(u.RawPath, "/")
+	return u, nil
+}
 
-	// DeprecationHeader controls whether Deprecation + Sunset headers
-	// are sent on legacy token responses.
+// ASLegacyConfig holds the REMOVED as.legacy.* settings, still readable so a leftover configuration
+// is reported rather than silently misread.
+//
+// enabled: true makes Validate() fail (this binary cannot issue or validate legacy tokens);
+// enabled: false, deprecation_header and sunset_date are ignored and reported by DeprecatedSettings.
+//
+// Deprecated: remove the whole as.legacy section; it will be dropped from
+// the configuration schema in a later release.
+type ASLegacyConfig struct {
+	// REMOVED. true makes startup fail; false is ignored with a startup warning. A pointer so
+	// that unset and explicit false differ.
+	Enabled *bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// REMOVED and ignored (startup warning).
 	DeprecationHeader bool `yaml:"deprecation_header" envconfig:"DEPRECATION_HEADER"`
 
-	// SunsetDate is the date after which legacy tokens will no longer be supported.
-	// Used in the Sunset HTTP header. Format: RFC 3339 date (e.g. "2027-10-01T00:00:00Z").
+	// REMOVED and ignored (startup warning).
 	SunsetDate string `yaml:"sunset_date" envconfig:"SUNSET_DATE"`
+}
+
+// rejectLegacyASEnabled refuses as.legacy.enabled=true; shared by Validate and ValidateRegistry so every role behaves the same.
+func (c *Config) rejectLegacyASEnabled() error {
+	if c.AS.Legacy.Enabled != nil && *c.AS.Legacy.Enabled {
+		return fmt.Errorf("as.legacy.enabled=true (or WALLET_AS_LEGACY_ENABLED=true) is no longer supported: the legacy HMAC authorization server (HS256 appTokens, /user/*-webauthn-*, jwt.refresh_days refresh tokens) has been removed. " +
+			"Remove the as.legacy section (or set it to false), enable the AS (as.enabled=true) and migrate clients to X-Token-Mode: session; see docs/new-as.md")
+	}
+	return nil
+}
+
+// DeprecatedSettings returns the names of present settings that no longer have any effect, for a
+// startup warning. (as.legacy.enabled=true is refused by Validate instead.)
+func (c *Config) DeprecatedSettings() []string {
+	var out []string
+	if c.AS.Legacy.Enabled != nil && !*c.AS.Legacy.Enabled {
+		out = append(out, "as.legacy.enabled (WALLET_AS_LEGACY_ENABLED)")
+	}
+	if c.AS.Legacy.DeprecationHeader {
+		out = append(out, "as.legacy.deprecation_header (WALLET_AS_LEGACY_DEPRECATION_HEADER)")
+	}
+	if c.AS.Legacy.SunsetDate != "" {
+		out = append(out, "as.legacy.sunset_date (WALLET_AS_LEGACY_SUNSET_DATE)")
+	}
+	if c.JWT.ExpiryHours != 0 {
+		out = append(out, "jwt.expiry_hours (WALLET_JWT_EXPIRY_HOURS)")
+	}
+	if c.JWT.RefreshDays != 0 {
+		out = append(out, "jwt.refresh_days (WALLET_JWT_REFRESH_DAYS)")
+	}
+	return out
 }
 
 // SetDefaults sets default values for AS configuration.
@@ -218,7 +261,7 @@ func (c *ASConfig) SetDefaults() {
 		c.SessionTTL = 24 * time.Hour
 	}
 	if c.DefaultMaxTAC == "" {
-		c.DefaultMaxTAC = "rwl"
+		c.DefaultMaxTAC = "rwlid"
 	}
 }
 
@@ -261,20 +304,13 @@ func (c *Config) EnableForRole() {
 		return
 	}
 	c.AS.Enabled = true
-	// Auto-enable can only inherit the wallet provider's signing key when
-	// the wallet provider is purely file-based - never when PKCS11 is
-	// configured for it, even if PrivateKeyPath is ALSO set as a runtime
-	// fallback (WalletProviderService tries PKCS11 first, independently of
-	// whether a file key is also configured). Inheriting the file path
-	// there would silently sign AS tokens with the weaker on-disk key while
-	// the wallet provider itself actually signs WIA/KA with the HSM key -
-	// a real, silent security downgrade, not just an unsupported
-	// configuration. AS's own PKCS11 signing is not implemented (see
-	// Validate()), so this deliberately leaves SigningKeyPath empty in that
-	// case; Validate() then rejects with a clear, actionable error rather
-	// than silently limping along with AS enabled on the wrong key.
+	// Inherit the wallet provider's key only when it is purely file-based. With
+	// PKCS11 configured (even alongside a fallback file key) inheriting the
+	// file would silently sign AS tokens with a weaker on-disk key while WIA/KA
+	// use the HSM. The AS must be given its own as.signing_key_pkcs11, so
+	// SigningKeyPath stays empty and Validate() rejects it.
 	walletProviderUsesPKCS11 := c.WalletProvider.PKCS11 != nil && c.WalletProvider.PKCS11.ModulePath != ""
-	if c.AS.SigningKeyPath == "" && c.AS.SigningKeyPKCS11 == "" && !walletProviderUsesPKCS11 {
+	if c.AS.SigningKeyPath == "" && c.AS.SigningKeyPKCS11 == nil && !walletProviderUsesPKCS11 {
 		c.AS.SigningKeyPath = c.WalletProvider.PrivateKeyPath
 	}
 	if c.AS.RulesDir == "" {
@@ -304,22 +340,24 @@ const defaultJWTIssuer = "wallet-backend"
 // Shared by Load() (which must run it BEFORE Validate()) and EnableForRole()
 // so both paths produce an identical result.
 //
-//   - as.audiences empty: the documented default set, plus server.rp_id while
-//     legacy (HMAC) tokens are enabled (they carry the RP ID as "aud").
-//   - jwt.issuer empty while legacy tokens are enabled: "wallet-backend".
+//   - as.audiences empty: the documented default set.
 func (c *Config) applyASSecurityDefaults() {
 	if !c.AS.Enabled {
 		return
 	}
 	if len(c.AS.Audiences) == 0 {
 		c.AS.Audiences = append([]string(nil), defaultASAudiences...)
-		if c.AS.Legacy.Enabled && c.Server.RPID != "" && !containsString(c.AS.Audiences, c.Server.RPID) {
-			c.AS.Audiences = append(c.AS.Audiences, c.Server.RPID)
-		}
 	}
-	if c.AS.Legacy.Enabled && c.JWT.Issuer == "" {
-		c.JWT.Issuer = defaultJWTIssuer
+}
+
+// SessionAudiences returns the audiences a validator must be built with: as.audiences, else the
+// documented defaults. Load() fills as.audiences only when the AS is enabled; a standalone engine
+// still needs a non-empty list because go-tokenauth refuses to validate without one.
+func (c *Config) SessionAudiences() []string {
+	if len(c.AS.Audiences) > 0 {
+		return c.AS.Audiences
 	}
+	return append([]string(nil), defaultASAudiences...)
 }
 
 // GetTokenTTL returns the TTL for a given audience, falling back to the default.
@@ -514,7 +552,7 @@ func (c HTTPClientConfig) newHTTPClient(timeoutOverride time.Duration, trustedHo
 		timeout = timeoutOverride
 	}
 
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport := cloneDefaultTransport()
 
 	if c.InsecureSkipVerify {
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
@@ -995,6 +1033,8 @@ type CORSConfig struct {
 	AllowedMethods []string `yaml:"allowed_methods" envconfig:"ALLOWED_METHODS"`
 
 	// AllowedHeaders is a list of request headers allowed in cross-origin requests.
+	// An explicit list replaces the defaults, so it must include X-Token-Mode
+	// (mandatory on /auth/passkey/*) and the other headers clients send.
 	AllowedHeaders []string `yaml:"allowed_headers" envconfig:"ALLOWED_HEADERS"`
 
 	// ExposedHeaders is a list of headers that browsers are allowed to access.
@@ -1130,51 +1170,28 @@ type LoggingConfig struct {
 	Format string `yaml:"format" envconfig:"FORMAT"` // json, text
 }
 
-// JWTConfig contains JWT configuration
+// JWTConfig contains the jwt.* settings. Session tokens are signed by the AS's asymmetric key, so only
+// Secret (keys the OIDC state-binding cookie HMAC) and Issuer (fallback for as.issuer) matter;
+// ExpiryHours and RefreshDays are removed no-ops (see Config.DeprecatedSettings).
 type JWTConfig struct {
-	Secret      string `yaml:"secret" envconfig:"SECRET"`
-	SecretPath  string `yaml:"secret_path" envconfig:"SECRET_PATH"` // Path to file containing JWT secret
-	ExpiryHours int    `yaml:"expiry_hours" envconfig:"EXPIRY_HOURS"`
-	RefreshDays int    `yaml:"refresh_days" envconfig:"REFRESH_DAYS"`
-	// Issuer is the "iss" claim of legacy (HMAC) tokens. Required (non-empty) when as.legacy.enabled is true: legacy tokens are issued and validated with it. Defaults to "wallet-backend"; if it is blanked while as.legacy.enabled is true, that default is re-applied before validation.
+	// Secret is a server-side secret of at least 32 bytes. It keys the HMAC that binds the OIDC
+	// state parameter to the browser (state-binding cookie). Required.
+	Secret string `yaml:"secret" envconfig:"SECRET"`
+	// SecretPath is the path to a file containing the secret (alternative to Secret).
+	SecretPath string `yaml:"secret_path" envconfig:"SECRET_PATH"`
+
+	// REMOVED and ignored (startup warning). AS token lifetimes are as.default_token_ttl / as.audience_ttls.
+	//
+	// Deprecated: no effect.
+	ExpiryHours int `yaml:"expiry_hours" envconfig:"EXPIRY_HOURS"`
+	// REMOVED and ignored (startup warning). AS sessions live as.session_ttl.
+	//
+	// Deprecated: no effect.
+	RefreshDays int `yaml:"refresh_days" envconfig:"REFRESH_DAYS"`
+
+	// Issuer is the fallback for as.issuer (the "iss" of AS-issued access
+	// tokens). Default: "wallet-backend".
 	Issuer string `yaml:"issuer" envconfig:"ISSUER"`
-}
-
-// MaxTokenLifetime returns the longer of the configured access-token
-// (ExpiryHours) and refresh-token (RefreshDays) lifetimes. A refresh-token
-// family revocation marker must be retained at least this long, since
-// nothing enforces that the refresh token outlives the access token.
-func (c JWTConfig) MaxTokenLifetime() time.Duration {
-	refresh := time.Duration(c.RefreshDays) * 24 * time.Hour
-	access := time.Duration(c.ExpiryHours) * time.Hour
-	if refresh > access {
-		return refresh
-	}
-	return access
-}
-
-// MinFamilyRetention is the floor for how long a refresh-token family
-// revocation marker is kept (365 days).
-//
-// The marker must outlive every token of the family, but the only bound
-// available at logout is the CURRENT configuration, while tokens may have
-// been minted under an earlier, longer one (e.g. jwt.refresh_days lowered
-// after deployment). A retention derived from the current lifetimes alone
-// could therefore expire early and un-revoke older tokens. The floor makes
-// retention non-shrinking across configuration changes for any earlier
-// configuration with token lifetimes up to a year; markers are tiny and
-// swept afterwards, so the cost is negligible. Configurations that ever
-// issued tokens beyond a year are covered by MaxTokenLifetime taking the
-// larger value.
-const MinFamilyRetention = 365 * 24 * time.Hour
-
-// FamilyRetention returns how long to keep a refresh-token family
-// revocation marker: the longer of MaxTokenLifetime and MinFamilyRetention.
-func (c JWTConfig) FamilyRetention() time.Duration {
-	if m := c.MaxTokenLifetime(); m > MinFamilyRetention {
-		return m
-	}
-	return MinFamilyRetention
 }
 
 // JWTLeeway is the clock-skew tolerance applied when validating JWT time claims
@@ -1203,9 +1220,32 @@ type PKCS11SigningConfig struct {
 	ModulePath string `yaml:"module_path" envconfig:"MODULE_PATH"`
 	SlotID     uint   `yaml:"slot_id" envconfig:"SLOT_ID"`
 	PIN        string `yaml:"pin" envconfig:"PIN"`
-	PINPath    string `yaml:"pin_path" envconfig:"PIN_PATH"` // Path to file containing PIN (preferred over inline PIN)
+	PINPath    string `yaml:"pin_path" envconfig:"PIN_PATH"` // Path to file containing PIN (preferred over inline PIN). Read at startup by Load for wallet_provider.pkcs11; for as.signing_key_pkcs11 it is read only when the AS signer is constructed, not by Load.
 	KeyLabel   string `yaml:"key_label" envconfig:"KEY_LABEL"`
 	PoolSize   int    `yaml:"pool_size" envconfig:"POOL_SIZE"` // Session pool size (default 4)
+}
+
+// ResolvePIN returns the PIN, from PINPath when set (it wins over the inline
+// PIN). Called by the code that opens the HSM, not Load, so other processes do
+// not need the file. Errors do not name the file.
+func (p *PKCS11SigningConfig) ResolvePIN() (string, error) {
+	if p.PINPath == "" {
+		return p.PIN, nil
+	}
+	data, err := os.ReadFile(p.PINPath)
+	if err != nil {
+		// os.ReadFile errors carry the path; unwrap to the bare cause.
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) {
+			err = pathErr.Err
+		}
+		return "", fmt.Errorf("pin_path: failed to read PIN file: %w", err)
+	}
+	pin := strings.TrimSpace(string(data))
+	if pin == "" {
+		return "", errors.New("pin_path: PIN file is empty")
+	}
+	return pin, nil
 }
 
 // AttestationConfig controls attestation lifecycle behavior.
@@ -1555,7 +1595,7 @@ func (c *TrustConfig) NewPDPHTTPClient(timeoutOverride time.Duration) (*http.Cli
 		tlsCfg.RootCAs = pool
 	}
 
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport := cloneDefaultTransport()
 	transport.TLSClientConfig = tlsCfg
 	// No proxy — PDP is an internal service reached directly.
 	transport.Proxy = nil
@@ -1913,10 +1953,9 @@ func Load(configFile string) (*Config, error) {
 // caller after any deprecated-alias overlay (see ValidateRegistry and
 // ValidateRegistryStandalone).
 func LoadRegistryOnly(configFile string) (*Config, error) {
-	// The legacy-audience check is deliberately not part of the load-time
-	// validation: the deprecated registry.yaml overlay (applied afterwards)
-	// can decide that it does not apply; ValidateRegistryStandalone runs it
-	// once the overlay is in place.
+	// Only the MongoDB password is read, and only when the shared revocation
+	// store is in use: the registry validates AS tokens through the JWKS (a
+	// deprecated registry.yaml jwt secret is ignored).
 	return load(configFile, (*Config).loadRegistrySecrets, (*Config).validateRegistryStandaloneServer)
 }
 
@@ -1939,7 +1978,6 @@ func load(configFile string, loadSecrets, validate func(*Config) error) (*Config
 			cfg.asEnabledExplicit = yamlHasASEnabledKey(data)
 			cfg.registryExplicit = yamlHasTopLevelKey(data, "registry")
 			cfg.registryYAML = yamlRegistrySection(data)
-			cfg.jwtIssuerExplicit = yamlHasNestedKey(data, "jwt", "issuer")
 			if w := retiredRegistryLayoutWarning(data); w != "" {
 				cfg.loadWarnings = append(cfg.loadWarnings, w)
 			}
@@ -1951,14 +1989,17 @@ func load(configFile string, loadSecrets, validate func(*Config) error) (*Config
 	if _, ok := os.LookupEnv("WALLET_AS_ENABLED"); ok {
 		cfg.asEnabledExplicit = true
 	}
-	if _, ok := os.LookupEnv("WALLET_JWT_ISSUER"); ok {
-		cfg.jwtIssuerExplicit = true
-	}
 	if envHasPrefix("WALLET_REGISTRY_") {
 		cfg.registryExplicit = true
 	}
 	if err := envconfig.Process("WALLET", cfg); err != nil {
 		return nil, fmt.Errorf("failed to process environment variables: %w", err)
+	}
+
+	// envconfig allocates nil struct pointers, which would otherwise trip the
+	// mutual-exclusion check for an AS that only sets signing_key_path.
+	if p := cfg.AS.SigningKeyPKCS11; p != nil && *p == (PKCS11SigningConfig{}) {
+		cfg.AS.SigningKeyPKCS11 = nil
 	}
 
 	// Load secrets from files if configured
@@ -2098,6 +2139,9 @@ func (c *Config) loadSecretsFromFiles() error {
 		}
 	}
 
+	// as.signing_key_pkcs11.pin_path is read lazily via ResolvePIN: processes
+	// sharing this config without the AS need not have the file.
+
 	// Load Play Integrity decryption/verification keys from file
 	natCfg := &c.WalletProvider.Attestation.NativeAttestation
 	if natCfg.GooglePlayIntegrityDecryptionKeyPath != "" {
@@ -2207,9 +2251,7 @@ func defaultConfig() *Config {
 			Format: "json",
 		},
 		JWT: JWTConfig{
-			ExpiryHours: 24,
-			RefreshDays: 7,
-			Issuer:      defaultJWTIssuer,
+			Issuer: defaultJWTIssuer,
 		},
 		Trust: TrustConfig{
 			Timeout: 30, // seconds
@@ -2266,10 +2308,6 @@ func defaultConfig() *Config {
 		Presentation: PresentationConfig{DCQLConsentCheck: DCQLConsentCheckWarn},
 		AS: ASConfig{
 			DefaultTokenTTL: 2 * time.Minute,
-			Legacy: ASLegacyConfig{
-				Enabled:           true,  // Legacy tokens accepted by default
-				DeprecationHeader: false, // No deprecation headers until explicitly enabled
-			},
 		},
 		WalletProvider: WalletProviderConfig{
 			WIA: WIAConfig{
@@ -2422,11 +2460,28 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("mongodb.cert_path is required when mongodb.key_path is set")
 	}
 
+	if err := c.rejectLegacyASEnabled(); err != nil {
+		return err
+	}
+
+	// jwt.secret keys the OIDC state-binding cookie HMAC (see JWTConfig).
 	if c.JWT.Secret == "" {
-		return fmt.Errorf("jwt secret is required")
+		return fmt.Errorf("jwt secret is required (it keys the OIDC state-binding cookie)")
 	}
 	if len(c.JWT.Secret) < 32 {
 		return fmt.Errorf("jwt secret must be at least 32 bytes for HMAC-SHA256 security")
+	}
+
+	// A remote AS JWKS is validated against as.issuer or jwt.issuer; both
+	// empty would leave the issuer unrestricted.
+	if c.AS.ExternalURL != "" && c.AS.Issuer == "" && c.JWT.Issuer == "" {
+		return fmt.Errorf("as.external_url requires an expected issuer to validate AS tokens; set as.issuer or jwt.issuer")
+	}
+
+	if c.AS.ExternalURL != "" {
+		if _, err := c.AS.ExternalBaseURL(); err != nil {
+			return err
+		}
 	}
 
 	// Validate CORS: AllowCredentials cannot be true with wildcard origins
@@ -2440,14 +2495,25 @@ func (c *Config) Validate() error {
 
 	// Validate AS configuration
 	if c.AS.Enabled {
-		if c.AS.SigningKeyPath == "" && c.AS.SigningKeyPKCS11 == "" {
+		if c.AS.SigningKeyPath == "" && c.AS.SigningKeyPKCS11 == nil {
 			return fmt.Errorf("as: signing_key_path or signing_key_pkcs11 is required when AS is enabled")
 		}
-		if c.AS.SigningKeyPath != "" && c.AS.SigningKeyPKCS11 != "" {
+		if c.AS.SigningKeyPath != "" && c.AS.SigningKeyPKCS11 != nil {
 			return fmt.Errorf("as: signing_key_path and signing_key_pkcs11 are mutually exclusive")
 		}
-		if c.AS.SigningKeyPKCS11 != "" {
-			return fmt.Errorf("as: signing_key_pkcs11 is not yet implemented; use signing_key_path")
+		if p := c.AS.SigningKeyPKCS11; p != nil {
+			if p.ModulePath == "" {
+				return fmt.Errorf("as: signing_key_pkcs11.module_path is required")
+			}
+			if p.KeyLabel == "" {
+				return fmt.Errorf("as: signing_key_pkcs11.key_label is required")
+			}
+			if p.PIN == "" && p.PINPath == "" {
+				return fmt.Errorf("as: signing_key_pkcs11.pin or pin_path is required")
+			}
+			if p.PoolSize < 0 {
+				return fmt.Errorf("as: signing_key_pkcs11.pool_size must not be negative")
+			}
 		}
 		if c.AS.RulesDir == "" {
 			return fmt.Errorf("as: rules_dir is required when AS is enabled (AllowAll is not safe for production)")
@@ -2494,23 +2560,9 @@ func (c *Config) Validate() error {
 		if len(c.AS.Audiences) == 0 {
 			return fmt.Errorf("as: audiences is required when AS is enabled (see Config.AS.Audiences's doc comment)")
 		}
-		// Legacy (HMAC) tokens carry "aud": Server.RPID (see
-		// UserService/WebAuthnService.generateToken), and go-tokenauth v0.5
-		// validates that against AS.Audiences. If the RP ID is not among
-		// them, every legacy login token is rejected on its next protected
-		// request - a failure that only shows up at runtime, so refuse it here.
-		// Legacy tokens are minted with "iss": jwt.issuer and validated
-		// against Legacy.Issuers=[jwt.issuer]; an empty value would mint
-		// tokens with an empty iss and turn go-tokenauth's mandatory issuer
-		// check into a no-op, so require it (as.issuer does not help: it is
-		// not the legacy issuer).
-		if c.AS.Legacy.Enabled && c.JWT.Issuer == "" {
-			return fmt.Errorf("as: legacy tokens are enabled but jwt.issuer is empty; legacy tokens are issued and validated with jwt.issuer, so set it or disable as.legacy.enabled")
-		}
-		if c.AS.Legacy.Enabled && !containsString(c.AS.Audiences, c.Server.RPID) {
-			return fmt.Errorf("as: legacy tokens are enabled but server.rp_id %q is not listed in as.audiences; "+
-				"legacy tokens carry the RP ID as their audience, so add it to as.audiences or disable as.legacy.enabled",
-				c.Server.RPID)
+		// Every process that enables the AS fetches its own JWKS from here.
+		if c.AS.ExternalURL == "" {
+			return fmt.Errorf("as: external_url is required when AS is enabled (the AS JWKS is fetched from <external_url>/auth/.well-known/jwks.json)")
 		}
 	}
 
@@ -2768,4 +2820,28 @@ func containsString(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// cloneDefaultTransport returns a private copy of http.DefaultTransport so
+// callers can customise TLS/proxy settings without mutating the shared
+// default. http.DefaultTransport is a mutable package variable; if something
+// has replaced it with a non-*http.Transport RoundTripper, fall back to a
+// fresh Transport carrying the same defaults as the standard library's,
+// instead of panicking on a failed type assertion.
+func cloneDefaultTransport() *http.Transport {
+	if t, ok := http.DefaultTransport.(*http.Transport); ok && t != nil {
+		return t.Clone()
+	}
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
 }

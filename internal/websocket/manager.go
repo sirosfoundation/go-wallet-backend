@@ -9,10 +9,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
+
+	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
@@ -85,7 +86,7 @@ type SigningRequest struct {
 type ClientMessage struct {
 	Type      string           `json:"type,omitempty"` // Message type (e.g., "auth")
 	MessageID string           `json:"message_id"`
-	AppToken  string           `json:"appToken,omitempty"` // Legacy: For handshake (deprecated)
+	AppToken  string           `json:"appToken,omitempty"` // Handshake token (historical field name; carries the AS access token)
 	Token     string           `json:"token,omitempty"`    // Auth token (preferred)
 	TenantID  string           `json:"tenantId,omitempty"` // Tenant ID for multi-tenant routing
 	Response  *SigningResponse `json:"response,omitempty"`
@@ -123,6 +124,9 @@ type Manager struct {
 
 	clientsMu sync.RWMutex
 	clients   map[string]*clientConnection // userID -> connection
+
+	// tokenValidator, when set, authenticates the handshake token.
+	tokenValidator *tokenvalidator.Validator
 
 	// activeConnections counts every upgraded connection, handshaked or not.
 	// The connection limit must be enforced against this, not len(clients):
@@ -303,27 +307,31 @@ func (m *Manager) handleClient(conn *websocket.Conn) {
 	}
 }
 
-func (m *Manager) validateToken(tokenString string) (string, error) {
-	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, errors.New("unexpected signing method")
-		}
-		return []byte(m.cfg.JWT.Secret), nil
-	}, jwt.WithLeeway(config.JWTLeeway))
+// SetTokenValidator makes the handshake validate tokens through the shared go-tokenauth validator.
+// Call before serving connections; without one every handshake is refused.
+func (m *Manager) SetTokenValidator(v *tokenvalidator.Validator) {
+	m.tokenValidator = v
+}
 
+func (m *Manager) validateToken(tokenString string) (string, error) {
+	if m.tokenValidator == nil {
+		// No validator: fail closed.
+		return "", errors.New("no token validator configured")
+	}
+	result, err := m.tokenValidator.Validate(context.Background(), tokenString)
 	if err != nil {
 		return "", err
 	}
-
-	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
-		userID, ok := claims["user_id"].(string)
-		if !ok {
-			return "", errors.New("invalid token claims")
-		}
-		return userID, nil
+	// The validator enforces as.audiences; the keystore socket additionally requires wallet-backend
+	// (registry-only tokens are refused).
+	if !result.HasAudience("wallet-backend") {
+		return "", errors.New("token audience not accepted")
 	}
-
-	return "", errors.New("invalid token")
+	// Per-user socket: an anonymous token has nothing to bind to.
+	if result.UserID == "" {
+		return "", errors.New("invalid token claims")
+	}
+	return result.UserID, nil
 }
 
 // IsConnected checks if a user is currently connected

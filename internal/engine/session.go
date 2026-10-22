@@ -10,7 +10,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
@@ -20,9 +19,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	ws "github.com/sirosfoundation/go-wallet-backend/internal/websocket"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/audience"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/legacytoken"
 )
 
 var (
@@ -41,28 +38,11 @@ var (
 // pkg/middleware.TokenBlacklistChecker's shape; *service.TokenBlacklist
 // satisfies this.
 //
-// validateToken's go-tokenauth branch relies on the shared
-// *tokenvalidator.Validator (see SetTokenValidator) already having its own
-// per-jti Revocation checker wired to the same blacklist instance (see
-// internal/server.blacklistRevocationChecker) - this field only adds the
-// user-level check that checker's interface can't express, and is the ONLY
-// revocation check at all for the legacy HMAC branch, which the shared
-// Validator never touches (#391 review, round 2: this handshake path was
-// found to bypass both TokenAuthMiddleware's own user-level check and, for
-// legacy tokens, revocation entirely).
+// validateToken relies on the shared Validator's own per-jti Revocation checker; this field
+// adds only the user-level check that checker's interface can't express.
 type TokenBlacklistChecker interface {
 	IsBlacklisted(ctx context.Context, jti string) bool
 	IsUserRevoked(ctx context.Context, userID string) bool
-
-	// IsFamilyRevoked reports whether sid - a refresh-token family/session
-	// id (see service.WebAuthnService.generateToken's doc comment) - has
-	// been revoked via RevokeFamily (what api.Handlers.Logout calls). Added
-	// for #402/#414 (Copilot review): without this, an access token from an
-	// earlier rotation of a since-logged-out session - its own jti never
-	// individually blacklisted - could still authenticate a NEW WebSocket
-	// handshake to this engine even after the HTTP paths (pkg/middleware.
-	// AuthMiddlewareWithBlacklist/TokenAuthMiddleware) already reject it.
-	IsFamilyRevoked(ctx context.Context, sid string) bool
 }
 
 // MaxPendingFlowsPerSession limits concurrent flows to prevent DoS.
@@ -102,11 +82,8 @@ type Session struct {
 	ID       string
 	UserID   string
 	TenantID string
-	// TAC is only ever populated on the go-tokenauth path - see
-	// Manager.validateToken. An empty TAC means "not applicable" (legacy
-	// auth, no TAC concept at all), not "no permissions" - handleFlowStart's
-	// per-protocol check must treat it as a no-op, exactly like
-	// requireTACIfEnforced does for HTTP routes.
+	// TAC is the token's TAC claim. Empty means no TAC claim, not "no permissions":
+	// handleFlowStart skips the check.
 	TAC     claims.TAC
 	conn    *websocket.Conn
 	sendMu  sync.Mutex
@@ -620,10 +597,7 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	}
 
 	// TAC check: only enforced when the session actually has a TAC to check
-	// (empty means legacy auth, which has no TAC concept - see
-	// Manager.validateToken - not "no permissions"), mirroring
-	// requireTACIfEnforced's identical conditional enforcement for HTTP
-	// routes (internal/server/providers.go).
+	// (empty means the token carries no TAC claim, not "no permissions").
 	if session.TAC != "" {
 		if required, ok := requiredTACForProtocol[msg.Protocol]; ok && !session.TAC.HasAll(required) {
 			_ = session.SendFlowError(flowID, "", ErrCodeForbidden, "insufficient permissions for protocol: "+string(msg.Protocol))
@@ -813,16 +787,8 @@ func (m *Manager) unregisterSession(session *Session) {
 	session.logger.Info("Session closed", zap.String("session_id", session.ID))
 }
 
-// engineAdmitsLegacyTokens is whether the engine transport accepts ModeLegacy
-// (HMAC login) tokens without an audience match. True today, as for every
-// other guarded route group; see audience.Allowed.
-const engineAdmitsLegacyTokens = true
-
-// validateToken authenticates tokenString and returns its identity.
-// tac is only ever populated on the go-tokenauth path - the legacy HMAC
-// path (below) has no TAC concept at all, so callers must treat an empty
-// tac as "not applicable here", not "no permissions", exactly like
-// requireTACIfEnforced does for HTTP routes (see internal/server/providers.go).
+// validateToken authenticates tokenString and returns its identity. Only tokens accepted by the
+// go-tokenauth validator are allowed; with none wired (SetTokenValidator) every handshake is refused.
 //
 // ctx is the handshake-scoped context and is passed to every validator and
 // revocation lookup. If it is already done, validation fails closed (a
@@ -832,116 +798,24 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 	if err := ctx.Err(); err != nil {
 		return "", "", "", fmt.Errorf("token validation aborted: %w", err)
 	}
-	// Use go-tokenauth validator when available (supports both new-style and legacy tokens)
-	if m.tokenValidator != nil {
-		result, err := m.tokenValidator.Validate(ctx, tokenString)
-		if err != nil {
-			return "", "", "", err
-		}
-		// The engine transport, like the AuthZEN proxy, only needs a
-		// wallet-registry or wallet-backend audience - never a broader one.
-		//
-		// Legacy (HMAC) tokens are exempt, exactly like
-		// middleware.RequireAudience (see audience.Allowed for why:
-		// they carry aud=Server.RPID, already validated against
-		// AS.Audiences). The exemption is an explicit opt-in constant, not an
-		// implicit special case: if the engine transport is ever restricted
-		// to a narrower audience that ordinary login tokens must not reach,
-		// flip engineAdmitsLegacyTokens to false. Session-mode tokens always
-		// keep the strict check.
-		if !audience.Allowed(result, engineAdmitsLegacyTokens, "wallet-registry", "wallet-backend") {
-			return "", "", "", errors.New("token audience not permitted for engine transport")
-		}
-		// Per-jti revocation is already enforced inside Validate itself (the
-		// shared Validator's own Revocation checker - see
-		// internal/server.blacklistRevocationChecker); user-level revocation
-		// is not, since that checker's interface only ever sees a jti (see
-		// #391 review, round 2). Checked against both the optional
-		// TokenBlacklist feature and the engine's own always-on
-		// revokedUsers (#403) - either one saying revoked is enough to
-		// reject.
-		if (m.blacklist != nil && m.blacklist.IsUserRevoked(ctx, result.UserID)) || m.isUserRevoked(result.UserID) {
-			return "", "", "", errors.New("token has been revoked")
-		}
-		// Refresh-token family revocation (#402/#414), legacy-mode tokens
-		// only: go-tokenauth "auto-detects new-style vs legacy" tokens, so a
-		// WebAuthnService-issued legacy HMAC token can reach this branch
-		// too whenever the AS is enabled. go-tokenauth's shared
-		// *claims.Result has no "sid" field at all (it's shared with
-		// AS-issued tokens, which have no family concept in this codebase),
-		// so this reuses legacytoken.SID to re-parse the same
-		// already-validated raw token independently and reach that one
-		// extra claim - the same helper TokenAuthMiddleware itself uses,
-		// for the identical reason. New-style AS-issued tokens (ModeSession)
-		// are skipped entirely.
-		if m.blacklist != nil && result.Mode == claims.ModeLegacy {
-			// Fail closed if the family cannot be determined.
-			sid, sidErr := legacytoken.ParseSID(m.cfg.JWT.Secret, tokenString)
-			if sidErr != nil {
-				return "", "", "", errors.New("cannot determine token family")
-			}
-			// Re-check ctx right before the lookup: fail closed rather than
-			// treat an abandoned handshake's lookup as "not revoked".
-			if err := ctx.Err(); err != nil {
-				return "", "", "", fmt.Errorf("family revocation check aborted: %w", err)
-			}
-			if sid != "" && m.blacklist.IsFamilyRevoked(ctx, sid) {
-				return "", "", "", errors.New("token has been revoked")
-			}
-		}
-		// UserID may be empty for anonymous tokens — that is acceptable.
-		return result.UserID, result.TenantID, result.TAC, nil
+	if m.tokenValidator == nil {
+		return "", "", "", errors.New("no token validator configured")
 	}
-
-	// Legacy path: direct HMAC validation. Unlike the go-tokenauth branch
-	// above, nothing else in this path ever checks revocation at all, so
-	// both checks below are needed, not just the user-level one (#391
-	// review, round 2).
-	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, errors.New("unexpected signing method")
-		}
-		return []byte(m.cfg.JWT.Secret), nil
-	}, jwt.WithLeeway(config.JWTLeeway))
-
+	result, err := m.tokenValidator.Validate(ctx, tokenString)
 	if err != nil {
 		return "", "", "", err
 	}
-
-	if mapClaims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
-		// Support both "user_id" (go-wallet-backend native) and "uuid" (wallet-backend-server compat)
-		userID, _ = mapClaims["user_id"].(string)
-		if userID == "" {
-			userID, _ = mapClaims["uuid"].(string)
-		}
-		tenantID, _ = mapClaims["tenant_id"].(string)
-		if userID == "" {
-			return "", "", "", errors.New("invalid token claims: missing user_id or uuid")
-		}
-		if m.blacklist != nil {
-			if jti, _ := mapClaims["jti"].(string); jti != "" && m.blacklist.IsBlacklisted(ctx, jti) {
-				return "", "", "", errors.New("token has been revoked")
-			}
-			if m.blacklist.IsUserRevoked(ctx, userID) {
-				return "", "", "", errors.New("token has been revoked")
-			}
-			// Refresh-token family revocation (#402/#414) - see the
-			// go-tokenauth branch above's identical check for why.
-			if sid, _ := mapClaims["sid"].(string); sid != "" && m.blacklist.IsFamilyRevoked(ctx, sid) {
-				return "", "", "", errors.New("token has been revoked")
-			}
-		}
-		// Checked unconditionally (unlike the m.blacklist block above,
-		// which is skipped entirely when no blacklist is wired): the
-		// engine's own revokedUsers works regardless of whether that
-		// optional feature is configured at all (#403).
-		if m.isUserRevoked(userID) {
-			return "", "", "", errors.New("token has been revoked")
-		}
-		return userID, tenantID, "", nil
+	// The engine transport needs a wallet-registry or wallet-backend audience, nothing broader.
+	if !result.HasAudience("wallet-registry", "wallet-backend") {
+		return "", "", "", errors.New("token audience not permitted for engine transport")
 	}
-
-	return "", "", "", errors.New("invalid token")
+	// Per-jti revocation happens inside Validate; user-level revocation does not (the checker only
+	// sees a jti), so check the optional TokenBlacklist and the engine's own revokedUsers (#403).
+	if (m.blacklist != nil && m.blacklist.IsUserRevoked(ctx, result.UserID)) || m.isUserRevoked(result.UserID) {
+		return "", "", "", errors.New("token has been revoked")
+	}
+	// UserID may be empty for anonymous tokens — that is acceptable.
+	return result.UserID, result.TenantID, result.TAC, nil
 }
 
 func (m *Manager) getCapabilities() []string {
@@ -1186,17 +1060,17 @@ func (s *Session) SendProgress(flowID string, step FlowStep, payload interface{}
 
 // SendFlowComplete sends a flow completion message
 func (s *Session) SendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string) error {
-	return s.sendFlowComplete(flowID, credentials, redirectURI, "", "", "")
+	return s.sendFlowComplete(flowID, credentials, redirectURI, "", "", "", nil)
 }
 
 // SendFlowCompleteWithRefreshToken is SendFlowComplete plus an OID4VCI
 // refresh_token (and the DPoP key it's bound to) to relay to the client -
 // see FlowCompleteMessage.RefreshToken/DPoPJWK.
 func (s *Session) SendFlowCompleteWithRefreshToken(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string, dpopKeyID string) error {
-	return s.sendFlowComplete(flowID, credentials, redirectURI, refreshToken, dpopJWK, dpopKeyID)
+	return s.sendFlowComplete(flowID, credentials, redirectURI, refreshToken, dpopJWK, dpopKeyID, nil)
 }
 
-func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string, dpopKeyID string) error {
+func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string, dpopKeyID string, md *CredentialMetadataRelay) error {
 	s.flowsMu.RLock()
 	flow := s.flows[flowID]
 	s.flowsMu.RUnlock()
@@ -1212,6 +1086,10 @@ func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult
 		RefreshToken: refreshToken,
 		DPoPJWK:      dpopJWK,
 		DPoPKeyID:    dpopKeyID,
+	}
+	if md != nil {
+		msg.CredentialMetadata = md.Metadata
+		msg.CredentialMetadataEncryptedResponse = md.Encrypted
 	}
 	if flow != nil {
 		flow.mu.RLock()

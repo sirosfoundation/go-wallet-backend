@@ -1994,6 +1994,15 @@ func TestResolve_URLSubject_LogoInlining(t *testing.T) {
 								},
 							},
 						},
+						"credential_metadata": map[string]interface{}{
+							"org.siros.secret_seed": map[string]interface{}{"namespaces": []interface{}{"x"}},
+						},
+					},
+					"leaky": map[string]interface{}{
+						"format": "vc+sd-jwt",
+						"credential_metadata": map[string]interface{}{
+							"org.siros.secret_seed": map[string]interface{}{"ns": "00112233445566778899aabbccddeeff"},
+						},
 					},
 				},
 			},
@@ -2057,6 +2066,19 @@ func TestResolve_URLSubject_LogoInlining(t *testing.T) {
 	credLogoURI := credLogo["uri"].(string)
 	if !strings.HasPrefix(credLogoURI, "data:image/png;base64,") {
 		t.Errorf("expected inlined data: URI for credential logo, got: %s", credLogoURI)
+	}
+
+	// A valid advertisement (names only) is public and is served; a malformed
+	// one (hex values) makes the configuration "not offered".
+	cm, _ := pid["credential_metadata"].(map[string]interface{})
+	if cm == nil || cm["org.siros.secret_seed"] == nil {
+		t.Error("valid org.siros.secret_seed advertisement must be served to the wallet")
+	}
+	if _, present := ccs["leaky"]; present {
+		t.Error("configuration with a malformed secret seed member must not be offered")
+	}
+	if strings.Contains(w.Body.String(), "00112233445566778899aabbccddeeff") {
+		t.Error("seed value must never reach the wallet")
 	}
 }
 
@@ -2182,6 +2204,58 @@ func TestResolve_URLSubject_SignedMetadata_VerificationFailed_Error(t *testing.T
 
 	if w.Code != http.StatusBadGateway {
 		t.Errorf("expected status %d for unverifiable signed_metadata JWT, got %d: %s", http.StatusBadGateway, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_URLSubject_SignedMetadata_MalformedSeedConfigAndJWTNotServed(t *testing.T) {
+	// A legacy signed document keeps the original JWT in signed_metadata; its
+	// payload still carries a rejected configuration (with a seed value). When
+	// sanitisation removes the configuration the JWT must not be served either.
+	const seedHex = "00112233445566778899aabbccddeeff"
+	pdpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(gotrust.EvaluationResponse{Decision: true})
+	}))
+	defer pdpServer.Close()
+
+	cc := `{"leaky":{"format":"vc+sd-jwt","credential_metadata":{"org.siros.secret_seed":{"ns":"` + seedHex + `"}}}}`
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"credential_issuer":"https://signed.example.com","credential_configurations_supported":` + cc + `}`))
+	// No embedded key in the header: key material falls through to inline jwks.
+	jwt := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"ES256"}`)) + "." + payload + ".sig"
+	var ccs map[string]interface{}
+	if err := json.Unmarshal([]byte(cc), &ccs); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver := &mockMetadataResolver{result: &issuermetadata.ResolveResult{
+		Signed: true,
+		Metadata: map[string]interface{}{
+			"credential_issuer":                   "https://signed.example.com",
+			"jwks":                                map[string]interface{}{"keys": []interface{}{map[string]interface{}{"kty": "EC"}}},
+			"signed_metadata":                     jwt,
+			"credential_configurations_supported": ccs,
+		},
+	}}
+	cfg := &config.AuthZENProxyConfig{Enabled: true, PDPURL: pdpServer.URL, Timeout: 30, AllowResolution: true}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, http.DefaultClient, zap.NewNop())
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set("tenant_id", "test-tenant"); c.Next() })
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{"subject_id": "https://signed.example.com", "subject_type": "url"})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	out := w.Body.String()
+	for _, bad := range []string{seedHex, payload, "leaky", "signed_metadata"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("response must not contain %q", bad)
+		}
 	}
 }
 

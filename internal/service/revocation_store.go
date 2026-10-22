@@ -35,7 +35,7 @@ type revocationRemover interface {
 
 // memoryRevocationStore is the process-local RevocationStore. It borrows the
 // owning TokenBlacklist's lock and jti map, so the jti entries stay in one
-// place for the cleanup sweep and for ConsumeOnce.
+// place for the cleanup sweep.
 type memoryRevocationStore struct {
 	mu     *sync.RWMutex
 	tokens map[string]time.Time // jti -> expiry

@@ -34,15 +34,13 @@ type TokenBlacklist struct {
 	config config.TokenBlacklistConfig
 	logger *zap.Logger
 
-	// store holds the jti and user revocations (in-memory unless replaced);
-	// ConsumeOnce and the families map stay process-local. With a custom
-	// store, tokens holds only the ConsumeOnce entries, and the cleanup
-	// sweep and Count cover only those: the store expires its own entries.
+	// store holds the jti and user revocations (in-memory unless replaced).
+	// With a custom store, tokens stays empty and the cleanup sweep and Count
+	// cover only the in-memory store: a custom store expires its own entries.
 	store RevocationStore
 
 	mu       sync.RWMutex
-	tokens   map[string]time.Time // jti -> expiry time (local; also backs the in-memory store)
-	families map[string]time.Time // sid (refresh-token family) -> revocation retention expiry
+	tokens   map[string]time.Time // jti -> expiry time (backs the in-memory store)
 	stopChan chan struct{}
 	wg       sync.WaitGroup
 }
@@ -75,7 +73,6 @@ func NewTokenBlacklistWithStore(cfg config.TokenBlacklistConfig, logger *zap.Log
 		config:   cfg,
 		logger:   logger.Named("token-blacklist"),
 		tokens:   make(map[string]time.Time),
-		families: make(map[string]time.Time),
 		stopChan: make(chan struct{}),
 	}
 	if store == nil {
@@ -87,19 +84,14 @@ func NewTokenBlacklistWithStore(cfg config.TokenBlacklistConfig, logger *zap.Log
 
 // Start begins the cleanup worker for expired blacklist entries.
 //
-// This always launches the cleanup goroutine, even when config.Enabled is
-// false: ConsumeOnce (see its doc comment) writes entries unconditionally,
-// independent of that flag, so a disabled blacklist can still accumulate
-// consumed-refresh-token entries that need periodic sweeping - without
-// this, every successful refresh would permanently grow the map for the
-// life of the process whenever the general blacklist feature happens to be
-// off (Copilot review on go-wallet-backend#400).
+// The cleanup goroutine always runs, even when config.Enabled is false, so
+// the lifecycle does not depend on the feature toggle.
 func (b *TokenBlacklist) Start() {
 	b.wg.Add(1)
 	go b.cleanupLoop()
 
 	if !b.config.Enabled {
-		b.logger.Info("Token blacklist (general revocation feature) disabled; cleanup worker still runs for ConsumeOnce-tracked entries")
+		b.logger.Info("Token blacklist (general revocation feature) disabled; cleanup worker still runs")
 		return
 	}
 
@@ -156,27 +148,6 @@ func (b *TokenBlacklist) cleanup() {
 
 	// userRevocations is intentionally not swept here - see the type's doc
 	// comment for why a user-level revocation is permanent, not time-bound.
-
-	// families IS swept, unlike userRevocations: a session is logged out
-	// far more often than an account is deleted, and RevokeFamily's own
-	// expiry is sized so no token that could still reference that sid can
-	// possibly still be valid past it (see RevokeFamily's doc comment) -
-	// so, unlike a user revocation, there is never a reason to keep the
-	// entry beyond that point.
-	familiesRemoved := 0
-	for sid, expiry := range b.families {
-		if now.After(expiry) {
-			delete(b.families, sid)
-			familiesRemoved++
-		}
-	}
-
-	if familiesRemoved > 0 {
-		b.logger.Debug("Cleaned up expired family revocations",
-			zap.Int("removed", familiesRemoved),
-			zap.Int("remaining", len(b.families)),
-		)
-	}
 }
 
 // Add adds a token JTI to the blacklist
@@ -201,44 +172,6 @@ func (b *TokenBlacklist) Add(ctx context.Context, jti string, expiry time.Time) 
 	)
 
 	return nil
-}
-
-// ConsumeOnce atomically checks-and-marks jti as used, returning true only
-// the first time it is called for a given jti (false on every subsequent
-// call, including concurrent ones - the check and the insert happen under
-// the same write lock, so two goroutines racing on the same jti cannot both
-// observe "not yet consumed").
-//
-// Unlike Add/IsBlacklisted, this is NOT gated by config.Enabled: those two
-// implement the general-purpose, operator-opt-in token revocation feature
-// (Logout, DeleteUser - see their callers), but single-use enforcement for
-// a refresh token (see WebAuthnService.RefreshAccessToken) is a correctness
-// property of the refresh-token protocol itself, not an optional feature -
-// making it conditional on a separate, independently-configured toggle
-// would mean the "checked-in" default configuration (TokenBlacklist
-// disabled) leaves refresh tokens replayable indefinitely despite
-// RefreshAccessToken appearing to enforce single-use (Copilot review on
-// #400: "wiring this object does not consume refresh tokens for standard
-// configurations"). This still reuses the same underlying map/expiry
-// cleanup machinery as Add/IsBlacklisted - only the Enabled gate is
-// bypassed.
-func (b *TokenBlacklist) ConsumeOnce(ctx context.Context, jti string, expiry time.Time) (firstUse bool, err error) {
-	if jti == "" {
-		// Can't track a jti-less token; treat as always "first use" so
-		// callers don't spuriously reject a token this service issued
-		// without one (shouldn't happen in practice).
-		return true, nil
-	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	if existingExpiry, exists := b.tokens[jti]; exists && time.Now().Before(existingExpiry) {
-		return false, nil
-	}
-
-	b.tokens[jti] = expiry
-	return true, nil
 }
 
 // IsBlacklisted checks if a token JTI is on the blacklist
@@ -306,97 +239,6 @@ func (b *TokenBlacklist) IsUserRevoked(ctx context.Context, userID string) bool 
 	return revoked
 }
 
-// RevokeFamily permanently revokes sid - a refresh-token family/session id
-// minted into both an access token's and its paired refresh token's "sid"
-// claim (see WebAuthnService.generateToken/generateRefreshToken) and carried
-// forward unchanged across every rotation of that refresh token
-// (WebAuthnService.RefreshAccessToken). From the moment this is called,
-// every access or refresh token sharing that sid must be rejected -
-// whichever of them is presented, however old, and regardless of whether
-// its own jti was ever individually blacklisted.
-//
-// This closes the gap tracked as #402: Logout previously had no way to
-// revoke anything beyond the single access token jti it was actually
-// given, leaving any refresh token issued alongside it (or any token from
-// a later rotation of it) fully valid until it naturally expired - a
-// stolen refresh token, or one simply still held by another device,
-// survived its own session's logout indefinitely.
-//
-// expiry must be no earlier than the latest possible expiry of any token
-// that could still legitimately carry this sid - typically now +
-// JWT.RefreshDays (the longer-lived of the pair) plus a safety margin;
-// see Logout's own computation. Once expiry passes, the entry is swept by
-// cleanup() exactly like a per-jti entry (unlike RevokeUser/
-// userRevocations, which are permanent - see cleanup's doc comment for
-// why a session revocation doesn't need to be).
-//
-// Unlike RevokeUser (an operator-opt-in feature gated by config.Enabled),
-// this is NOT gated by it: revoking a session's own refresh-token family
-// on logout is a correctness property of session termination itself, not
-// a separate opt-in feature - exactly the same reasoning ConsumeOnce's own
-// doc comment gives for bypassing the same gate, and for the same reason:
-// making it conditional on a separately-configured toggle would leave the
-// checked-in default configuration unable to revoke a session's refresh
-// tokens on logout at all.
-//
-// Re-revoking an already revoked sid keeps the LATER of the existing and
-// requested expiry, so the marker can only ever be extended.
-//
-// It returns ctx.Err() without recording anything if ctx is already done,
-// so a caller (Logout) can never mistake an abandoned request for a
-// completed revocation; callers must treat any error as "not revoked" and
-// fail closed.
-func (b *TokenBlacklist) RevokeFamily(ctx context.Context, sid string, expiry time.Time) error {
-	if sid == "" {
-		return nil
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	// Never shorten an existing marker: a re-revoke under a smaller
-	// retention (e.g. config lowered to the floor) must not make tokens
-	// from the original, longer window usable again.
-	if existing, ok := b.families[sid]; ok && existing.After(expiry) {
-		expiry = existing
-	}
-	b.families[sid] = expiry
-
-	b.logger.Debug("Refresh-token family revoked", zap.String("sid", sid))
-
-	return nil
-}
-
-// IsFamilyRevoked reports whether sid has been revoked via RevokeFamily and
-// that revocation's own retention window hasn't yet elapsed. Checked
-// alongside IsBlacklisted/IsUserRevoked by both the access-token validation
-// path (pkg/middleware.AuthMiddlewareWithBlacklist) and
-// WebAuthnService.RefreshAccessToken - see RevokeFamily's doc comment.
-//
-// Deliberately NOT gated by config.Enabled - see RevokeFamily.
-func (b *TokenBlacklist) IsFamilyRevoked(ctx context.Context, sid string) bool {
-	if sid == "" {
-		return false
-	}
-
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	expiry, exists := b.families[sid]
-	if !exists {
-		return false
-	}
-
-	if time.Now().After(expiry) {
-		return false
-	}
-
-	return true
-}
-
 // Remove removes a token from the blacklist (if needed for admin override).
 // It returns ErrRevocationRemoveUnsupported if the store cannot delete
 // entries, so a store-backed blacklist never silently keeps a revocation the
@@ -422,7 +264,7 @@ func (b *TokenBlacklist) Remove(ctx context.Context, jti string) error {
 }
 
 // Count returns the number of jti entries held by this process: all of them
-// with the in-memory store, only ConsumeOnce entries with any other store.
+// with the in-memory store, none with any other store.
 func (b *TokenBlacklist) Count() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()

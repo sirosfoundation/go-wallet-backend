@@ -118,6 +118,7 @@ func walletProviderMongoConfig(t *testing.T, backend string) *config.Config {
 	keyPath, certPath := writeTestECKeyAndCert(t, t.TempDir(), "wallet-provider")
 	cfg.Server = config.ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"}
 	cfg.JWT = config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"}
+	cfg.AS = config.ASConfig{Enabled: true, ExternalURL: "https://as.example.com"}
 	cfg.WalletProvider.PrivateKeyPath = keyPath
 	cfg.WalletProvider.CertificatePath = certPath
 	cfg.WalletProvider.WIA.RateLimit = config.AuthRateLimitConfig{Enabled: false}

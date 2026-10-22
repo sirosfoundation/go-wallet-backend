@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
@@ -53,7 +52,7 @@ func setupPasskeyHandlers(mock *mockWebAuthn) (*gin.Engine, *MemorySessionStore)
 	}
 	logger := zap.NewNop()
 
-	h := NewPasskeyHandlers(mock, store, nil, cfg, logger)
+	h := NewPasskeyHandlers(mock, store, cfg, logger)
 
 	router := gin.New()
 	router.POST("/auth/passkey/login/begin", h.LoginBegin)
@@ -191,36 +190,6 @@ func TestPasskeyLoginFinish_BadRequest(t *testing.T) {
 	}
 }
 
-func TestPasskeyLoginFinish_LegacyMode(t *testing.T) {
-	mock := &mockWebAuthn{
-		finishLoginResp: &service.FinishLoginResponse{
-			UUID:        "user-legacy",
-			DisplayName: "Legacy User",
-			TenantID:    "tenant-1",
-			Token:       "legacy-token-value",
-		},
-	}
-	router, _ := setupPasskeyHandlers(mock)
-
-	body, _ := json.Marshal(service.FinishLoginRequest{ChallengeID: "c2"})
-	req := httptest.NewRequest(http.MethodPost, "/auth/passkey/login/finish", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	// No X-Token-Mode header → legacy mode.
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-
-	// Legacy mode returns the full response including appToken.
-	var resp map[string]interface{}
-	_ = json.NewDecoder(w.Body).Decode(&resp)
-	if resp["appToken"] != "legacy-token-value" {
-		t.Errorf("expected appToken in legacy response, got %v", resp["appToken"])
-	}
-}
-
 func TestPasskeyRegisterBegin_Success(t *testing.T) {
 	mock := &mockWebAuthn{
 		beginRegResp: &service.BeginRegistrationResponse{
@@ -318,67 +287,4 @@ func TestPasskeyRegisterFinish_BadRequest(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", w.Code)
 	}
-}
-
-// TestPasskeyLoginFinish_RecordsRefreshTokenFamilyOnSession proves the
-// family id minted with the legacy appToken/refresh token pair is retained
-// on the AS session, so DELETE /auth/session can revoke it (#402).
-func TestPasskeyLoginFinish_RecordsRefreshTokenFamilyOnSession(t *testing.T) {
-	mock := &mockWebAuthn{
-		finishLoginResp: &service.FinishLoginResponse{
-			UUID: "user-123", TenantID: "tenant-1", Token: "t", RefreshToken: "r", SID: "sid-family-42",
-		},
-	}
-	router, store := setupPasskeyHandlers(mock)
-
-	body, _ := json.Marshal(service.FinishLoginRequest{ChallengeID: "c1"})
-	req := httptest.NewRequest(http.MethodPost, "/auth/passkey/login/finish", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-	if strings.Contains(w.Body.String(), "sid-family-42") {
-		t.Error("the family id must not be serialized into the response body")
-	}
-	for _, c := range w.Result().Cookies() {
-		if c.Name == sessionCookieInsecure {
-			sess, _ := store.Get(context.Background(), c.Value)
-			if sess == nil || sess.FamilyID != "sid-family-42" {
-				t.Fatalf("session FamilyID = %+v, want sid-family-42", sess)
-			}
-			return
-		}
-	}
-	t.Fatal("session cookie not set")
-}
-
-// Session-mode clients never receive the appToken/refresh token, so no
-// family is recorded on their session.
-func TestPasskeyLoginFinish_SessionMode_DoesNotRecordFamily(t *testing.T) {
-	mock := &mockWebAuthn{
-		finishLoginResp: &service.FinishLoginResponse{UUID: "user-123", TenantID: "tenant-1", SID: "sid-family-43"},
-	}
-	router, store := setupPasskeyHandlers(mock)
-
-	body, _ := json.Marshal(service.FinishLoginRequest{ChallengeID: "c1"})
-	req := httptest.NewRequest(http.MethodPost, "/auth/passkey/login/finish", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Token-Mode", "session")
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
-	}
-	for _, c := range w.Result().Cookies() {
-		if c.Name == sessionCookieInsecure {
-			sess, _ := store.Get(context.Background(), c.Value)
-			if sess == nil || sess.FamilyID != "" {
-				t.Fatalf("session-mode session must not record a family, got %+v", sess)
-			}
-			return
-		}
-	}
-	t.Fatal("session cookie not set")
 }

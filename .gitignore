@@ -44,3 +44,4 @@ playwright-screenshots/
 /wallet-admin
 registry_coverage.out
 /server
+configs/as-signing-key.pem

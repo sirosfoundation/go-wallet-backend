@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,6 +23,7 @@ func TestNewManager(t *testing.T) {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
 			Secret: "test-secret",
+			Issuer: "test-issuer",
 		},
 	}
 	logger := zap.NewNop()
@@ -38,6 +38,7 @@ func TestManager_IsConnected_NoClient(t *testing.T) {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
 			Secret: "test-secret",
+			Issuer: "test-issuer",
 		},
 	}
 	logger := zap.NewNop()
@@ -50,6 +51,7 @@ func TestManager_Close(t *testing.T) {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
 			Secret: "test-secret",
+			Issuer: "test-issuer",
 		},
 	}
 	logger := zap.NewNop()
@@ -60,14 +62,12 @@ func TestManager_Close(t *testing.T) {
 }
 
 func TestManager_WebSocketHandshake(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-		},
-	}
+	cfg := &config.Config{}
 	logger := zap.NewNop()
 
 	m := NewManager(cfg, logger)
+	v, key := wsValidator(t)
+	m.SetTokenValidator(v)
 
 	// Create test server
 	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
@@ -82,13 +82,7 @@ func TestManager_WebSocketHandshake(t *testing.T) {
 	require.Equal(t, 101, resp.StatusCode)
 	defer func() { _ = ws.Close() }()
 
-	// Create valid JWT token
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id": "test-user-123",
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
+	tokenString := wsES256(t, key, "test-user-123", time.Hour)
 
 	// Send handshake message
 	handshake := ClientMessage{
@@ -115,6 +109,7 @@ func TestManager_WebSocketInvalidToken(t *testing.T) {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
 			Secret: "test-secret",
+			Issuer: "test-issuer",
 		},
 	}
 	logger := zap.NewNop()
@@ -155,7 +150,7 @@ func TestManager_WebSocketInvalidToken(t *testing.T) {
 // len(m.clients), which is populated post-handshake — letting an attacker
 // open unlimited unauthenticated connections without ever being counted.
 func TestManager_ConnectionLimit_CountsUnhandshakedConnections(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 
 	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
@@ -185,7 +180,7 @@ func TestManager_ConnectionLimit_CountsUnhandshakedConnections(t *testing.T) {
 // activeConnections is at capacity, new connection attempts are rejected with
 // 503 even if m.clients is empty (i.e. even if nobody has handshaked yet).
 func TestManager_ConnectionLimit_RejectsAtCapacity(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 	m.activeConnections.Store(maxConnections)
 
@@ -215,7 +210,7 @@ func TestManager_ConnectionLimit_RejectsAtCapacity(t *testing.T) {
 // racy check. A starting gate forces all dial attempts to fire at once, to
 // maximize genuine concurrent contention on the counter.
 func TestManager_ConnectionLimit_NoOvershootUnderConcurrency(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 	m := NewManager(cfg, zap.NewNop())
 
 	const room = 5 // slots left before the limit
@@ -331,6 +326,7 @@ func TestManager_SendSigningRequest_UserNotConnected(t *testing.T) {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
 			Secret: "test-secret",
+			Issuer: "test-issuer",
 		},
 	}
 	logger := zap.NewNop()
@@ -349,6 +345,7 @@ func TestManager_GenerateOpenid4vciProof_UserNotConnected(t *testing.T) {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
 			Secret: "test-secret",
+			Issuer: "test-issuer",
 		},
 	}
 	logger := zap.NewNop()
@@ -364,6 +361,7 @@ func TestManager_SignJwtPresentation_UserNotConnected(t *testing.T) {
 	cfg := &config.Config{
 		JWT: config.JWTConfig{
 			Secret: "test-secret",
+			Issuer: "test-issuer",
 		},
 	}
 	logger := zap.NewNop()
@@ -397,115 +395,6 @@ func TestClientMessage_JSON(t *testing.T) {
 	assert.NotNil(t, parsed.Response)
 	assert.Equal(t, msg.Response.Action, parsed.Response.Action)
 	assert.Equal(t, msg.Response.ProofJWT, parsed.Response.ProofJWT)
-}
-
-func TestManager_validateToken_InvalidSigningMethod(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-		},
-	}
-	logger := zap.NewNop()
-
-	m := NewManager(cfg, logger)
-
-	// Create token with RS256 (not HMAC)
-	token := jwt.NewWithClaims(jwt.SigningMethodNone, jwt.MapClaims{
-		"user_id": "test-user",
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, _ := token.SignedString(jwt.UnsafeAllowNoneSignatureType)
-
-	_, err := m.validateToken(tokenString)
-	assert.Error(t, err)
-}
-
-func TestManager_validateToken_ExpiredToken(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-		},
-	}
-	logger := zap.NewNop()
-
-	m := NewManager(cfg, logger)
-
-	// Create expired token
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id": "test-user",
-		"exp":     time.Now().Add(-time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	_, err = m.validateToken(tokenString)
-	assert.Error(t, err)
-}
-
-func TestManager_validateToken_MissingUserID(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-		},
-	}
-	logger := zap.NewNop()
-
-	m := NewManager(cfg, logger)
-
-	// Create token without user_id
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"exp": time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	_, err = m.validateToken(tokenString)
-	assert.Error(t, err)
-}
-
-func TestManager_validateToken_ValidToken(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-		},
-	}
-	logger := zap.NewNop()
-
-	m := NewManager(cfg, logger)
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id": "test-user-123",
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	userID, err := m.validateToken(tokenString)
-	require.NoError(t, err)
-	assert.Equal(t, "test-user-123", userID)
-}
-
-func TestManager_validateToken_NbfSlightlyInFuture(t *testing.T) {
-	cfg := &config.Config{
-		JWT: config.JWTConfig{
-			Secret: "test-secret",
-		},
-	}
-	logger := zap.NewNop()
-	m := NewManager(cfg, logger)
-
-	// Token with nbf 2 seconds in the future — within the 5s leeway
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id": "test-user",
-		"nbf":     time.Now().Add(2 * time.Second).Unix(),
-		"exp":     time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
-
-	userID, err := m.validateToken(tokenString)
-	require.NoError(t, err)
-	assert.Equal(t, "test-user", userID)
 }
 
 func TestErrorVariables(t *testing.T) {
