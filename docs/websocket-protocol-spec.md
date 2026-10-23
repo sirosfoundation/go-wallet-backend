@@ -665,6 +665,43 @@ Server → Client:
 }
 ```
 
+#### Unknown Flows
+
+Any client message that references a `flow_id` the session does not know -
+`flow_action` (including `decline`), and `sign_response` / `match_response`
+that carry a `flow_id` and do not answer a request the session still has
+outstanding - is answered with exactly one `flow_error`, never
+silently dropped:
+
+```
+Server → Client:
+{
+  "type": "flow_error",
+  "flow_id": "<the flow_id the client sent>",
+  "error": { "code": "UNKNOWN_FLOW", "message": "Flow not found or already completed" }
+}
+```
+
+Clients MUST treat this as "the flow is dead" and leave any waiting UI state.
+Typical cause: the WebSocket dropped (e.g. network or proxy stall) while a
+flow was waiting for user input. Flows are bound to the session that started
+them and are cancelled when that session closes; they are not resumed on a
+new session, and the engine does not push anything on reconnect. The first
+message the client sends for such a flow on the new session is what reveals
+it, via this error.
+
+Properties: the lookup is scoped to the current session, so a flow owned by
+another session or user produces the identical reply as a flow that never
+existed (no probing). Replies are rate-limited per session (burst 10, then
+about 2/s); beyond that, messages for unknown flows are dropped without a
+reply. A `sign_response` answering an outstanding `sign_request` is always delivered,
+even if the requesting flow has completed (client-held DPoP signing after
+issuance relies on this). A `sign_response` without a `flow_id` is correlated
+by `message_id` only. A `match_response` MUST carry both the `flow_id` and the
+`message_id` of its `match_request`; without them it is ignored and the engine
+times the request out. `credential_notification` keeps its own
+`notification_ack` (`rejected`) semantics.
+
 ### OpenID4VP Credential Presentation
 
 #### Starting the Flow
@@ -959,7 +996,7 @@ Server → Client:
 | `AUTH_FAILED` | Invalid or expired authentication token |
 | `FORBIDDEN` | Token's `tac` doesn't permit the requested action (e.g. `flow_start` for a protocol the token's `tac` doesn't cover) |
 | `INVALID_MESSAGE` | Malformed message |
-| `UNKNOWN_FLOW` | `flow_id` not recognized |
+| `UNKNOWN_FLOW` | `flow_id` not recognized on this session (see [Unknown Flows](#unknown-flows)) |
 | `FLOW_TIMEOUT` | Flow exceeded maximum duration |
 | `OFFER_PARSE_ERROR` | Could not parse credential offer |
 | `OFFER_FETCH_ERROR` | Could not fetch `credential_offer_uri` |
