@@ -197,3 +197,38 @@ func TestPingLoop_SurvivesBlockedTransportWrite(t *testing.T) {
 	require.Eventually(t, func() bool { return pings.Load() >= before+2 }, 5*time.Second, 20*time.Millisecond,
 		"pings did not resume after a transport write stall")
 }
+
+// When the ping's own socket write times out the connection can no longer
+// send anything; it must be closed, not retried forever.
+func TestPingLoop_ClosesConnectionWhenControlWriteItselfTimesOut(t *testing.T) {
+	cl, s, done := keepaliveHarnessWindow(t, time.Minute)
+	_ = cl // never reads, so the server's socket send buffer fills up
+
+	// Keep the send path full by writing directly on the raw socket (no
+	// gorilla write lock involved) for the duration of the test, so the
+	// ping's own socket write cannot find room.
+	raw := s.conn.NetConn()
+	stopFill := make(chan struct{})
+	t.Cleanup(func() { close(stopFill) })
+	go func() {
+		junk := make([]byte, 1<<16)
+		for {
+			select {
+			case <-stopFill:
+				return
+			case <-done:
+				return
+			default:
+			}
+			_ = raw.SetWriteDeadline(time.Now().Add(20 * time.Millisecond))
+			_, _ = raw.Write(junk)
+		}
+	}()
+	time.Sleep(300 * time.Millisecond) // let the buffers fill
+	go s.pingLoop()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("connection was not closed after the ping write itself timed out")
+	}
+}

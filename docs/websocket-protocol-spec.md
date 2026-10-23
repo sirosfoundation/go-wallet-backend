@@ -136,8 +136,9 @@ when it has seen no sign of life for `ping_interval + pong_timeout` (default
 (including each fragment of a message still being received) counts as a sign
 of life and restarts that window. The engine's pings are not serialized behind
 the application's send lock; they are still ordered behind a data write that
-is stuck in the socket, and a ping that times out for that reason is retried
-on the next tick rather than ending the keepalive.
+is stuck in the socket, and a ping that merely waits too long for that write is retried
+on the next tick, while a ping whose own socket write times out closes the
+connection.
 
 ### Reconnection
 

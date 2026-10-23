@@ -473,6 +473,11 @@ func readMessageRefreshingDeadline(conn *websocket.Conn, window time.Duration) (
 	return mt, b, err
 }
 
+// gorillaWriteLockTimeoutMsg is the message of gorilla/websocket's
+// errWriteTimeout, returned when a control write could not get the write lock
+// before its deadline.
+const gorillaWriteLockTimeoutMsg = "websocket: write timeout"
+
 // pingLoop sends WebSocket ping frames at s.pingInterval.
 // Browser WebSocket implementations respond with pong automatically.
 func (s *Session) pingLoop() {
@@ -491,15 +496,20 @@ func (s *Session) pingLoop() {
 			// deadline (pongTimeout) - see the timeout handling below.
 			err := s.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(s.pongTimeout))
 			if err != nil {
-				// A deadline expiry just means a data write was holding the
-				// socket's write lock for longer than pongTimeout (gorilla
-				// still serializes WriteControl with in-flight data writes);
-				// the connection is not dead, so keep pinging. Anything else
-				// (closed, reset) is fatal and ReadMessage surfaces it.
+				// Gorilla reports two different timeouts. Waiting for its write
+				// lock behind a stuck data write is recoverable: the
+				// connection is fine, keep pinging. A timeout of the socket
+				// write itself is fatal - gorilla fails every later write with
+				// the saved error - so close the connection and let the read
+				// loop end, rather than leaving a session that can read but
+				// never answer. Both are *websocket.netError with Timeout()
+				// true; only the lock-wait one carries gorilla's own message
+				// (pinned by TestPingLoop_* against the vendored version).
 				var ne net.Error
-				if errors.As(err, &ne) && ne.Timeout() {
+				if errors.As(err, &ne) && ne.Timeout() && err.Error() == gorillaWriteLockTimeoutMsg {
 					continue
 				}
+				_ = s.conn.Close()
 				return
 			}
 		case <-s.stopPing:
