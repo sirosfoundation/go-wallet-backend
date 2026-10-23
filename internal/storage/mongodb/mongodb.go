@@ -5,12 +5,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
@@ -84,8 +86,12 @@ func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
 		cfg:      cfg,
 	}
 
-	// Initialize sub-stores
-	s.users = &UserStore{collection: database.Collection("users")}
+	// Initialize sub-stores.
+	// Users always read from the primary, regardless of any readPreference in
+	// the connection URI: a secondary read right after a private-data write
+	// would return a stale ETag and make the client report a sync failure.
+	s.users = &UserStore{collection: database.Collection("users",
+		options.Collection().SetReadPreference(readpref.Primary()))}
 	s.tenants = &TenantStore{collection: database.Collection("tenants")}
 	s.userTenants = &UserTenantStore{collection: database.Collection("user_tenants")}
 	s.credentials = &CredentialStore{collection: database.Collection("credentials"), counter: counters}
@@ -340,15 +346,83 @@ func (s *UserStore) GetByDID(ctx context.Context, did string) (*domain.User, err
 }
 
 func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
-	user.UpdatedAt = time.Now()
-	result, err := s.collection.ReplaceOne(ctx, bson.M{"_id.id": user.UUID.String()}, user)
+	snapshot := user.Clone()
+	stored, err := s.Modify(ctx, user.UUID, func(u *domain.User) error {
+		version := u.Version
+		*u = *snapshot.Clone()
+		u.Version = version
+		return nil
+	})
 	if err != nil {
-		return fmt.Errorf("failed to update user: %w", err)
+		return err
 	}
-	if result.MatchedCount == 0 {
-		return storage.ErrNotFound
-	}
+	user.UpdatedAt = stored.UpdatedAt
+	user.Version = stored.Version
 	return nil
+}
+
+// Optimistic-concurrency retry tuning for Modify. Contention on a single user
+// document is normally low (one user, a few tabs/devices), so these limits
+// are generous; backoff with jitter keeps competing writers from retrying in
+// lockstep.
+const (
+	maxModifyAttempts = 20
+	modifyBaseBackoff = 2 * time.Millisecond
+	modifyMaxBackoff  = 100 * time.Millisecond
+)
+
+// modifyBackoff returns a full-jitter exponential backoff for the given attempt.
+func modifyBackoff(attempt int) time.Duration {
+	d := modifyBaseBackoff << min(attempt, 6)
+	if d > modifyMaxBackoff {
+		d = modifyMaxBackoff
+	}
+	return time.Duration(rand.Int64N(int64(d)) + 1)
+}
+
+// Modify performs an optimistic read-modify-write on a user document.
+// The write is conditional on the version read, so a concurrent write causes
+// a retry with fresh data instead of silently overwriting it.
+func (s *UserStore) Modify(ctx context.Context, id domain.UserID, fn storage.UserModifier) (*domain.User, error) {
+	for attempt := 0; attempt < maxModifyAttempts; attempt++ {
+		current, err := s.GetByID(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+
+		readVersion := current.Version
+		if err := fn(current); err != nil {
+			return nil, err
+		}
+		current.UUID = id
+		current.Version = readVersion + 1
+		current.UpdatedAt = time.Now()
+
+		filter := bson.M{"_id.id": id.String(), "version": readVersion}
+		if readVersion == 0 {
+			// Documents written before the version field existed have no
+			// "version" key; {version: null} matches missing fields.
+			filter["version"] = bson.M{"$in": bson.A{int64(0), nil}}
+		}
+
+		result, err := s.collection.ReplaceOne(ctx, filter, current)
+		if err != nil {
+			return nil, fmt.Errorf("failed to update user: %w", err)
+		}
+		if result.MatchedCount == 1 {
+			return current, nil
+		}
+		// Either the user was deleted or another writer won the race.
+		// Loop: GetByID distinguishes the two cases.
+		timer := time.NewTimer(modifyBackoff(attempt))
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+	return nil, storage.ErrConflict
 }
 
 func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
@@ -358,42 +432,6 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 	}
 	if result.DeletedCount == 0 {
 		return storage.ErrNotFound
-	}
-	return nil
-}
-
-func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error {
-	filter := bson.M{"id.id": id.String()}
-	if ifMatch != "" {
-		filter["private_data_etag"] = ifMatch
-	}
-
-	// Generate new ETag
-	newETag := fmt.Sprintf("%d", time.Now().UnixNano())
-
-	update := bson.M{
-		"$set": bson.M{
-			"private_data":      data,
-			"private_data_etag": newETag,
-			"updated_at":        time.Now(),
-		},
-	}
-
-	result, err := s.collection.UpdateOne(ctx, filter, update)
-	if err != nil {
-		return fmt.Errorf("failed to update private data: %w", err)
-	}
-	if result.MatchedCount == 0 {
-		// Could be not found or ETag mismatch
-		var user domain.User
-		err := s.collection.FindOne(ctx, bson.M{"id.id": id.String()}).Decode(&user)
-		if err != nil {
-			if err == mongo.ErrNoDocuments {
-				return storage.ErrNotFound
-			}
-			return fmt.Errorf("failed to check user: %w", err)
-		}
-		return storage.ErrInvalidInput // ETag mismatch
 	}
 	return nil
 }

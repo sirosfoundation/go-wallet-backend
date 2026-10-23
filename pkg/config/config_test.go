@@ -1329,6 +1329,47 @@ func TestCORSConfig_SetDefaults(t *testing.T) {
 		t.Error("AllowedHeaders should have default value")
 	}
 }
+
+func TestCORSConfig_SetDefaults_KeepsPrivateDataHeadersWhenOverridden(t *testing.T) {
+	cfg := CORSConfig{
+		AllowedHeaders: []string{"Authorization", "content-type", "x-private-data-if-match"},
+		ExposedHeaders: []string{"X-Custom"},
+	}
+	cfg.SetDefaults()
+
+	count := func(list []string, name string) int {
+		n := 0
+		for _, h := range list {
+			if strings.EqualFold(h, name) {
+				n++
+			}
+		}
+		return n
+	}
+
+	for _, h := range RequiredCORSAllowedHeaders {
+		if count(cfg.AllowedHeaders, h) != 1 {
+			t.Errorf("AllowedHeaders = %v: want exactly one %q", cfg.AllowedHeaders, h)
+		}
+	}
+	for _, h := range RequiredCORSExposedHeaders {
+		if count(cfg.ExposedHeaders, h) != 1 {
+			t.Errorf("ExposedHeaders = %v: want exactly one %q", cfg.ExposedHeaders, h)
+		}
+	}
+	if count(cfg.AllowedHeaders, "Authorization") != 1 || count(cfg.ExposedHeaders, "X-Custom") != 1 {
+		t.Errorf("custom headers must be preserved: allowed=%v exposed=%v", cfg.AllowedHeaders, cfg.ExposedHeaders)
+	}
+}
+
+func TestCORSConfig_SetDefaults_WildcardAllowedHeaders(t *testing.T) {
+	cfg := CORSConfig{AllowedHeaders: []string{"*"}}
+	cfg.SetDefaults()
+	if len(cfg.AllowedHeaders) != 1 {
+		t.Errorf("wildcard AllowedHeaders should be left as-is, got %v", cfg.AllowedHeaders)
+	}
+}
+
 func TestASConfig_SetDefaults(t *testing.T) {
 	cfg := &ASConfig{}
 	cfg.SetDefaults()

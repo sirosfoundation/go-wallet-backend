@@ -13,7 +13,16 @@ var (
 	ErrAlreadyExists = errors.New("already exists")
 	ErrInvalidInput  = errors.New("invalid input")
 	ErrDatabase      = errors.New("database error")
+	// ErrConflict is returned when an optimistic-concurrency write could not
+	// be applied after retrying because the record kept changing.
+	ErrConflict = errors.New("concurrent modification")
 )
+
+// UserModifier mutates a user in place. It is used by UserStore.Modify and
+// may be invoked more than once if a concurrent write is detected, so it must
+// not have side effects outside the user it is given. Returning an error
+// aborts the modification without writing anything.
+type UserModifier func(user *domain.User) error
 
 // TenantStore defines the interface for tenant storage operations
 type TenantStore interface {
@@ -71,14 +80,19 @@ type UserStore interface {
 	// GetByDID retrieves a user by DID
 	GetByDID(ctx context.Context, did string) (*domain.User, error)
 
-	// Update updates a user
+	// Update unconditionally overwrites a user with the given snapshot.
+	// Prefer Modify for any read-modify-write: Update can roll back fields
+	// (e.g. private data) that were changed concurrently.
 	Update(ctx context.Context, user *domain.User) error
+
+	// Modify atomically reads the user, applies fn and writes the result.
+	// Concurrent writes are detected via User.Version and fn is re-applied
+	// to the fresh record. Errors returned by fn are passed through unchanged.
+	// Returns the stored user after modification.
+	Modify(ctx context.Context, id domain.UserID, fn UserModifier) (*domain.User, error)
 
 	// Delete deletes a user
 	Delete(ctx context.Context, id domain.UserID) error
-
-	// UpdatePrivateData updates user's private data with optimistic locking
-	UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error
 
 	// UpdateCredentialAuthenticator atomically persists a single WebAuthn
 	// credential's SignCount and CloneWarning, identified by the
