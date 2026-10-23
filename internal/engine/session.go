@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -443,6 +444,35 @@ func configureKeepalive(conn *websocket.Conn, window time.Duration) {
 	})
 }
 
+// deadlineExtendingReader pushes conn's read deadline out by window before
+// every read, so a message that arrives in fragments across more than one
+// window still counts as continuous liveness.
+type deadlineExtendingReader struct {
+	conn   *websocket.Conn
+	r      io.Reader
+	window time.Duration
+}
+
+func (d *deadlineExtendingReader) Read(p []byte) (int, error) {
+	_ = d.conn.SetReadDeadline(time.Now().Add(d.window))
+	return d.r.Read(p)
+}
+
+// readMessageRefreshingDeadline is conn.ReadMessage, except the read deadline
+// is extended as message data is consumed (and once more on completion), not
+// just when a pong or ping is processed.
+func readMessageRefreshingDeadline(conn *websocket.Conn, window time.Duration) (int, []byte, error) {
+	mt, r, err := conn.NextReader()
+	if err != nil {
+		return mt, nil, err
+	}
+	b, err := io.ReadAll(&deadlineExtendingReader{conn: conn, r: r, window: window})
+	if err == nil {
+		_ = conn.SetReadDeadline(time.Now().Add(window))
+	}
+	return mt, b, err
+}
+
 // pingLoop sends WebSocket ping frames at s.pingInterval.
 // Browser WebSocket implementations respond with pong automatically.
 func (s *Session) pingLoop() {
@@ -455,11 +485,22 @@ func (s *Session) pingLoop() {
 			// Deliberately not under sendMu: WriteControl may be called
 			// concurrently with any other write (gorilla's contract, see
 			// closeWithReason), and sendMu is held across WriteJSON, which has
-			// no write deadline. A blocked data write must not be able to
-			// starve the keepalive ping and so get the session timed out.
+			// no write deadline. That removes the application-level
+			// serialization; gorilla's own socket write lock still orders this
+			// ping behind an in-flight data write, bounded by the ping's
+			// deadline (pongTimeout) - see the timeout handling below.
 			err := s.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(s.pongTimeout))
 			if err != nil {
-				return // connection is dead; ReadMessage will surface the error
+				// A deadline expiry just means a data write was holding the
+				// socket's write lock for longer than pongTimeout (gorilla
+				// still serializes WriteControl with in-flight data writes);
+				// the connection is not dead, so keep pinging. Anything else
+				// (closed, reset) is fatal and ReadMessage surfaces it.
+				var ne net.Error
+				if errors.As(err, &ne) && ne.Timeout() {
+					continue
+				}
+				return
 			}
 		case <-s.stopPing:
 			return
@@ -482,17 +523,13 @@ func (m *Manager) handleSession(session *Session) {
 	}()
 
 	for {
-		_, message, err := session.conn.ReadMessage()
+		_, message, err := readMessageRefreshingDeadline(session.conn, session.pingInterval+session.pongTimeout)
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				session.logger.Error("Read error", zap.Error(err))
 			}
 			return
 		}
-		// Any inbound frame proves the peer is alive: push the read deadline
-		// out, not only on pongs.
-		_ = session.conn.SetReadDeadline(time.Now().Add(session.pingInterval + session.pongTimeout))
-
 		var msg Message
 		if err := json.Unmarshal(message, &msg); err != nil {
 			session.logger.Warn("Invalid message", zap.Error(err))

@@ -21,6 +21,12 @@ import (
 // plus a channel closed when the server's read loop exits.
 func keepaliveHarness(t *testing.T) (*websocket.Conn, *Session, <-chan struct{}) {
 	t.Helper()
+	return keepaliveHarnessWindow(t, 250*time.Millisecond)
+}
+
+// keepaliveHarnessWindow is keepaliveHarness with an explicit initial read-deadline window.
+func keepaliveHarnessWindow(t *testing.T, window time.Duration) (*websocket.Conn, *Session, <-chan struct{}) {
+	t.Helper()
 	m := NewManager(&config.Config{JWT: config.JWTConfig{Secret: "s", Issuer: "i"}}, zap.NewNop())
 	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	sessCh := make(chan *Session, 1)
@@ -33,7 +39,7 @@ func keepaliveHarness(t *testing.T) (*websocket.Conn, *Session, <-chan struct{})
 		defer c.Close()
 		s := testSession(c)
 		s.pingInterval, s.pongTimeout = 100*time.Millisecond, 150*time.Millisecond
-		configureKeepalive(c, s.pingInterval+s.pongTimeout)
+		configureKeepalive(c, window)
 		sessCh <- s
 		m.handleSession(s)
 		close(done)
@@ -109,9 +115,85 @@ func TestPingLoop_NotBlockedByHeldSendMutex(t *testing.T) {
 
 	s.sendMu.Lock() // simulates an in-flight, blocked s.Send
 	defer s.sendMu.Unlock()
-	go s.pingLoop()
-	defer close(s.stopPing)
+	go s.pingLoop() // stopped by handleSession's cleanup, which owns stopPing
 
 	require.Eventually(t, func() bool { return pings.Load() >= 2 }, 2*time.Second, 20*time.Millisecond,
 		"pingLoop must keep pinging while sendMu is held")
+}
+
+// A message that arrives in fragments spanning several keepalive windows,
+// with no pong or ping in between, is continuous liveness.
+func TestKeepalive_FragmentedMessageExtendsReadDeadline(t *testing.T) {
+	m := NewManager(&config.Config{JWT: config.JWTConfig{Secret: "s", Issuer: "i"}}, zap.NewNop())
+	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
+	done := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := up.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		s := testSession(c)
+		s.pingInterval, s.pongTimeout = 100*time.Millisecond, 150*time.Millisecond
+		configureKeepalive(c, s.pingInterval+s.pongTimeout)
+		m.handleSession(s)
+		close(done)
+	}))
+	t.Cleanup(srv.Close)
+	d := websocket.Dialer{WriteBufferSize: 256} // small buffer => a frame per chunk
+	cl, _, err := d.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cl.Close() })
+
+	w, err := cl.NextWriter(websocket.TextMessage)
+	require.NoError(t, err)
+	_, err = w.Write([]byte(`{"type":"nope","pad":"`))
+	require.NoError(t, err)
+	for i := 0; i < 10; i++ { // ~800ms against a 250ms window
+		_, err = w.Write([]byte(strings.Repeat("x", 300))) // exceeds the buffer: flushes a fragment
+		require.NoError(t, err)
+		time.Sleep(80 * time.Millisecond)
+		select {
+		case <-done:
+			t.Fatalf("session timed out mid-message after %d fragments", i+1)
+		default:
+		}
+	}
+	_, err = w.Write([]byte(`"}`))
+	require.NoError(t, err)
+	require.NoError(t, w.Close())
+}
+
+// A data write stuck in the socket for longer than a ping's deadline makes
+// WriteControl time out; the ping loop must survive that and resume.
+func TestPingLoop_SurvivesBlockedTransportWrite(t *testing.T) {
+	cl, s, _ := keepaliveHarnessWindow(t, time.Minute)
+	var pings atomic.Int32
+	cl.SetPingHandler(func(string) error { pings.Add(1); return nil })
+
+	// Fill the socket buffers while the client is not reading, so s.Send
+	// blocks inside the transport write.
+	sendDone := make(chan struct{})
+	go func() {
+		defer close(sendDone)
+		big := map[string]string{"pad": strings.Repeat("x", 1<<20)}
+		for i := 0; i < 64; i++ {
+			if s.Send(big) != nil {
+				return
+			}
+		}
+	}()
+	go s.pingLoop()
+	time.Sleep(600 * time.Millisecond) // several ping deadlines pass while the write is stuck
+
+	go func() { // client starts draining: the write and the pings flow again
+		for {
+			if _, _, err := cl.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}()
+	before := pings.Load()
+	require.Eventually(t, func() bool { return pings.Load() >= before+2 }, 5*time.Second, 20*time.Millisecond,
+		"pings did not resume after a transport write stall")
 }

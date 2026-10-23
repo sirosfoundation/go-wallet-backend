@@ -132,9 +132,12 @@ Connections idle for >60 seconds without ping/pong MAY be terminated.
 The engine's own cadence is reported in `handshake_complete.config.ping_interval_ms`
 (default 3000 ms). The engine pings at that interval and closes the connection
 when it has seen no sign of life for `ping_interval + pong_timeout` (default
-3 s + 5 s = 8 s). A pong, a client ping (answered with a pong) or any inbound
-data frame counts as a sign of life and restarts that window; the engine's
-pings are sent independently of any in-flight data write.
+3 s + 5 s = 8 s). A pong, a client ping (answered with a pong) or inbound data
+(including each fragment of a message still being received) counts as a sign
+of life and restarts that window. The engine's pings are not serialized behind
+the application's send lock; they are still ordered behind a data write that
+is stuck in the socket, and a ping that times out for that reason is retried
+on the next tick rather than ending the keepalive.
 
 ### Reconnection
 
