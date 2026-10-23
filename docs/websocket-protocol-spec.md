@@ -668,8 +668,9 @@ Server → Client:
 #### Unknown Flows
 
 Any client message that references a `flow_id` the session does not know -
-`flow_action` (including `decline`), `sign_response` and `match_response`
-that carry a `flow_id` - is answered with exactly one `flow_error`, never
+`flow_action` (including `decline`), and `sign_response` / `match_response`
+that carry a `flow_id` and do not answer a request the session still has
+outstanding - is answered with exactly one `flow_error`, never
 silently dropped:
 
 ```
@@ -693,8 +694,12 @@ Properties: the lookup is scoped to the current session, so a flow owned by
 another session or user produces the identical reply as a flow that never
 existed (no probing). Replies are rate-limited per session (burst 10, then
 about 2/s); beyond that, messages for unknown flows are dropped without a
-reply. `sign_response`/`match_response` without a `flow_id` are correlated by
-`message_id` only, and `credential_notification` keeps its own
+reply. A `sign_response` answering an outstanding `sign_request` is always delivered,
+even if the requesting flow has completed (client-held DPoP signing after
+issuance relies on this). A `sign_response` without a `flow_id` is correlated
+by `message_id` only. A `match_response` MUST carry both the `flow_id` and the
+`message_id` of its `match_request`; without them it is ignored and the engine
+times the request out. `credential_notification` keeps its own
 `notification_ack` (`rejected`) semantics.
 
 ### OpenID4VP Credential Presentation

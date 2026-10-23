@@ -118,6 +118,27 @@ type Session struct {
 	// unknownFlowLimiter rate-limits UNKNOWN_FLOW replies (see
 	// rejectIfUnknownFlow). Only touched from the read loop goroutine.
 	unknownFlowLimiter *rate.Limiter
+
+	// outstandingRequests holds the message_id of every sign/match request
+	// currently awaiting its response (guarded by flowsMu), so responses are
+	// still delivered after the requesting flow has completed.
+	outstandingRequests map[string]struct{}
+}
+
+// trackRequest registers messageID as an outstanding request until the
+// returned func is called.
+func (s *Session) trackRequest(messageID string) (done func()) {
+	s.flowsMu.Lock()
+	if s.outstandingRequests == nil {
+		s.outstandingRequests = make(map[string]struct{})
+	}
+	s.outstandingRequests[messageID] = struct{}{}
+	s.flowsMu.Unlock()
+	return func() {
+		s.flowsMu.Lock()
+		delete(s.outstandingRequests, messageID)
+		s.flowsMu.Unlock()
+	}
 }
 
 // Flow represents an active credential flow
@@ -466,11 +487,17 @@ const (
 // disclosed), so a client cannot probe for foreign flow IDs. A flow that was
 // in progress on a previous session of the same user is likewise unknown to
 // the new session - this error is how a reconnected client learns it is dead.
-func (s *Session) rejectIfUnknownFlow(flowID string, msgType MessageType) bool {
+//
+// A response (messageID != "") that answers a request this session still has
+// outstanding is never rejected, even if its flow has since completed: the
+// client-held DPoP signer deliberately addresses sign requests to a finished
+// flow (see clientHeldDPoPSigner) to forward credential notifications.
+func (s *Session) rejectIfUnknownFlow(flowID, messageID string, msgType MessageType) bool {
 	s.flowsMu.RLock()
 	_, ok := s.flows[flowID]
+	_, outstanding := s.outstandingRequests[messageID]
 	s.flowsMu.RUnlock()
-	if ok {
+	if ok || (messageID != "" && outstanding) {
 		return false
 	}
 	// Debug, not Warn: the flow_id is client-controlled and this path is
@@ -542,7 +569,7 @@ func (m *Manager) handleSession(session *Session) {
 			// Check if flow exists before routing - prevents action loss for
 			// unknown flows. The client is always told (flow_error
 			// UNKNOWN_FLOW), never left waiting on a flow that is gone.
-			if session.rejectIfUnknownFlow(actionMsg.FlowID, msg.Type) {
+			if session.rejectIfUnknownFlow(actionMsg.FlowID, "", msg.Type) {
 				continue
 			}
 			// Route to the flow - send error if channel full instead of dropping
@@ -564,7 +591,7 @@ func (m *Manager) handleSession(session *Session) {
 			// Responses that name a flow that no longer exists are answered
 			// with UNKNOWN_FLOW. A response without a flow_id is correlated
 			// by message_id alone and routed as before.
-			if signMsg.FlowID != "" && session.rejectIfUnknownFlow(signMsg.FlowID, msg.Type) {
+			if signMsg.FlowID != "" && session.rejectIfUnknownFlow(signMsg.FlowID, signMsg.MessageID, msg.Type) {
 				continue
 			}
 			// Route to waiting flow - send error if channel full instead of dropping
@@ -582,7 +609,7 @@ func (m *Manager) handleSession(session *Session) {
 				session.logger.Warn("Invalid match_response", zap.Error(err))
 				continue
 			}
-			if matchMsg.FlowID != "" && session.rejectIfUnknownFlow(matchMsg.FlowID, msg.Type) {
+			if matchMsg.FlowID != "" && session.rejectIfUnknownFlow(matchMsg.FlowID, matchMsg.MessageID, msg.Type) {
 				continue
 			}
 			// Route to waiting flow - send error if channel full instead of dropping
@@ -1300,6 +1327,7 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 		Params: params,
 	}
 
+	defer s.trackRequest(messageID)()
 	if err := s.Send(&msg); err != nil {
 		return nil, err
 	}
@@ -1347,6 +1375,7 @@ func (s *Session) RequestMatch(ctx context.Context, flowID string, dcql json.Raw
 		DCQLQuery: dcql,
 	}
 
+	defer s.trackRequest(messageID)()
 	if err := s.Send(&msg); err != nil {
 		return nil, err
 	}
