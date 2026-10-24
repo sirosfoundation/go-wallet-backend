@@ -95,9 +95,10 @@ rule lists a prefix of the slots and a query may carry trailing elements, and
 the `claimed` group still follows `verified` at the same position (pinned by
 tests). A commented S1 template that
 requires `instance_key (home (* set strongbox tee))` ships in
-`deploy/assurance/production.rules.example`; it does nothing until the backend
-holds instance-key evidence whose home is one of those (later stages add the
-android_key evidence), so it is not enabled by default.
+`deploy/assurance/production.rules.example`. It matches WIAs whose instance key
+has verified `android_key` evidence (see "Android key attestation of the
+instance key"), and stays commented: enable it only when your wallets submit
+that evidence.
 * Evidence is built through the S-expression element API, never by string
   concatenation. Atom values are length-prefixed in the canonical encoding, so
   a hostile value such as `x)(source platform_attested` stays one atom.
@@ -358,6 +359,117 @@ MongoDB stores; the MongoDB path is a compare-and-set on a revision). Homes
 rank `secure_enclave_asserted` < `tee` < `strongbox`/`fido2_hw`/`hsm`; at equal
 rank only the same kind replaces, and never by dropping the UV bit. A
 registration that would weaken the record is ignored without error.
+
+### Android key attestation of the instance key (stage B2)
+
+`POST /wallet-provider/wia/generate` accepts an optional `key_attestation`
+object, evidence about the **instance (PoP) key** itself:
+
+```json
+{"pop": "...", "challenge": "<C>",
+ "key_attestation": {"type": "android_key", "x5c": ["<base64 DER leaf>", "<intermediate>", "<root>"]}}
+```
+
+`type` selects a verifier from a registry (`android_key`; `app_attest_assertion`
+is registered by its own stage). The request is classified as follows:
+
+| Situation | Result |
+|---|---|
+| field absent | no instance-key evidence, home `unknown` |
+| `type` not registered | HTTP 400 `KEY_ATTESTATION_TYPE_UNSUPPORTED`, before the single-use challenge is consumed |
+| evidence invalid (malformed, broken chain, expired certificate, wrong leaf key, wrong challenge, missing attestation extension, revoked certificate) | WIA refused, HTTP 400 `KEY_ATTESTATION_INVALID` (same rule as a failing native attestation) |
+| the evidence cannot be judged (no fresh revocation list) | WIA refused, HTTP 503 `KEY_ATTESTATION_UNAVAILABLE`, nothing recorded |
+| sound but names no home (see below) | no record; the WIA issues with the home `unknown` |
+| verified hardware-backed | record written, home `strongbox` or `tee` |
+
+**Challenge.** The WIA challenge C is reused. The key must have been generated
+with the attestation challenge
+
+    SHA-256( "siros-instance-key-v1" || C )
+
+where C is the challenge string exactly as `POST /wallet-provider/wia/challenge`
+returned it (base64url without padding, taken as its UTF-8 bytes, **not**
+decoded) and `||` is plain concatenation. The result is 32 bytes
+(`setAttestationChallenge`). The WIA challenge is single use, so evidence cannot
+be replayed under another challenge.
+
+**What the verifier checks** (`internal/service/android_key_attestation.go`):
+
+1. the x5c list (base64 DER, leaf first; at most 8 certificates, 8 KiB each,
+   32 KiB in all) links up: names chain, every signature verifies, every issuer
+   is a CA;
+2. the chain verifies at submission time to a **pinned** anchor. The anchors are
+   only those the operator configured: the backend ships none, uses no operating
+   system pool and never fetches roots itself. The root may be omitted from the
+   x5c;
+3. the leaf's `KeyDescription` extension (OID `1.3.6.1.4.1.11129.2.1.17`) is
+   parsed (unknown tags and versions are skipped, hostile ASN.1 is bounded);
+4. the leaf's public key equals the PoP key (P-256), and `attestationChallenge`
+   equals the value above;
+5. both `attestationSecurityLevel` and `keymasterSecurityLevel` are
+   TrustedEnvironment or StrongBox; the home is the weaker of the two
+   (StrongBox -> `strongbox`, otherwise `tee`). Anything else (software) names
+   no home;
+6. from the hardware-enforced list: `origin` is GENERATED and `purpose`
+   includes SIGN (otherwise no home); `algorithm`/`ecCurve`, when present, are
+   EC/P-256 (otherwise invalid);
+7. the `attestationApplicationId` has at least one signing-certificate digest
+   and every digest is on `allowed_app_digests` (and, if `allowed_packages` is
+   set, every package is listed); otherwise no home;
+8. last, and only for evidence that would otherwise be accepted: no certificate
+   of the chain is listed in Google's status list
+   (`https://android.googleapis.com/attestation/status`). The list is cached
+   for its `Cache-Control: max-age` (default `status_list_default_ttl_seconds`,
+   at most 24 h) and **never used past that**: when it has expired and cannot be
+   fetched, evidence is refused (HTTP 503) and nothing is recorded.
+
+A chain that does not end in a pinned anchor names no home (it is not an
+error: the device may simply be one the operator does not trust). With no
+anchors or no allowed app digests configured the verifier is **fail closed**:
+it ignores every submission (no record, home `unknown`) and the server logs a
+warning at startup.
+
+`verifiedBootState`, `deviceLocked` and `osPatchLevel` are **recorded, never
+required**: the record carries `verified_boot_state` (`verified`, `self_signed`,
+`unverified`, `failed`), `device_locked` and `patch_level`, the `instance_key`
+slot carries `boot`, and policy decides what to do with them.
+
+On success the record (`kind android_key`, `home`, `security_level`,
+`verified_boot_state`, `device_locked`, `patch_level`, `app_digest`,
+`chain_fingerprint`, `chain_not_after`, `verified_at`) is written under the PoP
+key's thumbprint through the store, which never replaces it with weaker or
+absent evidence. The instance's `wscd_type` follows from the record's home
+(`native_android`), and the verified slot is rendered by the `android_key`
+builder:
+
+    (instance_key (kind android_key)(home strongbox|tee)(level L)(boot B)(binding attested))
+
+Nothing the client reports is copied into a verified atom. Later WIAs of the same
+key need no new chain: the stored record is looked up by the PoP key's
+thumbprint, and the fresh PoP proves possession. Periodic re-checking of stored
+records against the status list is not done yet (`chain_not_after` and
+`verified_at` are recorded for it).
+
+**Configuration** (`wallet_provider.attestation.android_key_attestation`):
+
+| Key | Environment | Meaning |
+|---|---|---|
+| `trust_anchors_path` | `WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_TRUST_ANCHORS_PATH` | file of PEM CERTIFICATE blocks (pinned roots) |
+| `trust_anchors_pem` | `..._TRUST_ANCHORS_PEM` | the same, inline; added to the file's |
+| `allowed_app_digests` | `..._ALLOWED_APP_DIGESTS` | SHA-256 of the app signing certificate(s), hex (colons allowed), comma separated |
+| `allowed_packages` | `..._ALLOWED_PACKAGES` | optional package-name restriction |
+| `status_list_url` | `..._STATUS_LIST_URL` | default Google's status list |
+| `status_list_default_ttl_seconds` | `..._STATUS_LIST_DEFAULT_TTL_SECONDS` | freshness when the response has no `max-age` (default 3600) |
+
+Get Google's attestation roots from <https://android.googleapis.com/attestation/root>
+(a JSON array of PEM certificates; it includes the RSA root and the ECDSA P-384
+"Key Attestation CA1" root), review them, and pin them. The server refuses to
+start on an anchors file or digest it cannot parse.
+
+Tests build synthetic chains (a test root, an intermediate and a hand-encoded
+`KeyDescription`). `TestAndroidKeyAttestation_RealPixelChains` verifies real
+chains from `internal/service/testdata/android/` when they are captured (see its
+README); it is skipped until then.
 
 ## Preview endpoint
 
