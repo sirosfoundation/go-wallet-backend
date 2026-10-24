@@ -278,7 +278,7 @@ func TestWIAAssurance_PlatformSlotIsThisRequestsNotStoredState(t *testing.T) {
 	svc, instances := wiaAssuranceSvc(t, wiaFullRules)
 	ctx := context.Background()
 	// The instance previously attested natively...
-	if err := instances.Upsert(ctx, &domain.WalletInstance{ID: "jkt-old-123456", AttestationSource: "platform_attested", Status: domain.InstanceStatusActive}); err != nil {
+	if err := instances.Upsert(ctx, &domain.WalletInstance{ID: "jkt-old-123456", AttestationSource: "platform_attested", Status: domain.InstanceStatusActive, LastAttestedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	// ...but this request carries no native evidence.
@@ -421,7 +421,7 @@ func TestPreview_UsesTheCallersOwnInstanceOnly(t *testing.T) {
 	svc, instances, _ := previewSvc(t, previewRules, true)
 	owner := domain.UserIDFromString("owner")
 	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
-		ID: "inst", TenantID: "t1", UserID: &owner, AttestationSource: "platform_attested", Status: domain.InstanceStatusActive,
+		ID: "inst", TenantID: "t1", UserID: &owner, AttestationSource: "platform_attested", Status: domain.InstanceStatusActive, LastAttestedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -472,7 +472,7 @@ func TestPreview_MatchesTheRealKeyAttestationOnTheSameFacts(t *testing.T) {
 func TestPreview_DisabledReturnsTheLegacyResult(t *testing.T) {
 	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
 	svc.SetAssessor(newTestAssessor(t, nil, previewRules)) // inert while disabled
-	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "n", AttestationSource: "platform_attested", Status: domain.InstanceStatusActive}); err != nil {
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "n", AttestationSource: "platform_attested", Status: domain.InstanceStatusActive, LastAttestedAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
 	jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}
@@ -627,7 +627,7 @@ func TestAssurance_VerifiedAppIDIsEvidenceEverywhere(t *testing.T) {
 		t.Helper()
 		if err := instances.Upsert(context.Background(), &domain.WalletInstance{
 			ID: id, Status: domain.InstanceStatusActive, AttestationSource: "platform_attested", VerifiedAppID: verified,
-			DeviceInfo: &domain.DeviceInfo{AppID: reported},
+			DeviceInfo: &domain.DeviceInfo{AppID: reported}, LastAttestedAt: time.Now(),
 		}); err != nil {
 			t.Fatal(err)
 		}
@@ -652,5 +652,20 @@ func TestAssurance_VerifiedAppIDIsEvidenceEverywhere(t *testing.T) {
 		if pv.KeyStorage[0] != want || pv.WIAProfile != wantProfile {
 			t.Errorf("preview %s: %+v, want ks %s profile %s", id, pv, want, wantProfile)
 		}
+	}
+}
+
+// Platform evidence older than the WIA lifetime is not used (PR A), so the
+// preview treats such an instance as unknown, exactly like the real KA does.
+func TestPreview_StaleInstanceIsUnknown(t *testing.T) {
+	svc, instances, _ := previewSvc(t, previewRules, true)
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+		ID: "old", AttestationSource: "platform_attested", Status: domain.InstanceStatusActive,
+		LastAttestedAt: time.Now().Add(-48 * time.Hour),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.PreviewAssurance(context.Background(), &AssurancePreviewRequest{WalletInstanceID: "old"}); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("err = %v", err)
 	}
 }

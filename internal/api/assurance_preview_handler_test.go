@@ -90,7 +90,7 @@ func TestAssurancePreview_EnabledUsesPolicyAndOwnInstanceOnly(t *testing.T) {
 	})
 	owner := domain.UserIDFromString("owner")
 	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{
-		ID: "inst", TenantID: "tenant-a", UserID: &owner, AttestationSource: "platform_attested", Status: domain.InstanceStatusActive,
+		ID: "inst", TenantID: "tenant-a", UserID: &owner, AttestationSource: "platform_attested", Status: domain.InstanceStatusActive, LastAttestedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}

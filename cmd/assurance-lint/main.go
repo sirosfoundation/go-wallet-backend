@@ -3,8 +3,9 @@
 //	assurance-lint -rules deploy/assurance/production.rules.example
 //	assurance-lint -config config.yaml
 //
-// With -config the rules file and level schemes come from
-// wallet_provider.attestation.assurance; with -rules alone the built-in
+// With -config the rules file and level schemes come from the YAML's
+// wallet_provider.attestation.assurance section (read alone, so -rules can
+// override a rules_file that would not validate); with -rules alone the built-in
 // iso_18045 scheme is assumed. Exit status is 1 when any ERROR is found.
 package main
 
@@ -13,6 +14,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+
+	"gopkg.in/yaml.v3"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -37,12 +40,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 		UserAuthenticationScheme: config.DefaultLevelSchemeID,
 	}
 	if *cfgFile != "" {
-		loaded, err := config.Load(*cfgFile)
+		// Read only the assurance section from the YAML. config.Load would
+		// validate the whole configuration first and reject a config whose
+		// rules_file is the very thing -rules is meant to replace.
+		loaded, err := readAssuranceConfig(*cfgFile, cfg)
 		if err != nil {
 			printf(stderr, "load config: %v\n", err)
 			return 2
 		}
-		cfg = loaded.WalletProvider.Attestation.Assurance
+		cfg = loaded
 	}
 	if *rules != "" {
 		cfg.RulesFile = *rules
@@ -73,4 +79,27 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	return 0
+}
+
+// readAssuranceConfig overlays wallet_provider.attestation.assurance from a
+// YAML file onto base (the defaults) without validating anything.
+func readAssuranceConfig(path string, base config.AssuranceConfig) (config.AssuranceConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return base, err
+	}
+	var doc struct {
+		WalletProvider struct {
+			Attestation struct {
+				Assurance config.AssuranceConfig `yaml:"assurance"`
+			} `yaml:"attestation"`
+		} `yaml:"wallet_provider"`
+	}
+	// A value (not a pointer): an explicit `assurance:` null then leaves
+	// the defaults in place instead of nil-ing the section.
+	doc.WalletProvider.Attestation.Assurance = base
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return base, err
+	}
+	return doc.WalletProvider.Attestation.Assurance, nil
 }

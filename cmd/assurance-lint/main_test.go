@@ -55,3 +55,64 @@ func TestLintCLI_ErrorsExitNonZero(t *testing.T) {
 		t.Fatalf("no rules file must be a usage error, got %d", code)
 	}
 }
+
+func TestLintCLI_ConfigWithoutRulesFileAcceptsRulesOverride(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "c.yaml")
+	// enabled with no rules_file: config.Load would reject this outright.
+	if err := os.WriteFile(cfg, []byte("wallet_provider:\n  attestation:\n    assurance:\n      enabled: true\n      key_storage_scheme: tiers\n      level_schemes:\n        - {id: tiers, levels: [k3, k1], values: [sw, hw], floor: k3}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rules := filepath.Join(dir, "r.rules")
+	if err := os.WriteFile(rules, []byte("# id: r\n(assure-ks (tier k1)(evidence))\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, out, e := runLint(t, "-config", cfg, "-rules", rules)
+	if code != 0 {
+		t.Fatalf("code %d out=%s err=%s", code, out, e)
+	}
+	// The configured scheme is in effect: a tier outside it is reported.
+	if err := os.WriteFile(rules, []byte("# id: r\n(assure-ks (tier zzz)(evidence))\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, out, _ := runLint(t, "-config", cfg, "-rules", rules); !strings.Contains(out, `"zzz"`) {
+		t.Fatalf("scheme from -config not applied: %s", out)
+	}
+	if code, _, _ := runLint(t, "-config", cfg); code != 2 {
+		t.Fatalf("no rules file anywhere must be a usage error, got %d", code)
+	}
+}
+
+// An explicit null section (or null parents) keeps the defaults; it used to
+// nil the section and panic.
+func TestLintCLI_NullAssuranceSectionDoesNotPanic(t *testing.T) {
+	dir := t.TempDir()
+	rules := filepath.Join(dir, "r.rules")
+	if err := os.WriteFile(rules, []byte("# id: r\n(assure-ks (tier moderate)(evidence))\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, doc := range map[string]string{
+		"null assurance":       "wallet_provider:\n  attestation:\n    assurance:\n",
+		"null attestation":     "wallet_provider:\n  attestation:\n",
+		"null wallet_provider": "wallet_provider:\n",
+		"empty file":           "",
+	} {
+		cfg := filepath.Join(dir, "c.yaml")
+		if err := os.WriteFile(cfg, []byte(doc), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if code, out, e := runLint(t, "-config", cfg, "-rules", rules); code != 0 {
+			t.Errorf("%s: code %d out=%s err=%s", name, code, out, e)
+		}
+	}
+}
+
+func TestLintCLI_ListValuedSetMemberIsAnError(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "r.rules")
+	if err := os.WriteFile(p, []byte("# id: nested\n(assure-ks (tier moderate)(evidence (verified (fido2 (mds3 trusted)(aaguid (* set (model a1)))))))\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, out, _ := runLint(t, "-rules", p); code != 1 || !strings.Contains(out, "ERROR: rule nested") {
+		t.Fatalf("%d %s", code, out)
+	}
+}

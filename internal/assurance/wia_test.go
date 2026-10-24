@@ -230,3 +230,23 @@ func TestEvidence_NeverContainsWSCDType(t *testing.T) {
 		t.Fatalf("a rule naming a wscd slot must be a lint error: %v", fs)
 	}
 }
+
+// The leaf-slot rule (one atom or one set per leaf) applies to the WIA
+// dimensions, including their candidate group (profile / name).
+func TestLint_LeafSlotRuleAppliesToWIADimensions(t *testing.T) {
+	cases := map[string]bool{
+		"(assure-wia (profile s1-full-client s3-backend-only)(evidence))":                 true,
+		"(assure-wia (profile (* set s1-full-client s3-backend-only))(evidence))":         false,
+		"(assure-wia-cert (name a b)(evidence))":                                          true,
+		"(assure-wia-cert (name (* set a b))(evidence))":                                  false,
+		"(assure-wia-issue (evidence (verified (fido2)(platform (source a b)))))":         true,
+		"(assure-wia-issue (evidence (verified (fido2)(platform (source (* set a b))))))": false,
+		"(assure-wia-issue (evidence (verified (fido2)(platform (app_id (x y))))))":       true,
+	}
+	for rule, wantErr := range cases {
+		fs := lintRules(t, "# id: r\n"+rule+"\n")
+		if HasErrors(fs) != wantErr {
+			t.Errorf("%s: error=%v want %v (%v)", rule, HasErrors(fs), wantErr, fs)
+		}
+	}
+}

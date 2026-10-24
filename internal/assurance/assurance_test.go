@@ -622,3 +622,21 @@ func TestLoadRuleSet_RejectsRangesAndEmptySets(t *testing.T) {
 		t.Fatalf("set/prefix/suffix must load: %v", err)
 	}
 }
+
+func TestAssess_ClaimedLevelRecordedEvenWhenLoweringDisabled(t *testing.T) {
+	for _, lower := range []bool{true, false} {
+		cfg := defaultCfg()
+		cfg.LowerByClaimsKeyStorage, cfg.LowerByClaimsUserAuthentication = lower, lower
+		a := newAssessor(t, cfg, "# id: all\n(assure-ks (tier high)(evidence))\n# id: all-ua\n(assure-ua (tier high)(evidence))\n")
+		o := a.Assess(context.Background(), Facts{Claims: Claims{KeyStorage: []string{"iso_18045_basic"}, UserAuthentication: []string{"iso_18045_moderate"}}})
+		if o.KeyStorage.ClaimedLevel != "basic" || o.UserAuthentication.ClaimedLevel != "moderate" {
+			t.Errorf("lower=%v: claimed levels %q %q", lower, o.KeyStorage.ClaimedLevel, o.UserAuthentication.ClaimedLevel)
+		}
+		if o.KeyStorage.Lowered != lower {
+			t.Errorf("lower=%v: Lowered=%v", lower, o.KeyStorage.Lowered)
+		}
+		if none := a.Assess(context.Background(), Facts{}); none.KeyStorage.ClaimedLevel != "" {
+			t.Errorf("no claim must leave ClaimedLevel empty, got %q", none.KeyStorage.ClaimedLevel)
+		}
+	}
+}

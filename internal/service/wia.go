@@ -544,6 +544,26 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 	return jwkMap, nil
 }
 
+// effectiveWIALifetime is the lifetime signWIA gives a WIA: the configured
+// attestation.lifetime_seconds, defaulting to (and capped by)
+// wia.max_expiry_seconds, which itself defaults to 24h. unset reports that
+// lifetime_seconds was not configured. Platform-evidence freshness for Key
+// Attestation uses the same value, so evidence never outlives its WIA.
+func effectiveWIALifetime(cfg *config.Config) (lifetime time.Duration, unset bool) {
+	lifetime = time.Duration(cfg.WalletProvider.Attestation.LifetimeSeconds) * time.Second
+	maxExpiry := time.Duration(cfg.WalletProvider.WIA.MaxExpirySeconds) * time.Second
+	if maxExpiry <= 0 {
+		maxExpiry = 24 * time.Hour // sensible default to prevent zero/negative expiry
+	}
+	if lifetime <= 0 {
+		lifetime, unset = maxExpiry, true
+	}
+	if lifetime > maxExpiry {
+		lifetime = maxExpiry
+	}
+	return lifetime, unset
+}
+
 // signWIA creates the WIA JWT (typ: oauth-client-attestation+jwt).
 // jkt is the JWK Thumbprint of cnfJWK, precomputed by the caller (GenerateWIA)
 // so it can also be used for the instance-status guard before signing.
@@ -560,18 +580,10 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 	// client_status/revocation-chaining mechanism (see below); a short
 	// lifetime is the actual mechanism bounding exposure from a
 	// compromised/revoked wallet instance.
-	lifetime := time.Duration(s.cfg.WalletProvider.Attestation.LifetimeSeconds) * time.Second
-	maxExpiry := time.Duration(s.cfg.WalletProvider.WIA.MaxExpirySeconds) * time.Second
-	if maxExpiry <= 0 {
-		maxExpiry = 24 * time.Hour // sensible default to prevent zero/negative expiry
-	}
-	if lifetime <= 0 {
-		lifetime = maxExpiry
+	lifetime, lifetimeUnset := effectiveWIALifetime(s.cfg)
+	if lifetimeUnset {
 		s.logger.Warn("attestation.lifetime_seconds not set, defaulting to max_expiry_seconds",
 			zap.Duration("lifetime", lifetime))
-	}
-	if lifetime > maxExpiry {
-		lifetime = maxExpiry
 	}
 
 	// sub: draft-ietf-oauth-attestation-based-client-auth-10 requires "the sub

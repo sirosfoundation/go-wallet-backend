@@ -308,13 +308,13 @@ func (a *Assessor) assessDimension(ctx context.Context, errs *[]error, dim strin
 	}
 	res := DimensionResult{Scheme: s, Granted: s.Levels[granted], RuleIDs: ids}
 	final := granted
-	if lower {
-		if ci, _, has := a.claimIndex(s, claimed); has {
-			res.ClaimedLevel = s.Levels[ci]
-			if ci < final {
-				final = ci
-				res.Lowered = true
-			}
+	// Record the claim whether or not it may lower the result, so the audit
+	// line can tell "claimed, ignored by policy" from "no claim".
+	if ci, _, has := a.claimIndex(s, claimed); has {
+		res.ClaimedLevel = s.Levels[ci]
+		if lower && ci < final {
+			final = ci
+			res.Lowered = true
 		}
 	}
 	if final < s.floor {

@@ -171,6 +171,18 @@ func knownList() string {
 // as a prefix of layout, and recurses into slots that have sub-slots.
 func checkLayout(l *sexp.List, layout []slot, noneOK bool, path string, errf func(string, ...interface{}) Finding) []Finding {
 	var out []Finding
+	if len(layout) == 0 {
+		// Leaf slot: the query always carries exactly one atom here, so a
+		// rule may carry zero values (don't care), one value or a single
+		// (* set ...) of alternatives. Several values, or a nested list,
+		// can never match.
+		if len(l.Elements) > 1 {
+			out = append(out, errf("%s has %d values; a query carries exactly one, so this can never match. Use a single (* set ...) for alternatives", path, len(l.Elements)))
+		} else if len(l.Elements) == 1 && hasListValue(l.Elements[0]) {
+			out = append(out, errf("%s value is (or contains) a list; a query carries one atom here, so this can never match", path))
+		}
+		return out
+	}
 	for i, el := range l.Elements {
 		child, isList := el.(*sexp.List)
 		if !isList {
@@ -183,9 +195,6 @@ func checkLayout(l *sexp.List, layout []slot, noneOK bool, path string, errf fun
 				out = append(out, errf("%s position %d: expected slot (%s) but found a value; positional matching would never match", path, i, layout[min(i, len(layout)-1)].name))
 			}
 			continue
-		}
-		if len(layout) == 0 {
-			continue // leaf slot: values are free-form
 		}
 		if i >= len(layout) {
 			out = append(out, errf("%s: unexpected (%s) at position %d; the canonical slots are %s", path, child.Tag, i, slotNames(layout)))
@@ -321,4 +330,20 @@ func lintCandidate(rule *sexp.List, cfg *config.AssuranceConfig, warnf func(stri
 		}
 	}
 	return out
+}
+
+// hasListValue reports whether el is a list, or a star form with a list
+// anywhere among its members (a set may nest further sets).
+func hasListValue(el sexp.Element) bool {
+	switch v := el.(type) {
+	case *sexp.List:
+		return true
+	case *starform.Set:
+		for _, m := range v.Elements {
+			if hasListValue(m) {
+				return true
+			}
+		}
+	}
+	return false
 }

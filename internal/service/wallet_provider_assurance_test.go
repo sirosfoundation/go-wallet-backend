@@ -33,7 +33,7 @@ func TestKeyAttestationTrustsBatch_PlatformSourceNames(t *testing.T) {
 	}
 	for source, want := range cases {
 		svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
-		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i", AttestationSource: source}); err != nil {
+		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i", AttestationSource: source, LastAttestedAt: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
 		jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}
@@ -51,7 +51,7 @@ func TestGenerateKeyAttestation_LegacyPlatformAttestedEndToEnd(t *testing.T) {
 		"platform_attested":    "iso_18045_high",
 		"development_attested": "iso_18045_basic",
 	} {
-		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i-" + source, AttestationSource: source}); err != nil {
+		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i-" + source, AttestationSource: source, LastAttestedAt: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
 		ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "n", sp, "i-"+source, "")
@@ -247,7 +247,7 @@ func TestAssurance_PlatformSourceIsTheRealStoredString(t *testing.T) {
 		"ios_app_attest":       "iso_18045_basic",
 	} {
 		svc, instances, _ := assuranceSvc(t, nil, rules)
-		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i", AttestationSource: source}); err != nil {
+		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i", AttestationSource: source, LastAttestedAt: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
 		ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "n", nil, "i", "")
@@ -425,7 +425,7 @@ func TestInstanceOwnership_ForeignInstanceLendsNoEvidence(t *testing.T) {
 	for _, c := range cases {
 		svc, instances, _ := assuranceSvc(t, nil,
 			"# id: plat\n(assure-ks (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2)(platform (source platform_attested)))))\n")
-		c.inst.AttestationSource = "platform_attested"
+		c.inst.AttestationSource, c.inst.LastAttestedAt = "platform_attested", time.Now()
 		if err := instances.Upsert(context.Background(), c.inst); err != nil {
 			t.Fatal(err)
 		}
@@ -478,7 +478,7 @@ func TestInstanceStatus_DeactivatedInstanceLendsNoEvidence(t *testing.T) {
 	} {
 		svc, instances, _ := assuranceSvc(t, nil,
 			"# id: plat\n(assure-ks (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2)(platform (source platform_attested)))))\n")
-		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i", Status: status, AttestationSource: "platform_attested"}); err != nil {
+		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i", Status: status, AttestationSource: "platform_attested", LastAttestedAt: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
 		jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}
@@ -491,6 +491,48 @@ func TestInstanceStatus_DeactivatedInstanceLendsNoEvidence(t *testing.T) {
 		}
 		if got := parseKAClaims(t, ka)["key_storage"].([]interface{})[0] == "iso_18045_moderate"; got != want {
 			t.Errorf("status %q: policy raised = %v, want %v", status, got, want)
+		}
+	}
+}
+
+// Platform evidence is only as fresh as the last WIA: past the WIA lifetime
+// (default 5 minutes) it lends nothing, on both paths. An instance that never
+// recorded an attestation time has no evidence at all.
+func TestInstanceFreshness_StalePlatformEvidenceLendsNothing(t *testing.T) {
+	cases := []struct {
+		name     string
+		lifetime int
+		maxExp   int
+		at       time.Time
+		want     bool
+	}{
+		{"just attested", 300, 0, time.Now(), true},
+		{"within lifetime", 300, 0, time.Now().Add(-4 * time.Minute), true},
+		{"past lifetime", 300, 0, time.Now().Add(-6 * time.Minute), false},
+		{"within long lifetime", 3600, 0, time.Now().Add(-30 * time.Minute), true},
+		{"lifetime capped by wia max expiry", 3600, 300, time.Now().Add(-10 * time.Minute), false},
+		{"within wia max expiry cap", 3600, 300, time.Now().Add(-4 * time.Minute), true},
+		{"lifetime unset follows wia max expiry", 0, 120, time.Now().Add(-3 * time.Minute), false},
+		{"never recorded", 300, 0, time.Time{}, false},
+	}
+	for _, c := range cases {
+		svc, instances, _ := assuranceSvc(t, nil,
+			"# id: plat\n(assure-ks (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2)(platform (source platform_attested)))))\n")
+		svc.cfg.WalletProvider.Attestation.LifetimeSeconds = c.lifetime
+		svc.cfg.WalletProvider.WIA.MaxExpirySeconds = c.maxExp
+		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i", AttestationSource: "platform_attested", LastAttestedAt: c.at}); err != nil {
+			t.Fatal(err)
+		}
+		jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}
+		if got := svc.keyAttestationTrustsBatch(context.Background(), "i", jwks); got != c.want {
+			t.Errorf("%s: legacy trust = %v, want %v", c.name, got, c.want)
+		}
+		ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "n", nil, "i", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := parseKAClaims(t, ka)["key_storage"].([]interface{})[0] == "iso_18045_moderate"; got != c.want {
+			t.Errorf("%s: policy raised = %v, want %v", c.name, got, c.want)
 		}
 	}
 }
