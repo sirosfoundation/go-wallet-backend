@@ -481,8 +481,17 @@ func (h *Handlers) GenerateKeyAttestation(c *gin.Context) {
 		return
 	}
 
+	// Bind the request to the authenticated caller so a wallet_instance_id
+	// belonging to another tenant or user cannot lend its platform evidence.
+	tenantID, _ := h.getTenantID(c)
+	callerUser, _ := contextUserID(c)
+	kaCtx := service.WithKeyAttestationCaller(c.Request.Context(), service.KeyAttestationCaller{
+		TenantID: tenantID,
+		UserID:   callerUser,
+	})
+
 	keyAttestation, err := h.services.WalletProvider.GenerateKeyAttestation(
-		c.Request.Context(),
+		kaCtx,
 		req.JWKS,
 		req.OpenID4VCI.Nonce,
 		req.SecurityProperties.toService(),

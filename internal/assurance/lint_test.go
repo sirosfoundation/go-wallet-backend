@@ -29,9 +29,9 @@ func findings(fs []Finding, sev Severity) string {
 
 func TestLint_CanonicalRulesAreClean(t *testing.T) {
 	fs := lintRules(t, `# id: ok1
-(assure-ks (tier (* set basic moderate))(evidence (verified (fido2 (mds3 trusted)(aaguid (* set a b))(uv present)(cert c))(platform (source platform_attested)(app_id x))(hsm (id h)))(claimed none)))
+(assure-ks (tier (* set basic moderate))(evidence (verified (fido2 (mds3 trusted)(aaguid (* set a b))(uv present)(cert c))(platform (source platform_attested)(app_id x))(hsm (id h)))(claimed)))
 # id: ok2
-(assure-ua (tier basic)(evidence (verified (fido2 none))))
+(assure-ua (tier basic)(evidence (verified (fido2 none)(platform none)(hsm none))))
 # id: ok3
 (assure-cert (name eucc)(evidence (verified)))
 # id: ok4
@@ -53,6 +53,9 @@ func TestLint_SlotOrderIsAnError(t *testing.T) {
 		"unknown slot":                    "(assure-ks (tier basic)(evidence (verified (tpm (id x)))))",
 		"too many slots":                  "(assure-ks (tier basic)(evidence (verified)(claimed)(extra)))",
 		"claimed plugin after claimed ks": "(assure-ks (tier basic)(evidence (verified)(claimed (key_storage x)(plugin soft))))",
+		"claimed none":                    "(assure-ks (tier basic)(evidence (verified)(claimed none)))",
+		"verified none":                   "(assure-ks (tier basic)(evidence (verified none)))",
+		"evidence none":                   "(assure-ks (tier basic)(evidence none))",
 		"cert uses tier":                  "(assure-cert (tier eucc)(evidence))",
 	}
 	for name, rule := range cases {
@@ -149,5 +152,14 @@ func TestShippedExamplesLoadAndLint(t *testing.T) {
 		if wantWarn == nil && w != "" {
 			t.Errorf("%s: unexpected warnings %s", file, w)
 		}
+	}
+}
+
+// A top-level star form loads (it is valid advanced form) but is not a list
+// rule: the linter must refuse it rather than let a catch-all through.
+func TestLint_TopLevelWildcardRuleIsAnError(t *testing.T) {
+	fs := lintRules(t, "# id: catch-all\n(* )\n")
+	if !HasErrors(fs) || !strings.Contains(findings(fs, SeverityError), "rule catch-all") {
+		t.Fatalf("%v", fs)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
@@ -16,6 +17,43 @@ import (
 // but no usable policy is loaded. Key Attestation then fails closed instead
 // of silently falling back to a different decision procedure.
 var ErrAssuranceUnavailable = errors.New("assurance policy enabled but not loaded")
+
+// KeyAttestationCaller identifies the authenticated caller of a KA request.
+type KeyAttestationCaller struct {
+	TenantID domain.TenantID
+	// UserID is the authenticated user, empty when unknown.
+	UserID string
+}
+
+type callerCtxKey struct{}
+
+// WithKeyAttestationCaller records the authenticated caller in ctx so that
+// GenerateKeyAttestation only accepts evidence from wallet instances that
+// caller owns. Without it (internal callers, tests) no ownership check is
+// made; the HTTP handler always sets it.
+func WithKeyAttestationCaller(ctx context.Context, c KeyAttestationCaller) context.Context {
+	return context.WithValue(ctx, callerCtxKey{}, c)
+}
+
+// lookupOwnedInstance loads a wallet instance and, when the caller is known,
+// requires it to belong to that caller: the same tenant, and the same user
+// when the instance records one. A foreign instance is reported as not found,
+// so another wallet's platform attestation can never raise this caller's KA.
+func (s *WalletProviderService) lookupOwnedInstance(ctx context.Context, walletInstanceID string) (*domain.WalletInstance, error) {
+	instance, err := s.instances.GetByID(ctx, walletInstanceID)
+	if err != nil {
+		return nil, err
+	}
+	if caller, ok := ctx.Value(callerCtxKey{}).(KeyAttestationCaller); ok {
+		if instance.TenantID != caller.TenantID ||
+			(instance.UserID != nil && caller.UserID != "" && instance.UserID.String() != caller.UserID) {
+			s.logger.Warn("wallet instance does not belong to the key attestation caller; ignoring its evidence",
+				zap.String("wallet_instance_id", walletInstanceID))
+			return nil, storage.ErrNotFound
+		}
+	}
+	return instance, nil
+}
 
 // SetAssessor installs the assurance policy used when
 // wallet_provider.attestation.assurance.enabled is true.
@@ -47,7 +85,7 @@ func (s *WalletProviderService) assuranceFacts(ctx context.Context, walletInstan
 	var f assurance.Facts
 
 	if walletInstanceID != "" && s.instances != nil {
-		instance, err := s.instances.GetByID(ctx, walletInstanceID)
+		instance, err := s.lookupOwnedInstance(ctx, walletInstanceID)
 		switch {
 		case err == nil:
 			if instance.AttestationSource != "" {

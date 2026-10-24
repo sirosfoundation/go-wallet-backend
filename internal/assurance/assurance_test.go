@@ -558,3 +558,45 @@ func TestNewFromConfig_StartupChecks(t *testing.T) {
 		t.Fatalf("disabled policy must never block startup: %v", err)
 	}
 }
+
+func TestAssess_ExactEmittedValueBeatsNormalizer(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.LevelSchemes = config.LevelSchemeList{{ID: "iso_18045", Levels: []string{"low", "top"}, Values: []string{"lowv", "certified"}, Floor: "low"}}
+	a := newAssessor(t, cfg, "# id: all\n(assure-ks (tier top)(evidence))\n")
+	a.NormalizeClaim = func(string, string) string { return "lowv" } // maps everything to the floor
+	o := a.Assess(context.Background(), Facts{Claims: Claims{KeyStorage: []string{"certified"}}})
+	if o.KeyStorage.Value != "certified" || o.KeyStorage.Lowered {
+		t.Fatalf("exact match must win over normalisation: %+v", o.KeyStorage)
+	}
+	// Input that matches no configured value is still normalised.
+	o = a.Assess(context.Background(), Facts{Claims: Claims{KeyStorage: []string{"software"}}})
+	if o.KeyStorage.Value != "lowv" {
+		t.Fatalf("unmatched input must be normalised: %+v", o.KeyStorage)
+	}
+}
+
+// go-spocp's advanced-form parser slices into a lone "(" and panics; neither
+// the loader nor the CLI/startup path may crash on such a file.
+func TestLoadRuleSet_MalformedLinesAreErrorsNotPanics(t *testing.T) {
+	for _, line := range []string{"(", ")", "()", "( )", "(((", "(a (b)"} {
+		content := "# id: a\n" + line + "\n"
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Errorf("%q: panicked: %v", line, r)
+				}
+			}()
+			if _, err := LoadRuleSet(writeRules(t, "p.rules", content)); err == nil {
+				t.Errorf("%q: expected an error", line)
+			}
+		}()
+	}
+}
+
+// Defence in depth: even if a line got past checkRuleLine, a loader panic
+// becomes an error.
+func TestLoadAdvanced_RecoversFromLoaderPanic(t *testing.T) {
+	if _, err := loadAdvanced(writeRules(t, "p.rules", "(\n")); err == nil || !strings.Contains(err.Error(), "panicked") {
+		t.Fatalf("err = %v", err)
+	}
+}

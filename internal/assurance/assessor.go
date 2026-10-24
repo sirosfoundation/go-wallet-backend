@@ -200,11 +200,13 @@ func (a *Assessor) Schemes() (ks, ua *Scheme) { return a.ks, a.ua }
 func (a *Assessor) claimIndex(s *Scheme, raws []string) (idx int, atomValue string, ok bool) {
 	idx = -1
 	for _, raw := range raws {
-		v := raw
-		if a.NormalizeClaim != nil {
-			v = a.NormalizeClaim(s.ID, raw)
+		// An exact match of a configured emitted value wins; only input
+		// that matches nothing is normalised (legacy vocabulary), so a
+		// scheme that replaces iso_18045 is never second-guessed.
+		i, known := s.byValue[raw]
+		if !known && a.NormalizeClaim != nil {
+			i, known = s.byValue[a.NormalizeClaim(s.ID, raw)]
 		}
-		i, known := s.byValue[v]
 		if !known {
 			// An unrecognised claim cannot be trusted to mean anything:
 			// it counts as the scheme's floor.

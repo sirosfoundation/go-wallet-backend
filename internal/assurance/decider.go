@@ -156,23 +156,6 @@ func LoadRuleSet(path string) (*RuleSet, error) {
 	}
 	sum := sha256.Sum256(data)
 
-	opts := persist.DefaultLoadOptions()
-	opts.Format = persist.FormatAdvanced
-	elems, err := persist.LoadFile(path, opts)
-	if err != nil {
-		return nil, fmt.Errorf("load rules file %s: %w", path, err)
-	}
-
-	// The loader reopened the file: refuse a file that changed in between,
-	// so the hash we report is the hash of the rules we loaded.
-	again, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("re-read rules file: %w", err)
-	}
-	if !bytes.Equal(again, data) {
-		return nil, fmt.Errorf("rules file %s changed while loading", path)
-	}
-
 	type idLine struct {
 		id   string
 		line int
@@ -211,6 +194,21 @@ func LoadRuleSet(path string) (*RuleSet, error) {
 	if pending != "" {
 		return nil, fmt.Errorf("line %d: rule id %q is not followed by a rule", pendingLine, pending)
 	}
+	elems, err := loadAdvanced(path)
+	if err != nil {
+		return nil, fmt.Errorf("load rules file %s: %w", path, err)
+	}
+
+	// The loader reopened the file: refuse a file that changed in between,
+	// so the hash we report is the hash of the rules we loaded.
+	again, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("re-read rules file: %w", err)
+	}
+	if !bytes.Equal(again, data) {
+		return nil, fmt.Errorf("rules file %s changed while loading", path)
+	}
+
 	if len(ids) != len(elems) {
 		return nil, fmt.Errorf("rules file %s: %d rule lines but the loader returned %d rules", path, len(ids), len(elems))
 	}
@@ -232,6 +230,21 @@ func LoadRuleSet(path string) (*RuleSet, error) {
 		rs.Rules = append(rs.Rules, Rule{ID: il.id, Element: el, Line: il.line})
 	}
 	return rs, nil
+}
+
+// loadAdvanced runs go-spocp's advanced-form loader. Every line was already
+// validated by checkRuleLine, but the loader indexes into its input without
+// guarding (a lone "(" panics), so a panic is turned into an error rather
+// than a crash at startup.
+func loadAdvanced(path string) (elems []sexp.Element, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			elems, err = nil, fmt.Errorf("rules loader panicked: %v", r)
+		}
+	}()
+	opts := persist.DefaultLoadOptions()
+	opts.Format = persist.FormatAdvanced
+	return persist.LoadFile(path, opts)
 }
 
 // SpocpDecider is the in-process go-spocp implementation of AssuranceDecider.

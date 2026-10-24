@@ -44,6 +44,10 @@ reported in the startup log, the audit line and the `policy_info` metric):
   always emits every slot.
 * The `fido2` slot is `verified` only when **every** key in the batch has a
   FIDO2 record and all records agree on the AAGUID. Otherwise it is `none`.
+* The instance's platform evidence is only used when the instance belongs to
+  the authenticated caller: same tenant, and same user when the instance
+  records one. A foreign `wallet_instance_id` is treated as unknown. This
+  applies with the policy disabled too.
 * `platform (source ...)` carries the stored string verbatim:
   `platform_attested`, `development_attested` or `backend_attested`. They are
   distinct atoms; `development_attested` is not treated as `platform_attested`.

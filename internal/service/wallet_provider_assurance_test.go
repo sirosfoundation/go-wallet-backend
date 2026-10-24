@@ -404,3 +404,64 @@ func toStrings(v interface{}) []string {
 	}
 	return out
 }
+
+// --- instance ownership ---------------------------------------------------
+
+func TestInstanceOwnership_ForeignInstanceLendsNoEvidence(t *testing.T) {
+	owner := domain.UserIDFromString("owner")
+	cases := []struct {
+		name   string
+		caller *KeyAttestationCaller
+		inst   *domain.WalletInstance
+		want   bool
+	}{
+		{"owner", &KeyAttestationCaller{TenantID: "t1", UserID: "owner"}, &domain.WalletInstance{ID: "i", TenantID: "t1", UserID: &owner}, true},
+		{"other tenant", &KeyAttestationCaller{TenantID: "t2", UserID: "owner"}, &domain.WalletInstance{ID: "i", TenantID: "t1", UserID: &owner}, false},
+		{"other user", &KeyAttestationCaller{TenantID: "t1", UserID: "mallory"}, &domain.WalletInstance{ID: "i", TenantID: "t1", UserID: &owner}, false},
+		{"instance without user, same tenant", &KeyAttestationCaller{TenantID: "t1", UserID: "owner"}, &domain.WalletInstance{ID: "i", TenantID: "t1"}, true},
+		{"instance without user, other tenant", &KeyAttestationCaller{TenantID: "t2"}, &domain.WalletInstance{ID: "i", TenantID: "t1"}, false},
+		{"no caller in context: no check", nil, &domain.WalletInstance{ID: "i", TenantID: "t1", UserID: &owner}, true},
+	}
+	for _, c := range cases {
+		svc, instances, _ := assuranceSvc(t, nil,
+			"# id: plat\n(assure-ks (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2)(platform (source platform_attested)))))\n")
+		c.inst.AttestationSource = "platform_attested"
+		if err := instances.Upsert(context.Background(), c.inst); err != nil {
+			t.Fatal(err)
+		}
+		ctx := context.Background()
+		if c.caller != nil {
+			ctx = WithKeyAttestationCaller(ctx, *c.caller)
+		}
+		jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}
+
+		// Legacy path.
+		if got := svc.keyAttestationTrustsBatch(ctx, "i", jwks); got != c.want {
+			t.Errorf("%s: legacy trust = %v, want %v", c.name, got, c.want)
+		}
+		// Policy path.
+		ka, err := svc.GenerateKeyAttestation(ctx, jwks, "n", nil, "i", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := parseKAClaims(t, ka)["key_storage"].([]interface{})[0] == "iso_18045_moderate"
+		if got != c.want {
+			t.Errorf("%s: policy raised = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// A configured scheme that replaces iso_18045 keeps its own values: an exact
+// match of a configured emitted value is never run through the legacy
+// normaliser (which would map the unknown string to basic).
+func TestAssurance_ReplacedISOSchemeClaimMatchesExactValueBeforeNormalizing(t *testing.T) {
+	mut := func(c *config.AssuranceConfig) {
+		c.LevelSchemes = config.LevelSchemeList{{ID: "iso_18045", Levels: []string{"low", "top"}, Values: []string{"lowv", "certified"}, Floor: "low"}}
+	}
+	svc, _, _ := assuranceSvc(t, mut, "# id: all\n(assure-ks (tier top)(evidence))\n")
+	ka, err := svc.GenerateKeyAttestation(context.Background(), twoKeys(), "n", &SecurityProperties{KeyStorage: []string{"certified"}}, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertKeyStorage(t, parseKAClaims(t, ka), "certified")
+}

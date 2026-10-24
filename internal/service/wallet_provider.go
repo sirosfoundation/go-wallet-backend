@@ -468,7 +468,7 @@ var nativeAttestationSources = map[string]bool{
 // unattested, never a genuinely homogeneous hardware-backed batch.
 func (s *WalletProviderService) keyAttestationTrustsBatch(ctx context.Context, walletInstanceID string, jwks []map[string]interface{}) bool {
 	if walletInstanceID != "" && s.instances != nil {
-		instance, err := s.instances.GetByID(ctx, walletInstanceID)
+		instance, err := s.lookupOwnedInstance(ctx, walletInstanceID)
 		if err != nil {
 			if !errors.Is(err, storage.ErrNotFound) {
 				s.logger.Warn("failed to look up wallet instance for KA trust check", zap.Error(err))

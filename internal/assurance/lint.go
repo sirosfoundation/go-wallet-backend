@@ -62,14 +62,18 @@ var KnownDimensions = map[string]bool{
 type slot struct {
 	name     string
 	children []slot
+	// noneOK marks slots the builder emits as (slot none) when absent, so a
+	// rule may name that case. Containers (evidence, verified, claimed) are
+	// always emitted with child lists, so "none" there can never match.
+	noneOK bool
 }
 
 // evidenceLayout MUST mirror Evidence.Element.
 var evidenceLayout = slot{name: "evidence", children: []slot{
 	{name: "verified", children: []slot{
-		{name: "fido2", children: []slot{{name: "mds3"}, {name: "aaguid"}, {name: "uv"}, {name: "cert"}}},
-		{name: "platform", children: []slot{{name: "source"}, {name: "app_id"}}},
-		{name: "hsm", children: []slot{{name: "id"}}},
+		{name: "fido2", noneOK: true, children: []slot{{name: "mds3"}, {name: "aaguid"}, {name: "uv"}, {name: "cert"}}},
+		{name: "platform", noneOK: true, children: []slot{{name: "source"}, {name: "app_id"}}},
+		{name: "hsm", noneOK: true, children: []slot{{name: "id"}}},
 	}},
 	{name: "claimed", children: []slot{
 		{name: "plugin"}, {name: "key_storage"}, {name: "user_authentication"}, {name: "certification"},
@@ -124,7 +128,7 @@ func lintRule(r Rule, cfg *config.AssuranceConfig) []Finding {
 	}
 
 	var out []Finding
-	out = append(out, checkLayout(list, topLayout(list.Tag), list.Tag, errf)...)
+	out = append(out, checkLayout(list, topLayout(list.Tag), false, list.Tag, errf)...)
 
 	// Candidate values against the configuration.
 	if cfg != nil {
@@ -151,15 +155,15 @@ func knownList() string {
 
 // checkLayout verifies that l's child lists appear in the canonical order,
 // as a prefix of layout, and recurses into slots that have sub-slots.
-func checkLayout(l *sexp.List, layout []slot, path string, errf func(string, ...interface{}) Finding) []Finding {
+func checkLayout(l *sexp.List, layout []slot, noneOK bool, path string, errf func(string, ...interface{}) Finding) []Finding {
 	var out []Finding
 	for i, el := range l.Elements {
 		child, isList := el.(*sexp.List)
 		if !isList {
-			// (slot none) and star forms are values, valid only in a slot
-			// that has no sub-slots, or as the "absent" marker.
+			// A value where sub-slots belong can never match, except the
+			// "absent" marker (slot none) of an optional verified slot.
 			if len(layout) > 0 {
-				if a, isAtom := el.(*sexp.Atom); isAtom && a.Value == None && len(l.Elements) == 1 {
+				if a, isAtom := el.(*sexp.Atom); isAtom && a.Value == None && len(l.Elements) == 1 && noneOK {
 					continue
 				}
 				out = append(out, errf("%s position %d: expected slot (%s) but found a value; positional matching would never match", path, i, layout[min(i, len(layout)-1)].name))
@@ -178,7 +182,7 @@ func checkLayout(l *sexp.List, layout []slot, path string, errf func(string, ...
 				path, i, child.Tag, layout[i].name, slotNames(layout)))
 			continue
 		}
-		out = append(out, checkLayout(child, layout[i].children, path+"/"+child.Tag, errf)...)
+		out = append(out, checkLayout(child, layout[i].children, layout[i].noneOK, path+"/"+child.Tag, errf)...)
 	}
 	return out
 }
