@@ -1037,3 +1037,50 @@ func TestAppAttest_FailedEnrollmentCanBeRetriedWithTheSameRequest(t *testing.T) 
 		t.Fatalf("challenge reusable after success: %v", err)
 	}
 }
+
+// flakyChallengePut fails the first n Put calls, then delegates.
+type flakyChallengePut struct {
+	WIAChallengeStore
+	fail  int
+	calls int
+}
+
+func (f *flakyChallengePut) Put(ctx context.Context, t domain.TenantID, c string, exp time.Time) (bool, error) {
+	f.calls++
+	if err := ctx.Err(); err != nil { // like a real database driver
+		return false, err
+	}
+	if f.calls <= f.fail {
+		return false, errors.New("db down")
+	}
+	return f.WIAChallengeStore.Put(ctx, t, c, exp)
+}
+
+// The compensating insert survives a transient storage failure and a
+// cancelled request context, and gives up (without panicking) when the store
+// stays down.
+func TestRestoreChallenge_RetriesAndSurvivesCancellation(t *testing.T) {
+	for name, tc := range map[string]struct {
+		fail     int
+		wantBack bool
+	}{
+		"transient": {fail: 2, wantBack: true},
+		"persists":  {fail: 100, wantBack: false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc, _ := newTestWIAServiceWithInstances(t)
+			flaky := &flakyChallengePut{WIAChallengeStore: svc.challenges, fail: tc.fail}
+			svc.challenges = flaky
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel() // the request context is already gone
+			svc.restoreChallenge(ctx, domain.DefaultTenantID, "chal-x")
+			ok, err := svc.challenges.Consume(context.Background(), "chal-x")
+			if err != nil || ok != tc.wantBack {
+				t.Fatalf("restored = %v (err %v), want %v after %d Put calls", ok, err, tc.wantBack, flaky.calls)
+			}
+			if flaky.calls > restoreChallengeAttempts {
+				t.Fatalf("%d Put calls, bound is %d", flaky.calls, restoreChallengeAttempts)
+			}
+		})
+	}
+}

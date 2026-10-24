@@ -312,17 +312,40 @@ func (s *WIAService) consumeChallenge(ctx context.Context, challenge string) err
 }
 
 // restoreChallenge puts a consumed challenge back for a retry after a
-// retryable server-side failure. Best effort: if it cannot be stored the caller
-// simply needs a new challenge.
+// retryable server-side failure. The failure it compensates for is usually a
+// storage blip that may still be in progress, so the Put is retried a few
+// times with a short backoff and runs detached from the request's
+// cancellation (a client that gave up must not strand its once-per-key
+// enrollment). It stays best effort: if the store is down throughout, the
+// caller needs a new challenge and, for App Attest, a new key.
 func (s *WIAService) restoreChallenge(ctx context.Context, tenantID domain.TenantID, challenge string) {
 	ttl := time.Duration(s.cfg.WalletProvider.WIA.ChallengeTTLSeconds) * time.Second
 	if ttl <= 0 {
 		ttl = 5 * time.Minute
 	}
-	if ok, err := s.challenges.Put(ctx, tenantID, challenge, time.Now().Add(ttl)); err != nil || !ok {
-		s.logger.Warn("could not restore the WIA challenge after a retryable failure", zap.Error(err))
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	var err error
+	for attempt, backoff := 0, 50*time.Millisecond; attempt < restoreChallengeAttempts; attempt, backoff = attempt+1, backoff*3 {
+		var ok bool
+		if ok, err = s.challenges.Put(ctx, tenantID, challenge, time.Now().Add(ttl)); err == nil {
+			if !ok {
+				s.logger.Warn("could not restore the WIA challenge: store at capacity")
+			}
+			return
+		}
+		if attempt+1 < restoreChallengeAttempts {
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+			}
+		}
 	}
+	s.logger.Warn("could not restore the WIA challenge after a retryable failure", zap.Error(err))
 }
+
+// restoreChallengeAttempts bounds restoreChallenge's retries of the Put.
+const restoreChallengeAttempts = 3
 
 // WIARequest contains the parameters for WIA generation.
 type WIARequest struct {
