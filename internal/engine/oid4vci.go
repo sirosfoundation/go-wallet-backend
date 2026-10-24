@@ -2750,8 +2750,15 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		h.updateDPoPNonce(resp)
 
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes+1))
 			_ = resp.Body.Close()
+			if len(body) > MaxErrorBodyBytes {
+				// Too large to classify: it could be an auxiliary_data_conflict
+				// whose text echoes a commitment. Fail closed, log nothing of it.
+				h.Logger.Debug("credential endpoint error body too large", zap.Int("status", resp.StatusCode))
+				_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
+				return nil, fmt.Errorf("credential endpoint returned status %d with an oversized error body", resp.StatusCode)
+			}
 			// Recognise the conflict BEFORE the raw body is logged: its
 			// error_description may echo a commitment.
 			if conflictErr := h.auxiliaryDataConflictError(resp.StatusCode, body); conflictErr != nil {
@@ -3160,7 +3167,12 @@ func (h *OID4VCIHandler) relayAuxiliaryDataConflict(resp *http.Response) error {
 	if resp.StatusCode != http.StatusBadRequest {
 		return nil
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes+1))
+	if len(body) > MaxErrorBodyBytes {
+		// Too large to classify (it may be a conflict): fail closed, no retry.
+		_ = resp.Body.Close()
+		return fmt.Errorf("credential endpoint returned status %d with an oversized error body", resp.StatusCode)
+	}
 	if err := h.auxiliaryDataConflictError(resp.StatusCode, body); err != nil {
 		_ = resp.Body.Close()
 		return err

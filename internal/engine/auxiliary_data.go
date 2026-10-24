@@ -486,6 +486,9 @@ func auxiliaryDataOfProof(proof ProofObject, advertised map[string]auxAdv, anyRe
 		// Every hash_commitment entry is checked, advertised or not: an
 		// opening (a secret) must never be forwarded to the issuer.
 		if typ == auxTypeHashCommitment {
+			if _, ok := claimsPathKey(e["path"]); !ok || entryAlg == "" {
+				return "", auxProofErr("a hash_commitment entry lacks a valid path or alg")
+			}
 			if err := checkCommitment(e, entryAlg); err != nil {
 				return "", err
 			}

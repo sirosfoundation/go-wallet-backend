@@ -498,6 +498,8 @@ func TestVerifyProofsCarryAuxiliaryData(t *testing.T) {
 		"optional with wrong alg":     proofs(append(good(), map[string]interface{}{"type": "hash_commitment", "alg": "sha-512", "path": []string{"n", "opt"}, "commitment": good()[0]["commitment"]})),
 		"unadvertised opening":        proofs(append(good(), map[string]interface{}{"type": "hash_commitment", "alg": "sha-256", "path": []string{"n", "other"}, "opening": "SECRET"})),
 		"unadvertised bad commitment": proofs(append(good(), map[string]interface{}{"type": "hash_commitment", "alg": "sha-256", "path": []string{"n", "other"}, "commitment": "AAAA"})),
+		"unadvertised no path":        proofs(append(good(), map[string]interface{}{"type": "hash_commitment", "alg": "sha-256", "commitment": good()[0]["commitment"]})),
+		"unadvertised no alg":         proofs(append(good(), map[string]interface{}{"type": "hash_commitment", "path": []string{"n", "z"}, "commitment": good()[0]["commitment"]})),
 		"not a JWT":                   {{ProofType: "jwt", JWT: "proof-0"}},
 		"attestation w/o claim":       {{ProofType: "attestation", Attestation: auxProofJWT(t, nil)}},
 		"unknown proof type":          {{ProofType: "di_vp"}},
@@ -587,4 +589,28 @@ func TestIssuance_RequiredAuxiliaryDataMissingFailsClosed(t *testing.T) {
 		}
 	}
 	assert.Equal(t, []string{"AUXILIARY_DATA_PROOF_INVALID"}, codes)
+}
+
+// An error body over the limit cannot be classified: it is neither logged nor
+// retried (even with a DPoP-Nonce header), and is not taken for a conflict.
+func TestOversizedErrorBodyFailsClosed(t *testing.T) {
+	big := `{"error":"auxiliary_data_conflict","error_description":"SECRET-ISSUER-TEXT ` + strings.Repeat("x", MaxErrorBodyBytes) + `"}`
+	for name, dpop := range map[string]bool{"plain": false, "with DPoP-Nonce header": true} {
+		t.Run(name, func(t *testing.T) {
+			st, hits := conflictStub(t, big, dpop)
+			fc := &fakeClient{t: t}
+			h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
+			defer cleanup()
+			err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", auxCfg(auxAdvFull), nil, "")
+			require.Error(t, err)
+			assert.Equal(t, 1, *hits, "never retried")
+			assert.NotContains(t, logDump(logs), "SECRET-ISSUER-TEXT")
+			assert.NotContains(t, err.Error(), "SECRET-ISSUER-TEXT")
+			fc.settle()
+			for _, m := range fc.outboundMessages() {
+				assert.NotContains(t, string(m["error"]), "SECRET-ISSUER-TEXT")
+				assert.NotContains(t, string(m["error"]), "AUXILIARY_DATA_CONFLICT")
+			}
+		})
+	}
 }
