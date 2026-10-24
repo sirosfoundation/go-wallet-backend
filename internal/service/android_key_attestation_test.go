@@ -648,6 +648,27 @@ func TestInitialAge(t *testing.T) {
 	}
 }
 
+// A list that takes time to download is older when it arrives: the body-read
+// time counts against its freshness.
+func TestHTTPStatusFetcher_SlowBodyCountsTowardsAge(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "max-age=600")
+		w.Header().Set("Age", "5")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		time.Sleep(400 * time.Millisecond)
+		_, _ = w.Write([]byte(emptyStatusList))
+	}))
+	defer srv.Close()
+	_, fresh, err := NewHTTPAttestationStatusFetcher(srv.Client(), srv.URL).Fetch(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Age < 5*time.Second+350*time.Millisecond {
+		t.Fatalf("Age = %v, the body download time was not counted", fresh.Age)
+	}
+}
+
 func TestHTTPStatusFetcher(t *testing.T) {
 	var status int
 	var hdr map[string]string

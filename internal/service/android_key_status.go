@@ -71,7 +71,6 @@ func (f *httpStatusFetcher) Fetch(ctx context.Context) ([]byte, StatusFreshness,
 		return nil, none, err
 	}
 	defer func() { _ = resp.Body.Close() }()
-	received := time.Now()
 	if resp.StatusCode != http.StatusOK {
 		return nil, none, fmt.Errorf("status list: HTTP %d", resp.StatusCode)
 	}
@@ -82,6 +81,8 @@ func (f *httpStatusFetcher) Fetch(ctx context.Context) ([]byte, StatusFreshness,
 	if len(body) > maxAndroidStatusBytes {
 		return nil, none, errors.New("status list too large")
 	}
+	// The response is complete only now: a slow body counts against its life.
+	received := time.Now()
 	return body, StatusFreshness{
 		MaxAge: cacheControlMaxAge(resp.Header.Get("Cache-Control")),
 		Age:    initialAge(resp.Header, sent, received),
