@@ -3258,3 +3258,35 @@ func TestConfig_Validate_AS_RequiresExternalURL(t *testing.T) {
 		t.Fatalf("AS disabled must not need external_url: %v", err)
 	}
 }
+
+func TestAndroidKeyAttestationConfig_YAMLAndEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+wallet_provider:
+  attestation:
+    android_key_attestation:
+      trust_anchors_path: /etc/siros/android-roots.pem
+      allowed_app_digests: ["aa", "bb"]
+      allowed_packages: [org.siros.wallet]
+      status_list_url: https://example.test/status
+      status_list_default_ttl_seconds: 120
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_TRUST_ANCHORS_PEM", "PEMDATA")
+	t.Setenv("WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_ALLOWED_APP_DIGESTS", "cc,dd")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := cfg.WalletProvider.Attestation.AndroidKeyAttestation
+	if a.TrustAnchorsPath != "/etc/siros/android-roots.pem" || a.TrustAnchorsPEM != "PEMDATA" ||
+		len(a.AllowedAppDigests) != 2 || a.AllowedAppDigests[0] != "cc" || // the environment overrides the file
+		len(a.AllowedPackages) != 1 || a.StatusListURL != "https://example.test/status" || a.StatusListDefaultTTLSeconds != 120 {
+		t.Fatalf("android_key_attestation = %+v", a)
+	}
+}

@@ -94,6 +94,8 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain, store.WalletInstances(), wiaAuditor, challengeStore)
 		wiaSvc.SetAssessor(assessor)
 		wiaSvc.SetKeyAttestations(store.KeyAttestations())
+		// Instance-key evidence verifiers, one line per key_attestation type.
+		wiaSvc.RegisterInstanceKeyVerifier(newAndroidKeyVerifierForServer(cfg, logger))
 		// A signing key alone is enough to construct WIAService, but "etsi"
 		// mode additionally requires a certificate chain (see IsSupported).
 		// Leaving wiaSvc non-nil here would register the WIA routes, but
