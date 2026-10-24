@@ -502,20 +502,24 @@ func TestInstanceFreshness_StalePlatformEvidenceLendsNothing(t *testing.T) {
 	cases := []struct {
 		name     string
 		lifetime int
+		maxExp   int
 		at       time.Time
 		want     bool
 	}{
-		{"just attested", 0, time.Now(), true},
-		{"within default window", 0, time.Now().Add(-4 * time.Minute), true},
-		{"past default window", 0, time.Now().Add(-6 * time.Minute), false},
-		{"within configured lifetime", 3600, time.Now().Add(-30 * time.Minute), true},
-		{"past configured lifetime", 60, time.Now().Add(-2 * time.Minute), false},
-		{"never recorded", 0, time.Time{}, false},
+		{"just attested", 300, 0, time.Now(), true},
+		{"within lifetime", 300, 0, time.Now().Add(-4 * time.Minute), true},
+		{"past lifetime", 300, 0, time.Now().Add(-6 * time.Minute), false},
+		{"within long lifetime", 3600, 0, time.Now().Add(-30 * time.Minute), true},
+		{"lifetime capped by wia max expiry", 3600, 300, time.Now().Add(-10 * time.Minute), false},
+		{"within wia max expiry cap", 3600, 300, time.Now().Add(-4 * time.Minute), true},
+		{"lifetime unset follows wia max expiry", 0, 120, time.Now().Add(-3 * time.Minute), false},
+		{"never recorded", 300, 0, time.Time{}, false},
 	}
 	for _, c := range cases {
 		svc, instances, _ := assuranceSvc(t, nil,
 			"# id: plat\n(assure-ks (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2)(platform (source platform_attested)))))\n")
 		svc.cfg.WalletProvider.Attestation.LifetimeSeconds = c.lifetime
+		svc.cfg.WalletProvider.WIA.MaxExpirySeconds = c.maxExp
 		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i", AttestationSource: "platform_attested", LastAttestedAt: c.at}); err != nil {
 			t.Fatal(err)
 		}

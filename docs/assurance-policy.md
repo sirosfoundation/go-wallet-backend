@@ -47,8 +47,9 @@ reported in the startup log, the audit line and the `policy_info` metric):
 * The instance's platform evidence is only used when the instance belongs to
   the authenticated caller: same tenant, and same user when the instance
   records one, the instance is active (suspended or revoked instances lend nothing), and
-  its last WIA is within `attestation.lifetime_seconds` (default 5 minutes;
-  platform integrity is re-derived on every WIA, so older evidence is stale). A foreign `wallet_instance_id` is treated as unknown. This applies
+  its last WIA is within the effective WIA lifetime (`attestation.lifetime_seconds`
+  capped by `wia.max_expiry_seconds`, as `signWIA` applies them; platform
+  integrity is re-derived on every WIA, so older evidence is stale). A foreign `wallet_instance_id` is treated as unknown. This applies
   with the policy disabled too.
 * `platform (source ...)` carries the stored string verbatim:
   `platform_attested`, `development_attested` or `backend_attested`. They are

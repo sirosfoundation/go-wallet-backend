@@ -73,17 +73,13 @@ func (s *WalletProviderService) lookupOwnedInstance(ctx context.Context, walletI
 	return instance, nil
 }
 
-// defaultPlatformEvidenceMaxAge applies when attestation.lifetime_seconds is
-// unset; it matches that setting's default.
-const defaultPlatformEvidenceMaxAge = 5 * time.Minute
-
 // platformEvidenceMaxAge is how long after its last WIA an instance's
-// platform attestation may still back a Key Attestation: the WIA lifetime.
+// platform attestation may still back a Key Attestation: the effective WIA
+// lifetime (lifetime_seconds capped by wia.max_expiry_seconds), exactly what
+// signWIA applies.
 func (s *WalletProviderService) platformEvidenceMaxAge() time.Duration {
-	if s.cfg != nil && s.cfg.WalletProvider.Attestation.LifetimeSeconds > 0 {
-		return time.Duration(s.cfg.WalletProvider.Attestation.LifetimeSeconds) * time.Second
-	}
-	return defaultPlatformEvidenceMaxAge
+	d, _ := effectiveWIALifetime(s.cfg)
+	return d
 }
 
 // SetAssessor installs the assurance policy used when
