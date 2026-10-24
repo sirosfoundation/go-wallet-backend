@@ -380,7 +380,7 @@ is registered by its own stage). The request is classified as follows:
 | field absent | no instance-key evidence, home `unknown` |
 | `type` not registered | HTTP 400 `KEY_ATTESTATION_TYPE_UNSUPPORTED`, before the single-use challenge is consumed |
 | evidence invalid (malformed, broken chain, expired certificate, wrong leaf key, wrong challenge, missing attestation extension, revoked certificate) | WIA refused, HTTP 400 `KEY_ATTESTATION_INVALID` (same rule as a failing native attestation) |
-| the evidence cannot be judged (no fresh revocation list) | WIA refused, HTTP 503 `KEY_ATTESTATION_UNAVAILABLE`, nothing recorded |
+| the evidence cannot be judged (no fresh revocation list) or a verified record cannot be stored (storage outage) | WIA refused, HTTP 503 `KEY_ATTESTATION_UNAVAILABLE`, nothing recorded |
 | sound but names no home (see below) | no record; the WIA issues with the home `unknown` |
 | verified hardware-backed | record written, home `strongbox` or `tee` |
 
