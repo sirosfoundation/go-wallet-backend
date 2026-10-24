@@ -120,6 +120,17 @@ const (
 	ErrCodeNoMatchingCredentials ErrorCode = "NO_MATCHING_CREDENTIALS"
 	ErrCodeInternalError         ErrorCode = "INTERNAL_ERROR"
 	ErrCodeTooManyRequests       ErrorCode = "TOO_MANY_REQUESTS"
+	// ErrCodeAuxiliaryDataConflict: the issuer rejected the credential request
+	// with the OpenID4VCI Credential Auxiliary Data error code
+	// auxiliary_data_conflict (an entry conflicts with a value it holds for
+	// the subject; retrying never helps, the issuer resolves it out of band).
+	// The flow_error details carry the issuer's code unchanged under "error";
+	// no other issuer text is relayed.
+	ErrCodeAuxiliaryDataConflict ErrorCode = "AUXILIARY_DATA_CONFLICT"
+	// ErrCodeAuxiliaryDataProofInvalid: the key proofs the client returned do
+	// not carry the issuer's required auxiliary_data entries correctly. Nothing
+	// was sent to the issuer.
+	ErrCodeAuxiliaryDataProofInvalid ErrorCode = "AUXILIARY_DATA_PROOF_INVALID"
 )
 
 // UserFacingMessage returns a generic user-facing message for an error code.
@@ -172,6 +183,10 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "Internal server error"
 	case ErrCodeTooManyRequests:
 		return "Too many requests"
+	case ErrCodeAuxiliaryDataProofInvalid:
+		return "The wallet did not attach the data the issuer requires"
+	case ErrCodeAuxiliaryDataConflict:
+		return "The issuer holds a conflicting value for you; it must be resolved with the issuer"
 	default:
 		return "An error occurred"
 	}
@@ -411,7 +426,7 @@ type FlowCompleteMessage struct {
 	// response: the display members (see displayMetadataMembers) of its
 	// response-level credential_metadata, applying to every credential in
 	// Credentials. Every other member, in particular the namespaced
-	// org.siros.secret_seed, is dropped by the engine and never relayed or
+	// every configured secret member (issuance.secret_members), is dropped by the engine and never relayed or
 	// logged. Never present when CredentialResponseEncrypted is true.
 	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
 }
@@ -508,6 +523,26 @@ type SignRequestParams struct {
 	// (signWithExistingKeypair(kid, payload)). Empty for ordinary issuance.
 	ReissuanceKid string `json:"reissuance_kid,omitempty"`
 
+	// AuxiliaryDataToIssuer (generate_proof only): the issuer's advertised
+	// credential_configurations_supported.<id>.auxiliary_data_supported.to_issuer
+	// entries, verbatim (type, alg, path, required, and any other member the
+	// issuer put there). The wallet decides placement: for each entry it
+	// recognises it puts an auxiliary_data entry {type, alg, path, commitment}
+	// in the SIGNED part of every key proof it returns, the same value in all
+	// proofs of the request, and it MUST send every entry with required=true
+	// (OpenID4VCI Credential Auxiliary Data v0.1, section 6). The engine never
+	// computes or sees a commitment value.
+	AuxiliaryDataToIssuer []json.RawMessage `json:"auxiliary_data_to_issuer,omitempty"`
+	// CredentialType and CredentialIssuer (generate_proof only; set whenever
+	// AuxiliaryDataToIssuer is non-empty, and by the holder-commitment (psc)
+	// request of #468, with identical names, types and meaning): the wallet
+	// derives its per-issuer value for (CredentialType, CredentialIssuer).
+	// CredentialType is the configuration's `vct`, or its `doctype` for mdoc;
+	// CredentialIssuer is the exact `credential_issuer` string of the issuer
+	// metadata.
+	CredentialType   string `json:"credential_type,omitempty"`
+	CredentialIssuer string `json:"credential_issuer,omitempty"`
+
 	// SignActionSignClientAuth parameters. HTM and HTU, when set, ask for a
 	// DPoP proof over that HTTP method and URL; DPoPNonce is the
 	// server-provided DPoP nonce to include (RFC 9449 §8), ATH the
@@ -545,7 +580,7 @@ type SignRequestParams struct {
 // CredentialResponseEncryptionParams is the negotiated credential response
 // encryption the engine asks the client to generate a key for. Required means
 // the engine fails the issuance when the client declines (the issuer demands
-// encryption, or advertises org.siros.secret_seed).
+// encryption, or advertises secret delivery to the wallet).
 type CredentialResponseEncryptionParams struct {
 	Alg      string `json:"alg"`
 	Enc      string `json:"enc"`
