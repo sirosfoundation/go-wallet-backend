@@ -1327,9 +1327,11 @@ func TestCreateChallenge_DefaultTTL(t *testing.T) {
 
 func TestWSCDTypeFromKeyHome(t *testing.T) {
 	cases := map[domain.KeyHome]domain.WSCDType{
-		domain.KeyHomeStrongBox:             domain.WSCDTypeNativeAndroid,
-		domain.KeyHomeTEE:                   domain.WSCDTypeNativeAndroid,
-		domain.KeyHomeSecureEnclaveAsserted: domain.WSCDTypeNativeIOS,
+		domain.KeyHomeStrongBox: domain.WSCDTypeNativeAndroid,
+		domain.KeyHomeTEE:       domain.WSCDTypeNativeAndroid,
+		// An App Attest assertion shows an attested app endorsed the key, not
+		// Secure Enclave residency, so the home never yields native_ios.
+		domain.KeyHomeSecureEnclaveAsserted: domain.WSCDTypeUnknown,
 		domain.KeyHomeFIDO2Hardware:         domain.WSCDTypeFIDO2Hardware,
 		domain.KeyHomeHSM:                   domain.WSCDTypeRemote,
 		"":                                  domain.WSCDTypeUnknown,
