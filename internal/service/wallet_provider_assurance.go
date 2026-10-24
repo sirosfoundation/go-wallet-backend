@@ -35,14 +35,22 @@ func WithKeyAttestationCaller(ctx context.Context, c KeyAttestationCaller) conte
 	return context.WithValue(ctx, callerCtxKey{}, c)
 }
 
-// lookupOwnedInstance loads a wallet instance and, when the caller is known,
-// requires it to belong to that caller: the same tenant, and the same user
+// lookupOwnedInstance loads an active wallet instance and, when the caller is
+// known, requires it to belong to that caller: the same tenant, and the same user
 // when the instance records one. A foreign instance is reported as not found,
 // so another wallet's platform attestation can never raise this caller's KA.
 func (s *WalletProviderService) lookupOwnedInstance(ctx context.Context, walletInstanceID string) (*domain.WalletInstance, error) {
 	instance, err := s.instances.GetByID(ctx, walletInstanceID)
 	if err != nil {
 		return nil, err
+	}
+	// A suspended or revoked instance keeps its AttestationSource, but must
+	// not keep lending platform evidence. An unset status (records that
+	// predate the field) is not treated as deactivated.
+	if instance.Status != "" && instance.Status != domain.InstanceStatusActive {
+		s.logger.Warn("wallet instance is not active; ignoring its evidence",
+			zap.String("wallet_instance_id", walletInstanceID), zap.String("status", string(instance.Status)))
+		return nil, storage.ErrNotFound
 	}
 	if caller, ok := ctx.Value(callerCtxKey{}).(KeyAttestationCaller); ok {
 		if instance.TenantID != caller.TenantID ||

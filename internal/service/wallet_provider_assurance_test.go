@@ -465,3 +465,32 @@ func TestAssurance_ReplacedISOSchemeClaimMatchesExactValueBeforeNormalizing(t *t
 	}
 	assertKeyStorage(t, parseKAClaims(t, ka), "certified")
 }
+
+// Suspended and revoked instances keep their AttestationSource but lend no
+// platform evidence, on both the legacy and the policy path.
+func TestInstanceStatus_DeactivatedInstanceLendsNoEvidence(t *testing.T) {
+	for status, want := range map[domain.InstanceStatus]bool{
+		domain.InstanceStatusActive:    true,
+		"":                             true, // records predating the field
+		domain.InstanceStatusSuspended: false,
+		domain.InstanceStatusRevoked:   false,
+		"something-new":                false,
+	} {
+		svc, instances, _ := assuranceSvc(t, nil,
+			"# id: plat\n(assure-ks (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2)(platform (source platform_attested)))))\n")
+		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i", Status: status, AttestationSource: "platform_attested"}); err != nil {
+			t.Fatal(err)
+		}
+		jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}
+		if got := svc.keyAttestationTrustsBatch(context.Background(), "i", jwks); got != want {
+			t.Errorf("status %q: legacy trust = %v, want %v", status, got, want)
+		}
+		ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "n", nil, "i", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := parseKAClaims(t, ka)["key_storage"].([]interface{})[0] == "iso_18045_moderate"; got != want {
+			t.Errorf("status %q: policy raised = %v, want %v", status, got, want)
+		}
+	}
+}
