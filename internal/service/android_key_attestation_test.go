@@ -633,6 +633,10 @@ func TestInitialAge(t *testing.T) {
 	if got := initialAge(h, recv, recv); got < 89*time.Second {
 		t.Fatalf("max of Date and Age: %v", got)
 	}
+	// No Age and no Date: the time the request and download took still counts.
+	if got := initialAge(http.Header{}, recv.Add(-10*time.Second), recv); got < 10*time.Second {
+		t.Fatalf("response delay without Age: %v", got)
+	}
 	// A Date in the future (our clock is behind) is not a negative age.
 	h = http.Header{}
 	h.Set("Date", recv.Add(time.Hour).UTC().Format(http.TimeFormat))

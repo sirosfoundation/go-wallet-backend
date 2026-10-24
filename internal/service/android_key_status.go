@@ -99,7 +99,8 @@ func initialAge(h http.Header, sent, received time.Time) time.Duration {
 			apparent = a
 		}
 	}
-	var corrected time.Duration
+	// With no Age header the age value is 0 and only the response delay counts.
+	corrected := received.Sub(sent)
 	// Repeated Age lines: the oldest counts.
 	for _, v := range h.Values("Age") {
 		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n >= 0 {
