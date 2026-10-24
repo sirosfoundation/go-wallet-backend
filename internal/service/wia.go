@@ -311,6 +311,19 @@ func (s *WIAService) consumeChallenge(ctx context.Context, challenge string) err
 	return nil
 }
 
+// restoreChallenge puts a consumed challenge back for a retry after a
+// retryable server-side failure. Best effort: if it cannot be stored the caller
+// simply needs a new challenge.
+func (s *WIAService) restoreChallenge(ctx context.Context, tenantID domain.TenantID, challenge string) {
+	ttl := time.Duration(s.cfg.WalletProvider.WIA.ChallengeTTLSeconds) * time.Second
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	if ok, err := s.challenges.Put(ctx, tenantID, challenge, time.Now().Add(ttl)); err != nil || !ok {
+		s.logger.Warn("could not restore the WIA challenge after a retryable failure", zap.Error(err))
+	}
+}
+
 // WIARequest contains the parameters for WIA generation.
 type WIARequest struct {
 	// Pop is the WIA-PoP JWT (typ: oauth-client-attestation-pop+jwt)
@@ -410,6 +423,14 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 			// If the client doesn't want native attestation, it should omit the field.
 			nativeAttestationErrors.Inc()
 			if errors.Is(err, ErrNativeAttestationUnavailable) {
+				// Apple issues an attestation object once per key and its nonce
+				// binds THIS challenge, so a retry with a fresh challenge could not
+				// reuse it. The request was otherwise valid (challenge, PoP and
+				// attestation verified), only storage failed: put the same
+				// challenge back so the caller can retry the identical request.
+				// Replay-safe: storing the key is bound to this caller, and the
+				// challenge is single-use again on the retry.
+				s.restoreChallenge(ctx, tenantID, req.Challenge)
 				return "", fmt.Errorf("%w: %v", ErrWIANativeAttestationUnavailable, err)
 			}
 			return "", fmt.Errorf("%w: native attestation failed: %v", ErrWIAPopInvalid, err)

@@ -905,17 +905,22 @@ func TestKeyAttestationTrustsBatch_InstanceKeyEvidenceIsNotKeyStorageEvidence(t 
 // unavailable (retryable), never as an invalid attestation.
 type failingAppAttestCreate struct {
 	storage.AppAttestKeyStore
-	create, get error
+	create, get    error
+	failCreateOnce bool // when set, the first Create fails (once), later ones succeed
 }
 
-func (f failingAppAttestCreate) Create(ctx context.Context, r *domain.AppAttestKeyRecord) error {
+func (f *failingAppAttestCreate) Create(ctx context.Context, r *domain.AppAttestKeyRecord) error {
+	if f.failCreateOnce {
+		f.failCreateOnce = false
+		return errors.New("db blip")
+	}
 	if f.create != nil {
 		return f.create
 	}
 	return f.AppAttestKeyStore.Create(ctx, r)
 }
 
-func (f failingAppAttestCreate) Get(ctx context.Context, id string) (*domain.AppAttestKeyRecord, error) {
+func (f *failingAppAttestCreate) Get(ctx context.Context, id string) (*domain.AppAttestKeyRecord, error) {
 	if f.get != nil {
 		return nil, f.get
 	}
@@ -926,7 +931,7 @@ func TestAppAttest_PersistenceFailureIsUnavailableNotInvalid(t *testing.T) {
 	d := newTestAppAttestDevice(t)
 	t.Run("create fails", func(t *testing.T) {
 		h := newAppAttestHarness(t, "production")
-		h.svc.SetAppAttestKeys(failingAppAttestCreate{AppAttestKeyStore: h.keys, create: errors.New("db down")})
+		h.svc.SetAppAttestKeys(&failingAppAttestCreate{AppAttestKeyStore: h.keys, create: errors.New("db down")})
 		_, err := h.verify(t, testBinding, d, d.keyIDB64(), "c", attOpts{})
 		if !errors.Is(err, ErrNativeAttestationUnavailable) || errors.Is(err, ErrNativeAttestationInvalid) {
 			t.Fatalf("err = %v", err)
@@ -937,7 +942,7 @@ func TestAppAttest_PersistenceFailureIsUnavailableNotInvalid(t *testing.T) {
 		if _, err := h.verify(t, testBinding, d, d.keyIDB64(), "c", attOpts{}); err != nil {
 			t.Fatal(err)
 		}
-		h.svc.SetAppAttestKeys(failingAppAttestCreate{AppAttestKeyStore: h.keys, get: errors.New("db down")})
+		h.svc.SetAppAttestKeys(&failingAppAttestCreate{AppAttestKeyStore: h.keys, get: errors.New("db down")})
 		_, err := h.verify(t, testBinding, d, d.keyIDB64(), "c2", attOpts{})
 		if !errors.Is(err, ErrNativeAttestationUnavailable) {
 			t.Fatalf("err = %v", err)
@@ -945,7 +950,7 @@ func TestAppAttest_PersistenceFailureIsUnavailableNotInvalid(t *testing.T) {
 	})
 	t.Run("through GenerateWIA", func(t *testing.T) {
 		h := newAppAttestHarness(t, "production")
-		h.svc.SetAppAttestKeys(failingAppAttestCreate{AppAttestKeyStore: h.keys, create: errors.New("db down")})
+		h.svc.SetAppAttestKeys(&failingAppAttestCreate{AppAttestKeyStore: h.keys, create: errors.New("db down")})
 		svc, _ := newTestWIAServiceWithInstances(t)
 		svc.nativeAttSvc = h.svc
 		ctx := context.Background()
@@ -994,5 +999,40 @@ func TestPreview_InstanceKeyEvidenceIsScopedToTheCaller(t *testing.T) {
 		if got.WIAIssue != c.want {
 			t.Errorf("%s: WIAIssue = %v, want %v", id, got.WIAIssue, c.want)
 		}
+	}
+}
+
+// A storage failure while enrolling the App Attest key must not strand the
+// client: Apple's attestation object is once per key and its nonce binds the
+// original challenge, so the identical request has to succeed on retry.
+func TestAppAttest_FailedEnrollmentCanBeRetriedWithTheSameRequest(t *testing.T) {
+	h := newAppAttestHarness(t, "production")
+	flaky := &failingAppAttestCreate{AppAttestKeyStore: h.keys, failCreateOnce: true}
+	h.svc.SetAppAttestKeys(flaky)
+	svc, _ := newTestWIAServiceWithInstances(t)
+	svc.nativeAttSvc = h.svc
+	d := newTestAppAttestDevice(t)
+	ctx := context.Background()
+	challenge, _, _ := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	pop, _ := createTestPop(t, challenge)
+	req := &WIARequest{Pop: pop, Challenge: challenge, NativeAttestation: &NativeAttestationRequest{
+		Type: NativeAttestationAppleAppAttest, KeyID: d.keyIDB64(), Challenge: challenge,
+		Token: d.attestation(t, h.ca, challenge, attOpts{appID: testAppAttestAppID}),
+	}}
+	if _, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, req); !errors.Is(err, ErrWIANativeAttestationUnavailable) {
+		t.Fatalf("first attempt: %v", err)
+	}
+	if _, err := h.keys.Get(ctx, d.keyIDB64()); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatal("key stored by the failed attempt")
+	}
+	if _, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, req); err != nil {
+		t.Fatalf("retry of the identical request: %v", err)
+	}
+	if _, err := h.keys.Get(ctx, d.keyIDB64()); err != nil {
+		t.Fatalf("key not stored after the retry: %v", err)
+	}
+	// And the challenge is single-use again after the successful retry.
+	if _, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, req); !errors.Is(err, ErrWIAChallengeExpired) {
+		t.Fatalf("challenge reusable after success: %v", err)
 	}
 }
