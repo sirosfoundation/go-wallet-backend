@@ -304,7 +304,7 @@ func TestAuxiliaryDataConflict_RelayedUnchangedNoRetry(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			st, hits := conflictStub(t, `{"error":"auxiliary_data_conflict","error_description":"`+issuerText+`"}`, dpop)
 			fc := &fakeClient{t: t}
-			h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
+			h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
 			defer cleanup()
 			err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", auxCfg(auxAdvFull), nil, "")
 			require.Error(t, err)
@@ -327,6 +327,7 @@ func TestAuxiliaryDataConflict_RelayedUnchangedNoRetry(t *testing.T) {
 			assert.Equal(t, map[string]interface{}{"error": "auxiliary_data_conflict"}, fe.Details)
 			assert.NotContains(t, string(flowErrs[0]["error"]), "SECRET-ISSUER-TEXT")
 			assert.NotContains(t, err.Error(), "SECRET-ISSUER-TEXT")
+			assert.NotContains(t, logDump(logs), "SECRET-ISSUER-TEXT", "the raw body is never logged for a conflict")
 		})
 	}
 }
@@ -478,27 +479,29 @@ func TestVerifyProofsCarryAuxiliaryData(t *testing.T) {
 	require.NoError(t, verifyProofsCarryAuxiliaryData([]ProofObject{{ProofType: "jwt", JWT: "proof-0"}}, nil))
 
 	bad := map[string][]ProofObject{
-		"no claim":                  proofs(nil),
-		"empty claim":               proofs([]interface{}{}),
-		"claim not an array":        proofs("x"),
-		"required missing, unknown": proofs([]map[string]interface{}{{"type": "https://x.example/t"}}),
-		"wrong type":                proofs(with(func(e map[string]interface{}) { e["type"] = "other" })),
-		"wrong alg":                 proofs(with(func(e map[string]interface{}) { e["alg"] = "sha-512" })),
-		"wrong path":                proofs(with(func(e map[string]interface{}) { e["path"] = []string{"n", "xxx"} })),
-		"missing in second proof":   proofs(good(), nil),
-		"differing values":          proofs(good(), validAuxClaim(t, adv[:1], 2)),
-		"differing extra entries":   proofs(good(), append(good(), map[string]interface{}{"type": "https://x.example/t"})),
-		"commitment missing":        proofs(with(func(e map[string]interface{}) { delete(e, "commitment") })),
-		"commitment wrong length":   proofs(with(func(e map[string]interface{}) { e["commitment"] = "AAAA" })),
-		"commitment padded":         proofs(with(func(e map[string]interface{}) { e["commitment"] = good()[0]["commitment"].(string) + "=" })),
-		"commitment not a string":   proofs(with(func(e map[string]interface{}) { e["commitment"] = 7 })),
-		"opening instead":           proofs(with(func(e map[string]interface{}) { e["opening"] = "x" })),
-		"duplicate entry":           proofs(append(good(), good()...)),
-		"optional with wrong alg":   proofs(append(good(), map[string]interface{}{"type": "hash_commitment", "alg": "sha-512", "path": []string{"n", "opt"}, "commitment": good()[0]["commitment"]})),
-		"not a JWT":                 {{ProofType: "jwt", JWT: "proof-0"}},
-		"attestation w/o claim":     {{ProofType: "attestation", Attestation: auxProofJWT(t, nil)}},
-		"unknown proof type":        {{ProofType: "di_vp"}},
-		"no proofs":                 nil,
+		"no claim":                    proofs(nil),
+		"empty claim":                 proofs([]interface{}{}),
+		"claim not an array":          proofs("x"),
+		"required missing, unknown":   proofs([]map[string]interface{}{{"type": "https://x.example/t"}}),
+		"wrong type":                  proofs(with(func(e map[string]interface{}) { e["type"] = "other" })),
+		"wrong alg":                   proofs(with(func(e map[string]interface{}) { e["alg"] = "sha-512" })),
+		"wrong path":                  proofs(with(func(e map[string]interface{}) { e["path"] = []string{"n", "xxx"} })),
+		"missing in second proof":     proofs(good(), nil),
+		"differing values":            proofs(good(), validAuxClaim(t, adv[:1], 2)),
+		"differing extra entries":     proofs(good(), append(good(), map[string]interface{}{"type": "https://x.example/t"})),
+		"commitment missing":          proofs(with(func(e map[string]interface{}) { delete(e, "commitment") })),
+		"commitment wrong length":     proofs(with(func(e map[string]interface{}) { e["commitment"] = "AAAA" })),
+		"commitment padded":           proofs(with(func(e map[string]interface{}) { e["commitment"] = good()[0]["commitment"].(string) + "=" })),
+		"commitment not a string":     proofs(with(func(e map[string]interface{}) { e["commitment"] = 7 })),
+		"opening instead":             proofs(with(func(e map[string]interface{}) { e["opening"] = "x" })),
+		"duplicate entry":             proofs(append(good(), good()...)),
+		"optional with wrong alg":     proofs(append(good(), map[string]interface{}{"type": "hash_commitment", "alg": "sha-512", "path": []string{"n", "opt"}, "commitment": good()[0]["commitment"]})),
+		"unadvertised opening":        proofs(append(good(), map[string]interface{}{"type": "hash_commitment", "alg": "sha-256", "path": []string{"n", "other"}, "opening": "SECRET"})),
+		"unadvertised bad commitment": proofs(append(good(), map[string]interface{}{"type": "hash_commitment", "alg": "sha-256", "path": []string{"n", "other"}, "commitment": "AAAA"})),
+		"not a JWT":                   {{ProofType: "jwt", JWT: "proof-0"}},
+		"attestation w/o claim":       {{ProofType: "attestation", Attestation: auxProofJWT(t, nil)}},
+		"unknown proof type":          {{ProofType: "di_vp"}},
+		"no proofs":                   nil,
 	}
 	for name, ps := range bad {
 		t.Run("bad/"+name, func(t *testing.T) {

@@ -2752,13 +2752,12 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 			_ = resp.Body.Close()
-			h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
-
-			// auxiliary_data_conflict is final (retrying never helps; the issuer
-			// resolves it out of band): relay the code unchanged, never retry.
+			// Recognise the conflict BEFORE the raw body is logged: its
+			// error_description may echo a commitment.
 			if conflictErr := h.auxiliaryDataConflictError(resp.StatusCode, body); conflictErr != nil {
 				return nil, conflictErr
 			}
+			h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
 
 			// Check whether the error response contains a refreshed c_nonce so the
 			// caller can re-request proofs and retry. Do NOT send a flow error here —

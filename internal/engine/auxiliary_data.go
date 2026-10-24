@@ -478,15 +478,16 @@ func auxiliaryDataOfProof(proof ProofObject, advertised map[string]auxAdv, anyRe
 			return "", auxProofErr("two entries share a type and path")
 		}
 		seen[k] = struct{}{}
-		if a, isAdv := advertised[k]; isAdv {
-			var alg string
-			if a.hasAlg && (json.Unmarshal(e["alg"], &alg) != nil || alg != a.alg) {
-				return "", auxProofErr("an entry's alg differs from the advertised one")
-			}
-			if a.typ == auxTypeHashCommitment {
-				if err := checkCommitment(e, a.alg); err != nil {
-					return "", err
-				}
+		entryAlg := ""
+		_ = json.Unmarshal(e["alg"], &entryAlg)
+		if a, isAdv := advertised[k]; isAdv && a.hasAlg && entryAlg != a.alg {
+			return "", auxProofErr("an entry's alg differs from the advertised one")
+		}
+		// Every hash_commitment entry is checked, advertised or not: an
+		// opening (a secret) must never be forwarded to the issuer.
+		if typ == auxTypeHashCommitment {
+			if err := checkCommitment(e, entryAlg); err != nil {
+				return "", err
 			}
 		}
 		var v interface{}
