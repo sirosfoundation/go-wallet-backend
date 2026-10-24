@@ -411,13 +411,13 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	// WIA; evidence that names no home changes nothing.
 	var submitted *domain.KeyAttestationRecord
 	if keyVerifier != nil {
-		submitted, err = s.verifyKeyAttestation(ctx, keyVerifier, req.KeyAttestation, tenantID, jkt, popKey, req.Challenge)
+		submitted, err = s.verifyKeyAttestation(ctx, keyVerifier, req.KeyAttestation, tenantID, userIDString(userID), jkt, popKey, req.Challenge)
 		if err != nil {
 			s.emitAuditFailure("key_attestation_rejected", err)
 			return "", err
 		}
 	}
-	att.KeyEvidence = s.instanceKeyEvidence(ctx, jkt)
+	att.KeyEvidence = s.instanceKeyEvidence(ctx, tenantID, userIDString(userID), jkt)
 	if att.KeyEvidence == nil && s.keyAttestations == nil {
 		att.KeyEvidence = submitted // nothing durable to read back from
 	}
@@ -476,7 +476,7 @@ type wiaAttestation struct {
 //
 // A store error is treated as no evidence (fail closed to unknown), never as
 // permission.
-func (s *WIAService) instanceKeyEvidence(ctx context.Context, jkt string) *domain.KeyAttestationRecord {
+func (s *WIAService) instanceKeyEvidence(ctx context.Context, tenantID domain.TenantID, userID, jkt string) *domain.KeyAttestationRecord {
 	if s.keyAttestations == nil {
 		return nil
 	}
@@ -487,7 +487,18 @@ func (s *WIAService) instanceKeyEvidence(ctx context.Context, jkt string) *domai
 		}
 		return nil
 	}
+	if !instanceEvidenceInScope(rec, tenantID, userID) {
+		s.logger.Warn("instance key evidence was verified for another tenant or user; ignoring it")
+		return nil
+	}
 	return rec
+}
+
+func userIDString(u *domain.UserID) string {
+	if u == nil {
+		return ""
+	}
+	return u.String()
 }
 
 // instanceKeyEvidenceBuilder turns a verified per-key evidence record of one

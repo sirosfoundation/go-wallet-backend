@@ -314,3 +314,67 @@ func signPopWithKey(t *testing.T, key *ecdsa.PrivateKey, nonce string) string {
 	}
 	return s
 }
+
+// Cached instance-key evidence is used only for the tenant and user it was
+// verified for.
+func TestWIAAndroidKey_EvidenceIsScopedToTenantAndUser(t *testing.T) {
+	a := newAKWIA(t, "")
+	a.svc.cfg.WalletProvider.Attestation.Assurance.Enabled = false
+	ctx := context.Background()
+	alice, bob := domain.UserIDFromString("alice"), domain.UserIDFromString("bob")
+
+	challenge, _, _ := a.svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	pop, key := createTestPop(t, challenge)
+	jkt := expectedThumbprint(t, &key.PublicKey)
+	raw, _ := json.Marshal(map[string]any{"type": "android_key", "x5c": b64chain(a.good(nil)(challenge, &key.PublicKey))})
+	if _, err := a.svc.GenerateWIA(ctx, domain.DefaultTenantID, &alice, &WIARequest{Pop: pop, Challenge: challenge, KeyAttestation: &KeyAttestation{Type: KeyAttestationAndroidKey, Raw: raw}}); err != nil {
+		t.Fatal(err)
+	}
+	if rec := a.record(jkt); rec.UserID != alice.String() {
+		t.Fatalf("record user = %q", rec.UserID)
+	}
+
+	later := func(tenant domain.TenantID, user *domain.UserID) domain.WSCDType {
+		t.Helper()
+		c, _, err := a.svc.CreateChallenge(ctx, tenant)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := a.svc.GenerateWIA(ctx, tenant, user, &WIARequest{Pop: signPopWithKey(t, key, c), Challenge: c}); err != nil {
+			t.Fatal(err)
+		}
+		return instanceType(t, a.inst, jkt)
+	}
+	if got := later(domain.DefaultTenantID, &bob); got != domain.WSCDTypeUnknown {
+		t.Fatalf("another user reused the evidence: %s", got)
+	}
+	if got := later(domain.DefaultTenantID, nil); got != domain.WSCDTypeUnknown {
+		t.Fatalf("an unauthenticated request reused the evidence: %s", got)
+	}
+	if got := later("other-tenant", &alice); got != domain.WSCDTypeUnknown {
+		t.Fatalf("another tenant reused the evidence: %s", got)
+	}
+	if got := later(domain.DefaultTenantID, &alice); got != domain.WSCDTypeNativeAndroid {
+		t.Fatalf("the verified user lost its evidence: %s", got)
+	}
+}
+
+func TestPreview_WIAHalfHonoursEvidenceScope(t *testing.T) {
+	svc, instances, keys := previewSvc(t, wiaNeedsAndroidRules, true)
+	const jkt = "instance-key-jkt-android"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: jkt, TenantID: domain.DefaultTenantID, Status: domain.InstanceStatusActive, LastAttestedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	putRecord(t, keys, domain.KeyAttestationRecord{KeyThumbprint: jkt, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE, TenantID: domain.DefaultTenantID, UserID: "u1"})
+	issue := func(user string) bool {
+		ctx := WithKeyAttestationCaller(context.Background(), KeyAttestationCaller{TenantID: domain.DefaultTenantID, UserID: user})
+		got, err := svc.PreviewAssurance(ctx, &AssurancePreviewRequest{WalletInstanceID: jkt})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got.WIAIssue
+	}
+	if !issue("u1") || issue("u2") || issue("") {
+		t.Fatal("the preview did not honour the evidence's user scope")
+	}
+}

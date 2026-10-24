@@ -37,6 +37,11 @@ type KeyAttestationRecord struct {
 	// stored before this field existed read as false ("uv none").
 	UV bool `json:"uv" bson:"uv"`
 
+	// UserID is the authenticated user the evidence was verified for, set on
+	// instance-key evidence (android_key, ...): a cached record is used only
+	// for the tenant and user it was verified for. Empty on FIDO2 records.
+	UserID string `json:"user_id,omitempty" bson:"user_id,omitempty"`
+
 	// Kind is the family of evidence that produced this record. Records
 	// stored before the field existed are FIDO2 records: Normalize applies
 	// that default.

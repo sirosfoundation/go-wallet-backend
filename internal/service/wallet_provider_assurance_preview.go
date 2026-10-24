@@ -153,6 +153,9 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 	wiaFacts := assurance.Facts{Platform: &assurance.PlatformVerified{Source: wiaSource, AppID: appID}}
 	if req.WalletInstanceID != "" && s.keyAttestations != nil {
 		if rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, req.WalletInstanceID); err == nil {
+			if caller, ok := ctx.Value(callerCtxKey{}).(KeyAttestationCaller); ok && !instanceEvidenceInScope(rec, caller.TenantID, caller.UserID) {
+				rec = nil
+			}
 			wiaFacts.Fido2 = fido2VerifiedFromRecord(rec)
 			wiaFacts.InstanceKey = instanceKeyVerifiedFromRecord(rec)
 		} else if !errors.Is(err, storage.ErrNotFound) {
