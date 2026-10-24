@@ -106,3 +106,13 @@ func TestLintCLI_NullAssuranceSectionDoesNotPanic(t *testing.T) {
 		}
 	}
 }
+
+func TestLintCLI_ListValuedSetMemberIsAnError(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "r.rules")
+	if err := os.WriteFile(p, []byte("# id: nested\n(assure-ks (tier moderate)(evidence (verified (fido2 (mds3 trusted)(aaguid (* set (model a1)))))))\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if code, out, _ := runLint(t, "-rules", p); code != 1 || !strings.Contains(out, "ERROR: rule nested") {
+		t.Fatalf("%d %s", code, out)
+	}
+}

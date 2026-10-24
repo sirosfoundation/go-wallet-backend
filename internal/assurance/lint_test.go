@@ -231,7 +231,7 @@ func TestLint_MultipleValuesInAnyLeafSlotAreErrors(t *testing.T) {
 				t.Errorf("%s: %q must lint clean, got %v", name, ok, fs)
 			}
 		}
-		for _, bad := range []string{"a b", "a (* set b c)", "(* set a) (* set b)", "(nested a)"} {
+		for _, bad := range []string{"a b", "a (* set b c)", "(* set a) (* set b)", "(nested a)", "(* set (model a1))", "(* set a (* set (m x)))"} {
 			if fs := lintRules(t, "# id: r\n"+build(l, bad)+"\n"); !HasErrors(fs) {
 				t.Errorf("%s: %q must be an ERROR (rule can never match)", name, bad)
 			}
@@ -248,6 +248,10 @@ func TestStartupCheckFailsLikeTheCLIOnMultiValueLeaf(t *testing.T) {
 	}
 	if _, err := NewFromConfig(cfg, testLogger()); !errors.Is(err, ErrLintFailed) {
 		t.Fatalf("NewFromConfig: %v", err)
+	}
+	cfg.RulesFile = writeRules(t, "n.rules", "# id: nested\n(assure-ks (tier moderate)(evidence (verified (fido2 (mds3 trusted)(aaguid (* set (model a1)))))))\n")
+	if err := CheckConfig(cfg); !errors.Is(err, ErrLintFailed) {
+		t.Fatalf("startup check must reject list-valued set members: %v", err)
 	}
 	if !HasErrors(LintRuleSet(mustRuleSet(t, "# id: multi\n(assure-ks (tier moderate high)(evidence))\n"), &cfg)) {
 		t.Fatal("linter (CLI path) must report the same error")

@@ -164,10 +164,8 @@ func checkLayout(l *sexp.List, layout []slot, noneOK bool, path string, errf fun
 		// can never match.
 		if len(l.Elements) > 1 {
 			out = append(out, errf("%s has %d values; a query carries exactly one, so this can never match. Use a single (* set ...) for alternatives", path, len(l.Elements)))
-		} else if len(l.Elements) == 1 {
-			if _, nested := l.Elements[0].(*sexp.List); nested {
-				out = append(out, errf("%s value is a list; a query carries one atom here, so this can never match", path))
-			}
+		} else if len(l.Elements) == 1 && hasListValue(l.Elements[0]) {
+			out = append(out, errf("%s value is (or contains) a list; a query carries one atom here, so this can never match", path))
 		}
 		return out
 	}
@@ -290,4 +288,20 @@ func lintCandidate(rule *sexp.List, cfg *config.AssuranceConfig, warnf func(stri
 		}
 	}
 	return out
+}
+
+// hasListValue reports whether el is a list, or a star form with a list
+// anywhere among its members (a set may nest further sets).
+func hasListValue(el sexp.Element) bool {
+	switch v := el.(type) {
+	case *sexp.List:
+		return true
+	case *starform.Set:
+		for _, m := range v.Elements {
+			if hasListValue(m) {
+				return true
+			}
+		}
+	}
+	return false
 }
