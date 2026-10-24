@@ -55,3 +55,30 @@ func TestLintCLI_ErrorsExitNonZero(t *testing.T) {
 		t.Fatalf("no rules file must be a usage error, got %d", code)
 	}
 }
+
+func TestLintCLI_ConfigWithoutRulesFileAcceptsRulesOverride(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "c.yaml")
+	// enabled with no rules_file: config.Load would reject this outright.
+	if err := os.WriteFile(cfg, []byte("wallet_provider:\n  attestation:\n    assurance:\n      enabled: true\n      key_storage_scheme: tiers\n      level_schemes:\n        - {id: tiers, levels: [k3, k1], values: [sw, hw], floor: k3}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rules := filepath.Join(dir, "r.rules")
+	if err := os.WriteFile(rules, []byte("# id: r\n(assure-ks (tier k1)(evidence))\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, out, e := runLint(t, "-config", cfg, "-rules", rules)
+	if code != 0 {
+		t.Fatalf("code %d out=%s err=%s", code, out, e)
+	}
+	// The configured scheme is in effect: a tier outside it is reported.
+	if err := os.WriteFile(rules, []byte("# id: r\n(assure-ks (tier zzz)(evidence))\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, out, _ := runLint(t, "-config", cfg, "-rules", rules); !strings.Contains(out, `"zzz"`) {
+		t.Fatalf("scheme from -config not applied: %s", out)
+	}
+	if code, _, _ := runLint(t, "-config", cfg); code != 2 {
+		t.Fatalf("no rules file anywhere must be a usage error, got %d", code)
+	}
+}
