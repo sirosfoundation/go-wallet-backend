@@ -558,8 +558,9 @@ func TestAppAttestAssertion_EndToEndRecordsAssertedEvidenceAndFeedsTheSlot(t *te
 	if rec.Kind != domain.KeyEvidenceAppAttestAssertion || rec.Home != domain.KeyHomeSecureEnclaveAsserted || rec.KeyThumbprint != jkt {
 		t.Fatalf("record = %+v", rec)
 	}
-	// B1 maps secure_enclave_asserted to native_ios.
-	if got := instanceType(t, e.instances, jkt); got != domain.WSCDTypeNativeIOS {
+	// B1 maps secure_enclave_asserted to unknown: an assertion is not proof
+	// of Secure Enclave residency.
+	if got := instanceType(t, e.instances, jkt); got != domain.WSCDTypeUnknown {
 		t.Fatalf("wscd_type = %s", got)
 	}
 
@@ -706,7 +707,7 @@ func TestAppAttest_AttestOnceThenAssertForLaterWIAs(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("later WIA with an assertion: %v", err)
 	}
-	if got := instanceType(t, instances, jkt2); got != domain.WSCDTypeNativeIOS {
+	if got := instanceType(t, instances, jkt2); got != domain.WSCDTypeUnknown {
 		t.Fatalf("wscd_type = %s", got)
 	}
 

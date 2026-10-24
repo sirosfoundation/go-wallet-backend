@@ -453,10 +453,10 @@ app instance is behind the request. A rule requiring `platform_attested` too
 would only match the one WIA that carried the attestation object.
 
 **WSCD type.** `wscdTypeFromKeyHome` maps `secure_enclave_asserted` to
-`native_ios` (stage B1). Because the home is only asserted, a deployment that
-wants `wscd_type` to mean a verified residency should map it to `unknown`
-instead; that is an owner decision recorded in the pull request and is a
-one-line change in `wscdTypeFromKeyHome`.
+`unknown` (stage B1, an owner decision): an App Attest assertion only proves
+that an attested app endorsed the key, not Secure Enclave residency, so the
+instance's `wscd_type` is never `native_ios` from this evidence.
+
 ### Android key attestation of the instance key (stage B2)
 
 `POST /wallet-provider/wia/generate` accepts an optional `key_attestation`
