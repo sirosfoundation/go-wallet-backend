@@ -84,6 +84,18 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 			return nil, err
 		}
 		overlay = rec
+		// The dry run must answer what the real registration would leave in
+		// place: a stored record that the submission would not supersede
+		// (weaker or absent evidence is never written over it) wins.
+		if s.keyAttestations != nil {
+			if stored, err := s.keyAttestations.GetByKeyThumbprint(ctx, rec.KeyThumbprint); err == nil {
+				if !rec.Supersedes(stored) {
+					overlay = stored
+				}
+			} else if !errors.Is(err, storage.ErrNotFound) {
+				s.logger.Warn("stored key evidence lookup failed; previewing the submission", zap.Error(err))
+			}
+		}
 	}
 
 	var thumbprints []string

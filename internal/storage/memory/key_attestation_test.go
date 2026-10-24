@@ -160,3 +160,24 @@ func TestKeyAttestationStore_LegacyRecordReadsAsFIDO2Hardware(t *testing.T) {
 		t.Fatalf("kind/home = %q/%q", g.Kind, g.Home)
 	}
 }
+
+// Stored evidence is isolated from the caller's pointers on write and on read.
+func TestKeyAttestationStore_DeviceLockedPointerIsIsolated(t *testing.T) {
+	ctx := context.Background()
+	kas := NewStore().KeyAttestations()
+	locked := true
+	in := &domain.KeyAttestationRecord{KeyThumbprint: "k", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE, DeviceLocked: &locked, VerifiedAt: time.Now()}
+	if err := kas.MarkKeyAttested(ctx, in); err != nil {
+		t.Fatal(err)
+	}
+	locked = false // caller mutates its own value after the write
+	got, _ := kas.GetByKeyThumbprint(ctx, "k")
+	if got.DeviceLocked == nil || !*got.DeviceLocked {
+		t.Fatal("caller mutation after MarkKeyAttested changed stored evidence")
+	}
+	*got.DeviceLocked = false // caller mutates a read result
+	again, _ := kas.GetByKeyThumbprint(ctx, "k")
+	if !*again.DeviceLocked {
+		t.Fatal("mutating a read result changed stored evidence")
+	}
+}
