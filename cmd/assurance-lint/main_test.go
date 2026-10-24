@@ -82,3 +82,27 @@ func TestLintCLI_ConfigWithoutRulesFileAcceptsRulesOverride(t *testing.T) {
 		t.Fatalf("no rules file anywhere must be a usage error, got %d", code)
 	}
 }
+
+// An explicit null section (or null parents) keeps the defaults; it used to
+// nil the section and panic.
+func TestLintCLI_NullAssuranceSectionDoesNotPanic(t *testing.T) {
+	dir := t.TempDir()
+	rules := filepath.Join(dir, "r.rules")
+	if err := os.WriteFile(rules, []byte("# id: r\n(assure-ks (tier moderate)(evidence))\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for name, doc := range map[string]string{
+		"null assurance":       "wallet_provider:\n  attestation:\n    assurance:\n",
+		"null attestation":     "wallet_provider:\n  attestation:\n",
+		"null wallet_provider": "wallet_provider:\n",
+		"empty file":           "",
+	} {
+		cfg := filepath.Join(dir, "c.yaml")
+		if err := os.WriteFile(cfg, []byte(doc), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if code, out, e := runLint(t, "-config", cfg, "-rules", rules); code != 0 {
+			t.Errorf("%s: code %d out=%s err=%s", name, code, out, e)
+		}
+	}
+}

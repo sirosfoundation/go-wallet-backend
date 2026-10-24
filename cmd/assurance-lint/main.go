@@ -91,13 +91,15 @@ func readAssuranceConfig(path string, base config.AssuranceConfig) (config.Assur
 	var doc struct {
 		WalletProvider struct {
 			Attestation struct {
-				Assurance *config.AssuranceConfig `yaml:"assurance"`
+				Assurance config.AssuranceConfig `yaml:"assurance"`
 			} `yaml:"attestation"`
 		} `yaml:"wallet_provider"`
 	}
-	doc.WalletProvider.Attestation.Assurance = &base
+	// A value (not a pointer): an explicit `assurance:` null then leaves
+	// the defaults in place instead of nil-ing the section.
+	doc.WalletProvider.Attestation.Assurance = base
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return base, err
 	}
-	return *doc.WalletProvider.Attestation.Assurance, nil
+	return doc.WalletProvider.Attestation.Assurance, nil
 }
