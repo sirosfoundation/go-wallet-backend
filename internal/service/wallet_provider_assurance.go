@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -52,6 +53,15 @@ func (s *WalletProviderService) lookupOwnedInstance(ctx context.Context, walletI
 			zap.String("wallet_instance_id", walletInstanceID), zap.String("status", string(instance.Status)))
 		return nil, storage.ErrNotFound
 	}
+	// Platform integrity is re-derived on every WIA request, so it is only
+	// as fresh as the last one. Evidence older than the WIA lifetime (the
+	// same short window that bounds a WIA's exposure) is not used; an
+	// instance that never recorded an attestation time has none.
+	if age := time.Since(instance.LastAttestedAt); instance.LastAttestedAt.IsZero() || age > s.platformEvidenceMaxAge() {
+		s.logger.Warn("wallet instance attestation is stale; ignoring its evidence",
+			zap.String("wallet_instance_id", walletInstanceID), zap.Time("last_attested_at", instance.LastAttestedAt))
+		return nil, storage.ErrNotFound
+	}
 	if caller, ok := ctx.Value(callerCtxKey{}).(KeyAttestationCaller); ok {
 		if instance.TenantID != caller.TenantID ||
 			(instance.UserID != nil && caller.UserID != "" && instance.UserID.String() != caller.UserID) {
@@ -61,6 +71,19 @@ func (s *WalletProviderService) lookupOwnedInstance(ctx context.Context, walletI
 		}
 	}
 	return instance, nil
+}
+
+// defaultPlatformEvidenceMaxAge applies when attestation.lifetime_seconds is
+// unset; it matches that setting's default.
+const defaultPlatformEvidenceMaxAge = 5 * time.Minute
+
+// platformEvidenceMaxAge is how long after its last WIA an instance's
+// platform attestation may still back a Key Attestation: the WIA lifetime.
+func (s *WalletProviderService) platformEvidenceMaxAge() time.Duration {
+	if s.cfg != nil && s.cfg.WalletProvider.Attestation.LifetimeSeconds > 0 {
+		return time.Duration(s.cfg.WalletProvider.Attestation.LifetimeSeconds) * time.Second
+	}
+	return defaultPlatformEvidenceMaxAge
 }
 
 // SetAssessor installs the assurance policy used when

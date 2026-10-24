@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
@@ -62,7 +63,7 @@ func TestHandlers_KeyAttestation_ForeignInstanceDoesNotRaiseClaims(t *testing.T)
 	store := memory.NewStore()
 	owner := domain.UserIDFromString("owner")
 	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{
-		ID: "inst", TenantID: "tenant-a", UserID: &owner, AttestationSource: "platform_attested",
+		ID: "inst", TenantID: "tenant-a", UserID: &owner, AttestationSource: "platform_attested", LastAttestedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
