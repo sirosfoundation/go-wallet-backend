@@ -136,7 +136,16 @@ func NewAndroidKeyAttestationVerifier(cfg config.AndroidKeyAttestationConfig, lo
 // setStatusClock lets tests control the revocation list's notion of now.
 func (v *AndroidKeyAttestationVerifier) setStatusClock(now func() time.Time) { v.status.now = now }
 
+// addPEMAnchors adds every CERTIFICATE block of data to pool. pem.Decode skips
+// forward past text it cannot decode, so a malformed block followed by a good
+// one would be dropped silently and the operator would run with a partially
+// read trust configuration; instead the number of BEGIN lines must equal the
+// number of blocks that decoded, and nothing but whitespace may surround them.
 func addPEMAnchors(pool *x509.CertPool, data []byte) (int, error) {
+	begins := bytes.Count(data, []byte("-----BEGIN "))
+	if begins > 0 && !bytes.HasPrefix(bytes.TrimSpace(data), []byte("-----BEGIN ")) {
+		return 0, errors.New("unexpected data before the first PEM block")
+	}
 	count := 0
 	for {
 		var block *pem.Block
@@ -156,6 +165,9 @@ func addPEMAnchors(pool *x509.CertPool, data []byte) (int, error) {
 	}
 	if len(bytes.TrimSpace(data)) != 0 {
 		return 0, errors.New("trailing data after the last PEM block")
+	}
+	if count != begins {
+		return 0, fmt.Errorf("%d PEM blocks begin but %d decode", begins, count)
 	}
 	return count, nil
 }
@@ -455,8 +467,8 @@ func CheckAndroidKeyAttestationConfig(cfg config.AndroidKeyAttestationConfig) er
 
 type noStatusFetcher struct{}
 
-func (noStatusFetcher) Fetch(context.Context) ([]byte, time.Duration, error) {
-	return nil, 0, errors.New("not fetching")
+func (noStatusFetcher) Fetch(context.Context) ([]byte, StatusFreshness, error) {
+	return nil, StatusFreshness{}, errors.New("not fetching")
 }
 
 // newAndroidKeyVerifierForServer builds the verifier for the running server.

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/x509"
@@ -29,6 +30,8 @@ func loadAndroidChainPEM(path string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	// pem.Decode skips undecodable text; a block it dropped must not pass.
+	begins := bytes.Count(data, []byte("-----BEGIN "))
 	var x5c []string
 	for {
 		var block *pem.Block
@@ -41,8 +44,8 @@ func loadAndroidChainPEM(path string) ([]string, error) {
 		}
 		x5c = append(x5c, base64.StdEncoding.EncodeToString(block.Bytes))
 	}
-	if len(x5c) == 0 {
-		return nil, fmt.Errorf("%s: no certificates", path)
+	if len(x5c) == 0 || len(x5c) != begins {
+		return nil, fmt.Errorf("%s: %d PEM blocks begin, %d certificates decode", path, begins, len(x5c))
 	}
 	return x5c, nil
 }
@@ -67,6 +70,13 @@ func TestLoadAndroidChainPEM(t *testing.T) {
 	}
 	if _, err := loadAndroidChainPEM(path); err == nil {
 		t.Fatal("empty file loaded")
+	}
+	bad := "-----BEGIN CERTIFICATE-----\nnot base64!!\n-----END CERTIFICATE-----\n"
+	if err := writeFile(path, bad+string(pemData)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadAndroidChainPEM(path); err == nil {
+		t.Fatal("a malformed block was silently skipped")
 	}
 }
 

@@ -7,7 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,16 +23,36 @@ import (
 type fakeStatusFetcher struct {
 	body   string
 	maxAge time.Duration
+	age    time.Duration
 	err    error
 	calls  int
+	// gate, when set, blocks Fetch until it is closed (or the context ends).
+	gate chan struct{}
+	mu   sync.Mutex
 }
 
-func (f *fakeStatusFetcher) Fetch(context.Context) ([]byte, time.Duration, error) {
+func (f *fakeStatusFetcher) Fetch(ctx context.Context) ([]byte, StatusFreshness, error) {
+	f.mu.Lock()
 	f.calls++
-	if f.err != nil {
-		return nil, 0, f.err
+	gate := f.gate
+	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, StatusFreshness{}, ctx.Err()
+		}
 	}
-	return []byte(f.body), f.maxAge, nil
+	if f.err != nil {
+		return nil, StatusFreshness{}, f.err
+	}
+	return []byte(f.body), StatusFreshness{MaxAge: f.maxAge, Age: f.age}, nil
+}
+
+func (f *fakeStatusFetcher) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
 }
 
 const emptyStatusList = `{"entries":{}}`
@@ -264,7 +287,7 @@ func TestAndroidKey_NoAnchorsOrNoAppsVerifiesNothing(t *testing.T) {
 			if err != nil || res.Record != nil {
 				t.Fatalf("res=%+v err=%v", res, err)
 			}
-			if h.fetch.calls != 0 {
+			if h.fetch.callCount() != 0 {
 				t.Fatal("fetched a revocation list without trust configured")
 			}
 		})
@@ -457,7 +480,7 @@ func TestAndroidKey_RevocationFailsClosed(t *testing.T) {
 		kd := h.goodKD()
 		kd.AttLevel, kd.KmLevel = -1, -1
 		h.noHome(h.chain(kd, leafOpts{}), "not hardware")
-		if h.fetch.calls != 0 {
+		if h.fetch.callCount() != 0 {
 			t.Fatal("fetched a revocation list for software evidence")
 		}
 	})
@@ -477,12 +500,12 @@ func TestAndroidStatusList_CacheHonoursCacheControlAndNeverServesStale(t *testin
 				t.Fatal(err)
 			}
 		}
-		if f.calls != 1 {
-			t.Fatalf("fetched %d times within max-age", f.calls)
+		if f.callCount() != 1 {
+			t.Fatalf("fetched %d times within max-age", f.callCount())
 		}
 		now = now.Add(11 * time.Minute)
-		if _, _, err := l.check(context.Background(), serial); err != nil || f.calls != 2 {
-			t.Fatalf("after expiry: err=%v calls=%d", err, f.calls)
+		if _, _, err := l.check(context.Background(), serial); err != nil || f.callCount() != 2 {
+			t.Fatalf("after expiry: err=%v calls=%d", err, f.callCount())
 		}
 	})
 	t.Run("expired and unfetchable fails closed", func(t *testing.T) {
@@ -498,7 +521,8 @@ func TestAndroidStatusList_CacheHonoursCacheControlAndNeverServesStale(t *testin
 		if _, _, err := l.check(context.Background(), serial); !errors.Is(err, ErrAndroidStatusUnavailable) {
 			t.Fatalf("served a stale list: %v", err)
 		}
-		// and recovers once the source does
+		// and recovers once the source does (after the failure backoff)
+		now = now.Add(androidStatusRetryBackoff + time.Second)
 		f.err = nil
 		if _, _, err := l.check(context.Background(), serial); err != nil {
 			t.Fatal(err)
@@ -512,13 +536,13 @@ func TestAndroidStatusList_CacheHonoursCacheControlAndNeverServesStale(t *testin
 		_, _, _ = l.check(context.Background(), serial)
 		now = now.Add(4 * time.Minute)
 		_, _, _ = l.check(context.Background(), serial)
-		if f.calls != 1 {
-			t.Fatalf("calls = %d", f.calls)
+		if f.callCount() != 1 {
+			t.Fatalf("calls = %d", f.callCount())
 		}
 		now = now.Add(2 * time.Minute)
 		_, _, _ = l.check(context.Background(), serial)
-		if f.calls != 2 {
-			t.Fatalf("calls = %d", f.calls)
+		if f.callCount() != 2 {
+			t.Fatalf("calls = %d", f.callCount())
 		}
 	})
 	t.Run("no-cache refetches every time", func(t *testing.T) {
@@ -528,8 +552,8 @@ func TestAndroidStatusList_CacheHonoursCacheControlAndNeverServesStale(t *testin
 		for i := 0; i < 3; i++ {
 			_, _, _ = l.check(context.Background(), serial)
 		}
-		if f.calls != 3 {
-			t.Fatalf("calls = %d", f.calls)
+		if f.callCount() != 3 {
+			t.Fatalf("calls = %d", f.callCount())
 		}
 	})
 	t.Run("a refreshed list that now revokes is applied", func(t *testing.T) {
@@ -544,6 +568,185 @@ func TestAndroidStatusList_CacheHonoursCacheControlAndNeverServesStale(t *testin
 			t.Fatalf("revoked=%v err=%v", revoked, err)
 		}
 	})
+}
+
+func TestAndroidStatusList_HTTPFreshnessAgeReducesLife(t *testing.T) {
+	serial := []*big.Int{big.NewInt(77)}
+	now := time.Now()
+	clock := func() time.Time { return now }
+
+	t.Run("max-age minus Age", func(t *testing.T) {
+		f := &fakeStatusFetcher{body: emptyStatusList, maxAge: time.Hour, age: time.Hour - 10*time.Second}
+		l := newAndroidStatusList(f, time.Hour)
+		l.now = clock
+		if _, _, err := l.check(context.Background(), serial); err != nil {
+			t.Fatal(err)
+		}
+		now = now.Add(5 * time.Second)
+		_, _, _ = l.check(context.Background(), serial)
+		if f.callCount() != 1 {
+			t.Fatalf("calls = %d within the remaining life", f.callCount())
+		}
+		now = now.Add(6 * time.Second) // 11 s after receipt: past the 10 s that were left
+		_, _, _ = l.check(context.Background(), serial)
+		if f.callCount() != 2 {
+			t.Fatalf("calls = %d, the full max-age was restarted at receipt", f.callCount())
+		}
+	})
+	t.Run("default ttl is reduced by Age too", func(t *testing.T) {
+		now = time.Now()
+		f := &fakeStatusFetcher{body: emptyStatusList, maxAge: -1, age: 4 * time.Minute}
+		l := newAndroidStatusList(f, 5*time.Minute)
+		l.now = clock
+		_, _, _ = l.check(context.Background(), serial)
+		now = now.Add(2 * time.Minute)
+		_, _, _ = l.check(context.Background(), serial)
+		if f.callCount() != 2 {
+			t.Fatalf("calls = %d", f.callCount())
+		}
+	})
+	t.Run("a response already past its max-age is refused", func(t *testing.T) {
+		now = time.Now()
+		f := &fakeStatusFetcher{body: `{"entries":{}}`, maxAge: time.Minute, age: 2 * time.Minute}
+		l := newAndroidStatusList(f, time.Hour)
+		l.now = clock
+		_, _, err := l.check(context.Background(), serial)
+		if !errors.Is(err, ErrAndroidStatusUnavailable) || !errors.Is(err, ErrAndroidStatusStale) {
+			t.Fatalf("err = %v", err)
+		}
+	})
+}
+
+func TestInitialAge(t *testing.T) {
+	recv := time.Now()
+	h := http.Header{}
+	h.Set("Age", "100")
+	if got := initialAge(h, recv.Add(-2*time.Second), recv); got < 101*time.Second || got > 103*time.Second {
+		t.Fatalf("Age header: %v", got)
+	}
+	h = http.Header{}
+	h.Set("Date", recv.Add(-90*time.Second).UTC().Format(http.TimeFormat))
+	if got := initialAge(h, recv, recv); got < 89*time.Second || got > 91*time.Second {
+		t.Fatalf("Date header: %v", got)
+	}
+	h.Set("Age", "5") // the larger of the two wins
+	if got := initialAge(h, recv, recv); got < 89*time.Second {
+		t.Fatalf("max of Date and Age: %v", got)
+	}
+	// A Date in the future (our clock is behind) is not a negative age.
+	h = http.Header{}
+	h.Set("Date", recv.Add(time.Hour).UTC().Format(http.TimeFormat))
+	if got := initialAge(h, recv, recv); got != 0 {
+		t.Fatalf("future Date: %v", got)
+	}
+	for _, bad := range []string{"-1", "abc", ""} {
+		h = http.Header{}
+		h.Set("Age", bad)
+		if got := initialAge(h, recv, recv); got != 0 {
+			t.Fatalf("Age %q: %v", bad, got)
+		}
+	}
+}
+
+func TestHTTPStatusFetcher(t *testing.T) {
+	var status int
+	var hdr map[string]string
+	var body string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for k, v := range hdr {
+			w.Header().Set(k, v)
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer srv.Close()
+	f := NewHTTPAttestationStatusFetcher(srv.Client(), srv.URL)
+
+	status, hdr, body = 200, map[string]string{"Cache-Control": "public, max-age=600", "Age": "60"}, emptyStatusList
+	got, fresh, err := f.Fetch(context.Background())
+	if err != nil || string(got) != emptyStatusList || fresh.MaxAge != 600*time.Second || fresh.Age < 60*time.Second {
+		t.Fatalf("got=%q fresh=%+v err=%v", got, fresh, err)
+	}
+	status = 503
+	if _, _, err = f.Fetch(context.Background()); err == nil {
+		t.Fatal("HTTP 503 accepted")
+	}
+	status, body = 200, strings.Repeat("x", maxAndroidStatusBytes+10)
+	if _, _, err = f.Fetch(context.Background()); err == nil {
+		t.Fatal("oversized list accepted")
+	}
+}
+
+// One refresh at a time; its outcome, a failure included, is shared by the
+// callers waiting for it, and a failed refresh is remembered briefly so an
+// outage does not cost every caller a timeout.
+func TestAndroidStatusList_SharedRefreshAndFailureBackoff(t *testing.T) {
+	serial := []*big.Int{big.NewInt(1)}
+	now := time.Now()
+	var clockMu sync.Mutex
+	clock := func() time.Time { clockMu.Lock(); defer clockMu.Unlock(); return now }
+	advance := func(d time.Duration) { clockMu.Lock(); now = now.Add(d); clockMu.Unlock() }
+
+	f := &fakeStatusFetcher{err: errors.New("down"), gate: make(chan struct{})}
+	l := newAndroidStatusList(f, time.Hour)
+	l.now = clock
+
+	const callers = 20
+	errs := make(chan error, callers)
+	for i := 0; i < callers; i++ {
+		go func() {
+			_, _, err := l.check(context.Background(), serial)
+			errs <- err
+		}()
+	}
+	// All callers are waiting on one refresh; let it fail.
+	for f.callCount() == 0 {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(f.gate)
+	for i := 0; i < callers; i++ {
+		if err := <-errs; !errors.Is(err, ErrAndroidStatusUnavailable) {
+			t.Fatalf("err = %v", err)
+		}
+	}
+	if f.callCount() != 1 {
+		t.Fatalf("%d concurrent callers caused %d fetches", callers, f.callCount())
+	}
+	// Within the backoff: no new fetch, same failure.
+	if _, _, err := l.check(context.Background(), serial); !errors.Is(err, ErrAndroidStatusUnavailable) || f.callCount() != 1 {
+		t.Fatalf("err=%v calls=%d", err, f.callCount())
+	}
+	// After it: the source is tried again, and a recovery is picked up.
+	advance(androidStatusRetryBackoff + time.Second)
+	f.err, f.gate, f.maxAge, f.body = nil, nil, time.Hour, emptyStatusList
+	if _, _, err := l.check(context.Background(), serial); err != nil || f.callCount() != 2 {
+		t.Fatalf("err=%v calls=%d", err, f.callCount())
+	}
+}
+
+func TestAndroidStatusList_WaitingHonoursTheCallersContext(t *testing.T) {
+	f := &fakeStatusFetcher{body: emptyStatusList, maxAge: time.Hour, gate: make(chan struct{})}
+	l := newAndroidStatusList(f, time.Hour)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, _, err := l.check(ctx, []*big.Int{big.NewInt(1)})
+	if !errors.Is(err, ErrAndroidStatusUnavailable) || time.Since(start) > 5*time.Second {
+		t.Fatalf("err=%v after %v", err, time.Since(start))
+	}
+	// The refresh the first caller started is not tied to its context: a
+	// second caller joins it and gets the list once the source answers.
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		close(f.gate)
+	}()
+	if _, _, err = l.check(context.Background(), []*big.Int{big.NewInt(1)}); err != nil {
+		t.Fatalf("second caller: %v", err)
+	}
+	if f.callCount() != 1 {
+		t.Fatalf("%d fetches", f.callCount())
+	}
 }
 
 func TestCacheControlMaxAge(t *testing.T) {
@@ -686,6 +889,26 @@ func TestAndroidKey_ExtensionOnlyReadFromLeaf(t *testing.T) {
 	kd.Challenge = InstanceKeyAttestationChallenge("wrong")
 	// Leaf has the wrong challenge; nothing else in the chain can rescue it.
 	h.invalid(h.chain(kd, leafOpts{}), "challenge")
+}
+
+func TestAndroidKey_PartiallyReadAnchorsAreRefused(t *testing.T) {
+	a, b := newChainFixture(t), newChainFixture(t)
+	bad := "-----BEGIN CERTIFICATE-----\nnot base64!!\n-----END CERTIFICATE-----\n"
+	for name, pemData := range map[string]string{
+		"malformed before valid":  bad + a.rootPEM(),
+		"malformed between valid": a.rootPEM() + bad + b.rootPEM(),
+		"malformed after valid":   a.rootPEM() + bad,
+		"garbage before":          "junk\n" + a.rootPEM(),
+		"undecodable DER":         "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n" + a.rootPEM(),
+	} {
+		if _, err := NewAndroidKeyAttestationVerifier(config.AndroidKeyAttestationConfig{TrustAnchorsPEM: pemData}, zap.NewNop(), &fakeStatusFetcher{}); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	v, err := NewAndroidKeyAttestationVerifier(config.AndroidKeyAttestationConfig{TrustAnchorsPEM: "\n" + a.rootPEM() + "\n\n" + b.rootPEM() + "\n"}, zap.NewNop(), &fakeStatusFetcher{})
+	if err != nil || v.numAnchors != 2 {
+		t.Fatalf("two clean anchors: err=%v n=%d", err, v.numAnchors)
+	}
 }
 
 func TestAndroidKey_ConfigErrorsAreErrors(t *testing.T) {

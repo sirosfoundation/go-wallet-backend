@@ -420,8 +420,13 @@ be replayed under another challenge.
    of the chain is listed in Google's status list
    (`https://android.googleapis.com/attestation/status`). The list is cached
    for its `Cache-Control: max-age` (default `status_list_default_ttl_seconds`,
-   at most 24 h) and **never used past that**: when it has expired and cannot be
-   fetched, evidence is refused (HTTP 503) and nothing is recorded.
+   at most 24 h) **minus the age the response already had** (the `Age` and
+   `Date` headers, RFC 9111), and **never used past that**: a response already
+   past its max-age is refused, and when the cached list has expired and cannot
+   be fetched, evidence is refused (HTTP 503) and nothing is recorded. One
+   refresh runs at a time, callers waiting for it share its result (a failure
+   too) and honour their own cancellation, and a failed refresh is remembered
+   for 5 s so an outage does not cost every request a timeout.
 
 A chain that does not end in a pinned anchor names no home (it is not an
 error: the device may simply be one the operator does not trust). With no
@@ -464,7 +469,8 @@ records against the status list is not done yet (`chain_not_after` and
 Get Google's attestation roots from <https://android.googleapis.com/attestation/root>
 (a JSON array of PEM certificates; it includes the RSA root and the ECDSA P-384
 "Key Attestation CA1" root), review them, and pin them. The server refuses to
-start on an anchors file or digest it cannot parse.
+start on an anchors file or digest it cannot parse, including a malformed PEM
+block between valid ones (a partly read trust list is never used).
 
 Tests build synthetic chains (a test root, an intermediate and a hand-encoded
 `KeyDescription`). `TestAndroidKeyAttestation_RealPixelChains` verifies real
