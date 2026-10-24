@@ -346,6 +346,10 @@ func TestAuxiliaryDataConflict_OtherErrorsNotRelayedAsConflict(t *testing.T) {
 			assert.False(t, isAuxiliaryDataConflict(http.StatusBadRequest, []byte(body)))
 		})
 	}
+	// A case-variant key alongside the exact one must not hide the conflict.
+	assert.True(t, isAuxiliaryDataConflict(http.StatusBadRequest, []byte(`{"error":"auxiliary_data_conflict","ERROR":"invalid_proof","error_description":"C"}`)))
+	assert.True(t, isAuxiliaryDataConflict(http.StatusBadRequest, []byte(`{"ERROR":"invalid_proof","error":"auxiliary_data_conflict"}`)))
+	assert.False(t, isAuxiliaryDataConflict(http.StatusBadRequest, []byte(`{"ERROR":"auxiliary_data_conflict"}`)))
 	assert.False(t, isAuxiliaryDataConflict(http.StatusUnauthorized, []byte(`{"error":"auxiliary_data_conflict"}`)))
 	assert.True(t, isAuxiliaryDataConflict(http.StatusBadRequest, []byte(`{"error":"auxiliary_data_conflict"}`)))
 
@@ -623,4 +627,31 @@ func TestOversizedErrorBodyFailsClosed(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A body that fails mid-read is neither logged, classified nor retried.
+func TestAuxiliaryDataConflict_ReadFailureFailsClosed(t *testing.T) {
+	st := newIssuerStub(t, `{"credential":"c"}`)
+	hits := 0
+	st.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("DPoP-Nonce", "n1")
+		w.Header().Set("Content-Length", "1000")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"auxiliary_data_conflict","error_description":"SECRET-ISSUER-TEXT`)) // cut short
+	})
+	fc := &fakeClient{t: t}
+	h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
+	defer cleanup()
+	require.Error(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", auxCfg(auxAdvFull), nil, ""))
+	assert.Equal(t, 1, hits, "never retried")
+	assert.NotContains(t, logDump(logs), "SECRET-ISSUER-TEXT")
+	fc.settle()
+	var n int
+	for _, m := range fc.outboundMessages() {
+		if string(m["type"]) == `"flow_error"` {
+			n++
+		}
+	}
+	assert.Equal(t, 1, n)
 }
