@@ -146,9 +146,18 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 			UserAuthentication: sp.UserAuthentication, Certification: sp.Certification,
 		}
 	}
-	// The WIA request carries no FIDO2 evidence and no claims: its facts are
-	// the platform source only, exactly as GenerateWIA builds them.
+	// The WIA request carries no claims and no FIDO2 submission: its facts are
+	// the platform source plus whatever verified evidence the store holds for
+	// the instance key (the instance id is its thumbprint), exactly as
+	// GenerateWIA builds them. The dry-run overlay never applies here.
 	wiaFacts := assurance.Facts{Platform: &assurance.PlatformVerified{Source: wiaSource, AppID: appID}}
+	if req.WalletInstanceID != "" && s.keyAttestations != nil {
+		if rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, req.WalletInstanceID); err == nil {
+			wiaFacts.Fido2 = fido2VerifiedFromRecord(rec)
+		} else if !errors.Is(err, storage.ErrNotFound) {
+			s.logger.Warn("instance key evidence lookup failed; treating as none", zap.Error(err))
+		}
+	}
 
 	ka, _ := s.assessor.Simulate(ctx, kaFacts)
 	_, wia := s.assessor.Simulate(ctx, wiaFacts)

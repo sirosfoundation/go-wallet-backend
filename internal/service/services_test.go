@@ -195,6 +195,10 @@ func TestNewServices_WiresAuditEmitterIntoWIA(t *testing.T) {
 	if services.WIA.audit == nil {
 		t.Error("expected WIA service to receive a real audit emitter when cfg.Audit.Enabled is true")
 	}
+	// The instance-key evidence lookup needs the per-key evidence store.
+	if services.WIA.keyAttestations == nil {
+		t.Error("expected WIA service to receive the key attestation store")
+	}
 }
 
 // TestNewServices_WIANilWhenSigningKeyButNoCertInETSIMode is a regression

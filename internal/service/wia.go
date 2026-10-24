@@ -167,6 +167,11 @@ type WIAService struct {
 	instances    storage.WalletInstanceStore
 	audit        *audit.Emitter
 
+	// keyAttestations holds per-key evidence verified by the backend. The WIA
+	// path reads it for the PoP (instance) key only; nil means no evidence is
+	// ever found and the instance records wscd_type unknown.
+	keyAttestations storage.KeyAttestationStore
+
 	// Challenge store for single-use nonces (memory or MongoDB).
 	challenges WIAChallengeStore
 
@@ -207,6 +212,10 @@ func NewWIAService(cfg *config.Config, logger *zap.Logger, jwtSigner *signing.Cr
 // SetAssessor installs the assurance policy used when
 // wallet_provider.attestation.assurance.enabled is true.
 func (s *WIAService) SetAssessor(a *assurance.Assessor) { s.assessor = a }
+
+// SetKeyAttestations installs the store of verified per-key evidence that
+// the instance key is looked up in (see instanceKeyEvidence).
+func (s *WIAService) SetKeyAttestations(k storage.KeyAttestationStore) { s.keyAttestations = k }
 
 func (s *WIAService) assuranceEnabled() bool {
 	return s.cfg.WalletProvider.Attestation.Assurance.Enabled
@@ -375,6 +384,11 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 		}
 	}
 
+	// Step 3.4: evidence about the instance key itself (the PoP key), from the
+	// store of per-key evidence the backend verified. Never from anything the
+	// client reports about its keystore.
+	att.KeyEvidence = s.instanceKeyEvidence(ctx, jkt)
+
 	// Step 3.5: the assurance policy decides whether a WIA is issued at all,
 	// which S profile it carries and which certification information applies.
 	// Disabled (default): always issue, exactly as before.
@@ -408,14 +422,72 @@ type wiaAttestation struct {
 	CertInfo map[string]interface{}
 	// Decision is the policy outcome, nil with the policy disabled.
 	Decision *assurance.WIAOutcome
+
+	// KeyEvidence is the VERIFIED per-key evidence record for the instance
+	// key (the thumbprint of the PoP key), nil when the backend holds none.
+	// It is what the fido2 evidence slot and the recorded wscd_type derive
+	// from; the client-reported plugin is never consulted.
+	KeyEvidence *domain.KeyAttestationRecord
+}
+
+// instanceKeyEvidence returns the verified key-evidence record stored for the
+// instance key with thumbprint jkt, or nil. The lookup is by the PoP key's own
+// RFC 7638 thumbprint, so evidence only applies when the key that was attested
+// is the key that signs the PoP.
+//
+// ARKG caveat: for a key derived with ARKG the public key the authenticator
+// attested is the base (seed) key, while the PoP key is a derived key with a
+// different thumbprint. The thumbprints then differ, nothing matches and the
+// result stays "no evidence" (wscd_type unknown). That is intended: the
+// evidence says nothing about the derived key unless a later stage binds them.
+//
+// A store error is treated as no evidence (fail closed to unknown), never as
+// permission.
+func (s *WIAService) instanceKeyEvidence(ctx context.Context, jkt string) *domain.KeyAttestationRecord {
+	if s.keyAttestations == nil {
+		return nil
+	}
+	rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, jkt)
+	if err != nil {
+		if !errors.Is(err, storage.ErrNotFound) {
+			s.logger.Warn("instance key evidence lookup failed; treating as none", zap.Error(err))
+		}
+		return nil
+	}
+	return rec
+}
+
+// fido2VerifiedFromRecord renders a verified FIDO2 record as the evidence
+// fido2 slot. Records of other kinds (android_key, app_attest_assertion, ...)
+// are not FIDO2 evidence and yield nil. Presence means the attestation chain
+// was accepted by the FIDO MDS3 registry.
+func fido2VerifiedFromRecord(rec *domain.KeyAttestationRecord) *assurance.Fido2Verified {
+	if rec == nil {
+		return nil
+	}
+	n := *rec
+	n.Normalize()
+	if n.Kind != domain.KeyEvidenceFIDO2 {
+		return nil
+	}
+	out := &assurance.Fido2Verified{AAGUID: n.AAGUID}
+	if n.UV {
+		out.UV = assurance.UVPresent
+	}
+	return out
 }
 
 // wiaFacts builds the evidence of a WIA decision. The platform slot is the
 // native attestation source verified in this request (not stored instance
-// state); the FIDO2 slot is none because a WIA request carries no FIDO2
-// evidence; there are no client claims.
+// state); the FIDO2 slot is the verified FIDO2 record stored for the instance
+// key (none when there is none: a WIA request itself carries no FIDO2
+// evidence); there are no client claims. This is KEY evidence about the
+// instance key: no shipped rule derives a credential key's KA level from it.
 func wiaFacts(att wiaAttestation) assurance.Facts {
-	return assurance.Facts{Platform: &assurance.PlatformVerified{Source: att.Source, AppID: att.AppID}}
+	return assurance.Facts{
+		Platform: &assurance.PlatformVerified{Source: att.Source, AppID: att.AppID},
+		Fido2:    fido2VerifiedFromRecord(att.KeyEvidence),
+	}
 }
 
 // applyAssurance runs the policy for one WIA request and records the result
@@ -729,9 +801,10 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 			Status:   domain.InstanceStatusActive,
 			// The WIA PoP key is the wallet's instance key in its own keystore
 			// (software store or any WSCD plugin), not the App Attest / Play
-			// Integrity key, and nothing here verifies where it lives, so no
-			// platform type is derived from the attestation.
-			WSCDType:          domain.WSCDTypeUnknown,
+			// Integrity key. Its home is only known from verified per-key
+			// evidence for that very key; without it the type is unknown (never
+			// derived from the platform attestation or a client-reported plugin).
+			WSCDType:          instanceWSCDType(att.KeyEvidence),
 			AttestationSource: attestationSource,
 			VerifiedAppID:     att.AppID,
 			LastAttestedAt:    now,
@@ -835,4 +908,15 @@ func wscdTypeFromKeyHome(home domain.KeyHome) domain.WSCDType {
 		return domain.WSCDTypeRemote
 	}
 	return domain.WSCDTypeUnknown
+}
+
+// instanceWSCDType is the wscd_type to record for an instance key given its
+// verified evidence record (nil: nothing verified, so unknown).
+func instanceWSCDType(rec *domain.KeyAttestationRecord) domain.WSCDType {
+	if rec == nil {
+		return domain.WSCDTypeUnknown
+	}
+	n := *rec
+	n.Normalize()
+	return wscdTypeFromKeyHome(n.Home)
 }
