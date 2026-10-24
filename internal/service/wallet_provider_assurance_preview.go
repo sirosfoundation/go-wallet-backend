@@ -124,7 +124,7 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 			// A FIDO2 attestation verified in this request vouches for the
 			// batch just as a stored record would.
 			trusted = s.keyAttestationTrustsBatchWith(ctx, req.WalletInstanceID, req.JWKS, overlay) ||
-				(len(req.JWKS) == 0 && overlay != nil)
+				(len(req.JWKS) == 0 && overlay != nil && isFIDO2KeyEvidence(overlay))
 		}
 		n := normalizeSecurityProperties(req.SecurityProperties, trusted)
 		out.KeyStorage, out.UserAuthentication, out.Certification = n.KeyStorage, n.UserAuthentication, n.Certification
@@ -153,6 +153,9 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 	wiaFacts := assurance.Facts{Platform: &assurance.PlatformVerified{Source: wiaSource, AppID: appID}}
 	if req.WalletInstanceID != "" && s.keyAttestations != nil {
 		if rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, req.WalletInstanceID); err == nil {
+			if caller, ok := ctx.Value(callerCtxKey{}).(KeyAttestationCaller); ok && !instanceEvidenceInScope(rec, caller.TenantID, caller.UserID) {
+				rec = nil
+			}
 			wiaFacts.Fido2 = fido2VerifiedFromRecord(rec)
 			wiaFacts.InstanceKey = instanceKeyVerifiedFromRecord(rec)
 		} else if !errors.Is(err, storage.ErrNotFound) {

@@ -196,6 +196,9 @@ func TestNewServices_WiresAuditEmitterIntoWIA(t *testing.T) {
 		t.Error("expected WIA service to receive a real audit emitter when cfg.Audit.Enabled is true")
 	}
 	// The instance-key evidence lookup needs the per-key evidence store.
+	if got := services.WIA.InstanceKeyVerifierTypes(); len(got) == 0 || got[0] != "android_key" {
+		t.Errorf("expected the android_key instance-key verifier to be registered, got %v", got)
+	}
 	if services.WIA.keyAttestations == nil {
 		t.Error("expected WIA service to receive the key attestation store")
 	}

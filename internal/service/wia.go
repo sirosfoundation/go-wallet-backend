@@ -172,6 +172,10 @@ type WIAService struct {
 	// ever found and the instance records wscd_type unknown.
 	keyAttestations storage.KeyAttestationStore
 
+	// keyVerifiers verifies the optional key_attestation request field, by
+	// type. Registered while wiring the service (RegisterInstanceKeyVerifier).
+	keyVerifiers map[KeyAttestationType]InstanceKeyEvidenceVerifier
+
 	// Challenge store for single-use nonces (memory or MongoDB).
 	challenges WIAChallengeStore
 
@@ -302,6 +306,9 @@ type WIARequest struct {
 	ClientID string `json:"client_id,omitempty"`
 	// NativeAttestation is optional platform attestation evidence
 	NativeAttestation *NativeAttestationRequest `json:"native_attestation,omitempty"`
+	// KeyAttestation is optional evidence about the instance (PoP) key
+	// itself; see instance_key_evidence.go. Absent: the home stays unknown.
+	KeyAttestation *KeyAttestation `json:"key_attestation,omitempty"`
 }
 
 // WIAPopClaims are the expected claims in a WIA-PoP JWT.
@@ -322,6 +329,13 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	start := time.Now()
 	defer func() { wiaGenerationDuration.Observe(time.Since(start).Seconds()) }()
 
+	// Step 0: an unknown key_attestation type is a client error that must not
+	// burn the single-use challenge.
+	keyVerifier, err := s.keyVerifierFor(req.KeyAttestation)
+	if err != nil {
+		return "", err
+	}
+
 	// Step 1: Consume challenge (single-use, atomic).
 	// Must happen before PoP validation to prevent concurrent crypto amplification
 	// attacks on the same challenge (TOCTOU). The trade-off is that a malformed PoP
@@ -333,6 +347,11 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 
 	// Step 2: Parse and validate WIA-PoP
 	cnfJWK, err := s.validatePop(req.Pop, req.Challenge)
+	if err != nil {
+		s.emitAuditFailure("pop_invalid", err)
+		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
+	}
+	popKey, err := jwk.ParseECPublicKey(cnfJWK)
 	if err != nil {
 		s.emitAuditFailure("pop_invalid", err)
 		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
@@ -387,7 +406,21 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	// Step 3.4: evidence about the instance key itself (the PoP key), from the
 	// store of per-key evidence the backend verified. Never from anything the
 	// client reports about its keystore.
-	att.KeyEvidence = s.instanceKeyEvidence(ctx, jkt)
+	// Step 3.3: evidence the client submitted about that key is verified and
+	// stored first, so the lookup below sees it. Invalid evidence refuses the
+	// WIA; evidence that names no home changes nothing.
+	var submitted *domain.KeyAttestationRecord
+	if keyVerifier != nil {
+		submitted, err = s.verifyKeyAttestation(ctx, keyVerifier, req.KeyAttestation, tenantID, userIDString(userID), jkt, popKey, req.Challenge)
+		if err != nil {
+			s.emitAuditFailure("key_attestation_rejected", err)
+			return "", err
+		}
+	}
+	att.KeyEvidence = s.instanceKeyEvidence(ctx, tenantID, userIDString(userID), jkt)
+	if att.KeyEvidence == nil && s.keyAttestations == nil {
+		att.KeyEvidence = submitted // nothing durable to read back from
+	}
 
 	// Step 3.5: the assurance policy decides whether a WIA is issued at all,
 	// which S profile it carries and which certification information applies.
@@ -443,7 +476,7 @@ type wiaAttestation struct {
 //
 // A store error is treated as no evidence (fail closed to unknown), never as
 // permission.
-func (s *WIAService) instanceKeyEvidence(ctx context.Context, jkt string) *domain.KeyAttestationRecord {
+func (s *WIAService) instanceKeyEvidence(ctx context.Context, tenantID domain.TenantID, userID, jkt string) *domain.KeyAttestationRecord {
 	if s.keyAttestations == nil {
 		return nil
 	}
@@ -454,7 +487,18 @@ func (s *WIAService) instanceKeyEvidence(ctx context.Context, jkt string) *domai
 		}
 		return nil
 	}
+	if !instanceEvidenceInScope(rec, tenantID, userID) {
+		s.logger.Warn("instance key evidence was verified for another tenant or user; ignoring it")
+		return nil
+	}
 	return rec
+}
+
+func userIDString(u *domain.UserID) string {
+	if u == nil {
+		return ""
+	}
+	return u.String()
 }
 
 // instanceKeyEvidenceBuilder turns a verified per-key evidence record of one

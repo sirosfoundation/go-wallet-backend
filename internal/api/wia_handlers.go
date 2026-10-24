@@ -60,6 +60,10 @@ type WIAGenerateRequest struct {
 	ClientID string `json:"client_id,omitempty"`
 	// NativeAttestation is optional platform attestation evidence (App Attest / Play Integrity)
 	NativeAttestation *service.NativeAttestationRequest `json:"native_attestation,omitempty"`
+	// KeyAttestation is optional evidence about the instance (PoP) key:
+	// {"type": "android_key" | "app_attest_assertion", ...}. See
+	// service.KeyAttestation.
+	KeyAttestation *service.KeyAttestation `json:"key_attestation,omitempty"`
 }
 
 // WIAGenerate handles POST /wallet-provider/wia/generate
@@ -93,6 +97,7 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 		Challenge:         req.Challenge,
 		ClientID:          req.ClientID,
 		NativeAttestation: req.NativeAttestation,
+		KeyAttestation:    req.KeyAttestation,
 	})
 	if err != nil {
 		switch {
@@ -106,6 +111,23 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":   "POP_INVALID",
 				"message": "WIA-PoP validation failed",
+			})
+		case errors.Is(err, service.ErrWIAKeyAttestationTypeUnsupported):
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":   "KEY_ATTESTATION_TYPE_UNSUPPORTED",
+				"message": "The key_attestation type is not supported",
+			})
+		case errors.Is(err, service.ErrWIAKeyAttestationInvalid):
+			h.logger.Debug("key attestation rejected", zap.Error(err))
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":   "KEY_ATTESTATION_INVALID",
+				"message": "The key_attestation evidence is invalid",
+			})
+		case errors.Is(err, service.ErrWIAKeyAttestationUnavailable):
+			h.logger.Warn("key attestation cannot be verified", zap.Error(err))
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":   "KEY_ATTESTATION_UNAVAILABLE",
+				"message": "The key_attestation evidence cannot be verified right now, retry later",
 			})
 		case errors.Is(err, service.ErrWIAInstanceDeactivated):
 			h.logger.Warn("WIA generation refused for deactivated instance", zap.Error(err))

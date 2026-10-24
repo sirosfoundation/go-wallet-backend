@@ -1283,6 +1283,11 @@ type AttestationConfig struct {
 	// FIDO2AttestationService.
 	FIDO2Attestation FIDO2AttestationConfig `yaml:"fido2_attestation" envconfig:"FIDO2_ATTESTATION"`
 
+	// AndroidKeyAttestation controls verification of Android Key Attestation
+	// chains submitted as evidence about the WIA instance key
+	// (key_attestation type android_key). Nothing is trusted by default.
+	AndroidKeyAttestation AndroidKeyAttestationConfig `yaml:"android_key_attestation" envconfig:"ANDROID_KEY_ATTESTATION"`
+
 	// StatusList controls the Token Status List references embedded in the
 	// WIA (`client_status`) and KA (`key_storage_status`).
 	StatusList StatusListConfig `yaml:"status_list" envconfig:"STATUS_LIST"`
@@ -1352,6 +1357,49 @@ type FIDO2AttestationConfig struct {
 	// endpoint accepts and verifies attestation objects. Off by default —
 	// like NativeAttestation, this is an explicit opt-in trust decision.
 	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+}
+
+// AndroidKeyAttestationConfig controls verification of Android Key
+// Attestation chains (key_attestation type android_key). The verifier ships
+// NO trust anchors and trusts no application: with no trust anchors, or no
+// allowed app digests, it records no evidence at all (fail closed), and a
+// wallet then simply has its instance key home "unknown".
+//
+// Get Google's hardware attestation roots from
+// https://android.googleapis.com/attestation/root (a JSON array of PEM
+// certificates: the RSA root and the ECDSA P-384 "Key Attestation CA1" root)
+// and pin them here. Operators review and rotate the list; the backend never
+// fetches trust anchors itself.
+type AndroidKeyAttestationConfig struct {
+	// TrustAnchorsPath is a file of PEM CERTIFICATE blocks: the pinned roots
+	// an attestation chain must end in. Unset and empty TrustAnchorsPEM mean
+	// no anchors, so nothing verifies.
+	TrustAnchorsPath string `yaml:"trust_anchors_path" envconfig:"TRUST_ANCHORS_PATH"`
+
+	// TrustAnchorsPEM is the same list given inline (for example from a
+	// mounted secret exposed as an environment variable). It is added to the
+	// anchors read from TrustAnchorsPath.
+	TrustAnchorsPEM string `yaml:"trust_anchors_pem" envconfig:"TRUST_ANCHORS_PEM"`
+
+	// AllowedAppDigests are the SHA-256 digests (hex, optionally colon
+	// separated) of the signing certificates of the wallet apps whose keys
+	// are accepted. Every digest the chain reports for the app must be on
+	// the list. Empty: no app is accepted.
+	AllowedAppDigests []string `yaml:"allowed_app_digests" envconfig:"ALLOWED_APP_DIGESTS"`
+
+	// AllowedPackages optionally narrows the accepted Android package names.
+	// Empty: any package whose signing digests are allowed.
+	AllowedPackages []string `yaml:"allowed_packages" envconfig:"ALLOWED_PACKAGES"`
+
+	// StatusListURL is Google's attestation revocation list. Default
+	// https://android.googleapis.com/attestation/status.
+	StatusListURL string `yaml:"status_list_url" envconfig:"STATUS_LIST_URL"`
+
+	// StatusListDefaultTTLSeconds is how long a fetched list is trusted when
+	// the response carries no Cache-Control max-age. Default 3600. The list
+	// is never used past its freshness: when it has expired and cannot be
+	// fetched, evidence is refused (fail closed).
+	StatusListDefaultTTLSeconds int `yaml:"status_list_default_ttl_seconds" envconfig:"STATUS_LIST_DEFAULT_TTL_SECONDS"`
 }
 
 // NativeAttestationConfig controls platform-specific attestation verification.

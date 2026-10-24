@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -12,8 +13,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
@@ -212,5 +215,77 @@ func TestWIAGenerate_InvalidPopFormat(t *testing.T) {
 	json.Unmarshal(w.Body.Bytes(), &resp)
 	if resp["error"] != "POP_INVALID" {
 		t.Errorf("expected POP_INVALID error, got %v", resp["error"])
+	}
+}
+
+// kaVerifier is a key_attestation verifier test double.
+type kaVerifier struct{ err error }
+
+func (kaVerifier) Type() service.KeyAttestationType { return "android_key" }
+func (v kaVerifier) Verify(context.Context, *service.InstanceKeyEvidenceInput) (*service.InstanceKeyEvidenceResult, error) {
+	return &service.InstanceKeyEvidenceResult{}, v.err
+}
+
+func postWIAGenerate(t *testing.T, h *Handlers, router *gin.Engine, keyAttestation string) *httptest.ResponseRecorder {
+	t.Helper()
+	router.POST("/wia/generate", h.WIAGenerate)
+	challenge, _, err := h.services.WIA.CreateChallenge(context.Background(), "default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tok := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{
+		"iss": "urn:wallet:instance:t", "nonce": challenge,
+		"iat": time.Now().Unix(), "exp": time.Now().Add(time.Minute).Unix(),
+	})
+	tok.Header["typ"] = "oauth-client-attestation-pop+jwt"
+	tok.Header["jwk"] = map[string]any{
+		"kty": "EC", "crv": "P-256",
+		"x": base64.RawURLEncoding.EncodeToString(key.PublicKey.X.FillBytes(make([]byte, 32))),
+		"y": base64.RawURLEncoding.EncodeToString(key.PublicKey.Y.FillBytes(make([]byte, 32))),
+	}
+	pop, err := tok.SignedString(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := `{"pop":"` + pop + `","challenge":"` + challenge + `"` + keyAttestation + `}`
+	req := httptest.NewRequest(http.MethodPost, "/wia/generate", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	return w
+}
+
+func errCode(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	var resp map[string]any
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	s, _ := resp["error"].(string)
+	return s
+}
+
+func TestWIAGenerate_KeyAttestationErrorsMapToStatuses(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		ka     string
+		err    error
+		status int
+		code   string
+	}{
+		{"unknown type", `,"key_attestation":{"type":"nope"}`, nil, http.StatusBadRequest, "KEY_ATTESTATION_TYPE_UNSUPPORTED"},
+		{"missing type", `,"key_attestation":{}`, nil, http.StatusBadRequest, "KEY_ATTESTATION_TYPE_UNSUPPORTED"},
+		{"invalid", `,"key_attestation":{"type":"android_key"}`, service.ErrWIAKeyAttestationInvalid, http.StatusBadRequest, "KEY_ATTESTATION_INVALID"},
+		{"unavailable", `,"key_attestation":{"type":"android_key"}`, service.ErrWIAKeyAttestationUnavailable, http.StatusServiceUnavailable, "KEY_ATTESTATION_UNAVAILABLE"},
+		{"valid, no home", `,"key_attestation":{"type":"android_key"}`, nil, http.StatusOK, ""},
+		{"absent", ``, nil, http.StatusOK, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h, router := setupWIATestHandlers(t, true)
+			h.services.WIA.RegisterInstanceKeyVerifier(kaVerifier{err: tc.err})
+			w := postWIAGenerate(t, h, router, tc.ka)
+			if w.Code != tc.status || errCode(t, w) != tc.code {
+				t.Fatalf("status %d code %q body %s", w.Code, errCode(t, w), w.Body.String())
+			}
+		})
 	}
 }
