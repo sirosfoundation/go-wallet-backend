@@ -204,3 +204,19 @@ func TestWIAKeyAttestation_RegistryIsKeyedByType(t *testing.T) {
 		t.Fatalf("types = %v", got)
 	}
 }
+
+// A storage failure after successful verification is a retryable outage
+// (ErrWIAKeyAttestationUnavailable, HTTP 503), not an internal failure, and
+// the WIA is refused without creating an instance.
+func TestWIAKeyAttestation_PersistenceFailureIsUnavailable(t *testing.T) {
+	svc, instances := newTestWIAServiceWithInstances(t)
+	svc.SetKeyAttestations(failingMarkStore{memory.NewStore().KeyAttestations()})
+	svc.RegisterInstanceKeyVerifier(&fakeKeyVerifier{typ: KeyAttestationAndroidKey, res: &InstanceKeyEvidenceResult{Record: androidRecord()}})
+	jkt, err := tryKeyAttestation(t, svc, &KeyAttestation{Type: KeyAttestationAndroidKey})
+	if !errors.Is(err, ErrWIAKeyAttestationUnavailable) {
+		t.Fatalf("err = %v, want ErrWIAKeyAttestationUnavailable", err)
+	}
+	if _, e := instances.GetByID(context.Background(), jkt); !errors.Is(e, storage.ErrNotFound) {
+		t.Fatalf("a refused WIA created an instance: %v", e)
+	}
+}

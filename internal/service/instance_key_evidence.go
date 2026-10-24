@@ -245,7 +245,10 @@ func (s *WIAService) verifyKeyAttestation(ctx context.Context, v InstanceKeyEvid
 	}
 	if s.keyAttestations != nil {
 		if err := s.keyAttestations.MarkKeyAttested(ctx, rec); err != nil {
-			return nil, fmt.Errorf("%w: store instance key evidence: %v", ErrWIAKeyAttestationUnavailable, err)
+			// The evidence verified but could not be persisted: a dependency
+			// outage, retryable (HTTP 503), not a verification failure. The
+			// storage error stays in the chain for the log.
+			return nil, fmt.Errorf("%w: store instance key evidence: %w", ErrWIAKeyAttestationUnavailable, err)
 		}
 	}
 	return rec, nil

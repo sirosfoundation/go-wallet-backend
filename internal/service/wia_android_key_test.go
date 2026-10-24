@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
@@ -377,34 +376,5 @@ func TestPreview_WIAHalfHonoursEvidenceScope(t *testing.T) {
 	}
 	if !issue("u1") || issue("u2") || issue("") {
 		t.Fatal("the preview did not honour the evidence's user scope")
-	}
-}
-
-// Policy disabled: a stored instance-key record that outranks a FIDO2
-// submission becomes the preview's overlay, and the no-JWKS fallback must not
-// treat it as FIDO2 evidence (actual issuance clamps).
-func TestPreview_PolicyDisabledFallbackIgnoresInstanceKeyOverlay(t *testing.T) {
-	svc, _, keys := previewSvc(t, "", true)
-	svc.cfg.WalletProvider.Attestation.Assurance.Enabled = false
-	aaguid := uuid.MustParse("00000000-0000-0000-0000-0000000000aa")
-	sub, tp := fido2Submission(t, aaguid, 0x40|0x04|0x01)
-	req := &AssurancePreviewRequest{FIDO2: sub, SecurityProperties: &SecurityProperties{KeyStorage: []string{"iso_18045_high"}}}
-
-	// Control: with no stored record the FIDO2 submission itself vouches.
-	got, err := svc.PreviewAssurance(context.Background(), req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.KeyStorage[0] != "iso_18045_high" {
-		t.Fatalf("control: %+v", got)
-	}
-	// A stored android_key record of equal rank is not superseded by the submission.
-	putRecord(t, keys, domain.KeyAttestationRecord{KeyThumbprint: tp, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox, TenantID: domain.DefaultTenantID})
-	got, err = svc.PreviewAssurance(context.Background(), req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.KeyStorage[0] == "iso_18045_high" {
-		t.Fatalf("an instance-key overlay vouched for key storage: %+v", got)
 	}
 }

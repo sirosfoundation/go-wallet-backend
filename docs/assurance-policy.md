@@ -349,9 +349,11 @@ shipped examples do; making the home depend on `keyProtection` needs the PDP
 decision to expose it first.
 
 `wscdTypeFromKeyHome(home)` maps a verified record's home to a WSCD type
-(`strongbox`/`tee` -> `native_android`, `secure_enclave_asserted` ->
-`native_ios`, `fido2_hw` -> `fido2_hardware`, `hsm` -> `remote`) and everything
-else to `unknown`. It is never fed from the client-reported plugin or the
+(`strongbox`/`tee` -> `native_android`, `fido2_hw` -> `fido2_hardware`,
+`hsm` -> `remote`) and everything else, including `secure_enclave_asserted`, to
+`unknown`. `secure_enclave_asserted` maps to `unknown` on purpose: an App
+Attest assertion only proves that an attested app endorsed the key, not that
+the key resides in the Secure Enclave, so it is never recorded as `native_ios`. It is never fed from the client-reported plugin or the
 platform attestation.
 
 **A record is never overwritten by weaker or absent evidence** (memory and
@@ -473,7 +475,7 @@ is registered by its own stage). The request is classified as follows:
 | field absent | no instance-key evidence, home `unknown` |
 | `type` not registered | HTTP 400 `KEY_ATTESTATION_TYPE_UNSUPPORTED`, before the single-use challenge is consumed |
 | evidence invalid (malformed, broken chain, expired certificate, wrong leaf key, wrong challenge, missing attestation extension, revoked certificate) | WIA refused, HTTP 400 `KEY_ATTESTATION_INVALID` (same rule as a failing native attestation) |
-| the evidence cannot be judged (no fresh revocation list) | WIA refused, HTTP 503 `KEY_ATTESTATION_UNAVAILABLE`, nothing recorded |
+| the evidence cannot be judged (no fresh revocation list) or a verified record cannot be stored (storage outage) | WIA refused, HTTP 503 `KEY_ATTESTATION_UNAVAILABLE`, nothing recorded |
 | sound but names no home (see below) | no record; the WIA issues with the home `unknown` |
 | verified hardware-backed | record written, home `strongbox` or `tee` |
 
