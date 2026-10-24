@@ -1,0 +1,19 @@
+# Assurance policy: gdc / simulation.  NEVER use in production.
+#
+# Grants the highest tier to a wallet whose client CLAIMS to use the soft
+# plugin, so a test environment without hardware can exercise issuers that
+# demand high key storage / user authentication. Both rules depend on
+# client-claimed evidence on purpose; the linter warns about them.
+#
+# The client must send security_properties.plugin = "soft".
+#
+# With lower_by_claims_* = true (the default) the result is min(claimed,
+# granted), so the granted tier only shows up when the client also claims the
+# target level. Set lower_by_claims_key_storage / _user_authentication to
+# false to let these rules be the sole authority.
+
+# id: gdc-soft-ks-high
+(assure-ks (tier (* set basic enhanced-basic moderate high))(evidence (verified)(claimed (plugin soft))))
+
+# id: gdc-soft-ua-high
+(assure-ua (tier (* set basic enhanced-basic moderate high))(evidence (verified)(claimed (plugin soft))))
