@@ -674,6 +674,56 @@ dropped from the served document too (editing the payload would break the
 signature). A valid advertisement is public names-only data and is served to the
 wallet unchanged; the wallet needs it to request encryption.
 
+#### Credential Auxiliary Data
+
+The engine also understands the OpenID4VCI Credential Auxiliary Data
+advertisement (draft v0.1, sirosfoundation/nym_auth_rulebook#12), beside the
+legacy `org.siros.secret_seed` one. Which `credential_metadata` members count as
+secret-bearing is configuration: `issuance.secret_members` (default
+`org.siros.secret_seed` and `auxiliary_data`; see CONFIGURATION.md). The engine
+uses that one set to refuse a plain issuer response that has any such member, to
+keep it out of every relayed message and log, and to treat one in the issuer
+metadata's `credential_metadata` as malformed (`auxiliary_data` MUST NOT appear
+there).
+
+The advertisement is read from the credential configuration:
+
+```
+credential_configurations_supported[cfg].auxiliary_data_supported
+  = {"to_wallet": [entry, ...], "to_issuer": [entry, ...]}
+```
+
+- It must be an object with at least one of `to_wallet` and `to_issuer`, each a
+  non-empty array (at most 16) of entry objects with a string `type`, at most
+  one entry per `type` and `path`. `required` (a boolean) is allowed in
+  `to_issuer` entries only. A `hash_commitment` entry needs a string `alg` and a
+  `path` (a non-empty claims path of strings, nulls and non-negative integers)
+  and must not carry `opening` or `commitment`. Entries of any other `type` are
+  kept and otherwise ignored. Anything else makes the configuration not offered,
+  exactly like a malformed seed advertisement (same drop at decode, same removal
+  in the resolve endpoint).
+- When `to_wallet` has an entry of type `hash_commitment` (a type with a Secret
+  Value), the response MUST be encrypted: the engine behaves as for a seed
+  advertisement (encryption `required`, a plain answer is refused unread, no
+  encryption offered by the issuer fails the issuance before any request).
+- `to_issuer` entries go to the client on the `generate_proof` `sign_request`,
+  verbatim, in the param `auxiliary_data_to_issuer` (an array of the entry
+  objects as the issuer published them). The wallet places
+  `{type, alg, path, commitment}` in the signed part of every key proof it
+  returns, the same value in all proofs of the request, and MUST send each entry
+  with `required: true`. The engine never computes or sees a commitment. A
+  configuration with a `required` entry and no proof type fails the flow with
+  `SIGN_ERROR`.
+
+If the credential endpoint answers HTTP 400 with the OAuth error code
+`auxiliary_data_conflict` (an entry conflicts with a value the issuer holds for
+the subject; retrying never helps, the issuer resolves it out of band) the engine
+sends a `flow_error` with code `AUXILIARY_DATA_CONFLICT`, step
+`requesting_credential`, a fixed `error.message`, and `error.details` =
+`{"error": "auxiliary_data_conflict"}` (the issuer's code, unchanged), and does
+not retry. No other issuer text (`error_description`) is relayed. Every other
+error, including `invalid_proof`, is an ordinary `CREDENTIAL_ERROR`.
+
 Deferred issuance:
 
 ```
@@ -1015,6 +1065,7 @@ Server → Client:
 | `AUTHORIZATION_FAILED` | OAuth authorization flow failed |
 | `TOKEN_ERROR` | Token endpoint returned error |
 | `CREDENTIAL_ERROR` | Credential endpoint returned error |
+| `AUXILIARY_DATA_CONFLICT` | Issuer rejected the credential request with `auxiliary_data_conflict`; `error.details.error` carries that code |
 | `SIGN_TIMEOUT` | Client did not respond to sign request |
 | `SIGN_ERROR` | Client signature was invalid |
 | `PRESENTATION_ERROR` | VP creation or submission failed |

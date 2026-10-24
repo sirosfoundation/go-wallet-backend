@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -273,9 +274,13 @@ type CredentialConfig struct {
 	// in either shape (some send an array) does not fail the whole document (#370).
 	Claims json.RawMessage `json:"claims,omitempty"`
 	// CredentialMetadata is the 1.0/1.1 credential_metadata member, kept raw.
-	// The engine reads only its org.siros.secret_seed advertisement (see
-	// secretSeedAdvertised); display data is never taken from it here.
+	// The engine reads only the secret delivery advertisement (see
+	// secretDeliveryOf); display data is never taken from it here.
 	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
+	// AuxiliaryDataSupported is the OpenID4VCI Credential Auxiliary Data
+	// advertisement (to_wallet / to_issuer entries), kept raw; see
+	// secretDeliveryOf for what the engine takes from it.
+	AuxiliaryDataSupported json.RawMessage `json:"auxiliary_data_supported,omitempty"`
 }
 
 // CredentialConfigurations is credential_configurations_supported, decoded
@@ -310,9 +315,10 @@ func (c *CredentialConfigurations) UnmarshalJSON(data []byte) error {
 		if err := json.Unmarshal(entry, &cfg); err != nil {
 			continue
 		}
-		// A malformed org.siros.secret_seed advertisement means the
+		// A malformed secret delivery advertisement (legacy
+		// org.siros.secret_seed, or auxiliary_data_supported) means the
 		// configuration is not offered (privatedata-spec 5A.3).
-		if present, ok := SecretSeedAdvertisement(cfg.CredentialMetadata); present && !ok {
+		if _, err := secretDeliveryOf(&cfg); err != nil {
 			continue
 		}
 		parsed[id] = cfg
@@ -356,7 +362,8 @@ type CredentialResponse struct {
 	Interval        int           `json:"interval,omitempty"`
 	NotificationID  string        `json:"notification_id,omitempty"`
 	// CredentialMetadata is the raw response-level credential_metadata of a
-	// PLAIN response. It may carry a secret (org.siros.secret_seed): never log
+	// PLAIN response. It may carry a secret (a configured secret member, by
+	// default org.siros.secret_seed or auxiliary_data): never log
 	// it; only displayMetadata(...) of it may leave the engine.
 	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
 
@@ -1091,6 +1098,11 @@ func (h *OID4VCIHandler) issueCredential(ctx context.Context, metadata *IssuerMe
 	if err != nil {
 		return err
 	}
+	// A required to_issuer entry can only travel in a key proof: with no proof
+	// type declared the request would bypass it, so refuse (fail closed).
+	if err := h.checkRequiredAuxiliaryDataNeedsProof(selectedConfig); err != nil {
+		return err
+	}
 	var credential *CredentialResponse
 	for retries := 0; retries <= 1; retries++ {
 		var proofs []ProofObject
@@ -1170,8 +1182,8 @@ func (h *OID4VCIHandler) issueCredential(ctx context.Context, metadata *IssuerMe
 func (h *OID4VCIHandler) finishIssuance(ctx context.Context, resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo, metadata *IssuerMetadata, token *TokenResponse) error {
 	// A plain response never delivers a seed (privatedata-spec 5A.4), whether
 	// advertised or not: refuse it, without quoting any content.
-	if !resp.Encrypted && hasSecretSeedMember(resp.CredentialMetadata) {
-		err := errors.New("secret seed credential_metadata arrived in a plain response")
+	if !resp.Encrypted && hasSecretMember(resp.CredentialMetadata) {
+		err := errors.New("secret credential_metadata member arrived in a plain response")
 		h.Logger.Warn("rejecting credential response", zap.Error(err))
 		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer returned malformed credential metadata")
 		return err
@@ -1416,7 +1428,7 @@ func (h *OID4VCIHandler) logIgnoredCredentialConfigurations(source map[string]in
 			h.Logger.Warn("ignoring credential configuration with a broken format",
 				zap.String("credential_configuration_id", id),
 				zap.Error(err))
-		} else if present, ok := SecretSeedAdvertisement(cfg.CredentialMetadata); present && !ok {
+		} else if _, err := secretDeliveryOf(&cfg); err != nil {
 			// Never log the member: a malformed one may carry seed values.
 			h.Logger.Warn("ignoring credential configuration with a malformed secret seed advertisement",
 				zap.String("credential_configuration_id", id))
@@ -2432,6 +2444,11 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 	if offer != nil {
 		params.CredentialResponseEncryption = offer.params()
 	}
+	delivery, err := secretDeliveryOf(config)
+	if err != nil {
+		return nil, nil, err
+	}
+	params.AuxiliaryDataToIssuer = delivery.toIssuer
 	resp, err := h.RequestSign(ctx, SignActionGenerateProof, params)
 	if err != nil {
 		return nil, nil, err
@@ -2620,12 +2637,13 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 	// carries secret material that must not travel as plain JSON. The pair was
 	// negotiated and the client's key obtained before this call (see
 	// negotiateResponseEncryption); the engine holds no response key.
-	seedAdvertised, seedErr := secretSeedAdvertised(config)
+	delivery, seedErr := secretDeliveryOf(config)
 	if seedErr != nil {
 		h.Logger.Warn("rejecting issuer metadata", zap.Error(seedErr))
 		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer advertised malformed secret seed metadata")
 		return nil, seedErr
 	}
+	seedAdvertised := delivery.requireEncryption
 	refuseSeed := func(msg string) (*CredentialResponse, error) {
 		err := errors.New(msg)
 		h.Logger.Warn("rejecting credential request", zap.Error(err))
@@ -2701,6 +2719,11 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		// Check for DPoP nonce requirement — retry once with server-provided nonce
 		if attempt == 0 && isDPoPNonceError(resp) {
 			h.updateDPoPNonce(resp)
+			// An auxiliary data conflict is terminal even when the response
+			// also carries a DPoP-Nonce header: never retry it, never hide it.
+			if conflictErr := h.relayAuxiliaryDataConflict(resp); conflictErr != nil {
+				return nil, conflictErr
+			}
 			_ = resp.Body.Close()
 			continue
 		}
@@ -2710,6 +2733,12 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 			_ = resp.Body.Close()
 			h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+
+			// auxiliary_data_conflict is final (retrying never helps; the issuer
+			// resolves it out of band): relay the code unchanged, never retry.
+			if conflictErr := h.auxiliaryDataConflictError(resp.StatusCode, body); conflictErr != nil {
+				return nil, conflictErr
+			}
 
 			// Check whether the error response contains a refreshed c_nonce so the
 			// caller can re-request proofs and retry. Do NOT send a flow error here —
@@ -3007,7 +3036,7 @@ const (
 	secretSeedMember = "org.siros.secret_seed"
 )
 
-// SecretSeedAdvertisement inspects the credential_metadata of one credential
+// SecretSeedAdvertisement (the legacy shape) inspects the credential_metadata of one credential
 // configuration of the issuer metadata for the org.siros.secret_seed member.
 // present reports whether the member exists; ok is true only for the valid
 // advertisement form {"namespaces": [1..8 distinct names of 1..64 bytes, none
@@ -3015,7 +3044,7 @@ const (
 // carrying hex or other values instead of a name list, is malformed
 // (present && !ok). A credential_metadata that is not an object has no member.
 func SecretSeedAdvertisement(credentialMetadata json.RawMessage) (present, ok bool) {
-	if len(credentialMetadata) == 0 {
+	if len(credentialMetadata) == 0 || !isSecretMember(secretSeedMember) {
 		return false, false
 	}
 	var md map[string]json.RawMessage
@@ -3047,20 +3076,6 @@ func SecretSeedAdvertisement(credentialMetadata json.RawMessage) (present, ok bo
 	return true, true
 }
 
-// secretSeedAdvertised reports whether a credential configuration advertises
-// seed delivery. A malformed advertisement returns an error that never
-// includes the offending content.
-func secretSeedAdvertised(config *CredentialConfig) (bool, error) {
-	if config == nil {
-		return false, nil
-	}
-	present, ok := SecretSeedAdvertisement(config.CredentialMetadata)
-	if present && !ok {
-		return false, fmt.Errorf("issuer metadata %s advertisement is malformed", secretSeedMember)
-	}
-	return ok, nil
-}
-
 // validSeedNamespace: 1..64 bytes, and not the name "namespaces", which is
 // reserved for the issuer-metadata advertisement (5A.1).
 func validSeedNamespace(n string) bool {
@@ -3087,13 +3102,63 @@ func credentialToString(cred interface{}) string {
 	}
 }
 
-// hasSecretSeedMember reports whether a response-level credential_metadata
-// object has the org.siros.secret_seed member.
-func hasSecretSeedMember(md json.RawMessage) bool {
-	var m map[string]json.RawMessage
-	if json.Unmarshal(md, &m) != nil {
+// auxiliaryDataConflictCode is the OpenID4VCI Credential Auxiliary Data error
+// code the engine relays to the wallet unchanged.
+const auxiliaryDataConflictCode = "auxiliary_data_conflict"
+
+// isAuxiliaryDataConflict reports whether a credential endpoint error response
+// is an auxiliary_data_conflict: HTTP 400 with the OAuth error code exactly
+// auxiliary_data_conflict. Only the code is read, never error_description.
+func isAuxiliaryDataConflict(status int, body []byte) bool {
+	if status != http.StatusBadRequest {
 		return false
 	}
-	_, ok := m[secretSeedMember]
-	return ok
+	var e struct {
+		Error string `json:"error"`
+	}
+	return json.Unmarshal(body, &e) == nil && e.Error == auxiliaryDataConflictCode
+}
+
+// auxiliaryDataConflictError relays the issuer's auxiliary_data_conflict, if
+// body is one, as a flow error with code AUXILIARY_DATA_CONFLICT and the
+// issuer's code under details.error, and returns the error to fail the flow
+// with; nil when the response is not a conflict. No other issuer text is
+// relayed.
+func (h *OID4VCIHandler) auxiliaryDataConflictError(status int, body []byte) error {
+	if !isAuxiliaryDataConflict(status, body) {
+		return nil
+	}
+	_ = h.ErrorWithDetails(StepRequestingCredential, ErrCodeAuxiliaryDataConflict,
+		ErrCodeAuxiliaryDataConflict.UserFacingMessage(),
+		map[string]interface{}{"error": auxiliaryDataConflictCode})
+	return errors.New("credential request rejected: " + auxiliaryDataConflictCode)
+}
+
+// relayAuxiliaryDataConflict reads (and closes) the body of a 400 response and
+// relays it if it is an auxiliary_data_conflict. Other responses are left for
+// the caller (their body is untouched when the status is not 400).
+func (h *OID4VCIHandler) relayAuxiliaryDataConflict(resp *http.Response) error {
+	if resp.StatusCode != http.StatusBadRequest {
+		return nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+	if err := h.auxiliaryDataConflictError(resp.StatusCode, body); err != nil {
+		_ = resp.Body.Close()
+		return err
+	}
+	// Not a conflict: hand the body back for the caller's own handling.
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return nil
+}
+
+// checkRequiredAuxiliaryDataNeedsProof fails the flow when the configuration
+// has a required to_issuer entry but declares no proof type to carry it:
+// sending a credential request without it would bypass the issuer's rule.
+func (h *OID4VCIHandler) checkRequiredAuxiliaryDataNeedsProof(config *CredentialConfig) error {
+	d, _ := secretDeliveryOf(config) // a malformed advertisement was refused at negotiation
+	if !d.requiredToIssuer || h.needsProof(config) {
+		return nil
+	}
+	_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+	return errors.New("issuer requires auxiliary data in key proofs but declares no proof type to carry it")
 }

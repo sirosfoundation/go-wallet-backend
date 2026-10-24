@@ -36,6 +36,7 @@ type Config struct {
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
 	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
 	Presentation   PresentationConfig   `yaml:"presentation" envconfig:"PRESENTATION"`
+	Issuance       IssuanceConfig       `yaml:"issuance" envconfig:"ISSUANCE"`
 
 	// Registry configures the VCTM registry role (--mode=registry). It
 	// replaces the retired standalone registry configuration file
@@ -436,6 +437,65 @@ type PresentationConfig struct {
 	// contents of the resulting vp_token. Unknown values fail at startup.
 	// Env: WALLET_PRESENTATION_DCQL_CONSENT_CHECK
 	DCQLConsentCheck DCQLConsentCheckMode `yaml:"dcql_consent_check" envconfig:"DCQL_CONSENT_CHECK"`
+}
+
+// DefaultSecretMembers are the response-level credential_metadata members the
+// engine treats as secret-bearing unless issuance.secret_members says
+// otherwise: the SIROS legacy seed member and the OpenID4VCI Credential
+// Auxiliary Data member.
+var DefaultSecretMembers = []string{"org.siros.secret_seed", "auxiliary_data"}
+
+// maxSecretMemberLen bounds one secret member name.
+const maxSecretMemberLen = 128
+
+// IssuanceConfig controls how the engine handles OpenID4VCI issuance.
+type IssuanceConfig struct {
+	// SecretMembers is the set of credential_metadata member names that carry
+	// secret values (a delivered seed or opening). The engine refuses a PLAIN
+	// issuer response that has any of them, never relays or logs them, requires
+	// an encrypted response for a credential configuration whose issuer
+	// metadata advertises their delivery, and treats such a member in the
+	// issuer metadata itself as malformed. Names are matched exactly. Default:
+	// `org.siros.secret_seed` and `auxiliary_data`. Set it to move to a new
+	// member name without a code change; an empty list is invalid.
+	// Env: WALLET_ISSUANCE_SECRET_MEMBERS (comma-separated)
+	SecretMembers []string `yaml:"secret_members" envconfig:"SECRET_MEMBERS"`
+}
+
+// EffectiveSecretMembers returns the configured set, or DefaultSecretMembers
+// when it is unset (nil).
+func (c *IssuanceConfig) EffectiveSecretMembers() []string {
+	if c.SecretMembers == nil {
+		return append([]string(nil), DefaultSecretMembers...)
+	}
+	return append([]string(nil), c.SecretMembers...)
+}
+
+// validate checks the secret member set: non-empty, each name 1..128 bytes of
+// printable ASCII without spaces, no duplicates.
+func (c *IssuanceConfig) validate() error {
+	if c.SecretMembers == nil {
+		return nil // unset: EffectiveSecretMembers returns the defaults
+	}
+	if len(c.SecretMembers) == 0 {
+		return fmt.Errorf("issuance.secret_members must list at least one member name")
+	}
+	seen := make(map[string]struct{}, len(c.SecretMembers))
+	for _, n := range c.SecretMembers {
+		if n == "" || len(n) > maxSecretMemberLen {
+			return fmt.Errorf("issuance.secret_members: names must be 1 to %d bytes", maxSecretMemberLen)
+		}
+		for i := 0; i < len(n); i++ {
+			if n[i] <= ' ' || n[i] > '~' {
+				return fmt.Errorf("issuance.secret_members: name %q has a character that is not printable ASCII", n)
+			}
+		}
+		if _, dup := seen[n]; dup {
+			return fmt.Errorf("issuance.secret_members: duplicate name %q", n)
+		}
+		seen[n] = struct{}{}
+	}
+	return nil
 }
 
 // HTTPClientConfig contains HTTP client configuration for outbound requests
@@ -2324,6 +2384,7 @@ func defaultConfig() *Config {
 			Timeout:         30,
 		},
 		Presentation: PresentationConfig{DCQLConsentCheck: DCQLConsentCheckWarn},
+		Issuance:     IssuanceConfig{SecretMembers: append([]string(nil), DefaultSecretMembers...)},
 		AS: ASConfig{
 			DefaultTokenTTL: 2 * time.Minute,
 			Legacy: ASLegacyConfig{
@@ -2683,6 +2744,9 @@ func (c *Config) Validate() error {
 	}
 
 	if err := c.Presentation.DCQLConsentCheck.validate(); err != nil {
+		return err
+	}
+	if err := c.Issuance.validate(); err != nil {
 		return err
 	}
 

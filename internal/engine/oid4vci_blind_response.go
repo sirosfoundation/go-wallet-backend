@@ -32,8 +32,9 @@ type responseEncryption struct {
 	Alg      string
 	Enc      string
 	Required bool
-	// Seed is true when the issuer advertises org.siros.secret_seed for the
-	// configuration: a plain answer is then refused unread.
+	// Seed is true when the issuer advertises secret delivery to the wallet
+	// (legacy org.siros.secret_seed, or auxiliary_data_supported.to_wallet with
+	// a hash_commitment entry) for the configuration: a plain answer is then refused unread.
 	Seed bool
 	// JWK is the client's public response-encryption JWK, validated and
 	// normalised by the engine. Empty until the client has answered.
@@ -64,7 +65,8 @@ func (e *responseEncryption) requestMember() map[string]interface{} {
 // engine-visible, the issuer's choice). A seed-advertising configuration
 // requires encryption and fails closed here, before any request is made.
 func (h *OID4VCIHandler) negotiateResponseEncryption(metadata *IssuerMetadata, config *CredentialConfig) (*responseEncryption, error) {
-	seedAdvertised, seedErr := secretSeedAdvertised(config)
+	delivery, seedErr := secretDeliveryOf(config)
+	seedAdvertised := delivery.requireEncryption
 	if seedErr != nil {
 		h.Logger.Warn("rejecting issuer metadata", zap.Error(seedErr))
 		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer advertised malformed secret seed metadata")
@@ -212,8 +214,8 @@ func (h *OID4VCIHandler) relayEncryptedResponse(ctx context.Context, jwe string,
 
 // displayMetadataMembers are the members of a plain response's response-level
 // credential_metadata (OpenID4VCI 1.1) the engine relays: the display-only
-// ones. Everything else, in particular the namespaced org.siros.secret_seed,
-// is dropped.
+// ones. Everything else, in particular every configured secret member, is
+// dropped.
 var displayMetadataMembers = []string{"display", "claims"}
 
 // displayMetadata returns the allow-listed display members of a PLAIN

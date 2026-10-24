@@ -47,3 +47,25 @@ func TestSanitizeSecretSeedAdvertisement_DropsSignedJWTOnlyWhenConfigRemoved(t *
 	_, has := md["signed_metadata"]
 	assert.False(t, has, "removing a configuration also drops the original JWT")
 }
+
+func TestSanitizeAuxiliaryDataAdvertisement(t *testing.T) {
+	var md map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(`{"signed_metadata":"JWT","credential_configurations_supported":{
+		"valid":{"auxiliary_data_supported":{"to_wallet":[{"type":"hash_commitment","alg":"sha-256","path":["n","ssc"]}],"to_issuer":[{"type":"hash_commitment","alg":"sha-256","path":["n","psc"],"required":true}]}},
+		"opening":{"auxiliary_data_supported":{"to_wallet":[{"type":"hash_commitment","alg":"sha-256","path":["n","ssc"],"opening":"deadbeef"}]}},
+		"empty":{"auxiliary_data_supported":{"to_wallet":[]}},
+		"scalar":{"auxiliary_data_supported":"deadbeef"},
+		"in_metadata":{"credential_metadata":{"auxiliary_data":[{"type":"hash_commitment","opening":"deadbeef"}]}},
+		"plain":{"credential_metadata":{"display":[]}}}}`), &md))
+	sanitizeSecretSeedAdvertisement(md)
+	ccs := md["credential_configurations_supported"].(map[string]interface{})
+	assert.Contains(t, ccs, "valid")
+	assert.Contains(t, ccs, "plain")
+	for _, id := range []string{"opening", "empty", "scalar", "in_metadata"} {
+		assert.NotContains(t, ccs, id)
+	}
+	out, _ := json.Marshal(md)
+	assert.NotContains(t, string(out), "deadbeef")
+	_, has := md["signed_metadata"]
+	assert.False(t, has)
+}

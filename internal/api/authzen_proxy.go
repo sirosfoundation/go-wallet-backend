@@ -984,13 +984,17 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 	return nil, false
 }
 
-// sanitizeSecretSeedAdvertisement enforces privatedata-spec 5A.3/5A.4 on the
-// issuer metadata served to the wallet, in place. A valid advertisement
-// ({"org.siros.secret_seed":{"namespaces":[...]}}, names only) is public and is
-// served unchanged, because the wallet needs it to request response encryption.
-// A credential configuration whose org.siros.secret_seed member is malformed
-// (carrying hex or any other non-list content) is treated as not offered: the
-// whole configuration is removed, so no such value reaches the wallet.
+// sanitizeSecretSeedAdvertisement enforces privatedata-spec 5A.3/5A.4 and the
+// OpenID4VCI Credential Auxiliary Data advertisement rules on the issuer
+// metadata served to the wallet, in place. A valid advertisement
+// ({"org.siros.secret_seed":{"namespaces":[...]}}, names only, or
+// auxiliary_data_supported with to_wallet/to_issuer entries) is public and is
+// served unchanged, because the wallet needs it to request response encryption
+// and to place its commitments. A credential configuration whose advertisement
+// is malformed (carrying hex or any other value instead of names, an
+// auxiliary_data member or an opening in the metadata, a bad entry) is treated
+// as not offered: the whole configuration is removed, so no such value reaches
+// the wallet.
 //
 // When a configuration is removed, the original signed_metadata JWT (kept by
 // the resolver for legacy signed metadata) is also dropped from the served
@@ -1005,24 +1009,8 @@ func sanitizeSecretSeedAdvertisement(metadata map[string]interface{}) {
 		return
 	}
 	for id, ccRaw := range ccs {
-		cc, ok := ccRaw.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		cm, ok := cc["credential_metadata"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if _, has := cm["org.siros.secret_seed"]; !has {
-			continue
-		}
-		raw, err := json.Marshal(cm)
-		if err != nil {
-			delete(ccs, id)
-			delete(metadata, "signed_metadata")
-			continue
-		}
-		if present, valid := engine.SecretSeedAdvertisement(raw); present && !valid {
+		raw, err := json.Marshal(ccRaw)
+		if err != nil || engine.AdvertisementMalformed(raw) {
 			delete(ccs, id)
 			delete(metadata, "signed_metadata")
 		}

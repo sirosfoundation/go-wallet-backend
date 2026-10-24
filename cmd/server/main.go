@@ -50,6 +50,10 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to load backend configuration: %v", err)
 		}
+		// The set of credential_metadata members treated as secret-bearing
+		// (validated by Load) is process-wide: the engine flow and the
+		// issuer-metadata resolve endpoint both consult it.
+		wsengine.SetSecretMembers(backendCfg.Issuance.EffectiveSecretMembers())
 		if roles.Has(modes.RoleAuth) {
 			backendCfg.EnableForRole()
 			// EnableForRole mutates the already-validated config (e.g.
