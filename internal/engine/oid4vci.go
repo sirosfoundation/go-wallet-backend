@@ -266,6 +266,7 @@ type IssuerDisplay struct {
 type CredentialConfig struct {
 	Format              string                 `json:"format"`
 	VCT                 string                 `json:"vct,omitempty"`
+	Doctype             string                 `json:"doctype,omitempty"`
 	Scope               string                 `json:"scope,omitempty"`
 	Display             []CredentialDisplay    `json:"display,omitempty"`
 	ProofTypesSupported map[string]interface{} `json:"proof_types_supported,omitempty"`
@@ -1112,7 +1113,11 @@ func (h *OID4VCIHandler) issueCredential(ctx context.Context, metadata *IssuerMe
 			proofs, respEnc, proofErr = h.requestProofs(ctx, metadata, selectedConfig, nonce, reissuanceKid, respOffer)
 			if proofErr != nil {
 				h.Logger.Debug("failed to request proofs", zap.Error(proofErr))
-				_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+				code := ErrCodeSignError
+				if errors.Is(proofErr, errAuxiliaryDataProof) {
+					code = ErrCodeAuxiliaryDataProofInvalid
+				}
+				_ = h.Error(StepRequestingCredential, code, code.UserFacingMessage())
 				return proofErr
 			}
 		}
@@ -2448,7 +2453,18 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 	if err != nil {
 		return nil, nil, err
 	}
-	params.AuxiliaryDataToIssuer = delivery.toIssuer
+	if len(delivery.toIssuer) > 0 {
+		credType := config.VCT
+		if credType == "" {
+			credType = config.Doctype
+		}
+		if credType == "" {
+			return nil, nil, errors.New("issuer advertises auxiliary data for the issuer but the credential configuration has no vct or doctype")
+		}
+		params.AuxiliaryDataToIssuer = delivery.toIssuer
+		params.CredentialType = credType
+		params.CredentialIssuer = metadata.CredentialIssuer
+	}
 	resp, err := h.RequestSign(ctx, SignActionGenerateProof, params)
 	if err != nil {
 		return nil, nil, err
@@ -2491,6 +2507,10 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 		if _, ok := config.ProofTypesSupported[proof.ProofType]; !ok {
 			return nil, nil, fmt.Errorf("unsupported proof type %q: not listed in proof_types_supported", proof.ProofType)
 		}
+	}
+
+	if err := verifyProofsCarryAuxiliaryData(resp.Proofs, delivery.toIssuer); err != nil {
+		return nil, nil, err
 	}
 
 	return resp.Proofs, respEnc, nil

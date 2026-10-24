@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -29,7 +31,7 @@ func withSecretMembers(t *testing.T, names ...string) {
 }
 
 func auxCfg(aux string) *CredentialConfig {
-	c := &CredentialConfig{Format: "mso_mdoc", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}
+	c := &CredentialConfig{Format: "mso_mdoc", VCT: "urn:test", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}
 	if aux != "" {
 		c.AuxiliaryDataSupported = json.RawMessage(aux)
 	}
@@ -405,4 +407,181 @@ func TestAdvertisement_CaseFoldedLookAlikeKeysAreMalformed(t *testing.T) {
 	d, err := secretDeliveryOf(&cfg)
 	require.NoError(t, err)
 	assert.True(t, d.requireEncryption)
+}
+
+// auxProofJWT is an (unsigned) compact JWT whose body carries the given
+// auxiliary_data claim (nil = no claim). The engine reads the body only.
+func auxProofJWT(t *testing.T, claim interface{}) string {
+	t.Helper()
+	body := map[string]interface{}{"aud": "https://i.example", "nonce": "n"}
+	if claim != nil {
+		body["auxiliary_data"] = claim
+	}
+	b, err := json.Marshal(body)
+	require.NoError(t, err)
+	return "e30." + base64.RawURLEncoding.EncodeToString(b) + ".c2ln"
+}
+
+// validAuxClaim answers each advertised entry with a valid commitment
+// (SHA-256 of a one-byte secret, varied by seed).
+func validAuxClaim(t *testing.T, advertised []json.RawMessage, seed byte) []map[string]interface{} {
+	t.Helper()
+	var out []map[string]interface{}
+	for _, raw := range advertised {
+		var e map[string]interface{}
+		require.NoError(t, json.Unmarshal(raw, &e))
+		h := sha256.Sum256([]byte{seed})
+		out = append(out, map[string]interface{}{
+			"type": e["type"], "alg": e["alg"], "path": e["path"],
+			"commitment": base64.RawURLEncoding.EncodeToString(h[:]),
+		})
+	}
+	return out
+}
+
+func TestVerifyProofsCarryAuxiliaryData(t *testing.T) {
+	adv := []json.RawMessage{
+		json.RawMessage(auxToIssuerPSC), // required
+		json.RawMessage(`{"type":"hash_commitment","alg":"sha-256","path":["n","opt"]}`),
+	}
+	good := func() []map[string]interface{} { return validAuxClaim(t, adv[:1], 1) }
+	proofs := func(claims ...interface{}) []ProofObject {
+		var ps []ProofObject
+		for _, c := range claims {
+			ps = append(ps, ProofObject{ProofType: "jwt", JWT: auxProofJWT(t, c)})
+		}
+		return ps
+	}
+	with := func(f func(e map[string]interface{})) []map[string]interface{} {
+		c := good()
+		f(c[0])
+		return c
+	}
+
+	ok := map[string]struct {
+		proofs []ProofObject
+	}{
+		"valid, one proof":           {proofs(good())},
+		"valid, same value in all":   {proofs(good(), good(), good())},
+		"optional entry present":     {proofs(validAuxClaim(t, adv, 1))},
+		"unknown extra entry":        {proofs(append(good(), map[string]interface{}{"type": "https://x.example/t", "foo": 1}))},
+		"member order is irrelevant": {proofs(good(), []map[string]interface{}{{"commitment": good()[0]["commitment"], "path": good()[0]["path"], "alg": "sha-256", "type": "hash_commitment"}})},
+	}
+	for name, c := range ok {
+		t.Run("ok/"+name, func(t *testing.T) {
+			require.NoError(t, verifyProofsCarryAuxiliaryData(c.proofs, adv))
+		})
+	}
+	// Optional only, nothing sent: fine.
+	require.NoError(t, verifyProofsCarryAuxiliaryData(proofs(nil, nil), adv[1:]))
+	// Nothing advertised: nothing to check, even for non-JWT test proofs.
+	require.NoError(t, verifyProofsCarryAuxiliaryData([]ProofObject{{ProofType: "jwt", JWT: "proof-0"}}, nil))
+
+	bad := map[string][]ProofObject{
+		"no claim":                  proofs(nil),
+		"empty claim":               proofs([]interface{}{}),
+		"claim not an array":        proofs("x"),
+		"required missing, unknown": proofs([]map[string]interface{}{{"type": "https://x.example/t"}}),
+		"wrong type":                proofs(with(func(e map[string]interface{}) { e["type"] = "other" })),
+		"wrong alg":                 proofs(with(func(e map[string]interface{}) { e["alg"] = "sha-512" })),
+		"wrong path":                proofs(with(func(e map[string]interface{}) { e["path"] = []string{"n", "xxx"} })),
+		"missing in second proof":   proofs(good(), nil),
+		"differing values":          proofs(good(), validAuxClaim(t, adv[:1], 2)),
+		"differing extra entries":   proofs(good(), append(good(), map[string]interface{}{"type": "https://x.example/t"})),
+		"commitment missing":        proofs(with(func(e map[string]interface{}) { delete(e, "commitment") })),
+		"commitment wrong length":   proofs(with(func(e map[string]interface{}) { e["commitment"] = "AAAA" })),
+		"commitment padded":         proofs(with(func(e map[string]interface{}) { e["commitment"] = good()[0]["commitment"].(string) + "=" })),
+		"commitment not a string":   proofs(with(func(e map[string]interface{}) { e["commitment"] = 7 })),
+		"opening instead":           proofs(with(func(e map[string]interface{}) { e["opening"] = "x" })),
+		"duplicate entry":           proofs(append(good(), good()...)),
+		"optional with wrong alg":   proofs(append(good(), map[string]interface{}{"type": "hash_commitment", "alg": "sha-512", "path": []string{"n", "opt"}, "commitment": good()[0]["commitment"]})),
+		"not a JWT":                 {{ProofType: "jwt", JWT: "proof-0"}},
+		"attestation w/o claim":     {{ProofType: "attestation", Attestation: auxProofJWT(t, nil)}},
+		"unknown proof type":        {{ProofType: "di_vp"}},
+		"no proofs":                 nil,
+	}
+	for name, ps := range bad {
+		t.Run("bad/"+name, func(t *testing.T) {
+			err := verifyProofsCarryAuxiliaryData(ps, adv)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, errAuxiliaryDataProof)
+			assert.NotContains(t, err.Error(), good()[0]["commitment"].(string))
+		})
+	}
+	// Attestation proofs are checked like JWTs.
+	require.NoError(t, verifyProofsCarryAuxiliaryData([]ProofObject{{ProofType: "attestation", Attestation: auxProofJWT(t, good())}}, adv))
+}
+
+// Non-required entries absent from every proof are fine, but a differing claim
+// between proofs is not even then.
+func TestVerifyProofsOptionalOnly(t *testing.T) {
+	adv := []json.RawMessage{json.RawMessage(`{"type":"hash_commitment","alg":"sha-256","path":["n","opt"]}`)}
+	a := validAuxClaim(t, adv, 1)
+	require.NoError(t, verifyProofsCarryAuxiliaryData([]ProofObject{{ProofType: "jwt", JWT: auxProofJWT(t, a)}, {ProofType: "jwt", JWT: auxProofJWT(t, a)}}, adv))
+	require.Error(t, verifyProofsCarryAuxiliaryData([]ProofObject{{ProofType: "jwt", JWT: auxProofJWT(t, a)}, {ProofType: "jwt", JWT: auxProofJWT(t, nil)}}, adv))
+}
+
+func TestGenerateProof_CarriesCredentialTypeAndIssuer(t *testing.T) {
+	for name, tc := range map[string]struct{ vct, doctype, want string }{
+		"vct":     {"urn:v", "", "urn:v"},
+		"doctype": {"", "org.iso.doc", "org.iso.doc"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			st := newIssuerStub(t, `{"credential":"c"}`)
+			fc := &fakeClient{t: t}
+			h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
+			defer cleanup()
+			cfg := auxCfg(`{"to_issuer":[` + auxToIssuerPSC + `]}`)
+			cfg.VCT, cfg.Doctype = tc.vct, tc.doctype
+			require.NoError(t, h.issueCredential(context.Background(), st.metadata(nil), tokenBearer(), "cfg", cfg, nil, ""))
+			p := generateProofParams(t, fc)
+			assert.JSONEq(t, `"`+tc.want+`"`, string(p["credential_type"]))
+			assert.JSONEq(t, `"`+st.srv.URL+`"`, string(p["credential_issuer"]))
+		})
+	}
+	// Not sent without to_issuer entries.
+	st := newIssuerStub(t, `{"credential":"c"}`)
+	fc := &fakeClient{t: t}
+	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
+	defer cleanup()
+	cfg := auxCfg("")
+	cfg.VCT = "urn:v"
+	require.NoError(t, h.issueCredential(context.Background(), st.metadata(nil), tokenBearer(), "cfg", cfg, nil, ""))
+	p := generateProofParams(t, fc)
+	assert.NotContains(t, p, "credential_type")
+	assert.NotContains(t, p, "credential_issuer")
+
+	// No vct or doctype: refused.
+	st2 := newIssuerStub(t, `{"credential":"c"}`)
+	fc2 := &fakeClient{t: t}
+	h2, _, cleanup2 := newBlindHandler(t, fc2, st2.srv.Client())
+	defer cleanup2()
+	noType := auxCfg(`{"to_issuer":[` + auxToIssuerPSC + `]}`)
+	noType.VCT = ""
+	require.Error(t, h2.issueCredential(context.Background(), st2.metadata(nil), tokenBearer(), "cfg", noType, nil, ""))
+}
+
+// A client that omits a required entry fails the flow with its own code, and
+// nothing reaches the issuer.
+func TestIssuance_RequiredAuxiliaryDataMissingFailsClosed(t *testing.T) {
+	st := newIssuerStub(t, `{"credential":"c"}`)
+	fc := &fakeClient{t: t, proofMaker: func(int, *SignRequestMessage) string { return auxProofJWT(t, nil) }}
+	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
+	defer cleanup()
+	cfg := auxCfg(`{"to_issuer":[` + auxToIssuerPSC + `]}`)
+	cfg.VCT = "urn:v"
+	require.Error(t, h.issueCredential(context.Background(), st.metadata(nil), tokenBearer(), "cfg", cfg, nil, ""))
+	assert.Empty(t, st.requests, "nothing is sent to the issuer")
+	fc.settle()
+	var codes []string
+	for _, m := range fc.outboundMessages() {
+		if string(m["type"]) == `"flow_error"` {
+			var e struct {
+				Code string `json:"code"`
+			}
+			require.NoError(t, json.Unmarshal(m["error"], &e))
+			codes = append(codes, e.Code)
+		}
+	}
+	assert.Equal(t, []string{"AUXILIARY_DATA_PROOF_INVALID"}, codes)
 }

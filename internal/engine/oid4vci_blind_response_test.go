@@ -54,6 +54,10 @@ type fakeClient struct {
 	errorOnProof bool                                        // generate_proof answers error
 	decryptErr   bool                                        // decrypt answers error (with the plaintext in the text)
 	reply        func(pt []byte) (SignResponseMessage, bool) // override the decrypt answer
+	// proofMaker overrides the proof JWT the client returns for proof i; by
+	// default a request carrying auxiliary_data_to_issuer is answered with a
+	// proof holding a valid commitment for every advertised entry.
+	proofMaker func(i int, req *SignRequestMessage) string
 }
 
 func (c *fakeClient) setSession(s *Session) {
@@ -130,7 +134,14 @@ func (c *fakeClient) answerProof(req *SignRequestMessage, resp *SignResponseMess
 			n = 1
 		}
 		for i := 0; i < n; i++ {
-			resp.Proofs = append(resp.Proofs, ProofObject{ProofType: "jwt", JWT: fmt.Sprintf("proof-%d", i)})
+			jwt := fmt.Sprintf("proof-%d", i)
+			switch {
+			case c.proofMaker != nil:
+				jwt = c.proofMaker(i, req)
+			case len(req.Params.AuxiliaryDataToIssuer) > 0:
+				jwt = auxProofJWT(c.t, validAuxClaim(c.t, req.Params.AuxiliaryDataToIssuer, 0))
+			}
+			resp.Proofs = append(resp.Proofs, ProofObject{ProofType: "jwt", JWT: jwt})
 		}
 	}
 }

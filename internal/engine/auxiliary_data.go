@@ -1,9 +1,11 @@
 package engine
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync/atomic"
 )
@@ -347,4 +349,200 @@ func claimsPathKey(raw json.RawMessage) (string, bool) {
 		return "", false
 	}
 	return string(b), true
+}
+
+// errAuxiliaryDataProof is wrapped by every error verifyProofsCarryAuxiliaryData
+// returns; the flow then fails with AUXILIARY_DATA_PROOF_INVALID. Errors never
+// include a commitment value.
+var errAuxiliaryDataProof = errors.New("key proofs do not carry the required auxiliary data")
+
+func auxProofErr(why string) error { return fmt.Errorf("%w: %s", errAuxiliaryDataProof, why) }
+
+// auxKey identifies an entry: its type and its decoded claims path.
+func auxKey(typ string, path json.RawMessage) (string, bool) {
+	if len(path) == 0 {
+		return typ + "\x00", true
+	}
+	var v interface{}
+	if json.Unmarshal(path, &v) != nil {
+		return "", false
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return "", false
+	}
+	return typ + "\x00" + string(b), true
+}
+
+// verifyProofsCarryAuxiliaryData checks the proofs the client returned against
+// the advertised to_issuer entries (Auxiliary Data v0.1 section 6). Every
+// advertised entry with required=true must appear in the signed body of every
+// proof (a JWT, or a key attestation JWT) with the same type, alg and path; an
+// entry the proof carries for an advertised (type, path) must agree on alg;
+// hash_commitment entries must hold a base64url commitment of the hash output
+// length; one entry per type and path; and the whole auxiliary_data claim must
+// be identical across the proofs of the request. Unknown extra entries are
+// allowed. The engine compares and validates structure only: it never learns
+// what a commitment commits to, and never logs or returns its value. With no
+// required entries and no claim anywhere there is nothing to check.
+func verifyProofsCarryAuxiliaryData(proofs []ProofObject, toIssuer []json.RawMessage) error {
+	advertised := make(map[string]auxAdv, len(toIssuer))
+	anyRequired := false
+	for _, raw := range toIssuer {
+		var m map[string]json.RawMessage
+		if json.Unmarshal(raw, &m) != nil {
+			return auxProofErr("advertised entry is not an object")
+		}
+		var a auxAdv
+		_ = json.Unmarshal(m["type"], &a.typ)
+		a.hasAlg = json.Unmarshal(m["alg"], &a.alg) == nil && a.alg != ""
+		if rq, ok := m["required"]; ok {
+			_ = json.Unmarshal(rq, &a.required)
+		}
+		k, ok := auxKey(a.typ, m["path"])
+		if !ok {
+			return auxProofErr("advertised entry has an invalid path")
+		}
+		advertised[k] = a
+		anyRequired = anyRequired || a.required
+	}
+
+	if anyRequired && len(proofs) == 0 {
+		return auxProofErr("no proofs carry the required entries")
+	}
+	var first string
+	for i, proof := range proofs {
+		joined, err := auxiliaryDataOfProof(proof, advertised, anyRequired)
+		if err != nil {
+			return err
+		}
+		if i == 0 {
+			first = joined
+		} else if joined != first {
+			return auxProofErr("auxiliary_data differs between proofs")
+		}
+	}
+	return nil
+}
+
+// auxAdv is one advertised to_issuer entry, reduced to what the check needs.
+type auxAdv struct {
+	typ      string
+	alg      string
+	hasAlg   bool
+	required bool
+}
+
+// auxiliaryDataOfProof validates the auxiliary_data claim of one proof and
+// returns a canonical form of it (sorted, key-order independent; "" when the
+// proof has none) for comparison across the proofs of a request.
+func auxiliaryDataOfProof(proof ProofObject, advertised map[string]auxAdv, anyRequired bool) (string, error) {
+	var entries []map[string]json.RawMessage
+	switch proof.ProofType {
+	case "jwt", "attestation":
+		token := proof.JWT
+		if proof.ProofType == "attestation" {
+			token = proof.Attestation
+		}
+		claim, has, err := proofAuxiliaryDataClaim(token)
+		if err != nil {
+			if anyRequired {
+				return "", err
+			}
+			return "", nil
+		}
+		if has {
+			if json.Unmarshal(claim, &entries) != nil || entries == nil {
+				return "", auxProofErr("auxiliary_data is not an array of objects")
+			}
+		}
+	default:
+		if anyRequired {
+			return "", auxProofErr("proof type cannot be checked for required auxiliary data")
+		}
+		return "", nil
+	}
+
+	seen := make(map[string]struct{}, len(entries))
+	canon := make([]string, 0, len(entries))
+	for _, e := range entries {
+		var typ string
+		if json.Unmarshal(e["type"], &typ) != nil || typ == "" {
+			return "", auxProofErr("an entry has no string type")
+		}
+		k, ok := auxKey(typ, e["path"])
+		if !ok {
+			return "", auxProofErr("an entry has an invalid path")
+		}
+		if _, dup := seen[k]; dup {
+			return "", auxProofErr("two entries share a type and path")
+		}
+		seen[k] = struct{}{}
+		if a, isAdv := advertised[k]; isAdv {
+			var alg string
+			if a.hasAlg && (json.Unmarshal(e["alg"], &alg) != nil || alg != a.alg) {
+				return "", auxProofErr("an entry's alg differs from the advertised one")
+			}
+			if a.typ == auxTypeHashCommitment {
+				if err := checkCommitment(e, a.alg); err != nil {
+					return "", err
+				}
+			}
+		}
+		var v interface{}
+		b, _ := json.Marshal(e)
+		_ = json.Unmarshal(b, &v)
+		cb, _ := json.Marshal(v)
+		canon = append(canon, string(cb))
+	}
+	for k, a := range advertised {
+		if _, ok := seen[k]; a.required && !ok {
+			return "", auxProofErr("a required entry is missing")
+		}
+	}
+	sort.Strings(canon)
+	return strings.Join(canon, "\n"), nil
+}
+
+// checkCommitment: a hash_commitment entry from the wallet holds `commitment`
+// as unpadded canonical base64url of the output length of alg, and never an
+// opening.
+func checkCommitment(e map[string]json.RawMessage, alg string) error {
+	if _, has := e["opening"]; has {
+		return auxProofErr("a proof entry carries an opening")
+	}
+	var c string
+	if json.Unmarshal(e["commitment"], &c) != nil || c == "" {
+		return auxProofErr("a proof entry has no commitment")
+	}
+	dec, err := base64.RawURLEncoding.DecodeString(c)
+	if err != nil || base64.RawURLEncoding.EncodeToString(dec) != c {
+		return auxProofErr("a commitment is not canonical base64url")
+	}
+	if alg == "sha-256" && len(dec) != 32 {
+		return auxProofErr("a commitment has the wrong length for its alg")
+	}
+	if len(dec) == 0 {
+		return auxProofErr("a commitment is empty")
+	}
+	return nil
+}
+
+// proofAuxiliaryDataClaim returns the auxiliary_data claim of a compact JWT's
+// payload, and whether it is present.
+func proofAuxiliaryDataClaim(token string) (json.RawMessage, bool, error) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return nil, false, auxProofErr("proof is not a compact JWT")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return nil, false, auxProofErr("proof payload is not base64url")
+	}
+	var claims map[string]json.RawMessage
+	if json.Unmarshal(payload, &claims) != nil || claims == nil {
+		return nil, false, auxProofErr("proof payload is not a JSON object")
+	}
+	c, has := claims[auxiliaryDataMember]
+	return c, has, nil
 }

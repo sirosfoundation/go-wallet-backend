@@ -127,6 +127,10 @@ const (
 	// The flow_error details carry the issuer's code unchanged under "error";
 	// no other issuer text is relayed.
 	ErrCodeAuxiliaryDataConflict ErrorCode = "AUXILIARY_DATA_CONFLICT"
+	// ErrCodeAuxiliaryDataProofInvalid: the key proofs the client returned do
+	// not carry the issuer's required auxiliary_data entries correctly. Nothing
+	// was sent to the issuer.
+	ErrCodeAuxiliaryDataProofInvalid ErrorCode = "AUXILIARY_DATA_PROOF_INVALID"
 )
 
 // UserFacingMessage returns a generic user-facing message for an error code.
@@ -179,6 +183,8 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "Internal server error"
 	case ErrCodeTooManyRequests:
 		return "Too many requests"
+	case ErrCodeAuxiliaryDataProofInvalid:
+		return "The wallet did not attach the data the issuer requires"
 	case ErrCodeAuxiliaryDataConflict:
 		return "The issuer holds a conflicting value for you; it must be resolved with the issuer"
 	default:
@@ -527,6 +533,15 @@ type SignRequestParams struct {
 	// (OpenID4VCI Credential Auxiliary Data v0.1, section 6). The engine never
 	// computes or sees a commitment value.
 	AuxiliaryDataToIssuer []json.RawMessage `json:"auxiliary_data_to_issuer,omitempty"`
+	// CredentialType and CredentialIssuer (generate_proof only; set whenever
+	// AuxiliaryDataToIssuer is non-empty, and by the holder-commitment (psc)
+	// request of #468, with identical names, types and meaning): the wallet
+	// derives its per-issuer value for (CredentialType, CredentialIssuer).
+	// CredentialType is the configuration's `vct`, or its `doctype` for mdoc;
+	// CredentialIssuer is the exact `credential_issuer` string of the issuer
+	// metadata.
+	CredentialType   string `json:"credential_type,omitempty"`
+	CredentialIssuer string `json:"credential_issuer,omitempty"`
 
 	// SignActionSignClientAuth parameters. HTM and HTU, when set, ask for a
 	// DPoP proof over that HTTP method and URL; DPoPNonce is the
