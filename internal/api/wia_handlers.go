@@ -112,6 +112,12 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 				"error":   "POP_INVALID",
 				"message": "WIA-PoP validation failed",
 			})
+		case errors.Is(err, service.ErrWIANativeAttestationUnavailable):
+			h.logger.Warn("native attestation cannot be verified", zap.Error(err))
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":   "NATIVE_ATTESTATION_UNAVAILABLE",
+				"message": "The native attestation cannot be verified right now, retry later",
+			})
 		case errors.Is(err, service.ErrWIAKeyAttestationTypeUnsupported):
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":   "KEY_ATTESTATION_TYPE_UNSUPPORTED",

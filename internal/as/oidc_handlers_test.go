@@ -45,6 +45,7 @@ func (m *mockStore) Verifiers() storage.VerifierStore             { return nil }
 func (m *mockStore) Invites() storage.InviteStore                 { return nil }
 func (m *mockStore) WalletInstances() storage.WalletInstanceStore { return nil }
 func (m *mockStore) KeyAttestations() storage.KeyAttestationStore { return nil }
+func (m *mockStore) AppAttestKeys() storage.AppAttestKeyStore     { return nil }
 func (m *mockStore) Close() error                                 { return nil }
 func (m *mockStore) Ping(_ context.Context) error                 { return nil }
 

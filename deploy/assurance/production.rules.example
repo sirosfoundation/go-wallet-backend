@@ -78,6 +78,22 @@
 #
 # (assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform (source platform_attested))(hsm)(instance_key (kind)(home (* set strongbox tee))))))
 
+# Optional S1 template for iOS wallets: the instance key carries an App Attest
+# ASSERTION. It requires binding assertion, which means "an attested app
+# instance (an App Attest key Apple attested for this app) endorsed this
+# instance key". It is NOT evidence that the key lives in the Secure Enclave and
+# it is never a hardware attestation, which is why it is a separate, explicit
+# rule and why no assure-ks or assure-ua rule may be built on instance_key.
+# Slots match by position, so the bare (home)(level)(boot) hold their places.
+# The platform slot is a bare "don't care" on purpose: a renewal WIA carries no
+# native attestation object (the App Attest key was attested once, earlier), so
+# its platform source is backend_attested; the assertion itself is what proves
+# an attested app instance is behind this request.
+# Uncomment, put a "# id: wia-s1-app-attest-assertion" line before it, and drop
+# or narrow the plain wia-s1-platform rule above if S1 must require it:
+#
+# (assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform)(hsm)(instance_key (kind app_attest_assertion)(home)(level)(boot)(binding assertion)))))
+
 # assure-wia-cert: selects a wallet_solution_certification_information entry
 # from the wia_certification catalogue (none: the static
 # wallet_provider.wia.certification_info is used). Example, uncomment after

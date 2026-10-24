@@ -34,6 +34,9 @@ var (
 	// ErrWIARefusedByPolicy is returned when the assurance policy is enabled
 	// and no assure-wia-issue rule permits the evidence of this request.
 	ErrWIARefusedByPolicy = errors.New("WIA refused by assurance policy")
+	// ErrWIANativeAttestationUnavailable means the native attestation could not
+	// be judged or recorded because storage failed; refused, retryable (503).
+	ErrWIANativeAttestationUnavailable = errors.New("native attestation cannot be verified right now")
 )
 
 // WIAChallenge is a single-use nonce for WIA generation.
@@ -172,6 +175,9 @@ type WIAService struct {
 	// ever found and the instance records wscd_type unknown.
 	keyAttestations storage.KeyAttestationStore
 
+	// appAttestKeys holds attested App Attest keys (see SetAppAttestKeys).
+	appAttestKeys storage.AppAttestKeyStore
+
 	// keyVerifiers verifies the optional key_attestation request field, by
 	// type. Registered while wiring the service (RegisterInstanceKeyVerifier).
 	keyVerifiers map[KeyAttestationType]InstanceKeyEvidenceVerifier
@@ -220,6 +226,15 @@ func (s *WIAService) SetAssessor(a *assurance.Assessor) { s.assessor = a }
 // SetKeyAttestations installs the store of verified per-key evidence that
 // the instance key is looked up in (see instanceKeyEvidence).
 func (s *WIAService) SetKeyAttestations(k storage.KeyAttestationStore) { s.keyAttestations = k }
+
+// SetAppAttestKeys installs the store of attested Apple App Attest keys: the
+// native attestation verifier stores verified keys in it.
+func (s *WIAService) SetAppAttestKeys(k storage.AppAttestKeyStore) {
+	s.appAttestKeys = k
+	if s.nativeAttSvc != nil {
+		s.nativeAttSvc.SetAppAttestKeys(k)
+	}
+}
 
 func (s *WIAService) assuranceEnabled() bool {
 	return s.cfg.WalletProvider.Attestation.Assurance.Enabled
@@ -294,6 +309,19 @@ func (s *WIAService) consumeChallenge(ctx context.Context, challenge string) err
 	}
 	challengeConsumedTotal.Inc()
 	return nil
+}
+
+// restoreChallenge puts a consumed challenge back for a retry after a
+// retryable server-side failure. Best effort: if it cannot be stored the caller
+// simply needs a new challenge.
+func (s *WIAService) restoreChallenge(ctx context.Context, tenantID domain.TenantID, challenge string) {
+	ttl := time.Duration(s.cfg.WalletProvider.WIA.ChallengeTTLSeconds) * time.Second
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	if ok, err := s.challenges.Put(ctx, tenantID, challenge, time.Now().Add(ttl)); err != nil || !ok {
+		s.logger.Warn("could not restore the WIA challenge after a retryable failure", zap.Error(err))
+	}
 }
 
 // WIARequest contains the parameters for WIA generation.
@@ -389,11 +417,22 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 		if req.NativeAttestation.Challenge != req.Challenge {
 			return "", fmt.Errorf("%w: native attestation challenge does not match WIA challenge", ErrWIAPopInvalid)
 		}
-		result, err := s.nativeAttSvc.Verify(ctx, req.NativeAttestation)
+		result, err := s.nativeAttSvc.VerifyBound(ctx, NativeAttestationBinding{TenantID: tenantID, UserID: userID, WalletInstanceID: jkt}, req.NativeAttestation)
 		if err != nil {
 			// When native attestation is submitted but fails, reject the request.
 			// If the client doesn't want native attestation, it should omit the field.
 			nativeAttestationErrors.Inc()
+			if errors.Is(err, ErrNativeAttestationUnavailable) {
+				// Apple issues an attestation object once per key and its nonce
+				// binds THIS challenge, so a retry with a fresh challenge could not
+				// reuse it. The request was otherwise valid (challenge, PoP and
+				// attestation verified), only storage failed: put the same
+				// challenge back so the caller can retry the identical request.
+				// Replay-safe: storing the key is bound to this caller, and the
+				// challenge is single-use again on the retry.
+				s.restoreChallenge(ctx, tenantID, req.Challenge)
+				return "", fmt.Errorf("%w: %v", ErrWIANativeAttestationUnavailable, err)
+			}
 			return "", fmt.Errorf("%w: native attestation failed: %v", ErrWIAPopInvalid, err)
 		}
 		if result.Verified {
@@ -515,7 +554,8 @@ type instanceKeyEvidenceBuilder interface {
 // instanceKeyBuilders is keyed by record Kind. A record whose kind has no
 // builder yields no slot: unknown evidence is never rendered as verified.
 var instanceKeyBuilders = map[domain.KeyEvidenceKind]instanceKeyEvidenceBuilder{
-	domain.KeyEvidenceFIDO2: fido2InstanceKeyBuilder{},
+	domain.KeyEvidenceFIDO2:              fido2InstanceKeyBuilder{},
+	domain.KeyEvidenceAppAttestAssertion: appAttestAssertionBuilder{},
 }
 
 // fido2InstanceKeyBuilder renders a verified FIDO2 attestation: the key was

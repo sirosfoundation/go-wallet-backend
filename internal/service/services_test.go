@@ -277,3 +277,52 @@ func TestNewServices_AssuranceWiring(t *testing.T) {
 		t.Fatal("disabled policy must not load anything")
 	}
 }
+
+// App Attest assertions as instance-key evidence exist only where native
+// attestation with an Apple App ID is configured, and the verifier and the
+// native attestation service share the one App Attest key store.
+func TestNewServices_AppAttestAssertionWiring(t *testing.T) {
+	build := func(t *testing.T, native config.NativeAttestationConfig) *Services {
+		t.Helper()
+		dir := t.TempDir()
+		wpKeyPath, wpCertPath := writeECKeyAndCert(t, dir, "wallet-provider")
+		cfg := &config.Config{
+			Server: config.ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080", RPName: "Test Wallet"},
+			JWT:    config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes-long", Issuer: "test-wallet"},
+		}
+		cfg.WalletProvider.PrivateKeyPath = wpKeyPath
+		cfg.WalletProvider.CertificatePath = wpCertPath
+		cfg.WalletProvider.WIA = config.WIAConfig{Enabled: true, MaxExpirySeconds: 86400, ChallengeTTLSeconds: 300}
+		cfg.WalletProvider.Attestation = config.AttestationConfig{LifetimeSeconds: 3600, NativeAttestation: native}
+		s := NewServices(memory.NewStore(), cfg, zap.NewNop())
+		if s.WIA == nil {
+			t.Fatal("WIA not initialised")
+		}
+		return s
+	}
+	hasType := func(s *Services) bool {
+		for _, ty := range s.WIA.InstanceKeyVerifierTypes() {
+			if ty == string(KeyAttestationAppAttestAssertion) {
+				return true
+			}
+		}
+		return false
+	}
+
+	on := build(t, config.NativeAttestationConfig{Enabled: true, AppleAppID: "TEAM.com.example", AppleAppAttestEnvironment: "production"})
+	if !hasType(on) {
+		t.Error("app_attest_assertion verifier not registered with native attestation and an App ID")
+	}
+	if on.WIA.nativeAttSvc == nil || on.WIA.nativeAttSvc.appAttestKeys == nil || on.WIA.appAttestKeys == nil {
+		t.Error("native attestation does not store attested App Attest keys")
+	}
+	if hasType(build(t, config.NativeAttestationConfig{Enabled: true})) {
+		t.Error("verifier registered without an App ID")
+	}
+	if hasType(build(t, config.NativeAttestationConfig{AppleAppID: "TEAM.com.example"})) {
+		t.Error("verifier registered with native attestation disabled")
+	}
+	if hasType(build(t, config.NativeAttestationConfig{Enabled: true, AppleAppID: "TEAM.com.example", AppleAppAttestEnvironment: "staging"})) {
+		t.Error("verifier registered for an unsupported environment")
+	}
+}

@@ -3,6 +3,7 @@ package assurance
 import (
 	"context"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -98,7 +99,7 @@ func TestInstanceKey_ShippedTemplateIsInTheExampleAndLintsClean(t *testing.T) {
 	}
 	var tpl string
 	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "# (assure-wia (profile s1-full-client)") && strings.Contains(line, "(instance_key") {
+		if strings.HasPrefix(line, "# (assure-wia (profile s1-full-client)") && strings.Contains(line, "(instance_key") && !strings.Contains(line, "app_attest_assertion") {
 			tpl = strings.TrimPrefix(line, "# ")
 		}
 	}
@@ -136,4 +137,92 @@ func TestLint_InstanceKeySlotOrderAndLeaves(t *testing.T) {
 func simWIA(a *Assessor, f Facts) *WIAOutcome {
 	_, w := a.Simulate(context.Background(), f)
 	return w
+}
+
+// The documented App Attest assertion S1 template (shipped commented in
+// production.rules.example).
+const appAttestAssertionTemplate = "(assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform)(hsm)(instance_key (kind app_attest_assertion)(home)(level)(boot)(binding assertion)))))"
+
+func TestInstanceKey_AppAttestAssertionTemplate(t *testing.T) {
+	a := newAssessor(t, wiaCfg(), "# id: s1-app-attest\n"+appAttestAssertionTemplate+"\n")
+	// A renewal WIA carries no native attestation object: its platform source is
+	// backend_attested. The template must still select S1 for it.
+	plat := &PlatformVerified{Source: "backend_attested"}
+	cases := map[string]struct {
+		ik   *InstanceKeyVerified
+		want string
+	}{
+		"assertion":                  {&InstanceKeyVerified{Kind: "app_attest_assertion", Home: "secure_enclave_asserted", Binding: BindingAssertion}, "s1-full-client"},
+		"attested binding is not it": {&InstanceKeyVerified{Kind: "app_attest_assertion", Home: "secure_enclave_asserted", Binding: BindingAttested}, "s3-backend-only"},
+		"no binding":                 {&InstanceKeyVerified{Kind: "app_attest_assertion", Home: "secure_enclave_asserted"}, "s3-backend-only"},
+		"android key is not it":      {&InstanceKeyVerified{Kind: "android_key", Home: "strongbox", Binding: BindingAttested}, "s3-backend-only"},
+		"fido2 is not it":            {&InstanceKeyVerified{Kind: "fido2", Home: "fido2_hw", Binding: BindingAttested}, "s3-backend-only"},
+		"no instance key":            {nil, "s3-backend-only"},
+		"assertion kind, other bind": {&InstanceKeyVerified{Kind: "android_key", Home: "tee", Binding: BindingAssertion}, "s3-backend-only"},
+	}
+	for name, c := range cases {
+		out := simWIA(a, Facts{Platform: plat, InstanceKey: c.ik})
+		if out.Profile.Level != c.want {
+			t.Errorf("%s: profile %q, want %q", name, out.Profile.Level, c.want)
+		}
+	}
+}
+
+func TestInstanceKey_AppAttestTemplateIsInTheExampleAndLintsClean(t *testing.T) {
+	data, err := os.ReadFile("../../deploy/assurance/production.rules.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tpl string
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "# (assure-wia (profile s1-full-client)") && strings.Contains(line, "app_attest_assertion") {
+			tpl = strings.TrimPrefix(line, "# ")
+		}
+	}
+	if tpl != appAttestAssertionTemplate {
+		t.Fatalf("template missing or drifted from the tested one:\n got %q\nwant %q", tpl, appAttestAssertionTemplate)
+	}
+	cfg := defaultCfg()
+	if fs := LintRuleSet(mustRuleSet(t, "# id: s1-app-attest\n"+tpl+"\n"), &cfg); HasErrors(fs) {
+		t.Fatalf("%v", fs)
+	}
+}
+
+// instance_key is WIA evidence: no shipped rule file may constrain it from an
+// assure-ks or assure-ua rule (commented templates included), so an assertion
+// can never be turned into a key-storage or user-authentication level.
+func TestInstanceKey_ShippedRulesNeverUseItForKeyStorageOrUserAuth(t *testing.T) {
+	for _, path := range []string{"../../deploy/assurance/production.rules.example", "../../rules/default.rules", "../../rules/delegation.rules"} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			body := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "#"))
+			if !strings.Contains(body, "(instance_key") {
+				continue
+			}
+			if strings.HasPrefix(body, "(assure-ks") || strings.HasPrefix(body, "(assure-ua") {
+				t.Errorf("%s: instance_key used by a key-storage/user-auth rule: %s", path, body)
+			}
+		}
+	}
+	// Semantic check: the shipped example plus the App Attest template
+	// switched ON lifts no key-storage or user-authentication level from an
+	// assertion-only instance key.
+	data, err := os.ReadFile("../../deploy/assurance/production.rules.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := newAssessor(t, defaultCfg(), string(data)+"\n# id: s1-app-attest\n"+appAttestAssertionTemplate+"\n")
+	plat := &PlatformVerified{Source: "platform_attested"}
+	with, wWIA := a.Simulate(context.Background(), Facts{Platform: plat, InstanceKey: &InstanceKeyVerified{Kind: "app_attest_assertion", Home: "secure_enclave_asserted", Binding: BindingAssertion}})
+	without, _ := a.Simulate(context.Background(), Facts{Platform: plat})
+	if !reflect.DeepEqual(with.KeyStorage, without.KeyStorage) || !reflect.DeepEqual(with.UserAuthentication, without.UserAuthentication) {
+		t.Fatalf("an App Attest assertion changed key storage / user authentication: %+v vs %+v", with, without)
+	}
+	// While it does select the S1 profile through the WIA template.
+	if wWIA.Profile.Level != "s1-full-client" {
+		t.Fatalf("template did not apply: %q", wWIA.Profile.Level)
+	}
 }

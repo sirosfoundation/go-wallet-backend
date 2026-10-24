@@ -245,7 +245,7 @@ func (s *WIAService) verifyKeyAttestation(ctx context.Context, v InstanceKeyEvid
 	}
 	if s.keyAttestations != nil {
 		if err := s.keyAttestations.MarkKeyAttested(ctx, rec); err != nil {
-			return nil, fmt.Errorf("store instance key evidence: %w", err)
+			return nil, fmt.Errorf("%w: store instance key evidence: %v", ErrWIAKeyAttestationUnavailable, err)
 		}
 	}
 	return rec, nil
