@@ -312,6 +312,15 @@ before the field read as `fido2`), `home` (`strongbox`, `tee`,
 `chain_not_after`. Only verified evidence is ever stored, so a record's
 existence means "verified".
 
+`fido2_hw` means "an authenticator model the FIDO MDS3 registry trusts for this
+attestation chain". That is the same premise the FIDO2 key-storage rules already
+rest on: the trust decision is delegated to the PDP (ADR-010) and returns
+trusted / not trusted, it does not report the metadata's `keyProtection`, so the
+backend cannot tell a (rare) software authenticator model from a hardware one.
+Operators who need hardware only pin the accepted AAGUIDs in their rules, as the
+shipped examples do; making the home depend on `keyProtection` needs the PDP
+decision to expose it first.
+
 `wscdTypeFromKeyHome(home)` maps a verified record's home to a WSCD type
 (`strongbox`/`tee` -> `native_android`, `secure_enclave_asserted` ->
 `native_ios`, `fido2_hw` -> `fido2_hardware`, `hsm` -> `remote`) and everything
