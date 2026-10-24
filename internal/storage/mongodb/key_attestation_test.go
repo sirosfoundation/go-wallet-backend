@@ -3,9 +3,12 @@ package mongodb
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
 
@@ -149,4 +152,50 @@ func TestKeyAttestationStore_LegacyStoredDocument(t *testing.T) {
 	require.NoError(t, kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{KeyThumbprint: "thumb-legacy-db", AAGUID: "b", UV: true, VerifiedAt: time.Now().UTC()}))
 	got, _ = kas.GetByKeyThumbprint(ctx, "thumb-legacy-db")
 	require.Equal(t, "b", got.AAGUID)
+}
+
+// Competing writers: whatever the interleaving, the strongest evidence wins
+// and created_at is the first insert's. This exercises both the duplicate-key
+// retry (simultaneous first inserts) and the revision compare-and-set (writers
+// that read a stale record). Dropping the revision condition from the
+// replacement lets a stale weaker writer overwrite a stronger one.
+func TestKeyAttestationStore_CompetingWritersKeepStrongestEvidence(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	kas := store.KeyAttestations()
+	homes := []domain.KeyHome{domain.KeyHomeSecureEnclaveAsserted, domain.KeyHomeTEE, domain.KeyHomeStrongBox}
+
+	for round := 0; round < 25; round++ {
+		tp := fmt.Sprintf("thumb-race-%d", round)
+		preexisting := round%2 == 1 // odd rounds race against an existing weak record
+		if preexisting {
+			require.NoError(t, kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{KeyThumbprint: tp, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeSecureEnclaveAsserted, VerifiedAt: time.Now().UTC()}))
+		}
+
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := 0; i < 24; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				rec := &domain.KeyAttestationRecord{KeyThumbprint: tp, Kind: domain.KeyEvidenceAndroidKey, Home: homes[i%3], AppDigest: fmt.Sprintf("w%d", i), VerifiedAt: time.Now().UTC()}
+				assert.NoError(t, kas.MarkKeyAttested(ctx, rec))
+			}(i)
+		}
+		close(start)
+		wg.Wait()
+
+		got, err := kas.GetByKeyThumbprint(ctx, tp)
+		require.NoError(t, err)
+		require.Equal(t, domain.KeyHomeStrongBox, got.Home, "round %d: a weaker writer overwrote stronger evidence", round)
+		require.False(t, got.CreatedAt.IsZero())
+
+		// created_at survives a later replacement of the same rank.
+		created := got.CreatedAt
+		require.NoError(t, kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{KeyThumbprint: tp, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox, AppDigest: "later", VerifiedAt: time.Now().UTC()}))
+		got, _ = kas.GetByKeyThumbprint(ctx, tp)
+		require.Equal(t, "later", got.AppDigest)
+		require.True(t, created.Equal(got.CreatedAt), "round %d: created_at changed", round)
+	}
 }
