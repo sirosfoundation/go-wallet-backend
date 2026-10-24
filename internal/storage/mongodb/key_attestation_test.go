@@ -45,7 +45,7 @@ func TestKeyAttestationStore_GetByKeyThumbprint_NotFound(t *testing.T) {
 	require.True(t, errors.Is(err, storage.ErrNotFound))
 }
 
-func TestKeyAttestationStore_UVRoundTrip(t *testing.T) {
+func TestKeyAttestationStore_UVRoundTripNoDowngrade(t *testing.T) {
 	store := skipIfNoMongo(t)
 	ctx := context.Background()
 	kas := store.KeyAttestations()
@@ -58,7 +58,7 @@ func TestKeyAttestationStore_UVRoundTrip(t *testing.T) {
 	require.NoError(t, kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{KeyThumbprint: "thumb-mongo-uv", AAGUID: "a", UV: false, VerifiedAt: time.Now().UTC()}))
 	got, err = kas.GetByKeyThumbprint(ctx, "thumb-mongo-uv")
 	require.NoError(t, err)
-	require.False(t, got.UV)
+	require.True(t, got.UV, "weaker evidence must not overwrite")
 }
 
 // Documents written before the uv field existed must decode with UV false.
@@ -73,9 +73,80 @@ func TestKeyAttestationRecord_LegacyDocumentReadsAsUVNone(t *testing.T) {
 	require.NoError(t, bson.Unmarshal(legacy, &rec))
 	require.Equal(t, "thumb-old", rec.KeyThumbprint)
 	require.False(t, rec.UV)
+	rec.Normalize()
+	require.Equal(t, domain.KeyEvidenceFIDO2, rec.Kind)
+	require.Equal(t, domain.KeyHomeFIDO2Hardware, rec.Home)
 
 	withUV, err := bson.Marshal(bson.M{"_id": "thumb-new", "aaguid": "a", "uv": true})
 	require.NoError(t, err)
 	require.NoError(t, bson.Unmarshal(withUV, &rec))
 	require.True(t, rec.UV)
+}
+
+func TestKeyAttestationStore_NewFieldsRoundTripAndNoOverwrite(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	kas := store.KeyAttestations()
+	locked := true
+	notAfter := time.Now().Add(time.Hour).UTC().Truncate(time.Millisecond)
+	require.NoError(t, kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{
+		KeyThumbprint: "thumb-mongo-new", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE,
+		SecurityLevel: "trusted_environment", VerifiedBootState: "verified", DeviceLocked: &locked,
+		PatchLevel: "2026-09", AppDigest: "dg", ChainFingerprint: "fp", ChainNotAfter: notAfter,
+		VerifiedAt: time.Now().UTC(),
+	}))
+	got, err := kas.GetByKeyThumbprint(ctx, "thumb-mongo-new")
+	require.NoError(t, err)
+	require.Equal(t, domain.KeyHomeTEE, got.Home)
+	require.Equal(t, "verified", got.VerifiedBootState)
+	require.NotNil(t, got.DeviceLocked)
+	require.True(t, *got.DeviceLocked)
+	require.True(t, notAfter.Equal(got.ChainNotAfter))
+	created := got.CreatedAt
+
+	// Weaker: ignored.
+	require.NoError(t, kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{KeyThumbprint: "thumb-mongo-new", Kind: domain.KeyEvidenceAppAttestAssertion, Home: domain.KeyHomeSecureEnclaveAsserted}))
+	got, _ = kas.GetByKeyThumbprint(ctx, "thumb-mongo-new")
+	require.Equal(t, domain.KeyHomeTEE, got.Home)
+	// Stronger: replaces, CreatedAt kept.
+	require.NoError(t, kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{KeyThumbprint: "thumb-mongo-new", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox}))
+	got, _ = kas.GetByKeyThumbprint(ctx, "thumb-mongo-new")
+	require.Equal(t, domain.KeyHomeStrongBox, got.Home)
+	require.True(t, created.Equal(got.CreatedAt))
+}
+
+// A document stored before Rev, Kind and Home existed decodes and is then
+// replaceable by the first CAS (no database needed for the decode half).
+func TestKeyAttestationDoc_LegacyDecodeNormalizes(t *testing.T) {
+	legacy, err := bson.Marshal(bson.M{"_id": "x", "aaguid": "a", "uv": true})
+	require.NoError(t, err)
+	var doc keyAttestationDoc
+	require.NoError(t, bson.Unmarshal(legacy, &doc))
+	require.Zero(t, doc.Rev)
+	doc.Normalize()
+	require.Equal(t, domain.KeyHomeFIDO2Hardware, doc.Home)
+	require.Equal(t, "x", doc.KeyThumbprint)
+}
+
+// A pre-existing document without rev/kind/home is read as a FIDO2 hardware
+// record, is not displaced by weaker evidence, and is replaced by the CAS path
+// when the new evidence is not weaker.
+func TestKeyAttestationStore_LegacyStoredDocument(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	kas := store.KeyAttestations().(*KeyAttestationStore)
+	_, err := kas.collection.InsertOne(ctx, bson.M{"_id": "thumb-legacy-db", "aaguid": "a", "uv": true, "verified_at": time.Now().UTC(), "created_at": time.Now().UTC()})
+	require.NoError(t, err)
+
+	got, err := kas.GetByKeyThumbprint(ctx, "thumb-legacy-db")
+	require.NoError(t, err)
+	require.Equal(t, domain.KeyHomeFIDO2Hardware, got.Home)
+
+	require.NoError(t, kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{KeyThumbprint: "thumb-legacy-db", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE}))
+	got, _ = kas.GetByKeyThumbprint(ctx, "thumb-legacy-db")
+	require.Equal(t, domain.KeyEvidenceFIDO2, got.Kind, "weaker evidence displaced a legacy record")
+
+	require.NoError(t, kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{KeyThumbprint: "thumb-legacy-db", AAGUID: "b", UV: true, VerifiedAt: time.Now().UTC()}))
+	got, _ = kas.GetByKeyThumbprint(ctx, "thumb-legacy-db")
+	require.Equal(t, "b", got.AAGUID)
 }

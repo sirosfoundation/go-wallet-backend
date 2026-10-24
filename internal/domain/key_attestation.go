@@ -37,9 +37,129 @@ type KeyAttestationRecord struct {
 	// stored before this field existed read as false ("uv none").
 	UV bool `json:"uv" bson:"uv"`
 
+	// Kind is the family of evidence that produced this record. Records
+	// stored before the field existed are FIDO2 records: Normalize applies
+	// that default.
+	Kind KeyEvidenceKind `json:"kind,omitempty" bson:"kind,omitempty"`
+
+	// Home is where the verified evidence says the key lives. Empty only
+	// on records stored before the field existed, which Normalize resolves
+	// for FIDO2 records (a FIDO2 attestation verified against the FIDO MDS3
+	// registry is a hardware authenticator: KeyHomeFIDO2Hardware).
+	Home KeyHome `json:"home,omitempty" bson:"home,omitempty"`
+
+	// SecurityLevel is the attestation security level the evidence reports
+	// (for example software, trusted_environment, strongbox). Optional.
+	SecurityLevel string `json:"security_level,omitempty" bson:"security_level,omitempty"`
+
+	// VerifiedBootState is the verified boot state reported by the
+	// evidence (for example verified, self_signed, unverified). Optional.
+	VerifiedBootState string `json:"verified_boot_state,omitempty" bson:"verified_boot_state,omitempty"`
+
+	// DeviceLocked is the bootloader lock state reported by the evidence,
+	// nil when the evidence does not say.
+	DeviceLocked *bool `json:"device_locked,omitempty" bson:"device_locked,omitempty"`
+
+	// PatchLevel is the OS patch level reported by the evidence. Optional.
+	PatchLevel string `json:"patch_level,omitempty" bson:"patch_level,omitempty"`
+
+	// AppDigest is the digest of the application signing certificate(s)
+	// reported by the evidence. Optional.
+	AppDigest string `json:"app_digest,omitempty" bson:"app_digest,omitempty"`
+
+	// ChainFingerprint is the SHA-256 fingerprint of the evidence's
+	// certificate chain leaf, for audit. Optional.
+	ChainFingerprint string `json:"chain_fingerprint,omitempty" bson:"chain_fingerprint,omitempty"`
+
+	// ChainNotAfter is the earliest NotAfter in the evidence's certificate
+	// chain, zero when there is no chain.
+	ChainNotAfter time.Time `json:"chain_not_after,omitempty" bson:"chain_not_after,omitempty"`
+
 	// VerifiedAt is when this key's attestation was verified.
 	VerifiedAt time.Time `json:"verified_at" bson:"verified_at"`
 
 	// CreatedAt is when this record was first stored.
 	CreatedAt time.Time `json:"created_at" bson:"created_at"`
+}
+
+// KeyEvidenceKind names the family of per-key evidence a record holds.
+type KeyEvidenceKind string
+
+const (
+	// KeyEvidenceFIDO2 is a verified FIDO2/CTAP2 attestation object. It is
+	// the default for records stored before Kind existed.
+	KeyEvidenceFIDO2 KeyEvidenceKind = "fido2"
+
+	// KeyEvidenceAndroidKey is a verified Android Key Attestation chain.
+	KeyEvidenceAndroidKey KeyEvidenceKind = "android_key"
+
+	// KeyEvidenceAppAttestAssertion is an App Attest assertion over the key.
+	KeyEvidenceAppAttestAssertion KeyEvidenceKind = "app_attest_assertion"
+)
+
+// KeyHome says where verified evidence puts a key.
+type KeyHome string
+
+const (
+	KeyHomeStrongBox KeyHome = "strongbox"
+	KeyHomeTEE       KeyHome = "tee"
+	// KeyHomeSecureEnclaveAsserted is a key an App Attest assertion ties to
+	// an attested device: asserted, not attested, so it ranks below tee.
+	KeyHomeSecureEnclaveAsserted KeyHome = "secure_enclave_asserted"
+	KeyHomeFIDO2Hardware         KeyHome = "fido2_hw"
+	KeyHomeHSM                   KeyHome = "hsm"
+)
+
+// rank orders homes by strength of the guarantee. Unknown or empty homes
+// rank 0, so a record with no home never replaces one that has it.
+func (h KeyHome) rank() int {
+	switch h {
+	case KeyHomeSecureEnclaveAsserted:
+		return 1
+	case KeyHomeTEE:
+		return 2
+	case KeyHomeStrongBox, KeyHomeFIDO2Hardware, KeyHomeHSM:
+		return 3
+	}
+	return 0
+}
+
+// Normalize applies the defaults that make a record stored before Kind and
+// Home existed read as what it was: a FIDO2 record whose home is a hardware
+// authenticator. Stores call it on every read and before every comparison.
+func (r *KeyAttestationRecord) Normalize() {
+	if r.Kind == "" {
+		r.Kind = KeyEvidenceFIDO2
+	}
+	if r.Home == "" && r.Kind == KeyEvidenceFIDO2 {
+		r.Home = KeyHomeFIDO2Hardware
+	}
+}
+
+// Supersedes reports whether r may replace existing. A stored record is
+// never overwritten by weaker or absent evidence: r must not rank lower by
+// Home; at equal rank it must be the same Kind and must not lose the UV bit
+// (a different kind of evidence at the same rank does not displace the
+// first verified one). A nil existing is always superseded. Both records
+// are compared in normalized form.
+func (r *KeyAttestationRecord) Supersedes(existing *KeyAttestationRecord) bool {
+	if existing == nil {
+		return true
+	}
+	n, e := *r, *existing
+	n.Normalize()
+	e.Normalize()
+	switch {
+	case n.Home.rank() > e.Home.rank():
+		return true
+	case n.Home.rank() < e.Home.rank():
+		return false
+	}
+	if n.Kind != e.Kind {
+		return false
+	}
+	if e.UV && !n.UV {
+		return false
+	}
+	return true
 }

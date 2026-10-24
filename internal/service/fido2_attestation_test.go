@@ -382,6 +382,9 @@ func TestFIDO2AttestationService_VerifyEvidenceDoesNotPersist(t *testing.T) {
 	if rec.KeyThumbprint != expectedThumbprint(t, pub) || !rec.UV {
 		t.Errorf("unexpected record %+v", rec)
 	}
+	if rec.Kind != domain.KeyEvidenceFIDO2 || rec.Home != domain.KeyHomeFIDO2Hardware {
+		t.Errorf("kind/home = %q/%q, want fido2/fido2_hw", rec.Kind, rec.Home)
+	}
 	if _, err := store.KeyAttestations().GetByKeyThumbprint(context.Background(), rec.KeyThumbprint); !errors.Is(err, storage.ErrNotFound) {
 		t.Errorf("VerifyEvidence persisted a record: err=%v", err)
 	}

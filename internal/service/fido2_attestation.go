@@ -224,6 +224,8 @@ func (s *FIDO2AttestationService) VerifyEvidence(ctx context.Context, req *FIDO2
 		KeyThumbprint:    keyThumbprint,
 		WalletInstanceID: req.WalletInstanceID,
 		TenantID:         tenantID,
+		Kind:             domain.KeyEvidenceFIDO2,
+		Home:             domain.KeyHomeFIDO2Hardware,
 		AAGUID:           aaguid.String(),
 		UV:               attObj.AuthData.Flags.UserVerified() && authDataFlagsAreSigned(attObj.Format),
 		VerifiedAt:       time.Now().UTC(),

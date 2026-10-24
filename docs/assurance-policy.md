@@ -287,6 +287,31 @@ overwritten at their next attestation. An earlier version switched on the names
 `wscd_type` is never assurance evidence: the evidence schema has no slot for it
 and no rule can read it (pinned by a test).
 
+### Per-key evidence record (instance-key binding, stage B1)
+
+Where the instance key lives can only come from evidence about **that key**.
+`domain.KeyAttestationRecord` (per key, keyed by JWK thumbprint, never per
+wallet instance) therefore carries, besides `aaguid`, `uv` and `verified_at`:
+`kind` (`fido2`, later `android_key`, `app_attest_assertion`; records stored
+before the field read as `fido2`), `home` (`strongbox`, `tee`,
+`secure_enclave_asserted`, `fido2_hw`, `hsm`; old FIDO2 records read as
+`fido2_hw`), and optional `security_level`, `verified_boot_state`,
+`device_locked`, `patch_level`, `app_digest`, `chain_fingerprint`,
+`chain_not_after`. Only verified evidence is ever stored, so a record's
+existence means "verified".
+
+`wscdTypeFromKeyHome(home)` maps a verified record's home to a WSCD type
+(`strongbox`/`tee` -> `native_android`, `secure_enclave_asserted` ->
+`native_ios`, `fido2_hw` -> `fido2_hardware`, `hsm` -> `remote`) and everything
+else to `unknown`. It is never fed from the client-reported plugin or the
+platform attestation.
+
+**A record is never overwritten by weaker or absent evidence** (memory and
+MongoDB stores; the MongoDB path is a compare-and-set on a revision). Homes
+rank `secure_enclave_asserted` < `tee` < `strongbox`/`fido2_hw`/`hsm`; at equal
+rank only the same kind replaces, and never by dropping the UV bit. A
+registration that would weaken the record is ignored without error.
+
 ## Preview endpoint
 
 `POST /wallet-provider/assurance-preview` (same authentication, audience and
