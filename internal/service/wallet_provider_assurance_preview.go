@@ -66,13 +66,13 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 		req = &AssurancePreviewRequest{}
 	}
 
-	source := ""
+	source, appID := "", ""
 	if req.WalletInstanceID != "" && s.instances != nil {
 		instance, err := s.lookupOwnedInstance(ctx, req.WalletInstanceID)
 		if err != nil {
 			return nil, err
 		}
-		source = instance.AttestationSource
+		source, appID = instance.AttestationSource, instance.VerifiedAppID
 	}
 
 	var overlay *domain.KeyAttestationRecord
@@ -124,7 +124,7 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 
 	kaFacts := assurance.Facts{Fido2: s.fido2EvidenceFor(ctx, thumbprints, overlay)}
 	if source != "" {
-		kaFacts.Platform = &assurance.PlatformVerified{Source: source}
+		kaFacts.Platform = &assurance.PlatformVerified{Source: source, AppID: appID}
 	}
 	if sp := req.SecurityProperties; sp != nil {
 		kaFacts.Claims = assurance.Claims{
@@ -134,7 +134,7 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 	}
 	// The WIA request carries no FIDO2 evidence and no claims: its facts are
 	// the platform source only, exactly as GenerateWIA builds them.
-	wiaFacts := assurance.Facts{Platform: &assurance.PlatformVerified{Source: wiaSource}}
+	wiaFacts := assurance.Facts{Platform: &assurance.PlatformVerified{Source: wiaSource, AppID: appID}}
 
 	ka, _ := s.assessor.Simulate(ctx, kaFacts)
 	_, wia := s.assessor.Simulate(ctx, wiaFacts)

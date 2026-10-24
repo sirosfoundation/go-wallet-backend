@@ -1,11 +1,21 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/go-jose/go-jose/v4"
+	"github.com/sirosfoundation/go-siros-set/set"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -16,6 +26,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 )
@@ -516,3 +527,146 @@ func TestPreview_EnabledWithoutAssessorFailsClosed(t *testing.T) {
 }
 
 var _ = memory.NewStore
+
+// --- review follow-ups ---------------------------------------------------------
+
+func capturingAuditor(t *testing.T) (*audit.Emitter, *bytes.Buffer) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := set.NewSigner(key, jose.ES256, "k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	return audit.New("https://wallet.example", signer, slog.New(slog.NewJSONHandler(&buf, nil))), &buf
+}
+
+// auditPayload decodes the payload of the last emitted SET.
+func auditPayload(t *testing.T, buf *bytes.Buffer) string {
+	t.Helper()
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	var rec struct {
+		JWS string `json:"jws"`
+	}
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &rec); err != nil {
+		t.Fatalf("no audit record: %v (%q)", err, buf.String())
+	}
+	parts := strings.Split(rec.JWS, ".")
+	if len(parts) != 3 {
+		t.Fatalf("bad JWS %q", rec.JWS)
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(payload)
+}
+
+func TestWIAAssurance_IssuedAuditEventCarriesDecisionAndVerifiedSource(t *testing.T) {
+	svc, _ := wiaAssuranceSvc(t, wiaFullRules)
+	auditor, buf := capturingAuditor(t)
+	svc.audit = auditor
+
+	// development_attested is emitted as the floor profile; the event must
+	// still say what was verified.
+	att := wiaAttestation{Source: "development_attested", Platform: NativeAttestationAppleAppAttest}
+	if err := svc.applyAssurance(context.Background(), "jkt-dev-123456", &att); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.signWIA(map[string]interface{}{"kty": "EC"}, "jkt-dev-123456", "t", nil, att, "c"); err != nil {
+		t.Fatal(err)
+	}
+	p := auditPayload(t, buf)
+	for _, want := range []string{
+		`"attestation_source":"backend_attested"`,
+		`"verified_attestation_source":"development_attested"`,
+		`"assurance_profile":"s3-backend-only"`,
+		`"assurance_rule_ids":["issue-all"]`,
+		`"assurance_policy_hash":"`,
+	} {
+		if !strings.Contains(p, want) {
+			t.Errorf("audit payload lacks %s: %s", want, p)
+		}
+	}
+}
+
+func TestWIAAssurance_DisabledAuditEventIsUnchanged(t *testing.T) {
+	svc, _ := newTestWIAService(t)
+	auditor, buf := capturingAuditor(t)
+	svc.audit = auditor
+	if _, err := svc.signWIA(map[string]interface{}{"kty": "EC"}, "jkt-12345678", "t", nil, wiaAttestation{Source: "development_attested"}, "c"); err != nil {
+		t.Fatal(err)
+	}
+	p := auditPayload(t, buf)
+	if !strings.Contains(p, `"attestation_source":"development_attested"`) || strings.Contains(p, "assurance_") || strings.Contains(p, "verified_attestation_source") {
+		t.Fatalf("disabled event changed: %s", p)
+	}
+}
+
+// Re-attestation updates the recorded WSCD type (the stores used to keep the
+// first value, so an instance first seen without native evidence stayed
+// web_crypto for good).
+func TestSignWIA_ReattestationUpdatesWSCDTypeAndVerifiedAppID(t *testing.T) {
+	svc, instances := newTestWIAServiceWithInstances(t)
+	const jkt = "jkt-reattest-123456"
+	cnf := map[string]interface{}{"kty": "EC"}
+	if _, err := svc.signWIA(cnf, jkt, "t", nil, wiaAttestation{Source: "backend_attested"}, "c"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.signWIA(cnf, jkt, "t", nil, wiaAttestation{Source: "platform_attested", Platform: NativeAttestationGooglePlayInteg, AppID: "org.example.app"}, "c"); err != nil {
+		t.Fatal(err)
+	}
+	inst, err := instances.GetByID(context.Background(), jkt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inst.WSCDType != domain.WSCDTypeNativeAndroid || inst.VerifiedAppID != "org.example.app" || inst.AttestationSource != "platform_attested" {
+		t.Fatalf("%+v", inst)
+	}
+}
+
+// The verified app id (not the client-reported DeviceInfo.AppID) is evidence,
+// for the key attestation, the WIA preview and the real WIA alike.
+func TestAssurance_VerifiedAppIDIsEvidenceEverywhere(t *testing.T) {
+	rules := `# id: app-ks
+(assure-ks (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2)(platform (source platform_attested)(app_id org.example.app)))))
+# id: issue-all
+(assure-wia-issue (evidence))
+# id: app-wia
+(assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform (source platform_attested)(app_id org.example.app)))))
+`
+	svc, instances, _ := previewSvc(t, rules, true)
+	put := func(id, verified, reported string) {
+		t.Helper()
+		if err := instances.Upsert(context.Background(), &domain.WalletInstance{
+			ID: id, Status: domain.InstanceStatusActive, AttestationSource: "platform_attested", VerifiedAppID: verified,
+			DeviceInfo: &domain.DeviceInfo{AppID: reported},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("good", "org.example.app", "")
+	put("liar", "", "org.example.app") // only the client says so
+
+	jwks := twoKeys()
+	for id, want := range map[string]string{"good": "iso_18045_moderate", "liar": "iso_18045_basic"} {
+		ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "n", nil, id, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := parseKAClaims(t, ka)["key_storage"].([]interface{})[0]; got != want {
+			t.Errorf("KA %s: key_storage = %v, want %s", id, got, want)
+		}
+		pv, err := svc.PreviewAssurance(context.Background(), &AssurancePreviewRequest{WalletInstanceID: id, JWKS: jwks})
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantProfile := map[string]string{"good": "platform_attested", "liar": "backend_attested"}[id]
+		if pv.KeyStorage[0] != want || pv.WIAProfile != wantProfile {
+			t.Errorf("preview %s: %+v, want ks %s profile %s", id, pv, want, wantProfile)
+		}
+	}
+}

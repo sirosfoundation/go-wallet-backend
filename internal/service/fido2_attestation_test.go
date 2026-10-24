@@ -397,3 +397,93 @@ func TestFIDO2AttestationService_VerifyEvidenceRefusesUntrusted(t *testing.T) {
 		t.Fatalf("err = %v, want ErrFIDO2AttestationInvalid", err)
 	}
 }
+
+// buildTestU2FAttestationObject builds a valid "fido-u2f" attestation. Its
+// signature covers 0x00||rpIdHash||clientDataHash||credentialId||publicKey and
+// NOT the authenticator data flags, which is why flags is a free parameter.
+func buildTestU2FAttestationObject(t *testing.T, aaguid uuid.UUID, clientDataHash []byte, flags byte) ([]byte, *ecdsa.PublicKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "test-u2f"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x, y := key.PublicKey.X.FillBytes(make([]byte, 32)), key.PublicKey.Y.FillBytes(make([]byte, 32))
+	coseKeyBytes, err := webauthncbor.Marshal(webauthncose.EC2PublicKeyData{
+		PublicKeyData: webauthncose.PublicKeyData{KeyType: 2, Algorithm: -7},
+		Curve:         1, XCoord: x, YCoord: y,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rpIDHash := sha256.Sum256([]byte("test-rp"))
+	credentialID := []byte("test-credential-id")
+	authData := append([]byte{}, rpIDHash[:]...)
+	authData = append(authData, flags)
+	authData = binary.BigEndian.AppendUint32(authData, 1)
+	authData = append(authData, aaguid[:]...)
+	authData = binary.BigEndian.AppendUint16(authData, uint16(len(credentialID)))
+	authData = append(authData, credentialID...)
+	authData = append(authData, coseKeyBytes...)
+
+	signed := append([]byte{0x00}, rpIDHash[:]...)
+	signed = append(signed, clientDataHash...)
+	signed = append(signed, credentialID...)
+	signed = append(signed, 0x04)
+	signed = append(signed, x...)
+	signed = append(signed, y...)
+	digest := sha256.Sum256(signed)
+	sig, err := ecdsa.SignASN1(rand.Reader, key, digest[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj, err := webauthncbor.Marshal(map[string]interface{}{
+		"fmt":      "fido-u2f",
+		"attStmt":  map[string]interface{}{"sig": sig, "x5c": []interface{}{certDER}},
+		"authData": authData,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return obj, &key.PublicKey
+}
+
+// In fido-u2f the signature does not cover the flags, so UV in a u2f
+// attestation proves nothing: flipping the bit on a valid, trusted attestation
+// must never produce uv present. (Same attestation with the bit set or clear
+// verifies either way.)
+func TestFIDO2AttestationService_U2FUserVerifiedFlagIsNotEvidence(t *testing.T) {
+	for _, flags := range []byte{0x40 | 0x01, 0x40 | 0x04 | 0x01} {
+		store := memory.NewStore()
+		svc := NewFIDO2AttestationService(testFIDO2AttestationConfig(true), store.WalletInstances(), store.KeyAttestations(), newTestTrustService(t, &stubEvaluator{decision: true}), zap.NewNop())
+		hash := make([]byte, 32)
+		obj, _ := buildTestU2FAttestationObject(t, uuid.New(), hash, flags)
+		rec, err := svc.VerifyEvidence(context.Background(), &FIDO2AttestationRequest{AttestationObject: obj, ClientDataHash: hash})
+		if err != nil {
+			t.Fatalf("flags %#x: u2f attestation must still verify: %v", flags, err)
+		}
+		if rec.UV {
+			t.Errorf("flags %#x: UV recorded from an unsigned u2f flag", flags)
+		}
+	}
+}
+
+func TestAuthDataFlagsAreSigned(t *testing.T) {
+	for format, want := range map[string]bool{
+		"packed": true, "tpm": true, "android-key": true, "apple": true,
+		"fido-u2f": false, "none": false, "android-safetynet": false, "compound": false, "": false, "unknown": false,
+	} {
+		if got := authDataFlagsAreSigned(format); got != want {
+			t.Errorf("%q: %v, want %v", format, got, want)
+		}
+	}
+}

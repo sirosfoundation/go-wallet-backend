@@ -116,6 +116,13 @@ type WalletInstance struct {
 	// environment).
 	AttestationSource string `json:"attestation_source" bson:"attestation_source"`
 
+	// VerifiedAppID is the application id the backend itself verified in the
+	// most recent native attestation (App Attest / Play Integrity), empty when
+	// that attestation carried none or the request had no native attestation.
+	// Unlike DeviceInfo.AppID, which the client reports, this is verifier
+	// output and may be used as assurance evidence.
+	VerifiedAppID string `json:"verified_app_id,omitempty" bson:"verified_app_id,omitempty"`
+
 	// SecurityProperties captures the claimed security level (ISO 18045 AVA scale).
 	SecurityProperties *SecurityProperties `json:"security_properties,omitempty" bson:"security_properties,omitempty"`
 

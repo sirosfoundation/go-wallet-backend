@@ -25,7 +25,9 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
-var ErrKeyAttestationNotSupported = errors.New("key attestation not supported")
+var (
+	ErrKeyAttestationNotSupported = errors.New("key attestation not supported")
+)
 
 // MaxJWKSPerRequest is the hard upper bound on JWKs in a single KA request.
 // Prevents DoS via expensive JWT signing with excessively large arrays.

@@ -225,7 +225,23 @@ func (s *FIDO2AttestationService) VerifyEvidence(ctx context.Context, req *FIDO2
 		WalletInstanceID: req.WalletInstanceID,
 		TenantID:         tenantID,
 		AAGUID:           aaguid.String(),
-		UV:               attObj.AuthData.Flags.UserVerified(),
+		UV:               attObj.AuthData.Flags.UserVerified() && authDataFlagsAreSigned(attObj.Format),
 		VerifiedAt:       time.Now().UTC(),
 	}, nil
+}
+
+// authDataFlagsAreSigned reports whether the attestation signature of a
+// format covers the authenticator data flags. UV is only evidence when it
+// does: in fido-u2f the signature is over rpIdHash, clientDataHash,
+// credentialId and the public key, NOT over the flags (nor the counter), so a
+// caller could set UV on an otherwise valid, trusted attestation. packed,
+// android-key (signature over authData||clientDataHash), tpm (certInfo
+// extraData is a hash over them) and apple (the certificate nonce is a hash
+// over them) cover it. Anything else is not trusted for UV (fail closed).
+func authDataFlagsAreSigned(format string) bool {
+	switch format {
+	case "packed", "tpm", "android-key", "apple":
+		return true
+	}
+	return false
 }

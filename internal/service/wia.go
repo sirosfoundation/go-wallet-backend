@@ -721,6 +721,7 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 			Status:            domain.InstanceStatusActive,
 			WSCDType:          wscdTypeFromAttestation(attestationSource, att.Platform),
 			AttestationSource: attestationSource,
+			VerifiedAppID:     att.AppID,
 			LastAttestedAt:    now,
 			CreatedAt:         now,
 			UpdatedAt:         now,
@@ -732,9 +733,16 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 
 	// Emit audit event
 	if s.audit != nil {
-		s.audit.EmitWithSubject(set.EventWIAIssued, jkt, map[string]any{
-			"attestation_source": claimSource,
-		})
+		payload := map[string]any{"attestation_source": claimSource}
+		if att.Decision != nil {
+			// With the policy enabled attestation_source is the chosen
+			// profile's value, so the verified source goes alongside it.
+			payload["verified_attestation_source"] = attestationSource
+			payload["assurance_profile"] = att.Decision.Profile.Level
+			payload["assurance_policy_hash"] = att.Decision.PolicyVersion
+			payload["assurance_rule_ids"] = att.Decision.RuleIDs()
+		}
+		s.audit.EmitWithSubject(set.EventWIAIssued, jkt, payload)
 	}
 
 	return tokenString, nil

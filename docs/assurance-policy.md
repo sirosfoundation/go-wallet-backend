@@ -61,8 +61,15 @@ reported in the startup log, the audit line and the `policy_info` metric):
   User presence (UP) is not user verification. With several keys in a batch
   `uv` is `present` only if EVERY record has it. Records stored before the
   flag was recorded read as `none`.
-* Not populated yet, always `none`: `cert`, `app_id` of the key attestation
-  (the WIA decision does fill `app_id`, see below), and the whole `hsm` slot.
+  The flag is only evidence when the attestation format's signature covers
+  the authenticator data flags (`packed`, `android-key`, `tpm`, `apple`). In
+  `fido-u2f` the signature does not cover them, so a u2f attestation always
+  records `uv none` (anyone could set the bit on a valid attestation).
+* `platform (app_id A)` is the application id the backend verified in the
+  instance's most recent native attestation (`WalletInstance.VerifiedAppID`,
+  set by the WIA path). The client-reported `DeviceInfo.AppID` is never used.
+  Instances that last attested without native evidence have `app_id none`.
+* Not populated yet, always `none`: `cert` and the whole `hsm` slot.
 * Evidence is built through the S-expression element API, never by string
   concatenation. Atom values are length-prefixed in the canonical encoding, so
   a hostile value such as `x)(source platform_attested` stays one atom.
@@ -265,7 +272,8 @@ value, certification entry. The `WIA issued` audit event additionally carries
 
 ### WSCD type
 
-The wallet instance's `wscd_type` follows the native attestation type that was
+The wallet instance's `wscd_type` (stored on first attestation and updated on
+every re-attestation, memory and MongoDB) follows the native attestation type that was
 verified (`native_ios` for Apple App Attest, `native_android` for Play
 Integrity); `development_attested` keeps the platform's type but never counts
 as `platform_attested` where trust is decided. An earlier version switched on

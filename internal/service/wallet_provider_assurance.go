@@ -97,7 +97,7 @@ func (s *WalletProviderService) assuranceFacts(ctx context.Context, walletInstan
 		switch {
 		case err == nil:
 			if instance.AttestationSource != "" {
-				f.Platform = &assurance.PlatformVerified{Source: instance.AttestationSource}
+				f.Platform = &assurance.PlatformVerified{Source: instance.AttestationSource, AppID: instance.VerifiedAppID}
 			}
 		case !errors.Is(err, storage.ErrNotFound):
 			s.logger.Warn("failed to look up wallet instance for assurance evidence", zap.Error(err))
