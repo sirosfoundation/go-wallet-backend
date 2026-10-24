@@ -1,8 +1,10 @@
 package engine
 
 import (
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -27,11 +29,19 @@ func keepaliveHarness(t *testing.T) (*websocket.Conn, *Session, <-chan struct{})
 // keepaliveHarnessWindow is keepaliveHarness with an explicit initial read-deadline window.
 func keepaliveHarnessWindow(t *testing.T, window time.Duration) (*websocket.Conn, *Session, <-chan struct{}) {
 	t.Helper()
+	return keepaliveHarnessConn(t, window, nil)
+}
+
+// keepaliveHarnessConn is keepaliveHarnessWindow with the accepted server-side
+// net.Conn optionally wrapped (wrap may be nil), so a test can control the
+// socket write path deterministically.
+func keepaliveHarnessConn(t *testing.T, window time.Duration, wrap func(net.Conn) net.Conn) (*websocket.Conn, *Session, <-chan struct{}) {
+	t.Helper()
 	m := NewManager(&config.Config{JWT: config.JWTConfig{Secret: "s", Issuer: "i"}}, zap.NewNop())
 	up := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	sessCh := make(chan *Session, 1)
 	done := make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := up.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -44,6 +54,10 @@ func keepaliveHarnessWindow(t *testing.T, window time.Duration) (*websocket.Conn
 		m.handleSession(s)
 		close(done)
 	}))
+	if wrap != nil {
+		srv.Listener = &wrapListener{Listener: srv.Listener, wrap: wrap}
+	}
+	srv.Start()
 	t.Cleanup(srv.Close)
 	cl, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(srv.URL, "http"), nil)
 	require.NoError(t, err)
@@ -198,33 +212,60 @@ func TestPingLoop_SurvivesBlockedTransportWrite(t *testing.T) {
 		"pings did not resume after a transport write stall")
 }
 
+type wrapListener struct {
+	net.Listener
+	wrap func(net.Conn) net.Conn
+}
+
+func (l *wrapListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return l.wrap(c), nil
+}
+
+// stalledWriteConn is a net.Conn whose Write, once armed, blocks until the
+// write deadline passes and then fails with a timeout error, exactly as a
+// socket with a full send buffer behaves. Unlike a real socket it can never
+// absorb a small write into leftover buffer space, so it is deterministic.
+type stalledWriteConn struct {
+	net.Conn
+	armed    atomic.Bool
+	deadline atomic.Int64 // unix nanos; 0 = none
+}
+
+func (c *stalledWriteConn) SetWriteDeadline(t time.Time) error {
+	if t.IsZero() {
+		c.deadline.Store(0)
+	} else {
+		c.deadline.Store(t.UnixNano())
+	}
+	return c.Conn.SetWriteDeadline(t)
+}
+
+func (c *stalledWriteConn) Write(p []byte) (int, error) {
+	if !c.armed.Load() {
+		return c.Conn.Write(p)
+	}
+	d := c.deadline.Load()
+	if d == 0 {
+		return 0, os.ErrDeadlineExceeded // never block forever
+	}
+	time.Sleep(time.Until(time.Unix(0, d)))
+	return 0, os.ErrDeadlineExceeded
+}
+
 // When the ping's own socket write times out the connection can no longer
 // send anything; it must be closed, not retried forever.
 func TestPingLoop_ClosesConnectionWhenControlWriteItselfTimesOut(t *testing.T) {
-	cl, s, done := keepaliveHarnessWindow(t, time.Minute)
-	_ = cl // never reads, so the server's socket send buffer fills up
-
-	// Keep the send path full by writing directly on the raw socket (no
-	// gorilla write lock involved) for the duration of the test, so the
-	// ping's own socket write cannot find room.
-	raw := s.conn.NetConn()
-	stopFill := make(chan struct{})
-	t.Cleanup(func() { close(stopFill) })
-	go func() {
-		junk := make([]byte, 1<<16)
-		for {
-			select {
-			case <-stopFill:
-				return
-			case <-done:
-				return
-			default:
-			}
-			_ = raw.SetWriteDeadline(time.Now().Add(20 * time.Millisecond))
-			_, _ = raw.Write(junk)
-		}
-	}()
-	time.Sleep(300 * time.Millisecond) // let the buffers fill
+	var stall *stalledWriteConn
+	cl, s, done := keepaliveHarnessConn(t, time.Minute, func(c net.Conn) net.Conn {
+		stall = &stalledWriteConn{Conn: c}
+		return stall
+	})
+	_ = cl
+	stall.armed.Store(true) // every socket write from now on times out
 	go s.pingLoop()
 	select {
 	case <-done:
