@@ -135,11 +135,19 @@ func secretDeliveryOf(config *CredentialConfig) (secretDelivery, error) {
 // configuration is not offered. A document that does not decode as a
 // configuration is not judged here.
 func AdvertisementMalformed(configuration json.RawMessage) bool {
-	var cfg CredentialConfig
+	// Decode only the two members the advertisement lives in, so that a type
+	// error in an unrelated member (say "format":123) cannot disable the check.
+	var cfg struct {
+		CredentialMetadata     json.RawMessage `json:"credential_metadata"`
+		AuxiliaryDataSupported json.RawMessage `json:"auxiliary_data_supported"`
+	}
 	if json.Unmarshal(configuration, &cfg) != nil {
 		return false
 	}
-	_, err := secretDeliveryOf(&cfg)
+	_, err := secretDeliveryOf(&CredentialConfig{
+		CredentialMetadata:     cfg.CredentialMetadata,
+		AuxiliaryDataSupported: cfg.AuxiliaryDataSupported,
+	})
 	return err != nil
 }
 
@@ -223,9 +231,11 @@ func parseAuxEntries(raw json.RawMessage, list string) ([]auxEntry, []json.RawMe
 			if list != "to_issuer" {
 				return bad("has a required member")
 			}
-			if json.Unmarshal(rawReq, &e.required) != nil {
+			var req *bool // JSON null decodes to nil: not a boolean
+			if json.Unmarshal(rawReq, &req) != nil || req == nil {
 				return bad("has a required member that is not a boolean")
 			}
+			e.required = *req
 		}
 		pathKey := ""
 		if typ == auxTypeHashCommitment {
@@ -245,7 +255,17 @@ func parseAuxEntries(raw json.RawMessage, list string) ([]auxEntry, []json.RawMe
 			}
 			pathKey = p
 		} else if p, has := m["path"]; has {
-			pathKey = string(p) // unrecognised type: only duplicate detection
+			// Unrecognised type: only duplicate detection, on the decoded
+			// value so escapes and whitespace cannot hide a duplicate.
+			var v interface{}
+			if json.Unmarshal(p, &v) != nil {
+				return bad("has an entry with an invalid path")
+			}
+			norm, err := json.Marshal(v)
+			if err != nil {
+				return bad("has an entry with an invalid path")
+			}
+			pathKey = string(norm)
 		}
 		dup := typ + "\x00" + pathKey
 		if _, d := seen[dup]; d {
@@ -265,17 +285,26 @@ func claimsPathKey(raw json.RawMessage) (string, bool) {
 	if json.Unmarshal(raw, &p) != nil || len(p) == 0 || len(p) > maxAuxPathLen {
 		return "", false
 	}
+	// Decode every element so the key is independent of how the issuer spelled
+	// it (escapes, whitespace, number form).
+	norm := make([]interface{}, 0, len(p))
 	for _, el := range p {
 		var s *string
 		if json.Unmarshal(el, &s) == nil {
-			continue // string or null
+			if s == nil {
+				norm = append(norm, nil)
+			} else {
+				norm = append(norm, *s)
+			}
+			continue
 		}
 		var n uint64
 		if json.Unmarshal(el, &n) != nil {
 			return "", false
 		}
+		norm = append(norm, n)
 	}
-	b, err := json.Marshal(p)
+	b, err := json.Marshal(norm)
 	if err != nil {
 		return "", false
 	}

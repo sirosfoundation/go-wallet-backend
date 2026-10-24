@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -103,6 +104,9 @@ func TestAuxiliaryDataSupported_Malformed(t *testing.T) {
 		"opening in metadata":     `{"to_wallet":[` + hc(`,"opening":"SECRETOPENING"`) + `]}`,
 		"commitment in metadata":  `{"to_issuer":[` + hc(`,"commitment":"x"`) + `]}`,
 		"required not bool":       `{"to_issuer":[` + hc(`,"required":"yes"`) + `]}`,
+		"required null":           `{"to_issuer":[` + hc(`,"required":null`) + `]}`,
+		"duplicate escaped path":  `{"to_wallet":[` + hc("") + `,{"type":"hash_commitment","alg":"sha-256","path":["\u0061","b"]}]}`,
+		"duplicate unknown path":  `{"to_wallet":[{"type":"https://x.example/t","path":["a"]},{"type":"https://x.example/t","path":[ "\u0061" ]}]}`,
 		"required in to_wallet":   `{"to_wallet":[` + hc(`,"required":true`) + `]}`,
 		"duplicate type and path": `{"to_wallet":[` + hc("") + `,` + hc("") + `]}`,
 		"too many entries":        `{"to_wallet":[` + strings.TrimSuffix(strings.Repeat(hc("")+",", 17), ",") + `]}`,
@@ -119,6 +123,11 @@ func TestAuxiliaryDataSupported_Malformed(t *testing.T) {
 			assert.NotContains(t, ccs, "c")
 		})
 	}
+
+	// A type error elsewhere in the configuration must not disable the check.
+	assert.True(t, AdvertisementMalformed(json.RawMessage(`{"format":123,"credential_metadata":{"auxiliary_data":[{"opening":"SECRETOPENING"}]}}`)))
+	assert.True(t, AdvertisementMalformed(json.RawMessage(`{"format":123,"auxiliary_data_supported":{"to_wallet":[]}}`)))
+	assert.False(t, AdvertisementMalformed(json.RawMessage(`{"format":123}`)))
 
 	// Distinct paths are not duplicates.
 	_, err := secretDeliveryOf(auxCfg(`{"to_wallet":[` + hc("") + `,{"type":"hash_commitment","alg":"sha-256","path":["a","c"]}]}`))
@@ -347,3 +356,23 @@ func TestAuxiliaryDataConflict_OtherErrorsNotRelayedAsConflict(t *testing.T) {
 		assert.NotContains(t, string(m["error"]), "AUXILIARY_DATA_CONFLICT")
 	}
 }
+
+// A non-conflict 400 hands its body back to the caller and closes the original.
+func TestRelayAuxiliaryDataConflict_NonConflictBodyRestored(t *testing.T) {
+	h, _, cleanup := captureHandler(t)
+	defer cleanup()
+	rc := &closeTracker{Reader: strings.NewReader(`{"error":"invalid_proof"}`)}
+	resp := &http.Response{StatusCode: http.StatusBadRequest, Body: rc}
+	require.NoError(t, h.relayAuxiliaryDataConflict(resp))
+	assert.True(t, rc.closed, "the original body must be closed")
+	b, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"error":"invalid_proof"}`, string(b))
+}
+
+type closeTracker struct {
+	io.Reader
+	closed bool
+}
+
+func (c *closeTracker) Close() error { c.closed = true; return nil }

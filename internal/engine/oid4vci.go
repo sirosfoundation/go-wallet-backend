@@ -3146,7 +3146,9 @@ func (h *OID4VCIHandler) relayAuxiliaryDataConflict(resp *http.Response) error {
 		_ = resp.Body.Close()
 		return err
 	}
-	// Not a conflict: hand the body back for the caller's own handling.
+	// Not a conflict: close the original body (it may be unread past the
+	// limit) and hand a buffered copy back for the caller's own handling.
+	_ = resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	return nil
 }
