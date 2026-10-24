@@ -23,6 +23,14 @@ const (
 	DimKeyStorage         = "assure-ks"
 	DimUserAuthentication = "assure-ua"
 	DimCertification      = "assure-cert"
+
+	// Wallet Instance Attestation (WIA) dimensions. assure-wia probes the
+	// configured S-profile list, assure-wia-issue decides whether a WIA is
+	// issued at all (it has no candidate), assure-wia-cert selects the
+	// wallet_solution_certification_information entry.
+	DimWIA      = "assure-wia"
+	DimWIAIssue = "assure-wia-issue"
+	DimWIACert  = "assure-wia-cert"
 )
 
 // Query asks whether a candidate value may be granted for a dimension given
@@ -30,16 +38,26 @@ const (
 //
 //	(<Dimension> (tier <Candidate>)(evidence ...))      for assure-ks / assure-ua
 //	(assure-cert (name <Candidate>)(evidence ...))      for assure-cert
+//	(assure-wia (profile <Candidate>)(evidence ...))    for assure-wia
+//	(assure-wia-cert (name <Candidate>)(evidence ...))  for assure-wia-cert
+//	(assure-wia-issue (evidence ...))                   for assure-wia-issue
 type Query struct {
 	Dimension string
 	Candidate string
 	Evidence  sexp.Element
 }
 
-// candidateTag is the tag of the candidate group for a dimension.
+// candidateTag is the tag of the candidate group for a dimension, or ""
+// when the dimension has no candidate (assure-wia-issue is a yes/no
+// question about the evidence alone).
 func candidateTag(dimension string) string {
-	if dimension == DimCertification {
+	switch dimension {
+	case DimCertification, DimWIACert:
 		return "name"
+	case DimWIA:
+		return "profile"
+	case DimWIAIssue:
+		return ""
 	}
 	return "tier"
 }
@@ -47,8 +65,12 @@ func candidateTag(dimension string) string {
 // Element builds the query through the element API only; candidate and
 // evidence values are atoms, never spliced into text.
 func (q Query) Element() *sexp.List {
+	tag := candidateTag(q.Dimension)
+	if tag == "" {
+		return sexp.NewList(q.Dimension, q.Evidence)
+	}
 	return sexp.NewList(q.Dimension,
-		sexp.NewList(candidateTag(q.Dimension), sexp.NewAtom(q.Candidate)),
+		sexp.NewList(tag, sexp.NewAtom(q.Candidate)),
 		q.Evidence,
 	)
 }

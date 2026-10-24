@@ -15,6 +15,7 @@ func lintRules(t *testing.T, rules string) []Finding {
 	t.Helper()
 	cfg := defaultCfg()
 	cfg.Certification = config.CertificationCatalogueConfig{Entries: config.CertificationEntryList{{Name: "eucc", Scheme: "EUCC", AssuranceLevel: "high"}}}
+	cfg.WIACertification = config.WIACertificationCatalogueConfig{Entries: config.WIACertificationEntryList{{Name: "wcert", Information: map[string]interface{}{"scheme": "x"}}}}
 	return LintRuleSet(mustRuleSet(t, rules), &cfg)
 }
 
@@ -37,6 +38,12 @@ func TestLint_CanonicalRulesAreClean(t *testing.T) {
 (assure-cert (name eucc)(evidence (verified)))
 # id: ok4
 (assure-ks (tier moderate))
+# id: ok5
+(assure-wia-issue (evidence (verified (fido2)(platform (source platform_attested)))))
+# id: ok6
+(assure-wia (profile s1-full-client)(evidence (verified (fido2 none)(platform (source platform_attested)))))
+# id: ok7
+(assure-wia-cert (name wcert)(evidence (verified)))
 `)
 	if len(fs) != 0 {
 		t.Fatalf("unexpected findings: %v", fs)
