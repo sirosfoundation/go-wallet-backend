@@ -1,10 +1,13 @@
 package engine
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -280,7 +283,7 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 	if servedBy := m.cfg.Server.ResolvedServedBy(); servedBy != "" {
 		responseHeader.Set("X-Served-By", servedBy)
 	}
-	conn, err := m.upgrader.Upgrade(w, r, responseHeader)
+	conn, err := m.upgrader.Upgrade(newActivityResponseWriter(w), r, responseHeader)
 	if err != nil {
 		m.activeConnections.Add(-1)
 		m.logger.Error("Failed to upgrade connection", zap.Error(err))
@@ -349,11 +352,7 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	// keeping the connection alive across idle periods. Browser WebSocket
 	// implementations respond to protocol-level pings automatically.
 	pingInterval, pongTimeout := m.wsKeepalive()
-	_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongTimeout))
-	conn.SetPongHandler(func(string) error {
-		_ = conn.SetReadDeadline(time.Now().Add(pingInterval + pongTimeout))
-		return nil
-	})
+	configureKeepalive(conn, pingInterval+pongTimeout)
 
 	// Create session
 	sessionID := uuid.New().String()
@@ -419,6 +418,123 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	m.handleSession(session)
 }
 
+// configureKeepalive arms conn's read deadline and makes any sign of life
+// from the peer - a pong, a ping (which gorilla's default handler answers
+// but does not count), or (see handleSession) a data frame - push it out by
+// window. Without this a peer that is demonstrably alive but whose pongs are
+// delayed (shared uplink, tunnelled connection) is dropped.
+func configureKeepalive(conn *websocket.Conn, window time.Duration) {
+	if ac, ok := conn.NetConn().(*activityConn); ok {
+		ac.arm(window)
+	}
+	extend := func() { _ = conn.SetReadDeadline(time.Now().Add(window)) }
+	extend()
+	conn.SetPongHandler(func(string) error {
+		extend()
+		return nil
+	})
+	conn.SetPingHandler(func(appData string) error {
+		extend()
+		// Same reply as gorilla's default ping handler.
+		err := conn.WriteControl(websocket.PongMessage, []byte(appData), time.Now().Add(time.Second))
+		if errors.Is(err, websocket.ErrCloseSent) {
+			return nil
+		}
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			return nil
+		}
+		return err
+	})
+}
+
+// activityConn wraps the hijacked socket so that any successful read of bytes
+// - including frames gorilla consumes internally without surfacing them to
+// the caller, such as empty continuation frames of a fragmented message -
+// pushes the read deadline out by the keepalive window. It is inert until
+// armed by configureKeepalive. To keep this cheap the deadline is refreshed
+// at most once per window/8, so it can lag the last byte by that much.
+type activityConn struct {
+	net.Conn
+	window  atomic.Int64 // nanoseconds; 0 = not armed
+	lastSet atomic.Int64 // unix nanos of the last refresh
+}
+
+func (c *activityConn) arm(window time.Duration) {
+	c.lastSet.Store(time.Now().UnixNano())
+	c.window.Store(int64(window))
+}
+
+func (c *activityConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		if w := c.window.Load(); w > 0 {
+			now := time.Now()
+			if now.UnixNano()-c.lastSet.Load() >= w/8 {
+				c.lastSet.Store(now.UnixNano())
+				_ = c.SetReadDeadline(now.Add(time.Duration(w)))
+			}
+		}
+	}
+	return n, err
+}
+
+// activityResponseWriter makes http.Hijacker return an activityConn.
+type activityResponseWriter struct {
+	http.ResponseWriter
+	hj http.Hijacker
+}
+
+func newActivityResponseWriter(w http.ResponseWriter) http.ResponseWriter {
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		return w
+	}
+	return &activityResponseWriter{ResponseWriter: w, hj: hj}
+}
+
+func (w *activityResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	c, rw, err := w.hj.Hijack()
+	if err != nil {
+		return c, rw, err
+	}
+	return &activityConn{Conn: c}, rw, nil
+}
+
+// deadlineExtendingReader pushes conn's read deadline out by window before
+// every read, so a message that arrives in fragments across more than one
+// window still counts as continuous liveness.
+type deadlineExtendingReader struct {
+	conn   *websocket.Conn
+	r      io.Reader
+	window time.Duration
+}
+
+func (d *deadlineExtendingReader) Read(p []byte) (int, error) {
+	_ = d.conn.SetReadDeadline(time.Now().Add(d.window))
+	return d.r.Read(p)
+}
+
+// readMessageRefreshingDeadline is conn.ReadMessage, except the read deadline
+// is extended as message data is consumed (and once more on completion), not
+// just when a pong or ping is processed.
+func readMessageRefreshingDeadline(conn *websocket.Conn, window time.Duration) (int, []byte, error) {
+	mt, r, err := conn.NextReader()
+	if err != nil {
+		return mt, nil, err
+	}
+	b, err := io.ReadAll(&deadlineExtendingReader{conn: conn, r: r, window: window})
+	if err == nil {
+		_ = conn.SetReadDeadline(time.Now().Add(window))
+	}
+	return mt, b, err
+}
+
+// gorillaWriteLockTimeoutMsg is the message of gorilla/websocket's
+// errWriteTimeout, returned when a control write could not get the write lock
+// before its deadline.
+const gorillaWriteLockTimeoutMsg = "websocket: write timeout"
+
 // pingLoop sends WebSocket ping frames at s.pingInterval.
 // Browser WebSocket implementations respond with pong automatically.
 func (s *Session) pingLoop() {
@@ -428,11 +544,30 @@ func (s *Session) pingLoop() {
 	for {
 		select {
 		case <-ticker.C:
-			s.sendMu.Lock()
+			// Deliberately not under sendMu: WriteControl may be called
+			// concurrently with any other write (gorilla's contract, see
+			// closeWithReason), and sendMu is held across WriteJSON, which has
+			// no write deadline. That removes the application-level
+			// serialization; gorilla's own socket write lock still orders this
+			// ping behind an in-flight data write, bounded by the ping's
+			// deadline (pongTimeout) - see the timeout handling below.
 			err := s.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(s.pongTimeout))
-			s.sendMu.Unlock()
 			if err != nil {
-				return // connection is dead; ReadMessage will surface the error
+				// Gorilla reports two different timeouts. Waiting for its write
+				// lock behind a stuck data write is recoverable: the
+				// connection is fine, keep pinging. A timeout of the socket
+				// write itself is fatal - gorilla fails every later write with
+				// the saved error - so close the connection and let the read
+				// loop end, rather than leaving a session that can read but
+				// never answer. Both are *websocket.netError with Timeout()
+				// true; only the lock-wait one carries gorilla's own message
+				// (pinned by TestPingLoop_* against the vendored version).
+				var ne net.Error
+				if errors.As(err, &ne) && ne.Timeout() && err.Error() == gorillaWriteLockTimeoutMsg {
+					continue
+				}
+				_ = s.conn.Close()
+				return
 			}
 		case <-s.stopPing:
 			return
@@ -455,14 +590,13 @@ func (m *Manager) handleSession(session *Session) {
 	}()
 
 	for {
-		_, message, err := session.conn.ReadMessage()
+		_, message, err := readMessageRefreshingDeadline(session.conn, session.pingInterval+session.pongTimeout)
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				session.logger.Error("Read error", zap.Error(err))
 			}
 			return
 		}
-
 		var msg Message
 		if err := json.Unmarshal(message, &msg); err != nil {
 			session.logger.Warn("Invalid message", zap.Error(err))
