@@ -24,7 +24,10 @@ type keyAttestationDoc struct {
 	Rev                         int64 `bson:"rev"`
 }
 
-const markKeyAttestedMaxTries = 8
+// Every failed compare-and-set means another writer made progress, so a
+// writer fails at most once per concurrent writer; 32 is far above any real
+// concurrency on one key.
+const markKeyAttestedMaxTries = 32
 
 // MarkKeyAttested stores rec unless the stored record is stronger (see
 // domain.KeyAttestationRecord.Supersedes): weaker or absent evidence never
