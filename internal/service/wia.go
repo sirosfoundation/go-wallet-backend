@@ -457,6 +457,57 @@ func (s *WIAService) instanceKeyEvidence(ctx context.Context, jkt string) *domai
 	return rec
 }
 
+// instanceKeyEvidenceBuilder turns a verified per-key evidence record of one
+// Kind into the verified instance_key evidence slot. New evidence families
+// (android_key, app_attest_assertion) register a builder in
+// instanceKeyBuilders; nothing else in the WIA path changes.
+type instanceKeyEvidenceBuilder interface {
+	// Kind is the record kind this builder understands.
+	Kind() domain.KeyEvidenceKind
+	// Build renders a normalized, verified record of that kind.
+	Build(rec *domain.KeyAttestationRecord) *assurance.InstanceKeyVerified
+}
+
+// instanceKeyBuilders is keyed by record Kind. A record whose kind has no
+// builder yields no slot: unknown evidence is never rendered as verified.
+var instanceKeyBuilders = map[domain.KeyEvidenceKind]instanceKeyEvidenceBuilder{
+	domain.KeyEvidenceFIDO2: fido2InstanceKeyBuilder{},
+}
+
+// fido2InstanceKeyBuilder renders a verified FIDO2 attestation: the key was
+// attested by an authenticator (binding attested). A FIDO2 record carries no
+// security level or boot state, which render none (never invented).
+type fido2InstanceKeyBuilder struct{}
+
+func (fido2InstanceKeyBuilder) Kind() domain.KeyEvidenceKind { return domain.KeyEvidenceFIDO2 }
+
+func (fido2InstanceKeyBuilder) Build(rec *domain.KeyAttestationRecord) *assurance.InstanceKeyVerified {
+	return &assurance.InstanceKeyVerified{
+		Kind:    string(rec.Kind),
+		Home:    string(rec.Home),
+		Level:   rec.SecurityLevel,
+		Boot:    rec.VerifiedBootState,
+		Binding: assurance.BindingAttested,
+	}
+}
+
+// instanceKeyVerifiedFromRecord renders the verified instance_key slot from
+// the instance key's evidence record, nil (slot none) when there is no record
+// or no builder for its kind. Only this function fills the slot; it is fed
+// from storage, never from the request.
+func instanceKeyVerifiedFromRecord(rec *domain.KeyAttestationRecord) *assurance.InstanceKeyVerified {
+	if rec == nil {
+		return nil
+	}
+	n := *rec
+	n.Normalize()
+	b, ok := instanceKeyBuilders[n.Kind]
+	if !ok {
+		return nil
+	}
+	return b.Build(&n)
+}
+
 // fido2VerifiedFromRecord renders a verified FIDO2 record as the evidence
 // fido2 slot. Records of other kinds (android_key, app_attest_assertion, ...)
 // are not FIDO2 evidence and yield nil. Presence means the attestation chain
@@ -485,8 +536,9 @@ func fido2VerifiedFromRecord(rec *domain.KeyAttestationRecord) *assurance.Fido2V
 // instance key: no shipped rule derives a credential key's KA level from it.
 func wiaFacts(att wiaAttestation) assurance.Facts {
 	return assurance.Facts{
-		Platform: &assurance.PlatformVerified{Source: att.Source, AppID: att.AppID},
-		Fido2:    fido2VerifiedFromRecord(att.KeyEvidence),
+		Platform:    &assurance.PlatformVerified{Source: att.Source, AppID: att.AppID},
+		Fido2:       fido2VerifiedFromRecord(att.KeyEvidence),
+		InstanceKey: instanceKeyVerifiedFromRecord(att.KeyEvidence),
 	}
 }
 
@@ -508,6 +560,8 @@ func (s *WIAService) applyAssurance(ctx context.Context, jkt string, att *wiaAtt
 		zap.Bool("issue", out.Issue),
 		zap.Strings("issue_rules", out.IssueRuleIDs),
 		zap.String("verified_source", att.Source),
+		zap.String("instance_key_kind", instanceKeyAudit(att.KeyEvidence, func(i *assurance.InstanceKeyVerified) string { return i.Kind })),
+		zap.String("instance_key_home", instanceKeyAudit(att.KeyEvidence, func(i *assurance.InstanceKeyVerified) string { return i.Home })),
 		zap.String("profile", out.Profile.Level),
 		zap.String("profile_value", out.Profile.Value),
 		zap.Strings("profile_rules", out.Profile.RuleIDs),
@@ -919,4 +973,15 @@ func instanceWSCDType(rec *domain.KeyAttestationRecord) domain.WSCDType {
 	n := *rec
 	n.Normalize()
 	return wscdTypeFromKeyHome(n.Home)
+}
+
+// instanceKeyAudit extracts one field of the instance_key evidence for the
+// audit line, "none" when the slot is absent.
+func instanceKeyAudit(rec *domain.KeyAttestationRecord, field func(*assurance.InstanceKeyVerified) string) string {
+	if ik := instanceKeyVerifiedFromRecord(rec); ik != nil {
+		if v := field(ik); v != "" {
+			return v
+		}
+	}
+	return assurance.None
 }

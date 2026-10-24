@@ -77,6 +77,7 @@ var evidenceLayout = slot{name: "evidence", children: []slot{
 		{name: "fido2", noneOK: true, children: []slot{{name: "mds3"}, {name: "aaguid"}, {name: "uv"}, {name: "cert"}}},
 		{name: "platform", noneOK: true, children: []slot{{name: "source"}, {name: "app_id"}}},
 		{name: "hsm", noneOK: true, children: []slot{{name: "id"}}},
+		{name: "instance_key", noneOK: true, children: []slot{{name: "kind"}, {name: "home"}, {name: "level"}, {name: "boot"}, {name: "binding"}}},
 	}},
 	{name: "claimed", children: []slot{
 		{name: "plugin"}, {name: "key_storage"}, {name: "user_authentication"}, {name: "certification"},

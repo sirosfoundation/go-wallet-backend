@@ -1,0 +1,139 @@
+package assurance
+
+import (
+	"context"
+	"os"
+	"strings"
+	"testing"
+)
+
+func TestSchemaVersionIsTwoWithInstanceKeySlot(t *testing.T) {
+	if SchemaVersion != 2 {
+		t.Fatalf("SchemaVersion = %d, want 2 (instance_key slot appended)", SchemaVersion)
+	}
+}
+
+func TestEvidence_InstanceKeyBindingIsClosedVocabulary(t *testing.T) {
+	for in, want := range map[string]string{
+		BindingAttested: "(binding attested)", BindingAssertion: "(binding assertion)",
+		"": "(binding none)", "garbage": "(binding none)",
+	} {
+		got := render(Evidence{InstanceKey: &InstanceKeyVerified{Kind: "k", Binding: in}}.Element())
+		if !strings.Contains(got, want) {
+			t.Errorf("binding %q: %s lacks %s", in, got, want)
+		}
+	}
+}
+
+// Rules written against schema version 1 (prefix of the slots, including the
+// full v1 verified group ending in hsm) keep matching: the new slot is
+// appended inside verified and queries may carry trailing elements. The
+// claimed group is unaffected by the new slot.
+func TestInstanceKey_OldRulesStillMatchByPrefix(t *testing.T) {
+	rules := "# id: v1-full\n(assure-wia-issue (evidence (verified (fido2 none)(platform (source backend_attested)(app_id none))(hsm none))(claimed (plugin none))))\n" +
+		"# id: v1-short\n(assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform (source platform_attested)))))\n"
+	a := newAssessor(t, wiaCfg(), rules)
+	for name, ik := range map[string]*InstanceKeyVerified{
+		"slot none":    nil,
+		"slot present": {Kind: "android_key", Home: "tee", Binding: BindingAttested},
+	} {
+		out := simWIA(a, Facts{Platform: &PlatformVerified{Source: "backend_attested"}, InstanceKey: ik})
+		if !out.Issue {
+			t.Errorf("%s: v1 full-layout rule no longer matches", name)
+		}
+		out = simWIA(a, Facts{Platform: &PlatformVerified{Source: "platform_attested"}, InstanceKey: ik})
+		if out.Profile.Level != "s1-full-client" {
+			t.Errorf("%s: v1 prefix rule no longer matches (profile %q)", name, out.Profile.Level)
+		}
+	}
+}
+
+// The documented S1 template (shipped commented in production.rules.example).
+const instanceKeyTemplate = "(assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform (source platform_attested))(hsm)(instance_key (kind)(home (* set strongbox tee))))))"
+
+func TestInstanceKey_S1TemplateRequiresHardwareHome(t *testing.T) {
+	a := newAssessor(t, wiaCfg(), "# id: s1-instance-key\n"+instanceKeyTemplate+"\n")
+	plat := &PlatformVerified{Source: "platform_attested"}
+	cases := map[string]struct {
+		ik   *InstanceKeyVerified
+		want string
+	}{
+		"strongbox":         {&InstanceKeyVerified{Kind: "android_key", Home: "strongbox", Binding: BindingAttested}, "s1-full-client"},
+		"tee":               {&InstanceKeyVerified{Kind: "android_key", Home: "tee", Binding: BindingAttested}, "s1-full-client"},
+		"enclave asserted":  {&InstanceKeyVerified{Kind: "app_attest_assertion", Home: "secure_enclave_asserted", Binding: BindingAssertion}, "s3-backend-only"},
+		"no instance key":   {nil, "s3-backend-only"},
+		"home from nowhere": {&InstanceKeyVerified{Kind: "android_key"}, "s3-backend-only"},
+	}
+	for name, c := range cases {
+		out := simWIA(a, Facts{Platform: plat, InstanceKey: c.ik})
+		if out.Profile.Level != c.want {
+			t.Errorf("%s: profile %q, want %q", name, out.Profile.Level, c.want)
+		}
+	}
+}
+
+// Nothing a client says can populate the verified instance_key slot: only
+// Facts.InstanceKey does, and claims land in the claimed group.
+func TestInstanceKey_ClaimedGroupCanNeverPopulateIt(t *testing.T) {
+	a := newAssessor(t, wiaCfg(), "# id: s1-instance-key\n"+instanceKeyTemplate+"\n")
+	hostile := "x)(instance_key (kind android_key)(home strongbox"
+	for _, f := range []Facts{
+		{Platform: &PlatformVerified{Source: "platform_attested"}, Claims: Claims{Plugin: "strongbox", KeyStorage: []string{"strongbox"}, UserAuthentication: []string{"tee"}, Certification: []string{"tee"}}},
+		{Platform: &PlatformVerified{Source: "platform_attested"}, Claims: Claims{Plugin: hostile, Certification: []string{hostile}}},
+	} {
+		ev := render(a.Evidence(f).Element())
+		if !strings.Contains(ev, "(instance_key none)") {
+			t.Fatalf("claims populated instance_key: %s", ev)
+		}
+		if out := simWIA(a, f); out.Profile.Level != "s3-backend-only" {
+			t.Fatalf("claims lifted the S profile to %q", out.Profile.Level)
+		}
+	}
+}
+
+func TestInstanceKey_ShippedTemplateIsInTheExampleAndLintsClean(t *testing.T) {
+	data, err := os.ReadFile("../../deploy/assurance/production.rules.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tpl string
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "# (assure-wia (profile s1-full-client)") && strings.Contains(line, "(instance_key") {
+			tpl = strings.TrimPrefix(line, "# ")
+		}
+	}
+	if tpl == "" {
+		t.Fatal("production.rules.example has no commented instance_key S1 template")
+	}
+	if tpl != instanceKeyTemplate {
+		t.Fatalf("template drifted from the tested one:\n got %s\nwant %s", tpl, instanceKeyTemplate)
+	}
+	cfg := defaultCfg()
+	rs := mustRuleSet(t, "# id: s1-instance-key\n"+tpl+"\n")
+	if fs := LintRuleSet(rs, &cfg); HasErrors(fs) {
+		t.Fatalf("%v", fs)
+	}
+}
+
+func TestLint_InstanceKeySlotOrderAndLeaves(t *testing.T) {
+	ok := lintRules(t, "# id: a\n(assure-wia-issue (evidence (verified (fido2 none)(platform none)(hsm none)(instance_key none))))\n"+
+		"# id: b\n(assure-wia-issue (evidence (verified (fido2)(platform)(hsm)(instance_key (kind android_key)(home (* set strongbox tee))(level)(boot verified)(binding attested)))))\n")
+	if HasErrors(ok) {
+		t.Fatalf("canonical rules flagged: %v", ok)
+	}
+	bad := map[string]string{
+		"before hsm":       "(assure-wia-issue (evidence (verified (fido2)(platform)(instance_key (kind))(hsm))))",
+		"home before kind": "(assure-wia-issue (evidence (verified (fido2)(platform)(hsm)(instance_key (home strongbox)(kind x)))))",
+		"two home values":  "(assure-wia-issue (evidence (verified (fido2)(platform)(hsm)(instance_key (kind)(home strongbox tee)))))",
+	}
+	for name, r := range bad {
+		if !HasErrors(lintRules(t, "# id: bad\n"+r+"\n")) {
+			t.Errorf("%s: not an error", name)
+		}
+	}
+}
+
+func simWIA(a *Assessor, f Facts) *WIAOutcome {
+	_, w := a.Simulate(context.Background(), f)
+	return w
+}

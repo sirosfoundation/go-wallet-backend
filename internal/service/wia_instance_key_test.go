@@ -206,3 +206,98 @@ func TestPreview_WIAHalfUsesInstanceKeyEvidence(t *testing.T) {
 		t.Fatalf("evidence stored: WIA must be issued, got %+v", got)
 	}
 }
+
+// --- instance_key evidence slot ----------------------------------------------
+
+const wiaNeedsInstanceKeyRules = "# id: ik-fido2-hw\n(assure-wia-issue (evidence (verified (fido2)(platform)(hsm)(instance_key (kind fido2)(home fido2_hw)(level)(boot)(binding attested)))))\n"
+
+func TestWIAInstanceKey_SlotIsFilledFromTheVerifiedRecord(t *testing.T) {
+	svc, _ := wiaAssuranceSvc(t, wiaNeedsInstanceKeyRules)
+	keys := memory.NewStore().KeyAttestations()
+	svc.SetKeyAttestations(keys)
+	// No record: slot none, rule requiring it does not permit.
+	if _, err := wiaWithPopKey(t, svc, nil); !errors.Is(err, ErrWIARefusedByPolicy) {
+		t.Fatalf("no evidence: err = %v", err)
+	}
+	// Old-style row (no kind/home) normalizes to fido2/fido2_hw and fills it.
+	if _, err := wiaWithPopKey(t, svc, func(jkt string) {
+		putRecord(t, keys, domain.KeyAttestationRecord{KeyThumbprint: jkt, AAGUID: "a"})
+	}); err != nil {
+		t.Fatalf("verified record must fill the slot: %v", err)
+	}
+}
+
+func TestWIAInstanceKey_SlotRenderingAndExtensibility(t *testing.T) {
+	if instanceKeyVerifiedFromRecord(nil) != nil {
+		t.Fatal("nil record rendered a slot")
+	}
+	ik := instanceKeyVerifiedFromRecord(&domain.KeyAttestationRecord{Kind: domain.KeyEvidenceFIDO2, Home: domain.KeyHomeFIDO2Hardware})
+	if ik == nil || ik.Kind != "fido2" || ik.Home != "fido2_hw" || ik.Binding != assurance.BindingAttested || ik.Level != "" || ik.Boot != "" {
+		t.Fatalf("fido2 slot = %+v", ik)
+	}
+	// A kind without a registered builder is never rendered as verified.
+	if got := instanceKeyVerifiedFromRecord(&domain.KeyAttestationRecord{Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE}); got != nil {
+		t.Fatalf("builder-less kind rendered: %+v", got)
+	}
+	// A new kind plugs in by registering a builder keyed by Kind.
+	instanceKeyBuilders[domain.KeyEvidenceAndroidKey] = testAndroidBuilder{}
+	t.Cleanup(func() { delete(instanceKeyBuilders, domain.KeyEvidenceAndroidKey) })
+	got := instanceKeyVerifiedFromRecord(&domain.KeyAttestationRecord{Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE, SecurityLevel: "trusted_environment", VerifiedBootState: "verified"})
+	if got == nil || got.Home != "tee" || got.Level != "trusted_environment" || got.Boot != "verified" {
+		t.Fatalf("registered builder not used: %+v", got)
+	}
+}
+
+type testAndroidBuilder struct{}
+
+func (testAndroidBuilder) Kind() domain.KeyEvidenceKind { return domain.KeyEvidenceAndroidKey }
+func (testAndroidBuilder) Build(r *domain.KeyAttestationRecord) *assurance.InstanceKeyVerified {
+	return &assurance.InstanceKeyVerified{Kind: string(r.Kind), Home: string(r.Home), Level: r.SecurityLevel, Boot: r.VerifiedBootState, Binding: assurance.BindingAttested}
+}
+
+// Key attestation never sees the slot: even with matching credential-key
+// FIDO2 evidence AND an active instance whose own key has verified evidence,
+// the key attestation facts carry both of those (so the lookups work) but no
+// instance_key, and the claimed group cannot fill it either (K and S stay
+// orthogonal).
+func TestKeyAttestation_EvidenceNeverCarriesInstanceKey(t *testing.T) {
+	svc, instances, keys := assuranceSvc(t, nil, uvRules)
+	jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "a", "y": "b"}}
+	markAttestedUV(t, keys, jwks[0], "aa1", true) // credential-key evidence under the real thumbprint
+	const instanceID = "instance-key-jkt-ka"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: instanceID, Status: domain.InstanceStatusActive, AttestationSource: "platform_attested", LastAttestedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	putRecord(t, keys, domain.KeyAttestationRecord{KeyThumbprint: instanceID, Kind: domain.KeyEvidenceFIDO2, AAGUID: "aa1", UV: true})
+	if rec, err := keys.GetByKeyThumbprint(context.Background(), instanceID); err != nil || rec.Kind != domain.KeyEvidenceFIDO2 {
+		t.Fatalf("instance-key evidence not stored: %v", err)
+	}
+
+	f := svc.assuranceFacts(context.Background(), instanceID, jwks, &SecurityProperties{Plugin: "strongbox", KeyStorage: []string{"strongbox"}})
+	if f.Fido2 == nil || f.Platform == nil {
+		t.Fatalf("credential and instance evidence must be found (fido2=%v platform=%v)", f.Fido2, f.Platform)
+	}
+	if f.InstanceKey != nil {
+		t.Fatalf("key attestation facts carry instance-key evidence: %+v", f.InstanceKey)
+	}
+	if ev := svc.assessor.Evidence(f); ev.InstanceKey != nil {
+		t.Fatalf("evidence carries instance-key evidence: %+v", ev.InstanceKey)
+	}
+}
+
+func TestPreview_WIAHalfSeesInstanceKeySlot(t *testing.T) {
+	svc, instances, keys := previewSvc(t, wiaNeedsInstanceKeyRules, true)
+	const jkt = "instance-key-jkt-5678"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: jkt, Status: domain.InstanceStatusActive, LastAttestedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := svc.PreviewAssurance(context.Background(), &AssurancePreviewRequest{WalletInstanceID: jkt})
+	if got.WIAIssue {
+		t.Fatal("no evidence: must not issue")
+	}
+	putRecord(t, keys, domain.KeyAttestationRecord{KeyThumbprint: jkt, AAGUID: "a"})
+	got, _ = svc.PreviewAssurance(context.Background(), &AssurancePreviewRequest{WalletInstanceID: jkt})
+	if !got.WIAIssue {
+		t.Fatalf("evidence stored: must issue: %+v", got)
+	}
+}

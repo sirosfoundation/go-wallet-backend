@@ -154,6 +154,7 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 	if req.WalletInstanceID != "" && s.keyAttestations != nil {
 		if rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, req.WalletInstanceID); err == nil {
 			wiaFacts.Fido2 = fido2VerifiedFromRecord(rec)
+			wiaFacts.InstanceKey = instanceKeyVerifiedFromRecord(rec)
 		} else if !errors.Is(err, storage.ErrNotFound) {
 			s.logger.Warn("instance key evidence lookup failed; treating as none", zap.Error(err))
 		}

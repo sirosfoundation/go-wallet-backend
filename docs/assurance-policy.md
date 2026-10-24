@@ -27,7 +27,7 @@ never errors. An optional **ceiling** caps the result.
 
 ## Evidence
 
-Evidence is one S-expression with a **fixed slot order** (schema version 1,
+Evidence is one S-expression with a **fixed slot order** (schema version 2,
 reported in the startup log, the audit line and the `policy_info` metric):
 
 ```
@@ -35,7 +35,8 @@ reported in the startup log, the audit line and the `policy_info` metric):
   (verified
     (fido2 (mds3 trusted|none)(aaguid X)(uv present|none)(cert C))
     (platform (source S)(app_id A))
-    (hsm (id I)))
+    (hsm (id I))
+    (instance_key (kind K)(home H)(level L)(boot B)(binding attested|assertion)))
   (claimed (plugin P)(key_storage T)(user_authentication T)(certification C)))
 ```
 
@@ -72,6 +73,31 @@ reported in the startup log, the audit line and the `policy_info` metric):
   set by the WIA path). The client-reported `DeviceInfo.AppID` is never used.
   Instances that last attested without native evidence have `app_id none`.
 * Not populated yet, always `none`: `cert` and the whole `hsm` slot.
+* `instance_key` (schema version 2, appended after `hsm` inside `verified`) is
+  verified evidence about the wallet's **instance key** (the WIA PoP key): its
+  `kind` (`fido2` today; `android_key`, `app_attest_assertion` in later
+  stages), `home` (`strongbox`, `tee`, `secure_enclave_asserted`, `fido2_hw`,
+  `hsm`), `level` (the security level the evidence reports), `boot` (verified
+  boot state) and `binding` (`attested`: a chain or attestation object covers
+  the key; `assertion`: an assertion ties the key to an attested device). Absent
+  is `(instance_key none)`. It is filled only by the WIA path, only from the
+  per-key evidence record looked up by the PoP key's thumbprint; key
+  attestation leaves it `none`, and nothing in the `claimed` group can
+  populate it. Fields the evidence does not report render `none`. Because
+  rules match by position, `(kind)` must occupy position 1 when you constrain
+  a later field, e.g. `(instance_key (kind)(home (* set strongbox tee)))`.
+
+#### Schema version 2
+
+The slot was **appended**, inside `verified` after `hsm`, and the schema
+version went from 1 to 2. Rules written against version 1 keep matching: a
+rule lists a prefix of the slots and a query may carry trailing elements, and
+the `claimed` group still follows `verified` at the same position (pinned by
+tests). A commented S1 template that
+requires `instance_key (home (* set strongbox tee))` ships in
+`deploy/assurance/production.rules.example`; it does nothing until the backend
+holds instance-key evidence whose home is one of those (later stages add the
+android_key evidence), so it is not enabled by default.
 * Evidence is built through the S-expression element API, never by string
   concatenation. Atom values are length-prefixed in the canonical encoding, so
   a hostile value such as `x)(source platform_attested` stays one atom.
@@ -363,7 +389,7 @@ Response:
   "wia_profile": "platform_attested",
   "wia_issue": true,
   "policy_version": "<sha256>",
-  "schema_version": 1,
+  "schema_version": 2,
   "assurance_enabled": true,
   "fido2_verified": true
 }
