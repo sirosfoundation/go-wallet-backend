@@ -46,6 +46,8 @@ type Backend interface {
 	WalletInstances() storage.WalletInstanceStore
 	// KeyAttestations returns the per-credential-key FIDO2 attestation store
 	KeyAttestations() storage.KeyAttestationStore
+	// AppAttestKeys returns the attested Apple App Attest key store
+	AppAttestKeys() storage.AppAttestKeyStore
 	// Ping checks if the storage is alive
 	Ping(ctx context.Context) error
 	// Close closes the storage connection
@@ -72,6 +74,10 @@ func (b *memoryBackend) WalletInstances() storage.WalletInstanceStore {
 func (b *memoryBackend) KeyAttestations() storage.KeyAttestationStore {
 	return b.store.KeyAttestations()
 }
+func (b *memoryBackend) AppAttestKeys() storage.AppAttestKeyStore {
+	return b.store.AppAttestKeys()
+}
+
 func (b *memoryBackend) Ping(ctx context.Context) error { return b.store.Ping(ctx) }
 func (b *memoryBackend) Close() error                   { return nil }
 
@@ -95,6 +101,10 @@ func (b *mongoBackend) WalletInstances() storage.WalletInstanceStore {
 func (b *mongoBackend) KeyAttestations() storage.KeyAttestationStore {
 	return b.store.KeyAttestations()
 }
+func (b *mongoBackend) AppAttestKeys() storage.AppAttestKeyStore {
+	return b.store.AppAttestKeys()
+}
+
 func (b *mongoBackend) Ping(ctx context.Context) error { return b.store.Ping(ctx) }
 func (b *mongoBackend) Close() error                   { return b.store.Close() }
 

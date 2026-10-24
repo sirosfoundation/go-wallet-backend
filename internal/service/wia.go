@@ -172,6 +172,9 @@ type WIAService struct {
 	// ever found and the instance records wscd_type unknown.
 	keyAttestations storage.KeyAttestationStore
 
+	// appAttestKeys holds attested App Attest keys (see SetAppAttestKeys).
+	appAttestKeys storage.AppAttestKeyStore
+
 	// Challenge store for single-use nonces (memory or MongoDB).
 	challenges WIAChallengeStore
 
@@ -216,6 +219,15 @@ func (s *WIAService) SetAssessor(a *assurance.Assessor) { s.assessor = a }
 // SetKeyAttestations installs the store of verified per-key evidence that
 // the instance key is looked up in (see instanceKeyEvidence).
 func (s *WIAService) SetKeyAttestations(k storage.KeyAttestationStore) { s.keyAttestations = k }
+
+// SetAppAttestKeys installs the store of attested Apple App Attest keys: the
+// native attestation verifier stores verified keys in it.
+func (s *WIAService) SetAppAttestKeys(k storage.AppAttestKeyStore) {
+	s.appAttestKeys = k
+	if s.nativeAttSvc != nil {
+		s.nativeAttSvc.SetAppAttestKeys(k)
+	}
+}
 
 func (s *WIAService) assuranceEnabled() bool {
 	return s.cfg.WalletProvider.Attestation.Assurance.Enabled
@@ -370,7 +382,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 		if req.NativeAttestation.Challenge != req.Challenge {
 			return "", fmt.Errorf("%w: native attestation challenge does not match WIA challenge", ErrWIAPopInvalid)
 		}
-		result, err := s.nativeAttSvc.Verify(ctx, req.NativeAttestation)
+		result, err := s.nativeAttSvc.VerifyBound(ctx, NativeAttestationBinding{TenantID: tenantID, UserID: userID, WalletInstanceID: jkt}, req.NativeAttestation)
 		if err != nil {
 			// When native attestation is submitted but fails, reject the request.
 			// If the client doesn't want native attestation, it should omit the field.
