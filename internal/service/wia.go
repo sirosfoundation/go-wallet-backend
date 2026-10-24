@@ -814,13 +814,15 @@ func (s *WIAService) emitAuditFailure(reason string, err error) {
 // "android_play_integrity", which nothing ever stores, so every native
 // instance was classified web_crypto.
 //
-// development_attested is a real device attested against a development
-// environment: its key is still in that platform's secure hardware, so it
-// gets the platform's WSCD type, but it never counts as platform_attested
-// anywhere trust is decided (see nativeAttestationSources).
+// development_attested is NOT classified native: with
+// apple_app_attest_environment=development the verifier accepts an attestation
+// whose certificate chain failed verification, so it proves nothing about
+// Secure Enclave-backed storage. It stays web_crypto, the conservative type,
+// and never counts as platform_attested anywhere trust is decided (see
+// nativeAttestationSources).
 func wscdTypeFromAttestation(source string, platform NativeAttestationType) domain.WSCDType {
 	switch source {
-	case "platform_attested", "development_attested":
+	case "platform_attested":
 		switch platform {
 		case NativeAttestationAppleAppAttest:
 			return domain.WSCDTypeNativeIOS

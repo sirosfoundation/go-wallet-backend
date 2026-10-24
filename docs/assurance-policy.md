@@ -275,8 +275,9 @@ value, certification entry. The `WIA issued` audit event additionally carries
 The wallet instance's `wscd_type` (stored on first attestation and updated on
 every re-attestation, memory and MongoDB) follows the native attestation type that was
 verified (`native_ios` for Apple App Attest, `native_android` for Play
-Integrity); `development_attested` keeps the platform's type but never counts
-as `platform_attested` where trust is decided. An earlier version switched on
+Integrity); `development_attested` stays `web_crypto`: with
+`apple_app_attest_environment=development` the verifier accepts an attestation
+whose certificate chain failed verification, so it proves no secure hardware. An earlier version switched on
 the names `ios_app_attest` and `android_play_integrity`, which no verifier
 stores, so every native instance was recorded as `web_crypto`.
 

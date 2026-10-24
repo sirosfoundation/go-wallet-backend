@@ -299,9 +299,9 @@ func TestWSCDTypeFromAttestation(t *testing.T) {
 	}{
 		{"platform_attested", NativeAttestationAppleAppAttest, domain.WSCDTypeNativeIOS},
 		{"platform_attested", NativeAttestationGooglePlayInteg, domain.WSCDTypeNativeAndroid},
-		// A real device on a development environment keeps its platform type
-		// but is a different source everywhere trust is decided.
-		{"development_attested", NativeAttestationAppleAppAttest, domain.WSCDTypeNativeIOS},
+		// A development attestation may have bypassed chain verification, so
+		// it proves no Secure Enclave: the conservative type.
+		{"development_attested", NativeAttestationAppleAppAttest, domain.WSCDTypeWebCrypto},
 		{"backend_attested", "", domain.WSCDTypeWebCrypto},
 		{"backend_attested", NativeAttestationAppleAppAttest, domain.WSCDTypeWebCrypto},
 		{"platform_attested", "", domain.WSCDTypeWebCrypto},
