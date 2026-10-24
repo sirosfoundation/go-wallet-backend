@@ -124,7 +124,7 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 			// A FIDO2 attestation verified in this request vouches for the
 			// batch just as a stored record would.
 			trusted = s.keyAttestationTrustsBatchWith(ctx, req.WalletInstanceID, req.JWKS, overlay) ||
-				(len(req.JWKS) == 0 && overlay != nil)
+				(len(req.JWKS) == 0 && overlay != nil && isFIDO2KeyEvidence(overlay))
 		}
 		n := normalizeSecurityProperties(req.SecurityProperties, trusted)
 		out.KeyStorage, out.UserAuthentication, out.Certification = n.KeyStorage, n.UserAuthentication, n.Certification

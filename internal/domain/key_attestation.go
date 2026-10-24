@@ -104,7 +104,8 @@ const (
 	KeyHomeStrongBox KeyHome = "strongbox"
 	KeyHomeTEE       KeyHome = "tee"
 	// KeyHomeSecureEnclaveAsserted is a key an App Attest assertion ties to
-	// an attested device: asserted, not attested, so it ranks below tee.
+	// an attested device: asserted, not attested, so it ranks below tee. It
+	// does not prove Secure Enclave residency, so it maps to WSCD type unknown.
 	KeyHomeSecureEnclaveAsserted KeyHome = "secure_enclave_asserted"
 	KeyHomeFIDO2Hardware         KeyHome = "fido2_hw"
 	KeyHomeHSM                   KeyHome = "hsm"

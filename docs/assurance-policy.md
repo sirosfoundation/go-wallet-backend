@@ -348,9 +348,11 @@ shipped examples do; making the home depend on `keyProtection` needs the PDP
 decision to expose it first.
 
 `wscdTypeFromKeyHome(home)` maps a verified record's home to a WSCD type
-(`strongbox`/`tee` -> `native_android`, `secure_enclave_asserted` ->
-`native_ios`, `fido2_hw` -> `fido2_hardware`, `hsm` -> `remote`) and everything
-else to `unknown`. It is never fed from the client-reported plugin or the
+(`strongbox`/`tee` -> `native_android`, `fido2_hw` -> `fido2_hardware`,
+`hsm` -> `remote`) and everything else, including `secure_enclave_asserted`, to
+`unknown`. `secure_enclave_asserted` maps to `unknown` on purpose: an App
+Attest assertion only proves that an attested app endorsed the key, not that
+the key resides in the Secure Enclave, so it is never recorded as `native_ios`. It is never fed from the client-reported plugin or the
 platform attestation.
 
 **A record is never overwritten by weaker or absent evidence** (memory and
@@ -358,6 +360,10 @@ MongoDB stores; the MongoDB path is a compare-and-set on a revision). Homes
 rank `secure_enclave_asserted` < `tee` < `strongbox`/`fido2_hw`/`hsm`; at equal
 rank only the same kind replaces, and never by dropping the UV bit. A
 registration that would weaken the record is ignored without error.
+
+Records whose kind is not `fido2` never feed Key Attestation: neither the
+policy's `fido2` slot nor the legacy trust gate (used when the policy is
+disabled) accepts them as evidence about a credential key's storage.
 
 ## Preview endpoint
 
