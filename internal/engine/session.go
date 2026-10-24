@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -282,7 +283,7 @@ func (m *Manager) HandleConnection(w http.ResponseWriter, r *http.Request) {
 	if servedBy := m.cfg.Server.ResolvedServedBy(); servedBy != "" {
 		responseHeader.Set("X-Served-By", servedBy)
 	}
-	conn, err := m.upgrader.Upgrade(w, r, responseHeader)
+	conn, err := m.upgrader.Upgrade(newActivityResponseWriter(w), r, responseHeader)
 	if err != nil {
 		m.activeConnections.Add(-1)
 		m.logger.Error("Failed to upgrade connection", zap.Error(err))
@@ -423,6 +424,9 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 // window. Without this a peer that is demonstrably alive but whose pongs are
 // delayed (shared uplink, tunnelled connection) is dropped.
 func configureKeepalive(conn *websocket.Conn, window time.Duration) {
+	if ac, ok := conn.NetConn().(*activityConn); ok {
+		ac.arm(window)
+	}
 	extend := func() { _ = conn.SetReadDeadline(time.Now().Add(window)) }
 	extend()
 	conn.SetPongHandler(func(string) error {
@@ -442,6 +446,59 @@ func configureKeepalive(conn *websocket.Conn, window time.Duration) {
 		}
 		return err
 	})
+}
+
+// activityConn wraps the hijacked socket so that any successful read of bytes
+// - including frames gorilla consumes internally without surfacing them to
+// the caller, such as empty continuation frames of a fragmented message -
+// pushes the read deadline out by the keepalive window. It is inert until
+// armed by configureKeepalive. To keep this cheap the deadline is refreshed
+// at most once per window/8, so it can lag the last byte by that much.
+type activityConn struct {
+	net.Conn
+	window  atomic.Int64 // nanoseconds; 0 = not armed
+	lastSet atomic.Int64 // unix nanos of the last refresh
+}
+
+func (c *activityConn) arm(window time.Duration) {
+	c.lastSet.Store(time.Now().UnixNano())
+	c.window.Store(int64(window))
+}
+
+func (c *activityConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		if w := c.window.Load(); w > 0 {
+			now := time.Now()
+			if now.UnixNano()-c.lastSet.Load() >= w/8 {
+				c.lastSet.Store(now.UnixNano())
+				_ = c.SetReadDeadline(now.Add(time.Duration(w)))
+			}
+		}
+	}
+	return n, err
+}
+
+// activityResponseWriter makes http.Hijacker return an activityConn.
+type activityResponseWriter struct {
+	http.ResponseWriter
+	hj http.Hijacker
+}
+
+func newActivityResponseWriter(w http.ResponseWriter) http.ResponseWriter {
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		return w
+	}
+	return &activityResponseWriter{ResponseWriter: w, hj: hj}
+}
+
+func (w *activityResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	c, rw, err := w.hj.Hijack()
+	if err != nil {
+		return c, rw, err
+	}
+	return &activityConn{Conn: c}, rw, nil
 }
 
 // deadlineExtendingReader pushes conn's read deadline out by window before

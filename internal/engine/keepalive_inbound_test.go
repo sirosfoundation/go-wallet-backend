@@ -42,7 +42,7 @@ func keepaliveHarnessConn(t *testing.T, window time.Duration, wrap func(net.Conn
 	sessCh := make(chan *Session, 1)
 	done := make(chan struct{})
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c, err := up.Upgrade(w, r, nil)
+		c, err := up.Upgrade(newActivityResponseWriter(w), r, nil)
 		if err != nil {
 			return
 		}
@@ -79,6 +79,33 @@ func TestKeepalive_InboundDataFramesExtendReadDeadline(t *testing.T) {
 		}
 	}
 	// ...and a silent peer is still dropped.
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("silent peer was not timed out")
+	}
+}
+
+// A fragmented message made only of empty continuation frames is consumed
+// inside gorilla without ever reaching the caller; the bytes themselves must
+// still count as life. A peer that then goes silent is still dropped.
+func TestKeepalive_EmptyContinuationFramesExtendReadDeadline(t *testing.T) {
+	cl, _, done := keepaliveHarness(t)
+	raw := cl.NetConn()
+	mask := []byte{0, 0, 0, 0}
+	// Unfinished text frame "{", then empty continuations (FIN=0, opcode 0).
+	_, err := raw.Write(append([]byte{0x01, 0x81}, append(mask, '{')...))
+	require.NoError(t, err)
+	for i := 0; i < 12; i++ { // ~720ms against a 250ms window
+		_, err = raw.Write(append([]byte{0x00, 0x80}, mask...))
+		require.NoError(t, err)
+		time.Sleep(60 * time.Millisecond)
+		select {
+		case <-done:
+			t.Fatalf("session timed out after %d empty continuation frames", i+1)
+		default:
+		}
+	}
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
