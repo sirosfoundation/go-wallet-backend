@@ -449,7 +449,11 @@ builder:
 
     (instance_key (kind android_key)(home strongbox|tee)(level L)(boot B)(binding attested))
 
-Nothing the client reports is copied into a verified atom. Later WIAs of the same
+Instance-key records never feed Key Attestation: neither the policy's `fido2`
+slot nor the legacy trust gate (used when the policy is disabled) accepts a
+record whose kind is not `fido2`, so an `android_key` record cannot unlock
+client-selected `key_storage`, `user_authentication` or certification claims
+for a credential key. Nothing the client reports is copied into a verified atom. Later WIAs of the same
 key need no new chain: the stored record is looked up by the PoP key's
 thumbprint, and the fresh PoP proves possession. Periodic re-checking of stored
 records against the status list is not done yet (`chain_not_after` and
