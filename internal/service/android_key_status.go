@@ -84,7 +84,7 @@ func (f *httpStatusFetcher) Fetch(ctx context.Context) ([]byte, StatusFreshness,
 	// The response is complete only now: a slow body counts against its life.
 	received := time.Now()
 	return body, StatusFreshness{
-		MaxAge: cacheControlMaxAge(resp.Header.Get("Cache-Control")),
+		MaxAge: cacheControlMaxAge(strings.Join(resp.Header.Values("Cache-Control"), ",")),
 		Age:    initialAge(resp.Header, sent, received),
 	}, nil
 }
@@ -100,11 +100,14 @@ func initialAge(h http.Header, sent, received time.Time) time.Duration {
 		}
 	}
 	var corrected time.Duration
-	if n, err := strconv.ParseInt(strings.TrimSpace(h.Get("Age")), 10, 64); err == nil && n >= 0 {
-		if n > int64(maxAndroidStatusTTL/time.Second) {
-			n = int64(maxAndroidStatusTTL / time.Second)
+	// Repeated Age lines: the oldest counts.
+	for _, v := range h.Values("Age") {
+		if n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64); err == nil && n >= 0 {
+			if n > int64(maxAndroidStatusTTL/time.Second) {
+				n = int64(maxAndroidStatusTTL / time.Second)
+			}
+			corrected = max(corrected, time.Duration(n)*time.Second+received.Sub(sent))
 		}
-		corrected = time.Duration(n)*time.Second + received.Sub(sent)
 	}
 	return max(apparent, corrected)
 }

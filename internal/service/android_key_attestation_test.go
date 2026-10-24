@@ -669,6 +669,32 @@ func TestHTTPStatusFetcher_SlowBodyCountsTowardsAge(t *testing.T) {
 	}
 }
 
+// Cache-Control and Age may span several header lines.
+func TestHTTPStatusFetcher_RepeatedHeaderLines(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Cache-Control", "public")
+		w.Header().Add("Cache-Control", "max-age=30")
+		w.Header().Add("Age", "9")
+		w.Header().Add("Age", "3")
+		_, _ = w.Write([]byte(emptyStatusList))
+	}))
+	defer srv.Close()
+	_, fresh, err := NewHTTPAttestationStatusFetcher(srv.Client(), srv.URL).Fetch(context.Background())
+	if err != nil || fresh.MaxAge != 30*time.Second || fresh.Age < 9*time.Second {
+		t.Fatalf("fresh=%+v err=%v", fresh, err)
+	}
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Cache-Control", "max-age=30")
+		w.Header().Add("Cache-Control", "no-store")
+		_, _ = w.Write([]byte(emptyStatusList))
+	}))
+	defer srv2.Close()
+	_, fresh, err = NewHTTPAttestationStatusFetcher(srv2.Client(), srv2.URL).Fetch(context.Background())
+	if err != nil || fresh.MaxAge != 0 {
+		t.Fatalf("later no-store ignored: fresh=%+v err=%v", fresh, err)
+	}
+}
+
 func TestHTTPStatusFetcher(t *testing.T) {
 	var status int
 	var hdr map[string]string
