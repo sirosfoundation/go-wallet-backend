@@ -255,14 +255,28 @@ func (testAndroidBuilder) Build(r *domain.KeyAttestationRecord) *assurance.Insta
 	return &assurance.InstanceKeyVerified{Kind: string(r.Kind), Home: string(r.Home), Level: r.SecurityLevel, Boot: r.VerifiedBootState, Binding: assurance.BindingAttested}
 }
 
-// Key attestation never sees the slot, and the claimed group of a key
-// attestation request cannot fill it (K and S stay orthogonal).
+// Key attestation never sees the slot: even with matching credential-key
+// FIDO2 evidence AND an active instance whose own key has verified evidence,
+// the key attestation facts carry both of those (so the lookups work) but no
+// instance_key, and the claimed group cannot fill it either (K and S stay
+// orthogonal).
 func TestKeyAttestation_EvidenceNeverCarriesInstanceKey(t *testing.T) {
 	svc, instances, keys := assuranceSvc(t, nil, uvRules)
-	_ = instances
-	putRecord(t, keys, domain.KeyAttestationRecord{KeyThumbprint: "t9", Kind: domain.KeyEvidenceFIDO2, AAGUID: "aa1", UV: true})
 	jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "a", "y": "b"}}
-	f := svc.assuranceFacts(context.Background(), "", jwks, &SecurityProperties{Plugin: "strongbox", KeyStorage: []string{"strongbox"}})
+	markAttestedUV(t, keys, jwks[0], "aa1", true) // credential-key evidence under the real thumbprint
+	const instanceID = "instance-key-jkt-ka"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: instanceID, Status: domain.InstanceStatusActive, AttestationSource: "platform_attested", LastAttestedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	putRecord(t, keys, domain.KeyAttestationRecord{KeyThumbprint: instanceID, Kind: domain.KeyEvidenceFIDO2, AAGUID: "aa1", UV: true})
+	if rec, err := keys.GetByKeyThumbprint(context.Background(), instanceID); err != nil || rec.Kind != domain.KeyEvidenceFIDO2 {
+		t.Fatalf("instance-key evidence not stored: %v", err)
+	}
+
+	f := svc.assuranceFacts(context.Background(), instanceID, jwks, &SecurityProperties{Plugin: "strongbox", KeyStorage: []string{"strongbox"}})
+	if f.Fido2 == nil || f.Platform == nil {
+		t.Fatalf("credential and instance evidence must be found (fido2=%v platform=%v)", f.Fido2, f.Platform)
+	}
 	if f.InstanceKey != nil {
 		t.Fatalf("key attestation facts carry instance-key evidence: %+v", f.InstanceKey)
 	}
