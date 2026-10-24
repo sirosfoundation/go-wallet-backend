@@ -27,11 +27,6 @@ type KeyAttestationRecord struct {
 	// TenantID scopes this record to a specific tenant.
 	TenantID TenantID `json:"tenant_id" bson:"tenant_id"`
 
-	// UserID is the user the evidence was verified for, when the verifier
-	// knew one (nil on records stored before the field existed and for
-	// registrations that carry no user). See InScope.
-	UserID *UserID `json:"user_id,omitempty" bson:"user_id,omitempty"`
-
 	// AAGUID is the FIDO2 authenticator model's AAGUID, as verified against
 	// go-trust's fidomds3 registry.
 	AAGUID string `json:"aaguid" bson:"aaguid"`
@@ -41,6 +36,11 @@ type KeyAttestationRecord struct {
 	// was verified (PIN or biometric) when the key was created. Records
 	// stored before this field existed read as false ("uv none").
 	UV bool `json:"uv" bson:"uv"`
+
+	// UserID is the authenticated user the evidence was verified for, set on
+	// instance-key evidence (android_key, ...): a cached record is used only
+	// for the tenant and user it was verified for. Empty on FIDO2 records.
+	UserID string `json:"user_id,omitempty" bson:"user_id,omitempty"`
 
 	// Kind is the family of evidence that produced this record. Records
 	// stored before the field existed are FIDO2 records: Normalize applies
@@ -138,27 +138,7 @@ func (r *KeyAttestationRecord) Clone() *KeyAttestationRecord {
 		v := *r.DeviceLocked
 		c.DeviceLocked = &v
 	}
-	if r.UserID != nil {
-		u := *r.UserID
-		c.UserID = &u
-	}
 	return &c
-}
-
-// InScope reports whether the record may be used on behalf of the given
-// tenant and user. Evidence is about a key, but it was verified for one
-// caller: a record scoped to a tenant is not lent to another tenant, and a
-// record scoped to a user is not lent to another user (or to a caller with no
-// user). Empty scope (records stored before these fields existed, or without a
-// user) is not restricted.
-func (r *KeyAttestationRecord) InScope(tenant TenantID, user *UserID) bool {
-	if r.TenantID != "" && r.TenantID != tenant {
-		return false
-	}
-	if r.UserID != nil && (user == nil || *user != *r.UserID) {
-		return false
-	}
-	return true
 }
 
 // Normalize applies the defaults that make a record stored before Kind and

@@ -160,7 +160,12 @@ func (v *AppAttestAssertionVerifier) Verify(ctx context.Context, in *InstanceKey
 	if !rec.IsActive() {
 		return nil, assertionInvalid("App Attest key is not active")
 	}
-	if !rec.BelongsTo(in.TenantID, in.UserID) {
+	var user *domain.UserID
+	if in.UserID != "" {
+		u := domain.UserIDFromString(in.UserID)
+		user = &u
+	}
+	if !rec.BelongsTo(in.TenantID, user) {
 		return nil, assertionInvalid("App Attest key belongs to another context")
 	}
 	if rec.Environment != v.env {

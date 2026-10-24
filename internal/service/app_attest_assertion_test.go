@@ -60,7 +60,7 @@ func (h *assertionHarness) input(t *testing.T, keyID, assertion string) *Instanc
 	t.Helper()
 	payload, _ := json.Marshal(map[string]string{"type": "app_attest_assertion", "key_id": keyID, "assertion": assertion})
 	return &InstanceKeyEvidenceInput{
-		Payload: payload, Thumbprint: testAssertJKT, TenantID: "acme", UserID: userPtr("u1"),
+		Payload: payload, Thumbprint: testAssertJKT, TenantID: "acme", UserID: "u1",
 		WIAChallenge: testAssertChallenge, Now: time.Now().UTC(),
 	}
 }
@@ -210,8 +210,8 @@ func TestAppAttestAssertion_KeyContext(t *testing.T) {
 	})
 	for name, mut := range map[string]func(*InstanceKeyEvidenceInput){
 		"other tenant":    func(in *InstanceKeyEvidenceInput) { in.TenantID = "evil" },
-		"other user":      func(in *InstanceKeyEvidenceInput) { in.UserID = userPtr("u2") },
-		"no user context": func(in *InstanceKeyEvidenceInput) { in.UserID = nil },
+		"other user":      func(in *InstanceKeyEvidenceInput) { in.UserID = "u2" },
+		"no user context": func(in *InstanceKeyEvidenceInput) { in.UserID = "" },
 	} {
 		t.Run(name, func(t *testing.T) {
 			in := h.input(t, id, h.good(t, 1))
@@ -253,7 +253,7 @@ func TestAppAttestAssertion_EnvironmentAndEligibility(t *testing.T) {
 	}
 	input := func(d *testAppAttestDevice) *InstanceKeyEvidenceInput {
 		payload, _ := json.Marshal(map[string]string{"type": "app_attest_assertion", "key_id": d.keyIDB64(), "assertion": assertFor(d)})
-		return &InstanceKeyEvidenceInput{Payload: payload, Thumbprint: testAssertJKT, TenantID: "acme", UserID: userPtr("u1"), WIAChallenge: testAssertChallenge, Now: time.Now()}
+		return &InstanceKeyEvidenceInput{Payload: payload, Thumbprint: testAssertJKT, TenantID: "acme", UserID: "u1", WIAChallenge: testAssertChallenge, Now: time.Now()}
 	}
 
 	t.Run("development key never yields a home", func(t *testing.T) {
@@ -295,9 +295,9 @@ func TestAppAttestAssertion_MalformedInput(t *testing.T) {
 	shortAuth := h.dev.assertion(t, cdh, assertionOpts{appID: testAppAttestAppID, counter: 1})
 	_ = shortAuth
 	cases := map[string]*InstanceKeyEvidenceInput{
-		"payload not json":       {Payload: []byte("{"), TenantID: "acme", UserID: userPtr("u1")},
-		"payload is a string":    {Payload: []byte(`"x"`), TenantID: "acme", UserID: userPtr("u1")},
-		"payload too large":      {Payload: []byte(`{"assertion":"` + strings.Repeat("A", 2*maxAppAttestAssertionBytes+1) + `"}`), TenantID: "acme", UserID: userPtr("u1")},
+		"payload not json":       {Payload: []byte("{"), TenantID: "acme", UserID: "u1"},
+		"payload is a string":    {Payload: []byte(`"x"`), TenantID: "acme", UserID: "u1"},
+		"payload too large":      {Payload: []byte(`{"assertion":"` + strings.Repeat("A", 2*maxAppAttestAssertionBytes+1) + `"}`), TenantID: "acme", UserID: "u1"},
 		"missing key_id":         h.input(t, "", h.good(t, 1)),
 		"key_id not base64":      h.input(t, "@@@", h.good(t, 1)),
 		"key_id wrong length":    h.input(t, base64.StdEncoding.EncodeToString([]byte("short")), h.good(t, 1)),
@@ -334,7 +334,7 @@ func TestAppAttestAssertion_OversizeRefusedByLengthAlone(t *testing.T) {
 			"type": "app_attest_assertion", "key_id": h.dev.keyIDB64(),
 			"assertion": base64.StdEncoding.EncodeToString(padded), "pad": strings.Repeat("A", payloadPad),
 		})
-		return &InstanceKeyEvidenceInput{Payload: payload, Thumbprint: testAssertJKT, TenantID: "acme", UserID: userPtr("u1"), WIAChallenge: testAssertChallenge, Now: time.Now()}
+		return &InstanceKeyEvidenceInput{Payload: payload, Thumbprint: testAssertJKT, TenantID: "acme", UserID: "u1", WIAChallenge: testAssertChallenge, Now: time.Now()}
 	}
 	h := newAssertionHarness(t)
 	if _, err := h.v.Verify(ctx, build(h, 1, 100, 100)); err != nil {
@@ -792,7 +792,7 @@ func TestAppAttestAssertion_CachedEvidenceIsScopedToTheVerifiedCaller(t *testing
 		t.Fatal(err)
 	}
 	rec, err := e.records.GetByKeyThumbprint(ctx, jkt)
-	if err != nil || rec.UserID == nil || rec.UserID.ID != "owner" || rec.TenantID != domain.DefaultTenantID {
+	if err != nil || rec.UserID != "owner" || rec.TenantID != domain.DefaultTenantID {
 		t.Fatalf("record scope = %+v (%v)", rec, err)
 	}
 
@@ -818,7 +818,7 @@ func TestAppAttestAssertion_CachedEvidenceIsScopedToTheVerifiedCaller(t *testing
 			t.Errorf("%s: cached evidence was lent (err=%v)", name, err)
 		}
 	}
-	if got := e.svc.instanceKeyEvidence(ctx, "other-tenant", owner, jkt); got != nil {
+	if got := e.svc.instanceKeyEvidence(ctx, "other-tenant", "owner", jkt); got != nil {
 		t.Error("cached evidence was lent to another tenant")
 	}
 }
@@ -971,11 +971,10 @@ func TestPreview_InstanceKeyEvidenceIsScopedToTheCaller(t *testing.T) {
 	svc, instances, keys := assuranceSvc(t, nil, rules)
 	ctx := context.Background()
 	owner := domain.UserIDFromString("owner")
-	other := domain.UserIDFromString("someone-else")
 	for id, c := range map[string]struct {
-		recUser *domain.UserID
+		recUser string
 		want    bool
-	}{"inst-own": {&owner, true}, "inst-foreign": {&other, false}} {
+	}{"inst-own": {"owner", true}, "inst-foreign": {"someone-else", false}} {
 		if err := instances.Upsert(ctx, &domain.WalletInstance{
 			ID: id, TenantID: "t1", UserID: &owner, AttestationSource: "backend_attested", Status: domain.InstanceStatusActive, LastAttestedAt: time.Now(),
 		}); err != nil {

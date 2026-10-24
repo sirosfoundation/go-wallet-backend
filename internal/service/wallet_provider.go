@@ -474,6 +474,17 @@ func (s *WalletProviderService) keyAttestationTrustsBatch(ctx context.Context, w
 	return s.keyAttestationTrustsBatchWith(ctx, walletInstanceID, jwks, nil)
 }
 
+// isFIDO2KeyEvidence reports whether rec is a verified FIDO2 hardware-key
+// attestation, the only per-key evidence this legacy gate speaks for. Records
+// of other kinds (android_key and app_attest_assertion describe the WIA
+// INSTANCE key) are not evidence about a credential key's storage: key storage
+// and the instance key are orthogonal, and an instance-key record must never
+// unlock client-selected key_storage, user_authentication or certification
+// claims.
+func isFIDO2KeyEvidence(rec *domain.KeyAttestationRecord) bool {
+	return fido2VerifiedFromRecord(rec) != nil
+}
+
 // keyAttestationTrustsBatchWith is keyAttestationTrustsBatch with an optional
 // overlay: a record verified in this request but not persisted (the preview's
 // dry run) that answers for its own key thumbprint.
@@ -499,20 +510,16 @@ func (s *WalletProviderService) keyAttestationTrustsBatchWith(ctx context.Contex
 			return false
 		}
 		if overlay != nil && overlay.KeyThumbprint == thumbprint {
+			if !isFIDO2KeyEvidence(overlay) {
+				return false
+			}
 			continue
 		}
 		if s.keyAttestations == nil {
 			return false
 		}
 		rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, thumbprint)
-		if err != nil {
-			return false
-		}
-		// Only a verified FIDO2 attestation vouches for a credential key's
-		// storage. Instance-key evidence of other kinds (android_key,
-		// app_attest_assertion) is about the WIA PoP key and is never read as
-		// key-storage evidence, even if the same key is also submitted here.
-		if fido2VerifiedFromRecord(rec) == nil {
+		if err != nil || !isFIDO2KeyEvidence(rec) {
 			return false
 		}
 	}

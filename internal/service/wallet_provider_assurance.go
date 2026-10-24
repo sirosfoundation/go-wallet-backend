@@ -36,22 +36,6 @@ func WithKeyAttestationCaller(ctx context.Context, c KeyAttestationCaller) conte
 	return context.WithValue(ctx, callerCtxKey{}, c)
 }
 
-// recordInCallerScope reports whether a stored evidence record may be used for
-// the authenticated caller in ctx (see domain.KeyAttestationRecord.InScope).
-// With no caller in ctx there is nothing to compare, so the record is in scope.
-func recordInCallerScope(ctx context.Context, rec *domain.KeyAttestationRecord) bool {
-	caller, ok := ctx.Value(callerCtxKey{}).(KeyAttestationCaller)
-	if !ok {
-		return true
-	}
-	var user *domain.UserID
-	if caller.UserID != "" {
-		u := domain.UserIDFromString(caller.UserID)
-		user = &u
-	}
-	return rec.InScope(caller.TenantID, user)
-}
-
 // lookupOwnedInstance loads an active wallet instance and, when the caller is
 // known, requires it to belong to that caller: the same tenant, and the same user
 // when the instance records one. A foreign instance is reported as not found,

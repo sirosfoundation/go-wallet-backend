@@ -63,14 +63,18 @@
 # Optional S1 template that also requires VERIFIED evidence about where the
 # wallet's instance key (the WIA PoP key) lives, instead of trusting the
 # platform attestation alone. The (instance_key ...) slot is filled only from
-# per-key evidence the backend verified for that very key (kind android_key,
-# or fido2); the client's claims can never populate it. (kind) is "don't
-# care" but must stand in position 1 because slots match by position. Until
-# the backend verifies instance-key evidence of kind android_key the slot is
-# (instance_key none) and this rule does not match, so leave it commented
-# unless your wallets submit such evidence. Uncomment, put a
-# "# id: wia-s1-instance-key" line before it, and drop or narrow the plain
-# wia-s1-platform rule above if S1 must require it:
+# per-key evidence the backend verified for that very key: an Android Key
+# Attestation chain submitted as key_attestation {type android_key} on
+# /wallet-provider/wia/generate (verified against the operator-pinned roots in
+# wallet_provider.attestation.android_key_attestation, see
+# docs/assurance-policy.md), or FIDO2. The client's claims can never populate
+# it. (kind) is "don't care" but must stand in position 1 because slots match
+# by position. A WIA without such evidence has (instance_key none) and this
+# rule does not match. It is a template: it stays commented until your wallets
+# submit android_key evidence. To also constrain the boot state use the
+# fourth field, e.g. (instance_key (kind android_key)(home (* set strongbox tee))(level)(boot verified)).
+# Uncomment, put a "# id: wia-s1-instance-key" line before it, and drop or
+# narrow the plain wia-s1-platform rule above if S1 must require it:
 #
 # (assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform (source platform_attested))(hsm)(instance_key (kind)(home (* set strongbox tee))))))
 

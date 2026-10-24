@@ -236,13 +236,14 @@ func TestWIAInstanceKey_SlotRenderingAndExtensibility(t *testing.T) {
 		t.Fatalf("fido2 slot = %+v", ik)
 	}
 	// A kind without a registered builder is never rendered as verified.
-	if got := instanceKeyVerifiedFromRecord(&domain.KeyAttestationRecord{Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE}); got != nil {
+	const futureKind = domain.KeyEvidenceKind("future_kind")
+	if got := instanceKeyVerifiedFromRecord(&domain.KeyAttestationRecord{Kind: futureKind, Home: domain.KeyHomeTEE}); got != nil {
 		t.Fatalf("builder-less kind rendered: %+v", got)
 	}
 	// A new kind plugs in by registering a builder keyed by Kind.
-	instanceKeyBuilders[domain.KeyEvidenceAndroidKey] = testAndroidBuilder{}
-	t.Cleanup(func() { delete(instanceKeyBuilders, domain.KeyEvidenceAndroidKey) })
-	got := instanceKeyVerifiedFromRecord(&domain.KeyAttestationRecord{Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE, SecurityLevel: "trusted_environment", VerifiedBootState: "verified"})
+	instanceKeyBuilders[futureKind] = testAndroidBuilder{}
+	t.Cleanup(func() { delete(instanceKeyBuilders, futureKind) })
+	got := instanceKeyVerifiedFromRecord(&domain.KeyAttestationRecord{Kind: futureKind, Home: domain.KeyHomeTEE, SecurityLevel: "trusted_environment", VerifiedBootState: "verified"})
 	if got == nil || got.Home != "tee" || got.Level != "trusted_environment" || got.Boot != "verified" {
 		t.Fatalf("registered builder not used: %+v", got)
 	}
@@ -250,7 +251,7 @@ func TestWIAInstanceKey_SlotRenderingAndExtensibility(t *testing.T) {
 
 type testAndroidBuilder struct{}
 
-func (testAndroidBuilder) Kind() domain.KeyEvidenceKind { return domain.KeyEvidenceAndroidKey }
+func (testAndroidBuilder) Kind() domain.KeyEvidenceKind { return "future_kind" }
 func (testAndroidBuilder) Build(r *domain.KeyAttestationRecord) *assurance.InstanceKeyVerified {
 	return &assurance.InstanceKeyVerified{Kind: string(r.Kind), Home: string(r.Home), Level: r.SecurityLevel, Boot: r.VerifiedBootState, Binding: assurance.BindingAttested}
 }

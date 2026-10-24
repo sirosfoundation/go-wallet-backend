@@ -131,10 +131,8 @@ type InstanceKeyEvidenceInput struct {
 	Thumbprint string
 	// TenantID is the authenticated tenant of the request.
 	TenantID domain.TenantID
-	// UserID is the authenticated user of the request, nil when the caller is
-	// not user-bound. Evidence about a key a user attested must be refused for
-	// any other user.
-	UserID *domain.UserID
+	// UserID is the authenticated user, "" when unknown.
+	UserID string
 	// WIAChallenge is the consumed WIA challenge C, as issued. Use
 	// InstanceKeyAttestationChallenge for a derived challenge.
 	WIAChallenge string
@@ -209,7 +207,7 @@ func truncateForError(v string) string {
 // stores a resulting record under the instance key's thumbprint (the store
 // refuses to replace stronger evidence with weaker). It returns the record the
 // submission produced, nil when it named no home.
-func (s *WIAService) verifyKeyAttestation(ctx context.Context, v InstanceKeyEvidenceVerifier, ka *KeyAttestation, tenantID domain.TenantID, userID *domain.UserID, jkt string, pop *ecdsa.PublicKey, challenge string) (*domain.KeyAttestationRecord, error) {
+func (s *WIAService) verifyKeyAttestation(ctx context.Context, v InstanceKeyEvidenceVerifier, ka *KeyAttestation, tenantID domain.TenantID, userID, jkt string, pop *ecdsa.PublicKey, challenge string) (*domain.KeyAttestationRecord, error) {
 	now := time.Now().UTC()
 	res, err := v.Verify(ctx, &InstanceKeyEvidenceInput{
 		Payload:      ka.Raw,
@@ -241,11 +239,7 @@ func (s *WIAService) verifyKeyAttestation(ctx context.Context, v InstanceKeyEvid
 	rec.KeyThumbprint = jkt
 	rec.WalletInstanceID = jkt
 	rec.TenantID = tenantID
-	rec.UserID = nil
-	if userID != nil {
-		u := *userID
-		rec.UserID = &u
-	}
+	rec.UserID = userID
 	if rec.VerifiedAt.IsZero() {
 		rec.VerifiedAt = now
 	}
@@ -255,4 +249,21 @@ func (s *WIAService) verifyKeyAttestation(ctx context.Context, v InstanceKeyEvid
 		}
 	}
 	return rec, nil
+}
+
+// instanceEvidenceInScope reports whether a stored instance-key record may be
+// used for a request of (tenantID, userID). Evidence of a kind other than FIDO2
+// is bound to the tenant and, when it was verified for a user, to that user;
+// a request without the user it was verified for cannot reuse it. FIDO2
+// records predate the scope fields and are keyed by the key alone.
+func instanceEvidenceInScope(rec *domain.KeyAttestationRecord, tenantID domain.TenantID, userID string) bool {
+	n := *rec
+	n.Normalize()
+	if n.Kind == domain.KeyEvidenceFIDO2 && n.UserID == "" {
+		return true
+	}
+	if n.TenantID != tenantID {
+		return false
+	}
+	return n.UserID == "" || n.UserID == userID
 }
