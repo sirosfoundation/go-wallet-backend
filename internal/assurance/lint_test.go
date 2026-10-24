@@ -1,6 +1,7 @@
 package assurance
 
 import (
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -161,5 +162,94 @@ func TestLint_TopLevelWildcardRuleIsAnError(t *testing.T) {
 	fs := lintRules(t, "# id: catch-all\n(* )\n")
 	if !HasErrors(fs) || !strings.Contains(findings(fs, SeverityError), "rule catch-all") {
 		t.Fatalf("%v", fs)
+	}
+}
+
+// Every leaf slot of the schema takes one atom or one (* set ...). Walk the
+// schema so a new slot is covered automatically.
+func TestLint_MultipleValuesInAnyLeafSlotAreErrors(t *testing.T) {
+	type leaf struct {
+		dim  string
+		path []string
+	}
+	var leaves []leaf
+	var walk func(dim string, path []string, sl slot)
+	walk = func(dim string, path []string, sl slot) {
+		p := append(append([]string{}, path...), sl.name)
+		if len(sl.children) == 0 {
+			leaves = append(leaves, leaf{dim, p})
+			return
+		}
+		for _, c := range sl.children {
+			walk(dim, p, c)
+		}
+	}
+	for dim := range KnownDimensions {
+		for _, sl := range topLayout(dim) {
+			walk(dim, nil, sl)
+		}
+	}
+	if len(leaves) < 14 {
+		t.Fatalf("schema walk found only %d leaves", len(leaves))
+	}
+	// Build a rule that is canonical except for the one leaf under test.
+	build := func(l leaf, vals string) string {
+		var render func(sl slot, path []string) string
+		render = func(sl slot, path []string) string {
+			if len(sl.children) == 0 {
+				if len(path) > 0 && path[0] == sl.name {
+					return "(" + sl.name + " " + vals + ")"
+				}
+				return "(" + sl.name + " x)"
+			}
+			var sb strings.Builder
+			for _, c := range sl.children {
+				// Only descend along the chosen path; list earlier siblings
+				// as bare slots so positions stay canonical.
+				if len(path) > 1 && path[1] == c.name {
+					sb.WriteString(render(c, path[1:]))
+					break
+				}
+				sb.WriteString("(" + c.name + ")")
+			}
+			return "(" + sl.name + " " + sb.String() + ")"
+		}
+		var sb strings.Builder
+		for _, top := range topLayout(l.dim) {
+			if top.name == l.path[0] {
+				sb.WriteString(render(top, l.path))
+				break
+			}
+			sb.WriteString("(" + top.name + " x)")
+		}
+		return "(" + l.dim + " " + sb.String() + ")"
+	}
+	for _, l := range leaves {
+		name := l.dim + "/" + strings.Join(l.path, "/")
+		for _, ok := range []string{"a", "(* set a b)", ""} {
+			if fs := lintRules(t, "# id: r\n"+build(l, ok)+"\n"); HasErrors(fs) {
+				t.Errorf("%s: %q must lint clean, got %v", name, ok, fs)
+			}
+		}
+		for _, bad := range []string{"a b", "a (* set b c)", "(* set a) (* set b)", "(nested a)"} {
+			if fs := lintRules(t, "# id: r\n"+build(l, bad)+"\n"); !HasErrors(fs) {
+				t.Errorf("%s: %q must be an ERROR (rule can never match)", name, bad)
+			}
+		}
+	}
+}
+
+func TestStartupCheckFailsLikeTheCLIOnMultiValueLeaf(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.RulesFile = writeRules(t, "m.rules", "# id: multi\n(assure-ks (tier moderate high)(evidence))\n")
+	err := CheckConfig(cfg)
+	if !errors.Is(err, ErrLintFailed) || !strings.Contains(err.Error(), "multi") {
+		t.Fatalf("startup check: %v", err)
+	}
+	if _, err := NewFromConfig(cfg, testLogger()); !errors.Is(err, ErrLintFailed) {
+		t.Fatalf("NewFromConfig: %v", err)
+	}
+	if !HasErrors(LintRuleSet(mustRuleSet(t, "# id: multi\n(assure-ks (tier moderate high)(evidence))\n"), &cfg)) {
+		t.Fatal("linter (CLI path) must report the same error")
 	}
 }

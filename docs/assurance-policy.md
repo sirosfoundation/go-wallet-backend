@@ -226,24 +226,33 @@ nothing is permitted the claim is `"none"` (Annex C).
   client-claimed evidence on purpose. It only shows its effect with
   `lower_by_claims_*: false`, or when the client also claims the target level.
 
-## Deployment (Kubernetes)
+## Deployment
 
-Values for a ConfigMap-mounted rules file (the rules are policy, not secrets):
+The backend needs two things: the configuration, and the rules file present at
+`rules_file` inside the container.
 
 ```yaml
-backend:
-  assurance:
-    enabled: true
-    rulesFile: /etc/wallet/assurance/assurance.rules
-    rules: |
-      # id: prod-fido2-mds3-ks
-      (assure-ks (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2 (mds3 trusted)(aaguid (* set 00000000-0000-0000-0000-000000000001))))))
-  env:
-    WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_ENABLED: "true"
-    WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_RULES_FILE: /etc/wallet/assurance/assurance.rules
+wallet_provider:
+  attestation:
+    assurance:
+      enabled: true
+      rules_file: /etc/wallet/assurance/assurance.rules
 ```
 
-The chart renders `rules` into a ConfigMap (`assurance.rules` key) mounted at
-`/etc/wallet/assurance`. If the AAGUID allow-list is considered sensitive,
-mount the same file from a Secret instead (`secret.secretName`), keeping the
-same `RULES_FILE` path.
+or `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_ENABLED=true` and
+`WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_RULES_FILE=/etc/wallet/assurance/assurance.rules`.
+
+Mounting requirements for any orchestrator:
+
+* the file must be readable by the backend user at the configured path, and
+  its name must end in `.rules` (never `.spocp` or `.bin`);
+* mount it read-only; a ConfigMap is fine, or a Secret if the AAGUID
+  allow-list is considered sensitive;
+* the file is read once at startup, so a change needs a restart (the policy
+  hash in the startup log and the `policy_info` metric shows which version is
+  live);
+* the backend refuses to start if the file is missing or fails lint.
+
+The sirosid-dev Helm chart does **not** support this yet. Its ConfigMap and
+volume mount for the rules file are pending; until they exist, the file has
+to be provided by other means.
