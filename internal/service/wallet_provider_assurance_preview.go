@@ -152,7 +152,9 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 	// GenerateWIA builds them. The dry-run overlay never applies here.
 	wiaFacts := assurance.Facts{Platform: &assurance.PlatformVerified{Source: wiaSource, AppID: appID}}
 	if req.WalletInstanceID != "" && s.keyAttestations != nil {
-		if rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, req.WalletInstanceID); err == nil {
+		if rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, req.WalletInstanceID); err == nil && !recordInCallerScope(ctx, rec) {
+			s.logger.Warn("instance key evidence belongs to another caller; treating as none")
+		} else if err == nil {
 			wiaFacts.Fido2 = fido2VerifiedFromRecord(rec)
 			wiaFacts.InstanceKey = instanceKeyVerifiedFromRecord(rec)
 		} else if !errors.Is(err, storage.ErrNotFound) {

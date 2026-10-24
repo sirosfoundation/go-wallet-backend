@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/fxamacker/cbor/v2"
+	"github.com/golang-jwt/jwt/v5"
 )
 
 // testAppleCA stands in for the Apple App Attestation Root CA: a root and one
@@ -208,7 +209,9 @@ func (d *testAppAttestDevice) assertion(t *testing.T, clientDataHash []byte, o a
 		signed = o.signOver
 	}
 	nonce := sha256.Sum256(append(append([]byte{}, authData...), signed...))
-	sig, err := ecdsa.SignASN1(rand.Reader, d.key, nonce[:])
+	// ECDSA-with-SHA-256 over the nonce: the signed digest is SHA-256(nonce).
+	digest := sha256.Sum256(nonce[:])
+	sig, err := ecdsa.SignASN1(rand.Reader, d.key, digest[:])
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,4 +238,30 @@ func cborMarshalAssertion(sig, authData []byte) (string, error) {
 		return "", err
 	}
 	return base64.StdEncoding.EncodeToString(b), nil
+}
+
+// resignPop builds a WIA-PoP JWT for an existing instance key and nonce (a
+// renewal with the same key).
+func resignPop(t *testing.T, key *ecdsa.PrivateKey, nonce string) string {
+	t.Helper()
+	claims := &WIAPopClaims{
+		RegisteredClaims: jwt.RegisteredClaims{
+			Issuer:    "urn:wallet:instance:test-123",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(5 * time.Minute)),
+			IssuedAt:  jwt.NewNumericDate(time.Now()),
+		},
+		Nonce: nonce,
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
+	tok.Header["typ"] = "oauth-client-attestation-pop+jwt"
+	tok.Header["jwk"] = map[string]interface{}{
+		"kty": "EC", "crv": "P-256",
+		"x": base64.RawURLEncoding.EncodeToString(key.PublicKey.X.FillBytes(make([]byte, 32))),
+		"y": base64.RawURLEncoding.EncodeToString(key.PublicKey.Y.FillBytes(make([]byte, 32))),
+	}
+	s, err := tok.SignedString(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
 }

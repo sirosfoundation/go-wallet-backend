@@ -33,7 +33,8 @@ import (
 // InstanceKeyAttestationChallenge defines) and jkt is the RFC 7638 thumbprint
 // of the PoP key in its base64url no-padding string form (its ASCII bytes),
 // appended with no separator. This verifier checks the assertion against the
-// public key stored when that App Attest key was attested (see
+// public key stored when that App Attest key was attested (ECDSA-SHA256 over
+// the nonce SHA-256(authenticatorData || clientDataHash), so a double hash; see
 // NativeAttestationService), and records:
 //
 //	kind app_attest_assertion, home secure_enclave_asserted, binding assertion
@@ -176,11 +177,14 @@ func (v *AppAttestAssertionVerifier) Verify(ctx context.Context, in *InstanceKey
 		return nil, assertionInvalid("rpIdHash does not match the App ID")
 	}
 
-	// Signature: ECDSA over SHA-256(authenticatorData || clientDataHash), with
-	// clientDataHash binding this WIA challenge and this PoP key.
+	// Signature: Apple defines nonce = SHA-256(authenticatorData ||
+	// clientDataHash) and the signature is ECDSA-with-SHA-256 over that nonce,
+	// i.e. over a second hash of it: the digest handed to ECDSA verification is
+	// SHA-256(nonce). clientDataHash binds this WIA challenge and this PoP key.
 	cdh := AppAttestClientDataHash(in.WIAChallenge, in.Thumbprint)
 	nonce := sha256.Sum256(append(append([]byte{}, obj.AuthenticatorData...), cdh...))
-	if !ecdsa.VerifyASN1(pub, nonce[:], obj.Signature) {
+	digest := sha256.Sum256(nonce[:])
+	if !ecdsa.VerifyASN1(pub, digest[:], obj.Signature) {
 		return nil, assertionInvalid("assertion signature does not verify")
 	}
 

@@ -504,7 +504,15 @@ func (s *WalletProviderService) keyAttestationTrustsBatchWith(ctx context.Contex
 		if s.keyAttestations == nil {
 			return false
 		}
-		if _, err := s.keyAttestations.GetByKeyThumbprint(ctx, thumbprint); err != nil {
+		rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, thumbprint)
+		if err != nil {
+			return false
+		}
+		// Only a verified FIDO2 attestation vouches for a credential key's
+		// storage. Instance-key evidence of other kinds (android_key,
+		// app_attest_assertion) is about the WIA PoP key and is never read as
+		// key-storage evidence, even if the same key is also submitted here.
+		if fido2VerifiedFromRecord(rec) == nil {
 			return false
 		}
 	}

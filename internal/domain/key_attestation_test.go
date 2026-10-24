@@ -51,3 +51,37 @@ func TestKeyAttestationRecord_CloneDoesNotShareDeviceLocked(t *testing.T) {
 		t.Fatal("clone shares DeviceLocked")
 	}
 }
+
+func TestKeyAttestationRecord_InScope(t *testing.T) {
+	u1, u2 := UserIDFromString("u1"), UserIDFromString("u2")
+	cases := []struct {
+		name string
+		rec  KeyAttestationRecord
+		ten  TenantID
+		user *UserID
+		want bool
+	}{
+		{"same tenant and user", KeyAttestationRecord{TenantID: "t", UserID: &u1}, "t", &u1, true},
+		{"other user", KeyAttestationRecord{TenantID: "t", UserID: &u1}, "t", &u2, false},
+		{"no caller user for a user-scoped record", KeyAttestationRecord{TenantID: "t", UserID: &u1}, "t", nil, false},
+		{"other tenant", KeyAttestationRecord{TenantID: "t", UserID: &u1}, "x", &u1, false},
+		{"tenant-only record, any user", KeyAttestationRecord{TenantID: "t"}, "t", &u2, true},
+		{"tenant-only record, other tenant", KeyAttestationRecord{TenantID: "t"}, "x", nil, false},
+		{"legacy record without scope", KeyAttestationRecord{}, "x", &u2, true},
+	}
+	for _, c := range cases {
+		if got := c.rec.InScope(c.ten, c.user); got != c.want {
+			t.Errorf("%s: got %v want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestKeyAttestationRecord_CloneCopiesUserID(t *testing.T) {
+	u := UserIDFromString("u1")
+	r := &KeyAttestationRecord{UserID: &u}
+	c := r.Clone()
+	c.UserID.ID = "changed"
+	if r.UserID.ID != "u1" {
+		t.Fatal("Clone shares the UserID pointer")
+	}
+}

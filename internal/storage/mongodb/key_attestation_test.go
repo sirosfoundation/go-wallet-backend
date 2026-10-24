@@ -199,3 +199,25 @@ func TestKeyAttestationStore_CompetingWritersKeepStrongestEvidence(t *testing.T)
 		require.True(t, created.Equal(got.CreatedAt), "round %d: created_at changed", round)
 	}
 }
+
+// The user scope survives a round trip, and documents written before it
+// existed decode with no user scope.
+func TestKeyAttestationStore_UserScopeRoundTrip(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	kas := store.KeyAttestations()
+	u := domain.UserIDFromString("u-scope")
+	require.NoError(t, kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{KeyThumbprint: "thumb-scope", TenantID: "acme", UserID: &u, Kind: domain.KeyEvidenceAppAttestAssertion, Home: domain.KeyHomeSecureEnclaveAsserted, VerifiedAt: time.Now().UTC()}))
+	got, err := kas.GetByKeyThumbprint(ctx, "thumb-scope")
+	require.NoError(t, err)
+	require.NotNil(t, got.UserID)
+	require.Equal(t, "u-scope", got.UserID.ID)
+	require.True(t, got.InScope("acme", &u))
+	require.False(t, got.InScope("acme", nil))
+
+	legacy, err := bson.Marshal(bson.M{"_id": "thumb-old2", "tenant_id": "t", "aaguid": "a", "verified_at": time.Now().UTC()})
+	require.NoError(t, err)
+	var rec domain.KeyAttestationRecord
+	require.NoError(t, bson.Unmarshal(legacy, &rec))
+	require.Nil(t, rec.UserID)
+}

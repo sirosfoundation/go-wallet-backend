@@ -241,12 +241,17 @@ func (s *WIAService) verifyKeyAttestation(ctx context.Context, v InstanceKeyEvid
 	rec.KeyThumbprint = jkt
 	rec.WalletInstanceID = jkt
 	rec.TenantID = tenantID
+	rec.UserID = nil
+	if userID != nil {
+		u := *userID
+		rec.UserID = &u
+	}
 	if rec.VerifiedAt.IsZero() {
 		rec.VerifiedAt = now
 	}
 	if s.keyAttestations != nil {
 		if err := s.keyAttestations.MarkKeyAttested(ctx, rec); err != nil {
-			return nil, fmt.Errorf("store instance key evidence: %w", err)
+			return nil, fmt.Errorf("%w: store instance key evidence: %v", ErrWIAKeyAttestationUnavailable, err)
 		}
 	}
 	return rec, nil

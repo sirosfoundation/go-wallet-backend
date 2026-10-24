@@ -141,11 +141,13 @@ func simWIA(a *Assessor, f Facts) *WIAOutcome {
 
 // The documented App Attest assertion S1 template (shipped commented in
 // production.rules.example).
-const appAttestAssertionTemplate = "(assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform (source platform_attested))(hsm)(instance_key (kind app_attest_assertion)(home)(level)(boot)(binding assertion)))))"
+const appAttestAssertionTemplate = "(assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform)(hsm)(instance_key (kind app_attest_assertion)(home)(level)(boot)(binding assertion)))))"
 
 func TestInstanceKey_AppAttestAssertionTemplate(t *testing.T) {
 	a := newAssessor(t, wiaCfg(), "# id: s1-app-attest\n"+appAttestAssertionTemplate+"\n")
-	plat := &PlatformVerified{Source: "platform_attested"}
+	// A renewal WIA carries no native attestation object: its platform source is
+	// backend_attested. The template must still select S1 for it.
+	plat := &PlatformVerified{Source: "backend_attested"}
 	cases := map[string]struct {
 		ik   *InstanceKeyVerified
 		want string

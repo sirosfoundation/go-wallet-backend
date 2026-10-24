@@ -34,6 +34,9 @@ var (
 	// ErrWIARefusedByPolicy is returned when the assurance policy is enabled
 	// and no assure-wia-issue rule permits the evidence of this request.
 	ErrWIARefusedByPolicy = errors.New("WIA refused by assurance policy")
+	// ErrWIANativeAttestationUnavailable means the native attestation could not
+	// be judged or recorded because storage failed; refused, retryable (503).
+	ErrWIANativeAttestationUnavailable = errors.New("native attestation cannot be verified right now")
 )
 
 // WIAChallenge is a single-use nonce for WIA generation.
@@ -406,6 +409,9 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 			// When native attestation is submitted but fails, reject the request.
 			// If the client doesn't want native attestation, it should omit the field.
 			nativeAttestationErrors.Inc()
+			if errors.Is(err, ErrNativeAttestationUnavailable) {
+				return "", fmt.Errorf("%w: %v", ErrWIANativeAttestationUnavailable, err)
+			}
 			return "", fmt.Errorf("%w: native attestation failed: %v", ErrWIAPopInvalid, err)
 		}
 		if result.Verified {
@@ -429,7 +435,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 			return "", err
 		}
 	}
-	att.KeyEvidence = s.instanceKeyEvidence(ctx, jkt)
+	att.KeyEvidence = s.instanceKeyEvidence(ctx, tenantID, userID, jkt)
 	if att.KeyEvidence == nil && s.keyAttestations == nil {
 		att.KeyEvidence = submitted // nothing durable to read back from
 	}
@@ -487,8 +493,8 @@ type wiaAttestation struct {
 // evidence says nothing about the derived key unless a later stage binds them.
 //
 // A store error is treated as no evidence (fail closed to unknown), never as
-// permission.
-func (s *WIAService) instanceKeyEvidence(ctx context.Context, jkt string) *domain.KeyAttestationRecord {
+// permission. So is a record that was verified for another tenant or user.
+func (s *WIAService) instanceKeyEvidence(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID, jkt string) *domain.KeyAttestationRecord {
 	if s.keyAttestations == nil {
 		return nil
 	}
@@ -497,6 +503,12 @@ func (s *WIAService) instanceKeyEvidence(ctx context.Context, jkt string) *domai
 		if !errors.Is(err, storage.ErrNotFound) {
 			s.logger.Warn("instance key evidence lookup failed; treating as none", zap.Error(err))
 		}
+		return nil
+	}
+	// Evidence verified for one tenant/user is not lent to another: a caller
+	// that merely holds the same (exportable) key must bring its own evidence.
+	if !rec.InScope(tenantID, userID) {
+		s.logger.Warn("instance key evidence belongs to another caller; treating as none")
 		return nil
 	}
 	return rec

@@ -395,14 +395,25 @@ clientDataHash = SHA-256( "siros-instance-key-v1" || C || jkt )
 `C` is the WIA challenge string exactly as issued (its ASCII bytes, the same
 value the Android derived challenge uses) and `jkt` is the RFC 7638 thumbprint of
 the PoP key as its base64url string (ASCII bytes), concatenated with no
-separator. The backend verifies ECDSA over SHA-256(`authenticatorData` ||
-`clientDataHash`) with the **stored** public key, `rpIdHash` equal to
+separator. Apple defines `nonce = SHA-256(authenticatorData || clientDataHash)`
+and the assertion signature is ECDSA-with-SHA-256 over that nonce, so over its
+hash again; the backend verifies that with the **stored** public key, `rpIdHash` equal to
 SHA-256(`apple_app_id`), the counter strictly above the stored one, and that the
 key belongs to the caller's tenant and user, is active (not revoked) and was
 attested in the configured environment. The signature is verified before the
 counter moves, so an unauthenticated request cannot burn a key's counter. The
 WIA challenge is single-use. A submitted assertion that fails any check refuses
 the WIA; no `key_attestation` leaves the instance key without evidence.
+
+**Scope of stored evidence.** A per-key record keeps the tenant and, when the
+verifier knew one, the user it was verified for (`user_id`). WIA issuance and the
+assurance preview use a stored record only for that tenant and user: a caller
+that merely holds the same (exportable) PoP key under another user or tenant
+gets no evidence from the cache and must bring its own assertion. Records stored
+before the field existed carry no user scope and are not restricted by user.
+Instance-key evidence of any kind other than FIDO2 is never read as key-storage
+evidence for a credential key, even when the same key is submitted in a Key
+Attestation batch.
 
 **What an assertion proves, and what it does not.** It proves that an attested
 app instance endorsed this instance key at this challenge: "an attested app
@@ -428,10 +439,15 @@ test over the shipped rule files, commented templates included). The shipped,
 commented S1 template in `deploy/assurance/production.rules.example` is
 
 ```
-(assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform (source platform_attested))(hsm)(instance_key (kind app_attest_assertion)(home)(level)(boot)(binding assertion)))))
+(assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform)(hsm)(instance_key (kind app_attest_assertion)(home)(level)(boot)(binding assertion)))))
 ```
 
 Slots match by position, so the bare `(home)(level)(boot)` hold their places.
+The `platform` slot is a bare "don't care" on purpose: a renewal WIA carries no
+native attestation object (the App Attest key was attested once, earlier), so its
+platform source is `backend_attested`; the assertion is what proves an attested
+app instance is behind the request. A rule requiring `platform_attested` too
+would only match the one WIA that carried the attestation object.
 
 **WSCD type.** `wscdTypeFromKeyHome` maps `secure_enclave_asserted` to
 `native_ios` (stage B1). Because the home is only asserted, a deployment that

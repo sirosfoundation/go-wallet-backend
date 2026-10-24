@@ -28,6 +28,10 @@ import (
 var (
 	ErrNativeAttestationDisabled = errors.New("native attestation verification is not enabled")
 	ErrNativeAttestationInvalid  = errors.New("native attestation verification failed")
+	// ErrNativeAttestationUnavailable means a valid-looking attestation could
+	// not be judged or recorded because storage failed. It is not a client
+	// error: the request is refused and may be retried.
+	ErrNativeAttestationUnavailable = errors.New("native attestation cannot be verified right now")
 )
 
 // NativeAttestationType identifies the platform attestation type.
@@ -436,11 +440,11 @@ func (s *NativeAttestationService) persistAppAttestKey(ctx context.Context, bind
 		return nil
 	}
 	if !errors.Is(err, storage.ErrAlreadyExists) {
-		return fmt.Errorf("store attested key: %w", err)
+		return fmt.Errorf("%w: store attested key: %v", ErrNativeAttestationUnavailable, err)
 	}
 	existing, err := s.appAttestKeys.Get(ctx, rec.KeyID)
 	if err != nil {
-		return fmt.Errorf("load attested key: %w", err)
+		return fmt.Errorf("%w: load attested key: %v", ErrNativeAttestationUnavailable, err)
 	}
 	switch {
 	case !existing.IsActive():

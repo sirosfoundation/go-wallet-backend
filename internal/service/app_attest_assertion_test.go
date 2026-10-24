@@ -2,7 +2,11 @@ package service
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -716,5 +720,280 @@ func TestAppAttest_AttestOnceThenAssertForLaterWIAs(t *testing.T) {
 	})
 	if !errors.Is(err, ErrWIAKeyAttestationInvalid) {
 		t.Fatalf("foreign user: err = %v", err)
+	}
+}
+
+// ---- review follow-ups ----
+
+// Independent interoperability vector: generated with OpenSSL (Python
+// cryptography), not with this code. Apple defines nonce = SHA-256(authData ||
+// clientDataHash) and the signature is ECDSA-with-SHA-256 over the nonce, i.e.
+// over its hash again, which is what an ECDSA-SHA256 implementation produces
+// when asked to sign the nonce bytes. NOT captured from a device; a real
+// device capture should be added when one is available.
+func TestAppAttestAssertion_IndependentlyGeneratedVector(t *testing.T) {
+	mustHex := func(s string) []byte {
+		b, err := hex.DecodeString(s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return b
+	}
+	pub := mustHex("0492cb9907c1a2269d6b4cc793d91c7cce0c141fd4fbf627163f796fe06a86ad4a9fece7cbe4aed0c7665e7e33e929067b891d836ae00dbff3dc8afaadb969aa25")
+	authData := mustHex("d16f4131385fa57127c04450e362e990f08119f946d44314cab368cca47c167b0000000001")
+	sig := mustHex("304402203481d95f4732d60db1fbe1c854d6a8a00e94d10f7c5207ce71f84fbfbfc3023902200edc82917987ea517df9590a704e854af6b4ff7a3507fc005e449a9414310d05")
+	const keyID = "Ju3TG9M5sluwGChWwEOS2rukZMhrKuDSmdEeiS2gAOg="
+	if got := hex.EncodeToString(AppAttestClientDataHash("vector-challenge-C", "vector-jkt")); got != "4f46c47c3457350bbb6f30090c3a4c48d7342b891d75e9ac84e67e36a5eaf6b8" {
+		t.Fatalf("clientDataHash does not match the independent computation: %s", got)
+	}
+	keys := memory.NewStore().AppAttestKeys()
+	_ = keys.Create(context.Background(), &domain.AppAttestKeyRecord{
+		KeyID: keyID, PublicKey: pub, Environment: domain.AppAttestProduction, ChainVerified: true,
+		TenantID: "acme", Status: domain.AppAttestKeyActive,
+	})
+	v, err := NewAppAttestAssertionVerifier(keys, "TEAM123.com.example.test", "production", zap.NewNop())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cborBytes, _ := cbor.Marshal(map[string]any{"signature": sig, "authenticatorData": authData})
+	payload, _ := json.Marshal(map[string]string{"type": "app_attest_assertion", "key_id": keyID, "assertion": base64.StdEncoding.EncodeToString(cborBytes)})
+	res, err := v.Verify(context.Background(), &InstanceKeyEvidenceInput{
+		Payload: payload, Thumbprint: "vector-jkt", TenantID: "acme", WIAChallenge: "vector-challenge-C", Now: time.Now(),
+	})
+	if err != nil || res.Record == nil {
+		t.Fatalf("independent vector rejected: %v %+v", err, res)
+	}
+}
+
+// Evidence verified for one tenant/user is not lent to another caller that
+// merely holds the same key.
+func TestAppAttestAssertion_CachedEvidenceIsScopedToTheVerifiedCaller(t *testing.T) {
+	e := newAssertionE2E(t, wiaNeedsAssertionRules)
+	owner := userPtr("owner")
+	// The key attested for no user: re-attest for a user-bound key instead.
+	if err := e.appKeys.Revoke(context.Background(), e.dev.keyIDB64()); err != nil {
+		t.Fatal(err)
+	}
+	e.dev = newTestAppAttestDevice(t)
+	pub, _ := e.dev.key.PublicKey.ECDH()
+	_ = e.appKeys.Create(context.Background(), &domain.AppAttestKeyRecord{
+		KeyID: e.dev.keyIDB64(), PublicKey: pub.Bytes(), Environment: domain.AppAttestProduction, AppID: testAppAttestAppID,
+		ChainVerified: true, TenantID: domain.DefaultTenantID, UserID: owner, Status: domain.AppAttestKeyActive,
+	})
+
+	// The owner endorses a PoP key; the record is bound to the owner.
+	ctx := context.Background()
+	challenge, _, _ := e.svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	pop, key := createTestPop(t, challenge)
+	jkt := expectedThumbprint(t, &key.PublicKey)
+	a := e.dev.assertion(t, AppAttestClientDataHash(challenge, jkt), assertionOpts{appID: testAppAttestAppID, counter: 1})
+	raw, _ := json.Marshal(map[string]string{"type": "app_attest_assertion", "key_id": e.dev.keyIDB64(), "assertion": a})
+	if _, err := e.svc.GenerateWIA(ctx, domain.DefaultTenantID, owner, &WIARequest{Pop: pop, Challenge: challenge, KeyAttestation: &KeyAttestation{Type: KeyAttestationAppAttestAssertion, Raw: raw}}); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := e.records.GetByKeyThumbprint(ctx, jkt)
+	if err != nil || rec.UserID == nil || rec.UserID.ID != "owner" || rec.TenantID != domain.DefaultTenantID {
+		t.Fatalf("record scope = %+v (%v)", rec, err)
+	}
+
+	renew := func(tenant domain.TenantID, user *domain.UserID) error {
+		c, _, _ := e.svc.CreateChallenge(ctx, tenant)
+		p := resignPop(t, key, c)
+		_, err := e.svc.GenerateWIA(ctx, tenant, user, &WIARequest{Pop: p, Challenge: c})
+		return err
+	}
+	// The same user renews from the cache without resubmitting.
+	if err := renew(domain.DefaultTenantID, owner); err != nil {
+		t.Fatalf("owner renewal from cached evidence: %v", err)
+	}
+	// Another user, a caller with no user, and another tenant holding the same key get nothing.
+	for name, c := range map[string]struct {
+		tenant domain.TenantID
+		user   *domain.UserID
+	}{
+		"other user": {domain.DefaultTenantID, userPtr("thief")},
+		"no user":    {domain.DefaultTenantID, nil},
+	} {
+		if err := renew(c.tenant, c.user); !errors.Is(err, ErrWIARefusedByPolicy) {
+			t.Errorf("%s: cached evidence was lent (err=%v)", name, err)
+		}
+	}
+	if got := e.svc.instanceKeyEvidence(ctx, "other-tenant", owner, jkt); got != nil {
+		t.Error("cached evidence was lent to another tenant")
+	}
+}
+
+type failingMarkStore struct{ storage.KeyAttestationStore }
+
+func (failingMarkStore) MarkKeyAttested(context.Context, *domain.KeyAttestationRecord) error {
+	return errors.New("db down")
+}
+
+// An outage while storing the verified record is "unavailable" (503), not an
+// unclassified 500, and no WIA is issued.
+func TestAppAttestAssertion_RecordStoreOutageIsUnavailable(t *testing.T) {
+	e := newAssertionE2E(t, wiaAnyRules)
+	e.svc.SetKeyAttestations(failingMarkStore{e.records})
+	_, _, err := e.wia(t, nil, e.assertion(t, 1))
+	if !errors.Is(err, ErrWIAKeyAttestationUnavailable) {
+		t.Fatalf("err = %v, want unavailable", err)
+	}
+}
+
+// A renewal WIA, which carries no native attestation object (platform source
+// backend_attested), still gets S1 from the documented template.
+func TestAppAttestAssertion_RenewalSelectsS1ThroughTheShippedTemplate(t *testing.T) {
+	rules := "# id: s1-app-attest\n" +
+		"(assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform)(hsm)(instance_key (kind app_attest_assertion)(home)(level)(boot)(binding assertion)))))\n" +
+		"# id: issue\n(assure-wia-issue (evidence (verified (fido2)(platform)(hsm)(instance_key))))\n"
+	e := newAssertionE2E(t, rules)
+	tok, _, err := e.wia(t, nil, e.assertion(t, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := wiaClaims(t, tok)["attestation_source"]; got != "platform_attested" {
+		t.Fatalf("attestation_source = %v, want the S1 value", got)
+	}
+	tok, _, err = e.wia(t, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := wiaClaims(t, tok)["attestation_source"]; got != "backend_attested" {
+		t.Fatalf("no evidence: attestation_source = %v, want the floor", got)
+	}
+}
+
+// A key-storage (K) decision never reads instance-key evidence: a record of an
+// instance-key kind for a key submitted as a credential key does not vouch for
+// it, only a FIDO2 record does.
+func TestKeyAttestationTrustsBatch_InstanceKeyEvidenceIsNotKeyStorageEvidence(t *testing.T) {
+	svc, _, keys := newTestWalletProviderServiceWithInstances(t)
+	ctx := context.Background()
+	// One fresh key per case: a stored record is never replaced by a different kind.
+	freshKey := func() (map[string]interface{}, string) {
+		ck, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return map[string]interface{}{
+			"kty": "EC", "crv": "P-256",
+			"x": base64.RawURLEncoding.EncodeToString(ck.PublicKey.X.FillBytes(make([]byte, 32))),
+			"y": base64.RawURLEncoding.EncodeToString(ck.PublicKey.Y.FillBytes(make([]byte, 32))),
+		}, expectedThumbprint(t, &ck.PublicKey)
+	}
+	for name, c := range map[string]struct {
+		rec  domain.KeyAttestationRecord
+		want bool
+	}{
+		"app_attest_assertion": {domain.KeyAttestationRecord{Kind: domain.KeyEvidenceAppAttestAssertion, Home: domain.KeyHomeSecureEnclaveAsserted}, false},
+		"android_key":          {domain.KeyAttestationRecord{Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox}, false},
+		"fido2":                {domain.KeyAttestationRecord{Kind: domain.KeyEvidenceFIDO2, Home: domain.KeyHomeFIDO2Hardware, AAGUID: "a"}, true},
+	} {
+		j, tp := freshKey()
+		rec := c.rec
+		rec.KeyThumbprint, rec.VerifiedAt = tp, time.Now()
+		if err := keys.MarkKeyAttested(ctx, &rec); err != nil {
+			t.Fatal(err)
+		}
+		if got := svc.keyAttestationTrustsBatch(ctx, "", []map[string]interface{}{j}); got != c.want {
+			t.Errorf("%s evidence: batch trusted = %v, want %v", name, got, c.want)
+		}
+	}
+}
+
+// Storage failures while recording an attested key refuse the WIA as
+// unavailable (retryable), never as an invalid attestation.
+type failingAppAttestCreate struct {
+	storage.AppAttestKeyStore
+	create, get error
+}
+
+func (f failingAppAttestCreate) Create(ctx context.Context, r *domain.AppAttestKeyRecord) error {
+	if f.create != nil {
+		return f.create
+	}
+	return f.AppAttestKeyStore.Create(ctx, r)
+}
+
+func (f failingAppAttestCreate) Get(ctx context.Context, id string) (*domain.AppAttestKeyRecord, error) {
+	if f.get != nil {
+		return nil, f.get
+	}
+	return f.AppAttestKeyStore.Get(ctx, id)
+}
+
+func TestAppAttest_PersistenceFailureIsUnavailableNotInvalid(t *testing.T) {
+	d := newTestAppAttestDevice(t)
+	t.Run("create fails", func(t *testing.T) {
+		h := newAppAttestHarness(t, "production")
+		h.svc.SetAppAttestKeys(failingAppAttestCreate{AppAttestKeyStore: h.keys, create: errors.New("db down")})
+		_, err := h.verify(t, testBinding, d, d.keyIDB64(), "c", attOpts{})
+		if !errors.Is(err, ErrNativeAttestationUnavailable) || errors.Is(err, ErrNativeAttestationInvalid) {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("get fails after a duplicate", func(t *testing.T) {
+		h := newAppAttestHarness(t, "production")
+		if _, err := h.verify(t, testBinding, d, d.keyIDB64(), "c", attOpts{}); err != nil {
+			t.Fatal(err)
+		}
+		h.svc.SetAppAttestKeys(failingAppAttestCreate{AppAttestKeyStore: h.keys, get: errors.New("db down")})
+		_, err := h.verify(t, testBinding, d, d.keyIDB64(), "c2", attOpts{})
+		if !errors.Is(err, ErrNativeAttestationUnavailable) {
+			t.Fatalf("err = %v", err)
+		}
+	})
+	t.Run("through GenerateWIA", func(t *testing.T) {
+		h := newAppAttestHarness(t, "production")
+		h.svc.SetAppAttestKeys(failingAppAttestCreate{AppAttestKeyStore: h.keys, create: errors.New("db down")})
+		svc, _ := newTestWIAServiceWithInstances(t)
+		svc.nativeAttSvc = h.svc
+		ctx := context.Background()
+		challenge, _, _ := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+		pop, _ := createTestPop(t, challenge)
+		_, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{
+			Pop: pop, Challenge: challenge,
+			NativeAttestation: &NativeAttestationRequest{
+				Type: NativeAttestationAppleAppAttest, KeyID: d.keyIDB64(), Challenge: challenge,
+				Token: d.attestation(t, h.ca, challenge, attOpts{appID: testAppAttestAppID}),
+			},
+		})
+		if !errors.Is(err, ErrWIANativeAttestationUnavailable) || errors.Is(err, ErrWIAPopInvalid) {
+			t.Fatalf("err = %v", err)
+		}
+	})
+}
+
+// The preview reads the instance key's evidence like GenerateWIA does, so it
+// applies the same caller scope: evidence verified for another user is not used.
+func TestPreview_InstanceKeyEvidenceIsScopedToTheCaller(t *testing.T) {
+	rules := "# id: needs-assertion\n(assure-wia-issue (evidence (verified (fido2)(platform)(hsm)(instance_key (kind app_attest_assertion)(home secure_enclave_asserted)(level)(boot)(binding assertion)))))\n"
+	svc, instances, keys := assuranceSvc(t, nil, rules)
+	ctx := context.Background()
+	owner := domain.UserIDFromString("owner")
+	other := domain.UserIDFromString("someone-else")
+	for id, c := range map[string]struct {
+		recUser *domain.UserID
+		want    bool
+	}{"inst-own": {&owner, true}, "inst-foreign": {&other, false}} {
+		if err := instances.Upsert(ctx, &domain.WalletInstance{
+			ID: id, TenantID: "t1", UserID: &owner, AttestationSource: "backend_attested", Status: domain.InstanceStatusActive, LastAttestedAt: time.Now(),
+		}); err != nil {
+			t.Fatal(err)
+		}
+		rec := domain.KeyAttestationRecord{
+			KeyThumbprint: id, TenantID: "t1", UserID: c.recUser,
+			Kind: domain.KeyEvidenceAppAttestAssertion, Home: domain.KeyHomeSecureEnclaveAsserted, VerifiedAt: time.Now(),
+		}
+		if err := keys.MarkKeyAttested(ctx, &rec); err != nil {
+			t.Fatal(err)
+		}
+		got, err := svc.PreviewAssurance(WithKeyAttestationCaller(ctx, KeyAttestationCaller{TenantID: "t1", UserID: "owner"}), &AssurancePreviewRequest{WalletInstanceID: id})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.WIAIssue != c.want {
+			t.Errorf("%s: WIAIssue = %v, want %v", id, got.WIAIssue, c.want)
+		}
 	}
 }
