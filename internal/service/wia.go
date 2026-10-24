@@ -817,3 +817,24 @@ func (s *WIAService) emitAuditFailure(reason string, err error) {
 		})
 	}
 }
+
+// wscdTypeFromKeyHome maps the verified home of a key to the WSCD type an
+// instance records. It must only be called with the Home of a VERIFIED
+// key-evidence record (storage returns only verified records); with nothing
+// verified the type is domain.WSCDTypeUnknown, never a guess from the
+// client-reported plugin or from the platform attestation.
+//
+// KeyHomeSecureEnclaveAsserted deliberately maps to unknown: an App Attest
+// assertion proves that an attested app endorsed the key, not that the key
+// resides in the Secure Enclave, so it must not be recorded as native_ios.
+func wscdTypeFromKeyHome(home domain.KeyHome) domain.WSCDType {
+	switch home {
+	case domain.KeyHomeStrongBox, domain.KeyHomeTEE:
+		return domain.WSCDTypeNativeAndroid
+	case domain.KeyHomeFIDO2Hardware:
+		return domain.WSCDTypeFIDO2Hardware
+	case domain.KeyHomeHSM:
+		return domain.WSCDTypeRemote
+	}
+	return domain.WSCDTypeUnknown
+}

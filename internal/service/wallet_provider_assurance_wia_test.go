@@ -669,3 +669,31 @@ func TestPreview_StaleInstanceIsUnknown(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// Registration ignores a submission that would downgrade stored evidence, so
+// the dry run must answer from the stored record, not from the submission.
+func TestPreview_IgnoredDowngradeAnswersFromStoredRecord(t *testing.T) {
+	aaguid := uuid.MustParse("00000000-0000-0000-0000-0000000000aa")
+	svc, _, keys := previewSvc(t, strings.ReplaceAll(previewRules, "aa1", aaguid.String()), true)
+
+	noUV, tp := fido2Submission(t, aaguid, 0x40|0x01)
+	got, err := svc.PreviewAssurance(context.Background(), &AssurancePreviewRequest{FIDO2: noUV})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UserAuthentication[0] != "iso_18045_basic" {
+		t.Fatalf("without stored evidence the submission decides: %+v", got)
+	}
+
+	// The same key is already stored with UV (what Verify would keep).
+	if err := keys.MarkKeyAttested(context.Background(), &domain.KeyAttestationRecord{KeyThumbprint: tp, AAGUID: aaguid.String(), UV: true, VerifiedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = svc.PreviewAssurance(context.Background(), &AssurancePreviewRequest{FIDO2: noUV})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UserAuthentication[0] != "iso_18045_moderate" {
+		t.Fatalf("preview reflects a downgrade the store would ignore: %+v", got)
+	}
+}
