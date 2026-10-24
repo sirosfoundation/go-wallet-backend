@@ -124,6 +124,18 @@ func (h KeyHome) rank() int {
 	return 0
 }
 
+// Clone returns a copy that shares no mutable state with r (DeviceLocked is a
+// pointer). Stores clone on write and on read so a caller can never change
+// stored evidence through a pointer it holds.
+func (r *KeyAttestationRecord) Clone() *KeyAttestationRecord {
+	c := *r
+	if r.DeviceLocked != nil {
+		v := *r.DeviceLocked
+		c.DeviceLocked = &v
+	}
+	return &c
+}
+
 // Normalize applies the defaults that make a record stored before Kind and
 // Home existed read as what it was: a FIDO2 record whose home is a hardware
 // authenticator. Stores call it on every read and before every comparison.

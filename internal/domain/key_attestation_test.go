@@ -41,3 +41,13 @@ func TestKeyAttestationRecord_Supersedes(t *testing.T) {
 		}
 	}
 }
+
+func TestKeyAttestationRecord_CloneDoesNotShareDeviceLocked(t *testing.T) {
+	v := true
+	r := &KeyAttestationRecord{DeviceLocked: &v}
+	c := r.Clone()
+	*c.DeviceLocked = false
+	if !*r.DeviceLocked {
+		t.Fatal("clone shares DeviceLocked")
+	}
+}

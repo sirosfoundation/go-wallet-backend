@@ -19,7 +19,7 @@ func (s *KeyAttestationStore) MarkKeyAttested(_ context.Context, rec *domain.Key
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	stored := *rec
+	stored := *rec.Clone()
 	stored.Normalize()
 	if existing, ok := s.data[rec.KeyThumbprint]; ok {
 		// Never overwrite with weaker or absent evidence.
@@ -40,9 +40,9 @@ func (s *KeyAttestationStore) GetByKeyThumbprint(_ context.Context, thumbprint s
 	defer s.mu.RUnlock()
 
 	if rec, ok := s.data[thumbprint]; ok {
-		out := *rec
+		out := rec.Clone()
 		out.Normalize()
-		return &out, nil
+		return out, nil
 	}
 	return nil, storage.ErrNotFound
 }
