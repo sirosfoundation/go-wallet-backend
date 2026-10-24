@@ -226,7 +226,15 @@ Same schema and slot order as above (schema version unchanged).
   carried no native attestation (the baseline, which key attestation also sees
   as the stored source). It is never the instance's stored state from an
   earlier request.
-* `fido2` is `none`: a WIA request carries no FIDO2 evidence.
+* `fido2` is filled from the verified key-evidence record stored for the
+  **instance key** (the thumbprint of the PoP key), when there is one and its
+  kind is `fido2`; otherwise `none` (a WIA request itself carries no FIDO2
+  evidence). This is KEY evidence about the instance key: K and S stay
+  orthogonal, no shipped rule derives a credential key's KA level from it, and
+  key attestation for credential keys only counts `fido2` records (never
+  records of another kind). Caveat (ARKG): if the attested credential public
+  key is not the PoP key (for example the PoP key is derived from it), the
+  thumbprints differ, nothing matches and the result stays `none`.
 * `claimed` is empty: a WIA request carries no client claims, so there is no
   lower-by-claims gate for the S dimension (the gates exist per dimension
   where a client claim exists: key storage and user authentication).
@@ -274,15 +282,19 @@ value, certification entry. The `WIA issued` audit event additionally carries
 
 ### WSCD type
 
-The wallet instance's `wscd_type` is recorded as `unknown` by the WIA path on
-every attestation. The WIA PoP key is the wallet's **instance key in its own
+The wallet instance's `wscd_type` is `unknown` unless verified per-key evidence
+says otherwise. The WIA PoP key is the wallet's **instance key in its own
 keystore** (a software store or any WSCD plugin), not the App Attest / Play
-Integrity attestation key, and nothing verifies where it lives, so no type is
-derived from the platform attestation (`native_*`) and none is guessed
-(`web_crypto`), including for `development_attested`. Instances stored earlier
-may still carry `web_crypto`, `native_*` or an empty type; they are
-overwritten at their next attestation. An earlier version switched on the names
-`ios_app_attest` and `android_play_integrity`, which no verifier stores.
+Integrity attestation key. The WIA path looks the PoP key's thumbprint up in
+the store of verified per-key evidence; when a record exists, `wscd_type` is
+`wscdTypeFromKeyHome(record.home)` (see "Per-key evidence record" below), else
+`unknown`. Nothing is derived from the platform attestation (`native_*` is not
+guessed from App Attest / Play Integrity), from the client-reported plugin, or
+as `web_crypto` (including for `development_attested`). Instances stored
+earlier may still carry `web_crypto`, `native_*` or an empty type; they are
+overwritten at their next attestation. A store error counts as no evidence.
+An earlier version switched on the names `ios_app_attest` and
+`android_play_integrity`, which no verifier stores.
 
 `wscd_type` is never assurance evidence: the evidence schema has no slot for it
 and no rule can read it (pinned by a test).
