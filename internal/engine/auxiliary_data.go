@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 )
 
@@ -135,20 +136,57 @@ func secretDeliveryOf(config *CredentialConfig) (secretDelivery, error) {
 // configuration is not offered. A document that does not decode as a
 // configuration is not judged here.
 func AdvertisementMalformed(configuration json.RawMessage) bool {
-	// Decode only the two members the advertisement lives in, so that a type
-	// error in an unrelated member (say "format":123) cannot disable the check.
-	var cfg struct {
-		CredentialMetadata     json.RawMessage `json:"credential_metadata"`
-		AuxiliaryDataSupported json.RawMessage `json:"auxiliary_data_supported"`
+	// Read only the two members the advertisement lives in, by exact key, so
+	// that a type error in an unrelated member (say "format":123) cannot
+	// disable the check.
+	cm, aux, err := advertisementMembers(configuration)
+	if err != nil {
+		if errors.Is(err, errMalformedAdvertisement) {
+			return true
+		}
+		return false // not a JSON object: not judged here
 	}
-	if json.Unmarshal(configuration, &cfg) != nil {
-		return false
-	}
-	_, err := secretDeliveryOf(&CredentialConfig{
-		CredentialMetadata:     cfg.CredentialMetadata,
-		AuxiliaryDataSupported: cfg.AuxiliaryDataSupported,
-	})
+	_, err = secretDeliveryOf(&CredentialConfig{CredentialMetadata: cm, AuxiliaryDataSupported: aux})
 	return err != nil
+}
+
+// advertisementMembers extracts credential_metadata and
+// auxiliary_data_supported from a credential configuration by EXACT key.
+// encoding/json matches struct fields case-insensitively (and folds characters
+// such as U+017F to "s"), so a second, benign-looking key could otherwise
+// shadow the real member for one reader and not for another. A configuration
+// with any other key that case-folds to either name is malformed: fail closed.
+func advertisementMembers(configuration json.RawMessage) (cm, aux json.RawMessage, err error) {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(configuration, &m); err != nil || m == nil {
+		return nil, nil, errors.New("credential configuration is not an object")
+	}
+	for k := range m {
+		for _, name := range []string{"credential_metadata", "auxiliary_data_supported"} {
+			if k != name && strings.EqualFold(k, name) {
+				return nil, nil, fmt.Errorf("%w: ambiguous %s member", errMalformedAdvertisement, name)
+			}
+		}
+	}
+	return m["credential_metadata"], m["auxiliary_data_supported"], nil
+}
+
+// UnmarshalJSON decodes a credential configuration, taking the two
+// advertisement members by exact key (see advertisementMembers) rather than
+// through encoding/json's case-insensitive field matching.
+func (c *CredentialConfig) UnmarshalJSON(data []byte) error {
+	type plain CredentialConfig // no methods: avoids recursion
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	cm, aux, err := advertisementMembers(data)
+	if err != nil {
+		return err
+	}
+	p.CredentialMetadata, p.AuxiliaryDataSupported = cm, aux
+	*c = CredentialConfig(p)
+	return nil
 }
 
 type auxAdvertisement struct {

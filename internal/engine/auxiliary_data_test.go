@@ -376,3 +376,33 @@ type closeTracker struct {
 }
 
 func (c *closeTracker) Close() error { c.closed = true; return nil }
+
+// encoding/json matches field names case-insensitively and folds U+017F to
+// "s": a look-alike key must not shadow the real advertisement for any reader.
+func TestAdvertisement_CaseFoldedLookAlikeKeysAreMalformed(t *testing.T) {
+	const real = `"auxiliary_data_supported":{"to_wallet":[` + auxToWalletSSC + `]}`
+	for name, doc := range map[string]string{
+		"long s after":         `{"format":"mso_mdoc",` + real + `,"auxiliary_data_ſupported":{"to_issuer":[{"type":"x"}]}}`,
+		"long s before":        `{"format":"mso_mdoc","auxiliary_data_ſupported":{"to_issuer":[{"type":"x"}]},` + real + `}`,
+		"upper case":           `{"format":"mso_mdoc",` + real + `,"AUXILIARY_DATA_SUPPORTED":{"to_issuer":[{"type":"x"}]}}`,
+		"metadata look-alike":  `{"format":"mso_mdoc","credential_metadata":{"display":[]},"Credential_Metadata":{"auxiliary_data":[{"opening":"SECRETOPENING"}]}}`,
+		"metadata kelvin sign": `{"format":"mso_mdoc","credential_Key":1,"CREDENTIAL_METADATA":{}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.True(t, AdvertisementMalformed(json.RawMessage(doc)))
+			var ccs CredentialConfigurations
+			require.NoError(t, json.Unmarshal([]byte(`{"c":`+doc+`}`), &ccs))
+			assert.NotContains(t, ccs, "c", "the configuration is not offered")
+			var cfg CredentialConfig
+			require.Error(t, json.Unmarshal([]byte(doc), &cfg))
+		})
+	}
+
+	// The exact key is what is read, and other members are untouched.
+	var cfg CredentialConfig
+	require.NoError(t, json.Unmarshal([]byte(`{"format":"mso_mdoc","vct":"v",`+real+`}`), &cfg))
+	assert.Equal(t, "v", cfg.VCT)
+	d, err := secretDeliveryOf(&cfg)
+	require.NoError(t, err)
+	assert.True(t, d.requireEncryption)
+}
