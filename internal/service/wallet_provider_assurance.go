@@ -1,0 +1,153 @@
+package service
+
+import (
+	"context"
+	"errors"
+
+	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
+)
+
+// ErrAssuranceUnavailable is returned when the assurance policy is enabled
+// but no usable policy is loaded. Key Attestation then fails closed instead
+// of silently falling back to a different decision procedure.
+var ErrAssuranceUnavailable = errors.New("assurance policy enabled but not loaded")
+
+// SetAssessor installs the assurance policy used when
+// wallet_provider.attestation.assurance.enabled is true.
+func (s *WalletProviderService) SetAssessor(a *assurance.Assessor) {
+	if a != nil {
+		// iso_18045 also accepts the legacy SIROS vocabulary
+		// ("software", "hardware", ...) the clients send, mapped exactly
+		// as the non-policy path maps it.
+		a.NormalizeClaim = func(schemeID, raw string) string {
+			if schemeID == config.DefaultLevelSchemeID {
+				v, _ := isoAttackPotential(raw, false)
+				return v
+			}
+			return raw
+		}
+	}
+	s.assessor = a
+}
+
+func (s *WalletProviderService) assuranceEnabled() bool {
+	return s.cfg != nil && s.cfg.WalletProvider.Attestation.Assurance.Enabled
+}
+
+// assuranceFacts gathers what the backend itself verified for this request
+// (per-key FIDO2 records, the instance's platform attestation source) and,
+// separately, what the client claimed. Verified facts never come from the
+// request.
+func (s *WalletProviderService) assuranceFacts(ctx context.Context, walletInstanceID string, jwks []map[string]interface{}, secProps *SecurityProperties) assurance.Facts {
+	var f assurance.Facts
+
+	if walletInstanceID != "" && s.instances != nil {
+		instance, err := s.instances.GetByID(ctx, walletInstanceID)
+		switch {
+		case err == nil:
+			if instance.AttestationSource != "" {
+				f.Platform = &assurance.PlatformVerified{Source: instance.AttestationSource}
+			}
+		case !errors.Is(err, storage.ErrNotFound):
+			s.logger.Warn("failed to look up wallet instance for assurance evidence", zap.Error(err))
+		}
+	}
+
+	f.Fido2 = s.fido2Evidence(ctx, jwks)
+
+	if secProps != nil {
+		f.Claims = assurance.Claims{
+			Plugin:             secProps.Plugin,
+			KeyStorage:         secProps.KeyStorage,
+			UserAuthentication: secProps.UserAuthentication,
+			Certification:      secProps.Certification,
+		}
+	}
+	return f
+}
+
+// fido2Evidence returns the fido2 slot for a batch: only when EVERY key has a
+// durably verified FIDO2 record, and all records agree on the AAGUID (a
+// mixed batch has no single model to assert, so it is treated as
+// unverified). User verification is not stored yet, so it is never asserted.
+func (s *WalletProviderService) fido2Evidence(ctx context.Context, jwks []map[string]interface{}) *assurance.Fido2Verified {
+	if s.keyAttestations == nil || len(jwks) == 0 {
+		return nil
+	}
+	aaguid := ""
+	for i, j := range jwks {
+		thumbprint, err := jwk.Thumbprint(j)
+		if err != nil {
+			return nil
+		}
+		rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, thumbprint)
+		if err != nil {
+			if !errors.Is(err, storage.ErrNotFound) {
+				s.logger.Warn("failed to look up key attestation for assurance evidence", zap.Error(err))
+			}
+			return nil
+		}
+		if i == 0 {
+			aaguid = rec.AAGUID
+		} else if rec.AAGUID != aaguid {
+			return nil
+		}
+	}
+	return &assurance.Fido2Verified{AAGUID: aaguid}
+}
+
+// assuranceBucketIndex maps a level's bucket onto the KA status list index.
+func assuranceBucketIndex(b assurance.Bucket) int {
+	switch b {
+	case assurance.BucketHigh:
+		return statusIndexKAHigh
+	case assurance.BucketMiddle:
+		return statusIndexKAModerate
+	default:
+		return statusIndexKABasic
+	}
+}
+
+// applyAssurance runs the policy and returns the normalized security
+// properties plus the key_storage_status index. The audit line records the
+// rule ids, policy hash, schema version and chosen values, never the nonce.
+func (s *WalletProviderService) applyAssurance(ctx context.Context, walletInstanceID string, jwks []map[string]interface{}, secProps *SecurityProperties) (*SecurityProperties, int, error) {
+	if s.assessor == nil {
+		return nil, 0, ErrAssuranceUnavailable
+	}
+	out := s.assessor.Assess(ctx, s.assuranceFacts(ctx, walletInstanceID, jwks, secProps))
+
+	for _, err := range out.Errors {
+		s.logger.Warn("assurance decider error treated as deny", zap.Error(err))
+	}
+	s.logger.Info("key attestation assurance decision",
+		zap.String("wallet_instance_id", walletInstanceID),
+		zap.Int("keys", len(jwks)),
+		zap.String("policy_hash", out.PolicyVersion),
+		zap.Int("schema_version", out.SchemaVersion),
+		zap.Strings("rule_ids", out.RuleIDs()),
+		zap.String("key_storage", out.KeyStorage.Value),
+		zap.String("key_storage_granted", out.KeyStorage.Granted),
+		zap.String("key_storage_claimed", out.KeyStorage.ClaimedLevel),
+		zap.Strings("key_storage_rules", out.KeyStorage.RuleIDs),
+		zap.String("user_authentication", out.UserAuthentication.Value),
+		zap.String("user_authentication_granted", out.UserAuthentication.Granted),
+		zap.String("user_authentication_claimed", out.UserAuthentication.ClaimedLevel),
+		zap.Strings("user_authentication_rules", out.UserAuthentication.RuleIDs),
+		zap.String("certification_entry", out.CertificationName),
+		zap.Strings("certification_rules", out.CertificationRule),
+	)
+
+	props := &SecurityProperties{
+		KeyStorage:         []string{out.KeyStorage.Value},
+		UserAuthentication: []string{out.UserAuthentication.Value},
+		Certification:      out.Certification,
+	}
+	idx := assuranceBucketIndex(out.KeyStorage.Scheme.StatusBucket(out.KeyStorage.LevelIndex))
+	return props, idx, nil
+}

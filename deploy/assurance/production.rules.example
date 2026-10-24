@@ -1,0 +1,36 @@
+# Assurance policy: production template.  NOT enabled by default.
+#
+# Copy to a file ending in .rules (never .spocp or .bin), edit, and point
+#   wallet_provider.attestation.assurance.rules_file
+# at it. Validate with:  assurance-lint -rules <file>
+#
+# Format: advanced form, ONE RULE PER LINE, each rule preceded by a
+# "# id: <name>" comment line. Ids are unique and appear in audit logs.
+#
+# Rules grant tiers by naming them: (tier (* set a b)) permits every listed
+# tier, there is no implicit "at or below". There is no negation: deny is the
+# absence of a rule. The floor level is always granted.
+#
+# Slot order is FIXED (schema version 1) because lists match by position:
+#   (assure-ks (tier T)(evidence
+#       (verified (fido2 (mds3)(aaguid)(uv)(cert))(platform (source)(app_id))(hsm (id)))
+#       (claimed (plugin)(key_storage)(user_authentication)(certification))))
+# Write a prefix of the slots; use the bare empty list, e.g. (platform), as
+# "don't care". Only the (verified ...) group is backend-verified evidence;
+# (claimed ...) is whatever the client said.
+#
+# Replace the placeholder AAGUIDs with the authenticator models you accept.
+
+# id: prod-fido2-mds3-ks
+(assure-ks (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2 (mds3 trusted)(aaguid (* set 00000000-0000-0000-0000-000000000001 00000000-0000-0000-0000-000000000002))))))
+
+# User authentication at moderate needs proof of user verification (uv), which
+# the backend does not record yet (planned follow-up). Until then every key
+# resolves to the floor for user_authentication. Enable when (uv present) is
+# emitted (uncomment the rule line and put a "# id: <name>" line before it):
+#
+#   (rule id would be: prod-fido2-mds3-ua)
+# (assure-ua (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2 (mds3 trusted)(aaguid (* set 00000000-0000-0000-0000-000000000001))(uv present)))))
+
+# Wallet Instance Attestation (platform) rules belong to the follow-up that
+# adds the assure-wia dimension; do not add them here yet.

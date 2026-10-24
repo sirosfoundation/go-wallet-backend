@@ -403,6 +403,9 @@ type SecurityPropertiesRequest struct {
 	KeyStorage         []string    `json:"key_storage"`
 	UserAuthentication []string    `json:"user_authentication"`
 	Certification      interface{} `json:"certification,omitempty"`
+	// Plugin names the WSCD plugin holding the keys. A client claim, only
+	// ever evidence for the assurance policy.
+	Plugin string `json:"plugin,omitempty"`
 }
 
 func (s *SecurityPropertiesRequest) toService() *service.SecurityProperties {
@@ -413,6 +416,7 @@ func (s *SecurityPropertiesRequest) toService() *service.SecurityProperties {
 		KeyStorage:         s.KeyStorage,
 		UserAuthentication: s.UserAuthentication,
 		Certification:      s.Certification,
+		Plugin:             s.Plugin,
 	}
 }
 

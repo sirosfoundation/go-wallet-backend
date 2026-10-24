@@ -83,7 +83,7 @@ func TestGenerateKeyAttestation_TopLevelSecurityProperties(t *testing.T) {
 	instanceID := "test-instance-native"
 	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
 		ID:                instanceID,
-		AttestationSource: "ios_app_attest",
+		AttestationSource: "platform_attested",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -436,7 +436,7 @@ func TestGenerateKeyAttestation_SecurityProperties_NormalizesRawVocabulary(t *te
 	instanceID := "test-instance-native-2"
 	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
 		ID:                instanceID,
-		AttestationSource: "android_play_integrity",
+		AttestationSource: "platform_attested",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -470,7 +470,7 @@ func TestGenerateKeyAttestation_SecurityProperties_UnrecognizedValueDefaultsToBa
 	instanceID := "test-instance-native-3"
 	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
 		ID:                instanceID,
-		AttestationSource: "ios_app_attest",
+		AttestationSource: "platform_attested",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -543,7 +543,7 @@ func TestGenerateKeyAttestation_NoSecurityProperties_TrustedStillEmitsFloor(t *t
 	instanceID := "test-instance-native-no-secprops"
 	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
 		ID:                instanceID,
-		AttestationSource: "ios_app_attest",
+		AttestationSource: "platform_attested",
 	}); err != nil {
 		t.Fatal(err)
 	}
