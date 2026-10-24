@@ -213,6 +213,53 @@ func TestGenerateKeyAttestation_SecurityProperties_TrustedWhenAllBatchKeysHaveEv
 	}
 }
 
+// Instance-key evidence (android_key, app_attest_assertion) is not evidence
+// about a credential key's storage: with the assurance policy disabled, a
+// batch whose key has only such a record is clamped, not trusted. A FIDO2
+// record for the same shape of request is trusted (the test above).
+func TestGenerateKeyAttestation_InstanceKeyEvidenceDoesNotUnlockClaims(t *testing.T) {
+	for _, kind := range []domain.KeyEvidenceKind{domain.KeyEvidenceAndroidKey, domain.KeyEvidenceAppAttestAssertion} {
+		t.Run(string(kind), func(t *testing.T) {
+			svc, instances, keyAttestations := newTestWalletProviderServiceWithInstances(t)
+			instanceID := "test-instance-" + string(kind)
+			if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: instanceID}); err != nil {
+				t.Fatal(err)
+			}
+			jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}
+			thumbprint, err := jwk.Thumbprint(jwks[0])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := keyAttestations.MarkKeyAttested(context.Background(), &domain.KeyAttestationRecord{
+				KeyThumbprint: thumbprint, WalletInstanceID: instanceID, VerifiedAt: time.Now().UTC(),
+				Kind: kind, Home: domain.KeyHomeStrongBox, SecurityLevel: "strongbox",
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if svc.keyAttestationTrustsBatch(context.Background(), instanceID, jwks) {
+				t.Fatal("an instance-key record made the batch trusted")
+			}
+			ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "test-nonce", &SecurityProperties{KeyStorage: []string{"iso_18045_high"}}, instanceID, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			token, _, err := jwt.NewParser(jwt.WithoutClaimsValidation()).ParseUnverified(ka, jwt.MapClaims{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ks, _ := token.Claims.(jwt.MapClaims)["key_storage"].([]interface{})
+			if len(ks) == 1 && ks[0] == "iso_18045_high" {
+				t.Fatalf("elevated key_storage accepted on instance-key evidence: %v", ks)
+			}
+			// The preview's overlay (a stored record that outranks a FIDO2 submission) is the same gate.
+			overlay := &domain.KeyAttestationRecord{KeyThumbprint: thumbprint, Kind: kind, Home: domain.KeyHomeStrongBox}
+			if svc.keyAttestationTrustsBatchWith(context.Background(), instanceID, jwks, overlay) {
+				t.Fatal("an instance-key overlay made the batch trusted")
+			}
+		})
+	}
+}
+
 // TestGenerateKeyAttestation_SecurityProperties_ClampedWhenOnlySomeBatchKeysHaveEvidence
 // verifies the "all keys required" policy: a batch is only as trusted as its
 // weakest member - if even one key in a multi-key batch lacks evidence, the

@@ -335,6 +335,10 @@ rank `secure_enclave_asserted` < `tee` < `strongbox`/`fido2_hw`/`hsm`; at equal
 rank only the same kind replaces, and never by dropping the UV bit. A
 registration that would weaken the record is ignored without error.
 
+Records whose kind is not `fido2` never feed Key Attestation: neither the
+policy's `fido2` slot nor the legacy trust gate (used when the policy is
+disabled) accepts them as evidence about a credential key's storage.
+
 ## Preview endpoint
 
 `POST /wallet-provider/assurance-preview` (same authentication, audience and
