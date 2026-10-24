@@ -108,7 +108,10 @@ go-spocp v0.1.0:
   floor. A missing file, or no `rules_file` while enabled, is a startup error.
 * The loader refuses lines that go-spocp would misread: unbalanced
   parentheses (go-spocp otherwise drops the last character of the last atom),
-  more than one expression on a line, and double quotes.
+  more than one expression on a line, and double quotes. It also refuses
+  `(* range ...)` (go-spocp drops a dangling operator and builds an unbounded
+  range that matches every atom) and an empty `(* set)`. Use `(* set ...)`,
+  `(* prefix ...)` or `(* suffix ...)`.
 * A commented-out example rule must not begin with `# id:`, or the id would be
   taken to belong to the next rule.
 * The policy version is the sha256 of the file bytes.

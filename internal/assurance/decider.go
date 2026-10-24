@@ -14,6 +14,7 @@ import (
 	"github.com/sirosfoundation/go-spocp"
 	"github.com/sirosfoundation/go-spocp/pkg/persist"
 	"github.com/sirosfoundation/go-spocp/pkg/sexp"
+	"github.com/sirosfoundation/go-spocp/pkg/starform"
 )
 
 // Dimension tags: the top-level tag of a policy query, which is also the
@@ -218,6 +219,9 @@ func LoadRuleSet(path string) (*RuleSet, error) {
 	seenRule := map[string]string{}
 	for i, el := range elems {
 		il := ids[i]
+		if err := checkStarForms(el); err != nil {
+			return nil, fmt.Errorf("line %d: rule %q: %w", il.line, il.id, err)
+		}
 		if prev, dup := seenID[il.id]; dup {
 			return nil, fmt.Errorf("line %d: duplicate rule id %q (first at line %d)", il.line, il.id, prev)
 		}
@@ -230,6 +234,35 @@ func LoadRuleSet(path string) (*RuleSet, error) {
 		rs.Rules = append(rs.Rules, Rule{ID: il.id, Element: el, Line: il.line})
 	}
 	return rs, nil
+}
+
+// checkStarForms rejects star forms the loader would otherwise accept
+// silently wrong. go-spocp builds a range from whatever operator/value pairs
+// it finds and drops a dangling operator, so "(* range alpha ge)" becomes an
+// unbounded range that matches every atom. Assurance rules only ever compare
+// plain tokens (levels, ids, AAGUIDs, source names), so ranges are refused
+// outright, as is an empty set (it can never match: a dead rule).
+func checkStarForms(el sexp.Element) error {
+	switch v := el.(type) {
+	case *sexp.List:
+		for _, c := range v.Elements {
+			if err := checkStarForms(c); err != nil {
+				return err
+			}
+		}
+	case *starform.Range:
+		return errors.New("(* range ...) is not supported in assurance rules; list the accepted values with (* set ...) or use (* prefix ...)")
+	case *starform.Set:
+		if len(v.Elements) == 0 {
+			return errors.New("empty (* set) can never match")
+		}
+		for _, c := range v.Elements {
+			if err := checkStarForms(c); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // loadAdvanced runs go-spocp's advanced-form loader. Every line was already

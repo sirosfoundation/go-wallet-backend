@@ -600,3 +600,25 @@ func TestLoadAdvanced_RecoversFromLoaderPanic(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// go-spocp drops a dangling range operator and builds an unbounded range that
+// matches every atom; such rules (and the empty set, which never matches) are
+// refused by the loader, wherever they appear in the rule.
+func TestLoadRuleSet_RejectsRangesAndEmptySets(t *testing.T) {
+	for name, rule := range map[string]string{
+		"dangling range operator": "(assure-ks (tier basic)(evidence (verified (fido2 (mds3 trusted)(aaguid (* range alpha ge))))))",
+		"range with no bounds":    "(assure-ks (tier basic)(evidence (verified (fido2 (mds3 trusted)(aaguid (* range alpha))))))",
+		"complete range":          "(assure-ks (tier basic)(evidence (verified (fido2 (mds3 trusted)(aaguid (* range alpha ge a le z))))))",
+		"range inside a set":      "(assure-ks (tier (* set basic (* range alpha ge a)))(evidence))",
+		"empty set":               "(assure-ks (tier (* set))(evidence))",
+	} {
+		if _, err := LoadRuleSet(writeRules(t, "p.rules", "# id: r\n"+rule+"\n")); err == nil {
+			t.Errorf("%s: expected an error", name)
+		}
+	}
+	// Control: the supported star forms still load.
+	ok := "# id: r\n(assure-ks (tier (* set basic moderate))(evidence (verified (fido2 (mds3 trusted)(aaguid (* prefix 0000))(cert (* suffix x))))))\n"
+	if _, err := LoadRuleSet(writeRules(t, "p.rules", ok)); err != nil {
+		t.Fatalf("set/prefix/suffix must load: %v", err)
+	}
+}
