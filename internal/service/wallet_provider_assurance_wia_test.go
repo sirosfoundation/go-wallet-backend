@@ -182,7 +182,7 @@ func TestWIAAssurance_IssueDecidedByEvidence(t *testing.T) {
 	if _, err := generateWIAFor(t, svc); !errors.Is(err, ErrWIARefusedByPolicy) {
 		t.Fatalf("backend-only request must be refused, err = %v", err)
 	}
-	att := wiaAttestation{Source: "platform_attested", Platform: NativeAttestationAppleAppAttest}
+	att := wiaAttestation{Source: "platform_attested"}
 	if err := svc.applyAssurance(context.Background(), "jkt-native-12345", &att); err != nil {
 		t.Fatalf("native request must be issued: %v", err)
 	}
@@ -201,7 +201,7 @@ func TestWIAAssurance_ProfileValueAndCertificationInfoAreEmitted(t *testing.T) {
 	svc.cfg.WalletProvider.WIA.CertificationInfo = map[string]interface{}{"scheme": "static"}
 	ctx := context.Background()
 
-	att := wiaAttestation{Source: "platform_attested", Platform: NativeAttestationAppleAppAttest, AppID: "app"}
+	att := wiaAttestation{Source: "platform_attested", AppID: "app"}
 	if err := svc.applyAssurance(ctx, "jkt-native-12345", &att); err != nil {
 		t.Fatal(err)
 	}
@@ -221,13 +221,13 @@ func TestWIAAssurance_ProfileValueAndCertificationInfoAreEmitted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inst.AttestationSource != "platform_attested" || inst.WSCDType != domain.WSCDTypeNativeIOS {
+	if inst.AttestationSource != "platform_attested" || inst.WSCDType != domain.WSCDTypeUnknown {
 		t.Errorf("instance = %+v", inst)
 	}
 
 	// A development attestation is not S1: the floor profile is emitted, the
 	// static certification information stays, the instance records the truth.
-	dev := wiaAttestation{Source: "development_attested", Platform: NativeAttestationAppleAppAttest}
+	dev := wiaAttestation{Source: "development_attested"}
 	if err := svc.applyAssurance(ctx, "jkt-dev-123456", &dev); err != nil {
 		t.Fatal(err)
 	}
@@ -252,7 +252,7 @@ func TestWIAAssurance_AuditLineHasRuleIDsAndPolicyHash(t *testing.T) {
 	svc, _ := wiaAssuranceSvc(t, wiaFullRules)
 	core, logs := observer.New(zap.InfoLevel)
 	svc.logger = zap.New(core)
-	att := wiaAttestation{Source: "platform_attested", Platform: NativeAttestationGooglePlayInteg}
+	att := wiaAttestation{Source: "platform_attested"}
 	if err := svc.applyAssurance(context.Background(), "jkt-native-12345", &att); err != nil {
 		t.Fatal(err)
 	}
@@ -291,55 +291,39 @@ func TestWIAAssurance_PlatformSlotIsThisRequestsNotStoredState(t *testing.T) {
 	}
 }
 
-func TestWSCDTypeFromAttestation(t *testing.T) {
-	cases := []struct {
-		source   string
-		platform NativeAttestationType
-		want     domain.WSCDType
-	}{
-		{"platform_attested", NativeAttestationAppleAppAttest, domain.WSCDTypeNativeIOS},
-		{"platform_attested", NativeAttestationGooglePlayInteg, domain.WSCDTypeNativeAndroid},
-		// A development attestation may have bypassed chain verification, so
-		// it proves no Secure Enclave: the conservative type.
-		{"development_attested", NativeAttestationAppleAppAttest, domain.WSCDTypeWebCrypto},
-		{"backend_attested", "", domain.WSCDTypeWebCrypto},
-		{"backend_attested", NativeAttestationAppleAppAttest, domain.WSCDTypeWebCrypto},
-		{"platform_attested", "", domain.WSCDTypeWebCrypto},
-		// The names the old code switched on are not sources anything stores.
-		{"ios_app_attest", NativeAttestationAppleAppAttest, domain.WSCDTypeWebCrypto},
-		{"android_play_integrity", NativeAttestationGooglePlayInteg, domain.WSCDTypeWebCrypto},
-	}
-	for _, c := range cases {
-		if got := wscdTypeFromAttestation(c.source, c.platform); got != c.want {
-			t.Errorf("(%q, %q) = %q, want %q", c.source, c.platform, got, c.want)
-		}
-	}
-}
-
-// The recorded instance of a natively attested WIA is native, not web_crypto
-// (the dead-name bug classified every native instance web_crypto).
-func TestSignWIA_RecordsNativeWSCDType(t *testing.T) {
+// The WIA PoP key is the wallet's instance key in its own keystore, not the
+// platform attestation key, so no source (native, development or backend)
+// yields a platform type: the instance records "unknown".
+func TestSignWIA_RecordsUnknownWSCDTypeForEverySource(t *testing.T) {
 	svc, instances := newTestWIAServiceWithInstances(t)
-	for jkt, att := range map[string]wiaAttestation{
-		"jkt-ios-1234567":     {Source: "platform_attested", Platform: NativeAttestationAppleAppAttest},
-		"jkt-android-123456":  {Source: "platform_attested", Platform: NativeAttestationGooglePlayInteg},
-		"jkt-web-12345678901": {Source: "backend_attested"},
-	} {
-		if _, err := svc.signWIA(map[string]interface{}{"kty": "EC"}, jkt, "t", nil, att, "c"); err != nil {
+	for i, src := range []string{"platform_attested", "development_attested", "backend_attested"} {
+		jkt := "jkt-wscd-source-" + string(rune('a'+i)) + "12345"
+		if _, err := svc.signWIA(map[string]interface{}{"kty": "EC"}, jkt, "t", nil, wiaAttestation{Source: src}, "c"); err != nil {
 			t.Fatal(err)
 		}
-	}
-	want := map[string]domain.WSCDType{
-		"jkt-ios-1234567": domain.WSCDTypeNativeIOS, "jkt-android-123456": domain.WSCDTypeNativeAndroid, "jkt-web-12345678901": domain.WSCDTypeWebCrypto,
-	}
-	for jkt, w := range want {
 		inst, err := instances.GetByID(context.Background(), jkt)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if inst.WSCDType != w {
-			t.Errorf("%s: WSCDType = %q, want %q", jkt, inst.WSCDType, w)
+		if inst.WSCDType != domain.WSCDTypeUnknown {
+			t.Errorf("%s: WSCDType = %q, want unknown", src, inst.WSCDType)
 		}
+	}
+}
+
+// A legacy record with a derived type is overwritten at the next attestation.
+func TestSignWIA_OverwritesLegacyWSCDType(t *testing.T) {
+	svc, instances := newTestWIAServiceWithInstances(t)
+	const jkt = "jkt-legacy-wscd-123"
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: jkt, Status: domain.InstanceStatusActive, WSCDType: domain.WSCDTypeNativeIOS}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.signWIA(map[string]interface{}{"kty": "EC"}, jkt, "t", nil, wiaAttestation{Source: "platform_attested"}, "c"); err != nil {
+		t.Fatal(err)
+	}
+	inst, _ := instances.GetByID(context.Background(), jkt)
+	if inst.WSCDType != domain.WSCDTypeUnknown {
+		t.Fatalf("WSCDType = %q", inst.WSCDType)
 	}
 }
 
@@ -572,7 +556,7 @@ func TestWIAAssurance_IssuedAuditEventCarriesDecisionAndVerifiedSource(t *testin
 
 	// development_attested is emitted as the floor profile; the event must
 	// still say what was verified.
-	att := wiaAttestation{Source: "development_attested", Platform: NativeAttestationAppleAppAttest}
+	att := wiaAttestation{Source: "development_attested"}
 	if err := svc.applyAssurance(context.Background(), "jkt-dev-123456", &att); err != nil {
 		t.Fatal(err)
 	}
@@ -609,21 +593,21 @@ func TestWIAAssurance_DisabledAuditEventIsUnchanged(t *testing.T) {
 // Re-attestation updates the recorded WSCD type (the stores used to keep the
 // first value, so an instance first seen without native evidence stayed
 // web_crypto for good).
-func TestSignWIA_ReattestationUpdatesWSCDTypeAndVerifiedAppID(t *testing.T) {
+func TestSignWIA_ReattestationUpdatesVerifiedAppID(t *testing.T) {
 	svc, instances := newTestWIAServiceWithInstances(t)
 	const jkt = "jkt-reattest-123456"
 	cnf := map[string]interface{}{"kty": "EC"}
 	if _, err := svc.signWIA(cnf, jkt, "t", nil, wiaAttestation{Source: "backend_attested"}, "c"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.signWIA(cnf, jkt, "t", nil, wiaAttestation{Source: "platform_attested", Platform: NativeAttestationGooglePlayInteg, AppID: "org.example.app"}, "c"); err != nil {
+	if _, err := svc.signWIA(cnf, jkt, "t", nil, wiaAttestation{Source: "platform_attested", AppID: "org.example.app"}, "c"); err != nil {
 		t.Fatal(err)
 	}
 	inst, err := instances.GetByID(context.Background(), jkt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if inst.WSCDType != domain.WSCDTypeNativeAndroid || inst.VerifiedAppID != "org.example.app" || inst.AttestationSource != "platform_attested" {
+	if inst.WSCDType != domain.WSCDTypeUnknown || inst.VerifiedAppID != "org.example.app" || inst.AttestationSource != "platform_attested" {
 		t.Fatalf("%+v", inst)
 	}
 }

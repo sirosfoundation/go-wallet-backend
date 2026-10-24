@@ -370,7 +370,6 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 		}
 		if result.Verified {
 			att.Source = result.AttestationSource
-			att.Platform = req.NativeAttestation.Type
 			att.AppID = result.AppID
 			nativeAttestationSuccess.Inc()
 		}
@@ -397,9 +396,6 @@ type wiaAttestation struct {
 	// what is stored on the wallet instance and what rules see as the
 	// platform source.
 	Source string
-	// Platform is the native attestation type that was verified, "" when the
-	// request carried no verified native attestation.
-	Platform NativeAttestationType
 	// AppID is the verified application id, "" when none.
 	AppID string
 
@@ -715,11 +711,15 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 	if s.instances != nil {
 		now := time.Now().UTC()
 		instance := &domain.WalletInstance{
-			ID:                jkt,
-			TenantID:          tenantID,
-			UserID:            userID,
-			Status:            domain.InstanceStatusActive,
-			WSCDType:          wscdTypeFromAttestation(attestationSource, att.Platform),
+			ID:       jkt,
+			TenantID: tenantID,
+			UserID:   userID,
+			Status:   domain.InstanceStatusActive,
+			// The WIA PoP key is the wallet's instance key in its own keystore
+			// (software store or any WSCD plugin), not the App Attest / Play
+			// Integrity key, and nothing here verifies where it lives, so no
+			// platform type is derived from the attestation.
+			WSCDType:          domain.WSCDTypeUnknown,
 			AttestationSource: attestationSource,
 			VerifiedAppID:     att.AppID,
 			LastAttestedAt:    now,
@@ -804,39 +804,4 @@ func (s *WIAService) emitAuditFailure(reason string, err error) {
 			"error": err.Error(),
 		})
 	}
-}
-
-// wscdTypeFromAttestation maps what the WIA request verified to a WSCD type.
-// source is what the instance stores (platform_attested, development_attested
-// or backend_attested); platform is the native attestation type that produced
-// it. The stored sources never contain the platform name, so the platform
-// must be passed in: an earlier version switched on "ios_app_attest" /
-// "android_play_integrity", which nothing ever stores, so every native
-// instance was classified web_crypto.
-//
-// The result classifies the platform the instance verifiably runs on (what
-// the engine routes signing by). It is NOT evidence about where a credential
-// key lives and no assurance rule reads it: the policy sees only the source
-// atom, and the PoP key of a WIA request is not bound to the hardware key of
-// the native attestation, so a native type here is not a key-storage claim.
-// Binding the two is a separate, pre-existing gap.
-//
-// development_attested is NOT classified native: with
-// apple_app_attest_environment=development the verifier accepts an attestation
-// whose certificate chain failed verification, so it proves nothing about
-// Secure Enclave-backed storage. It stays web_crypto, the conservative type,
-// and never counts as platform_attested anywhere trust is decided (see
-// nativeAttestationSources).
-func wscdTypeFromAttestation(source string, platform NativeAttestationType) domain.WSCDType {
-	switch source {
-	case "platform_attested":
-		switch platform {
-		case NativeAttestationAppleAppAttest:
-			return domain.WSCDTypeNativeIOS
-		case NativeAttestationGooglePlayInteg:
-			return domain.WSCDTypeNativeAndroid
-		}
-	}
-	// Backend-attested instances from web frontend use Web Crypto.
-	return domain.WSCDTypeWebCrypto
 }

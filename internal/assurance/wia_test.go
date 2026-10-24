@@ -208,3 +208,25 @@ func counterValue(t *testing.T, dimension, level string) float64 {
 	}
 	return m.GetCounter().GetValue()
 }
+
+// wscd_type is never evidence: nothing in the evidence can carry it and no
+// rule can name it.
+func TestEvidence_NeverContainsWSCDType(t *testing.T) {
+	ev := Evidence{
+		Fido2:    &Fido2Verified{AAGUID: "a", UV: UVPresent, Cert: "c"},
+		Platform: &PlatformVerified{Source: "platform_attested", AppID: "app"},
+		HSM:      &HSMVerified{ID: "h"},
+		Claimed:  Claimed{Plugin: "native_ios", KeyStorage: "web_crypto"},
+	}
+	got := render(ev.Element())
+	for _, bad := range []string{"wscd", "(type"} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("evidence contains %q: %s", bad, got)
+		}
+	}
+	cfg := wiaCfg()
+	fs := LintRuleSet(mustRuleSet(t, "# id: w\n(assure-ks (tier moderate)(evidence (verified (fido2)(platform (source platform_attested))(hsm)(wscd (type native_ios)))))\n"), &cfg)
+	if !strings.Contains(findings(fs, SeverityError), "rule w") {
+		t.Fatalf("a rule naming a wscd slot must be a lint error: %v", fs)
+	}
+}

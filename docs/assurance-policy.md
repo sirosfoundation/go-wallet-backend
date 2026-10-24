@@ -272,20 +272,18 @@ value, certification entry. The `WIA issued` audit event additionally carries
 
 ### WSCD type
 
-The wallet instance's `wscd_type` (stored on first attestation and updated on
-every re-attestation, memory and MongoDB) follows the native attestation type that was
-verified (`native_ios` for Apple App Attest, `native_android` for Play
-Integrity); `development_attested` stays `web_crypto`: with
-`apple_app_attest_environment=development` the verifier accepts an attestation
-whose certificate chain failed verification, so it proves no secure hardware.
-`wscd_type` classifies the platform the instance verifiably runs on, which is
-what the engine routes signing by. It is **not** evidence about where a
-credential key is stored and no assurance rule reads it: the policy sees only
-the `platform (source ...)` atom, and the PoP key of a WIA request is not
-bound to the hardware key of the native attestation. That binding is a
-separate, pre-existing gap. An earlier version switched on
-the names `ios_app_attest` and `android_play_integrity`, which no verifier
-stores, so every native instance was recorded as `web_crypto`.
+The wallet instance's `wscd_type` is recorded as `unknown` by the WIA path on
+every attestation. The WIA PoP key is the wallet's **instance key in its own
+keystore** (a software store or any WSCD plugin), not the App Attest / Play
+Integrity attestation key, and nothing verifies where it lives, so no type is
+derived from the platform attestation (`native_*`) and none is guessed
+(`web_crypto`), including for `development_attested`. Instances stored earlier
+may still carry `web_crypto`, `native_*` or an empty type; they are
+overwritten at their next attestation. An earlier version switched on the names
+`ios_app_attest` and `android_play_integrity`, which no verifier stores.
+
+`wscd_type` is never assurance evidence: the evidence schema has no slot for it
+and no rule can read it (pinned by a test).
 
 ## Preview endpoint
 

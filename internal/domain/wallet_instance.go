@@ -53,6 +53,13 @@ const (
 	// Keys are managed in the PKCS#11 slot identified by client_id.
 	WSCDTypeRemote WSCDType = "remote"
 
+	// WSCDTypeUnknown means nothing verifies where the instance key lives.
+	// The WIA path records it: the PoP key is the wallet's instance key in
+	// its own keystore, not the platform attestation key. Instances stored
+	// before this value existed (or with an empty type) carry web_crypto,
+	// native_* or "" and are overwritten at their next attestation.
+	WSCDTypeUnknown WSCDType = "unknown"
+
 	// WSCDTypeNativeIOS uses iOS Secure Enclave via App Attest.
 	WSCDTypeNativeIOS WSCDType = "native_ios"
 
@@ -94,11 +101,10 @@ type WalletInstance struct {
 	// Status is the lifecycle state: active, suspended, revoked.
 	Status InstanceStatus `json:"status" bson:"status"`
 
-	// WSCDType identifies the type of WSCD backing this instance. For native
-	// instances it is derived from the verified platform attestation and
-	// classifies the platform the wallet runs on; it is not evidence about
-	// where a credential key is stored and is not an input of the assurance
-	// policy (see docs/assurance-policy.md, "WSCD type").
+	// WSCDType identifies the type of WSCD backing this instance, or
+	// WSCDTypeUnknown when nothing verifies it (what the WIA path records).
+	// It is not an input of the assurance policy (see
+	// docs/assurance-policy.md, "WSCD type").
 	WSCDType WSCDType `json:"wscd_type" bson:"wscd_type"`
 
 	// CredentialID is the WebAuthn credential ID (base64url) of the passkey
