@@ -220,3 +220,32 @@ func TestWIAKeyAttestation_PersistenceFailureIsUnavailable(t *testing.T) {
 		t.Fatalf("a refused WIA created an instance: %v", e)
 	}
 }
+
+// The store keeps stronger evidence that belongs to another user and never
+// replaces it, but a fresh verification for THIS caller still counts for this
+// request (and does not touch the other user's record).
+func TestWIAKeyAttestation_FreshEvidenceUsedWhenStoredIsOutOfScope(t *testing.T) {
+	svc, instances := newTestWIAServiceWithInstances(t)
+	store := memory.NewStore().KeyAttestations()
+	svc.SetKeyAttestations(store)
+	weaker := androidRecord()
+	weaker.Home, weaker.SecurityLevel = domain.KeyHomeTEE, "trusted_environment"
+	svc.RegisterInstanceKeyVerifier(&fakeKeyVerifier{typ: KeyAttestationAndroidKey, res: &InstanceKeyEvidenceResult{Record: weaker}})
+
+	ctx := context.Background()
+	challenge, _, _ := svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	pop, key := createTestPop(t, challenge)
+	jkt := expectedThumbprint(t, &key.PublicKey)
+	putRecord(t, store, domain.KeyAttestationRecord{KeyThumbprint: jkt, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox, TenantID: domain.DefaultTenantID, UserID: "other-user"})
+	me := domain.UserIDFromString("me")
+	if _, err := svc.GenerateWIA(ctx, domain.DefaultTenantID, &me, &WIARequest{Pop: pop, Challenge: challenge, KeyAttestation: &KeyAttestation{Type: KeyAttestationAndroidKey}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := instanceType(t, instances, jkt); got != domain.WSCDTypeNativeAndroid {
+		t.Fatalf("fresh caller-scoped evidence was discarded: wscd_type = %s", got)
+	}
+	rec, err := store.GetByKeyThumbprint(ctx, jkt)
+	if err != nil || rec.Home != domain.KeyHomeStrongBox || rec.UserID != "other-user" {
+		t.Fatalf("the other user's stronger record changed: %+v %v", rec, err)
+	}
+}

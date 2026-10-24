@@ -312,12 +312,13 @@ func (s *WIAService) consumeChallenge(ctx context.Context, challenge string) err
 }
 
 // restoreChallenge puts a consumed challenge back for a retry after a
-// retryable server-side failure. The failure it compensates for is usually a
-// storage blip that may still be in progress, so the Put is retried a few
-// times with a short backoff and runs detached from the request's
+// retryable server-side failure. It runs detached from the request's
 // cancellation (a client that gave up must not strand its once-per-key
-// enrollment). It stays best effort: if the store is down throughout, the
-// caller needs a new challenge and, for App Attest, a new key.
+// enrollment) and is a SINGLE best-effort Put on purpose: retrying a Put whose
+// acknowledgement was lost could recreate a nonce a concurrent request has
+// already consumed, which would let one PoP and attestation issue twice. If it
+// cannot be stored the caller needs a new challenge (and, for App Attest, a
+// new key).
 func (s *WIAService) restoreChallenge(ctx context.Context, tenantID domain.TenantID, challenge string) {
 	ttl := time.Duration(s.cfg.WalletProvider.WIA.ChallengeTTLSeconds) * time.Second
 	if ttl <= 0 {
@@ -325,27 +326,10 @@ func (s *WIAService) restoreChallenge(ctx context.Context, tenantID domain.Tenan
 	}
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
-	var err error
-	for attempt, backoff := 0, 50*time.Millisecond; attempt < restoreChallengeAttempts; attempt, backoff = attempt+1, backoff*3 {
-		var ok bool
-		if ok, err = s.challenges.Put(ctx, tenantID, challenge, time.Now().Add(ttl)); err == nil {
-			if !ok {
-				s.logger.Warn("could not restore the WIA challenge: store at capacity")
-			}
-			return
-		}
-		if attempt+1 < restoreChallengeAttempts {
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
-			}
-		}
+	if ok, err := s.challenges.Put(ctx, tenantID, challenge, time.Now().Add(ttl)); err != nil || !ok {
+		s.logger.Warn("could not restore the WIA challenge after a retryable failure", zap.Error(err))
 	}
-	s.logger.Warn("could not restore the WIA challenge after a retryable failure", zap.Error(err))
 }
-
-// restoreChallengeAttempts bounds restoreChallenge's retries of the Put.
-const restoreChallengeAttempts = 3
 
 // WIARequest contains the parameters for WIA generation.
 type WIARequest struct {
@@ -480,8 +464,12 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 		}
 	}
 	att.KeyEvidence = s.instanceKeyEvidence(ctx, tenantID, userIDString(userID), jkt)
-	if att.KeyEvidence == nil && s.keyAttestations == nil {
-		att.KeyEvidence = submitted // nothing durable to read back from
+	if att.KeyEvidence == nil {
+		// Nothing in scope to read back: no store, or the stored record for
+		// this key belongs to another tenant or user (the store keeps the
+		// stronger one and never replaces it). What was just verified for THIS
+		// caller still counts for this request; the durable record is untouched.
+		att.KeyEvidence = submitted
 	}
 
 	// Step 3.5: the assurance policy decides whether a WIA is issued at all,
