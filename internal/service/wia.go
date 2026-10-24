@@ -175,6 +175,10 @@ type WIAService struct {
 	// appAttestKeys holds attested App Attest keys (see SetAppAttestKeys).
 	appAttestKeys storage.AppAttestKeyStore
 
+	// keyVerifiers verifies the optional key_attestation request field, by
+	// type. Registered while wiring the service (RegisterInstanceKeyVerifier).
+	keyVerifiers map[KeyAttestationType]InstanceKeyEvidenceVerifier
+
 	// Challenge store for single-use nonces (memory or MongoDB).
 	challenges WIAChallengeStore
 
@@ -314,6 +318,9 @@ type WIARequest struct {
 	ClientID string `json:"client_id,omitempty"`
 	// NativeAttestation is optional platform attestation evidence
 	NativeAttestation *NativeAttestationRequest `json:"native_attestation,omitempty"`
+	// KeyAttestation is optional evidence about the instance (PoP) key
+	// itself; see instance_key_evidence.go. Absent: the home stays unknown.
+	KeyAttestation *KeyAttestation `json:"key_attestation,omitempty"`
 }
 
 // WIAPopClaims are the expected claims in a WIA-PoP JWT.
@@ -334,6 +341,13 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	start := time.Now()
 	defer func() { wiaGenerationDuration.Observe(time.Since(start).Seconds()) }()
 
+	// Step 0: an unknown key_attestation type is a client error that must not
+	// burn the single-use challenge.
+	keyVerifier, err := s.keyVerifierFor(req.KeyAttestation)
+	if err != nil {
+		return "", err
+	}
+
 	// Step 1: Consume challenge (single-use, atomic).
 	// Must happen before PoP validation to prevent concurrent crypto amplification
 	// attacks on the same challenge (TOCTOU). The trade-off is that a malformed PoP
@@ -345,6 +359,11 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 
 	// Step 2: Parse and validate WIA-PoP
 	cnfJWK, err := s.validatePop(req.Pop, req.Challenge)
+	if err != nil {
+		s.emitAuditFailure("pop_invalid", err)
+		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
+	}
+	popKey, err := jwk.ParseECPublicKey(cnfJWK)
 	if err != nil {
 		s.emitAuditFailure("pop_invalid", err)
 		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
@@ -399,7 +418,21 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	// Step 3.4: evidence about the instance key itself (the PoP key), from the
 	// store of per-key evidence the backend verified. Never from anything the
 	// client reports about its keystore.
+	// Step 3.3: evidence the client submitted about that key is verified and
+	// stored first, so the lookup below sees it. Invalid evidence refuses the
+	// WIA; evidence that names no home changes nothing.
+	var submitted *domain.KeyAttestationRecord
+	if keyVerifier != nil {
+		submitted, err = s.verifyKeyAttestation(ctx, keyVerifier, req.KeyAttestation, tenantID, jkt, popKey, req.Challenge)
+		if err != nil {
+			s.emitAuditFailure("key_attestation_rejected", err)
+			return "", err
+		}
+	}
 	att.KeyEvidence = s.instanceKeyEvidence(ctx, jkt)
+	if att.KeyEvidence == nil && s.keyAttestations == nil {
+		att.KeyEvidence = submitted // nothing durable to read back from
+	}
 
 	// Step 3.5: the assurance policy decides whether a WIA is issued at all,
 	// which S profile it carries and which certification information applies.
