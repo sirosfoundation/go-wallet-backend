@@ -94,7 +94,11 @@ type WalletInstance struct {
 	// Status is the lifecycle state: active, suspended, revoked.
 	Status InstanceStatus `json:"status" bson:"status"`
 
-	// WSCDType identifies the type of WSCD backing this instance.
+	// WSCDType identifies the type of WSCD backing this instance. For native
+	// instances it is derived from the verified platform attestation and
+	// classifies the platform the wallet runs on; it is not evidence about
+	// where a credential key is stored and is not an input of the assurance
+	// policy (see docs/assurance-policy.md, "WSCD type").
 	WSCDType WSCDType `json:"wscd_type" bson:"wscd_type"`
 
 	// CredentialID is the WebAuthn credential ID (base64url) of the passkey

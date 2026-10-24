@@ -814,6 +814,13 @@ func (s *WIAService) emitAuditFailure(reason string, err error) {
 // "android_play_integrity", which nothing ever stores, so every native
 // instance was classified web_crypto.
 //
+// The result classifies the platform the instance verifiably runs on (what
+// the engine routes signing by). It is NOT evidence about where a credential
+// key lives and no assurance rule reads it: the policy sees only the source
+// atom, and the PoP key of a WIA request is not bound to the hardware key of
+// the native attestation, so a native type here is not a key-storage claim.
+// Binding the two is a separate, pre-existing gap.
+//
 // development_attested is NOT classified native: with
 // apple_app_attest_environment=development the verifier accepts an attestation
 // whose certificate chain failed verification, so it proves nothing about
