@@ -452,8 +452,8 @@ func auxiliaryDataOfProof(proof ProofObject, advertised map[string]auxAdv, anyRe
 			return "", nil
 		}
 		if has {
-			if json.Unmarshal(claim, &entries) != nil || entries == nil {
-				return "", auxProofErr("auxiliary_data is not an array of objects")
+			if json.Unmarshal(claim, &entries) != nil || len(entries) == 0 {
+				return "", auxProofErr("auxiliary_data is not a non-empty array of objects")
 			}
 		}
 	default:

@@ -3171,6 +3171,7 @@ func (h *OID4VCIHandler) relayAuxiliaryDataConflict(resp *http.Response) error {
 	if len(body) > MaxErrorBodyBytes {
 		// Too large to classify (it may be a conflict): fail closed, no retry.
 		_ = resp.Body.Close()
+		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 		return fmt.Errorf("credential endpoint returned status %d with an oversized error body", resp.StatusCode)
 	}
 	if err := h.auxiliaryDataConflictError(resp.StatusCode, body); err != nil {

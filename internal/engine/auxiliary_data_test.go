@@ -524,6 +524,8 @@ func TestVerifyProofsOptionalOnly(t *testing.T) {
 	a := validAuxClaim(t, adv, 1)
 	require.NoError(t, verifyProofsCarryAuxiliaryData([]ProofObject{{ProofType: "jwt", JWT: auxProofJWT(t, a)}, {ProofType: "jwt", JWT: auxProofJWT(t, a)}}, adv))
 	require.Error(t, verifyProofsCarryAuxiliaryData([]ProofObject{{ProofType: "jwt", JWT: auxProofJWT(t, a)}, {ProofType: "jwt", JWT: auxProofJWT(t, nil)}}, adv))
+	// An empty auxiliary_data array is prohibited even when nothing is required.
+	require.Error(t, verifyProofsCarryAuxiliaryData([]ProofObject{{ProofType: "jwt", JWT: auxProofJWT(t, []interface{}{})}}, adv))
 }
 
 func TestGenerateProof_CarriesCredentialTypeAndIssuer(t *testing.T) {
@@ -604,6 +606,14 @@ func TestOversizedErrorBodyFailsClosed(t *testing.T) {
 			err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", auxCfg(auxAdvFull), nil, "")
 			require.Error(t, err)
 			assert.Equal(t, 1, *hits, "never retried")
+			fc.settle()
+			var terminal int
+			for _, m := range fc.outboundMessages() {
+				if string(m["type"]) == `"flow_error"` {
+					terminal++
+				}
+			}
+			assert.Equal(t, 1, terminal, "the client gets exactly one terminal flow_error")
 			assert.NotContains(t, logDump(logs), "SECRET-ISSUER-TEXT")
 			assert.NotContains(t, err.Error(), "SECRET-ISSUER-TEXT")
 			fc.settle()
