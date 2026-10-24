@@ -11,9 +11,10 @@
 # tier, there is no implicit "at or below". There is no negation: deny is the
 # absence of a rule. The floor level is always granted.
 #
-# Slot order is FIXED (schema version 1) because lists match by position:
+# Slot order is FIXED (schema version 2) because lists match by position:
 #   (assure-ks (tier T)(evidence
-#       (verified (fido2 (mds3)(aaguid)(uv)(cert))(platform (source)(app_id))(hsm (id)))
+#       (verified (fido2 (mds3)(aaguid)(uv)(cert))(platform (source)(app_id))(hsm (id))
+#           (instance_key (kind)(home)(level)(boot)(binding)))
 #       (claimed (plugin)(key_storage)(user_authentication)(certification))))
 # Write a prefix of the slots; use the bare empty list, e.g. (platform), as
 # "don't care". Only the (verified ...) group is backend-verified evidence;
@@ -58,6 +59,20 @@
 
 # id: wia-s1-platform
 (assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform (source platform_attested)))))
+
+# Optional S1 template that also requires VERIFIED evidence about where the
+# wallet's instance key (the WIA PoP key) lives, instead of trusting the
+# platform attestation alone. The (instance_key ...) slot is filled only from
+# per-key evidence the backend verified for that very key (kind android_key,
+# or fido2); the client's claims can never populate it. (kind) is "don't
+# care" but must stand in position 1 because slots match by position. Until
+# the backend verifies instance-key evidence of kind android_key the slot is
+# (instance_key none) and this rule does not match, so leave it commented
+# unless your wallets submit such evidence. Uncomment, put a
+# "# id: wia-s1-instance-key" line before it, and drop or narrow the plain
+# wia-s1-platform rule above if S1 must require it:
+#
+# (assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform (source platform_attested))(hsm)(instance_key (kind)(home (* set strongbox tee))))))
 
 # assure-wia-cert: selects a wallet_solution_certification_information entry
 # from the wia_certification catalogue (none: the static
