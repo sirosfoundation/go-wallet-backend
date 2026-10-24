@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -255,6 +256,11 @@ func (c *AssuranceConfig) Validate() error {
 			return fmt.Errorf("%s.certification: duplicate entry name %q", p, e.Name)
 		}
 		names[e.Name] = true
+		if e.URL != "" {
+			if err := validateCertificationURL(e.URL); err != nil {
+				return fmt.Errorf("%s.certification entry %q: url: %w", p, e.Name, err)
+			}
+		}
 		if e.URL == "" && (e.Scheme == "" || e.AssuranceLevel == "") {
 			return fmt.Errorf("%s.certification entry %q needs scheme and assurance_level (or a url)", p, e.Name)
 		}
@@ -304,6 +310,23 @@ func (s LevelSchemeConfig) Validate() error {
 		if ci < fi {
 			return fmt.Errorf("ceiling %q is below floor %q", s.Ceiling, s.Floor)
 		}
+	}
+	return nil
+}
+
+// validateCertificationURL requires an absolute http(s) URL with a host and
+// no surrounding space or control characters: the string is emitted verbatim
+// as the signed certification claim.
+func validateCertificationURL(raw string) error {
+	if raw != strings.TrimSpace(raw) || strings.ContainsFunc(raw, func(r rune) bool { return r <= ' ' || r == 0x7f }) {
+		return fmt.Errorf("%q contains whitespace or control characters", raw)
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("%q is not a valid URL: %w", raw, err)
+	}
+	if (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" {
+		return fmt.Errorf("%q must be an absolute http(s) URL with a host", raw)
 	}
 	return nil
 }

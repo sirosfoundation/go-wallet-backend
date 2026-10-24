@@ -191,3 +191,26 @@ func TestAssuranceConfig_EnvLevelSchemesJSON(t *testing.T) {
 		t.Fatal("bad json must error")
 	}
 }
+
+func TestAssuranceConfig_CertificationURLValidation(t *testing.T) {
+	for url, ok := range map[string]bool{
+		"https://certs.example/eucc-high": true,
+		"http://certs.example/x":          true,
+		" ":                               false,
+		"not a url":                       false,
+		"https://":                        false,
+		"https:///path":                   false,
+		"ftp://certs.example/x":           false,
+		"/relative/path":                  false,
+		"https://certs.example/a b":       false,
+		" https://certs.example/x":        false,
+		"https://certs.example/x\n":       false,
+		"urn:cert:x":                      false,
+	} {
+		c := validAssurance()
+		c.Certification.Entries = CertificationEntryList{{Name: "e", URL: url}}
+		if err := c.Validate(); (err == nil) != ok {
+			t.Errorf("url %q: ok=%v err=%v", url, ok, err)
+		}
+	}
+}
