@@ -95,6 +95,16 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		wiaSvc.SetAssessor(assessor)
 		wiaSvc.SetKeyAttestations(store.KeyAttestations())
 		wiaSvc.SetAppAttestKeys(store.AppAttestKeys())
+		// App Attest assertions as instance-key evidence need the stored
+		// attested keys, so they exist only where native attestation does.
+		if nat := cfg.WalletProvider.Attestation.NativeAttestation; nat.Enabled && nat.AppleAppID != "" && store.AppAttestKeys() != nil {
+			v, err := NewAppAttestAssertionVerifier(store.AppAttestKeys(), nat.AppleAppID, nat.AppleAppAttestEnvironment, logger)
+			if err != nil {
+				logger.Warn("app_attest_assertion key attestation is not available", zap.Error(err))
+			} else {
+				wiaSvc.RegisterInstanceKeyVerifier(v)
+			}
+		}
 		// A signing key alone is enough to construct WIAService, but "etsi"
 		// mode additionally requires a certificate chain (see IsSupported).
 		// Leaving wiaSvc non-nil here would register the WIA routes, but

@@ -423,7 +423,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	// WIA; evidence that names no home changes nothing.
 	var submitted *domain.KeyAttestationRecord
 	if keyVerifier != nil {
-		submitted, err = s.verifyKeyAttestation(ctx, keyVerifier, req.KeyAttestation, tenantID, jkt, popKey, req.Challenge)
+		submitted, err = s.verifyKeyAttestation(ctx, keyVerifier, req.KeyAttestation, tenantID, userID, jkt, popKey, req.Challenge)
 		if err != nil {
 			s.emitAuditFailure("key_attestation_rejected", err)
 			return "", err
@@ -516,7 +516,8 @@ type instanceKeyEvidenceBuilder interface {
 // instanceKeyBuilders is keyed by record Kind. A record whose kind has no
 // builder yields no slot: unknown evidence is never rendered as verified.
 var instanceKeyBuilders = map[domain.KeyEvidenceKind]instanceKeyEvidenceBuilder{
-	domain.KeyEvidenceFIDO2: fido2InstanceKeyBuilder{},
+	domain.KeyEvidenceFIDO2:              fido2InstanceKeyBuilder{},
+	domain.KeyEvidenceAppAttestAssertion: appAttestAssertionBuilder{},
 }
 
 // fido2InstanceKeyBuilder renders a verified FIDO2 attestation: the key was

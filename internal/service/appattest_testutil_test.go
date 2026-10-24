@@ -221,3 +221,18 @@ func (d *testAppAttestDevice) assertion(t *testing.T, clientDataHash []byte, o a
 	}
 	return base64.StdEncoding.EncodeToString(b)
 }
+
+func sha256Of(s string) []byte {
+	h := sha256.Sum256([]byte(s))
+	return h[:]
+}
+
+// cborMarshalAssertion encodes an assertion object with an arbitrary
+// signature and authenticatorData.
+func cborMarshalAssertion(sig, authData []byte) (string, error) {
+	b, err := cbor.Marshal(map[string]any{"signature": sig, "authenticatorData": authData})
+	if err != nil {
+		return "", err
+	}
+	return base64.StdEncoding.EncodeToString(b), nil
+}

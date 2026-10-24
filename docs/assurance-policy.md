@@ -359,6 +359,86 @@ rank `secure_enclave_asserted` < `tee` < `strongbox`/`fido2_hw`/`hsm`; at equal
 rank only the same kind replaces, and never by dropping the UV bit. A
 registration that would weaken the record is ignored without error.
 
+### App Attest keys and assertions (instance-key binding, stage B5)
+
+**What the attestation proves.** An Apple App Attest key is assertion-only: it
+cannot sign a JWS, so it can never be the WIA PoP key. The backend verifies the
+App Attest attestation object in full (certificate chain to the pinned Apple
+App Attestation Root CA, the nonce binding the WIA challenge, `keyId` equal to
+SHA-256 of the credCert X9.62 public key, `credentialId` equal to `keyId`,
+attestation counter 0, `rpIdHash` equal to SHA-256 of `apple_app_id`, and the
+AAGUID of the configured environment: `appattest` + 7 zero bytes for
+`production`, `appattestdevelop` for `development`; a development attestation
+is refused by a production backend and the reverse). The client-supplied
+`key_id` is only compared with the attested key, never trusted.
+
+**Durable storage.** The verified key is stored (`AppAttestKeyStore`, memory and
+MongoDB `app_attest_keys`): X9.62 public key, assertion counter, environment,
+App ID, whether the chain verified, and the tenant/user/wallet instance it was
+attested for. Apple issues an attestation object once per key, so this is the
+only place the key can come from again: later WIAs use assertions instead of
+attesting again. A key that is already stored is never overwritten and its
+counter never reset; it is accepted again only for the same tenant and user
+while active. The counter advances by one atomic conditional update (strictly
+greater than the stored value), which is the replay protection.
+
+**Assertion as instance-key evidence.** `POST /wallet-provider/wia/generate`
+accepts `key_attestation` `{"type":"app_attest_assertion","key_id":"<base64>",
+"assertion":"<base64 CBOR {signature, authenticatorData}>"}` (the object
+`DCAppAttestService.generateAssertion` returns). The wallet generates the
+instance key, then asks its App Attest key for an assertion with
+
+```
+clientDataHash = SHA-256( "siros-instance-key-v1" || C || jkt )
+```
+
+`C` is the WIA challenge string exactly as issued (its ASCII bytes, the same
+value the Android derived challenge uses) and `jkt` is the RFC 7638 thumbprint of
+the PoP key as its base64url string (ASCII bytes), concatenated with no
+separator. The backend verifies ECDSA over SHA-256(`authenticatorData` ||
+`clientDataHash`) with the **stored** public key, `rpIdHash` equal to
+SHA-256(`apple_app_id`), the counter strictly above the stored one, and that the
+key belongs to the caller's tenant and user, is active (not revoked) and was
+attested in the configured environment. The signature is verified before the
+counter moves, so an unauthenticated request cannot burn a key's counter. The
+WIA challenge is single-use. A submitted assertion that fails any check refuses
+the WIA; no `key_attestation` leaves the instance key without evidence.
+
+**What an assertion proves, and what it does not.** It proves that an attested
+app instance endorsed this instance key at this challenge: "an attested app
+instance endorsed this key". It does **not** prove that the key lives in the
+Secure Enclave; the backend never sees an attestation of the PoP key itself. The
+stored per-key record therefore has `kind app_attest_assertion`, `home
+secure_enclave_asserted` (the lowest-ranked home), no level and no boot state,
+and is rendered as
+
+```
+(instance_key (kind app_attest_assertion)(home secure_enclave_asserted)(level none)(boot none)(binding assertion))
+```
+
+`binding assertion` is the only binding this kind can render; it is never
+`attested` and never a hardware attestation. A development-environment key, or a
+key whose chain could not be verified (a development deployment only), is
+sound for the counter but **never yields a record**: the WIA issues with the
+home unknown.
+
+`instance_key` feeds `assure-wia` and `assure-wia-issue` only. No shipped rule
+derives `assure-ks` or `assure-ua` for credential keys from it (pinned by a
+test over the shipped rule files, commented templates included). The shipped,
+commented S1 template in `deploy/assurance/production.rules.example` is
+
+```
+(assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform (source platform_attested))(hsm)(instance_key (kind app_attest_assertion)(home)(level)(boot)(binding assertion)))))
+```
+
+Slots match by position, so the bare `(home)(level)(boot)` hold their places.
+
+**WSCD type.** `wscdTypeFromKeyHome` maps `secure_enclave_asserted` to
+`native_ios` (stage B1). Because the home is only asserted, a deployment that
+wants `wscd_type` to mean a verified residency should map it to `unknown`
+instead; that is an owner decision recorded in the pull request and is a
+one-line change in `wscdTypeFromKeyHome`.
+
 ## Preview endpoint
 
 `POST /wallet-provider/assurance-preview` (same authentication, audience and

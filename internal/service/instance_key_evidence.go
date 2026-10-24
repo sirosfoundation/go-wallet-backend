@@ -131,6 +131,10 @@ type InstanceKeyEvidenceInput struct {
 	Thumbprint string
 	// TenantID is the authenticated tenant of the request.
 	TenantID domain.TenantID
+	// UserID is the authenticated user of the request, nil when the caller is
+	// not user-bound. Evidence about a key a user attested must be refused for
+	// any other user.
+	UserID *domain.UserID
 	// WIAChallenge is the consumed WIA challenge C, as issued. Use
 	// InstanceKeyAttestationChallenge for a derived challenge.
 	WIAChallenge string
@@ -205,13 +209,14 @@ func truncateForError(v string) string {
 // stores a resulting record under the instance key's thumbprint (the store
 // refuses to replace stronger evidence with weaker). It returns the record the
 // submission produced, nil when it named no home.
-func (s *WIAService) verifyKeyAttestation(ctx context.Context, v InstanceKeyEvidenceVerifier, ka *KeyAttestation, tenantID domain.TenantID, jkt string, pop *ecdsa.PublicKey, challenge string) (*domain.KeyAttestationRecord, error) {
+func (s *WIAService) verifyKeyAttestation(ctx context.Context, v InstanceKeyEvidenceVerifier, ka *KeyAttestation, tenantID domain.TenantID, userID *domain.UserID, jkt string, pop *ecdsa.PublicKey, challenge string) (*domain.KeyAttestationRecord, error) {
 	now := time.Now().UTC()
 	res, err := v.Verify(ctx, &InstanceKeyEvidenceInput{
 		Payload:      ka.Raw,
 		PoPKey:       pop,
 		Thumbprint:   jkt,
 		TenantID:     tenantID,
+		UserID:       userID,
 		WIAChallenge: challenge,
 		Now:          now,
 	})
