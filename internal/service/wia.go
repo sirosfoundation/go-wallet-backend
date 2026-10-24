@@ -16,6 +16,7 @@ import (
 
 	"github.com/sirosfoundation/go-siros-set/set"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
@@ -30,6 +31,9 @@ var (
 	ErrWIAPopInvalid           = errors.New("WIA-PoP validation failed")
 	ErrWIAChallengeCapacityMax = errors.New("challenge capacity exceeded")
 	ErrWIAInstanceDeactivated  = errors.New("wallet instance is suspended or revoked")
+	// ErrWIARefusedByPolicy is returned when the assurance policy is enabled
+	// and no assure-wia-issue rule permits the evidence of this request.
+	ErrWIARefusedByPolicy = errors.New("WIA refused by assurance policy")
 )
 
 // WIAChallenge is a single-use nonce for WIA generation.
@@ -166,6 +170,10 @@ type WIAService struct {
 	// Challenge store for single-use nonces (memory or MongoDB).
 	challenges WIAChallengeStore
 
+	// assessor is the assurance policy; used only when
+	// wallet_provider.attestation.assurance.enabled is true.
+	assessor *assurance.Assessor
+
 	// stopCh signals the cleanup goroutine to exit.
 	stopCh    chan struct{}
 	stopOnce  sync.Once
@@ -194,6 +202,14 @@ func NewWIAService(cfg *config.Config, logger *zap.Logger, jwtSigner *signing.Cr
 	}
 
 	return svc
+}
+
+// SetAssessor installs the assurance policy used when
+// wallet_provider.attestation.assurance.enabled is true.
+func (s *WIAService) SetAssessor(a *assurance.Assessor) { s.assessor = a }
+
+func (s *WIAService) assuranceEnabled() bool {
+	return s.cfg.WalletProvider.Attestation.Assurance.Enabled
 }
 
 // IsSupported returns true if WIA generation is available. Unlike
@@ -339,7 +355,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	}
 
 	// Step 3: Determine attestation source
-	attestationSource := "backend_attested" // Tier 3 baseline
+	att := wiaAttestation{Source: "backend_attested"} // Tier 3 baseline
 	if req.NativeAttestation != nil && s.nativeAttSvc != nil {
 		// Bind native attestation challenge to the WIA challenge nonce
 		if req.NativeAttestation.Challenge != req.Challenge {
@@ -353,13 +369,90 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 			return "", fmt.Errorf("%w: native attestation failed: %v", ErrWIAPopInvalid, err)
 		}
 		if result.Verified {
-			attestationSource = result.AttestationSource
+			att.Source = result.AttestationSource
+			att.Platform = req.NativeAttestation.Type
+			att.AppID = result.AppID
 			nativeAttestationSuccess.Inc()
 		}
 	}
 
+	// Step 3.5: the assurance policy decides whether a WIA is issued at all,
+	// which S profile it carries and which certification information applies.
+	// Disabled (default): always issue, exactly as before.
+	if s.assuranceEnabled() {
+		if err := s.applyAssurance(ctx, jkt, &att); err != nil {
+			s.emitAuditFailure("assurance_refused", err)
+			return "", err
+		}
+	}
+
 	// Step 4: Generate WIA JWT
-	return s.signWIA(cnfJWK, jkt, tenantID, userID, attestationSource, req.ClientID)
+	return s.signWIA(cnfJWK, jkt, tenantID, userID, att, req.ClientID)
+}
+
+// wiaAttestation is what one WIA request established and decided.
+type wiaAttestation struct {
+	// Source is the attestation source the backend verified in THIS request:
+	// platform_attested, development_attested or backend_attested. It is
+	// what is stored on the wallet instance and what rules see as the
+	// platform source.
+	Source string
+	// Platform is the native attestation type that was verified, "" when the
+	// request carried no verified native attestation.
+	Platform NativeAttestationType
+	// AppID is the verified application id, "" when none.
+	AppID string
+
+	// Claim is the attestation_source claim value. Empty means Source (the
+	// policy-disabled behaviour); with the policy enabled it is the emitted
+	// value of the chosen S profile.
+	Claim string
+	// CertInfo, when non-nil, replaces the configured
+	// wallet_solution_certification_information.
+	CertInfo map[string]interface{}
+	// Decision is the policy outcome, nil with the policy disabled.
+	Decision *assurance.WIAOutcome
+}
+
+// wiaFacts builds the evidence of a WIA decision. The platform slot is the
+// native attestation source verified in this request (not stored instance
+// state); the FIDO2 slot is none because a WIA request carries no FIDO2
+// evidence; there are no client claims.
+func wiaFacts(att wiaAttestation) assurance.Facts {
+	return assurance.Facts{Platform: &assurance.PlatformVerified{Source: att.Source, AppID: att.AppID}}
+}
+
+// applyAssurance runs the policy for one WIA request and records the result
+// in att. It returns ErrWIARefusedByPolicy when no rule permits issuance.
+func (s *WIAService) applyAssurance(ctx context.Context, jkt string, att *wiaAttestation) error {
+	if s.assessor == nil {
+		return ErrAssuranceUnavailable
+	}
+	out := s.assessor.AssessWIA(ctx, wiaFacts(*att))
+	for _, err := range out.Errors {
+		s.logger.Warn("assurance decider error treated as deny", zap.Error(err))
+	}
+	s.logger.Info("wia assurance decision",
+		zap.String("jkt", jkt[:min(8, len(jkt))]+"..."),
+		zap.String("policy_hash", out.PolicyVersion),
+		zap.Int("schema_version", out.SchemaVersion),
+		zap.Strings("rule_ids", out.RuleIDs()),
+		zap.Bool("issue", out.Issue),
+		zap.Strings("issue_rules", out.IssueRuleIDs),
+		zap.String("verified_source", att.Source),
+		zap.String("profile", out.Profile.Level),
+		zap.String("profile_value", out.Profile.Value),
+		zap.Strings("profile_rules", out.Profile.RuleIDs),
+		zap.String("certification_entry", out.CertName),
+		zap.Strings("certification_rules", out.CertRuleIDs),
+	)
+	att.Decision = out
+	if !out.Issue {
+		return ErrWIARefusedByPolicy
+	}
+	att.Claim = out.Profile.Value
+	att.CertInfo = out.CertInfo
+	return nil
 }
 
 // validatePop validates the WIA-PoP JWT and extracts the cnf key.
@@ -458,8 +551,13 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 // signWIA creates the WIA JWT (typ: oauth-client-attestation+jwt).
 // jkt is the JWK Thumbprint of cnfJWK, precomputed by the caller (GenerateWIA)
 // so it can also be used for the instance-status guard before signing.
-func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, attestationSource string, clientID string) (string, error) {
+func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, att wiaAttestation, clientID string) (string, error) {
 	now := time.Now()
+	attestationSource := att.Source
+	claimSource := att.Claim
+	if claimSource == "" {
+		claimSource = att.Source
+	}
 
 	// WIA lifetime, capped by WIA max expiry. Deliberately short (default
 	// 300s / 5 min, see AttestationConfig) — this wallet provider has no
@@ -499,24 +597,33 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 		"iat": now.Unix(),
 		"exp": now.Add(lifetime).Unix(),
 		// attestation_source: a SIROS extension claim — neither EC TS03 nor
-		// ETSI TS 119 472-3 define a WIA claim for this. Its values are
-		// chosen to mirror the S1/S3 "WIA dimension" tiers from WE BUILD
-		// wp4-architecture PR #229 ("cs-04: Add Annex C — Tiered WUA for
-		// cross-platform Wallet Solutions", open as of 2026-08, branch
+		// ETSI TS 119 472-3 define a WIA claim for this. It mirrors the
+		// S-tier "WIA dimension" of WE BUILD wp4-architecture PR #229
+		// ("cs-04: Add Annex C — Tiered WUA for cross-platform Wallet
+		// Solutions", open as of 2026-08, branch
 		// cs-04/annex-c-tiered-attestation) — NOT "WP4 CS-05" (Business
 		// Wallet, unrelated); Annex C is a proposed addition to CS-04.
 		// Annex C's own note is explicit that TS-03/CS-04 don't define this
 		// claim: any such signal "may [be conveyed] via the certification
 		// information or via an extension claim, but this is outside the
 		// scope of TS-03 and CS-04" — this claim is that extension.
-		//   "backend_attested"         — Annex C tier S3: backend-only attestation
-		//   "ios_app_attest"           — Annex C tier S1: full client attestation (Apple App Attest)
-		//   "android_play_integrity"   — Annex C tier S1: full client attestation (Google Play Integrity)
-		// Annex C's tier S2 (partial client attestation, e.g. a browser
-		// extension/companion) has no corresponding value yet.
+		// Values emitted by the backend without the assurance policy (the
+		// strings the attestation verifier produces):
+		//   "backend_attested"      — Annex C S3: backend-only attestation
+		//   "platform_attested"     — Annex C S1: full client attestation,
+		//                             a verified Apple App Attest or Google
+		//                             Play Integrity check
+		//   "development_attested"  — an App Attest chain that only chained
+		//                             to a development environment; NOT S1
+		// Annex C's S2 (partial client attestation, e.g. a browser
+		// extension/companion) has no evidence source and no value yet.
+		// With wallet_provider.attestation.assurance enabled the value is
+		// the emitted string of the S profile the policy chose
+		// (assure-wia); the verified source stays in the audit log and on
+		// the wallet instance.
 		// Third-party wallet providers may omit this claim; issuers must handle
 		// both present and absent cases (absent = unknown tier).
-		"attestation_source": attestationSource,
+		"attestation_source": claimSource,
 	}
 
 	if s.cfg.WalletProvider.WIA.WalletName != "" {
@@ -529,8 +636,13 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 		claims["wallet_link"] = s.cfg.WalletProvider.WIA.WalletLink
 	}
 
-	// Wallet solution certification information (Annex C §C.3.2)
-	if len(s.cfg.WalletProvider.WIA.CertificationInfo) > 0 {
+	// Wallet solution certification information (Annex C §C.3.2). The
+	// assurance policy may select a catalogue entry; otherwise the static
+	// configuration is used.
+	switch {
+	case len(att.CertInfo) > 0:
+		claims["wallet_solution_certification_information"] = att.CertInfo
+	case len(s.cfg.WalletProvider.WIA.CertificationInfo) > 0:
 		claims["wallet_solution_certification_information"] = s.cfg.WalletProvider.WIA.CertificationInfo
 	}
 
@@ -592,7 +704,7 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 		return "", err
 	}
 
-	wiaGeneratedTotal.WithLabelValues(attestationSource).Inc()
+	wiaGeneratedTotal.WithLabelValues(claimSource).Inc()
 	s.logger.Info("WIA generated", zap.String("jkt", jkt[:8]+"..."))
 
 	// Record wallet instance (upsert: creates on first attestation, updates on subsequent).
@@ -607,7 +719,7 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 			TenantID:          tenantID,
 			UserID:            userID,
 			Status:            domain.InstanceStatusActive,
-			WSCDType:          wscdTypeFromAttestation(attestationSource),
+			WSCDType:          wscdTypeFromAttestation(attestationSource, att.Platform),
 			AttestationSource: attestationSource,
 			LastAttestedAt:    now,
 			CreatedAt:         now,
@@ -621,7 +733,7 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 	// Emit audit event
 	if s.audit != nil {
 		s.audit.EmitWithSubject(set.EventWIAIssued, jkt, map[string]any{
-			"attestation_source": attestationSource,
+			"attestation_source": claimSource,
 		})
 	}
 
@@ -686,15 +798,28 @@ func (s *WIAService) emitAuditFailure(reason string, err error) {
 	}
 }
 
-// wscdTypeFromAttestation maps attestation source to WSCD type.
-func wscdTypeFromAttestation(source string) domain.WSCDType {
+// wscdTypeFromAttestation maps what the WIA request verified to a WSCD type.
+// source is what the instance stores (platform_attested, development_attested
+// or backend_attested); platform is the native attestation type that produced
+// it. The stored sources never contain the platform name, so the platform
+// must be passed in: an earlier version switched on "ios_app_attest" /
+// "android_play_integrity", which nothing ever stores, so every native
+// instance was classified web_crypto.
+//
+// development_attested is a real device attested against a development
+// environment: its key is still in that platform's secure hardware, so it
+// gets the platform's WSCD type, but it never counts as platform_attested
+// anywhere trust is decided (see nativeAttestationSources).
+func wscdTypeFromAttestation(source string, platform NativeAttestationType) domain.WSCDType {
 	switch source {
-	case "ios_app_attest":
-		return domain.WSCDTypeNativeIOS
-	case "android_play_integrity":
-		return domain.WSCDTypeNativeAndroid
-	default:
-		// Backend-attested instances from web frontend use Web Crypto.
-		return domain.WSCDTypeWebCrypto
+	case "platform_attested", "development_attested":
+		switch platform {
+		case NativeAttestationAppleAppAttest:
+			return domain.WSCDTypeNativeIOS
+		case NativeAttestationGooglePlayInteg:
+			return domain.WSCDTypeNativeAndroid
+		}
 	}
+	// Backend-attested instances from web frontend use Web Crypto.
+	return domain.WSCDTypeWebCrypto
 }

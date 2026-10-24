@@ -81,29 +81,53 @@ func (s *FIDO2AttestationService) IsEnabled() bool {
 // Verify validates a FIDO2 attestation object and, on success, durably
 // marks the corresponding WalletInstance as hardware-key-attested.
 func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2AttestationRequest) error {
-	if !s.IsEnabled() {
-		return ErrFIDO2AttestationDisabled
-	}
-	if req == nil {
-		return fmt.Errorf("%w: nil request", ErrFIDO2AttestationInvalid)
-	}
-	if req.WalletInstanceID == "" {
+	if req != nil && req.WalletInstanceID == "" && s.IsEnabled() {
 		return fmt.Errorf("%w: empty wallet_instance_id", ErrFIDO2AttestationInvalid)
 	}
+	rec, err := s.VerifyEvidence(ctx, req)
+	if err != nil {
+		return err
+	}
+	if err := s.keyAttestations.MarkKeyAttested(ctx, rec); err != nil {
+		return fmt.Errorf("%w: record verification: %v", ErrFIDO2AttestationInvalid, err)
+	}
+
+	s.logger.Info("FIDO2 hardware attestation verified",
+		zap.String("wallet_instance_id", req.WalletInstanceID),
+		zap.String("key_thumbprint", rec.KeyThumbprint),
+		zap.Bool("uv", rec.UV),
+	)
+
+	return nil
+}
+
+// VerifyEvidence runs every verification step of Verify (CBOR decode,
+// attestation signature, x5c chain against the FIDO MDS3 registry, key
+// derivation) and returns the record Verify would store, WITHOUT storing
+// anything. It is the single verifier: Verify persists its result, the
+// assurance preview endpoint only reads it. The request's WalletInstanceID
+// is optional here (a preview has no registration to attach it to).
+func (s *FIDO2AttestationService) VerifyEvidence(ctx context.Context, req *FIDO2AttestationRequest) (*domain.KeyAttestationRecord, error) {
+	if !s.IsEnabled() {
+		return nil, ErrFIDO2AttestationDisabled
+	}
+	if req == nil {
+		return nil, fmt.Errorf("%w: nil request", ErrFIDO2AttestationInvalid)
+	}
 	if len(req.ClientDataHash) != 32 {
-		return fmt.Errorf("%w: client_data_hash must be 32 bytes, got %d", ErrFIDO2AttestationInvalid, len(req.ClientDataHash))
+		return nil, fmt.Errorf("%w: client_data_hash must be 32 bytes, got %d", ErrFIDO2AttestationInvalid, len(req.ClientDataHash))
 	}
 
 	// Step 1: CBOR-decode the attestation object (fmt, authData, attStmt).
 	var attObj protocol.AttestationObject
 	if err := webauthncbor.Unmarshal(req.AttestationObject, &attObj); err != nil {
-		return fmt.Errorf("%w: cbor decode: %v", ErrFIDO2AttestationInvalid, err)
+		return nil, fmt.Errorf("%w: cbor decode: %v", ErrFIDO2AttestationInvalid, err)
 	}
 	if err := attObj.AuthData.Unmarshal(attObj.RawAuthData); err != nil {
-		return fmt.Errorf("%w: parse authData: %v", ErrFIDO2AttestationInvalid, err)
+		return nil, fmt.Errorf("%w: parse authData: %v", ErrFIDO2AttestationInvalid, err)
 	}
 	if !attObj.AuthData.Flags.HasAttestedCredentialData() {
-		return fmt.Errorf("%w: authData missing attested credential data flag", ErrFIDO2AttestationInvalid)
+		return nil, fmt.Errorf("%w: authData missing attested credential data flag", ErrFIDO2AttestationInvalid)
 	}
 
 	// Step 2: verify the attestation statement's signature over
@@ -125,7 +149,7 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 	policy := protocol.AttestationPolicy{}
 	signature := protocol.SignaturePolicy{ECDSAEncoding: protocol.ECDSASignatureEncodingBER}
 	if err := attObj.VerifyAttestation(req.ClientDataHash, nil, policy, signature); err != nil {
-		return fmt.Errorf("%w: attestation signature: %v", ErrFIDO2AttestationInvalid, err)
+		return nil, fmt.Errorf("%w: attestation signature: %v", ErrFIDO2AttestationInvalid, err)
 	}
 
 	// Step 3: verify the x5c chain (present for "packed" Basic Attestation,
@@ -138,29 +162,29 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 	// delegated to the PDP, same as issuer/verifier trust.
 	x5cRaw, ok := attObj.AttStatement["x5c"].([]any)
 	if !ok || len(x5cRaw) == 0 {
-		return fmt.Errorf("%w: no x5c attestation certificate chain present (self-attestation is not accepted)", ErrFIDO2AttestationInvalid)
+		return nil, fmt.Errorf("%w: no x5c attestation certificate chain present (self-attestation is not accepted)", ErrFIDO2AttestationInvalid)
 	}
 
 	x5cChain := make([]string, 0, len(x5cRaw))
 	for i, raw := range x5cRaw {
 		der, ok := raw.([]byte)
 		if !ok {
-			return fmt.Errorf("%w: malformed x5c chain element %d", ErrFIDO2AttestationInvalid, i)
+			return nil, fmt.Errorf("%w: malformed x5c chain element %d", ErrFIDO2AttestationInvalid, i)
 		}
 		x5cChain = append(x5cChain, base64.StdEncoding.EncodeToString(der))
 	}
 
 	aaguid, err := uuid.FromBytes(attObj.AuthData.AttData.AAGUID)
 	if err != nil {
-		return fmt.Errorf("%w: parse AAGUID: %v", ErrFIDO2AttestationInvalid, err)
+		return nil, fmt.Errorf("%w: parse AAGUID: %v", ErrFIDO2AttestationInvalid, err)
 	}
 
 	trustInfo, err := s.trust.EvaluateFIDO2Attestation(ctx, aaguid.String(), x5cChain)
 	if err != nil {
-		return fmt.Errorf("%w: trust evaluation: %v", ErrFIDO2AttestationInvalid, err)
+		return nil, fmt.Errorf("%w: trust evaluation: %v", ErrFIDO2AttestationInvalid, err)
 	}
 	if !trustInfo.Trusted {
-		return fmt.Errorf("%w: not trusted by FIDO MDS3 registry: %s", ErrFIDO2AttestationInvalid, trustInfo.Reason)
+		return nil, fmt.Errorf("%w: not trusted by FIDO MDS3 registry: %s", ErrFIDO2AttestationInvalid, trustInfo.Reason)
 	}
 
 	// Step 4: derive the attested credential key's own JWK Thumbprint from
@@ -171,11 +195,11 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 	// evidence (see domain.KeyAttestationRecord's doc comment).
 	pubKeyAny, err := webauthncose.ParsePublicKey(attObj.AuthData.AttData.CredentialPublicKey)
 	if err != nil {
-		return fmt.Errorf("%w: parse credential public key: %v", ErrFIDO2AttestationInvalid, err)
+		return nil, fmt.Errorf("%w: parse credential public key: %v", ErrFIDO2AttestationInvalid, err)
 	}
 	ec2Key, ok := pubKeyAny.(webauthncose.EC2PublicKeyData)
 	if !ok || ec2Key.Curve != int64(webauthncose.P256) {
-		return fmt.Errorf("%w: unsupported credential key type (only EC P-256 supported)", ErrFIDO2AttestationInvalid)
+		return nil, fmt.Errorf("%w: unsupported credential key type (only EC P-256 supported)", ErrFIDO2AttestationInvalid)
 	}
 	keyThumbprint, err := jwk.Thumbprint(map[string]interface{}{
 		"kty": "EC",
@@ -184,33 +208,24 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 		"y":   base64.RawURLEncoding.EncodeToString(ec2Key.YCoord),
 	})
 	if err != nil {
-		return fmt.Errorf("%w: compute key thumbprint: %v", ErrFIDO2AttestationInvalid, err)
+		return nil, fmt.Errorf("%w: compute key thumbprint: %v", ErrFIDO2AttestationInvalid, err)
 	}
 
 	// TenantID is for auditing/scoping only - best-effort lookup, not part
 	// of the trust decision (which is keyed by thumbprint alone).
 	var tenantID domain.TenantID
-	if instance, err := s.instances.GetByID(ctx, req.WalletInstanceID); err == nil {
-		tenantID = instance.TenantID
+	if req.WalletInstanceID != "" {
+		if instance, err := s.instances.GetByID(ctx, req.WalletInstanceID); err == nil {
+			tenantID = instance.TenantID
+		}
 	}
 
-	verifiedAt := time.Now().UTC()
-	rec := &domain.KeyAttestationRecord{
+	return &domain.KeyAttestationRecord{
 		KeyThumbprint:    keyThumbprint,
 		WalletInstanceID: req.WalletInstanceID,
 		TenantID:         tenantID,
 		AAGUID:           aaguid.String(),
-		VerifiedAt:       verifiedAt,
-	}
-	if err := s.keyAttestations.MarkKeyAttested(ctx, rec); err != nil {
-		return fmt.Errorf("%w: record verification: %v", ErrFIDO2AttestationInvalid, err)
-	}
-
-	s.logger.Info("FIDO2 hardware attestation verified",
-		zap.String("wallet_instance_id", req.WalletInstanceID),
-		zap.String("key_thumbprint", keyThumbprint),
-		zap.String("format", attObj.Format),
-	)
-
-	return nil
+		UV:               attObj.AuthData.Flags.UserVerified(),
+		VerifiedAt:       time.Now().UTC(),
+	}, nil
 }

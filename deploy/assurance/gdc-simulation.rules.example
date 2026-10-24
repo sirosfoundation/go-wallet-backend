@@ -17,3 +17,7 @@
 
 # id: gdc-soft-ua-high
 (assure-ua (tier (* set basic enhanced-basic moderate high))(evidence (verified)(claimed (plugin soft))))
+
+# A WIA is issued to every wallet, as with the policy disabled.
+# id: gdc-wia-issue-all
+(assure-wia-issue (evidence))

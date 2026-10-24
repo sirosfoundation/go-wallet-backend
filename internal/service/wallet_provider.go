@@ -18,15 +18,14 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
-var (
-	ErrKeyAttestationNotSupported = errors.New("key attestation not supported")
-)
+var ErrKeyAttestationNotSupported = errors.New("key attestation not supported")
 
 // MaxJWKSPerRequest is the hard upper bound on JWKs in a single KA request.
 // Prevents DoS via expensive JWT signing with excessively large arrays.
@@ -46,6 +45,9 @@ type WalletProviderService struct {
 	instances       storage.WalletInstanceStore
 	keyAttestations storage.KeyAttestationStore
 	assessor        *assurance.Assessor
+	// fido2 is the FIDO2 attestation verifier, used only by the assurance
+	// preview (dry run). May be nil.
+	fido2 *FIDO2AttestationService
 }
 
 // NewWalletProviderService creates a new WalletProviderService.
@@ -467,6 +469,13 @@ var nativeAttestationSources = map[string]bool{
 // this only ever clamps a batch that's actually mixed-evidence or entirely
 // unattested, never a genuinely homogeneous hardware-backed batch.
 func (s *WalletProviderService) keyAttestationTrustsBatch(ctx context.Context, walletInstanceID string, jwks []map[string]interface{}) bool {
+	return s.keyAttestationTrustsBatchWith(ctx, walletInstanceID, jwks, nil)
+}
+
+// keyAttestationTrustsBatchWith is keyAttestationTrustsBatch with an optional
+// overlay: a record verified in this request but not persisted (the preview's
+// dry run) that answers for its own key thumbprint.
+func (s *WalletProviderService) keyAttestationTrustsBatchWith(ctx context.Context, walletInstanceID string, jwks []map[string]interface{}, overlay *domain.KeyAttestationRecord) bool {
 	if walletInstanceID != "" && s.instances != nil {
 		instance, err := s.lookupOwnedInstance(ctx, walletInstanceID)
 		if err != nil {
@@ -478,13 +487,19 @@ func (s *WalletProviderService) keyAttestationTrustsBatch(ctx context.Context, w
 		}
 	}
 
-	if s.keyAttestations == nil || len(jwks) == 0 {
+	if len(jwks) == 0 || (s.keyAttestations == nil && overlay == nil) {
 		return false
 	}
 	for _, j := range jwks {
 		thumbprint, err := jwk.Thumbprint(j)
 		if err != nil {
 			// Unsupported/malformed key (e.g. non-EC) - can't have evidence.
+			return false
+		}
+		if overlay != nil && overlay.KeyThumbprint == thumbprint {
+			continue
+		}
+		if s.keyAttestations == nil {
 			return false
 		}
 		if _, err := s.keyAttestations.GetByKeyThumbprint(ctx, thumbprint); err != nil {

@@ -117,34 +117,72 @@ func (s *WalletProviderService) assuranceFacts(ctx context.Context, walletInstan
 	return f
 }
 
+// batchThumbprints returns the RFC 7638 thumbprint of every key, or false
+// when any key is malformed or unsupported (it then cannot have evidence).
+func batchThumbprints(jwks []map[string]interface{}) ([]string, bool) {
+	out := make([]string, 0, len(jwks))
+	for _, j := range jwks {
+		tp, err := jwk.Thumbprint(j)
+		if err != nil {
+			return nil, false
+		}
+		out = append(out, tp)
+	}
+	return out, true
+}
+
 // fido2Evidence returns the fido2 slot for a batch: only when EVERY key has a
 // durably verified FIDO2 record, and all records agree on the AAGUID (a
 // mixed batch has no single model to assert, so it is treated as
-// unverified). User verification is not stored yet, so it is never asserted.
+// unverified). User verification is "present" only when EVERY record carries
+// the authenticator's user-verified flag.
 func (s *WalletProviderService) fido2Evidence(ctx context.Context, jwks []map[string]interface{}) *assurance.Fido2Verified {
-	if s.keyAttestations == nil || len(jwks) == 0 {
+	tps, ok := batchThumbprints(jwks)
+	if !ok {
+		return nil
+	}
+	return s.fido2EvidenceFor(ctx, tps, nil)
+}
+
+// fido2EvidenceFor is fido2Evidence over thumbprints. overlay, when set, is
+// a record the backend verified in this very request but did not persist (the
+// preview's dry run); it answers for its own thumbprint, every other key is
+// looked up in the store.
+func (s *WalletProviderService) fido2EvidenceFor(ctx context.Context, thumbprints []string, overlay *domain.KeyAttestationRecord) *assurance.Fido2Verified {
+	if len(thumbprints) == 0 || (s.keyAttestations == nil && overlay == nil) {
 		return nil
 	}
 	aaguid := ""
-	for i, j := range jwks {
-		thumbprint, err := jwk.Thumbprint(j)
-		if err != nil {
-			return nil
-		}
-		rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, thumbprint)
-		if err != nil {
-			if !errors.Is(err, storage.ErrNotFound) {
-				s.logger.Warn("failed to look up key attestation for assurance evidence", zap.Error(err))
+	uv := true
+	for i, thumbprint := range thumbprints {
+		var rec *domain.KeyAttestationRecord
+		if overlay != nil && overlay.KeyThumbprint == thumbprint {
+			rec = overlay
+		} else {
+			if s.keyAttestations == nil {
+				return nil
 			}
-			return nil
+			var err error
+			rec, err = s.keyAttestations.GetByKeyThumbprint(ctx, thumbprint)
+			if err != nil {
+				if !errors.Is(err, storage.ErrNotFound) {
+					s.logger.Warn("failed to look up key attestation for assurance evidence", zap.Error(err))
+				}
+				return nil
+			}
 		}
 		if i == 0 {
 			aaguid = rec.AAGUID
 		} else if rec.AAGUID != aaguid {
 			return nil
 		}
+		uv = uv && rec.UV
 	}
-	return &assurance.Fido2Verified{AAGUID: aaguid}
+	out := &assurance.Fido2Verified{AAGUID: aaguid}
+	if uv {
+		out.UV = assurance.UVPresent
+	}
+	return out
 }
 
 // assuranceBucketIndex maps a level's bucket onto the KA status list index.

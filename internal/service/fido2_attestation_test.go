@@ -158,6 +158,13 @@ func TestFIDO2AttestationService_InvalidCBOR(t *testing.T) {
 // covered by go-trust's own pkg/registry/fidomds3 tests).
 func buildTestAttestationObject(t *testing.T, aaguid uuid.UUID, clientDataHash []byte) ([]byte, *ecdsa.PublicKey) {
 	t.Helper()
+	return buildTestAttestationObjectFlags(t, aaguid, clientDataHash, 0x40)
+}
+
+// buildTestAttestationObjectFlags is buildTestAttestationObject with explicit
+// authenticator data flags (0x40 = AT, 0x04 = UV, 0x01 = UP).
+func buildTestAttestationObjectFlags(t *testing.T, aaguid uuid.UUID, clientDataHash []byte, flags byte) ([]byte, *ecdsa.PublicKey) {
+	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -201,7 +208,7 @@ func buildTestAttestationObject(t *testing.T, aaguid uuid.UUID, clientDataHash [
 
 	authData := make([]byte, 0, 128)
 	authData = append(authData, rpIDHash[:]...)
-	authData = append(authData, 0x40) // flags: AT (attested credential data present)
+	authData = append(authData, flags) // 0x40 = AT (attested credential data present)
 	authData = binary.BigEndian.AppendUint32(authData, 1)
 	authData = append(authData, aaguid[:]...)
 	authData = binary.BigEndian.AppendUint16(authData, uint16(len(credentialID)))
@@ -327,5 +334,66 @@ func TestFIDO2AttestationService_NotTrustedByPDP(t *testing.T) {
 	thumbprint := expectedThumbprint(t, pub)
 	if _, getErr := store.KeyAttestations().GetByKeyThumbprint(context.Background(), thumbprint); !errors.Is(getErr, storage.ErrNotFound) {
 		t.Errorf("expected no stored key attestation record when the PDP denies trust, got err=%v", getErr)
+	}
+}
+
+// verifyWithFlags registers an attestation made with the given authenticator
+// data flags and returns the stored record.
+func verifyWithFlags(t *testing.T, flags byte) *domain.KeyAttestationRecord {
+	t.Helper()
+	store := memory.NewStore()
+	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{ID: "test-instance"}); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewFIDO2AttestationService(testFIDO2AttestationConfig(true), store.WalletInstances(), store.KeyAttestations(), newTestTrustService(t, &stubEvaluator{decision: true}), zap.NewNop())
+	hash := make([]byte, 32)
+	attObj, pub := buildTestAttestationObjectFlags(t, uuid.New(), hash, flags)
+	if err := svc.Verify(context.Background(), &FIDO2AttestationRequest{WalletInstanceID: "test-instance", AttestationObject: attObj, ClientDataHash: hash}); err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	rec, err := store.KeyAttestations().GetByKeyThumbprint(context.Background(), expectedThumbprint(t, pub))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rec
+}
+
+// The user-verified flag of the authenticator data is stored with the record.
+func TestFIDO2AttestationService_StoresUserVerifiedFlag(t *testing.T) {
+	if !verifyWithFlags(t, 0x40|0x04|0x01).UV {
+		t.Error("UV flag set in authData but record.UV is false")
+	}
+	if verifyWithFlags(t, 0x40|0x01).UV {
+		t.Error("UV flag clear in authData but record.UV is true (user presence is not user verification)")
+	}
+}
+
+// VerifyEvidence is the verifier Verify uses; it must not persist anything.
+func TestFIDO2AttestationService_VerifyEvidenceDoesNotPersist(t *testing.T) {
+	store := memory.NewStore()
+	svc := NewFIDO2AttestationService(testFIDO2AttestationConfig(true), store.WalletInstances(), store.KeyAttestations(), newTestTrustService(t, &stubEvaluator{decision: true}), zap.NewNop())
+	hash := make([]byte, 32)
+	attObj, pub := buildTestAttestationObjectFlags(t, uuid.New(), hash, 0x40|0x04)
+
+	rec, err := svc.VerifyEvidence(context.Background(), &FIDO2AttestationRequest{AttestationObject: attObj, ClientDataHash: hash})
+	if err != nil {
+		t.Fatalf("VerifyEvidence: %v", err)
+	}
+	if rec.KeyThumbprint != expectedThumbprint(t, pub) || !rec.UV {
+		t.Errorf("unexpected record %+v", rec)
+	}
+	if _, err := store.KeyAttestations().GetByKeyThumbprint(context.Background(), rec.KeyThumbprint); !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("VerifyEvidence persisted a record: err=%v", err)
+	}
+}
+
+// An untrusted attestation is refused by the dry run exactly as by Verify.
+func TestFIDO2AttestationService_VerifyEvidenceRefusesUntrusted(t *testing.T) {
+	store := memory.NewStore()
+	svc := NewFIDO2AttestationService(testFIDO2AttestationConfig(true), store.WalletInstances(), store.KeyAttestations(), newTestTrustService(t, &stubEvaluator{decision: false, reason: "x"}), zap.NewNop())
+	hash := make([]byte, 32)
+	attObj, _ := buildTestAttestationObjectFlags(t, uuid.New(), hash, 0x40|0x04)
+	if _, err := svc.VerifyEvidence(context.Background(), &FIDO2AttestationRequest{AttestationObject: attObj, ClientDataHash: hash}); !errors.Is(err, ErrFIDO2AttestationInvalid) {
+		t.Fatalf("err = %v, want ErrFIDO2AttestationInvalid", err)
 	}
 }

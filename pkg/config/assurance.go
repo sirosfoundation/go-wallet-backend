@@ -56,6 +56,148 @@ type AssuranceConfig struct {
 	// false and NOT spec-supported: OpenID4VCI 1.0/1.1 Appendix D defines
 	// certification as a URL string. See docs/assurance-policy.md.
 	CertificationBasisInClaim bool `yaml:"certification_basis_in_claim" envconfig:"CERTIFICATION_BASIS_IN_CLAIM"`
+
+	// WIAProfileSchemes are the named S-profile schemes available to the
+	// Wallet Instance Attestation (WIA) decision (assure-wia). The built-in
+	// "cs04_annex_c" scheme is always available unless one with that id is
+	// configured here.
+	WIAProfileSchemes WIAProfileSchemeList `yaml:"wia_profile_schemes" envconfig:"WIA_PROFILE_SCHEMES"`
+
+	// WIAProfileScheme selects the scheme (by id) the WIA profile is decided
+	// in. Default "cs04_annex_c".
+	WIAProfileScheme string `yaml:"wia_profile_scheme" envconfig:"WIA_PROFILE_SCHEME"`
+
+	// WIACertification is the catalogue of wallet_solution_certification_
+	// information values assure-wia-cert may select for the WIA. When no
+	// entry is permitted the static wallet_provider.wia.certification_info
+	// is used, exactly as without the policy.
+	WIACertification WIACertificationCatalogueConfig `yaml:"wia_certification" envconfig:"WIA_CERTIFICATION"`
+}
+
+// DefaultWIAProfileSchemeID is the built-in S-profile scheme, named after the
+// attestation coverage tiers of WE BUILD CS-04 Annex C.2.2.
+const DefaultWIAProfileSchemeID = "cs04_annex_c"
+
+// WIAProfileSchemeConfig is a named, ordered set of WIA attestation-coverage
+// profiles (the S dimension of CS-04 Annex C). It has the shape of a level
+// scheme with the levels called profiles.
+type WIAProfileSchemeConfig struct {
+	// ID names the scheme.
+	ID string `yaml:"id" json:"id"`
+	// Profiles are the profile names, weakest first. They are the atoms
+	// rules use in (profile ...).
+	Profiles []string `yaml:"profiles" json:"profiles"`
+	// Values are the strings emitted in the WIA's attestation_source claim
+	// for each profile, same length and order as Profiles.
+	Values []string `yaml:"values" json:"values"`
+	// Floor is the profile returned when nothing is granted.
+	Floor string `yaml:"floor" json:"floor"`
+	// Ceiling optionally caps the result.
+	Ceiling string `yaml:"ceiling,omitempty" json:"ceiling,omitempty"`
+}
+
+// AsLevelScheme returns the equivalent level scheme, which is what the
+// engine indexes.
+func (s WIAProfileSchemeConfig) AsLevelScheme() LevelSchemeConfig {
+	return LevelSchemeConfig{ID: s.ID, Levels: s.Profiles, Values: s.Values, Floor: s.Floor, Ceiling: s.Ceiling}
+}
+
+// Validate checks one profile scheme for internal consistency.
+func (s WIAProfileSchemeConfig) Validate() error { return s.AsLevelScheme().Validate() }
+
+// WIAProfileSchemeList is a list of profile schemes that can also be supplied
+// through an environment variable as a JSON array.
+type WIAProfileSchemeList []WIAProfileSchemeConfig
+
+// Decode implements envconfig.Decoder (JSON array).
+func (l *WIAProfileSchemeList) Decode(value string) error {
+	if strings.TrimSpace(value) == "" {
+		*l = nil
+		return nil
+	}
+	var out []WIAProfileSchemeConfig
+	if err := json.Unmarshal([]byte(value), &out); err != nil {
+		return fmt.Errorf("wia_profile_schemes must be a JSON array: %w", err)
+	}
+	*l = out
+	return nil
+}
+
+// BuiltinWIAProfileScheme returns the default S-profile scheme. The profiles
+// are the CS-04 Annex C.2.2 tiers S3 (backend-only attestation) and S1 (full
+// client attestation); S2 (partial client attestation) has no evidence source
+// and no existing attestation_source value, so it is not in the default.
+// The emitted values are the attestation_source strings the WIA has always
+// carried, so enabling the policy does not change the vocabulary.
+func BuiltinWIAProfileScheme() WIAProfileSchemeConfig {
+	return WIAProfileSchemeConfig{
+		ID:       DefaultWIAProfileSchemeID,
+		Profiles: []string{"s3-backend-only", "s1-full-client"},
+		Values:   []string{"backend_attested", "platform_attested"},
+		Floor:    "s3-backend-only",
+	}
+}
+
+// WIACertificationCatalogueConfig lists the wallet_solution_certification_
+// information values the policy may select.
+type WIACertificationCatalogueConfig struct {
+	// Entries are probed in order (list the strongest first); the first one a
+	// rule permits wins.
+	Entries WIACertificationEntryList `yaml:"entries" envconfig:"ENTRIES"`
+}
+
+// WIACertificationEntry is a named wallet_solution_certification_information
+// value a rule can select.
+type WIACertificationEntry struct {
+	// Name is the atom rules use in (assure-wia-cert (name ...)).
+	Name string `yaml:"name" json:"name"`
+	// Information is emitted verbatim as wallet_solution_certification_
+	// information.
+	Information map[string]interface{} `yaml:"information" json:"information"`
+}
+
+// WIACertificationEntryList is a list of entries that can also be supplied
+// through an environment variable as a JSON array.
+type WIACertificationEntryList []WIACertificationEntry
+
+// Decode implements envconfig.Decoder (JSON array).
+func (l *WIACertificationEntryList) Decode(value string) error {
+	if strings.TrimSpace(value) == "" {
+		*l = nil
+		return nil
+	}
+	var out []WIACertificationEntry
+	if err := json.Unmarshal([]byte(value), &out); err != nil {
+		return fmt.Errorf("wia certification entries must be a JSON array: %w", err)
+	}
+	*l = out
+	return nil
+}
+
+// EffectiveWIAProfileSchemes returns the configured profile schemes plus the
+// built-in one when none with its id is configured.
+func (c *AssuranceConfig) EffectiveWIAProfileSchemes() []WIAProfileSchemeConfig {
+	out := append([]WIAProfileSchemeConfig(nil), c.WIAProfileSchemes...)
+	for _, s := range out {
+		if s.ID == DefaultWIAProfileSchemeID {
+			return out
+		}
+	}
+	return append(out, BuiltinWIAProfileScheme())
+}
+
+// WIAProfileSchemeByID returns the effective profile scheme with the given id
+// (the default when id is empty).
+func (c *AssuranceConfig) WIAProfileSchemeByID(id string) (WIAProfileSchemeConfig, bool) {
+	if id == "" {
+		id = DefaultWIAProfileSchemeID
+	}
+	for _, s := range c.EffectiveWIAProfileSchemes() {
+		if s.ID == id {
+			return s, true
+		}
+	}
+	return WIAProfileSchemeConfig{}, false
 }
 
 // LevelSchemeConfig is a named, ordered set of assurance levels.
@@ -261,6 +403,36 @@ func (c *AssuranceConfig) Validate() error {
 	}
 	if len(c.Certification.Entries) == 0 && len(c.Certification.Levels) > 0 && c.Certification.Scheme == "" {
 		return fmt.Errorf("%s.certification.levels requires certification.scheme", p)
+	}
+
+	seenWIA := map[string]bool{}
+	for i, s := range c.EffectiveWIAProfileSchemes() {
+		if !IsAssuranceAtom(s.ID) {
+			return fmt.Errorf("%s.wia_profile_schemes[%d].id %q is not a valid identifier", p, i, s.ID)
+		}
+		if seenWIA[s.ID] {
+			return fmt.Errorf("%s.wia_profile_schemes: duplicate scheme id %q", p, s.ID)
+		}
+		seenWIA[s.ID] = true
+		if err := s.Validate(); err != nil {
+			return fmt.Errorf("%s.wia_profile_schemes[%q]: %w", p, s.ID, err)
+		}
+	}
+	if _, ok := c.WIAProfileSchemeByID(c.WIAProfileScheme); !ok {
+		return fmt.Errorf("%s.wia_profile_scheme references unknown scheme %q", p, c.WIAProfileScheme)
+	}
+	wiaNames := map[string]bool{}
+	for i, e := range c.WIACertification.Entries {
+		if !IsAssuranceAtom(e.Name) {
+			return fmt.Errorf("%s.wia_certification entry %d: name %q is not a valid identifier", p, i, e.Name)
+		}
+		if wiaNames[e.Name] {
+			return fmt.Errorf("%s.wia_certification: duplicate entry name %q", p, e.Name)
+		}
+		wiaNames[e.Name] = true
+		if len(e.Information) == 0 {
+			return fmt.Errorf("%s.wia_certification entry %q needs a non-empty information object", p, e.Name)
+		}
 	}
 	return nil
 }

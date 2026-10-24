@@ -2307,6 +2307,7 @@ func defaultConfig() *Config {
 					UserAuthenticationScheme:        DefaultLevelSchemeID,
 					LowerByClaimsKeyStorage:         true,
 					LowerByClaimsUserAuthentication: true,
+					WIAProfileScheme:                DefaultWIAProfileSchemeID,
 				},
 				StatusList: StatusListConfig{
 					// On by default: CS-04 §7.1.2/§7.1.3 require

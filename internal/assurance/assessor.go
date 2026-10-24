@@ -154,6 +154,7 @@ type Assessor struct {
 	cfg     config.AssuranceConfig
 	decider AssuranceDecider
 	ks, ua  *Scheme
+	wia     *Scheme
 	certs   []config.CertificationEntry
 	version string
 	// NormalizeClaim optionally maps a raw client claim string into a
@@ -178,8 +179,13 @@ func NewAssessor(cfg config.AssuranceConfig, decider AssuranceDecider, policyVer
 	if err != nil {
 		return nil, err
 	}
+	wiaCfg, _ := cfg.WIAProfileSchemeByID(cfg.WIAProfileScheme)
+	wia, err := NewScheme(wiaCfg.AsLevelScheme())
+	if err != nil {
+		return nil, err
+	}
 	return &Assessor{
-		cfg: cfg, decider: decider, ks: ks, ua: ua,
+		cfg: cfg, decider: decider, ks: ks, ua: ua, wia: wia,
 		certs: cfg.EffectiveCertificationEntries(), version: policyVersion,
 	}, nil
 }
@@ -253,13 +259,22 @@ func (a *Assessor) Evidence(f Facts) Evidence {
 // Assess decides all three dimensions. It does not return an error: every
 // failure resolves to a deny, so the worst case is the floor.
 func (a *Assessor) Assess(ctx context.Context, f Facts) *Outcome {
+	return a.assess(ctx, f, true)
+}
+
+// assess is Assess with metric recording switchable, so a dry run (the
+// assurance preview) does not inflate the decision counters.
+func (a *Assessor) assess(ctx context.Context, f Facts, record bool) *Outcome {
 	ev := a.Evidence(f).Element()
 	out := &Outcome{PolicyVersion: a.version, SchemaVersion: SchemaVersion}
 
-	out.KeyStorage = a.assessDimension(ctx, out, DimKeyStorage, a.ks, ev, f.Claims.KeyStorage, a.cfg.LowerByClaimsKeyStorage)
-	out.UserAuthentication = a.assessDimension(ctx, out, DimUserAuthentication, a.ua, ev, f.Claims.UserAuthentication, a.cfg.LowerByClaimsUserAuthentication)
+	out.KeyStorage = a.assessDimension(ctx, &out.Errors, DimKeyStorage, a.ks, ev, f.Claims.KeyStorage, a.cfg.LowerByClaimsKeyStorage)
+	out.UserAuthentication = a.assessDimension(ctx, &out.Errors, DimUserAuthentication, a.ua, ev, f.Claims.UserAuthentication, a.cfg.LowerByClaimsUserAuthentication)
 	a.assessCertification(ctx, out, ev)
 
+	if !record {
+		return out
+	}
 	decisionsTotal.WithLabelValues("key_storage", out.KeyStorage.Level).Inc()
 	decisionsTotal.WithLabelValues("user_authentication", out.UserAuthentication.Level).Inc()
 	cert := out.CertificationName
@@ -270,22 +285,22 @@ func (a *Assessor) Assess(ctx context.Context, f Facts) *Outcome {
 	return out
 }
 
-func (a *Assessor) permits(ctx context.Context, out *Outcome, q Query) (bool, Trace) {
+func (a *Assessor) permits(ctx context.Context, errs *[]error, q Query) (bool, Trace) {
 	ok, tr, err := a.decider.Permits(ctx, q)
 	if err != nil {
-		out.Errors = append(out.Errors, fmt.Errorf("%s %s: %w", q.Dimension, q.Candidate, err))
+		*errs = append(*errs, fmt.Errorf("%s %s: %w", q.Dimension, q.Candidate, err))
 		return false, tr
 	}
 	return ok, tr
 }
 
-func (a *Assessor) assessDimension(ctx context.Context, out *Outcome, dim string, s *Scheme, ev sexp.Element, claimed []string, lower bool) DimensionResult {
+func (a *Assessor) assessDimension(ctx context.Context, errs *[]error, dim string, s *Scheme, ev sexp.Element, claimed []string, lower bool) DimensionResult {
 	granted := s.floor
 	var ids []string
 	// Highest to lowest, from the ceiling; the floor is never probed, it is
 	// what remains when nothing above it is permitted.
 	for i := s.ceiling; i > s.floor; i-- {
-		ok, tr := a.permits(ctx, out, Query{Dimension: dim, Candidate: s.Levels[i], Evidence: ev})
+		ok, tr := a.permits(ctx, errs, Query{Dimension: dim, Candidate: s.Levels[i], Evidence: ev})
 		if ok {
 			granted, ids = i, tr.RuleIDs
 			break
@@ -312,7 +327,7 @@ func (a *Assessor) assessDimension(ctx context.Context, out *Outcome, dim string
 func (a *Assessor) assessCertification(ctx context.Context, out *Outcome, ev sexp.Element) {
 	out.Certification = None
 	for _, e := range a.certs {
-		ok, tr := a.permits(ctx, out, Query{Dimension: DimCertification, Candidate: e.Name, Evidence: ev})
+		ok, tr := a.permits(ctx, &out.Errors, Query{Dimension: DimCertification, Candidate: e.Name, Evidence: ev})
 		if !ok {
 			continue
 		}
