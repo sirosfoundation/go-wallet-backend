@@ -258,7 +258,10 @@ func candidateValues(l *sexp.List) (values []string, open bool) {
 func lintCandidate(rule *sexp.List, cfg *config.AssuranceConfig, warnf func(string, ...interface{}) Finding) []Finding {
 	group := childList(rule, candidateTag(rule.Tag))
 	if group == nil {
-		return nil
+		// A rule listing no (tier ...)/(name ...) group matches every
+		// candidate: positional prefix matching treats the omitted slot as
+		// "don't care".
+		return []Finding{warnf("has no (%s ...) group; it matches every candidate and grants every tier or entry", candidateTag(rule.Tag))}
 	}
 	values, open := candidateValues(group)
 	var out []Finding
@@ -365,7 +368,7 @@ func lintFido2AAGUIDFilter(rule *sexp.List, cfg *config.AssuranceConfig, warnf f
 func grantsAboveFloor(rule *sexp.List, cfg *config.AssuranceConfig) bool {
 	group := childList(rule, candidateTag(rule.Tag))
 	if group == nil {
-		return false
+		return true // an omitted (tier ...) matches every tier
 	}
 	values, open := candidateValues(group)
 	if open {

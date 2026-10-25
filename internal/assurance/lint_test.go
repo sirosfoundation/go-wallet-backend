@@ -364,3 +364,14 @@ func TestShippedTemplatesHaveNoFido2AAGUIDFindings(t *testing.T) {
 		}
 	}
 }
+
+// A rule that omits its candidate group matches every candidate through
+// prefix matching; the linter must say so for every dimension.
+func TestLint_MissingCandidateGroupWarnsAsOpenGrant(t *testing.T) {
+	for _, rule := range []string{"(assure-ks)", "(assure-ua)", "(assure-cert)"} {
+		fs := lintRules(t, "# id: bare\n"+rule+"\n")
+		if !strings.Contains(findings(fs, SeverityWarn), "rule bare: has no (") || HasErrors(fs) {
+			t.Errorf("%s: %v", rule, fs)
+		}
+	}
+}
