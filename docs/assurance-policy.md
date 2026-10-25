@@ -326,9 +326,14 @@ attestation chain". That is the same premise the FIDO2 key-storage rules already
 rest on: the trust decision is delegated to the PDP (ADR-010) and returns
 trusted / not trusted, it does not report the metadata's `keyProtection`, so the
 backend cannot tell a (rare) software authenticator model from a hardware one.
-Operators who need hardware only pin the accepted AAGUIDs in their rules, as the
-shipped examples do; making the home depend on `keyProtection` needs the PDP
-decision to expose it first.
+The AAGUID set in the rules IS the hardware filter: an authenticator counts as
+hardware for the policy only if the operator's rules list its AAGUID (the shipped
+examples do, and `assurance-lint` warns on a rule that grants from verified fido2
+evidence without one). The stored `fido2_hw` label is only the record's home, it
+does not decide the tier.
+
+Follow-up (not started): expose MDS3 `keyProtection` from go-trust so `fido2_hw`
+does not rest on the AAGUID list alone.
 
 `wscdTypeFromKeyHome(home)` maps a verified record's home to a WSCD type
 (`strongbox`/`tee` -> `native_android`, `fido2_hw` -> `fido2_hardware`,
