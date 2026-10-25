@@ -374,6 +374,8 @@ func (v *AndroidKeyAttestationVerifier) Verify(ctx context.Context, in *Instance
 	if !allowed {
 		return v.notQualifying(NoHomeAppNotAllowed)
 	}
+	appPackages := append([]string(nil), appID.Packages...)
+	sort.Strings(appPackages)
 
 	// Reject mode also demands a healthy device. Ignore mode records these
 	// facts and decides nothing from them.
@@ -414,6 +416,7 @@ func (v *AndroidKeyAttestationVerifier) Verify(ctx context.Context, in *Instance
 		Home:              home,
 		SecurityLevel:     level,
 		AppDigest:         appDigest,
+		AppPackages:       appPackages,
 		ChainFingerprint:  hex.EncodeToString(fp[:]),
 		ChainNotAfter:     notAfter.UTC(),
 		VerifiedAt:        in.Now,
@@ -581,17 +584,29 @@ func newAndroidKeyVerifierForServer(cfg *config.Config, logger *zap.Logger) *And
 }
 
 // Recheck implements InstanceKeyEvidenceRechecker: it decides whether a stored
-// android_key record may still be used. The record must carry the serials of
-// its chain (records stored before they were kept cannot be re-checked and are
-// unknown, never good), its chain must not have expired, and none of the
-// serials may be on a FRESH revocation list. A list that cannot be had is an
-// error (the caller fails closed).
+// android_key record may still be used. In this order:
+//
+//  1. its chain must not have expired;
+//  2. the CURRENT configuration must still accept what the record says: trust
+//     and app allowlists (digests, packages) always, and in reject mode the
+//     boot-state, bootloader and patch-level requirements (a configuration
+//     tightened after submission applies to evidence already stored, so a
+//     renewal that submits nothing cannot keep an old approval alive). A record
+//     that no longer qualifies is RecheckNotQualifying, not an outage, and is
+//     never marked: relaxing the configuration again restores it;
+//  3. it must carry the serials of its chain (records stored before they were
+//     kept cannot be re-checked and are unknown, never good);
+//  4. none of the serials may be on a FRESH revocation list. A list that cannot
+//     be had is an error (the caller fails closed).
 func (v *AndroidKeyAttestationVerifier) Recheck(ctx context.Context, rec *domain.KeyAttestationRecord, now time.Time) (RecheckResult, error) {
+	if !rec.ChainNotAfter.IsZero() && !now.Before(rec.ChainNotAfter) {
+		return RecheckResult{Verdict: RecheckExpired, Reason: RecheckReasonExpired}, nil
+	}
+	if reason := v.storedRecordPolicy(rec); reason != "" {
+		return RecheckResult{Verdict: RecheckNotQualifying, Reason: reason}, nil
+	}
 	if len(rec.CertSerials) == 0 || rec.ChainNotAfter.IsZero() {
 		return RecheckResult{Verdict: RecheckUnknown, Reason: RecheckReasonLegacy}, nil
-	}
-	if !now.Before(rec.ChainNotAfter) {
-		return RecheckResult{Verdict: RecheckExpired, Reason: RecheckReasonExpired}, nil
 	}
 	serial, revoked, err := v.status.checkKeys(ctx, rec.CertSerials)
 	if err != nil {
@@ -601,4 +616,51 @@ func (v *AndroidKeyAttestationVerifier) Recheck(ctx context.Context, rec *domain
 		return RecheckResult{Verdict: RecheckRevoked, Reason: RecheckReasonRevoked, Serial: serial}, nil
 	}
 	return RecheckResult{Verdict: RecheckGood}, nil
+}
+
+// storedRecordPolicy applies the current configuration to a stored record and
+// returns the NoHome reason of the first requirement it fails, "" when it
+// still qualifies. What the record does not carry fails the requirement that
+// needs it.
+func (v *AndroidKeyAttestationVerifier) storedRecordPolicy(rec *domain.KeyAttestationRecord) string {
+	if !v.configured() {
+		return NoHomeNotConfigured
+	}
+	if rec.AppDigest == "" {
+		return NoHomeAppNotAllowed
+	}
+	for _, d := range strings.Split(rec.AppDigest, ",") {
+		if _, ok := v.digests[d]; !ok {
+			return NoHomeAppNotAllowed
+		}
+	}
+	if len(v.packages) > 0 {
+		if len(rec.AppPackages) == 0 {
+			return NoHomeAppNotAllowed
+		}
+		for _, p := range rec.AppPackages {
+			if _, ok := v.packages[p]; !ok {
+				return NoHomeAppNotAllowed
+			}
+		}
+	}
+	if !v.policy.reject {
+		return ""
+	}
+	if v.policy.verifiedBoot && rec.VerifiedBootState != androidBootStateName(androidBootVerified) {
+		return NoHomeBootNotVerified
+	}
+	if v.policy.lockedBoot && (rec.DeviceLocked == nil || !*rec.DeviceLocked) {
+		return NoHomeBootloaderUnlocked
+	}
+	if min := v.policy.minPatchLevel; min > 0 {
+		pl, err := strconv.Atoi(rec.PatchLevel)
+		if err != nil {
+			return NoHomePatchLevelMissing
+		}
+		if normalizePatchLevel(pl) < min {
+			return NoHomePatchLevelTooOld
+		}
+	}
+	return ""
 }

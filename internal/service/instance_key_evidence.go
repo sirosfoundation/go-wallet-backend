@@ -319,6 +319,12 @@ func (s *WIAService) verifyKeyAttestation(ctx context.Context, v InstanceKeyEvid
 		rec.VerifiedAt = now
 	}
 	if s.keyAttestations != nil {
+		// The store never replaces stronger evidence with weaker. A stored
+		// record that is no longer good must not shield itself that way and
+		// discard this verified submission: retire it first.
+		if err := s.keyChecker.retireStale(ctx, s.keyAttestations, rec); err != nil {
+			return nil, err
+		}
 		if err := s.keyAttestations.MarkKeyAttested(ctx, rec); err != nil {
 			// The evidence verified but could not be persisted: a dependency
 			// outage, retryable (HTTP 503), not a verification failure. The

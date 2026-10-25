@@ -63,7 +63,7 @@ var (
 		Namespace: "siros",
 		Subsystem: "wia",
 		Name:      "instance_key_recheck_total",
-		Help:      "Re-checks of stored instance-key evidence on use, by outcome: ok, revoked (marked now), already_revoked, expired, legacy_unknown (no stored serials), unavailable (no fresh status list).",
+		Help:      "Re-checks of stored instance-key evidence on use, by outcome: ok, revoked (marked now), already_revoked, expired, not_qualifying (no longer accepted by the current configuration), legacy_unknown (no stored serials or no checker), unavailable (no fresh status list), retired_for_replacement (a stale stored record retired so a fresh submission could replace it).",
 	}, []string{"outcome"})
 
 	// KA metrics

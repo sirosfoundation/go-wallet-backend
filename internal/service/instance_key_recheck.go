@@ -23,14 +23,20 @@ import (
 //
 //   - revoked: the record is marked revoked in the store (never deleted) and
 //     reads as no evidence, so instance_key is "none" and wscd_type unknown;
-//   - expired, or a legacy record that cannot be re-checked: no evidence
-//     (home unknown); nothing is changed in the store;
+//   - expired, no longer qualifying under the CURRENT configuration (a
+//     tightened allowlist, or reject-mode boot/patch requirements), or a
+//     legacy record that cannot be re-checked: no evidence (home unknown);
+//     nothing is changed in the store, so relaxing the configuration again
+//     restores a record that was only tightened away;
 //   - the status source is unavailable: an error wrapping
 //     ErrWIAKeyAttestationUnavailable. A WIA is then refused (HTTP 503); a
 //     read-only path that cannot return 503 treats the evidence as absent.
 //
-// A fresh, valid re-submission replaces a revoked record whatever its rank
-// (KeyAttestationRecord.Supersedes).
+// A fresh, valid re-submission replaces a record that is no longer good
+// whatever its rank: a revoked record by Supersedes, and one that is merely
+// stale (expired, no longer qualifying, legacy) because the submission path
+// retires it first (retire) so the no-downgrade rule only ever protects
+// evidence that still stands.
 
 // RecheckVerdict is the outcome of re-checking a stored record.
 type RecheckVerdict int
@@ -44,6 +50,9 @@ const (
 	RecheckExpired
 	// RecheckUnknown: the record cannot be re-checked (legacy, no serials).
 	RecheckUnknown
+	// RecheckNotQualifying: the current configuration no longer accepts what
+	// the record says (a tightened allowlist or boot/patch requirement).
+	RecheckNotQualifying
 )
 
 // Fixed reasons recorded on revoked marks and in logs.
@@ -51,6 +60,8 @@ const (
 	RecheckReasonRevoked = "status_list_revoked"
 	RecheckReasonExpired = "chain_expired"
 	RecheckReasonLegacy  = "legacy_no_serials"
+	// RecheckReasonNoChecker: an android_key record and nothing wired to check it.
+	RecheckReasonNoChecker = "no_checker"
 )
 
 // RecheckResult is what an InstanceKeyEvidenceRechecker found.
@@ -94,28 +105,10 @@ func newInstanceKeyChecker(logger *zap.Logger) *instanceKeyChecker {
 
 func (c *instanceKeyChecker) register(r InstanceKeyEvidenceRechecker) { c.rechecks[r.Kind()] = r }
 
-// usable returns rec when it may back a decision now, nil when it is no
-// evidence, and an error wrapping ErrWIAKeyAttestationUnavailable when that
-// cannot be decided. A nil checker (or one without a recheck for a kind that
-// needs it) fails closed for android_key records.
-func (c *instanceKeyChecker) usable(ctx context.Context, store storage.KeyAttestationStore, rec *domain.KeyAttestationRecord) (*domain.KeyAttestationRecord, error) {
-	if rec == nil {
-		return nil, nil
-	}
-	n := *rec
-	n.Normalize()
-	logger := zap.NewNop()
-	if c != nil {
-		logger = c.logger
-	}
-	jkt := n.KeyThumbprint
-	if len(jkt) > 8 {
-		jkt = jkt[:8] + "..."
-	}
-	if n.Revoked() {
-		instanceKeyRecheck.WithLabelValues("already_revoked").Inc()
-		return nil, nil
-	}
+// evaluate decides about one record without touching the store. rc is nil
+// when no recheck is registered for the kind. A nil result with a nil error
+// means the record is no evidence; a non-nil result carries the verdict.
+func (c *instanceKeyChecker) evaluate(ctx context.Context, n *domain.KeyAttestationRecord) (RecheckResult, bool, error) {
 	var rc InstanceKeyEvidenceRechecker
 	if c != nil {
 		rc = c.rechecks[n.Kind]
@@ -124,18 +117,60 @@ func (c *instanceKeyChecker) usable(ctx context.Context, store storage.KeyAttest
 		if n.Kind == domain.KeyEvidenceAndroidKey {
 			// Evidence that needs a status check and has no checker wired is
 			// not evidence.
-			instanceKeyRecheck.WithLabelValues("unavailable").Inc()
-			logger.Warn("android_key evidence cannot be re-checked: no checker wired; treating as none", zap.String("jkt", jkt))
-			return nil, nil
+			return RecheckResult{Verdict: RecheckUnknown, Reason: RecheckReasonNoChecker}, true, nil
 		}
-		return rec, nil
+		return RecheckResult{Verdict: RecheckGood}, false, nil
 	}
-	now := c.now()
-	res, err := rc.Recheck(ctx, &n, now)
+	res, err := rc.Recheck(ctx, n, c.clock())
+	return res, true, err
+}
+
+func shortJKT(n *domain.KeyAttestationRecord) string {
+	if len(n.KeyThumbprint) > 8 {
+		return n.KeyThumbprint[:8] + "..."
+	}
+	return n.KeyThumbprint
+}
+
+// clock is the checker's now; a nil checker uses the wall clock.
+func (c *instanceKeyChecker) clock() time.Time {
+	if c == nil {
+		return time.Now().UTC()
+	}
+	return c.now()
+}
+
+func (c *instanceKeyChecker) log() *zap.Logger {
+	if c == nil {
+		return zap.NewNop()
+	}
+	return c.logger
+}
+
+// usable returns rec when it may back a decision now, nil when it is no
+// evidence, and an error wrapping ErrWIAKeyAttestationUnavailable when that
+// cannot be decided. A nil checker (or one without a recheck for a kind that
+// needs it) fails closed for android_key records. A record found revoked is
+// marked in the store.
+func (c *instanceKeyChecker) usable(ctx context.Context, store storage.KeyAttestationStore, rec *domain.KeyAttestationRecord) (*domain.KeyAttestationRecord, error) {
+	if rec == nil {
+		return nil, nil
+	}
+	n := *rec
+	n.Normalize()
+	logger, jkt := c.log(), shortJKT(&n)
+	if n.Revoked() {
+		instanceKeyRecheck.WithLabelValues("already_revoked").Inc()
+		return nil, nil
+	}
+	res, checked, err := c.evaluate(ctx, &n)
 	if err != nil {
 		instanceKeyRecheck.WithLabelValues("unavailable").Inc()
 		logger.Warn("stored instance key evidence cannot be re-checked", zap.String("jkt", jkt), zap.Error(err))
 		return nil, fmt.Errorf("%w: %v", ErrWIAKeyAttestationUnavailable, err)
+	}
+	if !checked {
+		return rec, nil
 	}
 	switch res.Verdict {
 	case RecheckGood:
@@ -145,7 +180,7 @@ func (c *instanceKeyChecker) usable(ctx context.Context, store storage.KeyAttest
 		instanceKeyRecheck.WithLabelValues("revoked").Inc()
 		marked := false
 		if store != nil {
-			ok, err := store.MarkKeyRevoked(ctx, n.KeyThumbprint, n.ChainFingerprint, res.Reason, now)
+			ok, err := store.MarkKeyRevoked(ctx, n.KeyThumbprint, n.ChainFingerprint, res.Reason, c.clock())
 			if err != nil && !errors.Is(err, context.Canceled) {
 				logger.Warn("failed to mark instance key evidence revoked", zap.String("jkt", jkt), zap.Error(err))
 			}
@@ -156,9 +191,58 @@ func (c *instanceKeyChecker) usable(ctx context.Context, store storage.KeyAttest
 	case RecheckExpired:
 		instanceKeyRecheck.WithLabelValues("expired").Inc()
 		logger.Info("stored instance key evidence has expired; treating as none", zap.String("jkt", jkt), zap.String("reason", res.Reason))
+	case RecheckNotQualifying:
+		instanceKeyRecheck.WithLabelValues("not_qualifying").Inc()
+		logger.Info("stored instance key evidence no longer qualifies under the current configuration; treating as none",
+			zap.String("jkt", jkt), zap.String("reason", noHomeReasonLabel(res.Reason)))
 	default:
 		instanceKeyRecheck.WithLabelValues("legacy_unknown").Inc()
 		logger.Info("stored instance key evidence cannot be re-checked; treating as none", zap.String("jkt", jkt), zap.String("reason", res.Reason))
 	}
 	return nil, nil
+}
+
+// retireStale makes room for a freshly verified record rec. When the stored
+// record for the same key would win the no-downgrade comparison (it ranks
+// higher) but is no longer good (revoked on the list but not marked yet,
+// expired, no longer qualifying, legacy), it is marked retired so the fresh
+// record replaces it instead of being discarded. Evidence that still stands is
+// left alone: weaker evidence never replaces it. An error wraps
+// ErrWIAKeyAttestationUnavailable: whether the stored record stands could not
+// be decided.
+func (c *instanceKeyChecker) retireStale(ctx context.Context, store storage.KeyAttestationStore, rec *domain.KeyAttestationRecord) error {
+	if store == nil {
+		return nil
+	}
+	existing, err := store.GetByKeyThumbprint(ctx, rec.KeyThumbprint)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("%w: look up stored instance key evidence: %w", ErrWIAKeyAttestationUnavailable, err)
+	}
+	if rec.Supersedes(existing) {
+		return nil // it will be replaced anyway
+	}
+	n := *existing
+	n.Normalize()
+	res, checked, err := c.evaluate(ctx, &n)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrWIAKeyAttestationUnavailable, err)
+	}
+	if !checked || res.Verdict == RecheckGood {
+		return nil
+	}
+	reason := res.Reason
+	if res.Verdict == RecheckNotQualifying {
+		reason = noHomeReasonLabel(reason)
+	}
+	marked, err := store.MarkKeyRevoked(ctx, n.KeyThumbprint, n.ChainFingerprint, reason, c.clock())
+	if err != nil {
+		return fmt.Errorf("%w: retire stale instance key evidence: %w", ErrWIAKeyAttestationUnavailable, err)
+	}
+	instanceKeyRecheck.WithLabelValues("retired_for_replacement").Inc()
+	c.log().Info("stored instance key evidence retired so a fresh submission can replace it",
+		zap.String("jkt", shortJKT(&n)), zap.String("reason", reason), zap.Bool("marked", marked))
+	return nil
 }

@@ -531,15 +531,20 @@ status list fetcher and cache the verifier uses:
 | a serial is on the fresh list | `instance_key none`, `wscd_type` unknown; the record is marked `revoked_at`/`revoked_reason` (kept, never deleted), metric and log line | same: evidence absent |
 | no fresh list can be had | refused, HTTP 503 `KEY_ATTESTATION_UNAVAILABLE`; nothing is marked | evidence absent, lowest tier |
 | `chain_not_after` has passed | `instance_key none`, `wscd_type` unknown; nothing is marked | evidence absent |
+| no longer accepted by the CURRENT configuration (app digest or package allowlist narrowed, trust anchors removed; in reject mode also boot state, bootloader lock or `min_patch_level` tightened) | `instance_key none`, `wscd_type` unknown; nothing is marked (relaxing the configuration restores it) | evidence absent |
 | stored before serials were kept (legacy) | cannot be re-checked: unknown, `instance_key none`; nothing is marked | evidence absent |
 
-A revoked record is replaced by any freshly verified submission whatever its
-rank (the no-downgrade rule protects only live evidence). The mark is set only
+A freshly verified submission replaces a record that is no longer good whatever
+its rank: a revoked record by rule, and one that is merely stale (revoked on the
+list but not marked yet, expired, no longer qualifying, legacy) because the
+submission path first retires it (marks it with the reason) before the
+no-downgrade comparison. The no-downgrade rule protects only evidence that still
+stands. The mark is set only
 on the record whose chain was checked, so a record that a fresh submission
 replaced meanwhile is not marked. Key Attestation never reads instance-key
 records, so it has nothing to re-check. Metric:
 `siros_wia_instance_key_recheck_total{outcome}` with `ok`, `revoked`,
-`already_revoked`, `expired`, `legacy_unknown`, `unavailable`.
+`already_revoked`, `expired`, `not_qualifying`, `legacy_unknown`, `unavailable`, `retired_for_replacement`.
 
 **Configuration** (`wallet_provider.attestation.android_key_attestation`):
 

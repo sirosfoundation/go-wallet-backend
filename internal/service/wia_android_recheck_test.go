@@ -40,7 +40,11 @@ type rcWIA struct {
 	leafSerial int64
 }
 
-func newRCWIA(t *testing.T, rules string) *rcWIA {
+func newRCWIA(t *testing.T, rules string) *rcWIA { return newRCWIAWith(t, rules, nil, time.Time{}) }
+
+// newRCWIAWith issues the first WIA with the evidence adjusted by mut and a
+// leaf valid until notAfter (zero: the fixture default).
+func newRCWIAWith(t *testing.T, rules string, mut func(*kdParams), notAfter time.Time) *rcWIA {
 	t.Helper()
 	a := newAKWIA(t, rules)
 	if rules == "" {
@@ -57,7 +61,11 @@ func newRCWIA(t *testing.T, rules string) *rcWIA {
 	pop, key := createTestPop(t, challenge)
 	a.fx.serial += 100
 	serial := a.fx.serial // later fixture serials count on from here
-	chain := a.fx.leaf(&key.PublicKey, encodeKeyDescription(goodParams(InstanceKeyAttestationChallenge(challenge))), leafOpts{Serial: serial})
+	kd := goodParams(InstanceKeyAttestationChallenge(challenge))
+	if mut != nil {
+		mut(&kd)
+	}
+	chain := a.fx.leaf(&key.PublicKey, encodeKeyDescription(kd), leafOpts{Serial: serial, NotAfter: notAfter})
 	raw, _ := json.Marshal(map[string]any{"type": "android_key", "x5c": b64chain(chain)})
 	if _, err := a.svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge, KeyAttestation: &KeyAttestation{Type: KeyAttestationAndroidKey, Raw: raw}}); err != nil {
 		t.Fatalf("first WIA: %v", err)
@@ -342,5 +350,158 @@ func TestRecheck_FIDO2RecordsAreNotRechecked(t *testing.T) {
 	}
 	if got, err := c.usable(context.Background(), nil, ak); err != nil || got != nil {
 		t.Fatalf("checker without an android re-check must fail closed: got=%v err=%v", got, err)
+	}
+}
+
+// resubmit sends a fresh chain for the same key (made by mut).
+func (r *rcWIA) resubmit(mut func(*kdParams)) error {
+	r.t.Helper()
+	ctx := context.Background()
+	c, _, _ := r.svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	k := goodParams(InstanceKeyAttestationChallenge(c))
+	if mut != nil {
+		mut(&k)
+	}
+	chain := r.fx.leaf(&r.key.PublicKey, encodeKeyDescription(k), leafOpts{})
+	raw, _ := json.Marshal(map[string]any{"type": "android_key", "x5c": b64chain(chain)})
+	_, err := r.svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{Pop: signPopWithKey(r.t, r.key, c), Challenge: c, KeyAttestation: &KeyAttestation{Type: KeyAttestationAndroidKey, Raw: raw}})
+	return err
+}
+
+func (r *rcWIA) verifier() *AndroidKeyAttestationVerifier {
+	return r.svc.keyVerifiers[KeyAttestationAndroidKey].(*AndroidKeyAttestationVerifier)
+}
+
+// A configuration tightened after submission applies to the evidence already
+// stored: a renewal that submits nothing must not keep an old approval alive,
+// and relaxing the configuration restores it (nothing is marked).
+func TestRecheck_TightenedConfigurationAppliesToStoredEvidence(t *testing.T) {
+	for name, tc := range map[string]struct {
+		weak    func(*kdParams)
+		tighten func(*AndroidKeyAttestationVerifier)
+		relax   func(*AndroidKeyAttestationVerifier)
+	}{
+		"boot state": {
+			weak:    func(k *kdParams) { k.BootState = 2 },
+			tighten: func(v *AndroidKeyAttestationVerifier) { v.policy.reject = true },
+			relax:   func(v *AndroidKeyAttestationVerifier) { v.policy.verifiedBoot = false },
+		},
+		"unlocked bootloader": {
+			weak:    func(k *kdParams) { k.Locked = false },
+			tighten: func(v *AndroidKeyAttestationVerifier) { v.policy.reject = true },
+			relax:   func(v *AndroidKeyAttestationVerifier) { v.policy.lockedBoot = false },
+		},
+		"patch level": {
+			weak:    func(k *kdParams) { k.Patch = intp(202301) },
+			tighten: func(v *AndroidKeyAttestationVerifier) { v.policy.reject, v.policy.minPatchLevel = true, 202501 },
+			relax:   func(v *AndroidKeyAttestationVerifier) { v.policy.minPatchLevel = 0 },
+		},
+		"app digest narrowed": {
+			tighten: func(v *AndroidKeyAttestationVerifier) { v.digests = map[string]struct{}{"00": {}} },
+			relax:   func(v *AndroidKeyAttestationVerifier) { v.digests = map[string]struct{}{testAppDigestHex(): {}} },
+		},
+		"package narrowed": {
+			tighten: func(v *AndroidKeyAttestationVerifier) { v.packages = map[string]struct{}{"org.other.app": {}} },
+			relax:   func(v *AndroidKeyAttestationVerifier) { v.packages = map[string]struct{}{} },
+		},
+		"trust removed": {
+			tighten: func(v *AndroidKeyAttestationVerifier) { v.numAnchors = 0 },
+			relax:   func(v *AndroidKeyAttestationVerifier) { v.numAnchors = 1 },
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newRCWIAWith(t, wiaNeedsAndroidRules, tc.weak, time.Time{})
+			if _, err := r.later(); err != nil {
+				t.Fatalf("under the original configuration: %v", err)
+			}
+			svcP, instP, keysP := previewSvc(t, wiaNeedsAndroidRules, true)
+			svcP.SetInstanceKeyChecker(r.svc.keyChecker)
+			if err := instP.Upsert(context.Background(), &domain.WalletInstance{ID: r.jkt, TenantID: domain.DefaultTenantID, Status: domain.InstanceStatusActive, LastAttestedAt: time.Now().UTC()}); err != nil {
+				t.Fatal(err)
+			}
+			putRecord(t, keysP, *r.record(r.jkt))
+			preview := func() bool {
+				t.Helper()
+				got, err := svcP.PreviewAssurance(context.Background(), &AssurancePreviewRequest{WalletInstanceID: r.jkt})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return got.WIAIssue
+			}
+			if !preview() {
+				t.Fatal("preview does not see the record")
+			}
+
+			tc.tighten(r.verifier())
+			if _, err := r.later(); !errors.Is(err, ErrWIARefusedByPolicy) {
+				t.Fatalf("a stored record that no longer qualifies still backed the slot: %v", err)
+			}
+			if preview() {
+				t.Fatal("the preview used a record that no longer qualifies")
+			}
+			if r.record(r.jkt).Revoked() {
+				t.Fatal("a configuration change marked the record revoked")
+			}
+			r.svc.cfg.WalletProvider.Attestation.Assurance.Enabled = false
+			if _, err := r.later(); err != nil || r.wscd() != domain.WSCDTypeUnknown {
+				t.Fatalf("err=%v wscd=%s", err, r.wscd())
+			}
+			r.svc.cfg.WalletProvider.Attestation.Assurance.Enabled = true
+
+			tc.relax(r.verifier())
+			if _, err := r.later(); err != nil {
+				t.Fatalf("after relaxing the configuration: %v", err)
+			}
+		})
+	}
+}
+
+// A stored record that no longer stands must not shield itself from a fresh
+// valid submission through the no-downgrade rule, even when nothing has marked
+// it yet (revoked on the list, expired).
+func TestRecheck_StaleStrongerRecordDoesNotDiscardAFreshSubmission(t *testing.T) {
+	strongbox := func(k *kdParams) { k.AttLevel, k.KmLevel = androidLevelStrongBox, androidLevelStrongBox }
+	for name, tc := range map[string]struct {
+		notAfter time.Duration
+		stale    func(r *rcWIA)
+	}{
+		"revoked on the list, not yet marked": {stale: func(r *rcWIA) { r.revokeLeaf() }},
+		"expired":                             {notAfter: time.Hour, stale: func(r *rcWIA) { r.clock.Advance(2 * time.Hour) }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var na time.Time
+			if tc.notAfter > 0 {
+				na = time.Now().Add(tc.notAfter)
+			}
+			r := newRCWIAWith(t, wiaNeedsAndroidRules, strongbox, na)
+			if r.record(r.jkt).Home != domain.KeyHomeStrongBox {
+				t.Fatal("no strongbox record")
+			}
+			tc.stale(r)
+			// No request has looked at the stored record since it went stale.
+			if r.record(r.jkt).Revoked() {
+				t.Fatal("already marked")
+			}
+			// A fresh, valid, weaker (TEE) submission must replace it and issue.
+			if err := r.resubmit(nil); err != nil {
+				t.Fatalf("fresh valid submission refused: %v", err)
+			}
+			rec := r.record(r.jkt)
+			if rec.Revoked() || rec.Home != domain.KeyHomeTEE {
+				t.Fatalf("the fresh submission was discarded: %+v", rec)
+			}
+			if _, err := r.later(); err != nil {
+				t.Fatalf("WIA from the fresh record: %v", err)
+			}
+		})
+	}
+	// Evidence that still stands keeps its protection: weaker evidence does
+	// not replace it.
+	r := newRCWIAWith(t, wiaNeedsAndroidRules, strongbox, time.Time{})
+	if err := r.resubmit(nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.record(r.jkt); got.Home != domain.KeyHomeStrongBox || got.Revoked() {
+		t.Fatalf("live stronger evidence was replaced: %+v", got)
 	}
 }
