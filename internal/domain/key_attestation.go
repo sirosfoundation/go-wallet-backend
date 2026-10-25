@@ -98,16 +98,13 @@ type KeyAttestationRecord struct {
 	// and so are treated as unknown, never as still good.
 	CertSerials []string `json:"cert_serials,omitempty" bson:"cert_serials,omitempty"`
 
-	// RevokedAt is when the evidence was retired: a re-check found it revoked,
-	// or a fresh submission replaced it while it was no longer good (expired,
-	// no longer qualifying). Zero while it stands. A retired record is kept
-	// (never deleted) and is never evidence: readers treat the key as having
-	// none.
+	// RevokedAt is when a re-check found the evidence revoked; zero while it
+	// stands. A revoked record is kept (never deleted) and is never evidence:
+	// readers treat the key as having none.
 	RevokedAt time.Time `json:"revoked_at,omitempty" bson:"revoked_at,omitempty"`
 
 	// RevokedReason says why RevokedAt was set (a fixed enum, never client
-	// text: status_list_revoked, chain_expired, legacy_no_serials or a
-	// no-longer-qualifying reason).
+	// text).
 	RevokedReason string `json:"revoked_reason,omitempty" bson:"revoked_reason,omitempty"`
 
 	// VerifiedAt is when this key's attestation was verified.

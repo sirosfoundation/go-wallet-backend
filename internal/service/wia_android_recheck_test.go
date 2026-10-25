@@ -15,6 +15,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
 
 // recheckClock drives both the status list's cache and the checker's notion
@@ -519,5 +520,52 @@ func TestRecheck_StaleStrongerRecordDoesNotDiscardAFreshSubmission(t *testing.T)
 	}
 	if got := r.record(r.jkt); got.Home != domain.KeyHomeStrongBox || got.Revoked() {
 		t.Fatalf("live stronger evidence was replaced: %+v", got)
+	}
+}
+
+// failingReplaceStore fails the conditional replacement (as a database outage
+// or a crash between two writes would).
+type failingReplaceStore struct{ storage.KeyAttestationStore }
+
+func (failingReplaceStore) ReplaceKeyEvidence(context.Context, *domain.KeyAttestationRecord, string) (bool, error) {
+	return false, errors.New("write failed")
+}
+
+// Replacing stale evidence is one conditional write: when it fails, the old
+// record is exactly as it was (not marked), so evidence that was only excluded
+// by the current configuration comes back when the configuration is relaxed.
+func TestRecheck_FailedReplacementLeavesTheStaleRecordUntouched(t *testing.T) {
+	strongboxUnverified := func(k *kdParams) {
+		k.AttLevel, k.KmLevel = androidLevelStrongBox, androidLevelStrongBox
+		k.BootState = 2 // accepted in ignore mode
+	}
+	r := newRCWIAWith(t, wiaNeedsAndroidRules, strongboxUnverified, time.Time{})
+	before := r.record(r.jkt)
+	r.verifier().policy.reject = true // the stored record no longer qualifies
+
+	real := r.svc.keyAttestations
+	r.svc.keyAttestations = failingReplaceStore{real}
+	err := r.resubmit(nil) // a fresh, verified, weaker (TEE) submission
+	if !errors.Is(err, ErrWIAKeyAttestationUnavailable) {
+		t.Fatalf("a failed replacement must be unavailable (503), got %v", err)
+	}
+	r.svc.keyAttestations = real
+	after := r.record(r.jkt)
+	if after.Revoked() || after.ChainFingerprint != before.ChainFingerprint || after.Home != domain.KeyHomeStrongBox {
+		t.Fatalf("the failed replacement changed the stored record: %+v", after)
+	}
+
+	// Relaxing the configuration restores the old evidence: nothing was marked.
+	r.verifier().policy.reject = false
+	if _, err := r.later(); err != nil {
+		t.Fatalf("after relaxing: %v", err)
+	}
+	// And with a working store the same submission replaces the stale record.
+	r.verifier().policy.reject = true
+	if err := r.resubmit(nil); err != nil {
+		t.Fatalf("replacement: %v", err)
+	}
+	if got := r.record(r.jkt); got.Home != domain.KeyHomeTEE || got.Revoked() {
+		t.Fatalf("not replaced: %+v", got)
 	}
 }

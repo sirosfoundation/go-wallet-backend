@@ -60,3 +60,20 @@ func (s *KeyAttestationStore) MarkKeyRevoked(_ context.Context, thumbprint, chai
 	rec.RevokedReason = reason
 	return true, nil
 }
+
+// ReplaceKeyEvidence implements storage.KeyAttestationStore.
+func (s *KeyAttestationStore) ReplaceKeyEvidence(_ context.Context, rec *domain.KeyAttestationRecord, staleChainFingerprint string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	existing, ok := s.data[rec.KeyThumbprint]
+	if !ok || existing.ChainFingerprint != staleChainFingerprint {
+		return false, nil
+	}
+	stored := *rec.Clone()
+	stored.Normalize()
+	stored.CreatedAt = existing.CreatedAt
+	s.data[rec.KeyThumbprint] = &stored
+	rec.CreatedAt = stored.CreatedAt
+	return true, nil
+}

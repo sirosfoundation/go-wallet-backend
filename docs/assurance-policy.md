@@ -537,14 +537,15 @@ status list fetcher and cache the verifier uses:
 A freshly verified submission replaces a record that is no longer good whatever
 its rank: a revoked record by rule, and one that is merely stale (revoked on the
 list but not marked yet, expired, no longer qualifying, legacy) because the
-submission path first retires it (marks it with the reason) before the
-no-downgrade comparison. The no-downgrade rule protects only evidence that still
+submission path replaces it in one conditional store write (only if the stored
+record is still that chain; nothing is marked first, so a failed write loses
+nothing). The no-downgrade rule protects only evidence that still
 stands. The mark is set only
 on the record whose chain was checked, so a record that a fresh submission
 replaced meanwhile is not marked. Key Attestation never reads instance-key
 records, so it has nothing to re-check. Metric:
 `siros_wia_instance_key_recheck_total{outcome}` with `ok`, `revoked`,
-`already_revoked`, `expired`, `not_qualifying`, `legacy_unknown`, `unavailable`, `retired_for_replacement`.
+`already_revoked`, `expired`, `not_qualifying`, `legacy_unknown`, `unavailable`, `replaced_stale`.
 
 **Configuration** (`wallet_provider.attestation.android_key_attestation`):
 

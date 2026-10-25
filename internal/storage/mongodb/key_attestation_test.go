@@ -266,3 +266,40 @@ func TestKeyAttestationStore_CertSerialsAndRevocationMark(t *testing.T) {
 	require.True(t, ok, "a legacy document without a rev field must be markable")
 	require.NoError(t, kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{KeyThumbprint: legacyID, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE, ChainFingerprint: "n"}))
 }
+
+func TestKeyAttestationStore_ReplaceKeyEvidence(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	kas := store.KeyAttestations()
+	id := fmt.Sprintf("thumb-replace-%d", time.Now().UnixNano())
+
+	strong := &domain.KeyAttestationRecord{KeyThumbprint: id, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox, ChainFingerprint: "old", VerifiedAt: time.Now().UTC()}
+	require.NoError(t, kas.MarkKeyAttested(ctx, strong))
+	created, err := kas.GetByKeyThumbprint(ctx, id)
+	require.NoError(t, err)
+
+	weak := &domain.KeyAttestationRecord{KeyThumbprint: id, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE, ChainFingerprint: "new", CertSerials: []string{"c3"}}
+	ok, err := kas.ReplaceKeyEvidence(ctx, weak, "not-the-stored-chain")
+	require.NoError(t, err)
+	require.False(t, ok)
+	ok, err = kas.ReplaceKeyEvidence(ctx, &domain.KeyAttestationRecord{KeyThumbprint: id + "-none", ChainFingerprint: "x"}, "x")
+	require.NoError(t, err)
+	require.False(t, ok)
+	got, _ := kas.GetByKeyThumbprint(ctx, id)
+	require.Equal(t, "old", got.ChainFingerprint, "written without a match")
+
+	ok, err = kas.ReplaceKeyEvidence(ctx, weak, "old")
+	require.NoError(t, err)
+	require.True(t, ok)
+	got, err = kas.GetByKeyThumbprint(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, "new", got.ChainFingerprint)
+	require.Equal(t, domain.KeyHomeTEE, got.Home, "replaced whatever the rank")
+	require.Equal(t, []string{"c3"}, got.CertSerials)
+	require.WithinDuration(t, created.CreatedAt, got.CreatedAt, time.Millisecond)
+
+	// The revision moved on: a second replacement of the same stale chain loses.
+	ok, err = kas.ReplaceKeyEvidence(ctx, strong, "old")
+	require.NoError(t, err)
+	require.False(t, ok)
+}

@@ -34,9 +34,10 @@ import (
 //
 // A fresh, valid re-submission replaces a record that is no longer good
 // whatever its rank: a revoked record by Supersedes, and one that is merely
-// stale (expired, no longer qualifying, legacy) because the submission path
-// retires it first (retire) so the no-downgrade rule only ever protects
-// evidence that still stands.
+// stale (expired, no longer qualifying, legacy, revoked but not marked yet)
+// because the submission path replaces it in one conditional write
+// (replaceStale), so the no-downgrade rule only ever protects evidence that
+// still stands.
 
 // RecheckVerdict is the outcome of re-checking a stored record.
 type RecheckVerdict int
@@ -202,47 +203,52 @@ func (c *instanceKeyChecker) usable(ctx context.Context, store storage.KeyAttest
 	return nil, nil
 }
 
-// retireStale makes room for a freshly verified record rec. When the stored
-// record for the same key would win the no-downgrade comparison (it ranks
-// higher) but is no longer good (revoked on the list but not marked yet,
-// expired, no longer qualifying, legacy), it is marked retired so the fresh
-// record replaces it instead of being discarded. Evidence that still stands is
-// left alone: weaker evidence never replaces it. An error wraps
-// ErrWIAKeyAttestationUnavailable: whether the stored record stands could not
-// be decided.
-func (c *instanceKeyChecker) retireStale(ctx context.Context, store storage.KeyAttestationStore, rec *domain.KeyAttestationRecord) error {
+// replaceStale makes room for a freshly verified record rec without a
+// two-step write. When the stored record for the same key would win the
+// no-downgrade comparison (it ranks higher) but is no longer good (revoked on
+// the list but not marked yet, expired, no longer qualifying, legacy), rec
+// replaces it in ONE conditional store operation (ReplaceKeyEvidence, only if
+// the stored record is still that chain). Nothing is marked beforehand, so a
+// failed or interrupted write leaves the old record exactly as it was. Evidence
+// that still stands is left alone: weaker evidence never replaces it. replaced
+// is true when rec was written; the caller then must not write it again. An
+// error wraps ErrWIAKeyAttestationUnavailable: whether the stored record
+// stands, or the replacement, could not be decided.
+func (c *instanceKeyChecker) replaceStale(ctx context.Context, store storage.KeyAttestationStore, rec *domain.KeyAttestationRecord) (replaced bool, err error) {
 	if store == nil {
-		return nil
+		return false, nil
 	}
 	existing, err := store.GetByKeyThumbprint(ctx, rec.KeyThumbprint)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			return nil
+			return false, nil
 		}
-		return fmt.Errorf("%w: look up stored instance key evidence: %w", ErrWIAKeyAttestationUnavailable, err)
+		return false, fmt.Errorf("%w: look up stored instance key evidence: %w", ErrWIAKeyAttestationUnavailable, err)
 	}
 	if rec.Supersedes(existing) {
-		return nil // it will be replaced anyway
+		return false, nil // the ordinary write replaces it
 	}
 	n := *existing
 	n.Normalize()
 	res, checked, err := c.evaluate(ctx, &n)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrWIAKeyAttestationUnavailable, err)
+		return false, fmt.Errorf("%w: %v", ErrWIAKeyAttestationUnavailable, err)
 	}
 	if !checked || res.Verdict == RecheckGood {
-		return nil
+		return false, nil
 	}
-	reason := res.Reason
-	if res.Verdict == RecheckNotQualifying {
-		reason = noHomeReasonLabel(reason)
-	}
-	marked, err := store.MarkKeyRevoked(ctx, n.KeyThumbprint, n.ChainFingerprint, reason, c.clock())
+	ok, err := store.ReplaceKeyEvidence(ctx, rec, n.ChainFingerprint)
 	if err != nil {
-		return fmt.Errorf("%w: retire stale instance key evidence: %w", ErrWIAKeyAttestationUnavailable, err)
+		return false, fmt.Errorf("%w: replace stale instance key evidence: %w", ErrWIAKeyAttestationUnavailable, err)
 	}
-	instanceKeyRecheck.WithLabelValues("retired_for_replacement").Inc()
-	c.log().Info("stored instance key evidence retired so a fresh submission can replace it",
-		zap.String("jkt", shortJKT(&n)), zap.String("reason", reason), zap.Bool("marked", marked))
-	return nil
+	if ok {
+		reason := res.Reason
+		if res.Verdict == RecheckNotQualifying {
+			reason = noHomeReasonLabel(reason)
+		}
+		instanceKeyRecheck.WithLabelValues("replaced_stale").Inc()
+		c.log().Info("stale stored instance key evidence replaced by a fresh submission",
+			zap.String("jkt", shortJKT(&n)), zap.String("reason", reason))
+	}
+	return ok, nil
 }

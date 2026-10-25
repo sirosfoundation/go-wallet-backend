@@ -230,3 +230,33 @@ func TestKeyAttestationStore_CertSerialsAndRevocationMark(t *testing.T) {
 		t.Fatalf("fresh record did not replace the revoked one: %+v", got)
 	}
 }
+
+func TestKeyAttestationStore_ReplaceKeyEvidence(t *testing.T) {
+	ctx := context.Background()
+	kas := NewStore().KeyAttestations()
+	strong := &domain.KeyAttestationRecord{KeyThumbprint: "k1", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox, ChainFingerprint: "old", VerifiedAt: time.Now().UTC()}
+	if err := kas.MarkKeyAttested(ctx, strong); err != nil {
+		t.Fatal(err)
+	}
+	weak := &domain.KeyAttestationRecord{KeyThumbprint: "k1", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE, ChainFingerprint: "new"}
+	// A different stored chain, or no record: nothing is written.
+	if ok, err := kas.ReplaceKeyEvidence(ctx, weak, "not-the-stored-chain"); ok || err != nil {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	other := &domain.KeyAttestationRecord{KeyThumbprint: "none", ChainFingerprint: "x"}
+	if ok, err := kas.ReplaceKeyEvidence(ctx, other, "x"); ok || err != nil {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	if got, _ := kas.GetByKeyThumbprint(ctx, "k1"); got.ChainFingerprint != "old" {
+		t.Fatalf("written without a match: %+v", got)
+	}
+	created, _ := kas.GetByKeyThumbprint(ctx, "k1")
+	// The stale chain matches: replaced whatever the rank (no-downgrade is not applied).
+	if ok, err := kas.ReplaceKeyEvidence(ctx, weak, "old"); !ok || err != nil {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	got, _ := kas.GetByKeyThumbprint(ctx, "k1")
+	if got.ChainFingerprint != "new" || got.Home != domain.KeyHomeTEE || !got.CreatedAt.Equal(created.CreatedAt) || got.Revoked() {
+		t.Fatalf("got %+v", got)
+	}
+}
