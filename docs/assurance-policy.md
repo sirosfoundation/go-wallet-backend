@@ -93,6 +93,20 @@ unique. Blank lines and other `#`, `//` and `;` comment lines are ignored.
 (assure-ks (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2 (mds3 trusted)(aaguid (* set AAGUID1 AAGUID2))))))
 ```
 
+### The AAGUID set is the hardware filter (`fido2_hw`)
+
+An authenticator counts as **hardware** (`fido2_hw`) only if the operator's
+rules list its AAGUID: the documented premise is *MDS3 trusted* **and**
+*operator-listed AAGUID*. The backend does not read MDS3 `keyProtection`, so
+MDS3 trust alone never says "hardware". Therefore no `assure-ks` /
+`assure-ua` rule that grants a tier above the scheme floor from verified
+`fido2` evidence may omit an `(aaguid (* set ...))` constraint. The linter
+warns on such a rule (see Linting) and the shipped templates are tested to
+have no such finding.
+
+Follow-up (not started): expose MDS3 `keyProtection` from go-trust so
+`fido2_hw` does not rest on the AAGUID list alone.
+
 Queries have the form `(assure-ks (tier T)(evidence ...))`,
 `(assure-ua (tier T)(evidence ...))`, `(assure-cert (name N)(evidence ...))`,
 `(assure-wia (profile P)(evidence ...))`, `(assure-wia-cert (name N)(evidence ...))`
@@ -358,6 +372,16 @@ checks run at startup; lint errors refuse to start, warnings are logged.
   id), a tier or certification name outside the configured scheme or
   catalogue, an open grant (`*`, prefix, range), an emitted value that is not
   a registered OpenID4VCI key storage / user authentication value.
+* **WARN** an `assure-ks` / `assure-ua` rule whose verified `fido2` slot
+  grants a tier above the configured scheme's floor, or constrains `mds3`,
+  `uv` or `cert`, without an `(aaguid ...)` constraint (naming the rule id).
+  A bare `(fido2)` is fine only when the rule grants nothing above the floor.
+  An `(aaguid ...)` that accepts every model (`(*)`, or a set containing it)
+  is no constraint, and an empty or omitted `(tier)` counts as granting every tier (an omitted
+  `(tier ...)`/`(name ...)` group is reported as an open grant for every
+  dimension).
+  The floor and level order come from the configured scheme, never from level
+  names. Narrow the rule with `(fido2 (mds3 trusted)(aaguid (* set ...)))`.
 
 ## Observability
 
@@ -397,6 +421,8 @@ nothing is permitted the claim is `"none"` (Annex C).
   placeholder AAGUIDs: key storage by AAGUID, user authentication by AAGUID
   **and `(uv present)`**, `wia-issue-all` (today's behaviour), an S1 rule for
   `platform_attested`, and a commented `assure-wia-cert` example.
+  The AAGUID set is the hardware filter (see above); a test lints every
+  shipped template for it.
 * `deploy/assurance/gdc-simulation.rules.example`: grants every tier to a
   client that claims the `soft` plugin. Simulation only; it relies on
   client-claimed evidence on purpose. It only shows its effect with
