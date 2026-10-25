@@ -64,13 +64,14 @@ reported in the startup log, the audit line and the `policy_info` metric):
   `uv` is `present` only if EVERY record has it. Records stored before the
   flag was recorded read as `none`.
   The flag is only evidence when the attestation format's signature covers
-  the authenticator data flags (`packed`, `tpm`, `apple`). In
+  the authenticator data flags (`packed`, `apple`). In
   `fido-u2f` the signature does not cover them, so a u2f attestation always
   records `uv none` (anyone could set the bit on a valid attestation).
-  `android-key` also always records `uv none`: an app can sign
-  caller-constructed authenticator data with a credential key that needs no
-  user authentication, and the attested `NoAuthRequired` / `UserAuthType`
-  constraints are not validated yet.
+  `android-key` and `tpm` also always record `uv none`: an app can sign
+  caller-constructed authenticator data with an android credential key that
+  needs no user authentication (the attested `NoAuthRequired` /
+  `UserAuthType` constraints are not validated yet), and a TPM attestation
+  identity key certifies a caller-supplied hash.
 * `platform (app_id A)` is the application id the backend verified in the
   instance's most recent native attestation (`WalletInstance.VerifiedAppID`,
   set by the WIA path). The client-reported `DeviceInfo.AppID` is never used.

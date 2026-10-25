@@ -479,7 +479,9 @@ func TestFIDO2AttestationService_U2FUserVerifiedFlagIsNotEvidence(t *testing.T) 
 
 func TestAuthDataFlagsAreSigned(t *testing.T) {
 	for format, want := range map[string]bool{
-		"packed": true, "tpm": true, "apple": true,
+		"packed": true, "apple": true,
+		// tpm: the AIK certifies a caller-supplied hash, so its UV flag proves nothing.
+		"tpm": false,
 		// android-key: the attested NoAuthRequired/UserAuthType are not validated.
 		"android-key": false,
 		"fido-u2f":    false, "none": false, "android-safetynet": false, "compound": false, "": false, "unknown": false,
