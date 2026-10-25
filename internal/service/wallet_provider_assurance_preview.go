@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"go.uber.org/zap"
 
@@ -93,7 +94,9 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 					overlay = stored
 				}
 			} else if !errors.Is(err, storage.ErrNotFound) {
-				s.logger.Warn("stored key evidence lookup failed; previewing the submission", zap.Error(err))
+				// Without the stored record the dry run cannot say whether the
+				// submission would replace it; a wrong preview is worse than none.
+				return nil, fmt.Errorf("look up stored key evidence: %w", err)
 			}
 		}
 	}

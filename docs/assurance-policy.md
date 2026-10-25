@@ -65,13 +65,20 @@ reported in the startup log, the audit line and the `policy_info` metric):
   `uv` is `present` only if EVERY record has it. Records stored before the
   flag was recorded read as `none`.
   The flag is only evidence when the attestation format's signature covers
-  the authenticator data flags (`packed`, `android-key`, `tpm`, `apple`). In
+  the authenticator data flags (`packed`, `apple`). In
   `fido-u2f` the signature does not cover them, so a u2f attestation always
   records `uv none` (anyone could set the bit on a valid attestation).
+  `android-key` and `tpm` also always record `uv none`: an app can sign
+  caller-constructed authenticator data with an android credential key that
+  needs no user authentication (the attested `NoAuthRequired` /
+  `UserAuthType` constraints are not validated yet), and a TPM attestation
+  identity key certifies a caller-supplied hash.
 * `platform (app_id A)` is the application id the backend verified in the
   instance's most recent native attestation (`WalletInstance.VerifiedAppID`,
   set by the WIA path). The client-reported `DeviceInfo.AppID` is never used.
-  Instances that last attested without native evidence have `app_id none`.
+  Instances that last attested without native evidence have `app_id none`, as
+  do `development_attested` ones: a development App Attest chain is
+  self-signed, so no application was authenticated and no app id is reported.
 * Not populated yet, always `none`: `cert` and the whole `hsm` slot.
 * `instance_key` (schema version 2, appended after `hsm` inside `verified`) is
   verified evidence about the wallet's **instance key** (the WIA PoP key): its
@@ -119,6 +126,20 @@ unique. Blank lines and other `#`, `//` and `;` comment lines are ignored.
 # id: prod-fido2-mds3-ks
 (assure-ks (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2 (mds3 trusted)(aaguid (* set AAGUID1 AAGUID2))))))
 ```
+
+### The AAGUID set is the hardware filter (`fido2_hw`)
+
+An authenticator counts as **hardware** (`fido2_hw`) only if the operator's
+rules list its AAGUID: the documented premise is *MDS3 trusted* **and**
+*operator-listed AAGUID*. The backend does not read MDS3 `keyProtection`, so
+MDS3 trust alone never says "hardware". Therefore no `assure-ks` /
+`assure-ua` rule that grants a tier above the scheme floor from verified
+`fido2` evidence may omit an `(aaguid (* set ...))` constraint. The linter
+warns on such a rule (see Linting) and the shipped templates are tested to
+have no such finding.
+
+Follow-up (not started): expose MDS3 `keyProtection` from go-trust so
+`fido2_hw` does not rest on the AAGUID list alone.
 
 Queries have the form `(assure-ks (tier T)(evidence ...))`,
 `(assure-ua (tier T)(evidence ...))`, `(assure-cert (name N)(evidence ...))`,
@@ -344,9 +365,14 @@ attestation chain". That is the same premise the FIDO2 key-storage rules already
 rest on: the trust decision is delegated to the PDP (ADR-010) and returns
 trusted / not trusted, it does not report the metadata's `keyProtection`, so the
 backend cannot tell a (rare) software authenticator model from a hardware one.
-Operators who need hardware only pin the accepted AAGUIDs in their rules, as the
-shipped examples do; making the home depend on `keyProtection` needs the PDP
-decision to expose it first.
+The AAGUID set in the rules IS the hardware filter: an authenticator counts as
+hardware for the policy only if the operator's rules list its AAGUID (the shipped
+examples do, and `assurance-lint` warns on a rule that grants from verified fido2
+evidence without one). The stored `fido2_hw` label is only the record's home, it
+does not decide the tier.
+
+Follow-up (not started): expose MDS3 `keyProtection` from go-trust so `fido2_hw`
+does not rest on the AAGUID list alone.
 
 `wscdTypeFromKeyHome(home)` maps a verified record's home to a WSCD type
 (`strongbox`/`tee` -> `native_android`, `fido2_hw` -> `fido2_hardware`,
@@ -554,6 +580,16 @@ checks run at startup; lint errors refuse to start, warnings are logged.
   id), a tier or certification name outside the configured scheme or
   catalogue, an open grant (`*`, prefix, range), an emitted value that is not
   a registered OpenID4VCI key storage / user authentication value.
+* **WARN** an `assure-ks` / `assure-ua` rule whose verified `fido2` slot
+  grants a tier above the configured scheme's floor, or constrains `mds3`,
+  `uv` or `cert`, without an `(aaguid ...)` constraint (naming the rule id).
+  A bare `(fido2)` is fine only when the rule grants nothing above the floor.
+  An `(aaguid ...)` that accepts every model (`(*)`, or a set containing it)
+  is no constraint, and an empty or omitted `(tier)` counts as granting every tier (an omitted
+  `(tier ...)`/`(name ...)` group is reported as an open grant for every
+  dimension).
+  The floor and level order come from the configured scheme, never from level
+  names. Narrow the rule with `(fido2 (mds3 trusted)(aaguid (* set ...)))`.
 
 ## Observability
 
@@ -593,6 +629,8 @@ nothing is permitted the claim is `"none"` (Annex C).
   placeholder AAGUIDs: key storage by AAGUID, user authentication by AAGUID
   **and `(uv present)`**, `wia-issue-all` (today's behaviour), an S1 rule for
   `platform_attested`, and a commented `assure-wia-cert` example.
+  The AAGUID set is the hardware filter (see above); a test lints every
+  shipped template for it.
 * `deploy/assurance/gdc-simulation.rules.example`: grants every tier to a
   client that claims the `soft` plugin. Simulation only; it relies on
   client-claimed evidence on purpose. It only shows its effect with
