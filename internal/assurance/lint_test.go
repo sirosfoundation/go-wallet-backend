@@ -278,6 +278,9 @@ func TestLint_Fido2WithoutAAGUIDWarns(t *testing.T) {
 		"empty aaguid is no constraint":   "(assure-ks (tier moderate)(evidence (verified (fido2 (mds3 trusted)(aaguid)))))",
 		"names uv but floor-only grant":   "(assure-ua (tier basic)(evidence (verified (fido2 (mds3 trusted)(aaguid)(uv present)))))",
 		"names mds3 but floor-only grant": "(assure-ks (tier basic)(evidence (verified (fido2 (mds3 trusted)))))",
+		"empty tier matches every tier":   "(assure-ks (tier)(evidence (verified (fido2))))",
+		"wildcard aaguid accepts all":     "(assure-ks (tier moderate)(evidence (verified (fido2 (mds3 trusted)(aaguid (*))))))",
+		"set containing wildcard":         "(assure-ks (tier moderate)(evidence (verified (fido2 (mds3 trusted)(aaguid (* set a (*)))))))",
 		"open tier grant, bare fido2":     "(assure-ks (tier (* prefix e))(evidence (verified (fido2))))",
 	}
 	for name, rule := range cases {

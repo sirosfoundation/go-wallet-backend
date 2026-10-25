@@ -232,6 +232,10 @@ func hasRealChildren(l *sexp.List) bool {
 // candidateValues returns the atoms a (tier ...)/(name ...) group names and
 // whether it uses a star form that is not a plain set (an open grant).
 func candidateValues(l *sexp.List) (values []string, open bool) {
+	if len(l.Elements) == 0 {
+		// A bare (tier) is "don't care": it matches every tier.
+		return nil, true
+	}
 	for _, el := range l.Elements {
 		switch v := el.(type) {
 		case *sexp.Atom:
@@ -336,7 +340,7 @@ func lintFido2AAGUIDFilter(rule *sexp.List, cfg *config.AssuranceConfig, warnf f
 	if f2 == nil || (len(f2.Elements) > 0 && !hasRealChildren(f2)) {
 		return nil // absent, or (fido2 none)
 	}
-	if g := childList(f2, "aaguid"); g != nil && len(g.Elements) > 0 {
+	if g := childList(f2, "aaguid"); g != nil && narrowsAAGUID(g) {
 		return nil
 	}
 	constrained := ""
@@ -392,4 +396,40 @@ func grantsAboveFloor(rule *sexp.List, cfg *config.AssuranceConfig) bool {
 		}
 	}
 	return false
+}
+
+// narrowsAAGUID reports whether an (aaguid ...) group restricts to listed
+// models: at least one element, and no member that accepts every model (a
+// bare (*) wildcard, an empty prefix/suffix, or a range).
+func narrowsAAGUID(g *sexp.List) bool {
+	if len(g.Elements) == 0 {
+		return false
+	}
+	for _, el := range g.Elements {
+		if !narrowingElement(el) {
+			return false
+		}
+	}
+	return true
+}
+
+func narrowingElement(el sexp.Element) bool {
+	switch v := el.(type) {
+	case *starform.Wildcard, *starform.Range:
+		return false
+	case *starform.Prefix:
+		return v.Value != ""
+	case *starform.Suffix:
+		return v.Value != ""
+	case *starform.Set:
+		if len(v.Elements) == 0 {
+			return false
+		}
+		for _, m := range v.Elements {
+			if !narrowingElement(m) {
+				return false
+			}
+		}
+	}
+	return true
 }

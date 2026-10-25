@@ -202,6 +202,8 @@ checks run at startup; lint errors refuse to start, warnings are logged.
   grants a tier above the configured scheme's floor, or constrains `mds3`,
   `uv` or `cert`, without an `(aaguid ...)` constraint (naming the rule id).
   A bare `(fido2)` is fine only when the rule grants nothing above the floor.
+  An `(aaguid ...)` that accepts every model (`(*)`, or a set containing it)
+  is no constraint, and an empty `(tier)` counts as granting every tier.
   The floor and level order come from the configured scheme, never from level
   names. Narrow the rule with `(fido2 (mds3 trusted)(aaguid (* set ...)))`.
 
