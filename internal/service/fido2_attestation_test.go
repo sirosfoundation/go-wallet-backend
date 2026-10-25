@@ -479,8 +479,10 @@ func TestFIDO2AttestationService_U2FUserVerifiedFlagIsNotEvidence(t *testing.T) 
 
 func TestAuthDataFlagsAreSigned(t *testing.T) {
 	for format, want := range map[string]bool{
-		"packed": true, "tpm": true, "android-key": true, "apple": true,
-		"fido-u2f": false, "none": false, "android-safetynet": false, "compound": false, "": false, "unknown": false,
+		"packed": true, "tpm": true, "apple": true,
+		// android-key: the attested NoAuthRequired/UserAuthType are not validated.
+		"android-key": false,
+		"fido-u2f":    false, "none": false, "android-safetynet": false, "compound": false, "": false, "unknown": false,
 	} {
 		if got := authDataFlagsAreSigned(format); got != want {
 			t.Errorf("%q: %v, want %v", format, got, want)

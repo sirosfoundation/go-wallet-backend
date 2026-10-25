@@ -235,12 +235,15 @@ func (s *FIDO2AttestationService) VerifyEvidence(ctx context.Context, req *FIDO2
 // does: in fido-u2f the signature is over rpIdHash, clientDataHash,
 // credentialId and the public key, NOT over the flags (nor the counter), so a
 // caller could set UV on an otherwise valid, trusted attestation. packed,
-// android-key (signature over authData||clientDataHash), tpm (certInfo
-// extraData is a hash over them) and apple (the certificate nonce is a hash
-// over them) cover it. Anything else is not trusted for UV (fail closed).
+// tpm (certInfo extraData is a hash over them) and apple (the certificate
+// nonce is a hash over them) cover it. android-key signs authData too, but
+// an app can sign caller-constructed authData with a credential key that
+// needs no user authentication, and the pinned verifier does not enforce the
+// attested NoAuthRequired / UserAuthType constraints, so its UV flag proves
+// nothing. Anything else is not trusted for UV (fail closed).
 func authDataFlagsAreSigned(format string) bool {
 	switch format {
-	case "packed", "tpm", "android-key", "apple":
+	case "packed", "tpm", "apple":
 		return true
 	}
 	return false
