@@ -407,7 +407,8 @@ is registered by its own stage). The request is classified as follows:
 | `type` not registered | HTTP 400 `KEY_ATTESTATION_TYPE_UNSUPPORTED`, before the single-use challenge is consumed |
 | evidence invalid (malformed, broken chain, expired certificate, wrong leaf key, wrong challenge, missing attestation extension, revoked certificate) | WIA refused, HTTP 400 `KEY_ATTESTATION_INVALID` (same rule as a failing native attestation) |
 | the evidence cannot be judged (no fresh revocation list) or a verified record cannot be stored (storage outage) | WIA refused, HTTP 503 `KEY_ATTESTATION_UNAVAILABLE`, nothing recorded |
-| sound but names no home (see below) | no record; the WIA issues with the home `unknown` |
+| sound but names no home (see below), `enforcement: ignore` (default) | no record; the WIA issues with the home `unknown`; counted in `siros_wia_instance_key_not_qualifying_total{reason,enforcement="ignore"}` and logged with the reason |
+| sound but names no home (see below), `enforcement: reject` | WIA refused, HTTP 400 `KEY_ATTESTATION_NOT_QUALIFYING` with `details.reason` (enum below); nothing recorded; the challenge is consumed, as for `KEY_ATTESTATION_INVALID` |
 | verified hardware-backed | record written, home `strongbox` or `tee` |
 
 **Challenge.** The WIA challenge C is reused. The key must have been generated
@@ -483,9 +484,62 @@ record whose kind is not `fido2`, so an `android_key` record cannot unlock
 client-selected `key_storage`, `user_authentication` or certification claims
 for a credential key. Nothing the client reports is copied into a verified atom. Later WIAs of the same
 key need no new chain: the stored record is looked up by the PoP key's
-thumbprint, and the fresh PoP proves possession. Periodic re-checking of stored
-records against the status list is not done yet (`chain_not_after` and
-`verified_at` are recorded for it).
+thumbprint, and the fresh PoP proves possession. Stored records are re-checked each
+time they are used, see "Re-check on use" below.
+
+**Enforcement.** `enforcement: ignore` (the default) keeps the behaviour above.
+`enforcement: reject` refuses evidence that cannot name a home instead of
+quietly issuing with the home `unknown`. The refusal is
+`400 {"error": "KEY_ATTESTATION_NOT_QUALIFYING", "details": {"reason": R}}` and
+`R` is exactly one of these fixed values (never text from the evidence):
+
+| `reason` | Meaning |
+|---|---|
+| `not_configured` | no trust anchors or no allowed app digests configured |
+| `untrusted_root` | the chain does not end in a pinned anchor |
+| `software_security_level` | attestation or keymaster security level is not TEE/StrongBox |
+| `key_not_generated` | origin is not GENERATED in the hardware-enforced list |
+| `no_sign_purpose` | the key has no SIGN purpose |
+| `app_not_allowed` | signing digest, package or application id not allowed |
+| `boot_not_verified` | verified boot state is not `verified` (or not reported) |
+| `bootloader_unlocked` | the bootloader is not locked (or not reported) |
+| `patch_level_too_old` | OS patch level older than `min_patch_level` |
+| `patch_level_missing` | `min_patch_level` is set and no patch level was attested |
+
+Evidence that is invalid stays `KEY_ATTESTATION_INVALID`, and an unavailable
+revocation list stays `KEY_ATTESTATION_UNAVAILABLE`, in both modes. In reject
+mode the boot-state and locked-bootloader requirements are on by default and
+individually switchable; `min_patch_level` (YYYYMM) is off unless set. In ignore
+mode they are never applied (the facts are recorded). The server refuses to
+start with `enforcement: reject` and no trust anchors or no allowed app digests
+(`ignore` keeps its single startup warning).
+
+**What this does NOT detect.** Key attestation says where the key lives and what
+the device's own trusted software reports about it. It does not detect a rooted
+phone that keeps a locked bootloader and spoofs its boot state, and it says
+nothing about the device after the key was generated. Play Integrity
+(`native_attestation`) is complementary: it judges the app and device now but
+does not bind a key. Neither replaces the other.
+
+**Re-check on use.** The record stores the serial numbers of the chain
+(`cert_serials`). Whenever a stored `android_key` record backs a WIA or the
+assurance preview it is checked again, through the same fail-closed, TTL-bounded
+status list fetcher and cache the verifier uses:
+
+| Stored record | WIA | Preview and other read-only paths |
+|---|---|---|
+| a serial is on the fresh list | `instance_key none`, `wscd_type` unknown; the record is marked `revoked_at`/`revoked_reason` (kept, never deleted), metric and log line | same: evidence absent |
+| no fresh list can be had | refused, HTTP 503 `KEY_ATTESTATION_UNAVAILABLE`; nothing is marked | evidence absent, lowest tier |
+| `chain_not_after` has passed | `instance_key none`, `wscd_type` unknown; nothing is marked | evidence absent |
+| stored before serials were kept (legacy) | cannot be re-checked: unknown, `instance_key none`; nothing is marked | evidence absent |
+
+A revoked record is replaced by any freshly verified submission whatever its
+rank (the no-downgrade rule protects only live evidence). The mark is set only
+on the record whose chain was checked, so a record that a fresh submission
+replaced meanwhile is not marked. Key Attestation never reads instance-key
+records, so it has nothing to re-check. Metric:
+`siros_wia_instance_key_recheck_total{outcome}` with `ok`, `revoked`,
+`already_revoked`, `expired`, `legacy_unknown`, `unavailable`.
 
 **Configuration** (`wallet_provider.attestation.android_key_attestation`):
 
@@ -497,6 +551,12 @@ records against the status list is not done yet (`chain_not_after` and
 | `allowed_packages` | `..._ALLOWED_PACKAGES` | optional package-name restriction |
 | `status_list_url` | `..._STATUS_LIST_URL` | default Google's status list |
 | `status_list_default_ttl_seconds` | `..._STATUS_LIST_DEFAULT_TTL_SECONDS` | freshness when the response has no `max-age` (default 3600) |
+| `enforcement` | `..._ENFORCEMENT` | `ignore` (default) or `reject` |
+| `require_verified_boot` | `..._REQUIRE_VERIFIED_BOOT` | reject mode: require verified boot state; default true |
+| `require_locked_bootloader` | `..._REQUIRE_LOCKED_BOOTLOADER` | reject mode: require a locked bootloader; default true |
+| `min_patch_level` | `..._MIN_PATCH_LEVEL` | reject mode: oldest OS patch level, YYYYMM; 0 (default) = none |
+
+(`...` is `WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION`.)
 
 Get Google's attestation roots from <https://android.googleapis.com/attestation/root>
 (a JSON array of PEM certificates; it includes the RSA root and the ECDSA P-384

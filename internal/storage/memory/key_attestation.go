@@ -46,3 +46,17 @@ func (s *KeyAttestationStore) GetByKeyThumbprint(_ context.Context, thumbprint s
 	}
 	return nil, storage.ErrNotFound
 }
+
+// MarkKeyRevoked implements storage.KeyAttestationStore.
+func (s *KeyAttestationStore) MarkKeyRevoked(_ context.Context, thumbprint, chainFingerprint, reason string, at time.Time) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	rec, ok := s.data[thumbprint]
+	if !ok || rec.Revoked() || rec.ChainFingerprint != chainFingerprint {
+		return false, nil
+	}
+	rec.RevokedAt = at.UTC()
+	rec.RevokedReason = reason
+	return true, nil
+}

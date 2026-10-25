@@ -90,3 +90,20 @@ func (s *KeyAttestationStore) GetByKeyThumbprint(ctx context.Context, thumbprint
 	rec.Normalize()
 	return &rec, nil
 }
+
+// MarkKeyRevoked implements storage.KeyAttestationStore. It is one atomic
+// update that matches only the record with the given chain fingerprint that is
+// not yet revoked, and bumps the revision so a concurrent MarkKeyAttested that
+// decided on the old document fails its compare-and-set and re-evaluates.
+func (s *KeyAttestationStore) MarkKeyRevoked(ctx context.Context, thumbprint, chainFingerprint, reason string, at time.Time) (bool, error) {
+	res, err := s.collection.UpdateOne(ctx,
+		bson.M{"_id": thumbprint, "chain_fingerprint": chainFingerprint, "revoked_at": bson.M{"$exists": false}},
+		bson.M{
+			"$set": bson.M{"revoked_at": at.UTC(), "revoked_reason": reason},
+			"$inc": bson.M{"rev": 1},
+		})
+	if err != nil {
+		return false, fmt.Errorf("%w: mark key revoked: %v", storage.ErrDatabase, err)
+	}
+	return res.ModifiedCount == 1, nil
+}

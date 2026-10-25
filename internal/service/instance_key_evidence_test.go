@@ -7,6 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
+
+	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
@@ -23,6 +26,26 @@ type fakeKeyVerifier struct {
 }
 
 func (f *fakeKeyVerifier) Type() KeyAttestationType { return f.typ }
+
+// Kind and Recheck make the fake a re-checker that finds every record good
+// (tests of the re-check use the real verifier).
+func (f *fakeKeyVerifier) Kind() domain.KeyEvidenceKind {
+	if f.typ == KeyAttestationAppAttestAssertion {
+		return domain.KeyEvidenceAppAttestAssertion
+	}
+	return domain.KeyEvidenceAndroidKey
+}
+
+func (f *fakeKeyVerifier) Recheck(context.Context, *domain.KeyAttestationRecord, time.Time) (RecheckResult, error) {
+	return RecheckResult{Verdict: RecheckGood}, nil
+}
+
+// goodChecker is a checker that finds every android_key record good.
+func goodChecker() *instanceKeyChecker {
+	c := newInstanceKeyChecker(zap.NewNop())
+	c.register(&fakeKeyVerifier{typ: KeyAttestationAndroidKey})
+	return c
+}
 func (f *fakeKeyVerifier) Verify(_ context.Context, in *InstanceKeyEvidenceInput) (*InstanceKeyEvidenceResult, error) {
 	f.calls++
 	f.got = in

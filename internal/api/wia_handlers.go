@@ -117,6 +117,20 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 				"error":   "KEY_ATTESTATION_TYPE_UNSUPPORTED",
 				"message": "The key_attestation type is not supported",
 			})
+		case errors.Is(err, service.ErrWIAKeyAttestationNotQualifying):
+			// The reason is one of the fixed service.NoHome* values, never
+			// text from the evidence.
+			reason := ""
+			var nq *service.KeyAttestationNotQualifyingError
+			if errors.As(err, &nq) {
+				reason = nq.SafeReason()
+			}
+			h.logger.Info("key attestation does not qualify", zap.String("reason", reason))
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":   "KEY_ATTESTATION_NOT_QUALIFYING",
+				"message": "The key_attestation evidence does not qualify",
+				"details": gin.H{"reason": reason},
+			})
 		case errors.Is(err, service.ErrWIAKeyAttestationInvalid):
 			h.logger.Debug("key attestation rejected", zap.Error(err))
 			c.JSON(http.StatusBadRequest, gin.H{

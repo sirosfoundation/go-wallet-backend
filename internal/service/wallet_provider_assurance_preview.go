@@ -159,6 +159,15 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 			if caller, ok := ctx.Value(callerCtxKey{}).(KeyAttestationCaller); ok && !instanceEvidenceInScope(rec, caller.TenantID, caller.UserID) {
 				rec = nil
 			}
+			// The preview cannot answer 503: evidence that cannot be
+			// re-checked (or no longer stands) is absent, the lowest tier.
+			if rec != nil {
+				var uerr error
+				if rec, uerr = s.keyChecker.usable(ctx, s.keyAttestations, rec); uerr != nil {
+					s.logger.Warn("instance key evidence cannot be re-checked; treating as none in the preview", zap.Error(uerr))
+					rec = nil
+				}
+			}
 			wiaFacts.Fido2 = fido2VerifiedFromRecord(rec)
 			wiaFacts.InstanceKey = instanceKeyVerifiedFromRecord(rec)
 		} else if !errors.Is(err, storage.ErrNotFound) {

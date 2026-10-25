@@ -80,6 +80,21 @@ type KeyAttestationRecord struct {
 	// chain, zero when there is no chain.
 	ChainNotAfter time.Time `json:"chain_not_after,omitempty" bson:"chain_not_after,omitempty"`
 
+	// CertSerials are the serial numbers (lowercase hex, no leading zeros) of
+	// the certificates of the verified chain, kept so the chain can be checked
+	// against the revocation list again each time the record is used. Records
+	// stored before the field existed have none: they cannot be re-checked
+	// and so are treated as unknown, never as still good.
+	CertSerials []string `json:"cert_serials,omitempty" bson:"cert_serials,omitempty"`
+
+	// RevokedAt is when a re-check found the evidence revoked; zero while it
+	// stands. A revoked record is kept (never deleted) and is never evidence:
+	// readers treat the key as having none.
+	RevokedAt time.Time `json:"revoked_at,omitempty" bson:"revoked_at,omitempty"`
+
+	// RevokedReason says why RevokedAt was set (a fixed enum, never client text).
+	RevokedReason string `json:"revoked_reason,omitempty" bson:"revoked_reason,omitempty"`
+
 	// VerifiedAt is when this key's attestation was verified.
 	VerifiedAt time.Time `json:"verified_at" bson:"verified_at"`
 
@@ -139,6 +154,10 @@ func (r *KeyAttestationRecord) Clone() *KeyAttestationRecord {
 		v := *r.DeviceLocked
 		c.DeviceLocked = &v
 	}
+	c.CertSerials = append([]string(nil), r.CertSerials...)
+	if len(c.CertSerials) == 0 {
+		c.CertSerials = nil
+	}
 	return &c
 }
 
@@ -154,6 +173,9 @@ func (r *KeyAttestationRecord) Normalize() {
 	}
 }
 
+// Revoked reports whether a re-check found the evidence revoked.
+func (r *KeyAttestationRecord) Revoked() bool { return !r.RevokedAt.IsZero() }
+
 // Supersedes reports whether r may replace existing. A stored record is
 // never overwritten by weaker or absent evidence: r must not rank lower by
 // Home; at equal rank it must be the same Kind and must not lose the UV bit
@@ -162,6 +184,11 @@ func (r *KeyAttestationRecord) Normalize() {
 // are compared in normalized form.
 func (r *KeyAttestationRecord) Supersedes(existing *KeyAttestationRecord) bool {
 	if existing == nil {
+		return true
+	}
+	// Revoked evidence is no evidence: a freshly verified record replaces it
+	// whatever its rank (the no-downgrade rule protects live evidence only).
+	if existing.Revoked() {
 		return true
 	}
 	n, e := *r, *existing

@@ -256,7 +256,7 @@ func TestAndroidKey_SoftwareLevelsGiveNoHome(t *testing.T) {
 			// encodeKeyDescription defaults 0/0 to TEE; force software through a non-zero sentinel.
 			kd.AttLevel, kd.KmLevel = -1, -1
 		}
-		h.noHome(h.chain(kd, leafOpts{}), "not hardware")
+		h.noHome(h.chain(kd, leafOpts{}), NoHomeSoftwareSecurityLevel)
 	}
 }
 
@@ -265,13 +265,13 @@ func TestAndroidKey_UnknownRootGivesNoHome(t *testing.T) {
 	// A complete, internally valid chain under a root nobody pinned.
 	other := newChainFixture(t)
 	chain := other.leaf(&h.pop.PublicKey, encodeKeyDescription(h.goodKD()), leafOpts{})
-	h.noHome(chain, "pinned trust anchor")
+	h.noHome(chain, NoHomeUntrustedRoot)
 	// The root need not be sent: a chain that stops below a PINNED root still
 	// verifies against the operator's copy of it.
 	h.ok(h.chain(h.goodKD(), leafOpts{})[:2])
 	// But a chain whose last certificate is not issued by any pinned anchor
 	// does not, however complete it looks.
-	h.noHome(other.leaf(&h.pop.PublicKey, encodeKeyDescription(h.goodKD()), leafOpts{})[:2], "pinned trust anchor")
+	h.noHome(other.leaf(&h.pop.PublicKey, encodeKeyDescription(h.goodKD()), leafOpts{})[:2], NoHomeUntrustedRoot)
 }
 
 func TestAndroidKey_NoAnchorsOrNoAppsVerifiesNothing(t *testing.T) {
@@ -281,7 +281,7 @@ func TestAndroidKey_NoAnchorsOrNoAppsVerifiesNothing(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			h := newAKHarness(t, mut)
-			h.noHome(h.chain(h.goodKD(), leafOpts{}), "not configured")
+			h.noHome(h.chain(h.goodKD(), leafOpts{}), NoHomeNotConfigured)
 			// Not even a malformed payload is looked at: nothing is learned from it.
 			res, err := h.verifyPayload([]byte(`not json`))
 			if err != nil || res.Record != nil {
@@ -299,12 +299,12 @@ func TestAndroidKey_OriginAndPurposeMustBeHardwareGeneratedSigning(t *testing.T)
 		mut    func(*kdParams)
 		reason string
 	}{
-		"origin imported":   {func(k *kdParams) { k.Origin = intp(2) }, "not generated"},
-		"origin derived":    {func(k *kdParams) { k.Origin = intp(1) }, "not generated"},
-		"origin missing":    {func(k *kdParams) { k.Origin = nil }, "not generated"},
-		"origin only in sw": {func(k *kdParams) { k.Origin = nil; k.ExtraSoftware = [][]byte{explicit(akTagOrigin, integer(0))} }, "not generated"},
-		"no sign purpose":   {func(k *kdParams) { k.Purposes = []int{3, 4} }, "SIGN"},
-		"no purposes":       {func(k *kdParams) { k.Purposes = nil }, "SIGN"},
+		"origin imported":   {func(k *kdParams) { k.Origin = intp(2) }, NoHomeKeyNotGenerated},
+		"origin derived":    {func(k *kdParams) { k.Origin = intp(1) }, NoHomeKeyNotGenerated},
+		"origin missing":    {func(k *kdParams) { k.Origin = nil }, NoHomeKeyNotGenerated},
+		"origin only in sw": {func(k *kdParams) { k.Origin = nil; k.ExtraSoftware = [][]byte{explicit(akTagOrigin, integer(0))} }, NoHomeKeyNotGenerated},
+		"no sign purpose":   {func(k *kdParams) { k.Purposes = []int{3, 4} }, NoHomeNoSignPurpose},
+		"no purposes":       {func(k *kdParams) { k.Purposes = nil }, NoHomeNoSignPurpose},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -337,29 +337,29 @@ func TestAndroidKey_AppAllowlist(t *testing.T) {
 		h := newAKHarness(t, nil)
 		kd := h.goodKD()
 		kd.Digests = [][]byte{otherDigest}
-		h.noHome(h.chain(kd, leafOpts{}), "allowlist")
+		h.noHome(h.chain(kd, leafOpts{}), NoHomeAppNotAllowed)
 	})
 	t.Run("one of two digests not allowed", func(t *testing.T) {
 		h := newAKHarness(t, nil)
 		kd := h.goodKD()
 		kd.Digests = [][]byte{testAppDigest[:], otherDigest}
-		h.noHome(h.chain(kd, leafOpts{}), "allowlist")
+		h.noHome(h.chain(kd, leafOpts{}), NoHomeAppNotAllowed)
 	})
 	t.Run("no app id", func(t *testing.T) {
 		h := newAKHarness(t, nil)
 		kd := h.goodKD()
 		kd.NoAppID = true
-		h.noHome(h.chain(kd, leafOpts{}), "allowlist")
+		h.noHome(h.chain(kd, leafOpts{}), NoHomeAppNotAllowed)
 	})
 	t.Run("no digests", func(t *testing.T) {
 		h := newAKHarness(t, nil)
 		kd := h.goodKD()
 		kd.Digests = nil
-		h.noHome(h.chain(kd, leafOpts{}), "allowlist")
+		h.noHome(h.chain(kd, leafOpts{}), NoHomeAppNotAllowed)
 	})
 	t.Run("package restriction", func(t *testing.T) {
 		h := newAKHarness(t, func(c *config.AndroidKeyAttestationConfig) { c.AllowedPackages = []string{"org.other.app"} })
-		h.noHome(h.chain(h.goodKD(), leafOpts{}), "allowlist")
+		h.noHome(h.chain(h.goodKD(), leafOpts{}), NoHomeAppNotAllowed)
 		h2 := newAKHarness(t, func(c *config.AndroidKeyAttestationConfig) { c.AllowedPackages = []string{testAppPackage} })
 		h2.ok(h2.chain(h2.goodKD(), leafOpts{}))
 	})
@@ -479,7 +479,7 @@ func TestAndroidKey_RevocationFailsClosed(t *testing.T) {
 		h := newAKHarness(t, nil)
 		kd := h.goodKD()
 		kd.AttLevel, kd.KmLevel = -1, -1
-		h.noHome(h.chain(kd, leafOpts{}), "not hardware")
+		h.noHome(h.chain(kd, leafOpts{}), NoHomeSoftwareSecurityLevel)
 		if h.fetch.callCount() != 0 {
 			t.Fatal("fetched a revocation list for software evidence")
 		}

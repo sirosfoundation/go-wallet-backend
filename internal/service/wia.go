@@ -176,6 +176,10 @@ type WIAService struct {
 	// type. Registered while wiring the service (RegisterInstanceKeyVerifier).
 	keyVerifiers map[KeyAttestationType]InstanceKeyEvidenceVerifier
 
+	// keyChecker re-checks stored instance-key evidence each time it backs a
+	// WIA (revocation, expiry). Verifiers that can re-check register here too.
+	keyChecker *instanceKeyChecker
+
 	// Challenge store for single-use nonces (memory or MongoDB).
 	challenges WIAChallengeStore
 
@@ -220,6 +224,10 @@ func (s *WIAService) SetAssessor(a *assurance.Assessor) { s.assessor = a }
 // SetKeyAttestations installs the store of verified per-key evidence that
 // the instance key is looked up in (see instanceKeyEvidence).
 func (s *WIAService) SetKeyAttestations(k storage.KeyAttestationStore) { s.keyAttestations = k }
+
+// SetInstanceKeyChecker installs the shared re-check of stored instance-key
+// evidence (see instance_key_recheck.go).
+func (s *WIAService) SetInstanceKeyChecker(c *instanceKeyChecker) { s.keyChecker = c }
 
 func (s *WIAService) assuranceEnabled() bool {
 	return s.cfg.WalletProvider.Attestation.Assurance.Enabled
@@ -417,7 +425,13 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 			return "", err
 		}
 	}
-	att.KeyEvidence = s.instanceKeyEvidence(ctx, tenantID, userIDString(userID), jkt)
+	att.KeyEvidence, err = s.instanceKeyEvidence(ctx, tenantID, userIDString(userID), jkt)
+	if err != nil {
+		// The stored evidence cannot be re-checked right now: refuse rather
+		// than issue with a home nobody could confirm.
+		s.emitAuditFailure("key_attestation_unavailable", err)
+		return "", err
+	}
 	if att.KeyEvidence == nil && s.keyAttestations == nil {
 		att.KeyEvidence = submitted // nothing durable to read back from
 	}
@@ -475,23 +489,26 @@ type wiaAttestation struct {
 // evidence says nothing about the derived key unless a later stage binds them.
 //
 // A store error is treated as no evidence (fail closed to unknown), never as
-// permission.
-func (s *WIAService) instanceKeyEvidence(ctx context.Context, tenantID domain.TenantID, userID, jkt string) *domain.KeyAttestationRecord {
+// permission. A stored record is re-checked before it is used (revocation,
+// expiry, see instance_key_recheck.go): a record that fails is no evidence; a
+// re-check that cannot be done returns an error wrapping
+// ErrWIAKeyAttestationUnavailable.
+func (s *WIAService) instanceKeyEvidence(ctx context.Context, tenantID domain.TenantID, userID, jkt string) (*domain.KeyAttestationRecord, error) {
 	if s.keyAttestations == nil {
-		return nil
+		return nil, nil
 	}
 	rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, jkt)
 	if err != nil {
 		if !errors.Is(err, storage.ErrNotFound) {
 			s.logger.Warn("instance key evidence lookup failed; treating as none", zap.Error(err))
 		}
-		return nil
+		return nil, nil
 	}
 	if !instanceEvidenceInScope(rec, tenantID, userID) {
 		s.logger.Warn("instance key evidence was verified for another tenant or user; ignoring it")
-		return nil
+		return nil, nil
 	}
-	return rec
+	return s.keyChecker.usable(ctx, s.keyAttestations, rec)
 }
 
 func userIDString(u *domain.UserID) string {
