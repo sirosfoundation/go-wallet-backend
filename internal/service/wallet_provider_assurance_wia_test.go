@@ -726,3 +726,21 @@ func TestPreview_PolicyDisabledFallbackIgnoresInstanceKeyOverlay(t *testing.T) {
 		t.Fatalf("an instance-key overlay vouched for key storage: %+v", got)
 	}
 }
+
+type failingKeyLookup struct{ storage.KeyAttestationStore }
+
+func (failingKeyLookup) GetByKeyThumbprint(context.Context, string) (*domain.KeyAttestationRecord, error) {
+	return nil, errors.New("database timeout")
+}
+
+// A storage error while reading the stored record must fail the preview, not
+// silently preview the submission as if nothing were stored.
+func TestPreview_StoredEvidenceLookupErrorIsReturned(t *testing.T) {
+	svc, _, keys := previewSvc(t, strings.ReplaceAll(previewRules, "aa1", "00000000-0000-0000-0000-0000000000aa"), true)
+	svc.keyAttestations = failingKeyLookup{keys}
+	sub, _ := fido2Submission(t, uuid.MustParse("00000000-0000-0000-0000-0000000000aa"), 0x40|0x01)
+	got, err := svc.PreviewAssurance(context.Background(), &AssurancePreviewRequest{FIDO2: sub})
+	if err == nil || !strings.Contains(err.Error(), "database timeout") {
+		t.Fatalf("want the lookup error, got %+v, %v", got, err)
+	}
+}

@@ -479,6 +479,9 @@ func TestNativeAttestationService_AppAttest_DevModeStillEnforcesNonce(t *testing
 	if result.AttestationSource != "development_attested" {
 		t.Errorf("AttestationSource = %q, want development_attested", result.AttestationSource)
 	}
+	if result.AppID != "" {
+		t.Errorf("AppID = %q; a development (self-signed) attestation must not report a verified app id", result.AppID)
+	}
 }
 
 // authDataForAppID reconstructs the authData bytes buildTestAppAttestAttestation
