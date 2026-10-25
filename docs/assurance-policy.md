@@ -531,7 +531,7 @@ status list fetcher and cache the verifier uses:
 | a serial is on the fresh list | `instance_key none`, `wscd_type` unknown; the record is marked `revoked_at`/`revoked_reason` (kept, never deleted), metric and log line | same: evidence absent |
 | no fresh list can be had | refused, HTTP 503 `KEY_ATTESTATION_UNAVAILABLE`; nothing is marked | evidence absent, lowest tier |
 | `chain_not_after` has passed | `instance_key none`, `wscd_type` unknown; nothing is marked | evidence absent |
-| no longer accepted by the CURRENT configuration (app digest or package allowlist narrowed, trust anchors removed; in reject mode also boot state, bootloader lock or `min_patch_level` tightened) | `instance_key none`, `wscd_type` unknown; nothing is marked (relaxing the configuration restores it) | evidence absent |
+| no longer accepted by the CURRENT configuration (app digest or package allowlist narrowed, the pinned root the chain ended in removed (the record keeps its fingerprint) even while other roots stay pinned; in reject mode also boot state, bootloader lock or `min_patch_level` tightened) | `instance_key none`, `wscd_type` unknown; nothing is marked (relaxing the configuration restores it) | evidence absent |
 | stored before serials were kept (legacy) | cannot be re-checked: unknown, `instance_key none`; nothing is marked | evidence absent |
 
 A freshly verified submission replaces a record that is no longer good whatever

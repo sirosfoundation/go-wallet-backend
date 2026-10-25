@@ -80,10 +80,13 @@ type AndroidKeyAttestationVerifier struct {
 	logger     *zap.Logger
 	anchors    *x509.CertPool
 	numAnchors int
-	digests    map[string]struct{}
-	packages   map[string]struct{}
-	status     *androidStatusList
-	policy     androidEnforcement
+	// anchorFPs are the SHA-256 fingerprints (hex) of the pinned anchors, so a
+	// stored record can be checked against the CURRENT pins.
+	anchorFPs map[string]struct{}
+	digests   map[string]struct{}
+	packages  map[string]struct{}
+	status    *androidStatusList
+	policy    androidEnforcement
 }
 
 // androidEnforcement is the configured handling of evidence that does not
@@ -101,10 +104,11 @@ type androidEnforcement struct {
 // trust configuration); an EMPTY configuration is valid and verifies nothing.
 func NewAndroidKeyAttestationVerifier(cfg config.AndroidKeyAttestationConfig, logger *zap.Logger, fetcher AttestationStatusFetcher) (*AndroidKeyAttestationVerifier, error) {
 	v := &AndroidKeyAttestationVerifier{
-		logger:   logger.Named("android-key-attestation"),
-		anchors:  x509.NewCertPool(),
-		digests:  make(map[string]struct{}),
-		packages: make(map[string]struct{}),
+		logger:    logger.Named("android-key-attestation"),
+		anchors:   x509.NewCertPool(),
+		anchorFPs: make(map[string]struct{}),
+		digests:   make(map[string]struct{}),
+		packages:  make(map[string]struct{}),
 		policy: androidEnforcement{
 			reject:        cfg.Rejecting(),
 			verifiedBoot:  cfg.VerifiedBootRequired(),
@@ -126,7 +130,7 @@ func NewAndroidKeyAttestationVerifier(cfg config.AndroidKeyAttestationConfig, lo
 		pemData = append(pemData, '\n')
 	}
 	pemData = append(pemData, cfg.TrustAnchorsPEM...)
-	n, err := addPEMAnchors(v.anchors, pemData)
+	n, err := addPEMAnchors(v.anchors, v.anchorFPs, pemData)
 	if err != nil {
 		return nil, fmt.Errorf("android_key_attestation trust anchors: %w", err)
 	}
@@ -171,7 +175,7 @@ func (v *AndroidKeyAttestationVerifier) setStatusClock(now func() time.Time) { v
 // one would be dropped silently and the operator would run with a partially
 // read trust configuration; instead the number of BEGIN lines must equal the
 // number of blocks that decoded, and nothing but whitespace may surround them.
-func addPEMAnchors(pool *x509.CertPool, data []byte) (int, error) {
+func addPEMAnchors(pool *x509.CertPool, fps map[string]struct{}, data []byte) (int, error) {
 	begins := bytes.Count(data, []byte("-----BEGIN "))
 	if begins > 0 && !bytes.HasPrefix(bytes.TrimSpace(data), []byte("-----BEGIN ")) {
 		return 0, errors.New("unexpected data before the first PEM block")
@@ -191,6 +195,8 @@ func addPEMAnchors(pool *x509.CertPool, data []byte) (int, error) {
 			return 0, fmt.Errorf("parse certificate: %w", err)
 		}
 		pool.AddCert(cert)
+		fp := sha256.Sum256(cert.Raw)
+		fps[hex.EncodeToString(fp[:])] = struct{}{}
 		count++
 	}
 	if len(bytes.TrimSpace(data)) != 0 {
@@ -406,21 +412,23 @@ func (v *AndroidKeyAttestationVerifier) Verify(ctx context.Context, in *Instance
 		}
 	}
 	fp := sha256.Sum256(certs[0].Raw)
+	anchorFP := sha256.Sum256(chain[len(chain)-1].Raw)
 	certSerials := make([]string, 0, len(serials))
 	for _, sn := range serials {
 		certSerials = append(certSerials, serialKey(sn))
 	}
 	rec := &domain.KeyAttestationRecord{
-		Kind:              domain.KeyEvidenceAndroidKey,
-		CertSerials:       certSerials,
-		Home:              home,
-		SecurityLevel:     level,
-		AppDigest:         appDigest,
-		AppPackages:       appPackages,
-		ChainFingerprint:  hex.EncodeToString(fp[:]),
-		ChainNotAfter:     notAfter.UTC(),
-		VerifiedAt:        in.Now,
-		VerifiedBootState: "",
+		Kind:                   domain.KeyEvidenceAndroidKey,
+		CertSerials:            certSerials,
+		TrustAnchorFingerprint: hex.EncodeToString(anchorFP[:]),
+		Home:                   home,
+		SecurityLevel:          level,
+		AppDigest:              appDigest,
+		AppPackages:            appPackages,
+		ChainFingerprint:       hex.EncodeToString(fp[:]),
+		ChainNotAfter:          notAfter.UTC(),
+		VerifiedAt:             in.Now,
+		VerifiedBootState:      "",
 	}
 	if rot := kd.TEE.RootOfTrust; rot != nil {
 		rec.VerifiedBootState = androidBootStateName(rot.VerifiedBootState)
@@ -625,6 +633,12 @@ func (v *AndroidKeyAttestationVerifier) Recheck(ctx context.Context, rec *domain
 func (v *AndroidKeyAttestationVerifier) storedRecordPolicy(rec *domain.KeyAttestationRecord) string {
 	if !v.configured() {
 		return NoHomeNotConfigured
+	}
+	// The root the chain ended in must still be pinned: removing a root from
+	// the configuration withdraws what it vouched for. A record that does not
+	// say which root it ended in cannot be shown to have a pinned one.
+	if _, ok := v.anchorFPs[rec.TrustAnchorFingerprint]; !ok {
+		return NoHomeUntrustedRoot
 	}
 	if rec.AppDigest == "" {
 		return NoHomeAppNotAllowed

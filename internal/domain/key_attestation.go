@@ -77,6 +77,12 @@ type KeyAttestationRecord struct {
 	// applies to stored evidence.
 	AppPackages []string `json:"app_packages,omitempty" bson:"app_packages,omitempty"`
 
+	// TrustAnchorFingerprint is the SHA-256 fingerprint (hex) of the pinned
+	// root the verified chain ended in, so evidence is withdrawn when that root
+	// is no longer pinned. Records without it cannot be shown to have a pinned
+	// root and are treated as unknown.
+	TrustAnchorFingerprint string `json:"trust_anchor_fingerprint,omitempty" bson:"trust_anchor_fingerprint,omitempty"`
+
 	// ChainFingerprint is the SHA-256 fingerprint of the evidence's
 	// certificate chain leaf, for audit. Optional.
 	ChainFingerprint string `json:"chain_fingerprint,omitempty" bson:"chain_fingerprint,omitempty"`

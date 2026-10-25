@@ -3,6 +3,8 @@ package service
 import (
 	"context"
 	"crypto/ecdsa"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"math/big"
@@ -98,6 +100,10 @@ func TestRecheck_StoredRecordCarriesTheChainSerials(t *testing.T) {
 	}
 	if rec.Revoked() {
 		t.Fatal("fresh record is revoked")
+	}
+	root := sha256.Sum256(r.fx.rootDER)
+	if rec.TrustAnchorFingerprint != hex.EncodeToString(root[:]) {
+		t.Fatalf("trust anchor fingerprint = %q, want the pinned root's", rec.TrustAnchorFingerprint)
 	}
 }
 
@@ -376,6 +382,7 @@ func (r *rcWIA) verifier() *AndroidKeyAttestationVerifier {
 // stored: a renewal that submits nothing must not keep an old approval alive,
 // and relaxing the configuration restores it (nothing is marked).
 func TestRecheck_TightenedConfigurationAppliesToStoredEvidence(t *testing.T) {
+	var savedFPs map[string]struct{}
 	for name, tc := range map[string]struct {
 		weak    func(*kdParams)
 		tighten func(*AndroidKeyAttestationVerifier)
@@ -404,9 +411,18 @@ func TestRecheck_TightenedConfigurationAppliesToStoredEvidence(t *testing.T) {
 			tighten: func(v *AndroidKeyAttestationVerifier) { v.packages = map[string]struct{}{"org.other.app": {}} },
 			relax:   func(v *AndroidKeyAttestationVerifier) { v.packages = map[string]struct{}{} },
 		},
-		"trust removed": {
+		"all trust removed": {
 			tighten: func(v *AndroidKeyAttestationVerifier) { v.numAnchors = 0 },
 			relax:   func(v *AndroidKeyAttestationVerifier) { v.numAnchors = 1 },
+		},
+		// Roots {A, B} become {B}: what A vouched for is withdrawn while the
+		// configuration stays non-empty.
+		"one root removed, another remains": {
+			tighten: func(v *AndroidKeyAttestationVerifier) {
+				savedFPs = v.anchorFPs
+				v.anchorFPs = map[string]struct{}{"another-root-fingerprint": {}}
+			},
+			relax: func(v *AndroidKeyAttestationVerifier) { v.anchorFPs = savedFPs },
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
