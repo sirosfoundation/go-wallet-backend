@@ -2,7 +2,9 @@ package assurance
 
 import (
 	"errors"
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -88,7 +90,7 @@ func TestLint_ClaimedGroupWarnsNamingRuleIDs(t *testing.T) {
 	fs := lintRules(t, `# id: uses-claims
 (assure-ks (tier basic)(evidence (verified)(claimed (plugin soft))))
 # id: no-claims
-(assure-ks (tier moderate)(evidence (verified (fido2 (mds3 trusted)))))
+(assure-ks (tier moderate)(evidence (verified (fido2 (mds3 trusted)(aaguid a)))))
 # id: empty-claimed
 (assure-ua (tier basic)(evidence (verified)(claimed)))
 `)
@@ -255,5 +257,107 @@ func TestStartupCheckFailsLikeTheCLIOnMultiValueLeaf(t *testing.T) {
 	}
 	if !HasErrors(LintRuleSet(mustRuleSet(t, "# id: multi\n(assure-ks (tier moderate high)(evidence))\n"), &cfg)) {
 		t.Fatal("linter (CLI path) must report the same error")
+	}
+}
+
+func fido2Findings(fs []Finding) []Finding {
+	var out []Finding
+	for _, f := range fs {
+		if f.Severity == SeverityWarn && strings.Contains(f.Message, "AAGUID set is the hardware filter") {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func TestLint_Fido2WithoutAAGUIDWarns(t *testing.T) {
+	cases := map[string]string{
+		"grants above floor, bare fido2":  "(assure-ks (tier (* set basic moderate))(evidence (verified (fido2))))",
+		"grants above floor, mds3 only":   "(assure-ks (tier moderate)(evidence (verified (fido2 (mds3 trusted)))))",
+		"ua grants above floor":           "(assure-ua (tier enhanced-basic)(evidence (verified (fido2 (mds3 trusted)))))",
+		"empty aaguid is no constraint":   "(assure-ks (tier moderate)(evidence (verified (fido2 (mds3 trusted)(aaguid)))))",
+		"names uv but floor-only grant":   "(assure-ua (tier basic)(evidence (verified (fido2 (mds3 trusted)(aaguid)(uv present)))))",
+		"names mds3 but floor-only grant": "(assure-ks (tier basic)(evidence (verified (fido2 (mds3 trusted)))))",
+		"open tier grant, bare fido2":     "(assure-ks (tier (* prefix e))(evidence (verified (fido2))))",
+	}
+	for name, rule := range cases {
+		t.Run(name, func(t *testing.T) {
+			fs := fido2Findings(lintRules(t, "# id: rid\n"+rule+"\n"))
+			if len(fs) != 1 || fs[0].RuleID != "rid" {
+				t.Fatalf("want one finding naming rid, got %v", fs)
+			}
+		})
+	}
+}
+
+func TestLint_Fido2WithAAGUIDOrNoGrantIsClean(t *testing.T) {
+	cases := map[string]string{
+		"aaguid set":                  "(assure-ks (tier moderate)(evidence (verified (fido2 (mds3 trusted)(aaguid (* set a b))))))",
+		"single aaguid":               "(assure-ua (tier moderate)(evidence (verified (fido2 (mds3 trusted)(aaguid a)(uv present)))))",
+		"bare fido2, floor only":      "(assure-ks (tier basic)(evidence (verified (fido2))))",
+		"fido2 none":                  "(assure-ks (tier moderate)(evidence (verified (fido2 none))))",
+		"no fido2 slot":               "(assure-ks (tier moderate)(evidence (verified (platform (source platform_attested)))))",
+		"claimed only (not fido2)":    "(assure-ks (tier moderate)(evidence (verified)(claimed (plugin soft))))",
+		"certification is not a tier": "(assure-cert (name eucc)(evidence (verified (fido2 (mds3 trusted)))))",
+	}
+	for name, rule := range cases {
+		t.Run(name, func(t *testing.T) {
+			if fs := fido2Findings(lintRules(t, "# id: rid\n"+rule+"\n")); len(fs) != 0 {
+				t.Fatalf("unexpected: %v", fs)
+			}
+		})
+	}
+}
+
+// The floor comes from the configured scheme, never from level names: with a
+// scheme whose floor is not the first listed level name used elsewhere, a
+// grant of only the floor stays clean and a grant above it warns.
+func TestLint_Fido2FloorComesFromConfiguredScheme(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.LevelSchemes = config.LevelSchemeList{{ID: cfg.KeyStorageScheme, Levels: []string{"k3", "k2", "k1"}, Values: []string{"iso_18045_basic", "iso_18045_moderate", "iso_18045_high"}, Floor: "k2"}}
+	run := func(rule string) []Finding {
+		return fido2Findings(LintRuleSet(mustRuleSet(t, "# id: rid\n"+rule+"\n"), &cfg))
+	}
+	if fs := run("(assure-ks (tier k2)(evidence (verified (fido2))))"); len(fs) != 0 {
+		t.Fatalf("floor-only grant must be clean: %v", fs)
+	}
+	if fs := run("(assure-ks (tier k1)(evidence (verified (fido2))))"); len(fs) != 1 {
+		t.Fatalf("above-floor grant must warn: %v", fs)
+	}
+	if fs := run("(assure-ks (tier k3)(evidence (verified (fido2))))"); len(fs) != 0 {
+		t.Fatalf("below-floor level is not above the floor: %v", fs)
+	}
+}
+
+// Every shipped rules template, including rule lines that ship commented out
+// (they are one uncomment away from live), must have zero findings of the
+// fido2 AAGUID-filter class.
+func TestShippedTemplatesHaveNoFido2AAGUIDFindings(t *testing.T) {
+	files, err := filepath.Glob("../../deploy/assurance/*.example")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("no shipped templates found: %v", err)
+	}
+	cfg := defaultCfg()
+	for _, file := range files {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var uncommented []string
+		for i, line := range strings.Split(string(data), "\n") {
+			if t2, ok := strings.CutPrefix(line, "# (assure-"); ok {
+				t2 = "(assure-" + t2
+				uncommented = append(uncommented, fmt.Sprintf("# id: commented-line-%d\n%s", i+1, strings.TrimSpace(t2)))
+			}
+		}
+		for name, text := range map[string]string{"live": string(data), "commented": strings.Join(uncommented, "\n") + "\n"} {
+			if name == "commented" && len(uncommented) == 0 {
+				continue
+			}
+			rs := mustRuleSet(t, text)
+			if fs := fido2Findings(LintRuleSet(rs, &cfg)); len(fs) != 0 {
+				t.Errorf("%s (%s): %v", file, name, fs)
+			}
+		}
 	}
 }
