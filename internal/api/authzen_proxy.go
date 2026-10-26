@@ -991,11 +991,34 @@ func pdpErrorBody(msg, pdpBody string) gin.H {
 			return out
 		}
 	}
-	for n := maxPDPErrorBodyBytes; n > 0; n /= 2 {
-		out := gin.H{"error": msg, "details": strings.ToValidUTF8(truncateString(pdpBody, n), "")}
+	return truncatedPDPErrorBody(msg, pdpBody)
+}
+
+// truncatedPDPErrorBody embeds the longest prefix of pdpBody whose serialized
+// response still fits in maxPDPErrorBodyBytes, falling back to the bare error
+// envelope when not even an empty prefix fits.
+//
+// A byte-offset cut can split a UTF-8 rune, so each candidate is passed through
+// strings.ToValidUTF8, which drops the partial trailing rune. The search is
+// sound because the serialized length is monotonically non-decreasing in the
+// cut offset n: the cleaned string for n is always a prefix of the cleaned
+// string for n+1 (a partial rune is dropped, then completed), and JSON
+// escaping is applied independently per rune, so a longer prefix never
+// serializes shorter.
+func truncatedPDPErrorBody(msg, pdpBody string) gin.H {
+	lo, hi := 0, len(pdpBody)
+	var best gin.H
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		out := gin.H{"error": msg, "details": strings.ToValidUTF8(pdpBody[:mid], "")}
 		if serializedLen(out) <= maxPDPErrorBodyBytes {
-			return out
+			best, lo = out, mid+1
+		} else {
+			hi = mid - 1
 		}
+	}
+	if best != nil {
+		return best
 	}
 	return gin.H{"error": msg}
 }
@@ -1006,13 +1029,6 @@ func serializedLen(v interface{}) int {
 		return maxPDPErrorBodyBytes + 1
 	}
 	return len(b)
-}
-
-func truncateString(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
 }
 
 // validateEvaluationRequest performs the same local validation the AuthZEN
