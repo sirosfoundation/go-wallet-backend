@@ -1285,6 +1285,11 @@ type AttestationConfig struct {
 	// StatusList controls the Token Status List references embedded in the
 	// WIA (`client_status`) and KA (`key_storage_status`).
 	StatusList StatusListConfig `yaml:"status_list" envconfig:"STATUS_LIST"`
+
+	// Assurance is the backend-owned assurance policy deciding the KA's
+	// key_storage / user_authentication / certification values. Off by
+	// default; see AssuranceConfig.
+	Assurance AssuranceConfig `yaml:"assurance" envconfig:"ASSURANCE"`
 }
 
 // StatusListRefMinMaintenanceSeconds is the floor CS-04 §7.2.2 (TS-03
@@ -2294,6 +2299,15 @@ func defaultConfig() *Config {
 				// instance. See AttestationConfig's type-level comment.
 				LifetimeSeconds: 300,
 				KAExpirySeconds: 15,
+				Assurance: AssuranceConfig{
+					// Off by default: behaviour is exactly the pre-policy clamp.
+					// Lowering by client claims is on by default once enabled.
+					KeyStorageScheme:                DefaultLevelSchemeID,
+					UserAuthenticationScheme:        DefaultLevelSchemeID,
+					LowerByClaimsKeyStorage:         true,
+					LowerByClaimsUserAuthentication: true,
+					WIAProfileScheme:                DefaultWIAProfileSchemeID,
+				},
 				StatusList: StatusListConfig{
 					// On by default: CS-04 §7.1.2/§7.1.3 require
 					// client_status/key_storage_status on every WUA, and a
@@ -2628,6 +2642,13 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if err := c.WalletProvider.Attestation.Assurance.Validate(); err != nil {
+		return err
+	}
+
+	// Not issuermetadata.ParseMetadataType: that package imports this one (its
+	// default HTTP client is built from HTTPClientConfig), so the list is
+	// mirrored here and a test in pkg/issuermetadata keeps the two in sync.
 	if !isValidHTTPClientMetadataType(c.HTTPClient.MetadataType) {
 		return fmt.Errorf("http_client.metadata_type: unknown value %q (want one of %s)", c.HTTPClient.MetadataType, strings.Join(HTTPClientMetadataTypes, ", "))
 	}

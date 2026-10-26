@@ -92,31 +92,41 @@ const (
 // the verifier's OID4VP authorization request (TS12/SCA per OID4VP draft §7.4).
 type TransactionData struct {
 	Type string `json:"type"`
-	// Raw is the entry exactly as received: the base64url string from the request's
-	// transaction_data array. It is the only valid input to transaction_data_hashes
-	// (OID4VP 1.0 Appendix B) and is always set from the received string, never from
-	// the decoded JSON.
+	// Raw is the entry exactly as the verifier sent it: the base64url string
+	// from the request's transaction_data array. It is the only valid input to
+	// the transaction_data_hashes a presentation carries (OID4VP 1.0
+	// Appendix B hashes the string as received, without decoding it first), and
+	// the only thing a client may trust: the other members are what the engine
+	// decoded from it. Always set by decodeTransactionData from the received
+	// string, never from the decoded JSON.
 	Raw string `json:"raw,omitempty"`
-	// Payload is the decoded `payload` object (EC TS12 4.2), for validation and display. Never hash it.
+	// Payload is the decoded entry's `payload` object (EC TS12 Section 4.2), for
+	// the client's validation and display. Never hash it.
 	Payload       json.RawMessage        `json:"payload,omitempty"`
 	Params        map[string]interface{} `json:"params,omitempty"`
 	CredentialIDs []string               `json:"credential_ids,omitempty"`
 	HashAlgorithm string                 `json:"hash_alg,omitempty"`
-	// TransactionDataHashesAlg lists the acceptable hash algorithms for this entry
-	// (OID4VP 1.0 Appendix B); the KB-JWT carries the single chosen one.
+	// TransactionDataHashesAlg is the verifier's list of acceptable hash
+	// algorithms for this entry (OID4VP 1.0 Appendix B: an array in the
+	// request; the KB-JWT carries the single chosen one as a string).
 	TransactionDataHashesAlg HashAlgList `json:"transaction_data_hashes_alg,omitempty"`
 }
 
 // HashAlgList is the request-side `transaction_data_hashes_alg` member: a
 // non-empty array of hash algorithm names. It also accepts a bare string,
-// which some verifiers send for a single algorithm.
+// which some verifiers send for a single algorithm; typing the member as a
+// string made every spec-conformant array fail to unmarshal, so a verifier
+// that followed the specification had its whole request rejected as invalid
+// JSON.
 type HashAlgList []string
 
-// UnmarshalJSON accepts a non-empty string or a non-empty array of non-empty
-// strings. OID4VP defines the member as a non-empty array of algorithm
-// identifiers, one of which the wallet must use, so an empty list leaves it
-// nothing valid to choose. Anything else is rejected, and `null` is not the
-// same as leaving the member out.
+// UnmarshalJSON accepts either a JSON string or an array of strings.
+//
+// The list must be non-empty and hold non-empty names: OID4VP defines the
+// member as a non-empty array of algorithm identifiers, one of which the
+// wallet must use, so an empty list leaves it nothing valid to choose. Anything
+// else is rejected as invalid transaction_data, and `null` is not the same as
+// leaving the member out.
 func (l *HashAlgList) UnmarshalJSON(b []byte) error {
 	errInvalid := errors.New("transaction_data_hashes_alg must be a non-empty string or a non-empty array of non-empty strings")
 	var algs []string
@@ -241,15 +251,21 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	}
 
 	// OID4VP §5 / §6: Validate request parameters before proceeding
+	// A transaction_data problem does not end the flow yet. Telling the
+	// verifier means contacting the response_uri the request itself supplied,
+	// and until verifier trust has been established that is an arbitrary,
+	// attacker-chosen URL: an unauthenticated request could aim the backend at
+	// an internal service just by carrying transaction_data. The request is
+	// refused below, after trust evaluation, and the verifier is told only then.
+	var pendingTransactionDataErr *transactionDataError
+	var validationErr error
 	if err := h.validateAuthorizationRequest(authReq, msg); err != nil {
 		h.Logger.Debug("authorization request validation failed", zap.Error(err))
-		var tdErr *transactionDataError
-		if errors.As(err, &tdErr) {
-			h.failTransactionData(ctx, authReq, tdErr)
+		if !errors.As(err, &pendingTransactionDataErr) {
+			_ = h.Error(StepParsingRequest, ErrCodeInvalidMessage, ErrCodeInvalidMessage.UserFacingMessage())
 			return err
 		}
-		_ = h.Error(StepParsingRequest, ErrCodeInvalidMessage, ErrCodeInvalidMessage.UserFacingMessage())
-		return err
+		validationErr = err
 	}
 
 	h.SetData("auth_request", authReq)
@@ -260,6 +276,11 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 		h.Logger.Debug("verifier trust evaluation failed", zap.Error(err))
 		_ = h.Error(StepEvaluatingVerifierTrust, ErrCodeUntrustedVerifier, ErrCodeUntrustedVerifier.UserFacingMessage())
 		return err
+	}
+	if pendingTransactionDataErr != nil {
+		// The verifier is trusted now, so it may be told.
+		h.failTransactionData(ctx, authReq, pendingTransactionDataErr)
+		return validationErr
 	}
 
 	// Step 3: Send credential_selection with dcql_query + verifier; wait for consent or decline
@@ -431,10 +452,14 @@ func (h *OID4VPHandler) parseRequestFromURL(u *url.URL) (*AuthorizationRequest, 
 		authReq.DCQLQuery = json.RawMessage(dcqlStr)
 	}
 
-	// Parse transaction_data (a JSON array of base64url strings in a query string).
-	// It must be kept even though nothing here interprets it: dropping it would let a
-	// transaction request bypass validateTransactionData. A parameter that is
-	// present but empty is rejected rather than read as absent.
+	// Parse transaction_data. By value in a query string it is a JSON array of
+	// base64url strings, like dcql_query is JSON. It must be kept even though
+	// nothing here interprets it: dropping it made a request that carried a
+	// transaction look like one that did not, so it bypassed the checks in
+	// validateTransactionData and the client presented without the hashes. The
+	// signed-JWT and fetched-object forms already keep it through their
+	// `transaction_data` struct tag. A parameter that is present but empty is
+	// rejected rather than read as absent.
 	if q.Has("transaction_data") {
 		tdStr := q.Get("transaction_data")
 		if !json.Valid([]byte(tdStr)) {
@@ -1919,8 +1944,9 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 		ClientMetadata:        authReq.ClientMetadataRaw,
 		VerifiedRequest:       verifiedInputs(authReq),
 	}
-	// EC TS12 puts response_mode in the KB-JWT of an SCA presentation; sent only with
-	// transaction data.
+	// EC TS12 puts the request's response_mode in the key binding JWT of an SCA
+	// presentation. Sent only with transaction data, so every other
+	// presentation's sign request is unchanged.
 	if len(authReq.TransactionData) > 0 {
 		params.ResponseMode = effectiveResponseMode(authReq)
 	}
@@ -1936,8 +1962,11 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 	return resp.VPToken, nil
 }
 
-// effectiveResponseMode returns the request's response_mode (default direct_post
-// per OID4VP); validation, submission and the KB-JWT must all see the same value.
+// effectiveResponseMode is the response_mode this engine actually answers the
+// request with: the request's own, or direct_post when it names none. The sign
+// request must carry this value, not the raw (possibly empty) member: EC TS12
+// puts response_mode in the key binding JWT, and an empty one would make the
+// wallet either refuse or bind a mode the response is not sent in.
 func effectiveResponseMode(authReq *AuthorizationRequest) string {
 	if authReq.ResponseMode == "" {
 		return ResponseModeDirectPost
@@ -2505,8 +2534,10 @@ func validateResponseURIOrigin(authReq *AuthorizationRequest, msg *FlowStartMess
 	return nil
 }
 
-// transactionDataError is a transaction_data problem mapped to invalid_transaction_data
-// for the verifier and its own error code for the client.
+// transactionDataError is a transaction_data problem that gets its own
+// handling: the verifier is told invalid_transaction_data (OID4VP 1.0 requires
+// the wallet to error rather than carry on) and the client gets code, not the
+// generic invalid-request error every other validation failure maps to.
 type transactionDataError struct {
 	code ErrorCode
 	err  error
@@ -2519,15 +2550,19 @@ func newTransactionDataError(code ErrorCode, format string, args ...any) error {
 	return &transactionDataError{code: code, err: fmt.Errorf(format, args...)}
 }
 
-// decodedTransactionData pairs a decoded entry with the exact string received; the
-// string is what a presentation binds to, since re-encoding does not reproduce it.
+// decodedTransactionData pairs a decoded entry with the exact string the
+// verifier sent. The string, not the decoded object, is what a presentation
+// binds to: OID4VP hashes the base64url string as received and does not
+// decode it first, and re-encoding a decoded object does not reproduce it
+// (key order, whitespace, escapes and number formatting all differ).
 type decodedTransactionData struct {
 	Raw  string
 	Data TransactionData
 }
 
-// decodeTransactionData decodes the array structurally (non-empty, base64url strings, each a
-// JSON object) without deciding which types are supported.
+// decodeTransactionData decodes the transaction_data array structurally: an
+// non-empty array of base64url strings, each a JSON object. It decides nothing about
+// which types are supported.
 func decodeTransactionData(raw json.RawMessage) ([]decodedTransactionData, error) {
 	if len(raw) == 0 {
 		return nil, nil
@@ -2567,10 +2602,16 @@ func decodeTransactionData(raw json.RawMessage) ([]decodedTransactionData, error
 	return out, nil
 }
 
-// validateTransactionData decodes and validates transaction_data for the client that
-// started the flow. A request with transaction_data is only passed to a client that
-// declared FeatureTransactionDataV1; older clients ignore unknown fields and would
-// sign without the hashes, so they are refused.
+// validateTransactionData decodes and validates the transaction_data array for
+// the client that started the flow.
+//
+// A request that carries transaction_data is only passed on to a client that
+// declared FeatureTransactionDataV1. Clients that predate it ignore unknown
+// fields, so forwarding the request would have them sign a presentation
+// without the transaction hashes and without showing the user the transaction.
+// Refusing is the only safe answer for them, and it costs nothing that worked:
+// such a presentation has never been accepted by a verifier that checks the
+// hashes.
 func validateTransactionData(authReq *AuthorizationRequest, msg *FlowStartMessage) error {
 	entries, err := decodeTransactionData(authReq.TransactionDataRaw)
 	if err != nil {
@@ -2593,9 +2634,13 @@ func validateTransactionData(authReq *AuthorizationRequest, msg *FlowStartMessag
 	return nil
 }
 
-// checkTransactionDataEntry is the structural check OID4VP 1.0 puts on an entry: a
-// type and a non-empty list of credential_ids naming credentials in the DCQL query.
-// Support for the type is the client's decision (it depends on type metadata).
+// checkTransactionDataEntry is the structural check OID4VP 1.0 puts on an
+// entry: a type, and a non-empty list of credential_ids each naming a
+// credential in the request's DCQL query. It does not decide whether the type
+// is supported. That depends on the type metadata of the attestation the
+// entry is bound to, which the wallet resolves, so the engine passes every
+// well-formed entry to a client that declared FeatureTransactionDataV1 and the
+// client refuses what it cannot handle.
 func checkTransactionDataEntry(i int, td TransactionData, dcqlIDs map[string]bool) error {
 	if td.Type == "" {
 		return newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: missing type", i)
@@ -2603,9 +2648,12 @@ func checkTransactionDataEntry(i int, td TransactionData, dcqlIDs map[string]boo
 	if len(td.CredentialIDs) == 0 {
 		return newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: credential_ids must be a non-empty array", i)
 	}
+	// credential_ids name credentials of the request's DCQL query (OID4VP 1.0).
+	// With no readable query there is nothing they could name, and accepting
+	// them anyway would skip the binding the wallet relies on to know which
+	// credential answers which transaction.
 	if dcqlIDs == nil {
-		// Fail closed: without a readable DCQL credential set, credential_ids cannot be checked.
-		return newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: transaction_data requires a dcql_query with at least one credential for credential_ids to reference", i)
+		return newTransactionDataError(ErrCodeInvalidMessage, "transaction_data[%d]: the request has no dcql_query whose credentials credential_ids could name", i)
 	}
 	for _, id := range td.CredentialIDs {
 		if !dcqlIDs[id] {
@@ -2615,8 +2663,9 @@ func checkTransactionDataEntry(i int, td TransactionData, dcqlIDs map[string]boo
 	return nil
 }
 
-// dcqlCredentialIDs returns the DCQL credential query ids, or nil when the query is
-// absent or unreadable (reported by other validation).
+// dcqlCredentialIDs returns the credential query ids of a DCQL query, or nil
+// when there is no query or it cannot be read (so there is nothing to check
+// against; other validation reports an unreadable query).
 func dcqlCredentialIDs(dcql json.RawMessage) map[string]bool {
 	if len(dcql) == 0 {
 		return nil
@@ -2676,18 +2725,30 @@ func (h *OID4VPHandler) failSignRefused(ctx context.Context, authReq *Authorizat
 	_ = h.Error(StepSubmittingResponse, ErrCodePresentationError, "User declined the request")
 }
 
-// failTransactionData ends the flow: the verifier is told (as for a decline) and the
-// client gets the error code and any verifier redirect.
+// failTransactionData ends the flow for a transaction_data problem. The
+// verifier is told so its session ends now, as for a decline, and the client
+// gets the error code (and any redirect the verifier returned) to explain it to
+// the user in their own language.
+//
+// Only call it once the verifier's trust has been established (see Execute).
 func (h *OID4VPHandler) failTransactionData(ctx context.Context, authReq *AuthorizationRequest, tdErr *transactionDataError) {
 	details := map[string]interface{}{}
-	if redirectURI := h.submitErrorResponse(ctx, authReq, "invalid_transaction_data", transactionDataVerifierDescription); redirectURI != "" {
+	if authReq.ResponseMode == ResponseModeDirectPostJWT {
+		// An error for direct_post.jwt must itself be a JWT (JARM), which
+		// submitErrorResponse does not build: it posts plain form fields that
+		// such a verifier rejects. Sending that would only produce a failed
+		// request, so the verifier is not contacted and its session ends by
+		// timeout, as it does for every other failure in this mode today.
+		h.Logger.Info("not notifying a direct_post.jwt verifier of the transaction_data failure: error responses in this mode are not implemented")
+	} else if redirectURI := h.submitErrorResponse(ctx, authReq, "invalid_transaction_data", transactionDataVerifierDescription); redirectURI != "" {
 		details["redirect_uri"] = redirectURI
 	}
 	_ = h.ErrorWithDetails(StepParsingRequest, tdErr.code, tdErr.code.UserFacingMessage(), details)
 }
 
-// transactionDataVerifierDescription is deliberately generic: it does not reveal
-// which client feature is missing.
+// transactionDataVerifierDescription is deliberately generic: it says the
+// wallet cannot handle this transaction data, not which client feature is
+// missing.
 const transactionDataVerifierDescription = "The wallet cannot process the transaction data in this request"
 
 func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string, authReq *AuthorizationRequest, vpToken string) (string, error) {

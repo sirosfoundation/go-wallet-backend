@@ -118,9 +118,11 @@ const (
 	// was never asked, so reporting this to the wallet as "declined" would be
 	// wrong. The verifier is told neither apart - see submitErrorResponse.
 	ErrCodeNoMatchingCredentials ErrorCode = "NO_MATCHING_CREDENTIALS"
-	// ErrCodeUnsupportedTransactionData is returned when a request carries transaction_data
-	// the client cannot process (it did not declare FeatureTransactionDataV1, or the type
-	// is unsupported). The wallet refuses rather than present without the hashes.
+	// ErrCodeUnsupportedTransactionData is returned when a request carries
+	// OID4VP transaction_data this wallet cannot process: the client did not
+	// declare FeatureTransactionDataV1, or the type is not supported. The
+	// wallet refuses rather than present without the transaction hashes or
+	// without showing the user what they are authorizing.
 	ErrCodeUnsupportedTransactionData ErrorCode = "UNSUPPORTED_TRANSACTION_DATA"
 	// ErrCodeSignRefused is the client's answer to a sign_request it will not
 	// fulfil on purpose: the user declined at the consent step, the wallet
@@ -130,6 +132,10 @@ const (
 	ErrCodeSignRefused     ErrorCode = "SIGN_REFUSED"
 	ErrCodeInternalError   ErrorCode = "INTERNAL_ERROR"
 	ErrCodeTooManyRequests ErrorCode = "TOO_MANY_REQUESTS"
+	// ErrCodePSCConflict: the issuer already holds a different holder
+	// commitment (psc) for this subject. The message is the issuer's own text
+	// and tells the user what to do (operator-approved reset).
+	ErrCodePSCConflict ErrorCode = "PSC_CONFLICT"
 )
 
 // UserFacingMessage returns a generic user-facing message for an error code.
@@ -184,6 +190,8 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "Internal server error"
 	case ErrCodeTooManyRequests:
 		return "Too many requests"
+	case ErrCodePSCConflict:
+		return "The issuer holds a different holder commitment for you"
 	default:
 		return "An error occurred"
 	}
@@ -290,10 +298,15 @@ type FlowStartMessage struct {
 	// client that never sends this behaves exactly as before.
 	AuthorizationDetails []AuthorizationDetail `json:"authorization_details,omitempty"`
 
-	// Features lists the optional protocol features this client implements. A client
-	// that omits a feature is treated as not supporting it and is refused with an
-	// explicit error rather than sent work it cannot do. Unknown entries are ignored.
-	// The only feature today is FeatureTransactionDataV1.
+	// Features lists the optional protocol features this client implements,
+	// declared per flow. The engine only sends a client work it can do
+	// correctly: a client that omits a feature is treated as not supporting it,
+	// so an older frontend or SDK keeps working exactly as before and is
+	// refused (with an explicit error) rather than silently mishandling a
+	// request that needs the feature. Unknown entries are ignored, so a newer
+	// client can declare features an older engine does not know.
+	//
+	// Today's only feature is FeatureTransactionDataV1.
 	Features []string `json:"features,omitempty"`
 
 	// Resumption fields (same-tab redirect flow)
@@ -334,13 +347,17 @@ type FlowStartMessage struct {
 	DPoPKeyID string `json:"dpop_key_id,omitempty"`
 }
 
-// FeatureTransactionDataV1 is declared by a client that processes OID4VP
-// transaction_data end to end: validates it against the type metadata, shows it
-// to the user, and hashes each entry exactly as received (the base64url string).
-// A client that ignores the field would sign without the hashes (EC TS12 payment SCA).
+// FeatureTransactionDataV1 is declared by a client that can process OID4VP
+// `transaction_data` end to end: validate it against the attestation's type
+// metadata, show it to the user, and bind it into the presentation by hashing
+// each entry exactly as received (the base64url string, never a re-encoding of
+// it). A client must not declare it until all of that is implemented, because
+// a client that ignores the field signs a presentation without the hashes and
+// without the user ever seeing the transaction (EC TS12 payment SCA).
 const FeatureTransactionDataV1 = "transaction_data.v1"
 
-// Supports reports whether the client declared feature; false on a nil message.
+// Supports reports whether the client declared feature. It is safe on a nil
+// message, which means "declared nothing".
 func (m *FlowStartMessage) Supports(feature string) bool {
 	if m == nil {
 		return false
@@ -549,13 +566,17 @@ type SignRequestParams struct {
 	// VerifiedRequest is the same VerifiedRequestInputs credential_selection
 	// carried (sign_presentation only).
 	VerifiedRequest *VerifiedRequestInputs `json:"verified_request,omitempty"`
-	// TransactionData carries the verifier's OID4VP transaction_data (EC TS12), one
-	// entry per request element, in order. Sent only to a client that declared
-	// FeatureTransactionDataV1. The client hashes each entry's Raw string into the
-	// KB-JWT's transaction_data_hashes and shows the user Raw, not the decoded members.
+	// TransactionData carries the verifier's OID4VP transaction_data (EC TS12
+	// payment SCA), one entry per element of the request's array and in its
+	// order. Sent only to a client that declared FeatureTransactionDataV1.
+	// The client binds the presentation to it by hashing each entry's Raw
+	// string (never the decoded members) into the KB-JWT's
+	// transaction_data_hashes, and takes what it shows the user from Raw too,
+	// treating the decoded members as an aid.
 	TransactionData []TransactionData `json:"transaction_data,omitempty"`
-	// ResponseMode is the request's response_mode, set only with TransactionData
-	// (EC TS12 requires it in the KB-JWT).
+	// ResponseMode is the verifier request's response_mode. Set only together
+	// with TransactionData: EC TS12 requires it in the key binding JWT of an
+	// SCA presentation.
 	ResponseMode string `json:"response_mode,omitempty"`
 	// ReissuanceKid, when set (a renewal request - credential re-issuance/
 	// renewal plan, Phase 1 Slice 2), asks the client to sign this
@@ -566,6 +587,16 @@ type SignRequestParams struct {
 	// sirosfoundation/wallet-frontend#70's Tier 2 "same-key re-signing" design
 	// (signWithExistingKeypair(kid, payload)). Empty for ordinary issuance.
 	ReissuanceKid string `json:"reissuance_kid,omitempty"`
+
+	// HolderCommitments, CredentialType and CredentialIssuer (generate_proof
+	// only; set when the issuer metadata advertises org.siros.holder_commitments
+	// with "psc"): the wallet MUST derive the commitment for (CredentialType,
+	// CredentialIssuer) and add the claim org.siros.psc =
+	// base64url(32 bytes) to every proof JWT payload before signing. The engine
+	// verifies the claim on the returned proofs and never computes or logs it.
+	HolderCommitments []string `json:"holder_commitments,omitempty"`
+	CredentialType    string   `json:"credential_type,omitempty"`
+	CredentialIssuer  string   `json:"credential_issuer,omitempty"`
 
 	// SignActionSignClientAuth parameters. HTM and HTU, when set, ask for a
 	// DPoP proof over that HTTP method and URL; DPoPNonce is the

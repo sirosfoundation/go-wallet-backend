@@ -415,6 +415,56 @@ Client → Server:
 }
 ```
 
+#### Holder commitments (`org.siros.psc`)
+
+A credential configuration can ask the wallet to give the issuer a commitment
+derived from a per-issuer secret the engine never sees (SIROS extension,
+tracked in https://github.com/SUNET/vc/issues/823). The issuer advertises names
+only, never values:
+
+```
+credential_configurations_supported[cfg].credential_metadata["org.siros.holder_commitments"]
+  = {"commitments": ["psc"]}
+```
+
+The member must be an object with exactly one member, `commitments`: 1 to 4
+distinct names of 1 to 32 characters (`[a-z][a-z0-9_]*`), none of them a
+hex-looking string (16 or more hex characters). Anything else makes the
+configuration not offered: the engine drops it when decoding issuer metadata
+and the resolve endpoint removes it from the metadata it serves (dropping
+`signed_metadata`, as for `org.siros.secret_seed`). Unknown but well-formed
+names are ignored. Without the advertisement, behaviour is unchanged.
+
+When the selected configuration advertises `psc`, the `generate_proof`
+`sign_request` carries three more params (`credential_type` is the
+configuration's `vct`, or its `doctype` for mdoc; `credential_issuer` is the
+exact `credential_issuer` string of the issuer metadata):
+
+```
+"params": {
+  "audience": "https://issuer.example.com", "nonce": "...",
+  "holder_commitments": ["psc"],
+  "credential_type": "urn:eudi:pid:1",
+  "credential_issuer": "https://issuer.example.com"
+}
+```
+
+The wallet derives `private_seed` for (`credential_type`, `credential_issuer`)
+and adds the claim `org.siros.psc` = base64url, WITHOUT padding (RFC 7515 s2), of
+the 32-byte `SHA-256(private_seed)` to the payload of every proof JWT before
+signing. The engine does not compute the value. On each returned proof it
+verifies that the proof is a JWT whose payload holds `org.siros.psc` as an
+unpadded base64url string of exactly 32 bytes; otherwise the issuance fails with
+`SIGN_ERROR` and nothing is sent to the issuer. The value is never logged or
+placed in an error.
+
+If the issuer's credential endpoint answers HTTP 400 with an `error_description`
+beginning `org.siros.psc_conflict:` (it already holds a different commitment for
+the subject; nothing was issued), the engine sends a `flow_error` with code
+`PSC_CONFLICT`, step `requesting_credential`, and `error.message` set to the
+issuer's text (control characters removed, at most 512 bytes), and does not
+retry. The flow-error path is shared by every transport (WebSocket and WMP).
+
 #### Client Authentication (Signing)
 
 Two further `sign_request` actions let the client authenticate the engine's
@@ -664,6 +714,43 @@ Server → Client:
   }
 }
 ```
+
+#### Unknown Flows
+
+Any client message that references a `flow_id` the session does not know -
+`flow_action` (including `decline`), and `sign_response` / `match_response`
+that carry a `flow_id` and do not answer a request the session still has
+outstanding - is answered with exactly one `flow_error`, never
+silently dropped:
+
+```
+Server → Client:
+{
+  "type": "flow_error",
+  "flow_id": "<the flow_id the client sent>",
+  "error": { "code": "UNKNOWN_FLOW", "message": "Flow not found or already completed" }
+}
+```
+
+Clients MUST treat this as "the flow is dead" and leave any waiting UI state.
+Typical cause: the WebSocket dropped (e.g. network or proxy stall) while a
+flow was waiting for user input. Flows are bound to the session that started
+them and are cancelled when that session closes; they are not resumed on a
+new session, and the engine does not push anything on reconnect. The first
+message the client sends for such a flow on the new session is what reveals
+it, via this error.
+
+Properties: the lookup is scoped to the current session, so a flow owned by
+another session or user produces the identical reply as a flow that never
+existed (no probing). Replies are rate-limited per session (burst 10, then
+about 2/s); beyond that, messages for unknown flows are dropped without a
+reply. A `sign_response` answering an outstanding `sign_request` is always delivered,
+even if the requesting flow has completed (client-held DPoP signing after
+issuance relies on this). A `sign_response` without a `flow_id` is correlated
+by `message_id` only. A `match_response` MUST carry both the `flow_id` and the
+`message_id` of its `match_request`; without them it is ignored and the engine
+times the request out. `credential_notification` keeps its own
+`notification_ack` (`rejected`) semantics.
 
 ### OpenID4VP Credential Presentation
 
@@ -1098,7 +1185,7 @@ Server → Client:
 | `AUTH_FAILED` | Invalid or expired authentication token |
 | `FORBIDDEN` | Token's `tac` doesn't permit the requested action (e.g. `flow_start` for a protocol the token's `tac` doesn't cover) |
 | `INVALID_MESSAGE` | Malformed message |
-| `UNKNOWN_FLOW` | `flow_id` not recognized |
+| `UNKNOWN_FLOW` | `flow_id` not recognized on this session (see [Unknown Flows](#unknown-flows)) |
 | `FLOW_TIMEOUT` | Flow exceeded maximum duration |
 | `OFFER_PARSE_ERROR` | Could not parse credential offer |
 | `OFFER_FETCH_ERROR` | Could not fetch `credential_offer_uri` |
@@ -1108,6 +1195,7 @@ Server → Client:
 | `AUTHORIZATION_FAILED` | OAuth authorization flow failed |
 | `TOKEN_ERROR` | Token endpoint returned error |
 | `CREDENTIAL_ERROR` | Credential endpoint returned error |
+| `PSC_CONFLICT` | Issuer already holds a different holder commitment (`org.siros.psc`) for this subject; message is the issuer's text |
 | `SIGN_TIMEOUT` | Client did not respond to sign request |
 | `SIGN_ERROR` | Client signature was invalid |
 | `PRESENTATION_ERROR` | VP creation or submission failed |

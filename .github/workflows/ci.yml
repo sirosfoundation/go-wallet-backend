@@ -125,9 +125,6 @@ jobs:
         run: go vet ./...
 
       - name: Vet with pkcs11 tag
-        # Non-blocking until PR #429 (fixes untagged stub tests in
-        # pkg/signing) merges; then remove continue-on-error.
-        continue-on-error: true
         env:
           CGO_ENABLED: "1"
         run: go vet -tags pkcs11 ./...

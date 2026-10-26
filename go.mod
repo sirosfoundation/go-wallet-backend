@@ -6,7 +6,7 @@ require (
 	github.com/alicebob/miniredis/v2 v2.39.0
 	github.com/descope/virtualwebauthn v1.0.3
 	github.com/fxamacker/cbor/v2 v2.9.6
-	github.com/getkin/kin-openapi v0.151.0
+	github.com/getkin/kin-openapi v0.152.0
 	github.com/gin-contrib/cors v1.7.9
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-jose/go-jose/v4 v4.1.6
@@ -22,7 +22,7 @@ require (
 	github.com/sirosfoundation/go-siros-set v0.1.0
 	github.com/sirosfoundation/go-spocp v0.1.0
 	github.com/sirosfoundation/go-tokenauth v0.5.0
-	github.com/sirosfoundation/go-trust v0.25.0
+	github.com/sirosfoundation/go-trust v0.26.0
 	github.com/sirosfoundation/go-ts11client v0.0.0-20260820233304-8809951d6f67
 	github.com/sirosfoundation/go-wmp v0.9.1
 	github.com/spf13/cobra v1.10.2

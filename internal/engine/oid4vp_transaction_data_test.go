@@ -2,6 +2,9 @@ package engine
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/base64"
@@ -19,7 +22,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
+
+// payDCQL is a DCQL query with the credential "pay" that the test entries are bound to.
+var payDCQL = json.RawMessage(`{"credentials":[{"id":"pay","format":"dc+sd-jwt","meta":{"vct_values":["x"]}}]}`)
 
 // tdClient is a client that declared FeatureTransactionDataV1.
 var tdClient = &FlowStartMessage{Features: []string{FeatureTransactionDataV1}}
@@ -33,8 +42,10 @@ type tdVector struct {
 	Hashes       map[string]string `json:"hashes"`
 }
 
-// loadTDVectors reads the shared golden vectors. Their hashes were computed with
-// Python's hashlib, so agreement with Go is between independent implementations.
+// loadTDVectors reads the shared golden vectors. The hashes in the file were
+// computed with Python's hashlib over the ASCII bytes of `raw`, so agreement
+// with Go's crypto here is agreement between two independent implementations,
+// not a function checking itself.
 func loadTDVectors(t *testing.T) []tdVector {
 	t.Helper()
 	b, err := os.ReadFile("testdata/ts12/transaction_data_vectors.json")
@@ -76,7 +87,8 @@ func rawArray(t *testing.T, entries ...string) json.RawMessage {
 
 // --- Golden vectors ---
 
-// The vector file must be consistent: raw decodes to json and every hash matches Go's over raw.
+// The vector file itself must be internally consistent: raw decodes to json,
+// and every hash is what Go computes over raw as received.
 func TestTransactionDataVectors_Consistent(t *testing.T) {
 	for _, v := range loadTDVectors(t) {
 		t.Run(v.Name, func(t *testing.T) {
@@ -90,8 +102,9 @@ func TestTransactionDataVectors_Consistent(t *testing.T) {
 	}
 }
 
-// decodeTransactionData must return each entry exactly as sent, which a
-// decode-then-re-encode design cannot.
+// decodeTransactionData must hand back each entry exactly as the verifier sent
+// it. This is what a presentation has to hash, and it is the property a
+// decode-then-re-encode design cannot have.
 func TestDecodeTransactionData_PreservesRawStringExactly(t *testing.T) {
 	for _, v := range loadTDVectors(t) {
 		t.Run(v.Name, func(t *testing.T) {
@@ -104,9 +117,11 @@ func TestDecodeTransactionData_PreservesRawStringExactly(t *testing.T) {
 	}
 }
 
-// Re-serializing the decoded object does not reproduce the hash for any
-// non-canonical entry, which is why raw is carried. sorted_compact is the control:
-// the one shape a re-serializer reproduces, so the comparison can pass.
+// Documents why the raw string is carried and not re-derived: re-serializing
+// the decoded object (the only thing a client gets today) does not reproduce
+// the hash for any non-canonical entry. sorted_compact is the control: the one
+// shape a re-serializer happens to reproduce, which shows the comparison can
+// pass and is not vacuously failing.
 func TestTransactionDataReserializationDoesNotReproduceHash(t *testing.T) {
 	for _, v := range loadTDVectors(t) {
 		t.Run(v.Name, func(t *testing.T) {
@@ -135,12 +150,14 @@ func TestHashAlgList_Unmarshal(t *testing.T) {
 	}{
 		"array (OID4VP 1.0 request form)": {`["sha-256","sha-384"]`, HashAlgList{"sha-256", "sha-384"}, false},
 		"bare string tolerated":           {`"sha-384"`, HashAlgList{"sha-384"}, false},
-		"empty array rejected":            {`[]`, nil, true},
-		"null rejected":                   {`null`, nil, true},
-		"empty string rejected":           {`""`, nil, true},
-		"empty name in array rejected":    {`["sha-256",""]`, nil, true},
-		"number rejected":                 {`5`, nil, true},
-		"array of numbers rejected":       {`[1,2]`, nil, true},
+		// OID4VP: a non-empty array of algorithm identifiers. An empty list
+		// leaves the wallet nothing valid to choose, so it is invalid, not "absent".
+		"empty array rejected":         {`[]`, nil, true},
+		"null rejected":                {`null`, nil, true},
+		"empty string rejected":        {`""`, nil, true},
+		"empty name in array rejected": {`["sha-256",""]`, nil, true},
+		"number rejected":              {`5`, nil, true},
+		"array of numbers rejected":    {`[1,2]`, nil, true},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -156,7 +173,8 @@ func TestHashAlgList_Unmarshal(t *testing.T) {
 	}
 }
 
-// A spec-conformant verifier sends the array; it must unmarshal.
+// A verifier following the specification sends the array. Before the fix this
+// failed to unmarshal and the whole request was rejected as invalid JSON.
 func TestDecodeTransactionData_AcceptsHashAlgArrayAndString(t *testing.T) {
 	byName := map[string]tdVector{}
 	for _, v := range loadTDVectors(t) {
@@ -214,7 +232,8 @@ func TestValidateTransactionData_AcceptsDeclaringClient(t *testing.T) {
 	require.Len(t, authReq.TransactionData, 1)
 }
 
-// Requests WITHOUT transaction_data must behave the same for every client.
+// Behaviour for requests WITHOUT transaction_data must be untouched for every
+// client, declaring or not: this is the backward-compatibility guarantee.
 func TestValidateTransactionData_NoTransactionDataIsUnaffectedByDeclaration(t *testing.T) {
 	for name, msg := range map[string]*FlowStartMessage{"nil": nil, "none": {}, "declared": tdClient} {
 		t.Run(name, func(t *testing.T) {
@@ -231,9 +250,6 @@ func TestValidateTransactionData_StructuralErrorsKeepGenericCode(t *testing.T) {
 }
 
 // --- Step 1: structural validation, raw and payload carried to the client ---
-
-// payDCQL names the credential ids the transaction_data fixtures reference.
-var payDCQL = json.RawMessage(`{"credentials":[{"id":"pay"},{"id":"age"}]}`)
 
 func entry(t *testing.T, jsonText string) string {
 	t.Helper()
@@ -255,7 +271,8 @@ func TestValidateTransactionData_AcceptsTS12TypesForDeclaringClient(t *testing.T
 	}
 }
 
-// A verifier can put a `raw` member in its JSON; Raw must still be the received string.
+// A verifier controls the JSON it encodes, so it can put a `raw` member in it.
+// Raw must still be the string that was received, not whatever the JSON says.
 func TestDecodeTransactionData_RawMemberInVerifierJSONIsIgnored(t *testing.T) {
 	enc := entry(t, `{"type":"x","credential_ids":["c"],"raw":"AAAA-attacker-chosen"}`)
 	entries, err := decodeTransactionData(rawArray(t, enc))
@@ -282,20 +299,19 @@ func TestValidateTransactionData_StructuralChecks(t *testing.T) {
 		dcql  json.RawMessage
 		want  string
 	}{
-		"missing type":                                    {`{"credential_ids":["pay"]}`, dcql, "missing type"},
-		"no credential_ids":                               {`{"type":"x"}`, dcql, "credential_ids must be a non-empty array"},
-		"empty credential_ids":                            {`{"type":"x","credential_ids":[]}`, dcql, "credential_ids must be a non-empty array"},
-		"id not in dcql":                                  {`{"type":"x","credential_ids":["nope"]}`, dcql, `"nope"`},
-		"one of several unknown":                          {`{"type":"x","credential_ids":["pay","nope"]}`, dcql, `"nope"`},
-		"no dcql: fail closed":                            {`{"type":"x","credential_ids":["anything"]}`, nil, "requires a dcql_query"},
-		"dcql without credentials":                        {`{"type":"x","credential_ids":["anything"]}`, json.RawMessage(`{"credentials":[]}`), "requires a dcql_query"},
-		"unreadable dcql":                                 {`{"type":"x","credential_ids":["anything"]}`, json.RawMessage(`"nope"`), "requires a dcql_query"},
-		"id in dcql":                                      {`{"type":"x","credential_ids":["age"]}`, dcql, ""},
-		"dcql credential without id: refused":             {`{"type":"x","credential_ids":[""]}`, json.RawMessage(`{"credentials":[{}]}`), "requires a dcql_query"},
-		"dcql credential with null id: refused":           {`{"type":"x","credential_ids":[""]}`, json.RawMessage(`{"credentials":[{"id":null}]}`), "requires a dcql_query"},
-		"dcql credential with empty id: refused":          {`{"type":"x","credential_ids":[""]}`, json.RawMessage(`{"credentials":[{"id":""}]}`), "requires a dcql_query"},
-		"empty id beside a valid one: empty not nameable": {`{"type":"x","credential_ids":[""]}`, json.RawMessage(`{"credentials":[{"id":"pay"},{"id":""}]}`), `references ""`},
-		"valid id beside an empty one: still accepted":    {`{"type":"x","credential_ids":["pay"]}`, json.RawMessage(`{"credentials":[{"id":""},{"id":"pay"}]}`), ""},
+		"missing type":           {`{"credential_ids":["pay"]}`, dcql, "missing type"},
+		"no credential_ids":      {`{"type":"x"}`, dcql, "credential_ids must be a non-empty array"},
+		"empty credential_ids":   {`{"type":"x","credential_ids":[]}`, dcql, "credential_ids must be a non-empty array"},
+		"id not in dcql":         {`{"type":"x","credential_ids":["nope"]}`, dcql, `"nope"`},
+		"one of several unknown": {`{"type":"x","credential_ids":["pay","nope"]}`, dcql, `"nope"`},
+		"no dcql: refused, nothing for credential_ids to name": {`{"type":"x","credential_ids":["anything"]}`, nil, "no dcql_query"},
+		"unreadable dcql: refused":                             {`{"type":"x","credential_ids":["anything"]}`, json.RawMessage(`{"credentials":[]}`), "no dcql_query"},
+		"id in dcql":                                           {`{"type":"x","credential_ids":["age"]}`, dcql, ""},
+		"dcql credential without id: refused":                  {`{"type":"x","credential_ids":[""]}`, json.RawMessage(`{"credentials":[{}]}`), "no dcql_query"},
+		"dcql credential with null id: refused":                {`{"type":"x","credential_ids":[""]}`, json.RawMessage(`{"credentials":[{"id":null}]}`), "no dcql_query"},
+		"dcql credential with empty id: refused":               {`{"type":"x","credential_ids":[""]}`, json.RawMessage(`{"credentials":[{"id":""}]}`), "no dcql_query"},
+		"empty id beside a valid one: empty not nameable":      {`{"type":"x","credential_ids":[""]}`, json.RawMessage(`{"credentials":[{"id":"pay"},{"id":""}]}`), `references ""`},
+		"valid id beside an empty one: still accepted":         {`{"type":"x","credential_ids":["pay"]}`, json.RawMessage(`{"credentials":[{"id":""},{"id":"pay"}]}`), ""},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -314,7 +330,8 @@ func TestValidateTransactionData_StructuralChecks(t *testing.T) {
 	}
 }
 
-// A client that did not declare the feature is refused before any structural check.
+// A client that did not declare the feature is refused before any structural
+// check, so the answer for it is always "update the wallet".
 func TestValidateTransactionData_GateComesBeforeStructuralChecks(t *testing.T) {
 	authReq := &AuthorizationRequest{TransactionDataRaw: rawArray(t, entry(t, `{"credential_ids":[]}`))}
 	err := validateTransactionData(authReq, nil)
@@ -323,8 +340,9 @@ func TestValidateTransactionData_GateComesBeforeStructuralChecks(t *testing.T) {
 	assert.Equal(t, ErrCodeUnsupportedTransactionData, tdErr.code)
 }
 
-// The sign_request must carry raw, payload and response_mode; a presentation
-// without transaction data is unchanged.
+// What a client receives. The sign_request must carry raw and payload for each
+// entry and the response_mode, and a presentation without transaction data
+// must be byte-for-byte what it was before.
 func TestSignRequestParams_WireCarriesRawPayloadAndResponseMode(t *testing.T) {
 	v := loadTDVectors(t)[2] // pretty_printed
 	authReq := &AuthorizationRequest{TransactionDataRaw: rawArray(t, v.Raw), DCQLQuery: payDCQL}
@@ -350,7 +368,8 @@ func TestSignRequestParams_WireCarriesRawPayloadAndResponseMode(t *testing.T) {
 	assert.Equal(t, "urn:eudi:sca:payment:1", wire.TransactionData[0].Type)
 	assert.JSONEq(t, `{"transaction_id":"tx-0001","payee":{"name":"Shop AB","id":"SE1234567890"},"amount":"49.99","currency":"EUR","execution_date":"2026-10-06"}`, string(wire.TransactionData[0].Payload))
 
-	// The raw string the client receives matches the independent vector.
+	// The raw string the client receives is still the hash input: it matches
+	// the independent vector, even though the object was decoded in between.
 	assert.Equal(t, v.Hashes["sha-256"], hashOf(t, "sha-256", wire.TransactionData[0].Raw))
 }
 
@@ -365,7 +384,8 @@ func TestFlowStartMessage_Supports(t *testing.T) {
 	assert.False(t, nilMsg.Supports(FeatureTransactionDataV1))
 	assert.False(t, (&FlowStartMessage{}).Supports(FeatureTransactionDataV1))
 	assert.True(t, tdClient.Supports(FeatureTransactionDataV1))
-	// An unknown declared feature is ignored, so newer clients work.
+	// An unknown declared feature is ignored rather than rejected, so a newer
+	// client can talk to this engine.
 	assert.True(t, (&FlowStartMessage{Features: []string{"future_thing", FeatureTransactionDataV1}}).Supports(FeatureTransactionDataV1))
 }
 
@@ -375,7 +395,7 @@ func TestFlowStartMessage_FeaturesWireName(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(`{"type":"flow_start","protocol":"oid4vp","features":["transaction_data.v1"]}`), &m))
 	assert.True(t, m.Supports(FeatureTransactionDataV1))
 
-	// Clients sending no `features` still decode and support nothing.
+	// Existing clients send no `features`: still decodes, supports nothing.
 	var old FlowStartMessage
 	require.NoError(t, json.Unmarshal([]byte(`{"type":"flow_start","protocol":"oid4vp"}`), &old))
 	assert.False(t, old.Supports(FeatureTransactionDataV1))
@@ -383,8 +403,9 @@ func TestFlowStartMessage_FeaturesWireName(t *testing.T) {
 
 // --- Verifier is told ---
 
-// Both ends hear of the refusal: the verifier gets invalid_transaction_data and the
-// client the distinct error code.
+// The gate is only useful if both ends hear about it: the verifier gets
+// invalid_transaction_data so its session ends now, and the client gets the
+// distinct error code so it can tell the user to update.
 func TestFailTransactionData_NotifiesVerifierAndClient(t *testing.T) {
 	var form url.Values
 	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -469,6 +490,12 @@ func TestParseRequestFromURL_NoTransactionDataStaysEmpty(t *testing.T) {
 	assert.Empty(t, authReq.TransactionDataRaw)
 }
 
+func TestParseRequestFromURL_InvalidTransactionDataJSON(t *testing.T) {
+	_, err := (&OID4VPHandler{}).parseRequestFromURL(inlineURL(t, map[string]string{"transaction_data": "{not json"}))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid transaction_data")
+}
+
 func TestParseRequestFromURL_EmptyTransactionDataParameterIsRejected(t *testing.T) {
 	_, err := (&OID4VPHandler{}).parseRequestFromURL(inlineURL(t, map[string]string{"client_id": "x", "transaction_data": ""}))
 	require.Error(t, err)
@@ -482,25 +509,29 @@ func TestValidateTransactionData_EmptyArrayIsRejected(t *testing.T) {
 	assert.Equal(t, ErrCodeInvalidMessage, tdErr.code)
 }
 
-func TestParseRequestFromURL_InvalidTransactionDataJSON(t *testing.T) {
-	_, err := (&OID4VPHandler{}).parseRequestFromURL(inlineURL(t, map[string]string{"transaction_data": "{not json"}))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid transaction_data")
+// --- Execute: the verifier is contacted only after its trust is established ---
+
+// executeRecorder runs Execute for a request and records what the verifier's
+// response_uri received and which flow errors the client saw.
+type executeRecorder struct {
+	verifierHits chan url.Values
+	clientErrors chan FlowErrorMessage
+	verifierURL  string
+	handler      *OID4VPHandler
 }
 
-// End to end through Execute: inline-URL transaction_data to a client without
-// support is refused, the verifier told, and the client given the distinct error
-// (parse -> validate -> typed error -> failTransactionData).
-func TestExecute_InlineTransactionData_RefusedForClientThatDidNotDeclare(t *testing.T) {
-	var form url.Values
-	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		require.NoError(t, r.ParseForm())
-		form = r.PostForm
+func newExecuteRecorder(t *testing.T, cfg *config.Config, trustSvc *TrustService) *executeRecorder {
+	t.Helper()
+	r := &executeRecorder{verifierHits: make(chan url.Values, 4), clientErrors: make(chan FlowErrorMessage, 8)}
+
+	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		_ = req.ParseForm()
+		r.verifierHits <- req.PostForm
 		w.WriteHeader(http.StatusOK)
 	}))
-	defer verifier.Close()
+	t.Cleanup(verifier.Close)
+	r.verifierURL = verifier.URL
 
-	errs := make(chan FlowErrorMessage, 4)
 	conn, cleanup := wsTestServer(t, func(srv *websocket.Conn) {
 		defer srv.Close()
 		for {
@@ -510,59 +541,176 @@ func TestExecute_InlineTransactionData_RefusedForClientThatDidNotDeclare(t *test
 			}
 			var m FlowErrorMessage
 			if json.Unmarshal(data, &m) == nil && m.Type == TypeFlowError {
-				errs <- m
+				r.clientErrors <- m
 			}
 		}
 	})
-	defer cleanup()
+	t.Cleanup(cleanup)
 
-	h := &OID4VPHandler{}
-	h.BaseHandler = BaseHandler{Logger: zap.NewNop(), Flow: &Flow{ID: "flow-1", Session: testSession(conn)}}
-	h.httpClient = verifier.Client()
+	r.handler = &OID4VPHandler{}
+	r.handler.BaseHandler = BaseHandler{
+		Logger: zap.NewNop(), Config: cfg, TrustSvc: trustSvc,
+		Flow: &Flow{ID: "flow-1", Session: testSession(conn), Data: map[string]interface{}{}},
+	}
+	r.handler.httpClient = verifier.Client()
+	return r
+}
+
+// run calls Execute; a panic means Execute carried on past where the test
+// expects it to stop, which is reported as a plain failure.
+func (r *executeRecorder) run(t *testing.T, msg *FlowStartMessage) (err error) {
+	t.Helper()
+	defer func() {
+		if rec := recover(); rec != nil {
+			t.Fatalf("Execute continued past where this test expects it to stop: %v", rec)
+		}
+	}()
+	return r.handler.Execute(context.Background(), msg)
+}
+
+func (r *executeRecorder) clientError(t *testing.T) FlowErrorMessage {
+	t.Helper()
+	select {
+	case m := <-r.clientErrors:
+		return m
+	case <-time.After(2 * time.Second):
+		t.Fatal("client never received a flow_error")
+		return FlowErrorMessage{}
+	}
+}
+
+func (r *executeRecorder) verifierWasContacted() bool {
+	select {
+	case <-r.verifierHits:
+		return true
+	case <-time.After(300 * time.Millisecond):
+		return false
+	}
+}
+
+// Security: refusing transaction_data means telling the verifier, which means
+// POSTing to the response_uri the REQUEST supplied. Until the verifier's trust
+// is established that is an attacker-chosen URL, so an unauthenticated request
+// must not be able to aim the backend at it just by carrying transaction_data.
+// An unsigned decentralized_identifier request passes request validation and is
+// then refused by trust evaluation: the verifier must never be contacted, and
+// the client must hear "untrusted verifier", not the transaction_data error.
+func TestExecute_TransactionDataFromUntrustedVerifier_VerifierIsNotContacted(t *testing.T) {
+	r := newExecuteRecorder(t, testConfig(), nil)
 
 	q := url.Values{}
-	q.Set("client_id", "https://verifier.example.com")
-	q.Set("client_id_scheme", ClientIDSchemeRedirectURI)
+	q.Set("client_id", ClientIDSchemeDecentralizedIdentifier+":did:web:verifier.example")
+	q.Set("client_id_scheme", ClientIDSchemeDecentralizedIdentifier)
 	q.Set("response_type", "vp_token")
 	q.Set("response_mode", ResponseModeDirectPost)
-	q.Set("response_uri", verifier.URL)
+	q.Set("response_uri", r.verifierURL)
 	q.Set("nonce", "n-1")
 	q.Set("state", "st-1")
 	q.Set("dcql_query", `{"credentials":[{"id":"pay","format":"dc+sd-jwt","meta":{"vct_values":["x"]}}]}`)
 	q.Set("transaction_data", string(owfRaw(t)))
 
-	// A client without Features in its flow_start. Execute continuing past validation
-	// would panic with this minimal handler, reported as a test failure.
-	var err error
-	func() {
-		defer func() {
-			if r := recover(); r != nil {
-				t.Fatalf("Execute continued past request validation (transaction_data was not refused): %v", r)
-			}
-		}()
-		err = h.Execute(context.Background(), &FlowStartMessage{
-			Protocol:   ProtocolOID4VP,
-			RequestURI: "openid4vp://?" + q.Encode(),
-		})
-	}()
+	// A client from before the feature: no Features in its flow_start.
+	err := r.run(t, &FlowStartMessage{Protocol: ProtocolOID4VP, RequestURI: "openid4vp://?" + q.Encode()})
+	require.Error(t, err)
+
+	assert.False(t, r.verifierWasContacted(), "the verifier must not be contacted before its trust is established")
+	assert.Equal(t, ErrCodeUntrustedVerifier, r.clientError(t).Error.Code)
+}
+
+// The other half: once the verifier IS trusted, a transaction_data request from
+// a client that did not declare support is refused, the verifier is told, and
+// the client gets the distinct error and the verifier's redirect.
+func TestExecute_TransactionDataFromTrustedVerifier_RefusedAndVerifierTold(t *testing.T) {
+	const (
+		did      = "did:web:verifier.example"
+		clientID = ClientIDSchemeDecentralizedIdentifier + ":" + did
+		kid      = did + "#jwk-1"
+	)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	stub := &stubDIDResolver{
+		didDoc: map[string]interface{}{
+			"id": did,
+			"verificationMethod": []interface{}{map[string]interface{}{
+				"id": kid, "type": "JsonWebKey2020", "controller": did, "publicKeyJwk": ecPublicJWK(&key.PublicKey, kid),
+			}},
+		},
+		decisionOk: true, decision: true,
+	}
+	cfg := testConfig()
+	cfg.Trust.PDPURL = "http://pdp.test"
+	trustSvc := trust.NewService(cfg, zap.NewNop(), func(_ string, _ time.Duration) (trust.TrustEvaluator, error) { return stub, nil })
+	r := newExecuteRecorder(t, cfg, trustSvc)
+
+	payload, err := json.Marshal(map[string]any{
+		"client_id": clientID, "response_type": "vp_token", "response_mode": ResponseModeDirectPost,
+		"response_uri": r.verifierURL, "nonce": "n-1", "state": "st-1",
+		"dcql_query":       json.RawMessage(`{"credentials":[{"id":"pay","format":"dc+sd-jwt","meta":{"vct_values":["x"]}}]}`),
+		"transaction_data": []string{string(owfRawEntry(t))},
+	})
+	require.NoError(t, err)
+	jwt := signedKidJWT(t, key, kid, payload)
+
+	q := url.Values{}
+	q.Set("client_id", clientID)
+	q.Set("request", jwt)
+	err = r.run(t, &FlowStartMessage{Protocol: ProtocolOID4VP, RequestURI: "openid4vp://?" + q.Encode()})
 
 	var tdErr *transactionDataError
 	require.True(t, errors.As(err, &tdErr), "Execute returned %v", err)
 	assert.Equal(t, ErrCodeUnsupportedTransactionData, tdErr.code)
 
-	assert.Equal(t, "invalid_transaction_data", form.Get("error"), "verifier must be told")
-	assert.Equal(t, "st-1", form.Get("state"))
-
 	select {
-	case m := <-errs:
-		assert.Equal(t, ErrCodeUnsupportedTransactionData, m.Error.Code, "client must get the distinct code, not the generic one")
+	case form := <-r.verifierHits:
+		assert.Equal(t, "invalid_transaction_data", form.Get("error"))
+		assert.Equal(t, "st-1", form.Get("state"))
 	case <-time.After(2 * time.Second):
-		t.Fatal("client never received a flow_error")
+		t.Fatal("a trusted verifier was not told")
 	}
+	assert.Equal(t, ErrCodeUnsupportedTransactionData, r.clientError(t).Error.Code)
 }
 
-// requestVPSignature assembles the sign_request: the client gets raw, payload and
-// response_mode, and a presentation without transaction data sends neither.
+// owfRawEntry is the single base64url entry owfRaw wraps in an array.
+func owfRawEntry(t *testing.T) []byte {
+	t.Helper()
+	var arr []string
+	require.NoError(t, json.Unmarshal(owfRaw(t), &arr))
+	return []byte(arr[0])
+}
+
+// signedKidJWT signs payload with an ES256 key identified by kid, the way
+// buildKidSignedJWT does but with a caller-supplied payload.
+func signedKidJWT(t *testing.T, key *ecdsa.PrivateKey, kid string, payload []byte) string {
+	t.Helper()
+	enc := base64.RawURLEncoding.EncodeToString
+	signingInput := enc([]byte(`{"alg":"ES256","kid":"`+kid+`"}`)) + "." + enc(payload)
+	sum := sha256.Sum256([]byte(signingInput))
+	rr, ss, err := ecdsa.Sign(rand.Reader, key, sum[:])
+	require.NoError(t, err)
+	n := (key.Curve.Params().BitSize + 7) / 8
+	sig := make([]byte, 2*n)
+	rr.FillBytes(sig[:n])
+	ss.FillBytes(sig[n:])
+	return signingInput + "." + enc(sig)
+}
+
+// direct_post.jwt needs an error response that is itself a JWT, which this does
+// not build. Posting plain form fields would only be rejected by such a
+// verifier, so it is not contacted.
+func TestFailTransactionData_DirectPostJWTVerifierIsNotSentAForm(t *testing.T) {
+	r := newExecuteRecorder(t, testConfig(), nil)
+	authReq := &AuthorizationRequest{ResponseMode: ResponseModeDirectPostJWT, ResponseURI: r.verifierURL, State: "st-1"}
+	tdErr := newTransactionDataError(ErrCodeUnsupportedTransactionData, "x").(*transactionDataError)
+
+	r.handler.failTransactionData(context.Background(), authReq, tdErr)
+
+	assert.False(t, r.verifierWasContacted(), "no form POST to a direct_post.jwt verifier")
+	assert.Equal(t, ErrCodeUnsupportedTransactionData, r.clientError(t).Error.Code, "the client is still told")
+}
+
+// requestVPSignature is where the sign_request is assembled, so this is the
+// check that the client really receives raw, payload and response_mode, and
+// that a presentation with no transaction data sends neither.
 func signRequestFor(t *testing.T, authReq *AuthorizationRequest) SignRequestMessage {
 	t.Helper()
 	got := make(chan SignRequestMessage, 1)
@@ -624,23 +772,72 @@ func TestRequestVPSignature_OmitsBothForAPresentationWithoutTransactionData(t *t
 	assert.Empty(t, m.Params.TransactionData)
 }
 
-// An omitted response_mode defaults to direct_post, and the KB-JWT must carry it.
-func TestRequestVPSignature_OmittedResponseModeIsSignedAsDirectPost(t *testing.T) {
-	v := loadTDVectors(t)[1]
-	authReq := &AuthorizationRequest{
-		Nonce: "n", ClientID: "verifier.example.com", // no ResponseMode
-		TransactionDataRaw: rawArray(t, v.Raw), DCQLQuery: payDCQL,
-	}
-	require.NoError(t, validateTransactionData(authReq, tdClient))
-
-	m := signRequestFor(t, authReq)
-	assert.Equal(t, ResponseModeDirectPost, m.Params.ResponseMode)
-}
+// --- response_mode: the sign request carries the mode the engine really uses ---
 
 func TestEffectiveResponseMode(t *testing.T) {
-	assert.Equal(t, ResponseModeDirectPost, effectiveResponseMode(&AuthorizationRequest{}))
-	assert.Equal(t, ResponseModeDirectPostJWT, effectiveResponseMode(&AuthorizationRequest{ResponseMode: ResponseModeDirectPostJWT}))
-	assert.Equal(t, ResponseModeFragment, effectiveResponseMode(&AuthorizationRequest{ResponseMode: ResponseModeFragment}))
+	cases := map[string]string{
+		"":                        ResponseModeDirectPost, // a request naming none is answered as direct_post
+		ResponseModeDirectPost:    ResponseModeDirectPost,
+		ResponseModeDirectPostJWT: ResponseModeDirectPostJWT,
+		ResponseModeQuery:         ResponseModeQuery,
+		ResponseModeFragment:      ResponseModeFragment,
+	}
+	for in, want := range cases {
+		assert.Equal(t, want, effectiveResponseMode(&AuthorizationRequest{ResponseMode: in}), "response_mode %q", in)
+	}
+}
+
+// A valid request may omit response_mode. The engine answers it as direct_post,
+// so the wallet must be told direct_post: an empty value in the sign request
+// would make the key binding JWT carry no response_mode, or be refused.
+func TestRequestVPSignature_SendsTheEffectiveResponseMode(t *testing.T) {
+	v := loadTDVectors(t)[1]
+	for name, tc := range map[string]struct{ requested, sent string }{
+		"absent defaults to direct_post": {"", ResponseModeDirectPost},
+		"direct_post.jwt kept":           {ResponseModeDirectPostJWT, ResponseModeDirectPostJWT},
+		"fragment kept":                  {ResponseModeFragment, ResponseModeFragment},
+	} {
+		t.Run(name, func(t *testing.T) {
+			authReq := &AuthorizationRequest{
+				Nonce: "n", ClientID: "verifier.example.com", ResponseMode: tc.requested,
+				TransactionDataRaw: rawArray(t, v.Raw), DCQLQuery: payDCQL,
+			}
+			if tc.requested == ResponseModeDirectPostJWT {
+				// The verifier thumbprint of a direct_post.jwt request needs
+				// the verifier's encryption key.
+				authReq.ClientMetadata = &ClientMetadata{JWKS: json.RawMessage(`{"keys":[{"kty":"EC","crv":"P-256","use":"enc","x":"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU","y":"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"}]}`)}
+			}
+			require.NoError(t, validateTransactionData(authReq, tdClient))
+			assert.Equal(t, tc.sent, signRequestFor(t, authReq).Params.ResponseMode)
+		})
+	}
+}
+
+// --- transaction_data needs a DCQL query to bind to ---
+
+// credential_ids name credentials of the DCQL query. With no query there is
+// nothing for them to name; the request must be refused, not waved through
+// with the binding skipped.
+func TestValidateAuthorizationRequest_TransactionDataWithoutDCQLIsRefused(t *testing.T) {
+	for name, dcql := range map[string]json.RawMessage{
+		"no dcql_query":               nil,
+		"a query with no credentials": json.RawMessage(`{"credentials":[]}`),
+		"an unreadable query":         json.RawMessage(`[1,2,3]`),
+	} {
+		t.Run(name, func(t *testing.T) {
+			authReq := &AuthorizationRequest{
+				Nonce: "abc", ResponseMode: ResponseModeDirectPost, ResponseURI: "https://verifier.example.com/response",
+				ClientID: "https://verifier.example.com", ClientIDScheme: ClientIDSchemeRedirectURI,
+				TransactionDataRaw: owfRaw(t), DCQLQuery: dcql,
+			}
+			err := (&OID4VPHandler{}).validateAuthorizationRequest(authReq, tdClient)
+			var tdErr *transactionDataError
+			require.True(t, errors.As(err, &tdErr), "got %v", err)
+			assert.Equal(t, ErrCodeInvalidMessage, tdErr.code, "the verifier's fault, not a missing client feature")
+			assert.Contains(t, err.Error(), "no dcql_query")
+			assert.Empty(t, authReq.TransactionData, "nothing may be forwarded")
+		})
+	}
 }
 
 // failSignHarness runs failSign against a verifier endpoint and a client socket,
@@ -711,4 +908,17 @@ func TestFailSign_OtherFailuresStaySignError(t *testing.T) {
 	form, errs = failSignHarness(t, []TransactionData{{Type: "x"}}, errors.New("boom"))
 	assert.Nil(t, form)
 	assert.Equal(t, ErrCodeSignError, errs[0].Error.Code)
+}
+
+// An omitted response_mode defaults to direct_post, and the KB-JWT must carry it.
+func TestRequestVPSignature_OmittedResponseModeIsSignedAsDirectPost(t *testing.T) {
+	v := loadTDVectors(t)[1]
+	authReq := &AuthorizationRequest{
+		Nonce: "n", ClientID: "verifier.example.com", // no ResponseMode
+		TransactionDataRaw: rawArray(t, v.Raw), DCQLQuery: payDCQL,
+	}
+	require.NoError(t, validateTransactionData(authReq, tdClient))
+
+	m := signRequestFor(t, authReq)
+	assert.Equal(t, ResponseModeDirectPost, m.Params.ResponseMode)
 }
