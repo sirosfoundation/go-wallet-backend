@@ -124,8 +124,7 @@ func TestSignRefusal_EndsRequestSignPromptlyAndTellsVerifier(t *testing.T) {
 	assert.Less(t, took, time.Second, "refusal must end RequestSign at once, not wait for the sign timeout")
 	assert.Equal(t, "access_denied", form.Get("error"))
 	assert.Equal(t, "st-1", form.Get("state"))
-	_, hasDesc := form["error_description"]
-	assert.False(t, hasDesc, "verifier must get no error_description")
+	assert.Equal(t, verifierRefusedDescription, form.Get("error_description"), "same public shape as every other refusal")
 	assert.Equal(t, ErrCodePresentationError, errs[0].Error.Code)
 }
 
@@ -149,7 +148,7 @@ func TestSignRefusal_CodeAloneSuffices(t *testing.T) {
 }
 
 // In a redirect response mode the refusal reaches the verifier as a redirect
-// carrying access_denied and no error_description.
+// carrying access_denied and the fixed refusal description.
 func TestSignRefusal_RedirectModeCarriesAccessDeniedOnly(t *testing.T) {
 	_, errs, _, _ := runRefusedPresentationSign(t, func(id string) string {
 		return refusalWire("flow-1", id, true)
@@ -160,7 +159,7 @@ func TestSignRefusal_RedirectModeCarriesAccessDeniedOnly(t *testing.T) {
 	u, err := url.Parse(redirect)
 	require.NoError(t, err)
 	assert.Equal(t, "access_denied", u.Query().Get("error"))
-	assert.False(t, u.Query().Has("error_description"))
+	assert.Equal(t, verifierRefusedDescription, u.Query().Get("error_description"))
 	assert.NotContains(t, redirect, "secret")
 }
 

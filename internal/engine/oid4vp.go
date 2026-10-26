@@ -2712,12 +2712,14 @@ func (h *OID4VPHandler) failSign(ctx context.Context, authReq *AuthorizationRequ
 // verifier gets access_denied at once, as for a decline at consent, and the
 // client gets the same decline error with the verifier's redirect, if any.
 //
-// The verifier is sent no error_description. The client's own text (signErr)
-// may carry the reason for the refusal - an untrusted verifier, a missing
-// thumbprint - which is the wallet's business, so it is only logged here.
+// The verifier is sent the same fixed error_description as every other refusal
+// (consent decline, no matching credential), so a refusal at signing cannot be
+// told apart from the others. The client's own text (signErr) may carry the
+// reason - an untrusted verifier, a missing thumbprint - which is the wallet's
+// business, so it is only logged here.
 func (h *OID4VPHandler) failSignRefused(ctx context.Context, authReq *AuthorizationRequest, signErr *SignError) {
 	h.Logger.Info("client refused to sign the presentation", zap.String("client_reason", signErr.ClientText()))
-	if redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", ""); redirectURI != "" {
+	if redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription); redirectURI != "" {
 		_ = h.ErrorWithDetails(StepSubmittingResponse, ErrCodePresentationError, "User declined the request",
 			map[string]interface{}{"redirect_uri": redirectURI})
 		return
