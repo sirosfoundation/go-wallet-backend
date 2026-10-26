@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -263,6 +264,13 @@ func parseAuxEntries(raw json.RawMessage, list string) ([]auxEntry, []json.RawMe
 				}
 			}
 		}
+		// Values, never metadata, whatever the entry's type.
+		if hasMemberFold(m, "opening") {
+			return bad("has an entry carrying an opening")
+		}
+		if hasMemberFold(m, "commitment") {
+			return bad("has an entry carrying a commitment")
+		}
 		var typ string
 		if json.Unmarshal(m["type"], &typ) != nil || typ == "" {
 			return bad("has an entry without a string type")
@@ -282,12 +290,6 @@ func parseAuxEntries(raw json.RawMessage, list string) ([]auxEntry, []json.RawMe
 			var alg string
 			if json.Unmarshal(m["alg"], &alg) != nil || alg == "" {
 				return bad("has a hash_commitment entry without a string alg")
-			}
-			if hasMemberFold(m, "opening") {
-				return bad("has a hash_commitment entry carrying an opening")
-			}
-			if hasMemberFold(m, "commitment") {
-				return bad("has a hash_commitment entry carrying a commitment")
 			}
 			p, ok := claimsPathKey(m["path"])
 			if !ok {
@@ -392,7 +394,9 @@ func checkProofsForwardNoOpening(proofs []ProofObject, inspect bool) error {
 		}
 		claim, has, err := proofAuxiliaryDataClaim(token)
 		if err != nil {
-			if inspect {
+			// An ambiguous claim (the member twice, or in two letter cases) is
+			// read differently by different decoders: never forwarded.
+			if inspect || errors.Is(err, errAmbiguousAuxClaim) {
 				return err
 			}
 			continue
@@ -400,14 +404,18 @@ func checkProofsForwardNoOpening(proofs []ProofObject, inspect bool) error {
 		if !has {
 			continue
 		}
-		var entries []map[string]json.RawMessage
-		if json.Unmarshal(claim, &entries) != nil {
-			return auxProofErr("auxiliary_data is not an array of objects")
+		var decoded interface{}
+		if json.Unmarshal(claim, &decoded) != nil {
+			return auxProofErr("auxiliary_data is not valid JSON")
 		}
-		for _, e := range entries {
-			if isHashCommitmentEntry(e) && hasMemberFold(e, "opening") {
-				return auxProofErr("a proof entry carries an opening")
-			}
+		// The member name is matched in any letter case, at any depth and in
+		// an entry of any type, and a repeated member cannot hide it: a key
+		// that is present is found whichever duplicate a decoder keeps.
+		if hasOpeningKey(decoded) {
+			return auxProofErr("a proof entry carries an opening")
+		}
+		if _, isArray := decoded.([]interface{}); !isArray {
+			return auxProofErr("auxiliary_data is not an array")
 		}
 	}
 	return nil
@@ -426,17 +434,29 @@ func hasMemberFold(m map[string]json.RawMessage, name string) bool {
 	return false
 }
 
-// isHashCommitmentEntry reports whether any spelling of the type member names
-// the hash_commitment type (a downstream decoder takes "Type" for "type").
-func isHashCommitmentEntry(e map[string]json.RawMessage) bool {
-	for k, v := range e {
-		var typ string
-		if strings.EqualFold(k, "type") && json.Unmarshal(v, &typ) == nil && typ == auxTypeHashCommitment {
-			return true
+// hasOpeningKey reports whether any object in v, at any depth, has a member
+// named "opening" in any letter case.
+func hasOpeningKey(v interface{}) bool {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		for k, child := range t {
+			if strings.EqualFold(k, "opening") || hasOpeningKey(child) {
+				return true
+			}
+		}
+	case []interface{}:
+		for _, child := range t {
+			if hasOpeningKey(child) {
+				return true
+			}
 		}
 	}
 	return false
 }
+
+// errAmbiguousAuxClaim: the payload has the auxiliary_data member more than
+// once, in any letter case.
+var errAmbiguousAuxClaim = errors.New("ambiguous auxiliary_data claim")
 
 // proofAuxiliaryDataClaim returns the auxiliary_data claim of a compact JWT's
 // payload, and whether it is present.
@@ -449,10 +469,33 @@ func proofAuxiliaryDataClaim(token string) (json.RawMessage, bool, error) {
 	if err != nil {
 		return nil, false, auxProofErr("proof payload is not base64url")
 	}
-	var claims map[string]json.RawMessage
-	if json.Unmarshal(payload, &claims) != nil || claims == nil {
+	// Walk the top-level members one by one so a repeated or case-variant
+	// auxiliary_data member is seen (a map keeps only one of them).
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		return nil, false, auxProofErr("proof payload is not a JSON object")
 	}
-	c, has := claims[auxiliaryDataMember]
-	return c, has, nil
+	var claim json.RawMessage
+	found := false
+	for dec.More() {
+		keyTok, err := dec.Token()
+		key, isString := keyTok.(string)
+		if err != nil || !isString {
+			return nil, false, auxProofErr("proof payload is not a JSON object")
+		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return nil, false, auxProofErr("proof payload is not a JSON object")
+		}
+		if strings.EqualFold(key, auxiliaryDataMember) {
+			if found || key != auxiliaryDataMember {
+				return nil, false, fmt.Errorf("%w: %w", errAuxiliaryDataProof, errAmbiguousAuxClaim)
+			}
+			claim, found = value, true
+		}
+	}
+	if _, err := dec.Token(); err != nil {
+		return nil, false, auxProofErr("proof payload is not a JSON object")
+	}
+	return claim, found, nil
 }

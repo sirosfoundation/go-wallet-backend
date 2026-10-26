@@ -731,7 +731,7 @@ credential_configurations_supported[cfg].auxiliary_data_supported
   relay (the member name is matched in any letter case, as a case-insensitive
   decoder downstream would read `Opening` as `opening`). When the issuer advertised `to_issuer` entries the engine also refuses a
   proof it cannot inspect (a type other than `jwt` or `attestation`, an unreadable
-  JWT, an `auxiliary_data` claim that is not an array of objects). A violation
+  JWT, an `auxiliary_data` claim that is not an array). A violation
   fails the flow with `AUXILIARY_DATA_PROOF_INVALID`, step `requesting_credential`,
   and no request reaches the issuer. The engine never logs or returns a
   commitment or opening value. For a credential configuration that advertises

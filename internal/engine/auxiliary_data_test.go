@@ -107,6 +107,7 @@ func TestAuxiliaryDataSupported_Malformed(t *testing.T) {
 		"OPENING in metadata":     `{"to_wallet":[` + hc(`,"OPENING":"SECRETOPENING"`) + `]}`,
 		"Commitment in metadata":  `{"to_issuer":[` + hc(`,"Commitment":"x"`) + `]}`,
 		"Type shadow":             `{"to_issuer":[{"type":"https://x.example/t","Type":"hash_commitment","Opening":"SECRETOPENING"}]}`,
+		"opening in unknown type": `{"to_wallet":[{"type":"hash_commitment","type":"x","path":["a"],"opening":"SECRETOPENING"}]}`,
 		"required not bool":       `{"to_issuer":[` + hc(`,"required":"yes"`) + `]}`,
 		"required null":           `{"to_issuer":[` + hc(`,"required":null`) + `]}`,
 		"duplicate escaped path":  `{"to_wallet":[` + hc("") + `,{"type":"hash_commitment","alg":"sha-256","path":["\u0061","b"]}]}`,
@@ -427,6 +428,12 @@ func auxProofJWT(t *testing.T, claim interface{}) string {
 	return "e30." + base64.RawURLEncoding.EncodeToString(b) + ".c2ln"
 }
 
+// rawProofJWT is a proof whose payload is exactly the given JSON text (so a
+// repeated or case-variant member can be spelled).
+func rawProofJWT(payload string) string {
+	return "e30." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".c2ln"
+}
+
 // validAuxClaim answers each advertised entry with a valid commitment
 // (SHA-256 of a one-byte secret, varied by seed).
 func validAuxClaim(t *testing.T, advertised []json.RawMessage, seed byte) []map[string]interface{} {
@@ -496,6 +503,23 @@ func TestCheckProofsForwardNoOpening(t *testing.T) {
 		"Type and Opening folded":     proofs([]map[string]interface{}{{"Type": "hash_commitment", "Opening": "SECRET"}}),
 		"opening in an attestation":   {{ProofType: "attestation", Attestation: auxProofJWT(t, entry(func(e map[string]interface{}) { e["opening"] = "SECRET" }))}},
 	}
+	const dupType = `[{"type":"hash_commitment","type":null,"alg":"sha-256","path":["a"],"opening":"SECRET"}]`
+	const benign = `[{"type":"hash_commitment","alg":"sha-256","path":["a"],"commitment":"AAAA"}]`
+	const secretEntry = `[{"type":"hash_commitment","opening":"SECRET"}]`
+	for name, payload := range map[string]string{
+		"duplicate type, null last":      `{"auxiliary_data":` + dupType + `}`,
+		"duplicate opening, null last":   `{"auxiliary_data":[{"type":"hash_commitment","opening":"SECRET","opening":null}]}`,
+		"AUXILIARY_DATA alias":           `{"AUXILIARY_DATA":` + secretEntry + `}`,
+		"alias next to benign canonical": `{"auxiliary_data":` + benign + `,"AUXILIARY_DATA":` + secretEntry + `}`,
+		"secret first, benign alias":     `{"auxiliary_data":` + secretEntry + `,"Auxiliary_Data":` + benign + `}`,
+		"secret first, benign twin":      `{"auxiliary_data":` + secretEntry + `,"auxiliary_data":` + benign + `}`,
+		"canonical twice":                `{"auxiliary_data":` + benign + `,"auxiliary_data":` + secretEntry + `}`,
+		"opening in an unknown type":     `{"auxiliary_data":[{"type":"hash_commitment","type":"x","opening":"SECRET"}]}`,
+		"nested opening":                 `{"auxiliary_data":[{"type":"x","v":{"Opening":"SECRET"}}]}`,
+	} {
+		withOpening["raw/jwt/"+name] = []ProofObject{{ProofType: "jwt", JWT: rawProofJWT(payload)}}
+		withOpening["raw/attestation/"+name] = []ProofObject{{ProofType: "attestation", Attestation: rawProofJWT(payload)}}
+	}
 	for name, ps := range withOpening {
 		for _, inspect := range []bool{true, false} {
 			t.Run(fmt.Sprintf("opening/%s/inspect=%v", name, inspect), func(t *testing.T) {
@@ -510,11 +534,10 @@ func TestCheckProofsForwardNoOpening(t *testing.T) {
 	// A proof the engine cannot inspect: refused when it promised to look
 	// (to_issuer advertised), left to the issuer's proof verification otherwise.
 	uninspectable := map[string][]ProofObject{
-		"not a JWT":                  {{ProofType: "jwt", JWT: "proof-0"}},
-		"payload not base64url":      {{ProofType: "jwt", JWT: "a.!!.c"}},
-		"unknown proof type":         {{ProofType: "di_vp"}},
-		"claim not an array":         proofs("x"),
-		"claim an array of non-objs": proofs([]interface{}{5}),
+		"not a JWT":             {{ProofType: "jwt", JWT: "proof-0"}},
+		"payload not base64url": {{ProofType: "jwt", JWT: "a.!!.c"}},
+		"unknown proof type":    {{ProofType: "di_vp"}},
+		"claim not an array":    proofs("x"),
 	}
 	for name, ps := range uninspectable {
 		t.Run("uninspectable/"+name, func(t *testing.T) {
