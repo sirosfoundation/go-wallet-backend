@@ -79,6 +79,7 @@ or session cookie as appropriate for the route group.
 | POST | `/proxy` | `r` | Only registered if `features.proxy_enabled` |
 | GET | `/keystore/status` | `r` | |
 | POST | `/wallet-provider/key-attestation/generate` | `w` | |
+| POST | `/wallet-provider/assurance-preview` | `w` | Dry run of the assurance decisions; rate-limited like the WIA routes. See `docs/assurance-policy.md` |
 | POST | `/wallet-provider/wia/challenge` | `w` | |
 | POST | `/wallet-provider/wia/generate` | `w` | |
 | POST | `/wallet-provider/fido2-attestation/register` | `w` | Only registered if `wallet_provider.attestation.fido2_attestation.enabled` |
@@ -135,7 +136,7 @@ above, not in any transport-specific message parsing.
 
 ## Legacy tokens
 
-Deployments without the AS enabled (`cfg.AS.Enabled: false`, legacy HMAC
-tokens) have no `tac`/`acr`/multi-`aud` concept at all - none of the checks
-above apply there. This reference only describes the new-style AS token
-model.
+The legacy HMAC all-in-one tokens (deployments with `as.enabled: false`) no
+longer exist: the backend only accepts AS-issued tokens, so every check above
+applies to every authenticated request. See
+[new-as.md](new-as.md#removal-of-the-legacy-as).

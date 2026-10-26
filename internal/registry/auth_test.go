@@ -23,8 +23,6 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
 const (
@@ -34,9 +32,8 @@ const (
 )
 
 type authEnv struct {
-	key    *ecdsa.PrivateKey
-	jwks   *httptest.Server
-	legacy bool
+	key  *ecdsa.PrivateKey
+	jwks *httptest.Server
 }
 
 func newAuthEnv(t *testing.T) *authEnv {
@@ -52,16 +49,14 @@ func newAuthEnv(t *testing.T) *authEnv {
 	return &authEnv{key: key, jwks: srv}
 }
 
-func (e *authEnv) validator(t *testing.T, legacy bool) *validator.Validator {
+// validator builds a go-tokenauth validator without legacy support, as the registry does, with an
+// audience list wider than the registry's so the registry's own audience rule is exercised.
+func (e *authEnv) validator(t *testing.T) *validator.Validator {
 	t.Helper()
 	v := validator.New(validator.Config{
-		JWKSURL: e.jwks.URL,
-		Issuer:  testIssuer,
-		// go-tokenauth v0.5 requires an audience list (also applied to legacy
-		// tokens, whose aud is the RP ID); the registry enforces its narrower
-		// rule on top.
-		Audiences: []string{"wallet-registry", "wallet-backend", testRPID},
-		Legacy:    validator.LegacyConfig{Enabled: legacy, HMACSecret: []byte(testSecret), Issuers: []string{"wallet-backend"}},
+		JWKSURL:   e.jwks.URL,
+		Issuer:    testIssuer,
+		Audiences: []string{"wallet-registry", "wallet-backend"},
 	})
 	v.Start(context.Background())
 	t.Cleanup(v.Stop)
@@ -139,7 +134,7 @@ func probe(t *testing.T, cfg AuthConfig, authz string) probeResult {
 
 func TestAuthMiddlewares_Strict(t *testing.T) {
 	env := newAuthEnv(t)
-	v := env.validator(t, true)
+	v := env.validator(t)
 	cfg := AuthConfig{Validator: v, RequireAuth: true, Logger: zap.NewNop()}
 	future := time.Now().Add(time.Hour)
 
@@ -178,25 +173,16 @@ func TestAuthMiddlewares_Strict(t *testing.T) {
 		r := probe(t, cfg, "Bearer "+env.es256(t, []string{"wallet-registry"}, "acme", time.Now().Add(-time.Hour)))
 		assert.Equal(t, http.StatusUnauthorized, r.status)
 	})
-	t.Run("legacy HMAC with the RP ID audience accepted while legacy enabled", func(t *testing.T) {
-		r := probe(t, cfg, "Bearer "+hmacToken(t, testSecret, nil, "acme"))
-		assert.Equal(t, http.StatusOK, r.status)
-		assert.True(t, r.auth)
-		assert.Equal(t, "acme", r.tenant)
-	})
-	t.Run("legacy HMAC with an audience outside the validator list is 401", func(t *testing.T) {
-		r := probe(t, cfg, "Bearer "+hmacToken(t, testSecret, []string{"something-else"}, "acme"))
-		assert.Equal(t, http.StatusUnauthorized, r.status)
-	})
-	t.Run("legacy HMAC with wrong secret is 401", func(t *testing.T) {
-		r := probe(t, cfg, "Bearer "+hmacToken(t, "ffffffffffffffffffffffffffffffff", nil, "acme"))
-		assert.Equal(t, http.StatusUnauthorized, r.status)
-	})
-	t.Run("legacy HMAC rejected when legacy disabled", func(t *testing.T) {
-		off := AuthConfig{Validator: env.validator(t, false), RequireAuth: true, Logger: zap.NewNop()}
-		assert.Equal(t, http.StatusUnauthorized, probe(t, off, "Bearer "+hmacToken(t, testSecret, nil, "acme")).status)
-		// ES256 still fine
-		assert.Equal(t, http.StatusOK, probe(t, off, "Bearer "+env.es256(t, []string{"wallet-registry"}, "acme", future)).status)
+	t.Run("HMAC tokens are never accepted (legacy AS removed)", func(t *testing.T) {
+		for name, tok := range map[string]string{
+			"rp id audience": hmacToken(t, testSecret, nil, "acme"),
+			"registry aud":   hmacToken(t, testSecret, []string{"wallet-registry"}, "acme"),
+			"wrong secret":   hmacToken(t, "ffffffffffffffffffffffffffffffff", nil, "acme"),
+		} {
+			r := probe(t, cfg, "Bearer "+tok)
+			assert.Equal(t, http.StatusUnauthorized, r.status, name)
+			assert.False(t, r.auth, name)
+		}
 	})
 }
 
@@ -223,7 +209,7 @@ func (f fakeBlacklist) IsUserRevoked(_ context.Context, u string) bool {
 
 func TestAuthMiddlewares_StrictWithTenantStoreAndBlacklist(t *testing.T) {
 	env := newAuthEnv(t)
-	v := env.validator(t, false)
+	v := env.validator(t)
 	future := time.Now().Add(time.Hour)
 	tok := "Bearer " + env.es256(t, []string{"wallet-registry"}, "acme", future)
 
@@ -251,58 +237,32 @@ func TestAuthMiddlewares_JTIRevocation(t *testing.T) {
 	env := newAuthEnv(t)
 	future := time.Now().Add(time.Hour)
 	es := "Bearer " + env.es256(t, []string{"wallet-registry"}, "acme", future) // jti-1
-	// A fully valid legacy token (RP ID audience, signed with the configured
-	// secret, carrying a live refresh-token family), so that the only thing
-	// that can reject it below is its jti.
-	c := gojwt.MapClaims{"iss": "wallet-backend", "user_id": "u1", "tenant_id": "acme", "jti": "legacy-jti",
-		"sid": "live-family", "aud": testRPID, "exp": time.Now().Add(time.Hour).Unix()}
-	hs, err := gojwt.NewWithClaims(gojwt.SigningMethodHS256, c).SignedString([]byte(testSecret))
-	require.NoError(t, err)
-	hs = "Bearer " + hs
 
 	for _, strict := range []bool{true, false} {
 		cfg := AuthConfig{
-			Validator: env.validator(t, true), RequireAuth: strict, Logger: zap.NewNop(),
-			Config:    &config.Config{JWT: config.JWTConfig{Secret: testSecret}},
+			Validator: env.validator(t), RequireAuth: strict, Logger: zap.NewNop(),
 			Blacklist: fakeBlacklist{revokedJTI: "unrelated-jti"},
 		}
 
-		// Positive controls: with no matching jti revoked both tokens pass
-		// the whole chain.
+		// Positive control: with no matching jti revoked the token passes.
 		r := probe(t, cfg, es)
-		assert.Equal(t, http.StatusOK, r.status, "asymmetric control, strict=%v", strict)
-		assert.True(t, r.auth, "asymmetric control, strict=%v", strict)
-		r = probe(t, cfg, hs)
-		assert.Equal(t, http.StatusOK, r.status, "legacy control, strict=%v", strict)
-		assert.True(t, r.auth, "legacy control, strict=%v", strict)
-		assert.Equal(t, "acme", r.tenant, "legacy control, strict=%v", strict)
+		assert.Equal(t, http.StatusOK, r.status, "control, strict=%v", strict)
+		assert.True(t, r.auth, "control, strict=%v", strict)
 
 		cfg.Blacklist = fakeBlacklist{revokedJTI: "jti-1"}
 		r = probe(t, cfg, es)
-		assert.False(t, r.auth, "asymmetric jti revoked, strict=%v", strict)
+		assert.False(t, r.auth, "jti revoked, strict=%v", strict)
 		if strict {
 			assert.Equal(t, http.StatusUnauthorized, r.status)
 			assert.Contains(t, r.body, "Token has been revoked")
 		}
-		r = probe(t, cfg, hs)
-		assert.True(t, r.auth, "legacy token unaffected by another jti, strict=%v", strict)
-
-		cfg.Blacklist = fakeBlacklist{revokedJTI: "legacy-jti"}
-		r = probe(t, cfg, hs)
-		assert.False(t, r.auth, "legacy jti revoked, strict=%v", strict)
-		if strict {
-			assert.Equal(t, http.StatusUnauthorized, r.status)
-			assert.Contains(t, r.body, "Token has been revoked", "rejected by jti, not by an earlier check")
-		}
-		r = probe(t, cfg, es)
-		assert.True(t, r.auth, "other tokens unaffected, strict=%v", strict)
 	}
 }
 
 func TestAuthMiddlewares_OptionalTenantAndUserChecks(t *testing.T) {
 	env := newAuthEnv(t)
 	tok := "Bearer " + env.es256(t, []string{"wallet-registry"}, "acme", time.Now().Add(time.Hour))
-	cfg := AuthConfig{Validator: env.validator(t, true), Logger: zap.NewNop(),
+	cfg := AuthConfig{Validator: env.validator(t), Logger: zap.NewNop(),
 		Tenants: fakeTenants{enabled: map[string]bool{"acme": true}}}
 
 	r := probe(t, cfg, tok)
@@ -331,7 +291,7 @@ func TestAuthMiddlewares_OptionalTenantAndUserChecks(t *testing.T) {
 
 func TestAuthMiddlewares_Optional(t *testing.T) {
 	env := newAuthEnv(t)
-	v := env.validator(t, true)
+	v := env.validator(t)
 	cfg := AuthConfig{Validator: v, RequireAuth: false, Logger: zap.NewNop()}
 	future := time.Now().Add(time.Hour)
 
@@ -368,13 +328,8 @@ func TestAuthMiddlewares_Optional(t *testing.T) {
 			assert.False(t, r.auth, name)
 		}
 	})
-	t.Run("legacy HMAC recognised while enabled", func(t *testing.T) {
+	t.Run("HMAC tokens are ignored (legacy AS removed)", func(t *testing.T) {
 		r := probe(t, cfg, "Bearer "+hmacToken(t, testSecret, []string{testRPID}, "acme"))
-		assert.True(t, r.auth)
-	})
-	t.Run("legacy HMAC ignored when disabled", func(t *testing.T) {
-		off := AuthConfig{Validator: env.validator(t, false), Logger: zap.NewNop()}
-		r := probe(t, off, "Bearer "+hmacToken(t, testSecret, nil, "acme"))
 		assert.Equal(t, http.StatusOK, r.status)
 		assert.False(t, r.auth)
 	})
@@ -383,143 +338,4 @@ func TestAuthMiddlewares_Optional(t *testing.T) {
 		assert.Equal(t, http.StatusOK, r.status)
 		assert.False(t, r.auth)
 	})
-}
-
-type familyBlacklist struct {
-	fakeBlacklist
-	revokedSID string
-}
-
-func (f familyBlacklist) IsFamilyRevoked(_ context.Context, sid string) bool {
-	return f.revokedSID != "" && sid == f.revokedSID
-}
-
-func TestAuthMiddlewares_OptionalFamilyRevocation(t *testing.T) {
-	env := newAuthEnv(t)
-	hs := func(secret, sid string) string {
-		c := gojwt.MapClaims{"iss": "wallet-backend", "user_id": "u1", "aud": testRPID,
-			"exp": time.Now().Add(time.Hour).Unix()}
-		if sid != "" {
-			c["sid"] = sid
-		}
-		s, err := gojwt.NewWithClaims(gojwt.SigningMethodHS256, c).SignedString([]byte(secret))
-		require.NoError(t, err)
-		return "Bearer " + s
-	}
-	cfg := AuthConfig{
-		Validator: env.validator(t, true), Logger: zap.NewNop(),
-		Config:    &config.Config{JWT: config.JWTConfig{Secret: testSecret}},
-		Blacklist: familyBlacklist{revokedSID: "dead"},
-	}
-
-	assert.False(t, probe(t, cfg, hs(testSecret, "dead")).auth, "revoked family is downgraded")
-	assert.True(t, probe(t, cfg, hs(testSecret, "live")).auth, "live family stays authenticated")
-	assert.True(t, probe(t, cfg, hs(testSecret, "")).auth, "token without sid stays authenticated")
-	assert.Equal(t, http.StatusOK, probe(t, cfg, hs(testSecret, "dead")).status, "never rejected")
-
-	// The SID cannot be determined without jwt.secret: fail closed.
-	noSecret := cfg
-	noSecret.Config = nil
-	assert.False(t, probe(t, noSecret, hs(testSecret, "live")).auth, "undeterminable sid is downgraded")
-	wrong := cfg
-	wrong.Config = &config.Config{JWT: config.JWTConfig{Secret: "another-secret-another-secret-0000"}}
-	assert.False(t, probe(t, wrong, hs(testSecret, "live")).auth, "unverifiable sid is downgraded")
-
-	// Without a blacklist there is nothing to check.
-	cfg.Blacklist = nil
-	assert.True(t, probe(t, cfg, hs(testSecret, "dead")).auth)
-}
-
-// Deprecated registry.yaml path: legacy HMAC tokens are validated without an
-// audience check, but everything else is still enforced and fail-closed.
-func TestAuthMiddlewares_LegacyAudienceIndependent(t *testing.T) {
-	env := newAuthEnv(t)
-	// The validator's audience list deliberately does NOT contain any aud used
-	// below, and its legacy path is OFF: the tokens can only be accepted by the
-	// audience-independent path.
-	v := validator.New(validator.Config{JWKSURL: env.jwks.URL, Issuer: testIssuer,
-		Audiences: []string{"wallet-registry", "localhost"}})
-	v.Start(context.Background())
-	t.Cleanup(v.Stop)
-
-	tok := func(secret string, mod func(gojwt.MapClaims)) string {
-		c := gojwt.MapClaims{"iss": "wallet-backend", "user_id": "u1", "tenant_id": "acme", "jti": "lj", "sid": "fam",
-			"aud": "https://some-backend-rp-id.example", "exp": time.Now().Add(time.Hour).Unix()}
-		if mod != nil {
-			mod(c)
-		}
-		s, err := gojwt.NewWithClaims(gojwt.SigningMethodHS256, c).SignedString([]byte(secret))
-		require.NoError(t, err)
-		return "Bearer " + s
-	}
-	mk := func(strict, indep bool, bl middleware.TokenBlacklistChecker) AuthConfig {
-		return AuthConfig{Validator: v, RequireAuth: strict, Logger: zap.NewNop(), Blacklist: bl,
-			LegacyAudienceIndependent: indep,
-			Config:                    &config.Config{JWT: config.JWTConfig{Secret: testSecret, Issuer: "wallet-backend"}}}
-	}
-
-	for _, strict := range []bool{true, false} {
-		// Positive controls first: any aud (even none, or a list) is accepted.
-		for _, mod := range []func(gojwt.MapClaims){nil, func(c gojwt.MapClaims) { delete(c, "aud") },
-			func(c gojwt.MapClaims) { c["aud"] = []string{"x", "y"} }} {
-			r := probe(t, mk(strict, true, nil), tok(testSecret, mod))
-			assert.Equal(t, http.StatusOK, r.status, "strict=%v", strict)
-			assert.True(t, r.auth, "strict=%v", strict)
-			assert.Equal(t, "acme", r.tenant)
-		}
-		// Without the flag the very same token is NOT accepted (proves the
-		// positive control above is due to the audience-independent path).
-		r := probe(t, mk(strict, false, nil), tok(testSecret, nil))
-		assert.False(t, r.auth, "flag off, strict=%v", strict)
-		if strict {
-			assert.Equal(t, http.StatusUnauthorized, r.status)
-		}
-
-		neg := map[string]string{
-			"bad issuer":   tok(testSecret, func(c gojwt.MapClaims) { c["iss"] = "someone-else" }),
-			"expired":      tok(testSecret, func(c gojwt.MapClaims) { c["exp"] = time.Now().Add(-time.Hour).Unix() }),
-			"no exp":       tok(testSecret, func(c gojwt.MapClaims) { delete(c, "exp") }),
-			"wrong secret": tok("another-secret-another-secret-00000", nil),
-		}
-		for name, tk := range neg {
-			r := probe(t, mk(strict, true, nil), tk)
-			assert.False(t, r.auth, "%s, strict=%v", name, strict)
-			if strict {
-				assert.Equal(t, http.StatusUnauthorized, r.status, name)
-			} else {
-				assert.Equal(t, http.StatusOK, r.status, "%s: optional mode downgrades, never rejects", name)
-			}
-		}
-
-		// Revocation: jti, user and refresh-token family (positive controls
-		// above: the same token with no matching revocation was accepted).
-		for name, bl := range map[string]middleware.TokenBlacklistChecker{
-			"jti":    fakeBlacklist{revokedJTI: "lj"},
-			"user":   fakeBlacklist{revokedUser: "u1"},
-			"family": familyBlacklist{revokedSID: "fam"},
-		} {
-			r := probe(t, mk(strict, true, bl), tok(testSecret, nil))
-			assert.False(t, r.auth, "%s revoked, strict=%v", name, strict)
-			if strict {
-				assert.Equal(t, http.StatusUnauthorized, r.status, name)
-			}
-		}
-		live := probe(t, mk(strict, true, familyBlacklist{revokedSID: "other"}), tok(testSecret, nil))
-		assert.True(t, live.auth, "unrelated revocation does not affect it, strict=%v", strict)
-	}
-
-	// Asymmetric tokens keep their audience rule on this path.
-	r := probe(t, mk(true, true, nil), "Bearer "+env.es256(t, []string{"wallet-backend"}, "acme", time.Now().Add(time.Hour)))
-	assert.Equal(t, http.StatusUnauthorized, r.status)
-	r = probe(t, mk(true, true, nil), "Bearer "+env.es256(t, []string{"wallet-registry"}, "acme", time.Now().Add(time.Hour)))
-	assert.Equal(t, http.StatusOK, r.status)
-
-	// Fail closed without a configuration to read the secret/issuer from.
-	nc := mk(true, true, nil)
-	nc.Config = nil
-	assert.Equal(t, http.StatusUnauthorized, probe(t, nc, tok(testSecret, nil)).status)
-	// An empty configured issuer is refused rather than matching anything.
-	ni := mk(true, true, nil)
-	ni.Config.JWT.Issuer = ""
-	assert.Equal(t, http.StatusUnauthorized, probe(t, ni, tok(testSecret, func(c gojwt.MapClaims) { delete(c, "iss") })).status)
 }
