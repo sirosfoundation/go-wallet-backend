@@ -242,3 +242,31 @@ func TestNewServices_WIANilWhenSigningKeyButNoCertInETSIMode(t *testing.T) {
 		t.Error("expected WIA service to be nil when unsupported (etsi mode, signing key but no certificate)")
 	}
 }
+
+func TestNewServices_AssuranceWiring(t *testing.T) {
+	logger := zap.NewNop()
+	store := memory.NewStore()
+
+	cfg := &config.Config{}
+	rules := filepath.Join(t.TempDir(), "p.rules")
+	if err := os.WriteFile(rules, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg.WalletProvider.Attestation.Assurance = enabledCfg()
+	cfg.WalletProvider.Attestation.Assurance.RulesFile = rules
+	if svc := NewServices(store, cfg, logger); svc.WalletProvider.assessor == nil {
+		t.Fatal("enabled policy with a valid (empty) rules file must install an assessor")
+	}
+
+	bad := &config.Config{}
+	bad.WalletProvider.Attestation.Assurance = enabledCfg()
+	bad.WalletProvider.Attestation.Assurance.RulesFile = filepath.Join(t.TempDir(), "missing.rules")
+	if svc := NewServices(store, bad, logger); svc.WalletProvider.assessor != nil {
+		t.Fatal("unloadable policy must not install an assessor (KA fails closed)")
+	}
+
+	off := &config.Config{}
+	if svc := NewServices(store, off, logger); svc.WalletProvider.assessor != nil {
+		t.Fatal("disabled policy must not load anything")
+	}
+}

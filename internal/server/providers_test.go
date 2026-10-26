@@ -105,6 +105,7 @@ func (b *memoryBackend) Invites() storage.InviteStore             { return b.sto
 func (b *memoryBackend) WalletInstances() storage.WalletInstanceStore {
 	return b.store.WalletInstances()
 }
+
 func (b *memoryBackend) KeyAttestations() storage.KeyAttestationStore {
 	return b.store.KeyAttestations()
 }
@@ -1745,3 +1746,89 @@ func TestWalletProviderProvider_CheckReady_RevocationStoreUnavailable(t *testing
 // Manager.AddProvider only registers a readiness check for providers that
 // implement ReadinessCheckProvider.
 var _ ReadinessCheckProvider = (*WalletProviderProvider)(nil)
+
+// =============================================================================
+// /wallet-provider/assurance-preview wiring: registered in both providers with
+// the same authentication, audience and TAC "w" as key-attestation/generate.
+// =============================================================================
+
+func newTestWalletProviderProviderWithValidator(t *testing.T, v *tokenvalidator.Validator) *WalletProviderProvider {
+	t.Helper()
+	store := newTestMemoryBackend(t)
+	logger := zap.NewNop()
+	cfg := minimalTestConfig()
+	services := service.NewServices(store, cfg, logger)
+	return &WalletProviderProvider{
+		cfg:            cfg,
+		logger:         logger,
+		store:          store,
+		handlers:       api.NewHandlers(services, cfg, logger, []string{"wallet-provider"}),
+		services:       services,
+		wiaRateLimiter: middleware.NewAuthRateLimiter(cfg.WalletProvider.WIA.RateLimit, logger),
+		tokenValidator: v,
+	}
+}
+
+func TestAssurancePreviewRoute_RegisteredAndGuardedInBothProviders(t *testing.T) {
+	v, key, issuer := setupServerTokenValidatorTest(t)
+
+	registers := map[string]func(*gin.Engine){
+		"auth provider": func(r *gin.Engine) {
+			p := newTestBackendProviderWithValidator(t, v)
+			p.auth.RegisterRoutes(r)
+		},
+		"wallet-provider provider": func(r *gin.Engine) {
+			newTestWalletProviderProviderWithValidator(t, v).RegisterRoutes(r)
+		},
+	}
+	token := func(aud, tac string) string {
+		return signServerToken(t, key, issuer, claims.AccessTokenClaims{
+			Claims:   jwt.Claims{Subject: "user-1", Audience: jwt.Audience{aud}},
+			TenantID: string(domain.DefaultTenantID),
+			TAC:      claims.TAC(tac),
+			ACR:      "urn:siros:acr:passkey",
+		})
+	}
+	call := func(r *gin.Engine, bearer string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/wallet-provider/assurance-preview", strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	for name, register := range registers {
+		t.Run(name, func(t *testing.T) {
+			router := gin.New()
+			register(router)
+			if !hasRoute(router.Routes(), http.MethodPost, "/wallet-provider/assurance-preview") {
+				t.Fatal("route not registered")
+			}
+			if w := call(router, ""); w.Code != http.StatusUnauthorized {
+				t.Errorf("no token: %d, want 401", w.Code)
+			}
+			if w := call(router, token("wallet-backend", "r")); w.Code != http.StatusForbidden {
+				t.Errorf("tac r: %d, want 403 (MustHaveTAC w)", w.Code)
+			}
+			if w := call(router, token("wallet-registry", "rw")); w.Code != http.StatusForbidden {
+				t.Errorf("wallet-registry audience: %d, want 403", w.Code)
+			}
+			w := call(router, token("wallet-backend", "w"))
+			if w.Code != http.StatusOK {
+				t.Fatalf("tac w: %d: %s", w.Code, w.Body.String())
+			}
+			var body map[string]interface{}
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			for _, k := range []string{"key_storage", "user_authentication", "certification", "wia_profile", "wia_issue", "policy_version", "schema_version"} {
+				if _, ok := body[k]; !ok {
+					t.Errorf("response has no %q: %v", k, body)
+				}
+			}
+		})
+	}
+}
