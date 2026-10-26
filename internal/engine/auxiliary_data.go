@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync/atomic"
 )
@@ -206,6 +207,13 @@ func parseAuxiliaryDataSupported(raw json.RawMessage) (*auxAdvertisement, error)
 	if json.Unmarshal(raw, &top) != nil || top == nil {
 		return nil, fmt.Errorf("%w: auxiliary_data_supported is not an object", errMalformedAdvertisement)
 	}
+	for k := range top {
+		for _, name := range []string{"to_wallet", "to_issuer"} {
+			if k != name && strings.EqualFold(k, name) {
+				return nil, fmt.Errorf("%w: ambiguous %s member", errMalformedAdvertisement, name)
+			}
+		}
+	}
 	toWallet, hasW := top["to_wallet"]
 	toIssuer, hasI := top["to_issuer"]
 	if !hasW && !hasI {
@@ -264,12 +272,11 @@ func parseAuxEntries(raw json.RawMessage, list string) ([]auxEntry, []json.RawMe
 				}
 			}
 		}
-		// Values, never metadata, whatever the entry's type.
-		if hasMemberFold(m, "opening") {
-			return bad("has an entry carrying an opening")
-		}
-		if hasMemberFold(m, "commitment") {
-			return bad("has an entry carrying a commitment")
+		// Values, never metadata: no opening or commitment member at any depth,
+		// in any letter case, whatever the entry's type (a raw token walk, so a
+		// repeated member cannot shadow it).
+		if values, _, err := scanMemberNames(re, "opening", "commitment"); err != nil || values {
+			return bad("has an entry carrying an opening or a commitment")
 		}
 		var typ string
 		if json.Unmarshal(m["type"], &typ) != nil || typ == "" {
@@ -404,54 +411,81 @@ func checkProofsForwardNoOpening(proofs []ProofObject, inspect bool) error {
 		if !has {
 			continue
 		}
-		var decoded interface{}
-		if json.Unmarshal(claim, &decoded) != nil {
+		// The member name is matched in any letter case, at any depth and in
+		// an entry of any type, on the raw token stream so that a repeated
+		// member (which a map decode would discard) cannot hide it.
+		hasOpening, isArray, err := scanClaimForOpening(claim)
+		if err != nil {
 			return auxProofErr("auxiliary_data is not valid JSON")
 		}
-		// The member name is matched in any letter case, at any depth and in
-		// an entry of any type, and a repeated member cannot hide it: a key
-		// that is present is found whichever duplicate a decoder keeps.
-		if hasOpeningKey(decoded) {
+		if hasOpening {
 			return auxProofErr("a proof entry carries an opening")
 		}
-		if _, isArray := decoded.([]interface{}); !isArray {
+		if !isArray {
 			return auxProofErr("auxiliary_data is not an array")
 		}
 	}
 	return nil
 }
 
-// hasMemberFold reports whether m has a member named name under ANY case
-// spelling. encoding/json matches struct fields case-insensitively, so a
-// downstream decoder reads "Opening" or "OPENING" as the opening: an exact-key
-// lookup would let it through.
-func hasMemberFold(m map[string]json.RawMessage, name string) bool {
-	for k := range m {
-		if strings.EqualFold(k, name) {
-			return true
-		}
-	}
-	return false
+// scanClaimForOpening walks the raw JSON of a claim token by token, so no
+// repeated member is discarded, and reports whether any object at any depth has
+// a member named "opening" in any letter case, and whether the claim is an array.
+func scanClaimForOpening(raw json.RawMessage) (hasOpening, isArray bool, err error) {
+	return scanMemberNames(raw, "opening")
 }
 
-// hasOpeningKey reports whether any object in v, at any depth, has a member
-// named "opening" in any letter case.
-func hasOpeningKey(v interface{}) bool {
-	switch t := v.(type) {
-	case map[string]interface{}:
-		for k, child := range t {
-			if strings.EqualFold(k, "opening") || hasOpeningKey(child) {
-				return true
-			}
+// scanMemberNames is the token walk behind scanClaimForOpening for any set of
+// member names.
+func scanMemberNames(raw json.RawMessage, names ...string) (hasOpening, isArray bool, err error) {
+	type frame struct{ obj, expectKey bool }
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	var stack []frame
+	first := true
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			break
 		}
-	case []interface{}:
-		for _, child := range t {
-			if hasOpeningKey(child) {
-				return true
+		if err != nil {
+			return false, false, err
+		}
+		if first {
+			d, ok := tok.(json.Delim)
+			isArray = ok && d == '['
+			first = false
+		}
+		top := len(stack) - 1
+		if d, ok := tok.(json.Delim); ok {
+			switch d {
+			case '{', '[':
+				if top >= 0 && stack[top].obj {
+					stack[top].expectKey = true // this container is the member's value
+				}
+				stack = append(stack, frame{obj: d == '{', expectKey: d == '{'})
+			default:
+				if top >= 0 {
+					stack = stack[:top]
+				}
+			}
+			continue
+		}
+		if top >= 0 && stack[top].obj {
+			if stack[top].expectKey {
+				if key, ok := tok.(string); ok {
+					for _, n := range names {
+						if strings.EqualFold(key, n) {
+							hasOpening = true
+						}
+					}
+				}
+				stack[top].expectKey = false
+			} else {
+				stack[top].expectKey = true
 			}
 		}
 	}
-	return false
+	return hasOpening, isArray, nil
 }
 
 // errAmbiguousAuxClaim: the payload has the auxiliary_data member more than

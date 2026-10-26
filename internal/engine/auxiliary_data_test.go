@@ -106,6 +106,9 @@ func TestAuxiliaryDataSupported_Malformed(t *testing.T) {
 		"Opening in metadata":     `{"to_wallet":[` + hc(`,"Opening":"SECRETOPENING"`) + `]}`,
 		"OPENING in metadata":     `{"to_wallet":[` + hc(`,"OPENING":"SECRETOPENING"`) + `]}`,
 		"Commitment in metadata":  `{"to_issuer":[` + hc(`,"Commitment":"x"`) + `]}`,
+		"To_Wallet alias":         `{"to_issuer":[` + hc("") + `],"To_Wallet":[` + hc(`,"opening":"SECRETOPENING"`) + `]}`,
+		"TO_ISSUER alias":         `{"to_wallet":[` + hc("") + `],"TO_ISSUER":[` + hc("") + `]}`,
+		"nested opening":          `{"to_wallet":[{"type":"x","extra":{"opening":"SECRETOPENING"},"extra":null}]}`,
 		"Type shadow":             `{"to_issuer":[{"type":"https://x.example/t","Type":"hash_commitment","Opening":"SECRETOPENING"}]}`,
 		"opening in unknown type": `{"to_wallet":[{"type":"hash_commitment","type":"x","path":["a"],"opening":"SECRETOPENING"}]}`,
 		"required not bool":       `{"to_issuer":[` + hc(`,"required":"yes"`) + `]}`,
@@ -515,6 +518,8 @@ func TestCheckProofsForwardNoOpening(t *testing.T) {
 		"secret first, benign twin":      `{"auxiliary_data":` + secretEntry + `,"auxiliary_data":` + benign + `}`,
 		"canonical twice":                `{"auxiliary_data":` + benign + `,"auxiliary_data":` + secretEntry + `}`,
 		"opening in an unknown type":     `{"auxiliary_data":[{"type":"hash_commitment","type":"x","opening":"SECRET"}]}`,
+		"shadowed nested subtree":        `{"auxiliary_data":[{"type":"x","extra":{"opening":"SECRET"},"extra":null}]}`,
+		"shadowed deeper subtree":        `{"auxiliary_data":[{"type":"x","a":{"b":[{"c":{"OPENING":"SECRET"}}],"b":1}}]}`,
 		"nested opening":                 `{"auxiliary_data":[{"type":"x","v":{"Opening":"SECRET"}}]}`,
 	} {
 		withOpening["raw/jwt/"+name] = []ProofObject{{ProofType: "jwt", JWT: rawProofJWT(payload)}}
