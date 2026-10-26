@@ -110,7 +110,10 @@ type WalletInstance struct {
 	DeviceInfo *DeviceInfo `json:"device_info,omitempty" bson:"device_info,omitempty"`
 
 	// AttestationSource identifies how this instance was attested.
-	// Values: "backend_attested", "ios_app_attest", "android_play_integrity"
+	// Values as stored by the WIA path: "backend_attested" (no client-side
+	// evidence), "platform_attested" (verified App Attest / Play Integrity) and
+	// "development_attested" (App Attest chained only to the development
+	// environment).
 	AttestationSource string `json:"attestation_source" bson:"attestation_source"`
 
 	// SecurityProperties captures the claimed security level (ISO 18045 AVA scale).

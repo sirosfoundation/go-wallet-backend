@@ -6,6 +6,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
 	"github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
@@ -51,6 +52,16 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	}
 
 	wpSvc := NewWalletProviderService(cfg, logger, store.WalletInstances(), store.KeyAttestations())
+	if cfg.WalletProvider.Attestation.Assurance.Enabled {
+		// cmd/server refuses to start on a bad policy (assurance.CheckConfig);
+		// if one still fails to load here, Key Attestation fails closed
+		// (ErrAssuranceUnavailable) rather than using another procedure.
+		if assessor, err := assurance.NewFromConfig(cfg.WalletProvider.Attestation.Assurance, logger); err != nil {
+			logger.Error("assurance policy failed to load; key attestation will fail closed", zap.Error(err))
+		} else {
+			wpSvc.SetAssessor(assessor)
+		}
+	}
 
 	// WIA shares the same signing key as the wallet provider. Uses
 	// HasSigningKey (not IsSupported) because "ietf"-mode WIA only needs a
@@ -96,13 +107,6 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	// external caller like cmd/server/main.go does for SetSessionCleaner,
 	// since both objects are already owned by this constructor.
 	userSvc.SetTokenBlacklist(tokenBlacklist)
-	// Wire the same blacklist into WebAuthnService so RefreshAccessToken can
-	// consume (single-use) each refresh token as it's exchanged, closing the
-	// replay gap Copilot flagged on #400's newly-exposed refresh route.
-	if webauthnSvc != nil {
-		webauthnSvc.SetTokenBlacklist(tokenBlacklist)
-	}
-
 	return &Services{
 		User:             userSvc,
 		Tenant:           NewTenantService(store, logger),

@@ -877,20 +877,40 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 		verifiedIdentity = clientIDSchemeVerifierAttestationPrefix + attestation.Subject + ":" + sha256Hex(attestation.RawJWT)
 
 	default:
-		// redirect_uri and other schemes: extract key material best-effort
-		if clientMeta != nil {
-			keyMaterial = h.extractVerifierKeyMaterial(ctx, clientMeta)
-		}
-		// Fallback: extract key material from the request JWT header
-		if keyMaterial == nil && authReq.RequestJWT != "" {
-			// Verify JWT signature if present (opportunistic verification)
+		// redirect_uri (the only other scheme validateAuthorizationRequest
+		// lets through): the client_id is not cryptographically
+		// authenticated, so the PDP is asked about the name alone UNLESS the
+		// request object carries a signature that actually verifies.
+		//
+		// Key material is only ever forwarded to the PDP as evidence of the
+		// verifier's identity when the requester has proven possession of
+		// it. That rules out client_metadata keys (jwks, jwks_uri, x5c are
+		// plain attacker-supplied data here) and any header key of a request
+		// object whose signature failed: a replayed copy of a trusted
+		// verifier's public key/certificate chain would otherwise be
+		// evaluated as if it belonged to the requester.
+		if authReq.RequestJWT != "" {
 			km, verifyErr := trust.VerifyJWTWithEmbeddedKey(authReq.RequestJWT)
-			if verifyErr != nil {
-				h.Logger.Warn("Request JWT signature verification failed, falling back to header extraction",
-					zap.Error(verifyErr))
-				keyMaterial = trust.ExtractKeyMaterialFromJWT(authReq.RequestJWT)
-			} else {
+			switch {
+			case verifyErr == nil:
 				keyMaterial = km
+				// A verdict reached with a proven key must never be served
+				// to a request that did not prove it (and vice versa), so
+				// bind the cache identity to that key, as the x509 schemes
+				// do. No fingerprint means no caching at all.
+				if fp := keyMaterialFingerprint(km); fp != "" {
+					// client_id is hashed so it cannot inject delimiters
+					// into the key, and the namespace keeps this identity
+					// distinct from the unsigned fallback key below.
+					verifiedIdentity = "redirect_uri:signed:" + sha256Hex(authReq.ClientID) + ":" + fp
+				} else {
+					cacheable = false
+				}
+			case errors.Is(verifyErr, trust.ErrNoEmbeddedKey):
+				// Nothing to verify against and nothing to forward: the
+				// name-only evaluation above is all that happens.
+			default:
+				return nil, fmt.Errorf("request JWT signature verification failed: %w", verifyErr)
 			}
 		}
 	}
@@ -934,7 +954,7 @@ func (h *OID4VPHandler) evaluateVerifierTrust(ctx context.Context, authReq *Auth
 	// itself can't be hashed.
 	cacheKey := verifiedIdentity
 	if cacheKey == "" && cacheable {
-		cacheKey = canonicalURL + "|client_id:" + authReq.ClientID
+		cacheKey = "unsigned|" + canonicalURL + "|client_id:" + authReq.ClientID
 	}
 	if cacheKey != "" && contextHash != "" {
 		cacheKey += "|ctx:" + contextHash
@@ -1510,46 +1530,6 @@ func extractDomain(clientID string) string {
 		return u.Host
 	}
 	return ""
-}
-
-// extractVerifierKeyMaterial extracts key material from client metadata for trust evaluation.
-// Priority: x5c > jwks > jwks_uri (for DIDs where client_id starts with did:, returns nil)
-func (h *OID4VPHandler) extractVerifierKeyMaterial(ctx context.Context, clientMeta *ClientMetadata) *KeyMaterial {
-	// X5C certificate chain takes priority
-	if len(clientMeta.X5C) > 0 {
-		return &KeyMaterial{
-			Type: "x5c",
-			X5C:  clientMeta.X5C,
-		}
-	}
-
-	// Inline JWKS
-	if len(clientMeta.JWKS) > 0 {
-		var jwks interface{}
-		if err := json.Unmarshal(clientMeta.JWKS, &jwks); err == nil {
-			return &KeyMaterial{
-				Type: "jwk",
-				JWK:  jwks,
-			}
-		}
-		h.Logger.Warn("Failed to parse inline JWKS", zap.Error(fmt.Errorf("invalid JSON")))
-	}
-
-	// Fetch from jwks_uri
-	if clientMeta.JWKsURI != "" {
-		jwks, err := trust.FetchJWKS(ctx, clientMeta.JWKsURI, h.httpClient)
-		if err != nil {
-			h.Logger.Warn("Failed to fetch JWKS from URI", zap.String("uri", clientMeta.JWKsURI), zap.Error(err))
-		} else {
-			return &KeyMaterial{
-				Type: "jwk",
-				JWK:  jwks,
-			}
-		}
-	}
-
-	// No key material available - will use resolution-only mode (for DIDs)
-	return nil
 }
 
 func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*ClientMetadata, error) {
@@ -2203,6 +2183,16 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 		return fmt.Errorf("unsupported client_id_scheme: %s", authReq.ClientIDScheme)
 	}
 
+	// A client_id that itself carries a signed-required scheme prefix must be
+	// evaluated under exactly that scheme. client_id_scheme is a separate,
+	// requester-controlled member; without this, declaring redirect_uri for
+	// "x509_san_dns:<victim>" would skip every signature check the prefixed
+	// scheme requires, while the PDP (which parses the prefix out of the
+	// subject itself) still treats the client_id as a certificate-bound one.
+	if err := validateSchemeMatchesClientIDPrefix(authReq); err != nil {
+		return err
+	}
+
 	// OID4VP §5: For direct_post, response_uri must be present
 	if isDirectPost && authReq.ResponseURI == "" {
 		return errors.New("response_uri is required for direct_post response mode")
@@ -2284,6 +2274,29 @@ func (h *OID4VPHandler) validateAuthorizationRequest(authReq *AuthorizationReque
 
 	// OID4VP §7.4: Decode and validate transaction_data if present.
 	return validateTransactionData(authReq, msg)
+}
+
+// validateSchemeMatchesClientIDPrefix rejects a request whose client_id
+// carries a scheme prefix that requires a signed request object (x509_*,
+// verifier_attestation, did / decentralized_identifier) but whose declared
+// client_id_scheme is a different one. did: and decentralized_identifier: are
+// two spellings of one scheme and may be mixed. A bare client_id with a
+// separately declared scheme (the draft-era form) is not affected.
+func validateSchemeMatchesClientIDPrefix(authReq *AuthorizationRequest) error {
+	prefixScheme := inferClientIDScheme(authReq.ClientID)
+	switch prefixScheme {
+	case ClientIDSchemeDID, ClientIDSchemeDecentralizedIdentifier:
+		if authReq.ClientIDScheme == ClientIDSchemeDID || authReq.ClientIDScheme == ClientIDSchemeDecentralizedIdentifier {
+			return nil
+		}
+	case ClientIDSchemeX509SANDNS, ClientIDSchemeX509SANURI, ClientIDSchemeX509Hash, ClientIDSchemeVerifierAttestation:
+		if authReq.ClientIDScheme == prefixScheme {
+			return nil
+		}
+	default:
+		return nil
+	}
+	return fmt.Errorf("client_id_scheme %q does not match the scheme prefix of client_id (%s)", authReq.ClientIDScheme, prefixScheme)
 }
 
 // validateClientIDMatch checks that client_id in the URL matches the JWT request object.

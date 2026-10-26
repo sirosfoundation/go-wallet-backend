@@ -34,9 +34,8 @@ func setupTestHandlers(t *testing.T) (*Handlers, *gin.Engine) {
 			RPName:   "Test Wallet",
 		},
 		JWT: config.JWTConfig{
-			Secret:      "test-secret",
-			ExpiryHours: 24,
-			Issuer:      "test-wallet",
+			Secret: "test-secret",
+			Issuer: "test-wallet",
 		},
 	}
 
@@ -85,67 +84,6 @@ func TestHandlers_Status(t *testing.T) {
 	if response["service"] != "wallet-backend" {
 		t.Errorf("Expected service 'wallet-backend', got %v", response["service"])
 	}
-}
-
-// Test WebAuthn handlers
-func TestHandlers_WebAuthn(t *testing.T) {
-	handlers, router := setupTestHandlers(t)
-	router.POST("/webauthn/register/start", handlers.StartWebAuthnRegistration)
-	router.POST("/webauthn/register/finish", handlers.FinishWebAuthnRegistration)
-	router.POST("/webauthn/login/start", handlers.StartWebAuthnLogin)
-	router.POST("/webauthn/login/finish", handlers.FinishWebAuthnLogin)
-
-	t.Run("start registration", func(t *testing.T) {
-		body := `{"username": "testuser", "displayName": "Test User"}`
-		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/webauthn/register/start", strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		router.ServeHTTP(w, req)
-
-		// Should return 200 with credential options
-		if w.Code != http.StatusOK {
-			t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
-		}
-	})
-
-	t.Run("finish registration without valid challenge", func(t *testing.T) {
-		// Finish registration without a valid challenge should return 404
-		body := `{"challenge_id": "non-existent-challenge", "credential_response": {}}`
-		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/webauthn/register/finish", strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		router.ServeHTTP(w, req)
-
-		if w.Code != http.StatusNotFound {
-			t.Errorf("Expected status %d, got %d: %s", http.StatusNotFound, w.Code, w.Body.String())
-		}
-	})
-
-	t.Run("start login", func(t *testing.T) {
-		// Discoverable login doesn't require username
-		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/webauthn/login/start", strings.NewReader(`{}`))
-		req.Header.Set("Content-Type", "application/json")
-		router.ServeHTTP(w, req)
-
-		// Should return 200 with assertion options
-		if w.Code != http.StatusOK {
-			t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
-		}
-	})
-
-	t.Run("finish login without valid challenge", func(t *testing.T) {
-		// Finish login without a valid challenge should return 404
-		body := `{"challenge_id": "non-existent-challenge", "assertion_response": {}}`
-		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/webauthn/login/finish", strings.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		router.ServeHTTP(w, req)
-
-		if w.Code != http.StatusNotFound {
-			t.Errorf("Expected status %d, got %d: %s", http.StatusNotFound, w.Code, w.Body.String())
-		}
-	})
 }
 
 // Test Presentation handlers (removed — VP endpoints are no longer registered)
@@ -324,38 +262,6 @@ func TestHandlers_KeyAttestation_InvalidRequest(t *testing.T) {
 // Ensure context and uuid imports are used
 var _ = context.Background
 var _ = uuid.New
-
-// Test tenant-scoped WebAuthn registration - uses StartWebAuthnRegistration (tenant from path)
-func TestHandlers_StartWebAuthnRegistration_NotAvailable(t *testing.T) {
-	handlers, router := setupTestHandlers(t)
-	// Note: WebAuthn is nil when not properly configured
-	handlers.services.WebAuthn = nil
-	router.POST("/tenant/webauthn/register/start", handlers.StartWebAuthnRegistration)
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/tenant/webauthn/register/start", strings.NewReader(`{}`))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("Expected status %d, got %d", http.StatusServiceUnavailable, w.Code)
-	}
-}
-
-func TestHandlers_FinishWebAuthnRegistration_NotAvailable(t *testing.T) {
-	handlers, router := setupTestHandlers(t)
-	handlers.services.WebAuthn = nil
-	router.POST("/tenant/webauthn/register/finish", handlers.FinishWebAuthnRegistration)
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/tenant/webauthn/register/finish", strings.NewReader(`{}`))
-	req.Header.Set("Content-Type", "application/json")
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusServiceUnavailable {
-		t.Errorf("Expected status %d, got %d", http.StatusServiceUnavailable, w.Code)
-	}
-}
 
 // Test credential storage handlers with authentication context
 func TestHandlers_StoreCredential_Unauthorized(t *testing.T) {

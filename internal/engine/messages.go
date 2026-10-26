@@ -126,6 +126,10 @@ const (
 	ErrCodeUnsupportedTransactionData ErrorCode = "UNSUPPORTED_TRANSACTION_DATA"
 	ErrCodeInternalError              ErrorCode = "INTERNAL_ERROR"
 	ErrCodeTooManyRequests            ErrorCode = "TOO_MANY_REQUESTS"
+	// ErrCodePSCConflict: the issuer already holds a different holder
+	// commitment (psc) for this subject. The message is the issuer's own text
+	// and tells the user what to do (operator-approved reset).
+	ErrCodePSCConflict ErrorCode = "PSC_CONFLICT"
 )
 
 // UserFacingMessage returns a generic user-facing message for an error code.
@@ -180,6 +184,8 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "Internal server error"
 	case ErrCodeTooManyRequests:
 		return "Too many requests"
+	case ErrCodePSCConflict:
+		return "The issuer holds a different holder commitment for you"
 	default:
 		return "An error occurred"
 	}
@@ -558,6 +564,16 @@ type SignRequestParams struct {
 	// sirosfoundation/wallet-frontend#70's Tier 2 "same-key re-signing" design
 	// (signWithExistingKeypair(kid, payload)). Empty for ordinary issuance.
 	ReissuanceKid string `json:"reissuance_kid,omitempty"`
+
+	// HolderCommitments, CredentialType and CredentialIssuer (generate_proof
+	// only; set when the issuer metadata advertises org.siros.holder_commitments
+	// with "psc"): the wallet MUST derive the commitment for (CredentialType,
+	// CredentialIssuer) and add the claim org.siros.psc =
+	// base64url(32 bytes) to every proof JWT payload before signing. The engine
+	// verifies the claim on the returned proofs and never computes or logs it.
+	HolderCommitments []string `json:"holder_commitments,omitempty"`
+	CredentialType    string   `json:"credential_type,omitempty"`
+	CredentialIssuer  string   `json:"credential_issuer,omitempty"`
 
 	// SignActionSignClientAuth parameters. HTM and HTU, when set, ask for a
 	// DPoP proof over that HTTP method and URL; DPoPNonce is the
