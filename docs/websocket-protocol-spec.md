@@ -711,25 +711,29 @@ credential_configurations_supported[cfg].auxiliary_data_supported
   objects as the issuer published them). The wallet places
   `{type, alg, path, commitment}` in the signed part of every key proof it
   returns, the same value in all proofs of the request, and MUST send each entry
-  with `required: true`. The engine never computes or sees a commitment. A
-  configuration with a `required` entry and no proof type fails the flow with
-  `SIGN_ERROR`.
+  with `required: true`. The engine never computes or sees a commitment. Whether
+  a `required` entry was sent is the issuer's to enforce: a configuration with a
+  `required` entry and no proof type is not refused by the engine, the request
+  goes out without the entry and the issuer refuses it.
 - Whenever `auxiliary_data_to_issuer` is non-empty the request also carries
-  `credential_type` (the configuration's `vct`, or its `doctype` for mdoc) and
   `credential_issuer` (the exact `credential_issuer` string of the issuer
-  metadata), so the wallet can derive its per-issuer value. These are the same
+  metadata) and, when the configuration has one, `credential_type` (its `vct`,
+  or its `doctype` for mdoc), so the wallet can derive its per-issuer value. These are the same
   params, with the same names, types and meaning, as the holder commitment
-  (`psc`) request of go-wallet-backend#468; a configuration with neither `vct`
-  nor `doctype` fails the flow.
+  (`psc`) request of go-wallet-backend#468. A configuration with neither `vct`
+  nor `doctype` fails the flow only when some `to_issuer` entry is of a type the
+  wallet recognises (`hash_commitment`); when every entry is of an unrecognised
+  type (which the wallet ignores) the engine proceeds and omits `credential_type`.
 - The engine does not judge whether the returned `auxiliary_data` is acceptable:
   that the proofs carry identical entries, that each entry matches an advertised
   `to_issuer` entry by `path` and `alg`, the commitment length, and that every
   `required: true` entry is sent are rules of Credential Auxiliary Data section
   6.4 that the issuer owns and enforces (and answers with `invalid_proof`). The
   engine checks one thing of its own before a proof is forwarded: no
-  `hash_commitment` entry carries an `opening`, a secret the engine must never
-  relay (the member name is matched in any letter case, as a case-insensitive
-  decoder downstream would read `Opening` as `opening`). When the issuer advertised `to_issuer` entries the engine also refuses a
+  entry carries an `opening`, a secret the engine must never relay (the member
+  name is matched in any letter case, at any depth, in an entry of any type, and
+  on the raw JSON so a repeated member cannot hide it; a repeated or
+  case-variant `auxiliary_data` member is refused). When the issuer advertised `to_issuer` entries the engine also refuses a
   proof it cannot inspect (a type other than `jwt` or `attestation`, an unreadable
   JWT, an `auxiliary_data` claim that is not an array). A violation
   fails the flow with `AUXILIARY_DATA_PROOF_INVALID`, step `requesting_credential`,
