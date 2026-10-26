@@ -139,6 +139,9 @@ func simWIA(a *Assessor, f Facts) *WIAOutcome {
 	return w
 }
 
+// The documented issuance gate (shipped commented in production.rules.example).
+const instanceKeyIssueTemplate = "(assure-wia-issue (evidence (verified (fido2)(platform)(hsm)(instance_key (kind android_key)))))"
+
 // The documented App Attest assertion S1 template (shipped commented in
 // production.rules.example).
 const appAttestAssertionTemplate = "(assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform)(hsm)(instance_key (kind app_attest_assertion)(home)(level)(boot)(binding assertion)))))"
@@ -164,6 +167,46 @@ func TestInstanceKey_AppAttestAssertionTemplate(t *testing.T) {
 		out := simWIA(a, Facts{Platform: plat, InstanceKey: c.ik})
 		if out.Profile.Level != c.want {
 			t.Errorf("%s: profile %q, want %q", name, out.Profile.Level, c.want)
+		}
+	}
+}
+
+func TestInstanceKey_IssueGateTemplateIsShippedLintsCleanAndGates(t *testing.T) {
+	data, err := os.ReadFile("../../deploy/assurance/production.rules.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tpl string
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "# (assure-wia-issue ") && strings.Contains(line, "(instance_key") {
+			tpl = strings.TrimPrefix(line, "# ")
+		}
+	}
+	if tpl == "" {
+		t.Fatal("production.rules.example has no commented instance_key issuance gate")
+	}
+	if tpl != instanceKeyIssueTemplate {
+		t.Fatalf("template drifted from the tested one:\n got %s\nwant %s", tpl, instanceKeyIssueTemplate)
+	}
+	cfg := defaultCfg()
+	rules := "# id: wia-issue-android-key\n" + tpl + "\n"
+	if fs := LintRuleSet(mustRuleSet(t, rules), &cfg); len(fs) != 0 {
+		t.Fatalf("findings: %v", fs)
+	}
+	a := newAssessor(t, wiaCfg(), rules)
+	plat := &PlatformVerified{Source: "platform_attested"}
+	for name, c := range map[string]struct {
+		ik   *InstanceKeyVerified
+		want bool
+	}{
+		"android key":          {&InstanceKeyVerified{Kind: "android_key", Home: "tee", Binding: BindingAttested}, true},
+		"strongbox":            {&InstanceKeyVerified{Kind: "android_key", Home: "strongbox", Binding: BindingAttested}, true},
+		"none":                 {nil, false},
+		"fido2 instance key":   {&InstanceKeyVerified{Kind: "fido2", Home: "fido2_hw", Binding: BindingAttested}, false},
+		"app attest assertion": {&InstanceKeyVerified{Kind: "app_attest_assertion", Home: "secure_enclave_asserted", Binding: BindingAssertion}, false},
+	} {
+		if got := simWIA(a, Facts{Platform: plat, InstanceKey: c.ik}).Issue; got != c.want {
+			t.Errorf("%s: issue = %v, want %v", name, got, c.want)
 		}
 	}
 }

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 )
@@ -365,6 +366,22 @@ type KeyAttestationStore interface {
 	// GetByKeyThumbprint retrieves a key attestation record by its JWK
 	// Thumbprint. Returns ErrNotFound if no evidence is on file for that key.
 	GetByKeyThumbprint(ctx context.Context, thumbprint string) (*domain.KeyAttestationRecord, error)
+
+	// MarkKeyRevoked marks the record of thumbprint revoked, but only when it
+	// is still the record whose chain has the given leaf fingerprint and is
+	// not already revoked: a record that a fresh submission replaced in the
+	// meantime is left alone. It reports whether this call set the mark. The
+	// record is never deleted. A missing record is not an error (false).
+	MarkKeyRevoked(ctx context.Context, thumbprint, chainFingerprint, reason string, at time.Time) (bool, error)
+
+	// ReplaceKeyEvidence atomically replaces the stored record of
+	// rec.KeyThumbprint with rec, but only when the stored record is still the
+	// one whose chain has the leaf fingerprint staleChainFingerprint, and
+	// whatever its rank (the no-downgrade rule is deliberately not applied: the
+	// caller found that record no longer good). It reports whether it replaced
+	// it; false (no error) means the stored record is another one now, or none,
+	// and nothing was written.
+	ReplaceKeyEvidence(ctx context.Context, rec *domain.KeyAttestationRecord, staleChainFingerprint string) (bool, error)
 }
 
 // AppAttestKeyStore defines durable storage of attested Apple App Attest keys

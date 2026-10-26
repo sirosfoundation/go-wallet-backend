@@ -46,11 +46,19 @@ type WalletProviderService struct {
 	certChain       []string
 	instances       storage.WalletInstanceStore
 	keyAttestations storage.KeyAttestationStore
-	assessor        *assurance.Assessor
+
+	// keyChecker re-checks stored instance-key evidence (revocation, expiry)
+	// before the preview shows what a WIA would carry.
+	keyChecker *instanceKeyChecker
+	assessor   *assurance.Assessor
 	// fido2 is the FIDO2 attestation verifier, used only by the assurance
 	// preview (dry run). May be nil.
 	fido2 *FIDO2AttestationService
 }
+
+// SetInstanceKeyChecker installs the shared re-check of stored instance-key
+// evidence (see instance_key_recheck.go).
+func (s *WalletProviderService) SetInstanceKeyChecker(c *instanceKeyChecker) { s.keyChecker = c }
 
 // NewWalletProviderService creates a new WalletProviderService.
 // instances is used to corroborate a KA request's self-reported security

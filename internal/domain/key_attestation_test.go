@@ -1,6 +1,9 @@
 package domain
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestKeyAttestationRecord_NormalizeDefaultsOldRows(t *testing.T) {
 	r := KeyAttestationRecord{AAGUID: "a"}
@@ -49,5 +52,30 @@ func TestKeyAttestationRecord_CloneDoesNotShareDeviceLocked(t *testing.T) {
 	*c.DeviceLocked = false
 	if !*r.DeviceLocked {
 		t.Fatal("clone shares DeviceLocked")
+	}
+}
+
+func TestSupersedes_RevokedEvidenceIsReplacedByAnything(t *testing.T) {
+	strong := &KeyAttestationRecord{Kind: KeyEvidenceAndroidKey, Home: KeyHomeStrongBox}
+	weak := &KeyAttestationRecord{Kind: KeyEvidenceAndroidKey, Home: KeyHomeTEE}
+	if weak.Supersedes(strong) {
+		t.Fatal("weaker evidence replaced live stronger evidence")
+	}
+	strong.RevokedAt = time.Now()
+	if !strong.Revoked() || !weak.Supersedes(strong) {
+		t.Fatal("a fresh record must replace revoked evidence whatever its rank")
+	}
+	other := &KeyAttestationRecord{Kind: KeyEvidenceFIDO2, Home: KeyHomeFIDO2Hardware}
+	if !other.Supersedes(strong) {
+		t.Fatal("revoked evidence blocked another kind")
+	}
+}
+
+func TestClone_CopiesCertSerials(t *testing.T) {
+	r := &KeyAttestationRecord{CertSerials: []string{"1", "2"}}
+	c := r.Clone()
+	c.CertSerials[0] = "x"
+	if r.CertSerials[0] != "1" {
+		t.Fatal("clone shares the serial slice")
 	}
 }

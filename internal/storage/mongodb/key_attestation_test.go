@@ -199,3 +199,107 @@ func TestKeyAttestationStore_CompetingWritersKeepStrongestEvidence(t *testing.T)
 		require.True(t, created.Equal(got.CreatedAt), "round %d: created_at changed", round)
 	}
 }
+
+func TestKeyAttestationStore_CertSerialsAndRevocationMark(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	kas := store.KeyAttestations()
+	id := fmt.Sprintf("thumb-revoke-%d", time.Now().UnixNano())
+
+	rec := &domain.KeyAttestationRecord{
+		KeyThumbprint: id, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox,
+		ChainFingerprint: "fp1", CertSerials: []string{"a1", "b2"}, VerifiedAt: time.Now().UTC(),
+	}
+	require.NoError(t, kas.MarkKeyAttested(ctx, rec))
+	got, err := kas.GetByKeyThumbprint(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, []string{"a1", "b2"}, got.CertSerials)
+	require.False(t, got.Revoked())
+
+	at := time.Now().UTC().Truncate(time.Millisecond)
+	ok, err := kas.MarkKeyRevoked(ctx, id, "other-fingerprint", "r", at)
+	require.NoError(t, err)
+	require.False(t, ok, "marked a record whose chain was not the one checked")
+	ok, err = kas.MarkKeyRevoked(ctx, "no-such-key", "fp1", "r", at)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	ok, err = kas.MarkKeyRevoked(ctx, id, "fp1", "status_list_revoked", at)
+	require.NoError(t, err)
+	require.True(t, ok)
+	ok, err = kas.MarkKeyRevoked(ctx, id, "fp1", "again", at)
+	require.NoError(t, err)
+	require.False(t, ok, "marked twice")
+
+	got, err = kas.GetByKeyThumbprint(ctx, id)
+	require.NoError(t, err)
+	require.True(t, got.Revoked())
+	require.Equal(t, "status_list_revoked", got.RevokedReason)
+	require.Equal(t, domain.KeyHomeStrongBox, got.Home, "the record is kept, not deleted")
+
+	// The mark bumped the revision: a fresh weaker record still replaces a
+	// revoked one, through the compare-and-set.
+	fresh := &domain.KeyAttestationRecord{KeyThumbprint: id, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE, ChainFingerprint: "fp2", CertSerials: []string{"c3"}}
+	require.NoError(t, kas.MarkKeyAttested(ctx, fresh))
+	got, err = kas.GetByKeyThumbprint(ctx, id)
+	require.NoError(t, err)
+	require.False(t, got.Revoked())
+	require.Equal(t, "fp2", got.ChainFingerprint)
+	require.Equal(t, domain.KeyHomeTEE, got.Home)
+
+	// Live stronger evidence is still protected from weaker evidence.
+	require.NoError(t, kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{KeyThumbprint: id, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox, ChainFingerprint: "fp3"}))
+	require.NoError(t, kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{KeyThumbprint: id, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE, ChainFingerprint: "fp4"}))
+	got, _ = kas.GetByKeyThumbprint(ctx, id)
+	require.Equal(t, "fp3", got.ChainFingerprint)
+
+	// A document written before the new fields existed reads as legacy.
+	legacyID := id + "-legacy"
+	_, err = store.keyAttestations.collection.InsertOne(ctx, bson.M{"_id": legacyID, "kind": "android_key", "home": "tee", "tenant_id": "t", "chain_fingerprint": "legacy-fp"})
+	require.NoError(t, err)
+	got, err = kas.GetByKeyThumbprint(ctx, legacyID)
+	require.NoError(t, err)
+	require.Empty(t, got.CertSerials)
+	require.False(t, got.Revoked())
+	ok, err = kas.MarkKeyRevoked(ctx, legacyID, "legacy-fp", "r", at)
+	require.NoError(t, err)
+	require.True(t, ok, "a legacy document without a rev field must be markable")
+	require.NoError(t, kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{KeyThumbprint: legacyID, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE, ChainFingerprint: "n"}))
+}
+
+func TestKeyAttestationStore_ReplaceKeyEvidence(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	kas := store.KeyAttestations()
+	id := fmt.Sprintf("thumb-replace-%d", time.Now().UnixNano())
+
+	strong := &domain.KeyAttestationRecord{KeyThumbprint: id, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox, ChainFingerprint: "old", VerifiedAt: time.Now().UTC()}
+	require.NoError(t, kas.MarkKeyAttested(ctx, strong))
+	created, err := kas.GetByKeyThumbprint(ctx, id)
+	require.NoError(t, err)
+
+	weak := &domain.KeyAttestationRecord{KeyThumbprint: id, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE, ChainFingerprint: "new", CertSerials: []string{"c3"}}
+	ok, err := kas.ReplaceKeyEvidence(ctx, weak, "not-the-stored-chain")
+	require.NoError(t, err)
+	require.False(t, ok)
+	ok, err = kas.ReplaceKeyEvidence(ctx, &domain.KeyAttestationRecord{KeyThumbprint: id + "-none", ChainFingerprint: "x"}, "x")
+	require.NoError(t, err)
+	require.False(t, ok)
+	got, _ := kas.GetByKeyThumbprint(ctx, id)
+	require.Equal(t, "old", got.ChainFingerprint, "written without a match")
+
+	ok, err = kas.ReplaceKeyEvidence(ctx, weak, "old")
+	require.NoError(t, err)
+	require.True(t, ok)
+	got, err = kas.GetByKeyThumbprint(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, "new", got.ChainFingerprint)
+	require.Equal(t, domain.KeyHomeTEE, got.Home, "replaced whatever the rank")
+	require.Equal(t, []string{"c3"}, got.CertSerials)
+	require.WithinDuration(t, created.CreatedAt, got.CreatedAt, time.Millisecond)
+
+	// The revision moved on: a second replacement of the same stale chain loses.
+	ok, err = kas.ReplaceKeyEvidence(ctx, strong, "old")
+	require.NoError(t, err)
+	require.False(t, ok)
+}

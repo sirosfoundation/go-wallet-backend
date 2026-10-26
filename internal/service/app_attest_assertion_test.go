@@ -515,6 +515,12 @@ func newAssertionE2E(t *testing.T, rules string) *e2e {
 		t.Fatal(err)
 	}
 	svc.RegisterInstanceKeyVerifier(v)
+	// Stored evidence is re-checked on use (fail closed without a checker):
+	// the assertion verifier re-checks its own records against the App Attest
+	// key store; android_key evidence is found good so stronger evidence stands.
+	checker := goodChecker()
+	checker.register(v)
+	svc.SetInstanceKeyChecker(checker)
 	return &e2e{svc, instances, records, appKeys, dev}
 }
 
@@ -621,6 +627,25 @@ func TestAppAttestAssertion_EndToEndNeverOverwritesStrongerEvidence(t *testing.T
 	rec, _ := e.records.GetByKeyThumbprint(context.Background(), jkt)
 	if rec.Kind != domain.KeyEvidenceAndroidKey || rec.Home != domain.KeyHomeStrongBox {
 		t.Fatalf("an assertion replaced stronger evidence: %+v", rec)
+	}
+}
+
+// A stored record that is no longer good (here: android_key evidence nothing
+// can re-check) does not shield itself behind its rank: a fresh valid assertion
+// replaces it, as any fresh evidence replaces stale evidence.
+func TestAppAttestAssertion_EndToEndReplacesStaleStrongerEvidence(t *testing.T) {
+	e := newAssertionE2E(t, wiaAnyRules)
+	e.svc.SetInstanceKeyChecker(nil) // nothing can re-check android_key: stale
+	_, jkt, err := e.wia(t, nil, func(c, jkt string) *KeyAttestation {
+		putRecord(t, e.records, domain.KeyAttestationRecord{KeyThumbprint: jkt, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox})
+		return e.assertion(t, 1)(c, jkt)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := e.records.GetByKeyThumbprint(context.Background(), jkt)
+	if rec.Kind != domain.KeyEvidenceAppAttestAssertion {
+		t.Fatalf("stale evidence shielded itself from a fresh assertion: %+v", rec)
 	}
 }
 
@@ -819,7 +844,7 @@ func TestAppAttestAssertion_CachedEvidenceIsScopedToTheVerifiedCaller(t *testing
 			t.Errorf("%s: cached evidence was lent (err=%v)", name, err)
 		}
 	}
-	if got := e.svc.instanceKeyEvidence(ctx, "other-tenant", "owner", jkt); got != nil {
+	if got, _ := e.svc.instanceKeyEvidence(ctx, "other-tenant", "owner", jkt); got != nil {
 		t.Error("cached evidence was lent to another tenant")
 	}
 }
@@ -975,6 +1000,10 @@ func TestAppAttest_PersistenceFailureIsUnavailableNotInvalid(t *testing.T) {
 func TestPreview_InstanceKeyEvidenceIsScopedToTheCaller(t *testing.T) {
 	rules := "# id: needs-assertion\n(assure-wia-issue (evidence (verified (fido2)(platform)(hsm)(instance_key (kind app_attest_assertion)(home secure_enclave_asserted)(level)(boot)(binding assertion)))))\n"
 	svc, instances, keys := assuranceSvc(t, nil, rules)
+	// Stored assertion evidence needs a checker to count; this one finds it good.
+	checker := newInstanceKeyChecker(zap.NewNop())
+	checker.register(&fakeKeyVerifier{typ: KeyAttestationAppAttestAssertion})
+	svc.SetInstanceKeyChecker(checker)
 	ctx := context.Background()
 	owner := domain.UserIDFromString("owner")
 	for id, c := range map[string]struct {
@@ -1058,5 +1087,119 @@ func TestRestoreChallenge_SurvivesRequestCancellation(t *testing.T) {
 	svc.restoreChallenge(ctx, domain.DefaultTenantID, "chal-x")
 	if ok, err := svc.challenges.Consume(context.Background(), "chal-x"); err != nil || !ok {
 		t.Fatalf("challenge not restored: ok=%v err=%v", ok, err)
+	}
+}
+
+// ---- stored assertion records are re-checked on use (counterpart of the
+// android_key re-check): key revoked, configuration tightened, key store down,
+// nothing wired to check. ----
+
+type failingAppAttestGet struct{ storage.AppAttestKeyStore }
+
+func (failingAppAttestGet) Get(context.Context, string) (*domain.AppAttestKeyRecord, error) {
+	return nil, errors.New("db down")
+}
+
+func storedAssertionEvidence(t *testing.T, e *e2e) (jkt string) {
+	t.Helper()
+	_, jkt, err := e.wia(t, nil, e.assertion(t, 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := e.records.GetByKeyThumbprint(context.Background(), jkt)
+	if err != nil || rec.ChainFingerprint != e.dev.keyIDB64() {
+		t.Fatalf("stored record does not name its App Attest key: %+v %v", rec, err)
+	}
+	if got, err := e.svc.instanceKeyEvidence(context.Background(), domain.DefaultTenantID, "", jkt); err != nil || got == nil {
+		t.Fatalf("fresh record not usable: %v %v", got, err)
+	}
+	return jkt
+}
+
+func TestAppAttestAssertion_RevokedKeyWithdrawsStoredEvidence(t *testing.T) {
+	e := newAssertionE2E(t, wiaAnyRules)
+	jkt := storedAssertionEvidence(t, e)
+	if err := e.appKeys.Revoke(context.Background(), e.dev.keyIDB64()); err != nil {
+		t.Fatal(err)
+	}
+	got, err := e.svc.instanceKeyEvidence(context.Background(), domain.DefaultTenantID, "", jkt)
+	if err != nil || got != nil {
+		t.Fatalf("evidence of a revoked App Attest key still counts: %v %v", got, err)
+	}
+	rec, _ := e.records.GetByKeyThumbprint(context.Background(), jkt)
+	if !rec.Revoked() || rec.RevokedReason != RecheckReasonAppAttestKeyRevoked {
+		t.Fatalf("record not marked revoked: %+v", rec)
+	}
+}
+
+func TestAppAttestAssertion_ConfigurationChangeWithdrawsStoredEvidenceWithoutChangingIt(t *testing.T) {
+	e := newAssertionE2E(t, wiaAnyRules)
+	jkt := storedAssertionEvidence(t, e)
+	for name, mk := range map[string]func() (*AppAttestAssertionVerifier, error){
+		"another environment": func() (*AppAttestAssertionVerifier, error) {
+			return NewAppAttestAssertionVerifier(e.appKeys, testAppAttestAppID, "development", zap.NewNop())
+		},
+		"another app id": func() (*AppAttestAssertionVerifier, error) {
+			return NewAppAttestAssertionVerifier(e.appKeys, "TEAM.other.app", "production", zap.NewNop())
+		},
+	} {
+		v, err := mk()
+		if err != nil {
+			t.Fatal(err)
+		}
+		c := newInstanceKeyChecker(zap.NewNop())
+		c.register(v)
+		e.svc.SetInstanceKeyChecker(c)
+		if got, err := e.svc.instanceKeyEvidence(context.Background(), domain.DefaultTenantID, "", jkt); err != nil || got != nil {
+			t.Fatalf("%s: stored evidence still counts: %v %v", name, got, err)
+		}
+		if rec, _ := e.records.GetByKeyThumbprint(context.Background(), jkt); rec.Revoked() {
+			t.Fatalf("%s: a configuration change must not revoke the record", name)
+		}
+	}
+	// Restoring the configuration restores the evidence.
+	c := newInstanceKeyChecker(zap.NewNop())
+	v, _ := NewAppAttestAssertionVerifier(e.appKeys, testAppAttestAppID, "production", zap.NewNop())
+	c.register(v)
+	e.svc.SetInstanceKeyChecker(c)
+	if got, _ := e.svc.instanceKeyEvidence(context.Background(), domain.DefaultTenantID, "", jkt); got == nil {
+		t.Fatal("evidence not restored with the configuration")
+	}
+}
+
+func TestAppAttestAssertion_KeyStoreOutageOnRecheckIsUnavailable(t *testing.T) {
+	e := newAssertionE2E(t, wiaAnyRules)
+	jkt := storedAssertionEvidence(t, e)
+	v, _ := NewAppAttestAssertionVerifier(failingAppAttestGet{e.appKeys}, testAppAttestAppID, "production", zap.NewNop())
+	c := newInstanceKeyChecker(zap.NewNop())
+	c.register(v)
+	e.svc.SetInstanceKeyChecker(c)
+	if _, err := e.svc.instanceKeyEvidence(context.Background(), domain.DefaultTenantID, "", jkt); !errors.Is(err, ErrWIAKeyAttestationUnavailable) {
+		t.Fatalf("err = %v, want ErrWIAKeyAttestationUnavailable", err)
+	}
+}
+
+func TestAppAttestAssertion_NoCheckerMeansNoEvidence(t *testing.T) {
+	e := newAssertionE2E(t, wiaAnyRules)
+	jkt := storedAssertionEvidence(t, e)
+	e.svc.SetInstanceKeyChecker(nil) // App Attest no longer configured
+	if got, err := e.svc.instanceKeyEvidence(context.Background(), domain.DefaultTenantID, "", jkt); err != nil || got != nil {
+		t.Fatalf("unchecked assertion evidence counts: %v %v", got, err)
+	}
+}
+
+// A record that names no App Attest key cannot be re-checked: it is no evidence.
+func TestAppAttestAssertion_RecheckLegacyRecordWithoutKeyIsUnknown(t *testing.T) {
+	e := newAssertionE2E(t, wiaAnyRules)
+	v, _ := NewAppAttestAssertionVerifier(e.appKeys, testAppAttestAppID, "production", zap.NewNop())
+	res, err := v.Recheck(context.Background(), &domain.KeyAttestationRecord{Kind: domain.KeyEvidenceAppAttestAssertion, Home: domain.KeyHomeSecureEnclaveAsserted}, time.Now())
+	if err != nil || res.Verdict != RecheckUnknown {
+		t.Fatalf("%+v %v", res, err)
+	}
+}
+
+func TestAppAttestAssertion_NoHomeReasonIsAFixedEnumValue(t *testing.T) {
+	if noHomeReasonLabel(NoHomeAppAttestKeyNotEligible) != NoHomeAppAttestKeyNotEligible {
+		t.Fatal("reason is not in NoHomeReasons")
 	}
 }

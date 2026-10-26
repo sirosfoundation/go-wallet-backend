@@ -181,3 +181,82 @@ func TestKeyAttestationStore_DeviceLockedPointerIsIsolated(t *testing.T) {
 		t.Fatal("mutating a read result changed stored evidence")
 	}
 }
+
+func TestKeyAttestationStore_CertSerialsAndRevocationMark(t *testing.T) {
+	ctx := context.Background()
+	kas := NewStore().KeyAttestations()
+	rec := &domain.KeyAttestationRecord{
+		KeyThumbprint: "k1", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE,
+		ChainFingerprint: "fp1", CertSerials: []string{"a1", "b2"}, VerifiedAt: time.Now().UTC(),
+	}
+	if err := kas.MarkKeyAttested(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := kas.GetByKeyThumbprint(ctx, "k1")
+	if len(got.CertSerials) != 2 || got.CertSerials[1] != "b2" || got.Revoked() {
+		t.Fatalf("got %+v", got)
+	}
+	// The stored copy is not reachable through the returned one.
+	got.CertSerials[0] = "zz"
+	again, _ := kas.GetByKeyThumbprint(ctx, "k1")
+	if again.CertSerials[0] != "a1" {
+		t.Fatal("stored serials changed through a returned record")
+	}
+
+	at := time.Now().UTC()
+	// Wrong fingerprint, unknown key: no mark, no error.
+	for _, c := range []struct{ tp, fp string }{{"k1", "other"}, {"missing", "fp1"}} {
+		if ok, err := kas.MarkKeyRevoked(ctx, c.tp, c.fp, "r", at); ok || err != nil {
+			t.Fatalf("%v: ok=%v err=%v", c, ok, err)
+		}
+	}
+	if ok, err := kas.MarkKeyRevoked(ctx, "k1", "fp1", "status_list_revoked", at); !ok || err != nil {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	if ok, _ := kas.MarkKeyRevoked(ctx, "k1", "fp1", "again", at); ok {
+		t.Fatal("marked twice")
+	}
+	got, err := kas.GetByKeyThumbprint(ctx, "k1")
+	if err != nil || !got.Revoked() || got.RevokedReason != "status_list_revoked" || got.Home != domain.KeyHomeTEE {
+		t.Fatalf("record not kept revoked: %+v err=%v", got, err)
+	}
+	// Never deleted, and a fresh weaker record replaces it.
+	fresh := &domain.KeyAttestationRecord{KeyThumbprint: "k1", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE, ChainFingerprint: "fp2", CertSerials: []string{"c3"}}
+	if err := kas.MarkKeyAttested(ctx, fresh); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = kas.GetByKeyThumbprint(ctx, "k1")
+	if got.Revoked() || got.ChainFingerprint != "fp2" {
+		t.Fatalf("fresh record did not replace the revoked one: %+v", got)
+	}
+}
+
+func TestKeyAttestationStore_ReplaceKeyEvidence(t *testing.T) {
+	ctx := context.Background()
+	kas := NewStore().KeyAttestations()
+	strong := &domain.KeyAttestationRecord{KeyThumbprint: "k1", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox, ChainFingerprint: "old", VerifiedAt: time.Now().UTC()}
+	if err := kas.MarkKeyAttested(ctx, strong); err != nil {
+		t.Fatal(err)
+	}
+	weak := &domain.KeyAttestationRecord{KeyThumbprint: "k1", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE, ChainFingerprint: "new"}
+	// A different stored chain, or no record: nothing is written.
+	if ok, err := kas.ReplaceKeyEvidence(ctx, weak, "not-the-stored-chain"); ok || err != nil {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	other := &domain.KeyAttestationRecord{KeyThumbprint: "none", ChainFingerprint: "x"}
+	if ok, err := kas.ReplaceKeyEvidence(ctx, other, "x"); ok || err != nil {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	if got, _ := kas.GetByKeyThumbprint(ctx, "k1"); got.ChainFingerprint != "old" {
+		t.Fatalf("written without a match: %+v", got)
+	}
+	created, _ := kas.GetByKeyThumbprint(ctx, "k1")
+	// The stale chain matches: replaced whatever the rank (no-downgrade is not applied).
+	if ok, err := kas.ReplaceKeyEvidence(ctx, weak, "old"); !ok || err != nil {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	got, _ := kas.GetByKeyThumbprint(ctx, "k1")
+	if got.ChainFingerprint != "new" || got.Home != domain.KeyHomeTEE || !got.CreatedAt.Equal(created.CreatedAt) || got.Revoked() {
+		t.Fatalf("got %+v", got)
+	}
+}

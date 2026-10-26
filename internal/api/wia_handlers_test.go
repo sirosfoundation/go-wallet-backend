@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -285,6 +286,45 @@ func TestWIAGenerate_KeyAttestationErrorsMapToStatuses(t *testing.T) {
 			w := postWIAGenerate(t, h, router, tc.ka)
 			if w.Code != tc.status || errCode(t, w) != tc.code {
 				t.Fatalf("status %d code %q body %s", w.Code, errCode(t, w), w.Body.String())
+			}
+		})
+	}
+}
+
+type nqVerifier struct{ reason string }
+
+func (nqVerifier) Type() service.KeyAttestationType { return service.KeyAttestationAndroidKey }
+func (v nqVerifier) Verify(context.Context, *service.InstanceKeyEvidenceInput) (*service.InstanceKeyEvidenceResult, error) {
+	return nil, &service.KeyAttestationNotQualifyingError{Reason: v.reason}
+}
+
+// A reject-mode refusal is 400 KEY_ATTESTATION_NOT_QUALIFYING with the reason
+// enum in details and nothing else from the evidence.
+func TestWIAGenerate_NotQualifyingCarriesOnlyTheReasonEnum(t *testing.T) {
+	for _, reason := range append(append([]string{}, service.NoHomeReasons...), "free text <script> from an evidence") {
+		t.Run(reason, func(t *testing.T) {
+			h, router := setupWIATestHandlers(t, true)
+			h.services.WIA.RegisterInstanceKeyVerifier(nqVerifier{reason: reason})
+			w := postWIAGenerate(t, h, router, `,"key_attestation":{"type":"android_key"}`)
+			if w.Code != http.StatusBadRequest || errCode(t, w) != "KEY_ATTESTATION_NOT_QUALIFYING" {
+				t.Fatalf("status %d body %s", w.Code, w.Body.String())
+			}
+			var resp struct {
+				Details map[string]string `json:"details"`
+				Message string            `json:"message"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+				t.Fatal(err)
+			}
+			want := reason
+			if !strings.Contains(strings.Join(service.NoHomeReasons, ","), reason) {
+				want = "other"
+			}
+			if len(resp.Details) != 1 || resp.Details["reason"] != want {
+				t.Fatalf("details = %v, want reason %q", resp.Details, want)
+			}
+			if strings.Contains(w.Body.String(), "script") {
+				t.Fatalf("evidence text leaked: %s", w.Body.String())
 			}
 		})
 	}

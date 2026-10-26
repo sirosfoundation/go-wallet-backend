@@ -150,6 +150,10 @@ func lintRule(r Rule, cfg *config.AssuranceConfig) []Finding {
 		out = append(out, lintCandidate(list, cfg, warnf)...)
 	}
 
+	// fido2_hw premise: verified fido2 evidence only counts as hardware when
+	// the rule names the operator's AAGUID list.
+	out = append(out, lintFido2AAGUIDFilter(list, cfg, warnf)...)
+
 	// Rules that depend on client claims.
 	if ev := childList(list, "evidence"); ev != nil {
 		if cl := childList(ev, "claimed"); cl != nil && hasRealChildren(cl) {
@@ -243,6 +247,10 @@ func hasRealChildren(l *sexp.List) bool {
 // candidateValues returns the atoms a (tier ...)/(name ...) group names and
 // whether it uses a star form that is not a plain set (an open grant).
 func candidateValues(l *sexp.List) (values []string, open bool) {
+	if len(l.Elements) == 0 {
+		// A bare (tier) is "don't care": it matches every tier.
+		return nil, true
+	}
 	for _, el := range l.Elements {
 		switch v := el.(type) {
 		case *sexp.Atom:
@@ -269,7 +277,10 @@ func lintCandidate(rule *sexp.List, cfg *config.AssuranceConfig, warnf func(stri
 	}
 	group := childList(rule, tag)
 	if group == nil {
-		return nil
+		// A rule listing no (tier ...)/(name ...) group matches every
+		// candidate: positional prefix matching treats the omitted slot as
+		// "don't care".
+		return []Finding{warnf("has no (%s ...) group; it matches every candidate and grants every tier or entry", candidateTag(rule.Tag))}
 	}
 	values, open := candidateValues(group)
 	var out []Finding
@@ -347,4 +358,124 @@ func hasListValue(el sexp.Element) bool {
 		}
 	}
 	return false
+}
+
+// lintFido2AAGUIDFilter enforces the documented fido2_hw premise: an
+// authenticator counts as hardware only if the operator's rules list its
+// AAGUID. The AAGUID set IS the hardware filter (MDS3 trust alone does not
+// say "hardware"). In assure-ks and assure-ua, a rule whose verified fido2
+// slot is not "none" and that either grants a tier above the scheme floor or
+// constrains mds3/uv/cert, must also constrain (aaguid ...) to a value or a
+// set. A bare (fido2) that grants only the floor is harmless and is not
+// reported. The check reads the configured scheme's floor and level order;
+// it never names a level. Without a configuration the floor is unknown, so
+// any granted tier counts as above it.
+func lintFido2AAGUIDFilter(rule *sexp.List, cfg *config.AssuranceConfig, warnf func(string, ...interface{}) Finding) []Finding {
+	if rule.Tag != DimKeyStorage && rule.Tag != DimUserAuthentication {
+		return nil
+	}
+	ev := childList(rule, "evidence")
+	if ev == nil {
+		return nil
+	}
+	ver := childList(ev, "verified")
+	if ver == nil {
+		return nil
+	}
+	f2 := childList(ver, "fido2")
+	if f2 == nil || (len(f2.Elements) > 0 && !hasRealChildren(f2)) {
+		return nil // absent, or (fido2 none)
+	}
+	if g := childList(f2, "aaguid"); g != nil && narrowsAAGUID(g) {
+		return nil
+	}
+	constrained := ""
+	for _, name := range []string{"mds3", "uv", "cert"} {
+		if g := childList(f2, name); g != nil && len(g.Elements) > 0 {
+			constrained = name
+			break
+		}
+	}
+	if constrained == "" && !grantsAboveFloor(rule, cfg) {
+		return nil
+	}
+	why := "grants a tier above the scheme floor"
+	if constrained != "" {
+		why = fmt.Sprintf("constrains fido2 %s", constrained)
+	}
+	return []Finding{warnf("%s from verified fido2 evidence without an (aaguid ...) constraint; the AAGUID set is the hardware filter (an authenticator counts as hardware only if the rules list its AAGUID), so narrow it with (fido2 (mds3 ...)(aaguid (* set ...)))", why)}
+}
+
+// grantsAboveFloor reports whether the rule's (tier ...) names any level
+// above the configured scheme's floor, or uses an open star form.
+func grantsAboveFloor(rule *sexp.List, cfg *config.AssuranceConfig) bool {
+	group := childList(rule, candidateTag(rule.Tag))
+	if group == nil {
+		return true // an omitted (tier ...) matches every tier
+	}
+	values, open := candidateValues(group)
+	if open {
+		return true
+	}
+	if cfg == nil {
+		return len(values) > 0
+	}
+	id := cfg.KeyStorageScheme
+	if rule.Tag == DimUserAuthentication {
+		id = cfg.UserAuthenticationScheme
+	}
+	sc, ok := cfg.SchemeByID(id)
+	if !ok {
+		return len(values) > 0
+	}
+	idx := map[string]int{}
+	for i, l := range sc.Levels {
+		idx[l] = i
+	}
+	floor, ok := idx[sc.Floor]
+	if !ok {
+		floor = 0
+	}
+	for _, v := range values {
+		if i, known := idx[v]; known && i > floor {
+			return true
+		}
+	}
+	return false
+}
+
+// narrowsAAGUID reports whether an (aaguid ...) group restricts to listed
+// models: at least one element, and no member that accepts every model (a
+// bare (*) wildcard, an empty prefix/suffix, or a range).
+func narrowsAAGUID(g *sexp.List) bool {
+	if len(g.Elements) == 0 {
+		return false
+	}
+	for _, el := range g.Elements {
+		if !narrowingElement(el) {
+			return false
+		}
+	}
+	return true
+}
+
+func narrowingElement(el sexp.Element) bool {
+	switch v := el.(type) {
+	case *starform.Wildcard, *starform.Range:
+		return false
+	case *starform.Prefix:
+		return v.Value != ""
+	case *starform.Suffix:
+		return v.Value != ""
+	case *starform.Set:
+		if len(v.Elements) == 0 {
+			return false
+		}
+		for _, m := range v.Elements {
+			if !narrowingElement(m) {
+				return false
+			}
+		}
+	}
+	return true
 }

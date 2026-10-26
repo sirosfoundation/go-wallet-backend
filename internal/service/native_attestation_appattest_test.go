@@ -228,6 +228,9 @@ func TestAppAttest_DevelopmentKeyIsNeverVerifiedHomeEligible(t *testing.T) {
 	if res.AttestationSource != "development_attested" {
 		t.Errorf("source = %q", res.AttestationSource)
 	}
+	if res.AppID != "" {
+		t.Errorf("AppID = %q; a development (self-signed) attestation must not report a verified app id", res.AppID)
+	}
 	rec, _ := h.keys.Get(context.Background(), d.keyIDB64())
 	if rec.Environment != domain.AppAttestDevelopment || rec.VerifiedHomeEligible() {
 		t.Errorf("development key eligible for a verified home: %+v", rec)

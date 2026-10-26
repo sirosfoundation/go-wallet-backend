@@ -36,6 +36,9 @@ const (
 	maxAndroidX5CB64Length = maxAndroidCertBytes*4/3 + 8
 )
 
+// androidBootVerified is the verifiedBootState value for a fully verified boot.
+const androidBootVerified = 0
+
 // Level strings recorded with the evidence.
 const (
 	androidLevelNameStrongBox = "strongbox"
@@ -59,21 +62,40 @@ const (
 //     expired or not-yet-valid certificate, wrong leaf key, wrong challenge,
 //     missing attestation extension, a revoked certificate;
 //   - unavailable (WIA refused, nothing recorded): no fresh revocation list;
-//   - no home (nothing recorded, WIA issues with the home unknown): not
-//     configured (no anchors or no allowed app digests), chain does not end
-//     in a pinned anchor, a software security level, a key not generated in
-//     the keystore, no SIGN purpose, an application not on the allowlist;
+//   - no home (nothing recorded): not configured (no anchors or no allowed
+//     app digests), chain does not end in a pinned anchor, a software
+//     security level, a key not generated in the keystore, no SIGN purpose,
+//     an application not on the allowlist, and in reject mode a boot state
+//     that is not verified, an unlocked bootloader or an old patch level. With
+//     enforcement "ignore" (default) the WIA issues with the home unknown;
+//     with "reject" the WIA is refused (KeyAttestationNotQualifyingError) with
+//     one of the fixed NoHome* reasons;
 //   - verified: a record with Home strongbox or tee.
 //
-// Boot state, bootloader lock and patch level are recorded, never required:
-// policy decides what to do with them.
+// In ignore mode boot state, bootloader lock and patch level are recorded,
+// never required: policy decides what to do with them. The record also keeps
+// the chain's serial numbers so it can be checked against the revocation list
+// again each time it is used (Recheck).
 type AndroidKeyAttestationVerifier struct {
 	logger     *zap.Logger
 	anchors    *x509.CertPool
 	numAnchors int
-	digests    map[string]struct{}
-	packages   map[string]struct{}
-	status     *androidStatusList
+	// anchorFPs are the SHA-256 fingerprints (hex) of the pinned anchors, so a
+	// stored record can be checked against the CURRENT pins.
+	anchorFPs map[string]struct{}
+	digests   map[string]struct{}
+	packages  map[string]struct{}
+	status    *androidStatusList
+	policy    androidEnforcement
+}
+
+// androidEnforcement is the configured handling of evidence that does not
+// qualify (see config.AndroidKeyAttestationConfig.Enforcement).
+type androidEnforcement struct {
+	reject        bool
+	verifiedBoot  bool
+	lockedBoot    bool
+	minPatchLevel int
 }
 
 // NewAndroidKeyAttestationVerifier builds the verifier from configuration. A
@@ -82,10 +104,17 @@ type AndroidKeyAttestationVerifier struct {
 // trust configuration); an EMPTY configuration is valid and verifies nothing.
 func NewAndroidKeyAttestationVerifier(cfg config.AndroidKeyAttestationConfig, logger *zap.Logger, fetcher AttestationStatusFetcher) (*AndroidKeyAttestationVerifier, error) {
 	v := &AndroidKeyAttestationVerifier{
-		logger:   logger.Named("android-key-attestation"),
-		anchors:  x509.NewCertPool(),
-		digests:  make(map[string]struct{}),
-		packages: make(map[string]struct{}),
+		logger:    logger.Named("android-key-attestation"),
+		anchors:   x509.NewCertPool(),
+		anchorFPs: make(map[string]struct{}),
+		digests:   make(map[string]struct{}),
+		packages:  make(map[string]struct{}),
+		policy: androidEnforcement{
+			reject:        cfg.Rejecting(),
+			verifiedBoot:  cfg.VerifiedBootRequired(),
+			lockedBoot:    cfg.LockedBootloaderRequired(),
+			minPatchLevel: cfg.MinPatchLevel,
+		},
 	}
 	var pemData []byte
 	if cfg.TrustAnchorsPath != "" {
@@ -101,7 +130,7 @@ func NewAndroidKeyAttestationVerifier(cfg config.AndroidKeyAttestationConfig, lo
 		pemData = append(pemData, '\n')
 	}
 	pemData = append(pemData, cfg.TrustAnchorsPEM...)
-	n, err := addPEMAnchors(v.anchors, pemData)
+	n, err := addPEMAnchors(v.anchors, v.anchorFPs, pemData)
 	if err != nil {
 		return nil, fmt.Errorf("android_key_attestation trust anchors: %w", err)
 	}
@@ -127,8 +156,13 @@ func NewAndroidKeyAttestationVerifier(cfg config.AndroidKeyAttestationConfig, lo
 	}
 	v.status = newAndroidStatusList(fetcher, time.Duration(cfg.StatusListDefaultTTLSeconds)*time.Second)
 	if !v.configured() {
-		v.logger.Warn("android key attestation has no trust anchors or no allowed app digests: submitted android_key evidence will be ignored (home unknown)",
-			zap.Int("trust_anchors", v.numAnchors), zap.Int("allowed_app_digests", len(v.digests)))
+		if v.policy.reject {
+			v.logger.Error("android key attestation enforcement is reject but there are no trust anchors or no allowed app digests: every submitted android_key evidence will be refused",
+				zap.Int("trust_anchors", v.numAnchors), zap.Int("allowed_app_digests", len(v.digests)))
+		} else {
+			v.logger.Warn("android key attestation has no trust anchors or no allowed app digests: submitted android_key evidence will be ignored (home unknown)",
+				zap.Int("trust_anchors", v.numAnchors), zap.Int("allowed_app_digests", len(v.digests)))
+		}
 	}
 	return v, nil
 }
@@ -141,7 +175,7 @@ func (v *AndroidKeyAttestationVerifier) setStatusClock(now func() time.Time) { v
 // one would be dropped silently and the operator would run with a partially
 // read trust configuration; instead the number of BEGIN lines must equal the
 // number of blocks that decoded, and nothing but whitespace may surround them.
-func addPEMAnchors(pool *x509.CertPool, data []byte) (int, error) {
+func addPEMAnchors(pool *x509.CertPool, fps map[string]struct{}, data []byte) (int, error) {
 	begins := bytes.Count(data, []byte("-----BEGIN "))
 	if begins > 0 && !bytes.HasPrefix(bytes.TrimSpace(data), []byte("-----BEGIN ")) {
 		return 0, errors.New("unexpected data before the first PEM block")
@@ -161,6 +195,8 @@ func addPEMAnchors(pool *x509.CertPool, data []byte) (int, error) {
 			return 0, fmt.Errorf("parse certificate: %w", err)
 		}
 		pool.AddCert(cert)
+		fp := sha256.Sum256(cert.Raw)
+		fps[hex.EncodeToString(fp[:])] = struct{}{}
 		count++
 	}
 	if len(bytes.TrimSpace(data)) != 0 {
@@ -192,7 +228,15 @@ func androidInvalid(format string, a ...any) error {
 	return fmt.Errorf("%w: android_key: %s", ErrWIAKeyAttestationInvalid, fmt.Sprintf(format, a...))
 }
 
-func noHome(reason string) (*InstanceKeyEvidenceResult, error) {
+// notQualifying is the outcome for well formed evidence that cannot name a
+// home. In ignore mode it is a result with no record (the WIA issues with the
+// home unknown); in reject mode it is a KeyAttestationNotQualifyingError. The
+// reason is always one of the fixed NoHome* values, never text from the
+// evidence.
+func (v *AndroidKeyAttestationVerifier) notQualifying(reason string) (*InstanceKeyEvidenceResult, error) {
+	if v.policy.reject {
+		return nil, &KeyAttestationNotQualifyingError{Reason: reason}
+	}
 	return &InstanceKeyEvidenceResult{Reason: reason}, nil
 }
 
@@ -231,7 +275,7 @@ func parseAndroidChain(x5c []string) ([]*x509.Certificate, error) {
 // Verify implements InstanceKeyEvidenceVerifier.
 func (v *AndroidKeyAttestationVerifier) Verify(ctx context.Context, in *InstanceKeyEvidenceInput) (*InstanceKeyEvidenceResult, error) {
 	if !v.configured() {
-		return noHome("android key attestation is not configured")
+		return v.notQualifying(NoHomeNotConfigured)
 	}
 	var p struct {
 		X5C []string `json:"x5c"`
@@ -276,7 +320,7 @@ func (v *AndroidKeyAttestationVerifier) Verify(ctx context.Context, in *Instance
 	if err != nil {
 		var unknown x509.UnknownAuthorityError
 		if errors.As(err, &unknown) {
-			return noHome("chain does not end in a pinned trust anchor")
+			return v.notQualifying(NoHomeUntrustedRoot)
 		}
 		return nil, androidInvalid("chain: %v", err)
 	}
@@ -319,14 +363,14 @@ func (v *AndroidKeyAttestationVerifier) Verify(ctx context.Context, in *Instance
 	// Where the key lives: both levels must be hardware, and the weaker wins.
 	home, level, ok := androidHome(kd)
 	if !ok {
-		return noHome("security level is not hardware backed")
+		return v.notQualifying(NoHomeSoftwareSecurityLevel)
 	}
 	// Facts that hold of the key must come from the hardware-enforced list.
 	if kd.TEE.Origin == nil || *kd.TEE.Origin != androidOriginGenerated {
-		return noHome("key was not generated in the keystore")
+		return v.notQualifying(NoHomeKeyNotGenerated)
 	}
 	if !kd.TEE.hasPurpose(androidPurposeSign) {
-		return noHome("key has no SIGN purpose")
+		return v.notQualifying(NoHomeNoSignPurpose)
 	}
 	appID := kd.Software.AppID
 	if appID == nil {
@@ -334,7 +378,17 @@ func (v *AndroidKeyAttestationVerifier) Verify(ctx context.Context, in *Instance
 	}
 	appDigest, allowed := v.appAllowed(appID)
 	if !allowed {
-		return noHome("application is not on the allowlist")
+		return v.notQualifying(NoHomeAppNotAllowed)
+	}
+	appPackages := append([]string(nil), appID.Packages...)
+	sort.Strings(appPackages)
+
+	// Reject mode also demands a healthy device. Ignore mode records these
+	// facts and decides nothing from them.
+	if v.policy.reject {
+		if reason := v.bootPolicy(kd); reason != "" {
+			return v.notQualifying(reason)
+		}
 	}
 
 	// Revocation last: the list is only consulted for evidence that would
@@ -358,15 +412,23 @@ func (v *AndroidKeyAttestationVerifier) Verify(ctx context.Context, in *Instance
 		}
 	}
 	fp := sha256.Sum256(certs[0].Raw)
+	anchorFP := sha256.Sum256(chain[len(chain)-1].Raw)
+	certSerials := make([]string, 0, len(serials))
+	for _, sn := range serials {
+		certSerials = append(certSerials, serialKey(sn))
+	}
 	rec := &domain.KeyAttestationRecord{
-		Kind:              domain.KeyEvidenceAndroidKey,
-		Home:              home,
-		SecurityLevel:     level,
-		AppDigest:         appDigest,
-		ChainFingerprint:  hex.EncodeToString(fp[:]),
-		ChainNotAfter:     notAfter.UTC(),
-		VerifiedAt:        in.Now,
-		VerifiedBootState: "",
+		Kind:                   domain.KeyEvidenceAndroidKey,
+		CertSerials:            certSerials,
+		TrustAnchorFingerprint: hex.EncodeToString(anchorFP[:]),
+		Home:                   home,
+		SecurityLevel:          level,
+		AppDigest:              appDigest,
+		AppPackages:            appPackages,
+		ChainFingerprint:       hex.EncodeToString(fp[:]),
+		ChainNotAfter:          notAfter.UTC(),
+		VerifiedAt:             in.Now,
+		VerifiedBootState:      "",
 	}
 	if rot := kd.TEE.RootOfTrust; rot != nil {
 		rec.VerifiedBootState = androidBootStateName(rot.VerifiedBootState)
@@ -377,6 +439,38 @@ func (v *AndroidKeyAttestationVerifier) Verify(ctx context.Context, in *Instance
 		rec.PatchLevel = strconv.Itoa(*kd.TEE.OsPatchLevel)
 	}
 	return &InstanceKeyEvidenceResult{Record: rec}, nil
+}
+
+// bootPolicy applies the reject-mode device requirements to the hardware
+// enforced boot facts and returns the NoHome reason of the first one that
+// fails, "" when all hold. A missing root of trust (or patch level) fails the
+// requirement that needs it: absence is never a pass.
+func (v *AndroidKeyAttestationVerifier) bootPolicy(kd *androidKeyDescription) string {
+	rot := kd.TEE.RootOfTrust
+	if v.policy.verifiedBoot && (rot == nil || rot.VerifiedBootState != androidBootVerified) {
+		return NoHomeBootNotVerified
+	}
+	if v.policy.lockedBoot && (rot == nil || !rot.DeviceLocked) {
+		return NoHomeBootloaderUnlocked
+	}
+	if min := v.policy.minPatchLevel; min > 0 {
+		if kd.TEE.OsPatchLevel == nil {
+			return NoHomePatchLevelMissing
+		}
+		if normalizePatchLevel(*kd.TEE.OsPatchLevel) < min {
+			return NoHomePatchLevelTooOld
+		}
+	}
+	return ""
+}
+
+// normalizePatchLevel reduces a YYYYMMDD patch level to YYYYMM (osPatchLevel
+// is YYYYMM; some devices report a day as well).
+func normalizePatchLevel(p int) int {
+	if p > 999999 {
+		return p / 100
+	}
+	return p
 }
 
 // androidHome maps the attestation and keymaster security levels to a key
@@ -461,8 +555,14 @@ func init() {
 // cmd/server calls it at startup so a half-read trust configuration stops the
 // process instead of silently disabling the verifier.
 func CheckAndroidKeyAttestationConfig(cfg config.AndroidKeyAttestationConfig) error {
-	_, err := NewAndroidKeyAttestationVerifier(cfg, zap.NewNop(), noStatusFetcher{})
-	return err
+	v, err := NewAndroidKeyAttestationVerifier(cfg, zap.NewNop(), noStatusFetcher{})
+	if err != nil {
+		return err
+	}
+	if v.policy.reject && !v.configured() {
+		return fmt.Errorf("android_key_attestation.enforcement=reject needs at least one trust anchor and one allowed app digest (anchors: %d, digests: %d)", v.numAnchors, len(v.digests))
+	}
+	return nil
 }
 
 type noStatusFetcher struct{}
@@ -484,7 +584,97 @@ func newAndroidKeyVerifierForServer(cfg *config.Config, logger *zap.Logger) *And
 	v, err := NewAndroidKeyAttestationVerifier(ac, logger, fetcher)
 	if err != nil {
 		logger.Error("android key attestation configuration unusable; android_key evidence will be ignored", zap.Error(err))
-		v, _ = NewAndroidKeyAttestationVerifier(config.AndroidKeyAttestationConfig{}, logger, fetcher)
+		// Keep the enforcement mode: a reject deployment must keep refusing,
+		// not quietly become an ignore deployment.
+		v, _ = NewAndroidKeyAttestationVerifier(config.AndroidKeyAttestationConfig{Enforcement: ac.Enforcement}, logger, fetcher)
 	}
 	return v
+}
+
+// Recheck implements InstanceKeyEvidenceRechecker: it decides whether a stored
+// android_key record may still be used. In this order:
+//
+//  1. its chain must not have expired;
+//  2. the CURRENT configuration must still accept what the record says: trust
+//     and app allowlists (digests, packages) always, and in reject mode the
+//     boot-state, bootloader and patch-level requirements (a configuration
+//     tightened after submission applies to evidence already stored, so a
+//     renewal that submits nothing cannot keep an old approval alive). A record
+//     that no longer qualifies is RecheckNotQualifying, not an outage, and is
+//     never marked: relaxing the configuration again restores it;
+//  3. it must carry the serials of its chain (records stored before they were
+//     kept cannot be re-checked and are unknown, never good);
+//  4. none of the serials may be on a FRESH revocation list. A list that cannot
+//     be had is an error (the caller fails closed).
+func (v *AndroidKeyAttestationVerifier) Recheck(ctx context.Context, rec *domain.KeyAttestationRecord, now time.Time) (RecheckResult, error) {
+	if !rec.ChainNotAfter.IsZero() && !now.Before(rec.ChainNotAfter) {
+		return RecheckResult{Verdict: RecheckExpired, Reason: RecheckReasonExpired}, nil
+	}
+	if reason := v.storedRecordPolicy(rec); reason != "" {
+		return RecheckResult{Verdict: RecheckNotQualifying, Reason: reason}, nil
+	}
+	if len(rec.CertSerials) == 0 || rec.ChainNotAfter.IsZero() {
+		return RecheckResult{Verdict: RecheckUnknown, Reason: RecheckReasonLegacy}, nil
+	}
+	serial, revoked, err := v.status.checkKeys(ctx, rec.CertSerials)
+	if err != nil {
+		return RecheckResult{}, err
+	}
+	if revoked {
+		return RecheckResult{Verdict: RecheckRevoked, Reason: RecheckReasonRevoked, Serial: serial}, nil
+	}
+	return RecheckResult{Verdict: RecheckGood}, nil
+}
+
+// storedRecordPolicy applies the current configuration to a stored record and
+// returns the NoHome reason of the first requirement it fails, "" when it
+// still qualifies. What the record does not carry fails the requirement that
+// needs it.
+func (v *AndroidKeyAttestationVerifier) storedRecordPolicy(rec *domain.KeyAttestationRecord) string {
+	if !v.configured() {
+		return NoHomeNotConfigured
+	}
+	// The root the chain ended in must still be pinned: removing a root from
+	// the configuration withdraws what it vouched for. A record that does not
+	// say which root it ended in cannot be shown to have a pinned one.
+	if _, ok := v.anchorFPs[rec.TrustAnchorFingerprint]; !ok {
+		return NoHomeUntrustedRoot
+	}
+	if rec.AppDigest == "" {
+		return NoHomeAppNotAllowed
+	}
+	for _, d := range strings.Split(rec.AppDigest, ",") {
+		if _, ok := v.digests[d]; !ok {
+			return NoHomeAppNotAllowed
+		}
+	}
+	if len(v.packages) > 0 {
+		if len(rec.AppPackages) == 0 {
+			return NoHomeAppNotAllowed
+		}
+		for _, p := range rec.AppPackages {
+			if _, ok := v.packages[p]; !ok {
+				return NoHomeAppNotAllowed
+			}
+		}
+	}
+	if !v.policy.reject {
+		return ""
+	}
+	if v.policy.verifiedBoot && rec.VerifiedBootState != androidBootStateName(androidBootVerified) {
+		return NoHomeBootNotVerified
+	}
+	if v.policy.lockedBoot && (rec.DeviceLocked == nil || !*rec.DeviceLocked) {
+		return NoHomeBootloaderUnlocked
+	}
+	if min := v.policy.minPatchLevel; min > 0 {
+		pl, err := strconv.Atoi(rec.PatchLevel)
+		if err != nil {
+			return NoHomePatchLevelMissing
+		}
+		if normalizePatchLevel(pl) < min {
+			return NoHomePatchLevelTooOld
+		}
+	}
+	return ""
 }

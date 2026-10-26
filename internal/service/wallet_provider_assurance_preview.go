@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"errors"
+	"fmt"
 
 	"go.uber.org/zap"
 
@@ -93,7 +94,9 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 					overlay = stored
 				}
 			} else if !errors.Is(err, storage.ErrNotFound) {
-				s.logger.Warn("stored key evidence lookup failed; previewing the submission", zap.Error(err))
+				// Without the stored record the dry run cannot say whether the
+				// submission would replace it; a wrong preview is worse than none.
+				return nil, fmt.Errorf("look up stored key evidence: %w", err)
 			}
 		}
 	}
@@ -155,6 +158,15 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 		if rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, req.WalletInstanceID); err == nil {
 			if caller, ok := ctx.Value(callerCtxKey{}).(KeyAttestationCaller); ok && !instanceEvidenceInScope(rec, caller.TenantID, caller.UserID) {
 				rec = nil
+			}
+			// The preview cannot answer 503: evidence that cannot be
+			// re-checked (or no longer stands) is absent, the lowest tier.
+			if rec != nil {
+				var uerr error
+				if rec, uerr = s.keyChecker.usable(ctx, s.keyAttestations, rec); uerr != nil {
+					s.logger.Warn("instance key evidence cannot be re-checked; treating as none in the preview", zap.Error(uerr))
+					rec = nil
+				}
 			}
 			wiaFacts.Fido2 = fido2VerifiedFromRecord(rec)
 			wiaFacts.InstanceKey = instanceKeyVerifiedFromRecord(rec)

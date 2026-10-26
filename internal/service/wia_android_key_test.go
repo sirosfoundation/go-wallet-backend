@@ -31,16 +31,23 @@ type akWIA struct {
 	fetch *fakeStatusFetcher
 }
 
-func newAKWIA(t *testing.T, rules string) *akWIA {
+func newAKWIA(t *testing.T, rules string) *akWIA { return newAKWIAWith(t, rules, nil) }
+
+// newAKWIAWith is newAKWIA with the verifier's configuration adjusted.
+func newAKWIAWith(t *testing.T, rules string, mutate func(*config.AndroidKeyAttestationConfig)) *akWIA {
 	t.Helper()
 	svc, inst := wiaAssuranceSvc(t, rules)
 	keys := memory.NewStore().KeyAttestations()
 	svc.SetKeyAttestations(keys)
 	fx := newChainFixture(t)
 	fetch := &fakeStatusFetcher{body: emptyStatusList, maxAge: time.Hour}
-	v, err := NewAndroidKeyAttestationVerifier(config.AndroidKeyAttestationConfig{
+	acfg := config.AndroidKeyAttestationConfig{
 		TrustAnchorsPEM: fx.rootPEM(), AllowedAppDigests: []string{testAppDigestHex()},
-	}, zap.NewNop(), fetch)
+	}
+	if mutate != nil {
+		mutate(&acfg)
+	}
+	v, err := NewAndroidKeyAttestationVerifier(acfg, zap.NewNop(), fetch)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,6 +368,7 @@ func TestWIAAndroidKey_EvidenceIsScopedToTenantAndUser(t *testing.T) {
 
 func TestPreview_WIAHalfHonoursEvidenceScope(t *testing.T) {
 	svc, instances, keys := previewSvc(t, wiaNeedsAndroidRules, true)
+	svc.SetInstanceKeyChecker(goodChecker())
 	const jkt = "instance-key-jkt-android"
 	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: jkt, TenantID: domain.DefaultTenantID, Status: domain.InstanceStatusActive, LastAttestedAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)

@@ -20,8 +20,19 @@
 # "don't care". Only the (verified ...) group is backend-verified evidence;
 # (claimed ...) is whatever the client said.
 #
-# Replace the placeholder AAGUIDs with the authenticator models you accept.
+# THE AAGUID SET IS THE HARDWARE FILTER.  fido2_hw rests on one documented
+# premise: an authenticator counts as hardware only if (a) its attestation is
+# MDS3 trusted AND (b) the operator's rules list its AAGUID.  MDS3 trust alone
+# does not say "hardware" (the backend does not read MDS3 keyProtection), so
+# NO rule that grants a tier above the floor (key storage or user
+# authentication) from verified fido2 evidence may omit an
+# (aaguid (* set ...)) set.  assurance-lint warns on such a rule, and the
+# shipped templates are tested to have no such finding.
+#
+# Replace the placeholder AAGUIDs (obviously not real: 00000000-...) with the
+# authenticator models you have vetted as hardware and accept.
 
+# The (aaguid (* set ...)) below is mandatory: it is the hardware filter.
 # id: prod-fido2-mds3-ks
 (assure-ks (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2 (mds3 trusted)(aaguid (* set 00000000-0000-0000-0000-000000000001 00000000-0000-0000-0000-000000000002))))))
 
@@ -30,7 +41,8 @@
 # backend records the user-verified flag of the verified FIDO2 attestation.
 # With several keys in a batch uv is "present" only if EVERY key has it.
 # The rule below grants moderate only to the listed models AND only with uv;
-# a key made without user verification stays at the floor.
+# a key made without user verification stays at the floor. The aaguid set is
+# the hardware filter here too.
 
 # id: prod-fido2-mds3-ua
 (assure-ua (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2 (mds3 trusted)(aaguid (* set 00000000-0000-0000-0000-000000000001))(uv present)))))
@@ -50,6 +62,33 @@
 
 # id: wia-issue-all
 (assure-wia-issue (evidence))
+
+# Optional, STRICTER issuance gate (template, stays commented): issue a WIA
+# only when the backend holds VERIFIED evidence that the wallet's instance key
+# (the WIA PoP key) is an Android Keystore key, that is an android_key
+# attestation chain it verified for that very key (key_attestation
+# {type android_key} on /wallet-provider/wia/generate, against the operator
+# pinned roots in wallet_provider.attestation.android_key_attestation) and
+# that is still standing at this request (the stored chain is checked again
+# against Google's revocation list on every use; a revoked, expired or
+# unverifiable record reads as (instance_key none)). Every wallet without it
+# is refused, including iOS and web wallets, so use it only for an
+# Android-only deployment. To use it, REPLACE the wia-issue-all rule above
+# (the rules are alternatives: while wia-issue-all stands everyone still
+# gets a WIA), uncomment this one and put an id line before it:
+# "# id: wia-issue-android-key". Narrow it with (home (* set strongbox tee))
+# or (boot verified) in the instance_key group if needed.
+#
+# WHAT THIS DOES NOT DETECT. Android key attestation proves the key lives in
+# the device's TEE or StrongBox and reports the boot state the device's own
+# trusted software reports. It does not detect a rooted phone that keeps a
+# locked bootloader and spoofs its boot state (an attacker who controls the
+# trusted environment's inputs); it says nothing about the device after the
+# key was generated. Play Integrity (native_attestation) is complementary:
+# it judges the app and device now, but does not bind a key. Require both
+# where that matters.
+#
+# (assure-wia-issue (evidence (verified (fido2)(platform)(hsm)(instance_key (kind android_key)))))
 
 # assure-wia: the S profile. Profiles are probed highest first; the scheme
 # floor (s3-backend-only) is what remains. The platform slot is the native

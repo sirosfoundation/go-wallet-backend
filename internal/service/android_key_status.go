@@ -258,6 +258,16 @@ func (l *androidStatusList) freshLocked() bool { return l.loaded && l.now().Befo
 // check returns the first serial of serials on the list (revoked is true),
 // or ErrAndroidStatusUnavailable when no fresh list is available.
 func (l *androidStatusList) check(ctx context.Context, serials []*big.Int) (revokedSerial string, revoked bool, err error) {
+	keys := make([]string, 0, len(serials))
+	for _, s := range serials {
+		keys = append(keys, serialKey(s))
+	}
+	return l.checkKeys(ctx, keys)
+}
+
+// checkKeys is check over serials already rendered as list keys (lowercase
+// hex, as serialKey and the stored records give them).
+func (l *androidStatusList) checkKeys(ctx context.Context, serials []string) (revokedSerial string, revoked bool, err error) {
 	l.mu.Lock()
 	if l.freshLocked() {
 		defer l.mu.Unlock()
@@ -302,10 +312,11 @@ func (l *androidStatusList) check(ctx context.Context, serials []*big.Int) (revo
 	return s, rev, nil
 }
 
-func lookupSerials(set map[string]struct{}, serials []*big.Int) (string, bool) {
+func lookupSerials(set map[string]struct{}, serials []string) (string, bool) {
 	for _, s := range serials {
-		if _, ok := set[serialKey(s)]; ok {
-			return serialKey(s), true
+		k := normalizeSerialHex(s)
+		if _, ok := set[k]; ok {
+			return k, true
 		}
 	}
 	return "", false

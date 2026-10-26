@@ -3290,3 +3290,94 @@ wallet_provider:
 		t.Fatalf("android_key_attestation = %+v", a)
 	}
 }
+
+func TestAndroidKeyAttestationConfig_EnforcementKeysAndDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	base := `
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+`
+	if err := os.WriteFile(path, []byte(base), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := cfg.WalletProvider.Attestation.AndroidKeyAttestation
+	if a.Rejecting() || a.Enforcement != "" || !a.VerifiedBootRequired() || !a.LockedBootloaderRequired() || a.MinPatchLevel != 0 {
+		t.Fatalf("defaults = %+v (ignore mode; boot requirements default on; no patch level)", a)
+	}
+
+	y := base + `
+wallet_provider:
+  attestation:
+    android_key_attestation:
+      enforcement: reject
+      trust_anchors_pem: PEM
+      allowed_app_digests: [aa]
+      require_verified_boot: false
+      min_patch_level: 202601
+`
+	if err := os.WriteFile(path, []byte(y), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const p = "WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_"
+	t.Setenv(p+"REQUIRE_LOCKED_BOOTLOADER", "false")
+	t.Setenv(p+"MIN_PATCH_LEVEL", "202603")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a = cfg.WalletProvider.Attestation.AndroidKeyAttestation
+	if !a.Rejecting() || a.VerifiedBootRequired() || a.LockedBootloaderRequired() || a.MinPatchLevel != 202603 {
+		t.Fatalf("yaml+env = %+v", a)
+	}
+
+	t.Setenv(p+"ENFORCEMENT", "ignore")
+	t.Setenv(p+"REQUIRE_VERIFIED_BOOT", "true")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a = cfg.WalletProvider.Attestation.AndroidKeyAttestation
+	if a.Rejecting() || !a.VerifiedBootRequired() {
+		t.Fatalf("env override = %+v", a)
+	}
+}
+
+func TestAndroidKeyAttestationConfig_ValidateEnforcement(t *testing.T) {
+	ok := AndroidKeyAttestationConfig{Enforcement: "reject", TrustAnchorsPEM: "x", AllowedAppDigests: []string{"aa"}, MinPatchLevel: 202601}
+	if err := ok.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for name, mut := range map[string]func(*AndroidKeyAttestationConfig){
+		"unknown mode":       func(c *AndroidKeyAttestationConfig) { c.Enforcement = "enforce" },
+		"reject, no anchors": func(c *AndroidKeyAttestationConfig) { c.TrustAnchorsPEM = " " },
+		"reject, no digests": func(c *AndroidKeyAttestationConfig) { c.AllowedAppDigests = nil },
+		"bad month":          func(c *AndroidKeyAttestationConfig) { c.MinPatchLevel = 202613 },
+		"not yyyymm":         func(c *AndroidKeyAttestationConfig) { c.MinPatchLevel = 2026 },
+	} {
+		c := ok
+		mut(&c)
+		if c.Validate() == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	// Anchors from a file count; ignore mode never needs either.
+	c := ok
+	c.TrustAnchorsPEM, c.TrustAnchorsPath = "", "/etc/roots.pem"
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := (AndroidKeyAttestationConfig{Enforcement: "ignore"}).Validate(); err != nil {
+		t.Fatal(err)
+	}
+	// The whole-config Validate applies it.
+	full := validBaseConfig()
+	full.WalletProvider.Attestation.AndroidKeyAttestation = AndroidKeyAttestationConfig{Enforcement: "reject"}
+	if full.Validate() == nil {
+		t.Fatal("Config.Validate accepted reject with nothing pinned")
+	}
+}

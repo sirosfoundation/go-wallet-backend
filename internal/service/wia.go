@@ -182,6 +182,10 @@ type WIAService struct {
 	// type. Registered while wiring the service (RegisterInstanceKeyVerifier).
 	keyVerifiers map[KeyAttestationType]InstanceKeyEvidenceVerifier
 
+	// keyChecker re-checks stored instance-key evidence each time it backs a
+	// WIA (revocation, expiry). Verifiers that can re-check register here too.
+	keyChecker *instanceKeyChecker
+
 	// Challenge store for single-use nonces (memory or MongoDB).
 	challenges WIAChallengeStore
 
@@ -235,6 +239,10 @@ func (s *WIAService) SetAppAttestKeys(k storage.AppAttestKeyStore) {
 		s.nativeAttSvc.SetAppAttestKeys(k)
 	}
 }
+
+// SetInstanceKeyChecker installs the shared re-check of stored instance-key
+// evidence (see instance_key_recheck.go).
+func (s *WIAService) SetInstanceKeyChecker(c *instanceKeyChecker) { s.keyChecker = c }
 
 func (s *WIAService) assuranceEnabled() bool {
 	return s.cfg.WalletProvider.Attestation.Assurance.Enabled
@@ -463,12 +471,21 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 			return "", err
 		}
 	}
-	att.KeyEvidence = s.instanceKeyEvidence(ctx, tenantID, userIDString(userID), jkt)
-	if att.KeyEvidence == nil {
+	att.KeyEvidence, err = s.instanceKeyEvidence(ctx, tenantID, userIDString(userID), jkt)
+	if err != nil {
+		// The stored evidence cannot be re-checked right now: refuse rather
+		// than issue with a home nobody could confirm.
+		s.emitAuditFailure("key_attestation_unavailable", err)
+		return "", err
+	}
+	if att.KeyEvidence == nil && s.storedEvidenceOutOfScope(ctx, tenantID, userIDString(userID), jkt) {
 		// Nothing in scope to read back: no store, or the stored record for
 		// this key belongs to another tenant or user (the store keeps the
 		// stronger one and never replaces it). What was just verified for THIS
 		// caller still counts for this request; the durable record is untouched.
+		// A record that is in scope but revoked, expired or no longer
+		// qualifying stays "none": it was replaced above if a fresh valid
+		// submission superseded it.
 		att.KeyEvidence = submitted
 	}
 
@@ -525,23 +542,41 @@ type wiaAttestation struct {
 // evidence says nothing about the derived key unless a later stage binds them.
 //
 // A store error is treated as no evidence (fail closed to unknown), never as
-// permission.
-func (s *WIAService) instanceKeyEvidence(ctx context.Context, tenantID domain.TenantID, userID, jkt string) *domain.KeyAttestationRecord {
+// permission. A stored record is re-checked before it is used (revocation,
+// expiry, see instance_key_recheck.go): a record that fails is no evidence; a
+// re-check that cannot be done returns an error wrapping
+// ErrWIAKeyAttestationUnavailable.
+func (s *WIAService) instanceKeyEvidence(ctx context.Context, tenantID domain.TenantID, userID, jkt string) (*domain.KeyAttestationRecord, error) {
 	if s.keyAttestations == nil {
-		return nil
+		return nil, nil
 	}
 	rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, jkt)
 	if err != nil {
 		if !errors.Is(err, storage.ErrNotFound) {
 			s.logger.Warn("instance key evidence lookup failed; treating as none", zap.Error(err))
 		}
-		return nil
+		return nil, nil
 	}
 	if !instanceEvidenceInScope(rec, tenantID, userID) {
 		s.logger.Warn("instance key evidence was verified for another tenant or user; ignoring it")
-		return nil
+		return nil, nil
 	}
-	return rec
+	return s.keyChecker.usable(ctx, s.keyAttestations, rec)
+}
+
+// storedEvidenceOutOfScope reports that there is no durable record this caller
+// may read back for jkt: no store is configured, or the stored record was
+// verified for another tenant or user. A record for this caller (usable or not)
+// or an unreadable store is not out of scope.
+func (s *WIAService) storedEvidenceOutOfScope(ctx context.Context, tenantID domain.TenantID, userID, jkt string) bool {
+	if s.keyAttestations == nil {
+		return true
+	}
+	rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, jkt)
+	if err != nil {
+		return false
+	}
+	return !instanceEvidenceInScope(rec, tenantID, userID)
 }
 
 func userIDString(u *domain.UserID) string {

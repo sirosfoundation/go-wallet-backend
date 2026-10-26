@@ -90,3 +90,54 @@ func (s *KeyAttestationStore) GetByKeyThumbprint(ctx context.Context, thumbprint
 	rec.Normalize()
 	return &rec, nil
 }
+
+// MarkKeyRevoked implements storage.KeyAttestationStore. It is one atomic
+// update that matches only the record with the given chain fingerprint that is
+// not yet revoked, and bumps the revision so a concurrent MarkKeyAttested that
+// decided on the old document fails its compare-and-set and re-evaluates.
+func (s *KeyAttestationStore) MarkKeyRevoked(ctx context.Context, thumbprint, chainFingerprint, reason string, at time.Time) (bool, error) {
+	res, err := s.collection.UpdateOne(ctx,
+		bson.M{"_id": thumbprint, "chain_fingerprint": chainFingerprint, "revoked_at": bson.M{"$exists": false}},
+		bson.M{
+			"$set": bson.M{"revoked_at": at.UTC(), "revoked_reason": reason},
+			"$inc": bson.M{"rev": 1},
+		})
+	if err != nil {
+		return false, fmt.Errorf("%w: mark key revoked: %v", storage.ErrDatabase, err)
+	}
+	return res.ModifiedCount == 1, nil
+}
+
+// ReplaceKeyEvidence implements storage.KeyAttestationStore: one compare-and-set
+// on the revision, conditioned on the stale record's chain fingerprint.
+func (s *KeyAttestationStore) ReplaceKeyEvidence(ctx context.Context, rec *domain.KeyAttestationRecord, staleChainFingerprint string) (bool, error) {
+	next := *rec
+	next.Normalize()
+	for try := 0; try < markKeyAttestedMaxTries; try++ {
+		var cur keyAttestationDoc
+		err := s.collection.FindOne(ctx, bson.M{"_id": rec.KeyThumbprint}).Decode(&cur)
+		if err == mongo.ErrNoDocuments {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("%w: replace key evidence: %v", storage.ErrDatabase, err)
+		}
+		if cur.ChainFingerprint != staleChainFingerprint {
+			return false, nil
+		}
+		next.CreatedAt = cur.CreatedAt
+		filter := bson.M{"_id": rec.KeyThumbprint, "rev": cur.Rev}
+		if cur.Rev == 0 {
+			filter = bson.M{"_id": rec.KeyThumbprint, "rev": bson.M{"$exists": false}}
+		}
+		res, err := s.collection.ReplaceOne(ctx, filter, keyAttestationDoc{KeyAttestationRecord: next, Rev: cur.Rev + 1})
+		if err != nil {
+			return false, fmt.Errorf("%w: replace key evidence: %v", storage.ErrDatabase, err)
+		}
+		if res.MatchedCount == 1 {
+			rec.CreatedAt = next.CreatedAt
+			return true, nil
+		}
+	}
+	return false, fmt.Errorf("%w: replace key evidence: too much contention", storage.ErrDatabase)
+}

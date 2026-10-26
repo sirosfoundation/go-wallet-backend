@@ -65,13 +65,20 @@ reported in the startup log, the audit line and the `policy_info` metric):
   `uv` is `present` only if EVERY record has it. Records stored before the
   flag was recorded read as `none`.
   The flag is only evidence when the attestation format's signature covers
-  the authenticator data flags (`packed`, `android-key`, `tpm`, `apple`). In
+  the authenticator data flags (`packed`, `apple`). In
   `fido-u2f` the signature does not cover them, so a u2f attestation always
   records `uv none` (anyone could set the bit on a valid attestation).
+  `android-key` and `tpm` also always record `uv none`: an app can sign
+  caller-constructed authenticator data with an android credential key that
+  needs no user authentication (the attested `NoAuthRequired` /
+  `UserAuthType` constraints are not validated yet), and a TPM attestation
+  identity key certifies a caller-supplied hash.
 * `platform (app_id A)` is the application id the backend verified in the
   instance's most recent native attestation (`WalletInstance.VerifiedAppID`,
   set by the WIA path). The client-reported `DeviceInfo.AppID` is never used.
-  Instances that last attested without native evidence have `app_id none`.
+  Instances that last attested without native evidence have `app_id none`, as
+  do `development_attested` ones: a development App Attest chain is
+  self-signed, so no application was authenticated and no app id is reported.
 * Not populated yet, always `none`: `cert` and the whole `hsm` slot.
 * `instance_key` (schema version 2, appended after `hsm` inside `verified`) is
   verified evidence about the wallet's **instance key** (the WIA PoP key): its
@@ -119,6 +126,20 @@ unique. Blank lines and other `#`, `//` and `;` comment lines are ignored.
 # id: prod-fido2-mds3-ks
 (assure-ks (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2 (mds3 trusted)(aaguid (* set AAGUID1 AAGUID2))))))
 ```
+
+### The AAGUID set is the hardware filter (`fido2_hw`)
+
+An authenticator counts as **hardware** (`fido2_hw`) only if the operator's
+rules list its AAGUID: the documented premise is *MDS3 trusted* **and**
+*operator-listed AAGUID*. The backend does not read MDS3 `keyProtection`, so
+MDS3 trust alone never says "hardware". Therefore no `assure-ks` /
+`assure-ua` rule that grants a tier above the scheme floor from verified
+`fido2` evidence may omit an `(aaguid (* set ...))` constraint. The linter
+warns on such a rule (see Linting) and the shipped templates are tested to
+have no such finding.
+
+Follow-up (not started): expose MDS3 `keyProtection` from go-trust so
+`fido2_hw` does not rest on the AAGUID list alone.
 
 Queries have the form `(assure-ks (tier T)(evidence ...))`,
 `(assure-ua (tier T)(evidence ...))`, `(assure-cert (name N)(evidence ...))`,
@@ -344,9 +365,14 @@ attestation chain". That is the same premise the FIDO2 key-storage rules already
 rest on: the trust decision is delegated to the PDP (ADR-010) and returns
 trusted / not trusted, it does not report the metadata's `keyProtection`, so the
 backend cannot tell a (rare) software authenticator model from a hardware one.
-Operators who need hardware only pin the accepted AAGUIDs in their rules, as the
-shipped examples do; making the home depend on `keyProtection` needs the PDP
-decision to expose it first.
+The AAGUID set in the rules IS the hardware filter: an authenticator counts as
+hardware for the policy only if the operator's rules list its AAGUID (the shipped
+examples do, and `assurance-lint` warns on a rule that grants from verified fido2
+evidence without one). The stored `fido2_hw` label is only the record's home, it
+does not decide the tier.
+
+Follow-up (not started): expose MDS3 `keyProtection` from go-trust so `fido2_hw`
+does not rest on the AAGUID list alone.
 
 `wscdTypeFromKeyHome(home)` maps a verified record's home to a WSCD type
 (`strongbox`/`tee` -> `native_android`, `fido2_hw` -> `fido2_hardware`,
@@ -467,8 +493,9 @@ object, evidence about the **instance (PoP) key** itself:
  "key_attestation": {"type": "android_key", "x5c": ["<base64 DER leaf>", "<intermediate>", "<root>"]}}
 ```
 
-`type` selects a verifier from a registry (`android_key`; `app_attest_assertion`
-is registered by its own stage). The request is classified as follows:
+`type` selects a verifier from a registry (`android_key`, and `app_attest_assertion`
+when Apple App Attest native attestation is configured; see the App Attest
+section above). Both use the same envelope and the same error codes. The request is classified as follows:
 
 | Situation | Result |
 |---|---|
@@ -476,7 +503,9 @@ is registered by its own stage). The request is classified as follows:
 | `type` not registered | HTTP 400 `KEY_ATTESTATION_TYPE_UNSUPPORTED`, before the single-use challenge is consumed |
 | evidence invalid (malformed, broken chain, expired certificate, wrong leaf key, wrong challenge, missing attestation extension, revoked certificate) | WIA refused, HTTP 400 `KEY_ATTESTATION_INVALID` (same rule as a failing native attestation) |
 | the evidence cannot be judged (no fresh revocation list) or a verified record cannot be stored (storage outage) | WIA refused, HTTP 503 `KEY_ATTESTATION_UNAVAILABLE`, nothing recorded |
-| sound but names no home (see below) | no record; the WIA issues with the home `unknown` |
+| App Attest only: the attested key or its counter cannot be read or advanced (key store outage) | WIA refused, HTTP 503 `KEY_ATTESTATION_UNAVAILABLE` (a native attestation object whose key cannot be stored is 503 `NATIVE_ATTESTATION_UNAVAILABLE`, with the challenge put back so the identical request can be retried, since Apple issues an attestation object once per key). A failed assertion needs no such restore: the device simply asks for a new assertion (a higher counter) over a fresh challenge |
+| sound but names no home (see below), `enforcement: ignore` (default) | no record; the WIA issues with the home `unknown`; counted in `siros_wia_instance_key_not_qualifying_total{reason,enforcement="ignore"}` and logged with the reason |
+| sound but names no home (see below), `enforcement: reject` | WIA refused, HTTP 400 `KEY_ATTESTATION_NOT_QUALIFYING` with `details.reason` (enum below); nothing recorded; the challenge is consumed, as for `KEY_ATTESTATION_INVALID` |
 | verified hardware-backed | record written, home `strongbox` or `tee` |
 
 **Challenge.** The WIA challenge C is reused. The key must have been generated
@@ -552,9 +581,88 @@ record whose kind is not `fido2`, so an `android_key` record cannot unlock
 client-selected `key_storage`, `user_authentication` or certification claims
 for a credential key. Nothing the client reports is copied into a verified atom. Later WIAs of the same
 key need no new chain: the stored record is looked up by the PoP key's
-thumbprint, and the fresh PoP proves possession. Periodic re-checking of stored
-records against the status list is not done yet (`chain_not_after` and
-`verified_at` are recorded for it).
+thumbprint, and the fresh PoP proves possession. Stored records are re-checked each
+time they are used, see "Re-check on use" below.
+
+**Enforcement.** `enforcement: ignore` (the default) keeps the behaviour above.
+`enforcement: reject` refuses evidence that cannot name a home instead of
+quietly issuing with the home `unknown`. The refusal is
+`400 {"error": "KEY_ATTESTATION_NOT_QUALIFYING", "details": {"reason": R}}` and
+`R` is exactly one of these fixed values (never text from the evidence):
+
+| `reason` | Meaning |
+|---|---|
+| `not_configured` | no trust anchors or no allowed app digests configured |
+| `untrusted_root` | the chain does not end in a pinned anchor |
+| `software_security_level` | attestation or keymaster security level is not TEE/StrongBox |
+| `key_not_generated` | origin is not GENERATED in the hardware-enforced list |
+| `no_sign_purpose` | the key has no SIGN purpose |
+| `app_not_allowed` | signing digest, package or application id not allowed |
+| `boot_not_verified` | verified boot state is not `verified` (or not reported) |
+| `bootloader_unlocked` | the bootloader is not locked (or not reported) |
+| `patch_level_too_old` | OS patch level older than `min_patch_level` |
+| `patch_level_missing` | `min_patch_level` is set and no patch level was attested |
+| `app_attest_key_not_eligible` | App Attest only: the key is not a verified production key (development environment or unverified chain), or no longer matches the configured App ID or environment. An assertion never rejects on this (App Attest has no `enforcement` switch): the WIA is issued with the home unknown, and a stored record is withdrawn |
+
+Evidence that is invalid stays `KEY_ATTESTATION_INVALID`, and an unavailable
+revocation list stays `KEY_ATTESTATION_UNAVAILABLE`, in both modes. In reject
+mode the boot-state and locked-bootloader requirements are on by default and
+individually switchable; `min_patch_level` (YYYYMM) is off unless set. In ignore
+mode they are never applied (the facts are recorded). The server refuses to
+start with `enforcement: reject` and no trust anchors or no allowed app digests
+(`ignore` keeps its single startup warning).
+
+**What this does NOT detect.** Key attestation says where the key lives and what
+the device's own trusted software reports about it. It does not detect a rooted
+phone that keeps a locked bootloader and spoofs its boot state, and it says
+nothing about the device after the key was generated. Play Integrity
+(`native_attestation`) is complementary: it judges the app and device now but
+does not bind a key. Neither replaces the other.
+
+**Re-check on use.** The record stores the serial numbers of the chain
+(`cert_serials`). Whenever a stored `android_key` record backs a WIA or the
+assurance preview it is checked again, through the same fail-closed, TTL-bounded
+status list fetcher and cache the verifier uses:
+
+| Stored record | WIA | Preview and other read-only paths |
+|---|---|---|
+| a serial is on the fresh list | `instance_key none`, `wscd_type` unknown; the record is marked `revoked_at`/`revoked_reason` (kept, never deleted), metric and log line | same: evidence absent |
+| no fresh list can be had | refused, HTTP 503 `KEY_ATTESTATION_UNAVAILABLE`; nothing is marked | evidence absent, lowest tier |
+| `chain_not_after` has passed | `instance_key none`, `wscd_type` unknown; nothing is marked | evidence absent |
+| no longer accepted by the CURRENT configuration (app digest or package allowlist narrowed, the pinned root the chain ended in removed (the record keeps its fingerprint) even while other roots stay pinned; in reject mode also boot state, bootloader lock or `min_patch_level` tightened) | `instance_key none`, `wscd_type` unknown; nothing is marked (relaxing the configuration restores it) | evidence absent |
+| stored before serials were kept (legacy) | cannot be re-checked: unknown, `instance_key none`; nothing is marked | evidence absent |
+
+A freshly verified submission replaces a record that is no longer good whatever
+its rank: a revoked record by rule, and one that is merely stale (revoked on the
+list but not marked yet, expired, no longer qualifying, legacy) because the
+submission path replaces it in one conditional store write (only if the stored
+record is still that chain; nothing is marked first, so a failed write loses
+nothing). The no-downgrade rule protects only evidence that still
+stands. The mark is set only
+on the record whose chain was checked, so a record that a fresh submission
+replaced meanwhile is not marked. Key Attestation never reads instance-key
+records, so it has nothing to re-check. Metric:
+`siros_wia_instance_key_recheck_total{outcome}` with `ok`, `revoked`,
+`already_revoked`, `expired`, `not_qualifying`, `legacy_unknown`, `unavailable`, `replaced_stale`.
+
+**Re-check of App Attest assertion records.** The same rules apply to stored
+`app_attest_assertion` records, with the App Attest key store as the status
+source (the record's `chain_fingerprint` holds the App Attest key id, so the
+re-check and the conditional replace/mark writes address that key):
+
+| Stored record | WIA | Preview and other read-only paths |
+|---|---|---|
+| the App Attest key was revoked | `instance_key none`, `wscd_type` unknown; the record is marked revoked (kept) | evidence absent |
+| the key store cannot be read | refused, HTTP 503 `KEY_ATTESTATION_UNAVAILABLE`; nothing is marked | evidence absent |
+| key no longer matches the CURRENT App ID or environment, or is not a verified production key | `instance_key none`; nothing is marked (restoring the configuration restores it) | evidence absent |
+| key missing from the store, or a record that names no key | cannot be re-checked: `instance_key none`; nothing is marked | evidence absent |
+| App Attest native attestation not configured (no checker wired) | `instance_key none` (fails closed, like `android_key` without a checker) | evidence absent |
+
+A fresh valid assertion replaces such a record whatever its rank, as above.
+Evidence a fresh submission just verified for THIS caller still counts for the
+request when the stored record for the key belongs to another tenant or user
+(the store keeps that record untouched); a stored record of this caller that is
+revoked, expired or no longer qualifying stays "none".
 
 **Configuration** (`wallet_provider.attestation.android_key_attestation`):
 
@@ -566,6 +674,12 @@ records against the status list is not done yet (`chain_not_after` and
 | `allowed_packages` | `..._ALLOWED_PACKAGES` | optional package-name restriction |
 | `status_list_url` | `..._STATUS_LIST_URL` | default Google's status list |
 | `status_list_default_ttl_seconds` | `..._STATUS_LIST_DEFAULT_TTL_SECONDS` | freshness when the response has no `max-age` (default 3600) |
+| `enforcement` | `..._ENFORCEMENT` | `ignore` (default) or `reject` |
+| `require_verified_boot` | `..._REQUIRE_VERIFIED_BOOT` | reject mode: require verified boot state; default true |
+| `require_locked_bootloader` | `..._REQUIRE_LOCKED_BOOTLOADER` | reject mode: require a locked bootloader; default true |
+| `min_patch_level` | `..._MIN_PATCH_LEVEL` | reject mode: oldest OS patch level, YYYYMM; 0 (default) = none |
+
+(`...` is `WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION`.)
 
 Get Google's attestation roots from <https://android.googleapis.com/attestation/root>
 (a JSON array of PEM certificates; it includes the RSA root and the ECDSA P-384
@@ -649,6 +763,16 @@ checks run at startup; lint errors refuse to start, warnings are logged.
   id), a tier or certification name outside the configured scheme or
   catalogue, an open grant (`*`, prefix, range), an emitted value that is not
   a registered OpenID4VCI key storage / user authentication value.
+* **WARN** an `assure-ks` / `assure-ua` rule whose verified `fido2` slot
+  grants a tier above the configured scheme's floor, or constrains `mds3`,
+  `uv` or `cert`, without an `(aaguid ...)` constraint (naming the rule id).
+  A bare `(fido2)` is fine only when the rule grants nothing above the floor.
+  An `(aaguid ...)` that accepts every model (`(*)`, or a set containing it)
+  is no constraint, and an empty or omitted `(tier)` counts as granting every tier (an omitted
+  `(tier ...)`/`(name ...)` group is reported as an open grant for every
+  dimension).
+  The floor and level order come from the configured scheme, never from level
+  names. Narrow the rule with `(fido2 (mds3 trusted)(aaguid (* set ...)))`.
 
 ## Observability
 
@@ -688,6 +812,8 @@ nothing is permitted the claim is `"none"` (Annex C).
   placeholder AAGUIDs: key storage by AAGUID, user authentication by AAGUID
   **and `(uv present)`**, `wia-issue-all` (today's behaviour), an S1 rule for
   `platform_attested`, and a commented `assure-wia-cert` example.
+  The AAGUID set is the hardware filter (see above); a test lints every
+  shipped template for it.
 * `deploy/assurance/gdc-simulation.rules.example`: grants every tier to a
   client that claims the `soft` plugin. Simulation only; it relies on
   client-claimed evidence on purpose. It only shows its effect with

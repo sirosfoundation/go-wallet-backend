@@ -1400,6 +1400,84 @@ type AndroidKeyAttestationConfig struct {
 	// is never used past its freshness: when it has expired and cannot be
 	// fetched, evidence is refused (fail closed).
 	StatusListDefaultTTLSeconds int `yaml:"status_list_default_ttl_seconds" envconfig:"STATUS_LIST_DEFAULT_TTL_SECONDS"`
+
+	// Enforcement says what happens to evidence that is well formed but does
+	// not qualify (no trust anchors or app digests configured, a chain that
+	// does not end in a pinned anchor, a software security level, a key not
+	// generated in the keystore, no SIGN purpose, an app that is not allowed,
+	// and the boot-state requirements below):
+	//
+	//	ignore (default)  the WIA issues and the instance key home stays
+	//	                  unknown; a metric and a log line record the reason.
+	//	reject            the request fails with 400 KEY_ATTESTATION_NOT_QUALIFYING
+	//	                  and a machine-readable reason; nothing is recorded.
+	//
+	// Evidence that is invalid (malformed, wrong key or challenge, revoked) is
+	// always refused whatever this says.
+	Enforcement string `yaml:"enforcement" envconfig:"ENFORCEMENT"`
+
+	// RequireVerifiedBoot, in reject mode, requires the attested verified
+	// boot state to be "verified". Unset means true; set false to switch it
+	// off. Ignored in ignore mode (the state is recorded either way).
+	RequireVerifiedBoot *bool `yaml:"require_verified_boot" envconfig:"REQUIRE_VERIFIED_BOOT"`
+
+	// RequireLockedBootloader, in reject mode, requires the attested
+	// bootloader to be locked. Unset means true; set false to switch it off.
+	RequireLockedBootloader *bool `yaml:"require_locked_bootloader" envconfig:"REQUIRE_LOCKED_BOOTLOADER"`
+
+	// MinPatchLevel, in reject mode, is the oldest accepted OS patch level as
+	// YYYYMM (for example 202601). 0 (default) means no requirement.
+	MinPatchLevel int `yaml:"min_patch_level" envconfig:"MIN_PATCH_LEVEL"`
+}
+
+// Android key attestation enforcement modes.
+const (
+	AndroidEnforcementIgnore = "ignore"
+	AndroidEnforcementReject = "reject"
+)
+
+// Rejecting reports whether non-qualifying evidence is refused.
+func (c AndroidKeyAttestationConfig) Rejecting() bool {
+	return c.Enforcement == AndroidEnforcementReject
+}
+
+// VerifiedBootRequired reports whether reject mode requires a verified boot
+// state (default true).
+func (c AndroidKeyAttestationConfig) VerifiedBootRequired() bool {
+	return c.RequireVerifiedBoot == nil || *c.RequireVerifiedBoot
+}
+
+// LockedBootloaderRequired reports whether reject mode requires a locked
+// bootloader (default true).
+func (c AndroidKeyAttestationConfig) LockedBootloaderRequired() bool {
+	return c.RequireLockedBootloader == nil || *c.RequireLockedBootloader
+}
+
+// Validate checks the enforcement settings. Reject mode with no trust anchors
+// or no allowed app digests could never accept anything and is refused, as is
+// an unknown mode or a malformed patch level. (The anchors themselves are
+// parsed by the service at startup.)
+func (c AndroidKeyAttestationConfig) Validate() error {
+	const p = "wallet_provider.attestation.android_key_attestation"
+	switch c.Enforcement {
+	case "", AndroidEnforcementIgnore:
+	case AndroidEnforcementReject:
+		if c.TrustAnchorsPath == "" && strings.TrimSpace(c.TrustAnchorsPEM) == "" {
+			return fmt.Errorf("%s.enforcement=reject needs trust anchors (trust_anchors_path or trust_anchors_pem)", p)
+		}
+		if len(c.AllowedAppDigests) == 0 {
+			return fmt.Errorf("%s.enforcement=reject needs allowed_app_digests", p)
+		}
+	default:
+		return fmt.Errorf("%s.enforcement %q must be %q or %q", p, c.Enforcement, AndroidEnforcementIgnore, AndroidEnforcementReject)
+	}
+	if c.MinPatchLevel != 0 {
+		y, m := c.MinPatchLevel/100, c.MinPatchLevel%100
+		if y < 2000 || y > 9999 || m < 1 || m > 12 {
+			return fmt.Errorf("%s.min_patch_level %d must be YYYYMM (for example 202601) or 0", p, c.MinPatchLevel)
+		}
+	}
+	return nil
 }
 
 // NativeAttestationConfig controls platform-specific attestation verification.
@@ -2672,6 +2750,10 @@ func (c *Config) Validate() error {
 	}
 
 	if err := c.WalletProvider.Attestation.Assurance.Validate(); err != nil {
+		return err
+	}
+
+	if err := c.WalletProvider.Attestation.AndroidKeyAttestation.Validate(); err != nil {
 		return err
 	}
 

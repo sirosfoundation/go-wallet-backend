@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/fxamacker/cbor/v2"
 	"go.uber.org/zap"
@@ -214,14 +215,59 @@ func (v *AppAttestAssertionVerifier) Verify(ctx context.Context, in *InstanceKey
 	if !rec.VerifiedHomeEligible() {
 		v.logger.Info("assertion accepted but names no home",
 			zap.String("environment", string(rec.Environment)), zap.Bool("chain_verified", rec.ChainVerified))
-		return &InstanceKeyEvidenceResult{Reason: "app attest key is not a verified production key"}, nil
+		return &InstanceKeyEvidenceResult{Reason: NoHomeAppAttestKeyNotEligible}, nil
 	}
 	return &InstanceKeyEvidenceResult{Record: &domain.KeyAttestationRecord{
 		Kind: domain.KeyEvidenceAppAttestAssertion,
+		// ChainFingerprint names the App Attest key that signed (its key id, the
+		// SHA-256 of its public point): the stored record is re-checked against
+		// that key on every use, and replaced or marked revoked by conditional
+		// writes keyed on it, exactly as a chain leaf fingerprint does for
+		// android_key evidence.
+		ChainFingerprint: keyID,
 		// Asserted, not attested: an attested app instance endorsed the key.
 		Home:       domain.KeyHomeSecureEnclaveAsserted,
 		VerifiedAt: in.Now,
 	}}, nil
+}
+
+// Kind implements InstanceKeyEvidenceRechecker.
+func (v *AppAttestAssertionVerifier) Kind() domain.KeyEvidenceKind {
+	return domain.KeyEvidenceAppAttestAssertion
+}
+
+// Recheck implements InstanceKeyEvidenceRechecker: a stored assertion record
+// backs a decision only while the App Attest key it names is still active, in
+// the same tenant/user context, a verified production key, and the configured
+// environment and App ID still match (the "configuration applies to stored
+// records" rule that android_key evidence follows). A revoked key withdraws
+// the record (marked revoked, never deleted); a configuration that no longer
+// accepts the key withdraws it without changing the store; an unreadable key
+// store is an error (the WIA is refused with 503). A record that names no key
+// cannot be re-checked and is no evidence.
+func (v *AppAttestAssertionVerifier) Recheck(ctx context.Context, rec *domain.KeyAttestationRecord, _ time.Time) (RecheckResult, error) {
+	if rec.ChainFingerprint == "" {
+		return RecheckResult{Verdict: RecheckUnknown, Reason: RecheckReasonLegacy}, nil
+	}
+	key, err := v.keys.Get(ctx, rec.ChainFingerprint)
+	switch {
+	case errors.Is(err, storage.ErrNotFound):
+		return RecheckResult{Verdict: RecheckUnknown, Reason: RecheckReasonAppAttestKeyMissing}, nil
+	case err != nil:
+		return RecheckResult{}, fmt.Errorf("load App Attest key: %w", err)
+	}
+	if !key.IsActive() {
+		return RecheckResult{Verdict: RecheckRevoked, Reason: RecheckReasonAppAttestKeyRevoked}, nil
+	}
+	var user *domain.UserID
+	if rec.UserID != "" {
+		u := domain.UserIDFromString(rec.UserID)
+		user = &u
+	}
+	if !key.BelongsTo(rec.TenantID, user) || key.Environment != v.env || key.AppID != v.appID || !key.VerifiedHomeEligible() {
+		return RecheckResult{Verdict: RecheckNotQualifying, Reason: NoHomeAppAttestKeyNotEligible}, nil
+	}
+	return RecheckResult{Verdict: RecheckGood}, nil
 }
 
 // appAttestPublicKey rebuilds an ECDSA P-256 key from a stored X9.62

@@ -36,8 +36,11 @@ import (
 //     unavailable (for example a revocation list): the WIA is refused and
 //     nothing is recorded (ErrWIAKeyAttestationUnavailable, HTTP 503);
 //   - evidence that is well formed but not trustworthy enough to name a home
-//     (unknown root, software keystore, ...): the verifier returns no
-//     record; the WIA issues with the home unknown.
+//     (unknown root, software keystore, ...): by default (enforcement
+//     "ignore") the verifier returns no record and the WIA issues with the
+//     home unknown, counted in a metric by reason; with enforcement "reject"
+//     the WIA is refused with ErrWIAKeyAttestationNotQualifying (HTTP 400
+//     KEY_ATTESTATION_NOT_QUALIFYING) and a fixed reason, nothing recorded.
 
 var (
 	// ErrWIAKeyAttestationTypeUnsupported means the key_attestation type has
@@ -51,6 +54,69 @@ var (
 	// closed: nothing is recorded and the WIA is refused.
 	ErrWIAKeyAttestationUnavailable = errors.New("key_attestation cannot be verified right now")
 )
+
+// ErrWIAKeyAttestationNotQualifying means the evidence is well formed but
+// cannot name a trustworthy home, and the deployment enforces that (reject
+// mode). Verifiers return a *KeyAttestationNotQualifyingError, which is it.
+var ErrWIAKeyAttestationNotQualifying = errors.New("key_attestation evidence does not qualify")
+
+// The reasons evidence can fail to name a home. They are a fixed enum: the
+// only text an error, a log line, a metric label or the HTTP `details` ever
+// carry about WHY, never anything taken from the evidence itself.
+const (
+	NoHomeNotConfigured         = "not_configured"          // no trust anchors or no allowed app digests
+	NoHomeUntrustedRoot         = "untrusted_root"          // chain does not end in a pinned anchor
+	NoHomeSoftwareSecurityLevel = "software_security_level" // not hardware backed
+	NoHomeKeyNotGenerated       = "key_not_generated"       // origin is not GENERATED
+	NoHomeNoSignPurpose         = "no_sign_purpose"         // key cannot sign
+	NoHomeAppNotAllowed         = "app_not_allowed"         // app digest or package not allowed
+	NoHomeBootNotVerified       = "boot_not_verified"       // verified boot state is not "verified"
+	NoHomeBootloaderUnlocked    = "bootloader_unlocked"     // bootloader not locked
+	NoHomePatchLevelTooOld      = "patch_level_too_old"     // older than min_patch_level
+	NoHomePatchLevelMissing     = "patch_level_missing"     // min_patch_level set, none attested
+
+	// NoHomeAppAttestKeyNotEligible: the App Attest key is not a verified
+	// production key (development environment, unverified chain), or is not
+	// the configured app's or environment's.
+	NoHomeAppAttestKeyNotEligible = "app_attest_key_not_eligible"
+)
+
+// NoHomeReasons lists every reason, in a stable order.
+var NoHomeReasons = []string{
+	NoHomeNotConfigured, NoHomeUntrustedRoot, NoHomeSoftwareSecurityLevel,
+	NoHomeKeyNotGenerated, NoHomeNoSignPurpose, NoHomeAppNotAllowed,
+	NoHomeBootNotVerified, NoHomeBootloaderUnlocked,
+	NoHomePatchLevelTooOld, NoHomePatchLevelMissing,
+	NoHomeAppAttestKeyNotEligible,
+}
+
+// KeyAttestationNotQualifyingError is the reject-mode refusal of evidence that
+// names no home. Reason is one of the NoHome* values.
+type KeyAttestationNotQualifyingError struct{ Reason string }
+
+func (e *KeyAttestationNotQualifyingError) Error() string {
+	return ErrWIAKeyAttestationNotQualifying.Error() + ": " + e.Reason
+}
+
+// SafeReason is Reason when it is one of the NoHome* values and "other"
+// otherwise: the only form that may leave the process (HTTP, metrics).
+func (e *KeyAttestationNotQualifyingError) SafeReason() string { return noHomeReasonLabel(e.Reason) }
+
+// Is makes errors.Is(err, ErrWIAKeyAttestationNotQualifying) hold.
+func (e *KeyAttestationNotQualifyingError) Is(target error) bool {
+	return target == ErrWIAKeyAttestationNotQualifying
+}
+
+// noHomeReasonLabel bounds a reason to the known set for use as a metric
+// label (another verifier's free-form reason must not mint new series).
+func noHomeReasonLabel(reason string) string {
+	for _, r := range NoHomeReasons {
+		if r == reason {
+			return r
+		}
+	}
+	return "other"
+}
 
 // maxKeyAttestationBytes bounds the encoded key_attestation object a verifier
 // is handed.
@@ -171,6 +237,13 @@ func (s *WIAService) RegisterInstanceKeyVerifier(v InstanceKeyEvidenceVerifier) 
 		s.keyVerifiers = make(map[KeyAttestationType]InstanceKeyEvidenceVerifier)
 	}
 	s.keyVerifiers[v.Type()] = v
+	// A verifier that can re-check what it stored is used for that too.
+	if r, ok := v.(InstanceKeyEvidenceRechecker); ok {
+		if s.keyChecker == nil {
+			s.keyChecker = newInstanceKeyChecker(s.logger)
+		}
+		s.keyChecker.register(r)
+	}
 }
 
 // InstanceKeyVerifierTypes lists the registered types, sorted.
@@ -219,6 +292,13 @@ func (s *WIAService) verifyKeyAttestation(ctx context.Context, v InstanceKeyEvid
 		Now:          now,
 	})
 	if err != nil {
+		var nq *KeyAttestationNotQualifyingError
+		if errors.As(err, &nq) {
+			instanceKeyNotQualifying.WithLabelValues(noHomeReasonLabel(nq.Reason), "reject").Inc()
+			s.logger.Info("instance key evidence refused: does not qualify",
+				zap.String("type", truncateForError(string(ka.Type))), zap.String("reason", noHomeReasonLabel(nq.Reason)))
+			return nil, err
+		}
 		if errors.Is(err, ErrWIAKeyAttestationUnavailable) || errors.Is(err, ErrWIAKeyAttestationInvalid) {
 			return nil, err
 		}
@@ -230,8 +310,9 @@ func (s *WIAService) verifyKeyAttestation(ctx context.Context, v InstanceKeyEvid
 		if res != nil {
 			reason = res.Reason
 		}
+		instanceKeyNotQualifying.WithLabelValues(noHomeReasonLabel(reason), "ignore").Inc()
 		s.logger.Info("instance key evidence names no home",
-			zap.String("type", truncateForError(string(ka.Type))), zap.String("reason", reason))
+			zap.String("type", truncateForError(string(ka.Type))), zap.String("reason", noHomeReasonLabel(reason)))
 		return nil, nil
 	}
 	rec := res.Record.Clone()
@@ -244,6 +325,17 @@ func (s *WIAService) verifyKeyAttestation(ctx context.Context, v InstanceKeyEvid
 		rec.VerifiedAt = now
 	}
 	if s.keyAttestations != nil {
+		// The store never replaces stronger evidence with weaker. A stored
+		// record that is no longer good must not shield itself that way and
+		// discard this verified submission: it is replaced in one conditional
+		// write (nothing is marked first, so a failure loses nothing).
+		replaced, err := s.keyChecker.replaceStale(ctx, s.keyAttestations, rec)
+		if err != nil {
+			return nil, err
+		}
+		if replaced {
+			return rec, nil
+		}
 		if err := s.keyAttestations.MarkKeyAttested(ctx, rec); err != nil {
 			// The evidence verified but could not be persisted: a dependency
 			// outage, retryable (HTTP 503), not a verification failure. The
