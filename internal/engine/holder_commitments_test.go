@@ -195,6 +195,14 @@ func TestRequestProofs_HolderCommitmentPSC(t *testing.T) {
 
 func TestPSCConflict_Relayed(t *testing.T) {
 	const desc = "org.siros.psc_conflict: this subject is bound to a different wallet secret; ask the issuer operator to approve a reset"
+	withAux := false
+	cfgFor := func(aux bool) *CredentialConfig {
+		c := hcCfg(hcAdv)
+		if aux {
+			c.AuxiliaryDataSupported = json.RawMessage(`{"to_issuer":[` + auxToIssuerPSC + `]}`)
+		}
+		return c
+	}
 	run := func(t *testing.T, status int, body string, hdr ...string) (*ErrorCodeAndMsg, error) {
 		calls := 0
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -231,7 +239,7 @@ func TestPSCConflict_Relayed(t *testing.T) {
 		defer c2()
 		h.Flow.Session.conn = conn
 		_, err := h.requestCredential(context.Background(), &IssuerMetadata{CredentialEndpoint: srv.URL},
-			&TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", hcCfg(hcAdv), nil, nil)
+			&TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", cfgFor(withAux), nil, nil)
 		select {
 		case m := <-got:
 			return &ErrorCodeAndMsg{m.Error.Code, m.Error.Message}, err
@@ -251,6 +259,23 @@ func TestPSCConflict_Relayed(t *testing.T) {
 		require.Error(t, err)
 		require.NotNil(t, e)
 		assert.Equal(t, ErrCodePSCConflict, e.Code)
+	})
+	// A configuration that advertises auxiliary data may be answered with text
+	// that echoes a commitment: neither the flow error nor the returned error
+	// may carry it, on the plain path and on the DPoP-nonce path.
+	t.Run("auxiliary data: issuer text is not relayed or returned", func(t *testing.T) {
+		withAux = true
+		defer func() { withAux = false }()
+		echoed := "org.siros.psc_conflict: held " + strings.Repeat("ab", 32)
+		for name, hdr := range map[string][]string{"plain": nil, "dpop nonce": {"n1"}} {
+			e, err := run(t, 400, `{"error":"invalid_request","error_description":"`+echoed+`"}`, hdr...)
+			require.Error(t, err, name)
+			require.NotNil(t, e, name)
+			assert.Equal(t, ErrCodePSCConflict, e.Code, name)
+			assert.Equal(t, ErrCodePSCConflict.UserFacingMessage(), e.Msg, name)
+			assert.NotContains(t, err.Error(), "abab", name)
+			assert.NotContains(t, e.Msg, "abab", name)
+		}
 	})
 	t.Run("other 400 stays CREDENTIAL_ERROR", func(t *testing.T) {
 		e, err := run(t, 400, `{"error":"invalid_request","error_description":"something else"}`)

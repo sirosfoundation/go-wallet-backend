@@ -2816,7 +2816,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			// Likewise a psc conflict. relayAuxiliaryDataConflict hands back a
 			// buffered body when the response is not an aux conflict, so this
 			// second read sees it.
-			if conflictErr := h.relayPSCConflict(resp); conflictErr != nil {
+			if conflictErr := h.relayPSCConflict(resp, config != nil && len(config.AuxiliaryDataSupported) > 0); conflictErr != nil {
 				return nil, conflictErr
 			}
 			_ = resp.Body.Close()
@@ -2835,6 +2835,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 				_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 				return nil, fmt.Errorf("credential endpoint returned status %d with an oversized error body", resp.StatusCode)
 			}
+			quiet := config != nil && len(config.AuxiliaryDataSupported) > 0
 			// Recognise the conflict BEFORE the raw body is logged: its
 			// error_description may echo a commitment.
 			if conflictErr := h.auxiliaryDataConflictError(resp.StatusCode, body); conflictErr != nil {
@@ -2842,14 +2843,13 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			}
 			// A holder commitment conflict is a final, user-actionable outcome:
 			// relay it as its own flow error code (never retried).
-			if conflictErr := h.pscConflictError(resp.StatusCode, body); conflictErr != nil {
+			if conflictErr := h.pscConflictError(resp.StatusCode, body, quiet); conflictErr != nil {
 				return nil, conflictErr
 			}
 			// A request that carried auxiliary data may be answered with text
 			// that echoes a commitment (an invalid_proof description, say):
 			// then neither the body nor the description is logged or returned,
 			// only the status and the error code.
-			quiet := config != nil && len(config.AuxiliaryDataSupported) > 0
 			errOf := parseOAuthError
 			if quiet {
 				errOf = oauthErrorCodeOnly
@@ -3447,10 +3447,19 @@ func (h *OID4VCIHandler) checkPSCNeedsProof(config *CredentialConfig) error {
 // pscConflictError relays the issuer's psc conflict, if body is one, as a
 // PSC_CONFLICT flow error and returns the error to fail the flow with; nil when
 // the response is not a conflict.
-func (h *OID4VCIHandler) pscConflictError(status int, body []byte) error {
+//
+// quiet is true for a configuration that advertises auxiliary data: the
+// issuer's text may then echo a commitment, so neither it nor the description
+// is relayed or returned; the flow error carries the fixed user-facing message
+// and the returned error only the OAuth error code.
+func (h *OID4VCIHandler) pscConflictError(status int, body []byte, quiet bool) error {
 	msg, ok := pscConflictMessage(status, body)
 	if !ok {
 		return nil
+	}
+	if quiet {
+		_ = h.Error(StepRequestingCredential, ErrCodePSCConflict, ErrCodePSCConflict.UserFacingMessage())
+		return oauthErrorCodeOnly(status, body)
 	}
 	_ = h.Error(StepRequestingCredential, ErrCodePSCConflict, msg)
 	return parseOAuthError(status, body)
@@ -3458,12 +3467,12 @@ func (h *OID4VCIHandler) pscConflictError(status int, body []byte) error {
 
 // relayPSCConflict reads (and closes) the body of a 400 response and relays it
 // as a psc conflict if it is one. Other responses are left for the caller.
-func (h *OID4VCIHandler) relayPSCConflict(resp *http.Response) error {
+func (h *OID4VCIHandler) relayPSCConflict(resp *http.Response, quiet bool) error {
 	if resp.StatusCode != http.StatusBadRequest {
 		return nil
 	}
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
-	if err := h.pscConflictError(resp.StatusCode, body); err != nil {
+	if err := h.pscConflictError(resp.StatusCode, body, quiet); err != nil {
 		_ = resp.Body.Close()
 		return err
 	}
