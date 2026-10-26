@@ -154,7 +154,6 @@ func minimalEngineConfig(httpCfg config.HTTPClientConfig) *config.Config {
 		},
 		JWT: config.JWTConfig{
 			Secret: "test-secret", Issuer: "test",
-			ExpiryHours: 1, RefreshDays: 1,
 		},
 		HTTPClient: httpCfg,
 	}

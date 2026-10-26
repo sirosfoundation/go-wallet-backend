@@ -1,6 +1,7 @@
 # External OAuth2 Authorization Server Support
 
-**Status**: Proposal  
+**Status**: Proposal (written before the AS existed; the HS256 token format and `AuthMiddleware` it describes
+under "Current Authentication Architecture" were removed, see [new-as.md](new-as.md#removal-of-the-legacy-as))  
 **Date**: 2026-01-20  
 **Author**: Analysis Document
 

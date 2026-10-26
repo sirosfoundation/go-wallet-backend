@@ -24,6 +24,10 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		// happen through UpdateStatus. Otherwise a routine re-attestation would
 		// silently reactivate a suspended/revoked instance.
 		existing.AttestationSource = instance.AttestationSource
+		existing.VerifiedAppID = instance.VerifiedAppID
+		if instance.WSCDType != "" {
+			existing.WSCDType = instance.WSCDType
+		}
 		existing.LastAttestedAt = instance.LastAttestedAt
 		existing.UpdatedAt = instance.UpdatedAt
 		existing.AttestationCount++

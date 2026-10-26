@@ -62,7 +62,8 @@ func TestHandlers_getHolderDID_NonStringUserID(t *testing.T) {
 }
 
 // TestHandlers_Logout_NonStringToken proves a non-string "token" context
-// value on the legacy logout path yields 401 instead of a panic.
+// value is ignored by Logout (the legacy HMAC token path is gone): it neither
+// panics nor fails the request.
 func TestHandlers_Logout_NonStringToken(t *testing.T) {
 	handlers, router := setupLogoutTestHandlers(t)
 	router.POST("/logout", func(c *gin.Context) {
@@ -72,7 +73,7 @@ func TestHandlers_Logout_NonStringToken(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/logout", nil))
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("expected 401, got %d: %s", w.Code, w.Body.String())
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 }

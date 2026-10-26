@@ -13,7 +13,11 @@ build-admin: man ## Build the wallet-admin CLI tool (includes man page)
 	@echo "Building wallet-admin CLI..."
 	@go build -o bin/wallet-admin ./cmd/wallet-admin
 
-build-all: build build-admin ## Build all binaries
+build-assurance-lint: ## Build the assurance policy linter
+	@echo "Building assurance-lint..."
+	@go build -o bin/assurance-lint ./cmd/assurance-lint
+
+build-all: build build-admin build-assurance-lint ## Build all binaries
 
 man: ## Copy man pages to bin directory
 	@echo "Copying man pages..."

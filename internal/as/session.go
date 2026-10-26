@@ -36,14 +36,6 @@ type Session struct {
 	// ExpiresAt is when the session expires.
 	ExpiresAt time.Time `json:"expires_at"`
 
-	// FamilyID is the refresh-token family/session id ("sid" claim, #402)
-	// of the legacy appToken/refresh token pair minted alongside this
-	// session at login (service.FinishLoginResponse.SID). LogoutHandler
-	// revokes that whole family with it, so logging out through
-	// DELETE /auth/session also kills the paired refresh token. Empty for
-	// sessions that were not paired with a legacy refresh token.
-	FamilyID string `json:"sid,omitempty"`
-
 	// Revoked indicates the session has been explicitly revoked.
 	Revoked bool `json:"revoked"`
 }

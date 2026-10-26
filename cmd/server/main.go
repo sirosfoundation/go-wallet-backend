@@ -13,6 +13,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
 	"github.com/sirosfoundation/go-wallet-backend/internal/server"
@@ -54,7 +55,9 @@ func main() {
 		// (validated by Load) is process-wide: the engine flow and the
 		// issuer-metadata resolve endpoint both consult it.
 		wsengine.SetSecretMembers(backendCfg.Issuance.EffectiveSecretMembers())
-		if roles.Has(modes.RoleAuth) {
+		// The backend role's only authentication is AS session tokens, so it enables the AS
+		// like the auth role; an explicit as.enabled: false makes startup fail.
+		if roles.Has(modes.RoleAuth) || roles.Has(modes.RoleBackend) {
 			backendCfg.EnableForRole()
 			// EnableForRole mutates the already-validated config (e.g.
 			// falling back to WalletProvider's signing key for AS), so
@@ -109,6 +112,14 @@ func main() {
 		}
 	}
 
+	// Fail closed at startup on a bad assurance policy (missing/invalid rules
+	// file, lint errors) instead of discovering it on the first KA request.
+	if backendCfg != nil {
+		if err := assurance.CheckConfig(backendCfg.WalletProvider.Attestation.Assurance); err != nil {
+			logger.Fatal("Invalid assurance policy", zap.Error(err))
+		}
+	}
+
 	checkPKCS11Support(backendCfg, logger)
 
 	logger.Info("Starting Wallet Backend",
@@ -118,8 +129,8 @@ func main() {
 		zap.Bool("pkcs11_supported", signing.PKCS11Supported),
 	)
 
-	// Once per process, whatever its roles.
-	logLegacyStatus(backendCfg, logger)
+	// Logged once per process, whatever its roles.
+	logLegacyStatus(backendCfg, registryCfg, logger)
 
 	// Security configuration validation for production environments
 	// Checks for potentially dangerous configurations and logs warnings
@@ -293,7 +304,7 @@ func main() {
 		if backendProvider != nil && backendProvider.TokenValidator() != nil {
 			provider.SetTokenValidator(backendProvider.TokenValidator())
 		}
-		// Standalone engine: needs its own JWKS-backed validator.
+		// Standalone engine: a JWKS-backed validator is the only way to authenticate handshakes.
 		if backendProvider == nil {
 			sv, err := server.NewStandaloneEngineTokenValidator(backendCfg, logger)
 			if err != nil {
@@ -306,8 +317,8 @@ func main() {
 		}
 		// Wire the same token blacklist the HTTP auth middlewares use, so a
 		// revoked token (or a deleted user's other tokens) is rejected
-		// during the WebSocket handshake too, on both the go-tokenauth and
-		// legacy HMAC paths - see EngineProvider.SetTokenBlacklist.
+		// during the WebSocket handshake too - see
+		// EngineProvider.SetTokenBlacklist.
 		if backendProvider != nil {
 			provider.SetTokenBlacklist(backendProvider.Services().TokenBlacklist)
 		}
@@ -453,11 +464,17 @@ func loggingConfig(backendCfg, registryCfg *config.Config) *logging.Config {
 	return &logging.Config{Level: src.Logging.Level, Format: src.Logging.Format}
 }
 
-// logLegacyStatus logs the legacy-token status; a nil config (registry-only)
-// logs nothing.
-func logLegacyStatus(cfg *config.Config, logger *zap.Logger) {
-	if cfg == nil {
+// logLegacyStatus logs the legacy AS removal and warns about leftover as.legacy.* / jwt.*
+// settings. A registry-only process warns about the settings it was given.
+func logLegacyStatus(backendCfg, registryCfg *config.Config, logger *zap.Logger) {
+	if backendCfg != nil {
+		server.LogLegacyTokenStatus(backendCfg, logger)
 		return
 	}
-	server.LogLegacyTokenStatus(cfg, logger)
+	if registryCfg != nil {
+		for _, name := range registryCfg.DeprecatedSettings() {
+			logger.Warn("Ignoring removed configuration setting: the legacy HMAC authorization server no longer exists; remove this setting",
+				zap.String("setting", name))
+		}
+	}
 }
