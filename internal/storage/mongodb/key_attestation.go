@@ -24,6 +24,7 @@ func (s *KeyAttestationStore) MarkKeyAttested(ctx context.Context, rec *domain.K
 			"wallet_instance_id": rec.WalletInstanceID,
 			"tenant_id":          rec.TenantID,
 			"aaguid":             rec.AAGUID,
+			"uv":                 rec.UV,
 			"verified_at":        rec.VerifiedAt,
 		},
 		"$setOnInsert": bson.M{

@@ -22,9 +22,8 @@ func testConfig() *config.Config {
 			RPOrigin: "http://localhost:8080",
 		},
 		JWT: config.JWTConfig{
-			Secret:      "test-secret-key-for-testing-only",
-			Issuer:      "test-issuer",
-			ExpiryHours: 24,
+			Secret: "test-secret-key-for-testing-only",
+			Issuer: "test-issuer",
 		},
 		HTTPClient: config.HTTPClientConfig{
 			AllowPrivateIPs: true,
@@ -186,91 +185,6 @@ func TestUserService_GetUserByID(t *testing.T) {
 
 	if retrieved.UUID.String() != user.UUID.String() {
 		t.Error("GetUserByID() returned wrong user")
-	}
-}
-
-func TestUserService_ValidateToken(t *testing.T) {
-	ctx := t.Context()
-	store := memory.NewStore()
-	cfg := testConfig()
-	logger := testLogger()
-	service := NewUserService(store, cfg, logger)
-
-	// Register and login to get token
-	username := "validatetoken"
-	req := &domain.RegisterRequest{
-		Username:    &username,
-		DisplayName: "Validate Token User",
-		WalletType:  domain.WalletTypeDB,
-	}
-
-	user, err := service.Register(ctx, req)
-	if err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
-
-	token, err := service.GenerateTokenForUser(user, domain.DefaultTenantID)
-	if err != nil {
-		t.Fatalf("GenerateTokenForUser() error = %v", err)
-	}
-
-	// Validate token
-	userID, err := service.ValidateToken(token)
-	if err != nil {
-		t.Fatalf("ValidateToken() error = %v", err)
-	}
-
-	if userID.String() != user.UUID.String() {
-		t.Errorf("ValidateToken() returned wrong user ID, got %q, want %q", userID.String(), user.UUID.String())
-	}
-}
-
-func TestUserService_ValidateToken_Invalid(t *testing.T) {
-	store := memory.NewStore()
-	cfg := testConfig()
-	logger := testLogger()
-	service := NewUserService(store, cfg, logger)
-
-	_, err := service.ValidateToken("invalid-token")
-	if err == nil {
-		t.Error("ValidateToken() with invalid token should return error")
-	}
-}
-
-func TestUserService_ValidateToken_WrongSecret(t *testing.T) {
-	ctx := t.Context()
-	store := memory.NewStore()
-	cfg := testConfig()
-	logger := testLogger()
-	service := NewUserService(store, cfg, logger)
-
-	// Register and login to get token
-	username := "wrongsecret"
-	req := &domain.RegisterRequest{
-		Username:    &username,
-		DisplayName: "Wrong Secret User",
-		WalletType:  domain.WalletTypeDB,
-	}
-
-	user, err := service.Register(ctx, req)
-	if err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
-
-	token, err := service.GenerateTokenForUser(user, domain.DefaultTenantID)
-	if err != nil {
-		t.Fatalf("GenerateTokenForUser() error = %v", err)
-	}
-
-	// Create service with different secret
-	cfg2 := testConfig()
-	cfg2.JWT.Secret = "different-secret"
-	service2 := NewUserService(store, cfg2, logger)
-
-	// Try to validate with wrong secret
-	_, err = service2.ValidateToken(token)
-	if err == nil {
-		t.Error("ValidateToken() with wrong secret should return error")
 	}
 }
 
@@ -703,47 +617,6 @@ func TestUserService_DeleteUser_CleansUpCredentialsAndPresentations(t *testing.T
 	preses, _ = store.Presentations().GetAllByHolder(ctx, domain.DefaultTenantID, user.DID)
 	if len(preses) != 0 {
 		t.Errorf("Expected 0 presentations after deletion, got %d", len(preses))
-	}
-}
-
-func TestUserService_GenerateTokenForUser(t *testing.T) {
-	ctx := t.Context()
-	store := memory.NewStore()
-	cfg := testConfig()
-	logger := testLogger()
-	service := NewUserService(store, cfg, logger)
-
-	// Register user
-	username := "generatetoken"
-	req := &domain.RegisterRequest{
-		Username:    &username,
-		DisplayName: "Generate Token User",
-		WalletType:  domain.WalletTypeDB,
-	}
-
-	user, err := service.Register(ctx, req)
-	if err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
-
-	// Generate token directly (with default tenant)
-	token, err := service.GenerateTokenForUser(user, domain.DefaultTenantID)
-	if err != nil {
-		t.Fatalf("GenerateTokenForUser() error = %v", err)
-	}
-
-	if token == "" {
-		t.Error("GenerateTokenForUser() returned empty token")
-	}
-
-	// Validate the token
-	userID, err := service.ValidateToken(token)
-	if err != nil {
-		t.Fatalf("ValidateToken() error = %v", err)
-	}
-
-	if userID.String() != user.UUID.String() {
-		t.Errorf("ValidateToken() returned wrong user ID")
 	}
 }
 
