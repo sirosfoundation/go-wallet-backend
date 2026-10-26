@@ -21,6 +21,15 @@ type SessionTransport interface {
 	Close() error
 }
 
+// ReplaceableTransport is implemented by a transport that can be swapped out
+// while a session is live (e.g. a resumed connection). Session.ReplaceTransport
+// calls retire before the swap and handOff, with the successor, after it.
+type ReplaceableTransport interface {
+	SessionTransport
+	retire()
+	handOff(next SessionTransport)
+}
+
 // wsTransport wraps a gorilla/websocket.Conn as a SessionTransport.
 type wsTransport struct {
 	conn   *websocket.Conn

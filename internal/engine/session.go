@@ -78,7 +78,7 @@ func (m *Manager) wsKeepalive() (pingInterval, pongTimeout time.Duration) {
 	return pingInterval, pongTimeout
 }
 
-// Session represents an authenticated session (WebSocket or WMP)
+// Session represents an authenticated session (WebSocket or an adapter transport)
 type Session struct {
 	ID       string
 	UserID   string
@@ -95,7 +95,7 @@ type Session struct {
 
 	// onSuperseded, when set before registration, runs (without any manager lock)
 	// after a later registerSession for the same user replaces this session; the
-	// WMP adapter uses it to invalidate the session's resume state.
+	// transport adapter uses it to invalidate the session's resume state.
 	onSuperseded func()
 	transport    SessionTransport
 	transportMu  sync.RWMutex // guards transport reassignment during session resume
@@ -105,10 +105,7 @@ type Session struct {
 	// path that publishes a flow checks it under the same lock, so a flow is
 	// either seen by the cancellation scan or refused.
 	closed bool
-	// testHookBeforePublish (tests only) runs in the WMP FlowStart between building
-	// the handler and publishing it.
-	testHookBeforePublish func()
-	logger                *zap.Logger
+	logger *zap.Logger
 
 	// Channels for flow coordination
 	actionCh chan *FlowActionMessage
@@ -118,7 +115,7 @@ type Session struct {
 	// stash parks responses read off the shared channels by a waiter they were
 	// not meant for, so no flow loses another flow's input.
 	stash responseStash
-	// closeOnce makes endSession idempotent (the read loop and the WMP adapter
+	// closeOnce makes endSession idempotent (the read loop and a transport adapter
 	// can both end the same session).
 	closeOnce sync.Once
 
@@ -617,7 +614,26 @@ func (s *Session) endSession() {
 	})
 }
 
-// currentTransport returns the transport under transportMu (swapped on WMP resume).
+// ReplaceTransport installs next as the session's transport. If the previous
+// transport is a ReplaceableTransport it is retired first (aborting calls that
+// block Send's read lock) and told about its successor afterwards. The write
+// lock waits for in-flight Send calls, so nothing is written to the old
+// transport once this returns.
+func (s *Session) ReplaceTransport(next SessionTransport) {
+	prev := s.currentTransport()
+	old, replaceable := prev.(ReplaceableTransport)
+	if replaceable {
+		old.retire()
+	}
+	s.transportMu.Lock()
+	s.transport = next
+	s.transportMu.Unlock()
+	if replaceable {
+		old.handOff(next)
+	}
+}
+
+// currentTransport returns the transport under transportMu (swapped by ReplaceTransport).
 func (s *Session) currentTransport() SessionTransport {
 	s.transportMu.RLock()
 	defer s.transportMu.RUnlock()
@@ -1024,7 +1040,7 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 }
 
 // validateTokenID is validateToken that also returns the token's jti, to which
-// the WMP adapter binds anonymous sessions.
+// an adapter binds anonymous sessions.
 func (m *Manager) validateTokenID(ctx context.Context, tokenString string) (userID, tenantID string, tac claims.TAC, jti string, err error) {
 	id, err := m.validateTokenAuth(ctx, tokenString)
 	return id.UserID, id.TenantID, id.TAC, id.JTI, err
@@ -1268,7 +1284,7 @@ func (s *Session) closeWithReason(reason string) {
 			time.Now().Add(time.Second),
 		)
 	}
-	// Non-WebSocket transports (WMP) have no close frame; closing ends the session.
+	// Non-WebSocket transports have no close frame; closing ends the session.
 	_ = t.Close()
 }
 
@@ -1341,7 +1357,7 @@ func (m *Manager) IsHealthy() bool {
 
 // Send sends a message to the client
 //
-// The read lock is held for the whole send: a WMP resume swaps (and closes)
+// The read lock is held for the whole send: a transport replacement swaps (and closes)
 // the transport under the write lock, so it must wait for in-flight sends.
 func (s *Session) Send(msg interface{}) error {
 	s.transportMu.RLock()

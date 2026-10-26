@@ -38,17 +38,18 @@ type WMPAdapter struct {
 	// bearerToken extracts the bearer credential from an HTTP request.
 	bearerToken func(*http.Request) string
 
-	mu                  sync.RWMutex
-	peers               map[string]*wmpSession      // keyed by WMP session ID
-	resumptionTokens    map[string]*resumptionEntry // token -> entry with session ID and expiry
-	eventBufs           map[string]*wmpEventBuffer  // keyed by WMP session ID; survives resume unlike peers
-	outbound            map[string]outboundRequest  // server->client request IDs awaiting a response (see trackOutbound)
-	externalURL         string                      // public base URL for discovery (SetExternalURL)
-	draining            bool                        // set by Drain/Close; new sessions and requests are refused
-	afterExpiryScan     func()                      // test hook: runs between cleanupExpired's scan and its closes
-	beforeResumePublish func(sessionID string)      // test hook: runs between a resume's validation and its publication
-	afterRegister       func(sessionID string)      // test hook: runs between manager registration and peer publication
-	beforeCreateToken   func(sessionID string)      // test hook: runs between publishing a new peer and issuing its token
+	mu                    sync.RWMutex
+	peers                 map[string]*wmpSession      // keyed by WMP session ID
+	resumptionTokens      map[string]*resumptionEntry // token -> entry with session ID and expiry
+	eventBufs             map[string]*wmpEventBuffer  // keyed by WMP session ID; survives resume unlike peers
+	outbound              map[string]outboundRequest  // server->client request IDs awaiting a response (see trackOutbound)
+	externalURL           string                      // public base URL for discovery (SetExternalURL)
+	draining              bool                        // set by Drain/Close; new sessions and requests are refused
+	afterExpiryScan       func()                      // test hook: runs between cleanupExpired's scan and its closes
+	beforeResumePublish   func(sessionID string)      // test hook: runs between a resume's validation and its publication
+	testHookBeforePublish func()                      // test hook: runs in FlowStart between building a handler and publishing it
+	afterRegister         func(sessionID string)      // test hook: runs between manager registration and peer publication
+	beforeCreateToken     func(sessionID string)      // test hook: runs between publishing a new peer and issuing its token
 
 	// tokenSlotsMu guards tokenSlots, the number of live WMP sessions per
 	// bearer token (see reserveSlot).
@@ -536,6 +537,14 @@ type wmpCaller struct {
 	EnforceTAC bool
 }
 
+// caller is the identity as a wmpCaller. It is the single conversion, so every
+// request path carries the same five fields (user, tenant, jti, TAC, enforce).
+func (id tokenIdentity) caller() wmpCaller {
+	return wmpCaller{UserID: id.UserID, TenantID: id.TenantID, TokenID: id.JTI, TAC: id.TAC, EnforceTAC: id.EnforceTAC}
+}
+
+var _ ReplaceableTransport = (*wmpSessionTransport)(nil)
+
 // wmpCallerTACKey carries the request's wmpTACInfo in the context.
 type wmpCallerTACKey struct{}
 
@@ -793,7 +802,7 @@ func (a *WMPAdapter) HandleRPC(ctx context.Context, sessionID, userID, tenantID 
 		var params wmp.SessionCreateParams
 		if json.Unmarshal(msg.AsRequest().Params, &params) == nil && params.Auth != nil && params.Auth.Token != "" {
 			if id, verr := a.manager.validateTokenAuth(ctx, params.Auth.Token); verr == nil {
-				return a.HandleRPCAs(ctx, sessionID, wmpCaller{UserID: id.UserID, TenantID: id.TenantID, TokenID: id.JTI, TAC: id.TAC, EnforceTAC: id.EnforceTAC}, body)
+				return a.HandleRPCAs(ctx, sessionID, id.caller(), body)
 			}
 		}
 	}
@@ -1490,20 +1499,10 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 	// Abort a blocking sign/match Call still holding Session.Send's read lock on
 	// the old transport (the client may have vanished), so the write lock below
 	// does not wait out the call timeout.
-	prevTransport := oldWS.session.currentTransport()
-	if old, ok := prevTransport.(*wmpSessionTransport); ok {
-		old.retire()
-	}
-
-	// Rewire to the new transport; the write lock waits for in-flight Send
-	// calls, so nothing is written to the old one afterwards.
-	oldWS.session.transportMu.Lock()
-	oldWS.session.transport = wmpTransport
-	oldWS.session.transportMu.Unlock()
-	// Child-flow starts interrupted by retire() are reissued on the new peer.
-	if old, ok := prevTransport.(*wmpSessionTransport); ok {
-		old.handOff(wmpTransport)
-	}
+	// Then rewire to the new transport (the write lock waits for in-flight Send
+	// calls, so nothing is written to the old one afterwards); child-flow starts
+	// interrupted by the retire are reissued on the new peer.
+	oldWS.session.ReplaceTransport(wmpTransport)
 
 	// Retire the old connection and wait for its pump to flush into the buffer
 	// before the new pump starts, preserving event order.
@@ -1823,7 +1822,7 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 	}
 	flow.Handler = handler
 
-	if hook := h.session.testHookBeforePublish; hook != nil {
+	if hook := h.adapter.testHookBeforePublish; hook != nil {
 		hook()
 	}
 
@@ -2226,7 +2225,8 @@ func newWMPSessionTransport(peer *wmp.Peer, ct *wmp.ChannelTransport) *wmpSessio
 
 // handOff records next as the transport that replaced t, so child-flow starts
 // interrupted by retire() can be reissued on it.
-func (t *wmpSessionTransport) handOff(next *wmpSessionTransport) {
+func (t *wmpSessionTransport) handOff(nextTransport SessionTransport) {
+	next, _ := nextTransport.(*wmpSessionTransport)
 	t.handoffOnce.Do(func() {
 		t.successor = next
 		if t.handedOff != nil {
