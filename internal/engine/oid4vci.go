@@ -53,6 +53,11 @@ type OID4VCIHandler struct {
 	attestationChallenge string                 // server-provided Client Attestation PoP challenge (attestation-based client auth)
 	challengeEndpoint    string                 // AS challenge endpoint for fetching attestation challenges
 	redirectURI          string
+	// encryptedNotificationRegistered is set once the notification context of
+	// an encrypted response has been registered for this issuance, so a later
+	// step (deferred polling, completion) cannot recreate a context the client
+	// already consumed with an early credential_notification.
+	encryptedNotificationRegistered bool
 	// authorizationDetails is what the client asked to be sent on the
 	// Authorization Request - see FlowStartMessage.AuthorizationDetails for
 	// why the Wallet decides this and the engine only forwards it.
@@ -1260,6 +1265,16 @@ func (h *OID4VCIHandler) registerNotificationContext(metadata *IssuerMetadata, t
 	}
 	if h.Flow == nil || h.Flow.Session == nil || h.Flow.Session.notifications == nil {
 		return
+	}
+	if resp.Encrypted {
+		// The context is one-shot: register it once per issuance. The client
+		// may notify before it answers decrypt_credential_response, and a
+		// second registration would allow a second, conflicting notification
+		// with the same issuance token.
+		if h.encryptedNotificationRegistered {
+			return
+		}
+		h.encryptedNotificationRegistered = true
 	}
 	h.Flow.Session.notifications.put(h.Flow.ID, &notificationContext{
 		endpoint:       metadata.NotificationEndpoint,
