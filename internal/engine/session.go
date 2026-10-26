@@ -10,19 +10,17 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
+	"golang.org/x/time/rate"
 
 	"github.com/sirosfoundation/go-tokenauth/claims"
 	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	ws "github.com/sirosfoundation/go-wallet-backend/internal/websocket"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/audience"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/legacytoken"
 )
 
 var (
@@ -41,28 +39,11 @@ var (
 // pkg/middleware.TokenBlacklistChecker's shape; *service.TokenBlacklist
 // satisfies this.
 //
-// validateToken's go-tokenauth branch relies on the shared
-// *tokenvalidator.Validator (see SetTokenValidator) already having its own
-// per-jti Revocation checker wired to the same blacklist instance (see
-// internal/server.blacklistRevocationChecker) - this field only adds the
-// user-level check that checker's interface can't express, and is the ONLY
-// revocation check at all for the legacy HMAC branch, which the shared
-// Validator never touches (#391 review, round 2: this handshake path was
-// found to bypass both TokenAuthMiddleware's own user-level check and, for
-// legacy tokens, revocation entirely).
+// validateToken relies on the shared Validator's own per-jti Revocation checker; this field
+// adds only the user-level check that checker's interface can't express.
 type TokenBlacklistChecker interface {
 	IsBlacklisted(ctx context.Context, jti string) bool
 	IsUserRevoked(ctx context.Context, userID string) bool
-
-	// IsFamilyRevoked reports whether sid - a refresh-token family/session
-	// id (see service.WebAuthnService.generateToken's doc comment) - has
-	// been revoked via RevokeFamily (what api.Handlers.Logout calls). Added
-	// for #402/#414 (Copilot review): without this, an access token from an
-	// earlier rotation of a since-logged-out session - its own jti never
-	// individually blacklisted - could still authenticate a NEW WebSocket
-	// handshake to this engine even after the HTTP paths (pkg/middleware.
-	// AuthMiddlewareWithBlacklist/TokenAuthMiddleware) already reject it.
-	IsFamilyRevoked(ctx context.Context, sid string) bool
 }
 
 // MaxPendingFlowsPerSession limits concurrent flows to prevent DoS.
@@ -102,11 +83,8 @@ type Session struct {
 	ID       string
 	UserID   string
 	TenantID string
-	// TAC is only ever populated on the go-tokenauth path - see
-	// Manager.validateToken. An empty TAC means "not applicable" (legacy
-	// auth, no TAC concept at all), not "no permissions" - handleFlowStart's
-	// per-protocol check must treat it as a no-op, exactly like
-	// requireTACIfEnforced does for HTTP routes.
+	// TAC is the token's TAC claim. Empty means no TAC claim, not "no permissions":
+	// handleFlowStart skips the check.
 	TAC     claims.TAC
 	conn    *websocket.Conn
 	sendMu  sync.Mutex
@@ -136,6 +114,31 @@ type Session struct {
 	// on the same cadence.
 	pingInterval time.Duration
 	pongTimeout  time.Duration
+
+	// unknownFlowLimiter rate-limits UNKNOWN_FLOW replies (see
+	// rejectIfUnknownFlow). Only touched from the read loop goroutine.
+	unknownFlowLimiter *rate.Limiter
+
+	// outstandingRequests holds the message_id of every sign/match request
+	// currently awaiting its response (guarded by flowsMu), so responses are
+	// still delivered after the requesting flow has completed.
+	outstandingRequests map[string]struct{}
+}
+
+// trackRequest registers messageID as an outstanding request until the
+// returned func is called.
+func (s *Session) trackRequest(messageID string) (done func()) {
+	s.flowsMu.Lock()
+	if s.outstandingRequests == nil {
+		s.outstandingRequests = make(map[string]struct{})
+	}
+	s.outstandingRequests[messageID] = struct{}{}
+	s.flowsMu.Unlock()
+	return func() {
+		s.flowsMu.Lock()
+		delete(s.outstandingRequests, messageID)
+		s.flowsMu.Unlock()
+	}
 }
 
 // Flow represents an active credential flow
@@ -463,6 +466,62 @@ func (s *Session) pingLoop() {
 	}
 }
 
+// unknownFlowErrorBurst/unknownFlowErrorRate bound how many UNKNOWN_FLOW
+// replies a single session may elicit, so a misbehaving client that spams
+// messages for non-existent flows cannot turn the engine into a write
+// amplifier for its own connection. A well-behaved client sends at most a
+// handful (one per stale UI action); beyond the budget the message is
+// dropped silently and only counted in the debug log.
+const (
+	unknownFlowErrorBurst = 10
+	unknownFlowErrorRate  = rate.Limit(2) // replies per second, sustained
+)
+
+// rejectIfUnknownFlow answers a client message that references flowID with a
+// flow_error (UNKNOWN_FLOW) when this session has no such flow, and reports
+// whether it did. It must only be called from the session's read loop.
+//
+// The lookup is deliberately scoped to this session's own flow table: a flow
+// that belongs to another session or user is indistinguishable from one that
+// never existed (same code, same message, nothing about the other flow is
+// disclosed), so a client cannot probe for foreign flow IDs. A flow that was
+// in progress on a previous session of the same user is likewise unknown to
+// the new session - this error is how a reconnected client learns it is dead.
+//
+// A response (messageID != "") that answers a request this session still has
+// outstanding is never rejected, even if its flow has since completed: the
+// client-held DPoP signer deliberately addresses sign requests to a finished
+// flow (see clientHeldDPoPSigner) to forward credential notifications.
+func (s *Session) rejectIfUnknownFlow(flowID, messageID string, msgType MessageType) bool {
+	s.flowsMu.RLock()
+	_, ok := s.flows[flowID]
+	_, outstanding := s.outstandingRequests[messageID]
+	s.flowsMu.RUnlock()
+	if ok || (messageID != "" && outstanding) {
+		return false
+	}
+	// Debug, not Warn: the flow_id is client-controlled and this path is
+	// reachable by any authenticated client, so it must not flood the logs.
+	s.logger.Debug("Message for unknown flow",
+		zap.String("type", string(msgType)),
+		zap.String("flow_id", truncateForLog(flowID, 64)))
+	if s.unknownFlowLimiter == nil {
+		s.unknownFlowLimiter = rate.NewLimiter(unknownFlowErrorRate, unknownFlowErrorBurst)
+	}
+	if !s.unknownFlowLimiter.Allow() {
+		return true // abusive volume: dropped, not answered
+	}
+	_ = s.SendFlowError(flowID, "", ErrCodeUnknownFlow, "Flow not found or already completed")
+	return true
+}
+
+func truncateForLog(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
+}
+
 func (m *Manager) handleSession(session *Session) {
 	defer func() {
 		close(session.stopPing) // stop the ping goroutine
@@ -507,15 +566,10 @@ func (m *Manager) handleSession(session *Session) {
 				_ = session.SendFlowError(msg.FlowID, "", ErrCodeInvalidMessage, "Invalid flow_action format")
 				continue
 			}
-			// Check if flow exists before routing - prevents action loss for unknown flows
-			session.flowsMu.RLock()
-			_, flowExists := session.flows[actionMsg.FlowID]
-			session.flowsMu.RUnlock()
-			if !flowExists {
-				session.logger.Warn("Action for unknown flow",
-					zap.String("flow_id", actionMsg.FlowID),
-					zap.String("action", actionMsg.Action))
-				_ = session.SendFlowError(actionMsg.FlowID, "", ErrCodeUnknownFlow, "Flow not found or already completed")
+			// Check if flow exists before routing - prevents action loss for
+			// unknown flows. The client is always told (flow_error
+			// UNKNOWN_FLOW), never left waiting on a flow that is gone.
+			if session.rejectIfUnknownFlow(actionMsg.FlowID, "", msg.Type) {
 				continue
 			}
 			// Route to the flow - send error if channel full instead of dropping
@@ -534,6 +588,12 @@ func (m *Manager) handleSession(session *Session) {
 				session.logger.Warn("Invalid sign_response", zap.Error(err))
 				continue
 			}
+			// Responses that name a flow that no longer exists are answered
+			// with UNKNOWN_FLOW. A response without a flow_id is correlated
+			// by message_id alone and routed as before.
+			if signMsg.FlowID != "" && session.rejectIfUnknownFlow(signMsg.FlowID, signMsg.MessageID, msg.Type) {
+				continue
+			}
 			// Route to waiting flow - send error if channel full instead of dropping
 			select {
 			case session.signCh <- &signMsg:
@@ -547,6 +607,9 @@ func (m *Manager) handleSession(session *Session) {
 			var matchMsg MatchResponseMessage
 			if err := json.Unmarshal(message, &matchMsg); err != nil {
 				session.logger.Warn("Invalid match_response", zap.Error(err))
+				continue
+			}
+			if matchMsg.FlowID != "" && session.rejectIfUnknownFlow(matchMsg.FlowID, matchMsg.MessageID, msg.Type) {
 				continue
 			}
 			// Route to waiting flow - send error if channel full instead of dropping
@@ -620,10 +683,7 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	}
 
 	// TAC check: only enforced when the session actually has a TAC to check
-	// (empty means legacy auth, which has no TAC concept - see
-	// Manager.validateToken - not "no permissions"), mirroring
-	// requireTACIfEnforced's identical conditional enforcement for HTTP
-	// routes (internal/server/providers.go).
+	// (empty means the token carries no TAC claim, not "no permissions").
 	if session.TAC != "" {
 		if required, ok := requiredTACForProtocol[msg.Protocol]; ok && !session.TAC.HasAll(required) {
 			_ = session.SendFlowError(flowID, "", ErrCodeForbidden, "insufficient permissions for protocol: "+string(msg.Protocol))
@@ -803,16 +863,8 @@ func (m *Manager) unregisterSession(session *Session) {
 	session.logger.Info("Session closed", zap.String("session_id", session.ID))
 }
 
-// engineAdmitsLegacyTokens is whether the engine transport accepts ModeLegacy
-// (HMAC login) tokens without an audience match. True today, as for every
-// other guarded route group; see audience.Allowed.
-const engineAdmitsLegacyTokens = true
-
-// validateToken authenticates tokenString and returns its identity.
-// tac is only ever populated on the go-tokenauth path - the legacy HMAC
-// path (below) has no TAC concept at all, so callers must treat an empty
-// tac as "not applicable here", not "no permissions", exactly like
-// requireTACIfEnforced does for HTTP routes (see internal/server/providers.go).
+// validateToken authenticates tokenString and returns its identity. Only tokens accepted by the
+// go-tokenauth validator are allowed; with none wired (SetTokenValidator) every handshake is refused.
 //
 // ctx is the handshake-scoped context and is passed to every validator and
 // revocation lookup. If it is already done, validation fails closed (a
@@ -822,124 +874,24 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 	if err := ctx.Err(); err != nil {
 		return "", "", "", fmt.Errorf("token validation aborted: %w", err)
 	}
-	// Use go-tokenauth validator when available (supports both new-style and legacy tokens)
-	if m.tokenValidator != nil {
-		result, err := m.tokenValidator.Validate(ctx, tokenString)
-		if err != nil {
-			return "", "", "", err
-		}
-		// The engine transport, like the AuthZEN proxy, only needs a
-		// wallet-registry or wallet-backend audience - never a broader one.
-		//
-		// Legacy (HMAC) tokens are exempt, exactly like
-		// middleware.RequireAudience (see audience.Allowed for why:
-		// they carry aud=Server.RPID, already validated against
-		// AS.Audiences). The exemption is an explicit opt-in constant, not an
-		// implicit special case: if the engine transport is ever restricted
-		// to a narrower audience that ordinary login tokens must not reach,
-		// flip engineAdmitsLegacyTokens to false. Session-mode tokens always
-		// keep the strict check.
-		if !audience.Allowed(result, engineAdmitsLegacyTokens, "wallet-registry", "wallet-backend") {
-			return "", "", "", errors.New("token audience not permitted for engine transport")
-		}
-		// Per-jti revocation is already enforced inside Validate itself (the
-		// shared Validator's own Revocation checker - see
-		// internal/server.blacklistRevocationChecker); user-level revocation
-		// is not, since that checker's interface only ever sees a jti (see
-		// #391 review, round 2). Checked against both the optional
-		// TokenBlacklist feature and the engine's own always-on
-		// revokedUsers (#403) - either one saying revoked is enough to
-		// reject.
-		if (m.blacklist != nil && m.blacklist.IsUserRevoked(ctx, result.UserID)) || m.isUserRevoked(result.UserID) {
-			return "", "", "", errors.New("token has been revoked")
-		}
-		// Refresh-token family revocation (#402/#414), legacy-mode tokens
-		// only: go-tokenauth "auto-detects new-style vs legacy" tokens, so a
-		// WebAuthnService-issued legacy HMAC token can reach this branch
-		// too whenever the AS is enabled. go-tokenauth's shared
-		// *claims.Result has no "sid" field at all (it's shared with
-		// AS-issued tokens, which have no family concept in this codebase),
-		// so this reuses legacytoken.SID to re-parse the same
-		// already-validated raw token independently and reach that one
-		// extra claim - the same helper TokenAuthMiddleware itself uses,
-		// for the identical reason. New-style AS-issued tokens (ModeSession)
-		// are skipped entirely.
-		if m.blacklist != nil && result.Mode == claims.ModeLegacy {
-			// Fail closed if the family cannot be determined.
-			sid, sidErr := legacytoken.ParseSID(m.cfg.JWT.Secret, tokenString)
-			if sidErr != nil {
-				return "", "", "", errors.New("cannot determine token family")
-			}
-			// Re-check ctx right before the lookup: fail closed rather than
-			// treat an abandoned handshake's lookup as "not revoked".
-			if err := ctx.Err(); err != nil {
-				return "", "", "", fmt.Errorf("family revocation check aborted: %w", err)
-			}
-			if sid != "" && m.blacklist.IsFamilyRevoked(ctx, sid) {
-				return "", "", "", errors.New("token has been revoked")
-			}
-		}
-		// UserID may be empty for anonymous tokens — that is acceptable.
-		return result.UserID, result.TenantID, result.TAC, nil
+	if m.tokenValidator == nil {
+		return "", "", "", errors.New("no token validator configured")
 	}
-
-	// Legacy path: direct HMAC validation, only while legacy is enabled.
-	if !m.cfg.LegacyEnabled() {
-		return "", "", "", errors.New("legacy tokens are disabled")
-	}
-
-	// Nothing else on this path checks revocation, so both checks below are
-	// needed.
-	// Pin iss = jwt.issuer; an empty value would disable the check
-	// (golang-jwt), so fail closed.
-	if m.cfg.JWT.Issuer == "" {
-		return "", "", "", errors.New("jwt issuer not configured")
-	}
-	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, errors.New("unexpected signing method")
-		}
-		return []byte(m.cfg.JWT.Secret), nil
-	}, jwt.WithLeeway(config.JWTLeeway), jwt.WithIssuer(m.cfg.JWT.Issuer))
-
+	result, err := m.tokenValidator.Validate(ctx, tokenString)
 	if err != nil {
 		return "", "", "", err
 	}
-
-	if mapClaims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
-		// Support both "user_id" (go-wallet-backend native) and "uuid" (wallet-backend-server compat)
-		userID, _ = mapClaims["user_id"].(string)
-		if userID == "" {
-			userID, _ = mapClaims["uuid"].(string)
-		}
-		tenantID, _ = mapClaims["tenant_id"].(string)
-		if userID == "" {
-			return "", "", "", errors.New("invalid token claims: missing user_id or uuid")
-		}
-		if m.blacklist != nil {
-			if jti, _ := mapClaims["jti"].(string); jti != "" && m.blacklist.IsBlacklisted(ctx, jti) {
-				return "", "", "", errors.New("token has been revoked")
-			}
-			if m.blacklist.IsUserRevoked(ctx, userID) {
-				return "", "", "", errors.New("token has been revoked")
-			}
-			// Refresh-token family revocation (#402/#414) - see the
-			// go-tokenauth branch above's identical check for why.
-			if sid, _ := mapClaims["sid"].(string); sid != "" && m.blacklist.IsFamilyRevoked(ctx, sid) {
-				return "", "", "", errors.New("token has been revoked")
-			}
-		}
-		// Checked unconditionally (unlike the m.blacklist block above,
-		// which is skipped entirely when no blacklist is wired): the
-		// engine's own revokedUsers works regardless of whether that
-		// optional feature is configured at all (#403).
-		if m.isUserRevoked(userID) {
-			return "", "", "", errors.New("token has been revoked")
-		}
-		return userID, tenantID, "", nil
+	// The engine transport needs a wallet-registry or wallet-backend audience, nothing broader.
+	if !result.HasAudience("wallet-registry", "wallet-backend") {
+		return "", "", "", errors.New("token audience not permitted for engine transport")
 	}
-
-	return "", "", "", errors.New("invalid token")
+	// Per-jti revocation happens inside Validate; user-level revocation does not (the checker only
+	// sees a jti), so check the optional TokenBlacklist and the engine's own revokedUsers (#403).
+	if (m.blacklist != nil && m.blacklist.IsUserRevoked(ctx, result.UserID)) || m.isUserRevoked(result.UserID) {
+		return "", "", "", errors.New("token has been revoked")
+	}
+	// UserID may be empty for anonymous tokens — that is acceptable.
+	return result.UserID, result.TenantID, result.TAC, nil
 }
 
 func (m *Manager) getCapabilities() []string {
@@ -1375,6 +1327,7 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 		Params: params,
 	}
 
+	defer s.trackRequest(messageID)()
 	if err := s.Send(&msg); err != nil {
 		return nil, err
 	}
@@ -1422,6 +1375,7 @@ func (s *Session) RequestMatch(ctx context.Context, flowID string, dcql json.Raw
 		DCQLQuery: dcql,
 	}
 
+	defer s.trackRequest(messageID)()
 	if err := s.Send(&msg); err != nil {
 		return nil, err
 	}

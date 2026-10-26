@@ -23,6 +23,7 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	set := bson.M{
 		"tenant_id":          instance.TenantID,
 		"attestation_source": instance.AttestationSource,
+		"verified_app_id":    instance.VerifiedAppID,
 		"last_attested_at":   instance.LastAttestedAt,
 		"updated_at":         instance.UpdatedAt,
 	}
@@ -39,6 +40,9 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 		"$inc": bson.M{
 			"attestation_count": 1,
 		},
+	}
+	if instance.WSCDType != "" {
+		set["wscd_type"] = instance.WSCDType
 	}
 	if instance.UserID != nil {
 		set["user_id"] = instance.UserID

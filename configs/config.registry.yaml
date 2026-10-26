@@ -6,16 +6,9 @@
 #
 # Every key can be set through WALLET_* environment variables, e.g.
 #   WALLET_REGISTRY_SOURCE_URL, WALLET_REGISTRY_REQUIRE_AUTH,
-#   WALLET_SERVER_REGISTRY_PORT, WALLET_AS_EXTERNAL_URL, WALLET_JWT_SECRET.
+#   WALLET_SERVER_REGISTRY_PORT, WALLET_AS_EXTERNAL_URL, WALLET_AS_ISSUER.
 
 server:
-  # Required while as.legacy.enabled is true and jwt.secret is set: the RP ID
-  # of the backend that issues the legacy HMAC tokens (their "aud" claim).
-  # Startup fails if it is left at the default "localhost". Not needed with
-  # as.legacy.enabled=false. (Exception: a process started from the deprecated
-  # registry.yaml / REGISTRY_* alias keeps starting without it and validates
-  # legacy tokens without an audience check - see docs/REGISTRY_MIGRATION.md.)
-  # rp_id: "wallet.example.org"
   host: "0.0.0.0"
   # Registry-only processes listen on registry_port (default 8097).
   registry_port: 8097
@@ -36,8 +29,9 @@ registry:
     # Enabled in the image, as the retired registry image did. Restrict with
     # allowed_hosts in production.
     enabled: true
-  # true: every request needs a valid access token, validated from the as.* /
-  # jwt.* settings below (no JWKS override exists).
+  # true: every request needs a valid AS-issued access token, validated through
+  # the AS JWKS at as.external_url (no JWKS override exists; the legacy HMAC
+  # tokens of the removed legacy AS are not accepted).
   # require_auth: true
 
 # Needed only when registry.require_auth is true (or to recognise tokens for
@@ -50,11 +44,3 @@ as:
   external_url: ""
   # Expected "iss" claim (defaults to jwt.issuer).
   issuer: ""
-  legacy:
-    # Accept legacy HMAC tokens signed with jwt.secret (never rejected on
-    # audience grounds). Set to false once all clients use AS-issued tokens.
-    enabled: true
-
-# jwt:
-#   secret_path: /run/secrets/jwt_secret   # >= 32 bytes; needed while as.legacy.enabled
-#   issuer: wallet-backend

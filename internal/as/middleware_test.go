@@ -24,20 +24,18 @@ func setupMiddlewareTest(t *testing.T) (*MemorySessionStore, *gin.Engine) {
 	r.GET("/protected", RequireSession(), func(c *gin.Context) {
 		session := GetSession(c)
 		c.JSON(http.StatusOK, gin.H{
-			"user_id":     session.UserID,
-			"tenant_id":   session.TenantID,
-			"client_mode": string(GetClientMode(c)),
+			"user_id":   session.UserID,
+			"tenant_id": session.TenantID,
 		})
 	})
 	r.GET("/optional", func(c *gin.Context) {
-		mode := GetClientMode(c)
-		c.JSON(http.StatusOK, gin.H{"client_mode": string(mode)})
+		c.JSON(http.StatusOK, gin.H{"has_session": GetSession(c) != nil})
 	})
 
 	return store, r
 }
 
-func TestMiddleware_NoSession_LegacyMode(t *testing.T) {
+func TestMiddleware_NoSession_ContinuesWithoutSession(t *testing.T) {
 	_, r := setupMiddlewareTest(t)
 
 	w := httptest.NewRecorder()
@@ -45,7 +43,7 @@ func TestMiddleware_NoSession_LegacyMode(t *testing.T) {
 	r.ServeHTTP(w, req)
 
 	assert.Equal(t, http.StatusOK, w.Code)
-	assert.Contains(t, w.Body.String(), "legacy")
+	assert.Contains(t, w.Body.String(), `"has_session":false`)
 }
 
 func TestMiddleware_NoSession_ProtectedEndpoint(t *testing.T) {
@@ -79,7 +77,6 @@ func TestMiddleware_ValidSession(t *testing.T) {
 
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Contains(t, w.Body.String(), "user-42")
-	assert.Contains(t, w.Body.String(), "session")
 }
 
 func TestMiddleware_ExpiredSession(t *testing.T) {
@@ -174,10 +171,4 @@ func TestCookie_Clear(t *testing.T) {
 	assert.Equal(t, sessionCookieSecure, cookies[0].Name)
 	assert.Equal(t, "", cookies[0].Value)
 	assert.Equal(t, -1, cookies[0].MaxAge)
-}
-
-func TestGetClientMode_Default(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	c, _ := gin.CreateTestContext(httptest.NewRecorder())
-	assert.Equal(t, ClientModeLegacy, GetClientMode(c))
 }
