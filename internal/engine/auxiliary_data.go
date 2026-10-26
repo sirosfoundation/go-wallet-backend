@@ -590,5 +590,11 @@ func proofAuxiliaryDataClaim(token string) (json.RawMessage, bool, error) {
 	if _, err := dec.Token(); err != nil {
 		return nil, false, auxProofErr("proof payload is not a JSON object")
 	}
+	// Nothing may follow the object: a decoder that stops after the first
+	// value would see a different claim set than one that reads on.
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		// Ambiguous like a repeated claim: never forwarded, inspected or not.
+		return nil, false, fmt.Errorf("%w: %w", errAuxiliaryDataProof, errAmbiguousAuxClaim)
+	}
 	return claim, found, nil
 }

@@ -338,6 +338,36 @@ func TestAuxiliaryDataConflict_RelayedUnchangedNoRetry(t *testing.T) {
 }
 
 // Anything that is not exactly the code is an ordinary credential error.
+// A repeated or case-variant "error" member is read differently by different
+// decoders (a map keeps the last, which may be null): the response cannot be
+// classified, so it is terminal and generic, never retried, logged or returned.
+func TestAuxiliaryDataConflict_RepeatedErrorMemberIsTerminalAndQuiet(t *testing.T) {
+	const echo = "COMMITMENT-ECHO"
+	for name, body := range map[string]string{
+		"trailing null":   `{"error":"auxiliary_data_conflict","error":null,"error_description":"` + echo + `"}`,
+		"case variant":    `{"error":"auxiliary_data_conflict","ERROR":"invalid_proof","error_description":"` + echo + `"}`,
+		"benign then bad": `{"error":"invalid_request","error":"x","error_description":"` + echo + `"}`,
+	} {
+		for dpop, label := range map[bool]string{false: "plain", true: "dpop-nonce"} {
+			t.Run(name+"/"+label, func(t *testing.T) {
+				st, hits := conflictStub(t, body, dpop)
+				fc := &fakeClient{t: t}
+				h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
+				defer cleanup()
+				err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", hcCfg(""), nil, "")
+				require.Error(t, err)
+				assert.Equal(t, 1, *hits, "never retried")
+				assert.NotContains(t, err.Error(), echo)
+				assert.NotContains(t, logDump(logs), echo)
+				fc.settle()
+				for _, m := range fc.outboundMessages() {
+					assert.NotContains(t, string(m["error"]), echo)
+				}
+			})
+		}
+	}
+}
+
 func TestAuxiliaryDataConflict_OtherErrorsNotRelayedAsConflict(t *testing.T) {
 	for name, body := range map[string]string{
 		"invalid_proof":     `{"error":"invalid_proof","error_description":"auxiliary_data_conflict"}`,
@@ -522,6 +552,8 @@ func TestCheckProofsForwardNoOpening(t *testing.T) {
 		"shadowed nested subtree":        `{"auxiliary_data":[{"type":"x","extra":{"opening":"SECRET"},"extra":null}]}`,
 		"shadowed deeper subtree":        `{"auxiliary_data":[{"type":"x","a":{"b":[{"c":{"OPENING":"SECRET"}}],"b":1}}]}`,
 		"nested opening":                 `{"auxiliary_data":[{"type":"x","v":{"Opening":"SECRET"}}]}`,
+		"trailing object with opening":   `{"nonce":"n"}{"auxiliary_data":` + secretEntry + `}`,
+		"trailing value after claim":     `{"auxiliary_data":` + benign + `} 1`,
 	} {
 		withOpening["raw/jwt/"+name] = []ProofObject{{ProofType: "jwt", JWT: rawProofJWT(payload)}}
 		withOpening["raw/attestation/"+name] = []ProofObject{{ProofType: "attestation", Attestation: rawProofJWT(payload)}}
