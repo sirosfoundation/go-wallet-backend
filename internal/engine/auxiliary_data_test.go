@@ -103,6 +103,10 @@ func TestAuxiliaryDataSupported_Malformed(t *testing.T) {
 		"hc path object":          `{"to_wallet":[{"type":"hash_commitment","alg":"sha-256","path":[{}]}]}`,
 		"opening in metadata":     `{"to_wallet":[` + hc(`,"opening":"SECRETOPENING"`) + `]}`,
 		"commitment in metadata":  `{"to_issuer":[` + hc(`,"commitment":"x"`) + `]}`,
+		"Opening in metadata":     `{"to_wallet":[` + hc(`,"Opening":"SECRETOPENING"`) + `]}`,
+		"OPENING in metadata":     `{"to_wallet":[` + hc(`,"OPENING":"SECRETOPENING"`) + `]}`,
+		"Commitment in metadata":  `{"to_issuer":[` + hc(`,"Commitment":"x"`) + `]}`,
+		"Type shadow":             `{"to_issuer":[{"type":"https://x.example/t","Type":"hash_commitment","Opening":"SECRETOPENING"}]}`,
 		"required not bool":       `{"to_issuer":[` + hc(`,"required":"yes"`) + `]}`,
 		"required null":           `{"to_issuer":[` + hc(`,"required":null`) + `]}`,
 		"duplicate escaped path":  `{"to_wallet":[` + hc("") + `,{"type":"hash_commitment","alg":"sha-256","path":["\u0061","b"]}]}`,
@@ -487,6 +491,9 @@ func TestCheckProofsForwardNoOpening(t *testing.T) {
 		"opening on an unlisted path": proofs(append(good(), map[string]interface{}{
 			"type": "hash_commitment", "alg": "sha-256", "path": []string{"n", "other"}, "opening": "SECRET"})),
 		"opening in the second proof": proofs(good(), entry(func(e map[string]interface{}) { e["opening"] = "SECRET" })),
+		"Opening, case-folded":        proofs(entry(func(e map[string]interface{}) { e["Opening"] = "SECRET" })),
+		"OPENING, case-folded":        proofs(entry(func(e map[string]interface{}) { e["OPENING"] = "SECRET" })),
+		"Type and Opening folded":     proofs([]map[string]interface{}{{"Type": "hash_commitment", "Opening": "SECRET"}}),
 		"opening in an attestation":   {{ProofType: "attestation", Attestation: auxProofJWT(t, entry(func(e map[string]interface{}) { e["opening"] = "SECRET" }))}},
 	}
 	for name, ps := range withOpening {
@@ -615,6 +622,33 @@ func TestOversizedErrorBodyFailsClosed(t *testing.T) {
 			for _, m := range fc.outboundMessages() {
 				assert.NotContains(t, string(m["error"]), "SECRET-ISSUER-TEXT")
 				assert.NotContains(t, string(m["error"]), "AUXILIARY_DATA_CONFLICT")
+			}
+		})
+	}
+}
+
+// An issuer error that is not a conflict (an invalid_proof whose description
+// echoes a commitment) is neither logged nor returned beyond its error code
+// when the credential carries auxiliary data; the nonce retry still works.
+func TestCredentialErrorTextNotLoggedWithAuxiliaryData(t *testing.T) {
+	const echo = "COMMITMENT-ECHO-Zm9vYmFy"
+	for name, body := range map[string]string{
+		"invalid_proof":   `{"error":"invalid_proof","error_description":"the commitment ` + echo + ` is wrong"}`,
+		"with c_nonce":    `{"error":"invalid_proof","c_nonce":"n2","error_description":"the commitment ` + echo + ` is wrong"}`,
+		"odd error value": `{"error":"not a code ` + echo + `"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			st, _ := conflictStub(t, body, false)
+			fc := &fakeClient{t: t}
+			h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
+			defer cleanup()
+			err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", auxCfg(auxAdvFull), nil, "")
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), echo)
+			assert.NotContains(t, logDump(logs), echo)
+			fc.settle()
+			for _, m := range fc.outboundMessages() {
+				assert.NotContains(t, string(m["error"]), echo)
 			}
 		})
 	}

@@ -232,6 +232,9 @@ func parseAuxiliaryDataSupported(raw json.RawMessage) (*auxAdvertisement, error)
 	return out, nil
 }
 
+// auxEntryMembers are the members of an auxiliary data entry the engine knows.
+var auxEntryMembers = []string{"type", "alg", "path", "required", "opening", "commitment"}
+
 type auxEntry struct {
 	typ string
 }
@@ -250,6 +253,15 @@ func parseAuxEntries(raw json.RawMessage, list string) ([]auxEntry, []json.RawMe
 		var m map[string]json.RawMessage
 		if json.Unmarshal(re, &m) != nil || m == nil {
 			return bad("has an entry that is not an object")
+		}
+		// A member spelled in another case ("Opening", "TYPE") is read as the
+		// canonical one by a case-insensitive decoder: refuse the entry.
+		for k := range m {
+			for _, name := range auxEntryMembers {
+				if k != name && strings.EqualFold(k, name) {
+					return bad("has an entry with a case-variant member name")
+				}
+			}
 		}
 		var typ string
 		if json.Unmarshal(m["type"], &typ) != nil || typ == "" {
@@ -271,10 +283,10 @@ func parseAuxEntries(raw json.RawMessage, list string) ([]auxEntry, []json.RawMe
 			if json.Unmarshal(m["alg"], &alg) != nil || alg == "" {
 				return bad("has a hash_commitment entry without a string alg")
 			}
-			if _, has := m["opening"]; has {
+			if hasMemberFold(m, "opening") {
 				return bad("has a hash_commitment entry carrying an opening")
 			}
-			if _, has := m["commitment"]; has {
+			if hasMemberFold(m, "commitment") {
 				return bad("has a hash_commitment entry carrying a commitment")
 			}
 			p, ok := claimsPathKey(m["path"])
@@ -393,16 +405,37 @@ func checkProofsForwardNoOpening(proofs []ProofObject, inspect bool) error {
 			return auxProofErr("auxiliary_data is not an array of objects")
 		}
 		for _, e := range entries {
-			var typ string
-			if json.Unmarshal(e["type"], &typ) != nil || typ != auxTypeHashCommitment {
-				continue
-			}
-			if _, has := e["opening"]; has {
+			if isHashCommitmentEntry(e) && hasMemberFold(e, "opening") {
 				return auxProofErr("a proof entry carries an opening")
 			}
 		}
 	}
 	return nil
+}
+
+// hasMemberFold reports whether m has a member named name under ANY case
+// spelling. encoding/json matches struct fields case-insensitively, so a
+// downstream decoder reads "Opening" or "OPENING" as the opening: an exact-key
+// lookup would let it through.
+func hasMemberFold(m map[string]json.RawMessage, name string) bool {
+	for k := range m {
+		if strings.EqualFold(k, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// isHashCommitmentEntry reports whether any spelling of the type member names
+// the hash_commitment type (a downstream decoder takes "Type" for "type").
+func isHashCommitmentEntry(e map[string]json.RawMessage) bool {
+	for k, v := range e {
+		var typ string
+		if strings.EqualFold(k, "type") && json.Unmarshal(v, &typ) == nil && typ == auxTypeHashCommitment {
+			return true
+		}
+	}
+	return false
 }
 
 // proofAuxiliaryDataClaim returns the auxiliary_data claim of a compact JWT's

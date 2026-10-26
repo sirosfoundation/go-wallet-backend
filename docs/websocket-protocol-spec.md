@@ -728,12 +728,16 @@ credential_configurations_supported[cfg].auxiliary_data_supported
   6.4 that the issuer owns and enforces (and answers with `invalid_proof`). The
   engine checks one thing of its own before a proof is forwarded: no
   `hash_commitment` entry carries an `opening`, a secret the engine must never
-  relay. When the issuer advertised `to_issuer` entries the engine also refuses a
+  relay (the member name is matched in any letter case, as a case-insensitive
+  decoder downstream would read `Opening` as `opening`). When the issuer advertised `to_issuer` entries the engine also refuses a
   proof it cannot inspect (a type other than `jwt` or `attestation`, an unreadable
   JWT, an `auxiliary_data` claim that is not an array of objects). A violation
   fails the flow with `AUXILIARY_DATA_PROOF_INVALID`, step `requesting_credential`,
   and no request reaches the issuer. The engine never logs or returns a
-  commitment or opening value.
+  commitment or opening value. For a credential configuration that advertises
+  `auxiliary_data_supported`, an error response from the credential endpoint is
+  neither logged nor returned beyond its OAuth error code, because the issuer's
+  text may echo a commitment.
 
 If the credential endpoint answers HTTP 400 with the OAuth error code
 `auxiliary_data_conflict` (an entry conflicts with a value the issuer holds for

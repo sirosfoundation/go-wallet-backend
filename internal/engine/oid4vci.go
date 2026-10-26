@@ -859,6 +859,29 @@ func parseOAuthError(statusCode int, body []byte) error {
 	return fmt.Errorf("endpoint returned status %d", statusCode)
 }
 
+// oauthErrorCodeOnly is parseOAuthError without the issuer's description or
+// URI: only a well-formed error code (token characters, bounded) is returned.
+func oauthErrorCodeOnly(statusCode int, body []byte) error {
+	var oauthErr OAuthError
+	if err := json.Unmarshal(body, &oauthErr); err == nil && validOAuthErrorCode(oauthErr.Error) {
+		return fmt.Errorf("%s", oauthErr.Error)
+	}
+	return fmt.Errorf("endpoint returned status %d", statusCode)
+}
+
+func validOAuthErrorCode(code string) bool {
+	if code == "" || len(code) > 64 {
+		return false
+	}
+	for _, r := range code {
+		ok := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.'
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // setAuthorizationHeader sets the Authorization header using DPoP scheme when the token
 // was DPoP-bound, otherwise uses Bearer.
 func (h *OID4VCIHandler) setAuthorizationHeader(req *http.Request, token *TokenResponse) {
@@ -2760,7 +2783,18 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			if conflictErr := h.auxiliaryDataConflictError(resp.StatusCode, body); conflictErr != nil {
 				return nil, conflictErr
 			}
-			h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+			// A request that carried auxiliary data may be answered with text
+			// that echoes a commitment (an invalid_proof description, say):
+			// then neither the body nor the description is logged or returned,
+			// only the status and the error code.
+			quiet := config != nil && len(config.AuxiliaryDataSupported) > 0
+			errOf := parseOAuthError
+			if quiet {
+				errOf = oauthErrorCodeOnly
+				h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode))
+			} else {
+				h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+			}
 
 			// Check whether the error response contains a refreshed c_nonce so the
 			// caller can re-request proofs and retry. Do NOT send a flow error here —
@@ -2771,12 +2805,12 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			if json.Unmarshal(body, &errResp) == nil && errResp.CNonce != "" {
 				return nil, &CNonceRequiredError{
 					NewNonce: errResp.CNonce,
-					Err:      parseOAuthError(resp.StatusCode, body),
+					Err:      errOf(resp.StatusCode, body),
 				}
 			}
 
 			_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
-			return nil, parseOAuthError(resp.StatusCode, body)
+			return nil, errOf(resp.StatusCode, body)
 		}
 
 		body, err := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))
