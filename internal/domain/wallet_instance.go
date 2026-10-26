@@ -53,6 +53,13 @@ const (
 	// Keys are managed in the PKCS#11 slot identified by client_id.
 	WSCDTypeRemote WSCDType = "remote"
 
+	// WSCDTypeUnknown means nothing verifies where the instance key lives.
+	// The WIA path records it: the PoP key is the wallet's instance key in
+	// its own keystore, not the platform attestation key. Instances stored
+	// before this value existed (or with an empty type) carry web_crypto,
+	// native_* or "" and are overwritten at their next attestation.
+	WSCDTypeUnknown WSCDType = "unknown"
+
 	// WSCDTypeNativeIOS uses iOS Secure Enclave via App Attest.
 	WSCDTypeNativeIOS WSCDType = "native_ios"
 
@@ -94,7 +101,10 @@ type WalletInstance struct {
 	// Status is the lifecycle state: active, suspended, revoked.
 	Status InstanceStatus `json:"status" bson:"status"`
 
-	// WSCDType identifies the type of WSCD backing this instance.
+	// WSCDType identifies the type of WSCD backing this instance, or
+	// WSCDTypeUnknown when nothing verifies it (what the WIA path records).
+	// It is not an input of the assurance policy (see
+	// docs/assurance-policy.md, "WSCD type").
 	WSCDType WSCDType `json:"wscd_type" bson:"wscd_type"`
 
 	// CredentialID is the WebAuthn credential ID (base64url) of the passkey
@@ -115,6 +125,13 @@ type WalletInstance struct {
 	// "development_attested" (App Attest chained only to the development
 	// environment).
 	AttestationSource string `json:"attestation_source" bson:"attestation_source"`
+
+	// VerifiedAppID is the application id the backend itself verified in the
+	// most recent native attestation (App Attest / Play Integrity), empty when
+	// that attestation carried none or the request had no native attestation.
+	// Unlike DeviceInfo.AppID, which the client reports, this is verifier
+	// output and may be used as assurance evidence.
+	VerifiedAppID string `json:"verified_app_id,omitempty" bson:"verified_app_id,omitempty"`
 
 	// SecurityProperties captures the claimed security level (ISO 18045 AVA scale).
 	SecurityProperties *SecurityProperties `json:"security_properties,omitempty" bson:"security_properties,omitempty"`

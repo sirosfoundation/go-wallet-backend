@@ -193,6 +193,9 @@ Environment prefix: `WALLET_WALLET_PROVIDER`
 | `wallet_provider.attestation.assurance.certification.levels` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_CERTIFICATION_LEVELS` | string list | Levels are the assurance levels of Scheme, strongest first. When Entries is empty one entry per level is derived, named after the level. |
 | `wallet_provider.attestation.assurance.certification.entries` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_CERTIFICATION_ENTRIES` | CertificationEntryList | Entries are the named certifications, probed in order (list the strongest first); the first one a rule permits wins. |
 | `wallet_provider.attestation.assurance.certification_basis_in_claim` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_CERTIFICATION_BASIS_IN_CLAIM` | boolean | CertificationBasisInClaim, when true, adds a "basis" member ({policy, rules}) to an object-valued certification claim. Default false and NOT spec-supported: OpenID4VCI 1.0/1.1 Appendix D defines certification as a URL string. See docs/assurance-policy.md. |
+| `wallet_provider.attestation.assurance.wia_profile_schemes` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_WIA_PROFILE_SCHEMES` | WIAProfileSchemeList | WIAProfileSchemes are the named S-profile schemes available to the Wallet Instance Attestation (WIA) decision (assure-wia). The built-in "cs04_annex_c" scheme is always available unless one with that id is configured here. |
+| `wallet_provider.attestation.assurance.wia_profile_scheme` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_WIA_PROFILE_SCHEME` | string | WIAProfileScheme selects the scheme (by id) the WIA profile is decided in. Default "cs04_annex_c". |
+| `wallet_provider.attestation.assurance.wia_certification.entries` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_WIA_CERTIFICATION_ENTRIES` | WIACertificationEntryList | Entries are probed in order (list the strongest first); the first one a rule permits wins. |
 
 ## trust
 

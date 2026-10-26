@@ -35,14 +35,47 @@
 # id: prod-fido2-mds3-ks
 (assure-ks (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2 (mds3 trusted)(aaguid (* set 00000000-0000-0000-0000-000000000001 00000000-0000-0000-0000-000000000002))))))
 
-# User authentication at moderate needs proof of user verification (uv), which
-# the backend does not record yet (planned follow-up). Until then every key
-# resolves to the floor for user_authentication. Enable when (uv present) is
-# emitted (uncomment the rule line and put a "# id: <name>" line before it):
-#
-#   (rule id would be: prod-fido2-mds3-ua; keep the aaguid set, it is the
-#   hardware filter)
-# (assure-ua (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2 (mds3 trusted)(aaguid (* set 00000000-0000-0000-0000-000000000001))(uv present)))))
+# User authentication (assure-ua) needs proof that the authenticator verified
+# the user (PIN or biometric) when the key was created: (uv present). The
+# backend records the user-verified flag of the verified FIDO2 attestation.
+# With several keys in a batch uv is "present" only if EVERY key has it.
+# The rule below grants moderate only to the listed models AND only with uv;
+# a key made without user verification stays at the floor. The aaguid set is
+# the hardware filter here too.
 
-# Wallet Instance Attestation (platform) rules belong to the follow-up that
-# adds the assure-wia dimension; do not add them here yet.
+# id: prod-fido2-mds3-ua
+(assure-ua (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2 (mds3 trusted)(aaguid (* set 00000000-0000-0000-0000-000000000001))(uv present)))))
+
+# ---- Wallet Instance Attestation (WIA) -------------------------------------
+#
+# K (key storage, above) and S (WIA attestation coverage, below) are
+# orthogonal (CS-04 Annex C.2.3): nothing here derives a key storage level
+# from the platform, and nothing above derives an S profile from a key.
+#
+# assure-wia-issue: may a WIA be issued at all? Deny is the absence of a
+# rule, so WITHOUT a rule like this one every WIA request is refused. This
+# rule permits every request, which is what the backend does with the policy
+# disabled. Narrow the evidence to restrict who gets a WIA, for example
+#   (evidence (verified (fido2)(platform (source platform_attested))))
+# to issue only to wallets that passed native platform attestation.
+
+# id: wia-issue-all
+(assure-wia-issue (evidence))
+
+# assure-wia: the S profile. Profiles are probed highest first; the scheme
+# floor (s3-backend-only) is what remains. The platform slot is the native
+# attestation source verified in THIS request (platform_attested after an
+# Apple App Attest / Play Integrity check, development_attested for a
+# development App Attest chain, backend_attested when the wallet sent none).
+
+# id: wia-s1-platform
+(assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform (source platform_attested)))))
+
+# assure-wia-cert: selects a wallet_solution_certification_information entry
+# from the wia_certification catalogue (none: the static
+# wallet_provider.wia.certification_info is used). Example, uncomment after
+# adding an entry named "wallet-cert-s1" to the catalogue (put a
+# "# id: <name>" line before it):
+#
+#   (rule id would be: wia-cert-s1)
+# (assure-wia-cert (name wallet-cert-s1)(evidence (verified (fido2)(platform (source platform_attested)))))

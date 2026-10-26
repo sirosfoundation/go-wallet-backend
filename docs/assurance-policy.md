@@ -16,6 +16,9 @@ exactly as before, including the clamp to the software floor.
 | `key_storage` | probing the configured levels, highest first | `assure-ks` |
 | `user_authentication` | probing the configured levels, highest first | `assure-ua` |
 | `certification` | probing the configured catalogue | `assure-cert` |
+| WIA S profile (`attestation_source`) | probing the configured profile list, highest first | `assure-wia` |
+| whether a WIA is issued at all | yes/no | `assure-wia-issue` |
+| WIA `wallet_solution_certification_information` | probing the configured catalogue | `assure-wia-cert` |
 
 For `key_storage` and `user_authentication` the first permitted level wins.
 The scheme's **floor** level is returned when nothing above it is permitted,
@@ -54,8 +57,28 @@ reported in the startup log, the audit line and the `policy_info` metric):
 * `platform (source ...)` carries the stored string verbatim:
   `platform_attested`, `development_attested` or `backend_attested`. They are
   distinct atoms; `development_attested` is not treated as `platform_attested`.
-* Not populated yet, always `none`: `uv` (the backend does not record user
-  verification yet), `cert`, `app_id`, and the whole `hsm` slot.
+* `uv` is `present` when the authenticator reported user verification: the
+  user-verified (UV) flag of the authenticator data of the FIDO2 attestation,
+  recorded with the key's attestation record when the backend verified it.
+  User presence (UP) is not user verification. With several keys in a batch
+  `uv` is `present` only if EVERY record has it. Records stored before the
+  flag was recorded read as `none`.
+  The flag is only evidence when the attestation format's signature covers
+  the authenticator data flags (`packed`, `apple`). In
+  `fido-u2f` the signature does not cover them, so a u2f attestation always
+  records `uv none` (anyone could set the bit on a valid attestation).
+  `android-key` and `tpm` also always record `uv none`: an app can sign
+  caller-constructed authenticator data with an android credential key that
+  needs no user authentication (the attested `NoAuthRequired` /
+  `UserAuthType` constraints are not validated yet), and a TPM attestation
+  identity key certifies a caller-supplied hash.
+* `platform (app_id A)` is the application id the backend verified in the
+  instance's most recent native attestation (`WalletInstance.VerifiedAppID`,
+  set by the WIA path). The client-reported `DeviceInfo.AppID` is never used.
+  Instances that last attested without native evidence have `app_id none`, as
+  do `development_attested` ones: a development App Attest chain is
+  self-signed, so no application was authenticated and no app id is reported.
+* Not populated yet, always `none`: `cert` and the whole `hsm` slot.
 * Evidence is built through the S-expression element API, never by string
   concatenation. Atom values are length-prefixed in the canonical encoding, so
   a hostile value such as `x)(source platform_attested` stays one atom.
@@ -92,7 +115,9 @@ Follow-up (not started): expose MDS3 `keyProtection` from go-trust so
 `fido2_hw` does not rest on the AAGUID list alone.
 
 Queries have the form `(assure-ks (tier T)(evidence ...))`,
-`(assure-ua (tier T)(evidence ...))` and `(assure-cert (name N)(evidence ...))`.
+`(assure-ua (tier T)(evidence ...))`, `(assure-cert (name N)(evidence ...))`,
+`(assure-wia (profile P)(evidence ...))`, `(assure-wia-cert (name N)(evidence ...))`
+and `(assure-wia-issue (evidence ...))` (no candidate).
 A rule grants a tier by naming it; `(tier (* set a b))` lists every tier it
 allows. There is no implicit "at or below" and **no negation**: deny is the
 absence of a rule.
@@ -150,6 +175,9 @@ go-spocp v0.1.0:
 | `certification.levels` | `CERTIFICATION_LEVELS` | none | With no `entries`, one entry per level (strongest first), named after the level. |
 | `certification.entries` | `CERTIFICATION_ENTRIES` (JSON array) | none | Named entries: `name`, `scheme`, `assurance_level`, optional `url`. Probed in order; list the strongest first. |
 | `certification_basis_in_claim` | `CERTIFICATION_BASIS_IN_CLAIM` | `false` | See "Certification basis". |
+| `wia_profile_schemes` | `WIA_PROFILE_SCHEMES` (JSON array) | built-in `cs04_annex_c` | Named S-profile schemes: `id`, `profiles` (weakest first), `values` (emitted `attestation_source` strings, one per profile), `floor`, optional `ceiling`. |
+| `wia_profile_scheme` | `WIA_PROFILE_SCHEME` | `cs04_annex_c` | Scheme the WIA profile is decided in. |
+| `wia_certification.entries` | `WIA_CERTIFICATION_ENTRIES` (JSON array) | none | Named `wallet_solution_certification_information` values: `name`, `information` (object, emitted verbatim). Probed in order; list the strongest first. |
 
 The built-in `iso_18045` scheme has the levels `basic`, `enhanced-basic`,
 `moderate`, `high` (ISO 18045 order: VAN.2, VAN.3, VAN.4, VAN.5), emitting
@@ -185,15 +213,168 @@ high index and anything between the moderate index. For `iso_18045` this is
 exactly the grouping used without the policy. Other schemes are mapped by
 level position.
 
+## Wallet Instance Attestation (WIA)
+
+The same engine decides the WIA. With the policy disabled the WIA is produced
+exactly as before: always issued, `attestation_source` is the verified source
+verbatim.
+
+### What a WIA request decides
+
+* **`assure-wia-issue`**: is a WIA issued at all? When the policy is enabled
+  and no rule permits the evidence, the request is refused with `403`
+  `WIA_REFUSED_BY_POLICY` (no instance is recorded). Deny is the absence of a
+  rule, so **a rules file without an `assure-wia-issue` rule refuses every
+  WIA**; the linter warns about it, and the shipped examples contain a rule
+  that permits everything, which is today's behaviour. An enabled policy that
+  failed to load answers `503` `ASSURANCE_UNAVAILABLE`.
+* **`assure-wia`**: the S profile, probed highest to lowest over the
+  configured scheme; the scheme floor is returned when nothing above it is
+  permitted, including with an empty ruleset. An optional ceiling caps it.
+* **`assure-wia-cert`**: which `wallet_solution_certification_information`
+  entry applies, probed over `wia_certification.entries`. When none is
+  permitted the static `wallet_provider.wia.certification_info` is used, as
+  without the policy.
+
+### Evidence of a WIA request
+
+Same schema and slot order as above (schema version unchanged).
+
+* `platform (source S)(app_id A)` is what the backend verified in **this**
+  request: `platform_attested` after a verified Apple App Attest / Play
+  Integrity check, `development_attested` for an App Attest chain that only
+  chained to a development environment, `backend_attested` when the request
+  carried no native attestation (the baseline, which key attestation also sees
+  as the stored source). It is never the instance's stored state from an
+  earlier request.
+* `fido2` is `none`: a WIA request carries no FIDO2 evidence.
+* `claimed` is empty: a WIA request carries no client claims, so there is no
+  lower-by-claims gate for the S dimension (the gates exist per dimension
+  where a client claim exists: key storage and user authentication).
+
+K and S are orthogonal (CS-04 Annex C.2.3): no shipped rule derives a key
+storage level from the platform, or an S profile from a key.
+
+### The S-profile scheme and where it is emitted
+
+Findings from WE BUILD CS-04 Annex C (wp4-architecture PR 229, informative):
+
+* The WIA tiers are **S1 full client attestation**, **S2 partial client
+  attestation** and **S3 backend-only attestation** (C.2.2).
+* Annex C defines **no** WIA claim for them: "TS-03 and CS-04 do not define a
+  WIA claim that declares the attestation coverage level (S1/S2/S3)", and a
+  wallet solution may signal it "via the certification information or via an
+  extension claim" (C.3.2).
+
+So the profile has no spec-registered home and no claim is added. The chosen
+profile's emitted string goes into the claim the WIA already has for this,
+the SIROS extension claim `attestation_source`. The built-in scheme
+`cs04_annex_c` has the profiles `s3-backend-only` (emits `backend_attested`,
+the floor) and `s1-full-client` (emits `platform_attested`), the strings the
+WIA has always carried. S2 has no evidence source and no existing value, so it
+is not in the default; a custom scheme can add it.
+
+Consequences when the policy is enabled: `attestation_source` carries the
+**profile's** value, so a `development_attested` request that no rule lifts to
+S1 is emitted as `backend_attested` (a development attestation is not S1). The
+verified source is not lost: it stays on the wallet instance record (which is
+what key attestation uses as platform evidence), and the audit log and the WIA
+issued audit event carry it as `verified_source`.
+`wallet_solution_certification_information` is the spec-registered claim
+Annex C names for per-tier references, and is the place `assure-wia-cert`
+writes.
+
+### Audit
+
+Audit line `wia assurance decision` per WIA request: rule ids, policy hash,
+schema version, issue decision, verified source, profile and its emitted
+value, certification entry. The `WIA issued` audit event additionally carries
+`verified_attestation_source`, `assurance_profile`, `assurance_policy_hash` and
+`assurance_rule_ids` when the policy is enabled. Metrics:
+`wallet_backend_assurance_decisions_total{dimension="wia_issue|wia_profile|wia_certification"}`.
+
+### WSCD type
+
+The wallet instance's `wscd_type` is recorded as `unknown` by the WIA path on
+every attestation. The WIA PoP key is the wallet's **instance key in its own
+keystore** (a software store or any WSCD plugin), not the App Attest / Play
+Integrity attestation key, and nothing verifies where it lives, so no type is
+derived from the platform attestation (`native_*`) and none is guessed
+(`web_crypto`), including for `development_attested`. Instances stored earlier
+may still carry `web_crypto`, `native_*` or an empty type; they are
+overwritten at their next attestation. An earlier version switched on the names
+`ios_app_attest` and `android_play_integrity`, which no verifier stores.
+
+`wscd_type` is never assurance evidence: the evidence schema has no slot for it
+and no rule can read it (pinned by a test).
+
+## Preview endpoint
+
+`POST /wallet-provider/assurance-preview` (same authentication, audience and
+`w` permission as `/key-attestation/generate`; rate-limited like the WIA
+routes) lets a wallet learn what it would get before it asks for a Key
+Attestation or a WIA. It runs the **same verifier** and the **same assessor**
+in dry-run mode: nothing is stored, no attestation is issued, no decision
+metric is recorded. No rules or rule text are returned.
+
+Request (every field optional):
+
+```json
+{
+  "wallet_instance_id": "<jkt>",
+  "jwks": [ {"kty": "EC", "crv": "P-256", "x": "...", "y": "..."} ],
+  "security_properties": { "key_storage": ["hardware"], "plugin": "fido2" },
+  "fido2_attestation": { "attestation_object": "<base64url>", "client_data_hash": "<base64url>" }
+}
+```
+
+Response:
+
+```json
+{
+  "key_storage": ["iso_18045_moderate"],
+  "user_authentication": ["iso_18045_basic"],
+  "certification": "none",
+  "wia_profile": "platform_attested",
+  "wia_issue": true,
+  "policy_version": "<sha256>",
+  "schema_version": 1,
+  "assurance_enabled": true,
+  "fido2_verified": true
+}
+```
+
+* `fido2_attestation` is verified by `FIDO2AttestationService` exactly as at
+  registration (a failure is `400` `ATTESTATION_INVALID`) but never stored.
+  When it is the only key information the attested key is the batch; with
+  `jwks`, stored records cover the other keys. If FIDO2 verification is not
+  enabled on this backend, the submission cannot be verified and counts for
+  nothing (`fido2_verified: false`); everything the caller merely states is
+  claimed evidence.
+* `wallet_instance_id` must be an active instance of the caller (same tenant
+  and user) whose last attestation is within the WIA lifetime; otherwise `404`, indistinguishable from an unknown instance. Its
+  stored platform source is what the WIA part of the preview assumes ("the
+  wallet attests the way it did last time"); without an instance the WIA
+  baseline `backend_attested` is assumed. The WIA part never sees the FIDO2
+  submission, as a real WIA request does not.
+* With the policy disabled the response is what the legacy path produces
+  (`assurance_enabled: false`, empty `policy_version`, `wia_issue: true`,
+  `wia_profile` the source a WIA would carry today).
+
 ## Linting
 
 `assurance-lint -rules <file>` (or `-config <backend config>` to use its
 schemes and catalogue) prints findings and exits 1 on any error. The same
 checks run at startup; lint errors refuse to start, warnings are logged.
 
-* **ERROR** a rule that is not a list, an unknown dimension tag, a slot order
+* **ERROR** a rule that is not a list, an unknown dimension tag (the known
+  ones are `assure-ks`, `assure-ua`, `assure-cert`, `assure-wia`,
+  `assure-wia-issue`, `assure-wia-cert`), a slot order
   that is not canonical (the rule could never match), a missing or duplicate
   id, an unloadable line.
+* **WARN** no `assure-wia-issue` rule at all (every WIA would be refused), an
+  `assure-wia` profile or `assure-wia-cert` name outside the configured scheme
+  or catalogue.
 * **WARN** a rule whose `(claimed ...)` group has children (naming the rule
   id), a tier or certification name outside the configured scheme or
   catalogue, an open grant (`*`, prefix, range), an emitted value that is not
@@ -243,11 +424,12 @@ nothing is permitted the claim is `"none"` (Annex C).
 
 ## Shipped examples
 
-* `deploy/assurance/production.rules.example`: verified-evidence rules only,
-  with placeholder AAGUIDs (the AAGUID set is the hardware filter, see
-  above; a test lints every shipped template for it). The user-authentication rule is commented out
-  because it needs `(uv present)`, which is not recorded yet; platform rules
-  belong to a later change.
+* `deploy/assurance/production.rules.example`: verified-evidence rules, with
+  placeholder AAGUIDs: key storage by AAGUID, user authentication by AAGUID
+  **and `(uv present)`**, `wia-issue-all` (today's behaviour), an S1 rule for
+  `platform_attested`, and a commented `assure-wia-cert` example.
+  The AAGUID set is the hardware filter (see above); a test lints every
+  shipped template for it.
 * `deploy/assurance/gdc-simulation.rules.example`: grants every tier to a
   client that claims the `soft` plugin. Simulation only; it relies on
   client-claimed evidence on purpose. It only shows its effect with
@@ -278,7 +460,10 @@ Mounting requirements for any orchestrator:
 * the file is read once at startup, so a change needs a restart (the policy
   hash in the startup log and the `policy_info` metric shows which version is
   live);
-* the backend refuses to start if the file is missing or fails lint.
+* the backend refuses to start if the file is missing or fails lint;
+* the rules must contain an `assure-wia-issue` rule (for example
+  `# id: wia-issue-all` / `(assure-wia-issue (evidence))`), or every WIA is
+  refused.
 
 The sirosid-dev Helm chart does **not** support this yet. Its ConfigMap and
 volume mount for the rules file are pending; until they exist, the file has

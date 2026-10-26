@@ -14,6 +14,9 @@ import (
 // audit line and the policy info metric.
 const SchemaVersion = 1
 
+// UVPresent is the Fido2Verified.UV value for proven user verification.
+const UVPresent = "present"
+
 // None is the atom emitted for an absent slot or value.
 const None = "none"
 
@@ -27,8 +30,9 @@ const maxAtomLen = 256
 // registry, which is rendered as (mds3 trusted).
 type Fido2Verified struct {
 	AAGUID string
-	// UV is "present" when user verification was proven by the attestation;
-	// anything else is rendered none. The backend does not store it yet.
+	// UV is UVPresent when user verification was proven by the attestation
+	// (the user-verified flag of its authenticator data, for every key in the
+	// batch); anything else is rendered none.
 	UV string
 	// Cert identifies the attestation certificate; empty renders none.
 	Cert string
@@ -98,8 +102,8 @@ func (e Evidence) Element() *sexp.List {
 	fido2 := sexp.NewList("fido2", sexp.NewAtom(None))
 	if e.Fido2 != nil {
 		uv := None
-		if e.Fido2.UV == "present" {
-			uv = "present"
+		if e.Fido2.UV == UVPresent {
+			uv = UVPresent
 		}
 		fido2 = sexp.NewList("fido2",
 			field("mds3", "trusted"),

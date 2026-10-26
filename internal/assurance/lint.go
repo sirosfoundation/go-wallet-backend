@@ -53,6 +53,9 @@ var KnownDimensions = map[string]bool{
 	DimKeyStorage:         true,
 	DimUserAuthentication: true,
 	DimCertification:      true,
+	DimWIA:                true,
+	DimWIAIssue:           true,
+	DimWIACert:            true,
 }
 
 // slot describes the canonical, positional layout of a rule. A rule lists a
@@ -81,7 +84,11 @@ var evidenceLayout = slot{name: "evidence", children: []slot{
 }}
 
 func topLayout(dimension string) []slot {
-	return []slot{{name: candidateTag(dimension)}, evidenceLayout}
+	tag := candidateTag(dimension)
+	if tag == "" {
+		return []slot{evidenceLayout}
+	}
+	return []slot{{name: tag}, evidenceLayout}
 }
 
 // LintRuleSet checks a loaded rule set. cfg, when non-nil, enables the
@@ -89,8 +96,15 @@ func topLayout(dimension string) []slot {
 // certification catalogue.
 func LintRuleSet(rs *RuleSet, cfg *config.AssuranceConfig) []Finding {
 	var out []Finding
+	hasIssue := false
 	for _, r := range rs.Rules {
+		if l, ok := r.Element.(*sexp.List); ok && l.Tag == DimWIAIssue {
+			hasIssue = true
+		}
 		out = append(out, lintRule(r, cfg)...)
+	}
+	if !hasIssue {
+		out = append(out, Finding{Severity: SeverityWarn, Message: "no assure-wia-issue rule: with the policy enabled every Wallet Instance Attestation request is refused (deny is the absence of a rule). Add a rule, see deploy/assurance/production.rules.example"})
 	}
 	return out
 }
@@ -256,7 +270,11 @@ func candidateValues(l *sexp.List) (values []string, open bool) {
 }
 
 func lintCandidate(rule *sexp.List, cfg *config.AssuranceConfig, warnf func(string, ...interface{}) Finding) []Finding {
-	group := childList(rule, candidateTag(rule.Tag))
+	tag := candidateTag(rule.Tag)
+	if tag == "" {
+		return nil
+	}
+	group := childList(rule, tag)
 	if group == nil {
 		// A rule listing no (tier ...)/(name ...) group matches every
 		// candidate: positional prefix matching treats the omitted slot as
@@ -285,6 +303,30 @@ func lintCandidate(rule *sexp.List, cfg *config.AssuranceConfig, warnf func(stri
 		for _, v := range values {
 			if !known[v] {
 				out = append(out, warnf("grants tier %q, which is outside the configured scheme %q (levels: %s); it can never be granted", v, sc.ID, strings.Join(sc.Levels, ", ")))
+			}
+		}
+	case DimWIA:
+		sc, ok := cfg.WIAProfileSchemeByID(cfg.WIAProfileScheme)
+		if !ok {
+			return out
+		}
+		known := map[string]bool{}
+		for _, l := range sc.Profiles {
+			known[l] = true
+		}
+		for _, v := range values {
+			if !known[v] {
+				out = append(out, warnf("grants profile %q, which is outside the configured WIA profile scheme %q (profiles: %s); it can never be granted", v, sc.ID, strings.Join(sc.Profiles, ", ")))
+			}
+		}
+	case DimWIACert:
+		known := map[string]bool{}
+		for _, e := range cfg.WIACertification.Entries {
+			known[e.Name] = true
+		}
+		for _, v := range values {
+			if !known[v] {
+				out = append(out, warnf("names WIA certification %q, which is not in the configured wia_certification catalogue", v))
 			}
 		}
 	case DimCertification:
