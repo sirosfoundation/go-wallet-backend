@@ -1507,7 +1507,7 @@ func TestValidateResponseURIOrigin_NilMsg(t *testing.T) {
 
 func TestValidateTransactionData_Empty(t *testing.T) {
 	authReq := &AuthorizationRequest{}
-	assert.NoError(t, validateTransactionData(authReq))
+	assert.NoError(t, validateTransactionData(authReq, tdClient))
 }
 
 func TestValidateTransactionData_Valid(t *testing.T) {
@@ -1517,7 +1517,7 @@ func TestValidateTransactionData_Valid(t *testing.T) {
 	raw, _ := json.Marshal([]string{encoded})
 
 	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
-	err := validateTransactionData(authReq)
+	err := validateTransactionData(authReq, tdClient)
 	assert.NoError(t, err)
 	require.Len(t, authReq.TransactionData, 1)
 	assert.Equal(t, "owf_payment_initiation", authReq.TransactionData[0].Type)
@@ -1526,7 +1526,7 @@ func TestValidateTransactionData_Valid(t *testing.T) {
 func TestValidateTransactionData_InvalidBase64(t *testing.T) {
 	raw, _ := json.Marshal([]string{"not-valid-base64!!!"})
 	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
-	err := validateTransactionData(authReq)
+	err := validateTransactionData(authReq, tdClient)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid base64url encoding")
 }
@@ -1535,7 +1535,7 @@ func TestValidateTransactionData_InvalidJSON(t *testing.T) {
 	encoded := base64.RawURLEncoding.EncodeToString([]byte("{bad json"))
 	raw, _ := json.Marshal([]string{encoded})
 	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
-	err := validateTransactionData(authReq)
+	err := validateTransactionData(authReq, tdClient)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid JSON")
 }
@@ -1547,21 +1547,21 @@ func TestValidateTransactionData_UnsupportedType(t *testing.T) {
 	raw, _ := json.Marshal([]string{encoded})
 
 	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
-	err := validateTransactionData(authReq)
+	err := validateTransactionData(authReq, tdClient)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "unsupported transaction_data type")
 }
 
 func TestValidateTransactionData_NotStringArray(t *testing.T) {
 	authReq := &AuthorizationRequest{TransactionDataRaw: json.RawMessage(`[123, 456]`)}
-	err := validateTransactionData(authReq)
+	err := validateTransactionData(authReq, tdClient)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "expected array of base64url strings")
 }
 
 func TestValidateTransactionData_Null(t *testing.T) {
 	authReq := &AuthorizationRequest{TransactionDataRaw: json.RawMessage(`null`)}
-	err := validateTransactionData(authReq)
+	err := validateTransactionData(authReq, tdClient)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "must be an array, not null")
 }
@@ -2328,7 +2328,7 @@ func TestValidateAuthorizationRequest_WithTransactionData(t *testing.T) {
 		ClientIDScheme:     ClientIDSchemeRedirectURI,
 		TransactionDataRaw: raw,
 	}
-	err := h.validateAuthorizationRequest(authReq, nil)
+	err := h.validateAuthorizationRequest(authReq, tdClient)
 	assert.NoError(t, err)
 	require.Len(t, authReq.TransactionData, 1)
 }
