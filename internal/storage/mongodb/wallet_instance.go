@@ -29,6 +29,7 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	set := bson.M{
 		"write_token":        writeToken,
 		"attestation_source": instance.AttestationSource,
+		"verified_app_id":    instance.VerifiedAppID,
 		"last_attested_at":   instance.LastAttestedAt,
 		"updated_at":         instance.UpdatedAt,
 	}
@@ -46,6 +47,9 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 		"$inc": bson.M{
 			"attestation_count": 1,
 		},
+	}
+	if instance.WSCDType != "" {
+		set["wscd_type"] = instance.WSCDType
 	}
 	if instance.DeviceInfo != nil {
 		set["device_info"] = instance.DeviceInfo
@@ -417,6 +421,7 @@ func (s *WalletInstanceStore) RestoreAttestation(ctx context.Context, before, wr
 	}
 	set := bson.M{
 		"attestation_source": before.AttestationSource,
+		"verified_app_id":    before.VerifiedAppID,
 		"last_attested_at":   before.LastAttestedAt,
 		"updated_at":         before.UpdatedAt,
 	}
@@ -427,6 +432,11 @@ func (s *WalletInstanceStore) RestoreAttestation(ctx context.Context, before, wr
 	unset := bson.M{}
 	if before.WriteToken == "" {
 		unset["write_token"] = ""
+	}
+	if before.WSCDType != "" {
+		set["wscd_type"] = before.WSCDType
+	} else {
+		unset["wscd_type"] = ""
 	}
 	if before.DeviceInfo != nil {
 		set["device_info"] = before.DeviceInfo

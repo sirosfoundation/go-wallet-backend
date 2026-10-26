@@ -236,14 +236,18 @@ func (s *NativeAttestationService) verifyAppleAppAttest(_ context.Context, req *
 	)
 
 	attSource := "platform_attested"
+	appID := nativeCfg.AppleAppID
 	if nativeCfg.AppleAppAttestEnvironment == "development" {
 		attSource = "development_attested"
+		// Development mode accepts a self-signed chain, so nothing
+		// authenticated the application: never report an app id as verified.
+		appID = ""
 	}
 
 	return &NativeAttestationResult{
 		Verified:          true,
 		Platform:          NativeAttestationAppleAppAttest,
-		AppID:             nativeCfg.AppleAppID,
+		AppID:             appID,
 		AttestationSource: attSource,
 	}, nil
 }

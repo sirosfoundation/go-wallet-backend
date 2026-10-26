@@ -84,7 +84,7 @@ func TestGenerateKeyAttestation_TopLevelSecurityProperties(t *testing.T) {
 	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
 		Status:            domain.InstanceStatusActive,
 		ID:                instanceID,
-		AttestationSource: "ios_app_attest",
+		AttestationSource: "platform_attested", LastAttestedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -393,7 +393,7 @@ func TestGenerateKeyAttestation_SecurityProperties_ClampedForBackendAttestedInst
 	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
 		Status:            domain.InstanceStatusActive,
 		ID:                instanceID,
-		AttestationSource: "backend_attested",
+		AttestationSource: "backend_attested", LastAttestedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +440,7 @@ func TestGenerateKeyAttestation_SecurityProperties_NormalizesRawVocabulary(t *te
 	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
 		Status:            domain.InstanceStatusActive,
 		ID:                instanceID,
-		AttestationSource: "android_play_integrity",
+		AttestationSource: "platform_attested", LastAttestedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -475,7 +475,7 @@ func TestGenerateKeyAttestation_SecurityProperties_UnrecognizedValueDefaultsToBa
 	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
 		Status:            domain.InstanceStatusActive,
 		ID:                instanceID,
-		AttestationSource: "ios_app_attest",
+		AttestationSource: "platform_attested", LastAttestedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -549,7 +549,7 @@ func TestGenerateKeyAttestation_NoSecurityProperties_TrustedStillEmitsFloor(t *t
 	if err := instances.Upsert(context.Background(), &domain.WalletInstance{
 		Status:            domain.InstanceStatusActive,
 		ID:                instanceID,
-		AttestationSource: "ios_app_attest",
+		AttestationSource: "platform_attested", LastAttestedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -708,7 +708,7 @@ func TestParsePEMCertChain_MultipleCerts(t *testing.T) {
 func TestParsePEMCertChain_NoCerts(t *testing.T) {
 	tmpDir := t.TempDir()
 	certPath := tmpDir + "/empty.pem"
-	_ = os.WriteFile(certPath, []byte("not a pem file"), 0600)
+	_ = os.WriteFile(certPath, []byte("not a pem file"), 0o600)
 
 	_, err := parsePEMCertChain(certPath)
 	if err == nil {
@@ -792,7 +792,7 @@ func TestLoadKeys_PKCS8Key(t *testing.T) {
 func TestLoadKeys_InvalidPEM(t *testing.T) {
 	tmpDir := t.TempDir()
 	keyPath := tmpDir + "/key.pem"
-	_ = os.WriteFile(keyPath, []byte("not a pem file"), 0600)
+	_ = os.WriteFile(keyPath, []byte("not a pem file"), 0o600)
 
 	cfg := &config.Config{}
 	cfg.WalletProvider.PrivateKeyPath = keyPath

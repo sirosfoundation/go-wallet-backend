@@ -1690,7 +1690,7 @@ components:
           enum: [active, revoked, suspended]
         wscd_type:
           type: string
-          enum: [web_crypto, remote, native_ios, native_android]
+          enum: [web_crypto, remote, native_ios, native_android, fido2_hardware, unknown]
         credential_id:
           type: string
         r2ps_client_id:

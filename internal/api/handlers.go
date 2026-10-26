@@ -416,6 +416,9 @@ type SecurityPropertiesRequest struct {
 	KeyStorage         []string    `json:"key_storage"`
 	UserAuthentication []string    `json:"user_authentication"`
 	Certification      interface{} `json:"certification,omitempty"`
+	// Plugin names the WSCD plugin holding the keys. A client claim, only
+	// ever evidence for the assurance policy.
+	Plugin string `json:"plugin,omitempty"`
 }
 
 func (s *SecurityPropertiesRequest) toService() *service.SecurityProperties {
@@ -426,6 +429,7 @@ func (s *SecurityPropertiesRequest) toService() *service.SecurityProperties {
 		KeyStorage:         s.KeyStorage,
 		UserAuthentication: s.UserAuthentication,
 		Certification:      s.Certification,
+		Plugin:             s.Plugin,
 	}
 }
 
@@ -490,9 +494,17 @@ func (h *Handlers) GenerateKeyAttestation(c *gin.Context) {
 		return
 	}
 
-	kaTenantID, _ := h.getTenantID(c)
+	// Bind the request to the authenticated caller so a wallet_instance_id
+	// belonging to another tenant or user cannot lend its platform evidence.
+	tenantID, _ := h.getTenantID(c)
+	callerUser, _ := contextUserID(c)
+	kaCtx := service.WithKeyAttestationCaller(service.WithKeyAttestationTenant(c.Request.Context(), tenantID), service.KeyAttestationCaller{
+		TenantID: tenantID,
+		UserID:   callerUser,
+	})
+
 	keyAttestation, err := h.services.WalletProvider.GenerateKeyAttestation(
-		service.WithKeyAttestationTenant(c.Request.Context(), kaTenantID),
+		kaCtx,
 		req.JWKS,
 		req.OpenID4VCI.Nonce,
 		req.SecurityProperties.toService(),
