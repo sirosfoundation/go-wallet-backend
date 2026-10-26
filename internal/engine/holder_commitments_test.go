@@ -290,3 +290,28 @@ func TestCheckPSCNeedsProof(t *testing.T) {
 	cfg.ProofTypesSupported = nil
 	require.NoError(t, h.checkPSCNeedsProof(cfg), "no advertisement: unchanged")
 }
+
+// A configuration may advertise both a psc holder commitment and Credential
+// Auxiliary Data to_issuer entries: the sign request must carry both, with one
+// shared credential type and issuer, and the psc claim is still verified.
+func TestRequestProofs_PSCAndAuxiliaryDataTogether(t *testing.T) {
+	cfg := hcCfg(hcAdv)
+	cfg.AuxiliaryDataSupported = json.RawMessage(`{"to_issuer":[` + auxToIssuerPSC + `]}`)
+	good := fakeJWT(map[string]interface{}{
+		PSCProofClaim: b64(32),
+		"auxiliary_data": []interface{}{map[string]interface{}{
+			"type": "hash_commitment", "alg": "sha-256",
+			"path": []string{"eu.europa.ec.eudi.nym_auth.1", "psc"}, "commitment": b64(32),
+		}},
+	})
+	p, proofs, err := runProofs(t, cfg, good)
+	require.NoError(t, err)
+	require.Len(t, proofs, 1)
+	assert.Equal(t, []string{HolderCommitmentPSC}, p.HolderCommitments)
+	assert.Len(t, p.AuxiliaryDataToIssuer, 1)
+	assert.Equal(t, "urn:example:vct", p.CredentialType)
+	assert.Equal(t, "https://issuer.example.com", p.CredentialIssuer)
+
+	_, _, err = runProofs(t, cfg, fakeJWT(map[string]interface{}{"nonce": "n"}))
+	require.Error(t, err, "a proof without the psc claim is still refused")
+}
