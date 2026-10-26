@@ -42,13 +42,23 @@ var (
 // validateToken relies on the shared Validator's own per-jti Revocation checker; this field
 // adds only the user-level check that checker's interface can't express.
 type TokenBlacklistChecker interface {
-	IsBlacklisted(ctx context.Context, jti string) bool
-	IsUserRevoked(ctx context.Context, userID string) bool
+	// IsBlacklisted and IsUserRevoked return an error when the revocation
+	// store cannot answer; the handshake is then refused.
+	IsBlacklisted(ctx context.Context, jti string) (bool, error)
+	IsUserRevoked(ctx context.Context, userID string) (bool, error)
 }
 
 // MaxPendingFlowsPerSession limits concurrent flows to prevent DoS.
 // A session cannot start a new flow if it already has this many pending flows.
 const MaxPendingFlowsPerSession = 3
+
+// revocationCheckTimeout bounds a revocation lookup made outside a request
+// context (session registration).
+var revocationCheckTimeout = 5 * time.Second
+
+// errRevocationUnavailable refuses a handshake whose revocation status could
+// not be determined.
+var errRevocationUnavailable = errors.New("token revocation check unavailable")
 
 const (
 	// defaultWSPingInterval/defaultWSPongTimeout are the fallback keepalive
@@ -754,10 +764,6 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	logger.Info("Flow completed")
 }
 
-// revocationLookupTimeout bounds the shared-store revocation lookup made when
-// registering a session.
-var revocationLookupTimeout = 5 * time.Second
-
 // registerSession adds session to the manager's live-session bookkeeping
 // and returns true, unless userID was revoked between validateToken's own
 // check (in handleNewConnection, immediately before this call) and this
@@ -791,21 +797,32 @@ var revocationLookupTimeout = 5 * time.Second
 // always caught here (RevokeUser sets revokedUsers before it scans for
 // and closes existing sessions, so there's no ordering to get wrong);
 // registering before it is caught by that same scan.
+//
+// The shared store is consulted before taking sessionsMu: a lookup that
+// reaches a remote store must not stall every other session. The engine's own
+// revokedUsers, which is what orders against RevokeUser, is still checked
+// under the lock.
 func (m *Manager) registerSession(session *Session) bool {
-	// The shared revocation store may be remote, so it is consulted before
-	// taking the lock and bounded; a lookup that fails or times out counts
-	// as revoked. The engine's own revokedUsers is rechecked under the lock.
-	storeRevoked := false
 	if session.UserID != "" && m.blacklist != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), revocationLookupTimeout)
-		storeRevoked = m.blacklist.IsUserRevoked(ctx, session.UserID)
+		ctx, cancel := context.WithTimeout(context.Background(), revocationCheckTimeout)
+		revoked, err := m.blacklist.IsUserRevoked(ctx, session.UserID)
 		cancel()
+		if err != nil {
+			m.logger.Error("Session refused: revocation check failed", zap.Error(err))
+			session.closeWithReason("revocation check unavailable")
+			return false
+		}
+		if revoked {
+			session.closeWithReason("account deleted")
+			return false
+		}
 	}
 
 	m.sessionsMu.Lock()
 
 	if session.UserID != "" {
-		if storeRevoked || m.isUserRevoked(session.UserID) {
+		revoked := m.isUserRevoked(session.UserID)
+		if revoked {
 			m.sessionsMu.Unlock()
 			session.closeWithReason("account deleted")
 			return false
@@ -897,7 +914,17 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 	}
 	// Per-jti revocation happens inside Validate; user-level revocation does not (the checker only
 	// sees a jti), so check the optional TokenBlacklist and the engine's own revokedUsers (#403).
-	if (m.blacklist != nil && m.blacklist.IsUserRevoked(ctx, result.UserID)) || m.isUserRevoked(result.UserID) {
+	if m.blacklist != nil {
+		revoked, err := m.blacklist.IsUserRevoked(ctx, result.UserID)
+		if err != nil {
+			m.logger.Error("Handshake refused: revocation check failed", zap.Error(err))
+			return "", "", "", errRevocationUnavailable
+		}
+		if revoked {
+			return "", "", "", errors.New("token has been revoked")
+		}
+	}
+	if m.isUserRevoked(result.UserID) {
 		return "", "", "", errors.New("token has been revoked")
 	}
 	// UserID may be empty for anonymous tokens — that is acceptable.
