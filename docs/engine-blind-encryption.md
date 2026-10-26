@@ -36,8 +36,9 @@ defence against an actively malicious engine.
 
 ## What the engine still needs
 
-- Issuance: only `transaction_id` and `interval` from the response (to poll a
-  deferred credential). The client supplies them.
+- Issuance: only `transaction_id` and `interval` (to poll a deferred
+  credential) or `credential_count` (credentials issued) from the response.
+  The client supplies them.
 - Presentation: the validated `response_uri` (from `verified_request`) to POST
   to, and the verifier's reply (`redirect_uri`).
 - Verifier trust evaluation and the fail-closed request-signature gate stay in
@@ -64,7 +65,9 @@ defence against an actively malicious engine.
    params `{ jwe, deferred }`.
 5. The client decrypts, keeps the credentials and the response-level
    `credential_metadata` locally, and answers with only
-   `{ transaction_id?, interval? }` (or `error`).
+   one of two mutually exclusive success forms (or `error`):
+   `{ transaction_id, interval? }` (deferred) or `{ credential_count }`
+   (issued, 1 to 256). A reply with neither, or both, is refused.
 6. If a `transaction_id` came back the engine polls the deferred endpoint; each
    answer goes through step 4 again with `deferred: true`. The client keeps its
    key for the whole flow.
