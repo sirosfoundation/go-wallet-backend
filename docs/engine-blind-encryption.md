@@ -137,9 +137,13 @@ defence against an actively malicious engine.
   `SIGN_ERROR` flow error carries it as `details.redirect_uri` (the same detail
   the decline and no-matching-credential errors carry); without one, there are
   no details. Nothing else the verifier sent is passed on.
-- A `sign_response` that carries `error` or `error_code` (a sign refusal)
-  carries no `response_jwe`; the refusal path is unchanged and is not an
-  encryption failure.
+- Sign refusals are not distinguished yet. `SignResponseMessage` has no `error`
+  or `error_code` field in this change, so a correlated reply that carries only
+  an error is returned by `Session.RequestSign` as an empty reply: for
+  `direct_post.jwt` it has no `response_jwe` and takes the encryption-failure
+  path above (`access_denied` to the verifier, `SIGN_ERROR` to the client). A
+  separate sign-refusal path needs those fields and a handler for them, which
+  is the work of the sign-refusal change (feat/engine-sign-refusal).
 - Plain `direct_post` and query/fragment modes are unchanged and the engine
   sees the `vp_token` (and still builds the DCQL object from the client's
   newline-separated tokens): the verifier asked for cleartext. DC API flows run
