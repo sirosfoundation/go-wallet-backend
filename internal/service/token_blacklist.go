@@ -34,40 +34,49 @@ type TokenBlacklist struct {
 	config config.TokenBlacklistConfig
 	logger *zap.Logger
 
-	mu              sync.RWMutex
-	tokens          map[string]time.Time // jti -> expiry time
-	userRevocations map[string]bool      // userID -> permanently revoked
-	stopChan        chan struct{}
-	wg              sync.WaitGroup
+	// store holds the jti and user revocations (in-memory unless replaced).
+	// With a custom store, tokens stays empty and the cleanup sweep and Count
+	// cover only the in-memory store: a custom store expires its own entries.
+	store RevocationStore
+
+	mu       sync.RWMutex
+	tokens   map[string]time.Time // jti -> expiry time (backs the in-memory store)
+	stopChan chan struct{}
+	wg       sync.WaitGroup
 }
 
 // NewTokenBlacklist creates a new token blacklist
 func NewTokenBlacklist(cfg config.TokenBlacklistConfig, logger *zap.Logger) *TokenBlacklist {
+	return NewTokenBlacklistWithStore(cfg, logger, nil)
+}
+
+// NewTokenBlacklistWithStore creates a token blacklist whose jti and user
+// revocations live in store; a nil store means the in-memory one.
+func NewTokenBlacklistWithStore(cfg config.TokenBlacklistConfig, logger *zap.Logger, store RevocationStore) *TokenBlacklist {
 	cfg.SetDefaults()
-	return &TokenBlacklist{
-		config:          cfg,
-		logger:          logger.Named("token-blacklist"),
-		tokens:          make(map[string]time.Time),
-		userRevocations: make(map[string]bool),
-		stopChan:        make(chan struct{}),
+	b := &TokenBlacklist{
+		config:   cfg,
+		logger:   logger.Named("token-blacklist"),
+		tokens:   make(map[string]time.Time),
+		stopChan: make(chan struct{}),
 	}
+	if store == nil {
+		store = &memoryRevocationStore{mu: &b.mu, tokens: b.tokens, users: make(map[string]bool)}
+	}
+	b.store = store
+	return b
 }
 
 // Start begins the cleanup worker for expired blacklist entries.
 //
-// This always launches the cleanup goroutine, even when config.Enabled is
-// false: ConsumeOnce (see its doc comment) writes entries unconditionally,
-// independent of that flag, so a disabled blacklist can still accumulate
-// consumed-refresh-token entries that need periodic sweeping - without
-// this, every successful refresh would permanently grow the map for the
-// life of the process whenever the general blacklist feature happens to be
-// off (Copilot review on go-wallet-backend#400).
+// The cleanup goroutine always runs, even when config.Enabled is false, so
+// the lifecycle does not depend on the feature toggle.
 func (b *TokenBlacklist) Start() {
 	b.wg.Add(1)
 	go b.cleanupLoop()
 
 	if !b.config.Enabled {
-		b.logger.Info("Token blacklist (general revocation feature) disabled; cleanup worker still runs for ConsumeOnce-tracked entries")
+		b.logger.Info("Token blacklist (general revocation feature) disabled; cleanup worker still runs")
 		return
 	}
 
@@ -138,10 +147,9 @@ func (b *TokenBlacklist) Add(ctx context.Context, jti string, expiry time.Time) 
 		return nil
 	}
 
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b.tokens[jti] = expiry
+	if err := b.store.Add(ctx, jti, expiry); err != nil {
+		return err
+	}
 
 	b.logger.Debug("Token added to blacklist",
 		zap.String("jti", jti),
@@ -162,20 +170,13 @@ func (b *TokenBlacklist) IsBlacklisted(ctx context.Context, jti string) bool {
 		return false
 	}
 
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	expiry, exists := b.tokens[jti]
-	if !exists {
-		return false
+	revoked, err := b.store.Has(ctx, jti)
+	if err != nil {
+		// The bool signature cannot carry the error; refuse rather than accept.
+		b.logger.Error("Revocation store unavailable; treating token as revoked", zap.Error(err))
+		return true
 	}
-
-	// Check if the blacklist entry has expired (token itself expired)
-	if time.Now().After(expiry) {
-		return false
-	}
-
-	return true
+	return revoked
 }
 
 // RevokeUser permanently marks userID as revoked: every token for it,
@@ -193,10 +194,9 @@ func (b *TokenBlacklist) RevokeUser(ctx context.Context, userID string) error {
 		return nil
 	}
 
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	b.userRevocations[userID] = true
+	if err := b.store.RevokeUser(ctx, userID); err != nil {
+		return err
+	}
 
 	b.logger.Debug("All tokens revoked for user", zap.String("user_id", userID))
 
@@ -216,22 +216,30 @@ func (b *TokenBlacklist) IsUserRevoked(ctx context.Context, userID string) bool 
 		return false
 	}
 
-	b.mu.RLock()
-	defer b.mu.RUnlock()
-
-	return b.userRevocations[userID]
+	revoked, err := b.store.IsUserRevoked(ctx, userID)
+	if err != nil {
+		b.logger.Error("Revocation store unavailable; treating user as revoked", zap.Error(err))
+		return true
+	}
+	return revoked
 }
 
-// Remove removes a token from the blacklist (if needed for admin override)
+// Remove removes a token from the blacklist (if needed for admin override).
+// It returns ErrRevocationRemoveUnsupported if the store cannot delete
+// entries, so a store-backed blacklist never silently keeps a revocation the
+// caller asked to lift.
 func (b *TokenBlacklist) Remove(ctx context.Context, jti string) error {
 	if !b.config.Enabled {
 		return nil
 	}
 
-	b.mu.Lock()
-	defer b.mu.Unlock()
-
-	delete(b.tokens, jti)
+	r, ok := b.store.(revocationRemover)
+	if !ok {
+		return ErrRevocationRemoveUnsupported
+	}
+	if err := r.Remove(ctx, jti); err != nil {
+		return err
+	}
 
 	b.logger.Debug("Token removed from blacklist",
 		zap.String("jti", jti),
@@ -240,7 +248,8 @@ func (b *TokenBlacklist) Remove(ctx context.Context, jti string) error {
 	return nil
 }
 
-// Count returns the number of tokens currently on the blacklist
+// Count returns the number of jti entries held by this process: all of them
+// with the in-memory store, none with any other store.
 func (b *TokenBlacklist) Count() int {
 	b.mu.RLock()
 	defer b.mu.RUnlock()

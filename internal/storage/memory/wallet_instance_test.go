@@ -814,3 +814,45 @@ func TestWalletInstanceStore_RestoreAttestation_NewerAttestationIsNotClobbered(t
 	require.Equal(t, "c", got.AttestationSource)
 	require.Equal(t, before.AttestationCount+2, got.AttestationCount, "the newer attestation's count is kept")
 }
+
+// Fields the WIA path sets must survive both insertion and re-attestation.
+func TestWalletInstanceStore_Upsert_PersistsWSCDTypeAndVerifiedAppID(t *testing.T) {
+	ctx := context.Background()
+	wis := NewStore().WalletInstances()
+
+	if err := wis.Upsert(ctx, &domain.WalletInstance{
+		ID: "i", TenantID: "acme", Status: domain.InstanceStatusActive,
+		WSCDType: domain.WSCDTypeWebCrypto, AttestationSource: "backend_attested",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := wis.GetByID(ctx, "i")
+	if got.WSCDType != domain.WSCDTypeWebCrypto {
+		t.Fatalf("insert: WSCDType = %q", got.WSCDType)
+	}
+
+	// Re-attestation with native evidence updates the type and the app id.
+	if err := wis.Upsert(ctx, &domain.WalletInstance{
+		ID: "i", TenantID: "acme", WSCDType: domain.WSCDTypeNativeIOS,
+		AttestationSource: "platform_attested", VerifiedAppID: "app.example",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = wis.GetByID(ctx, "i")
+	if got.WSCDType != domain.WSCDTypeNativeIOS || got.VerifiedAppID != "app.example" {
+		t.Fatalf("re-attestation: %+v", got)
+	}
+
+	// An upsert that does not know the type does not erase it, but the
+	// verified app id follows the latest attestation (none here).
+	if err := wis.Upsert(ctx, &domain.WalletInstance{ID: "i", TenantID: "acme", AttestationSource: "backend_attested"}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = wis.GetByID(ctx, "i")
+	if got.WSCDType != domain.WSCDTypeNativeIOS {
+		t.Fatalf("empty WSCDType erased the stored type: %q", got.WSCDType)
+	}
+	if got.VerifiedAppID != "" {
+		t.Fatalf("verified app id outlived the attestation that produced it: %q", got.VerifiedAppID)
+	}
+}

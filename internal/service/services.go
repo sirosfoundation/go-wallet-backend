@@ -6,6 +6,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
 	"github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
@@ -54,6 +55,21 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 
 	wpSvc := NewWalletProviderService(cfg, logger, store.WalletInstances(), store.KeyAttestations())
 	wpSvc.SetUsers(store.Users())
+	fido2Svc := NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), engine.NewTrustService(cfg, logger), logger)
+	// The assurance preview runs the same FIDO2 verifier in dry-run.
+	wpSvc.SetFIDO2Verifier(fido2Svc)
+	var assessor *assurance.Assessor
+	if cfg.WalletProvider.Attestation.Assurance.Enabled {
+		// cmd/server refuses to start on a bad policy (assurance.CheckConfig);
+		// if one still fails to load here, Key Attestation fails closed
+		// (ErrAssuranceUnavailable) rather than using another procedure.
+		if a, err := assurance.NewFromConfig(cfg.WalletProvider.Attestation.Assurance, logger); err != nil {
+			logger.Error("assurance policy failed to load; key attestation and WIA will fail closed", zap.Error(err))
+		} else {
+			assessor = a
+			wpSvc.SetAssessor(assessor)
+		}
+	}
 
 	// WIA shares the same signing key as the wallet provider. Uses
 	// HasSigningKey (not IsSupported) because "ietf"-mode WIA only needs a
@@ -79,6 +95,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		// audited whenever cfg.Audit is enabled, consistent with admin-API auditing.
 		wiaAuditor := audit.NewFromConfig(cfg, logger)
 		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain, store.WalletInstances(), store.Users(), wiaAuditor, challengeStore)
+		wiaSvc.SetAssessor(assessor)
 		// A signing key alone is enough to construct WIAService, but "etsi"
 		// mode additionally requires a certificate chain (see IsSupported).
 		// Leaving wiaSvc non-nil here would register the WIA routes, but
@@ -107,7 +124,6 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	}
 	proxySvc := NewProxyService(cfg, logger)
 	proxySvc.SetUsers(store.Users())
-	fido2Svc := NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), engine.NewTrustService(cfg, logger), logger)
 	fido2Svc.SetUsers(store.Users())
 	return &Services{
 		User:             userSvc,
