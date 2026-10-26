@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
@@ -46,6 +47,10 @@ type WalletProviderService struct {
 	certChain       []string
 	instances       storage.WalletInstanceStore
 	keyAttestations storage.KeyAttestationStore
+	assessor        *assurance.Assessor
+	// fido2 is the FIDO2 attestation verifier, used only by the assurance
+	// preview (dry run). May be nil.
+	fido2 *FIDO2AttestationService
 	// users is read for the SID-AUTH-06 cut-off at the minting boundary. Nil disables the recheck.
 	users tokengate.UserLookup
 }
@@ -284,6 +289,10 @@ type SecurityProperties struct {
 	KeyStorage []string `json:"key_storage"`
 	// UserAuthentication is the user auth mechanism (e.g., ["iso_18045_high"]).
 	UserAuthentication []string `json:"user_authentication"`
+	// Plugin names the WSCD plugin that holds the keys (e.g. "soft",
+	// "fido2"). It is a client claim: it is only ever evidence in the
+	// claimed group of the assurance policy, never trusted by itself.
+	Plugin string `json:"plugin,omitempty"`
 	// Certification describes the certification status.
 	// String "none" for no certification, or an object like
 	// {"scheme":"EUCC","assurance_level":"substantial"} for certified devices.
@@ -367,11 +376,25 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 	// when the client asserts them AND the batch is trusted (native platform
 	// integrity or per-key FIDO2 evidence); a client can always claim more
 	// than it can back up. See internal/service/wallet_provider_test.go.
-	trusted := false
-	if secProps != nil {
-		trusted = s.keyAttestationTrustsBatch(ctx, walletInstanceID, jwks)
+	var normalized *SecurityProperties
+	statusIdx := 0
+	if s.assuranceEnabled() {
+		// Backend-owned policy: rules applied to verified evidence decide
+		// the values. See docs/assurance-policy.md.
+		var err error
+		normalized, statusIdx, err = s.applyAssurance(ctx, walletInstanceID, jwks, secProps)
+		if err != nil {
+			kaGenerationErrors.Inc()
+			return "", err
+		}
+	} else {
+		trusted := false
+		if secProps != nil {
+			trusted = s.keyAttestationTrustsBatch(ctx, walletInstanceID, jwks)
+		}
+		normalized = normalizeSecurityProperties(secProps, trusted)
+		statusIdx = kaStatusIndex(normalized.KeyStorage)
 	}
-	normalized := normalizeSecurityProperties(secProps, trusted)
 	if len(normalized.KeyStorage) > 0 {
 		claims["key_storage"] = normalized.KeyStorage
 	}
@@ -386,7 +409,7 @@ func (s *WalletProviderService) GenerateKeyAttestation(ctx context.Context, jwks
 	// clause 2.3.2). Required on every KA by CS-04 — a conformant PID/EAA
 	// Provider rejects one without it. Indexed by keystore tier (CS-04
 	// §7.2.3 Option 1, type-shared); see kaStatusIndex and StatusListConfig.
-	if kss := statusClaim(s.cfg, kaStatusIndex(normalized.KeyStorage), now); kss != nil {
+	if kss := statusClaim(s.cfg, statusIdx, now); kss != nil {
 		claims["key_storage_status"] = kss
 	}
 
@@ -493,9 +516,16 @@ func refuseWalletInstance(ctx context.Context, instances storage.WalletInstanceS
 // independent signal that the instance's runtime integrity was checked,
 // which corroborates (though doesn't cryptographically prove) an elevated
 // key_storage/certification claim for that same instance.
+//
+// These are the strings the WIA path actually stores (native_attestation.go):
+// "platform_attested" after a verified App Attest / Play Integrity check.
+// "development_attested" (an attestation that only chained to a development
+// environment) and "backend_attested" (no client-side evidence) are
+// deliberately NOT trusted. This map used to hold "ios_app_attest" and
+// "android_play_integrity", which nothing ever stores, so the platform
+// corroboration never fired.
 var nativeAttestationSources = map[string]bool{
-	"ios_app_attest":         true,
-	"android_play_integrity": true,
+	"platform_attested": true,
 }
 
 // keyAttestationTrustsBatch reports whether THIS specific batch of
@@ -522,8 +552,15 @@ var nativeAttestationSources = map[string]bool{
 // this only ever clamps a batch that's actually mixed-evidence or entirely
 // unattested, never a genuinely homogeneous hardware-backed batch.
 func (s *WalletProviderService) keyAttestationTrustsBatch(ctx context.Context, walletInstanceID string, jwks []map[string]interface{}) bool {
+	return s.keyAttestationTrustsBatchWith(ctx, walletInstanceID, jwks, nil)
+}
+
+// keyAttestationTrustsBatchWith is keyAttestationTrustsBatch with an optional
+// overlay: a record verified in this request but not persisted (the preview's
+// dry run) that answers for its own key thumbprint.
+func (s *WalletProviderService) keyAttestationTrustsBatchWith(ctx context.Context, walletInstanceID string, jwks []map[string]interface{}, overlay *domain.KeyAttestationRecord) bool {
 	if walletInstanceID != "" && s.instances != nil {
-		instance, err := s.instances.GetByID(ctx, walletInstanceID)
+		instance, err := s.lookupOwnedInstance(ctx, walletInstanceID)
 		if err != nil {
 			if !errors.Is(err, storage.ErrNotFound) {
 				s.logger.Warn("failed to look up wallet instance for KA trust check", zap.Error(err))
@@ -533,7 +570,7 @@ func (s *WalletProviderService) keyAttestationTrustsBatch(ctx context.Context, w
 		}
 	}
 
-	if s.keyAttestations == nil || len(jwks) == 0 {
+	if len(jwks) == 0 || (s.keyAttestations == nil && overlay == nil) {
 		return false
 	}
 	// Per-key evidence is always recorded against a live instance (see
@@ -547,6 +584,12 @@ func (s *WalletProviderService) keyAttestationTrustsBatch(ctx context.Context, w
 		thumbprint, err := jwk.Thumbprint(j)
 		if err != nil {
 			// Unsupported/malformed key (e.g. non-EC) - can't have evidence.
+			return false
+		}
+		if overlay != nil && overlay.KeyThumbprint == thumbprint {
+			continue
+		}
+		if s.keyAttestations == nil {
 			return false
 		}
 		rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, thumbprint)

@@ -13,6 +13,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
 	"github.com/sirosfoundation/go-wallet-backend/internal/server"
@@ -104,6 +105,14 @@ func main() {
 	if registryCfg != nil {
 		for _, w := range registryCfg.Warnings() {
 			logger.Warn(w)
+		}
+	}
+
+	// Fail closed at startup on a bad assurance policy (missing/invalid rules
+	// file, lint errors) instead of discovering it on the first KA request.
+	if backendCfg != nil {
+		if err := assurance.CheckConfig(backendCfg.WalletProvider.Attestation.Assurance); err != nil {
+			logger.Fatal("Invalid assurance policy", zap.Error(err))
 		}
 	}
 

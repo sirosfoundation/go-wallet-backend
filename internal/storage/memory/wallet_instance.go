@@ -33,6 +33,10 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		existing.WriteToken = uuid.NewString()
 		instance.WriteToken = existing.WriteToken
 		existing.AttestationSource = instance.AttestationSource
+		existing.VerifiedAppID = instance.VerifiedAppID
+		if instance.WSCDType != "" {
+			existing.WSCDType = instance.WSCDType
+		}
 		existing.LastAttestedAt = instance.LastAttestedAt
 		existing.UpdatedAt = instance.UpdatedAt
 		existing.AttestationCount++
@@ -288,6 +292,8 @@ func (s *WalletInstanceStore) RestoreAttestation(_ context.Context, before, writ
 	inst.WriteToken = before.WriteToken
 	inst.AttestationCount--
 	inst.AttestationSource = before.AttestationSource
+	inst.VerifiedAppID = before.VerifiedAppID
+	inst.WSCDType = before.WSCDType
 	inst.LastAttestedAt = before.LastAttestedAt
 	inst.UpdatedAt = before.UpdatedAt
 	if before.DeviceInfo != nil {

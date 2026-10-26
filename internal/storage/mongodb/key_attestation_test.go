@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.mongodb.org/mongo-driver/bson"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
@@ -83,4 +84,39 @@ func TestKeyAttestationStore_RestoreIfUnchanged(t *testing.T) {
 	require.Equal(t, "old", got.AAGUID)
 	require.ErrorIs(t, kas.RestoreIfUnchanged(ctx, &written, second.Previous), storage.ErrNotFound)
 	require.NoError(t, kas.DeleteIfUnchanged(ctx, "thumb-mongo-restore", got.WriteToken))
+}
+
+func TestKeyAttestationStore_UVRoundTrip(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	kas := store.KeyAttestations()
+
+	require.NoError(t, kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{KeyThumbprint: "thumb-mongo-uv", AAGUID: "a", UV: true, VerifiedAt: time.Now().UTC()}))
+	got, err := kas.GetByKeyThumbprint(ctx, "thumb-mongo-uv")
+	require.NoError(t, err)
+	require.True(t, got.UV)
+
+	require.NoError(t, kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{KeyThumbprint: "thumb-mongo-uv", AAGUID: "a", UV: false, VerifiedAt: time.Now().UTC()}))
+	got, err = kas.GetByKeyThumbprint(ctx, "thumb-mongo-uv")
+	require.NoError(t, err)
+	require.False(t, got.UV)
+}
+
+// Documents written before the uv field existed must decode with UV false.
+// This needs no database: it is the same bson decoding GetByKeyThumbprint does.
+func TestKeyAttestationRecord_LegacyDocumentReadsAsUVNone(t *testing.T) {
+	legacy, err := bson.Marshal(bson.M{
+		"_id": "thumb-old", "wallet_instance_id": "i", "tenant_id": "t",
+		"aaguid": "a", "verified_at": time.Now().UTC(), "created_at": time.Now().UTC(),
+	})
+	require.NoError(t, err)
+	var rec domain.KeyAttestationRecord
+	require.NoError(t, bson.Unmarshal(legacy, &rec))
+	require.Equal(t, "thumb-old", rec.KeyThumbprint)
+	require.False(t, rec.UV)
+
+	withUV, err := bson.Marshal(bson.M{"_id": "thumb-new", "aaguid": "a", "uv": true})
+	require.NoError(t, err)
+	require.NoError(t, bson.Unmarshal(withUV, &rec))
+	require.True(t, rec.UV)
 }

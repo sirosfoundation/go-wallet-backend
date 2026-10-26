@@ -146,3 +146,32 @@ func TestKeyAttestationStore_RestoreIfUnchanged(t *testing.T) {
 		t.Fatalf("a restore is itself a new write; replay must not match, got %v", err)
 	}
 }
+
+func TestKeyAttestationStore_UVRoundTripAndOverwrite(t *testing.T) {
+	ctx := context.Background()
+	kas := NewStore().KeyAttestations()
+
+	if err := kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{KeyThumbprint: "t", AAGUID: "a", UV: true, VerifiedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := kas.GetByKeyThumbprint(ctx, "t")
+	if !got.UV {
+		t.Fatal("UV=true was not stored")
+	}
+	// A later attestation of the same key without UV replaces it.
+	if err := kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{KeyThumbprint: "t", AAGUID: "a", UV: false, VerifiedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = kas.GetByKeyThumbprint(ctx, "t")
+	if got.UV {
+		t.Fatal("UV=false did not replace UV=true")
+	}
+	// A record stored without the field reads as UV none.
+	if err := kas.MarkKeyAttested(ctx, &domain.KeyAttestationRecord{KeyThumbprint: "old", AAGUID: "a", VerifiedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = kas.GetByKeyThumbprint(ctx, "old")
+	if got.UV {
+		t.Fatal("a record without uv must read as false")
+	}
+}

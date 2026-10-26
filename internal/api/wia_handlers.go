@@ -104,7 +104,7 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 		switch code {
 		case "POP_INVALID":
 			h.logger.Debug("WIA-PoP validation failed", zap.Error(err))
-		case "WIA_GENERATION_FAILED":
+		case "WIA_GENERATION_FAILED", "ASSURANCE_UNAVAILABLE":
 			h.logger.Error("Failed to generate WIA", zap.Error(err))
 		default:
 			h.logger.Warn("WIA generation refused", zap.String("code", code), zap.Error(err))
@@ -135,6 +135,10 @@ func wiaFailure(err error) (status int, code, message string) {
 		return http.StatusForbidden, "UNKNOWN_USER", "This account no longer exists"
 	case errors.Is(err, service.ErrWIAInstanceDeactivated):
 		return http.StatusForbidden, "INSTANCE_DEACTIVATED", "This wallet instance is not active"
+	case errors.Is(err, service.ErrWIARefusedByPolicy):
+		return http.StatusForbidden, "WIA_REFUSED_BY_POLICY", "The wallet provider's assurance policy does not permit a Wallet Instance Attestation for this request"
+	case errors.Is(err, service.ErrAssuranceUnavailable):
+		return http.StatusServiceUnavailable, "ASSURANCE_UNAVAILABLE", "The assurance policy is enabled but not loaded"
 	case errors.Is(err, service.ErrWIAInstanceNotOwned):
 		return http.StatusForbidden, "INSTANCE_NOT_OWNED", "This wallet instance is registered to another tenant or user"
 	default:
