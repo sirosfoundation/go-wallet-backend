@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
+	"golang.org/x/time/rate"
 
 	"github.com/sirosfoundation/go-tokenauth/claims"
 	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
@@ -113,6 +114,31 @@ type Session struct {
 	// on the same cadence.
 	pingInterval time.Duration
 	pongTimeout  time.Duration
+
+	// unknownFlowLimiter rate-limits UNKNOWN_FLOW replies (see
+	// rejectIfUnknownFlow). Only touched from the read loop goroutine.
+	unknownFlowLimiter *rate.Limiter
+
+	// outstandingRequests holds the message_id of every sign/match request
+	// currently awaiting its response (guarded by flowsMu), so responses are
+	// still delivered after the requesting flow has completed.
+	outstandingRequests map[string]struct{}
+}
+
+// trackRequest registers messageID as an outstanding request until the
+// returned func is called.
+func (s *Session) trackRequest(messageID string) (done func()) {
+	s.flowsMu.Lock()
+	if s.outstandingRequests == nil {
+		s.outstandingRequests = make(map[string]struct{})
+	}
+	s.outstandingRequests[messageID] = struct{}{}
+	s.flowsMu.Unlock()
+	return func() {
+		s.flowsMu.Lock()
+		delete(s.outstandingRequests, messageID)
+		s.flowsMu.Unlock()
+	}
 }
 
 // Flow represents an active credential flow
@@ -440,6 +466,62 @@ func (s *Session) pingLoop() {
 	}
 }
 
+// unknownFlowErrorBurst/unknownFlowErrorRate bound how many UNKNOWN_FLOW
+// replies a single session may elicit, so a misbehaving client that spams
+// messages for non-existent flows cannot turn the engine into a write
+// amplifier for its own connection. A well-behaved client sends at most a
+// handful (one per stale UI action); beyond the budget the message is
+// dropped silently and only counted in the debug log.
+const (
+	unknownFlowErrorBurst = 10
+	unknownFlowErrorRate  = rate.Limit(2) // replies per second, sustained
+)
+
+// rejectIfUnknownFlow answers a client message that references flowID with a
+// flow_error (UNKNOWN_FLOW) when this session has no such flow, and reports
+// whether it did. It must only be called from the session's read loop.
+//
+// The lookup is deliberately scoped to this session's own flow table: a flow
+// that belongs to another session or user is indistinguishable from one that
+// never existed (same code, same message, nothing about the other flow is
+// disclosed), so a client cannot probe for foreign flow IDs. A flow that was
+// in progress on a previous session of the same user is likewise unknown to
+// the new session - this error is how a reconnected client learns it is dead.
+//
+// A response (messageID != "") that answers a request this session still has
+// outstanding is never rejected, even if its flow has since completed: the
+// client-held DPoP signer deliberately addresses sign requests to a finished
+// flow (see clientHeldDPoPSigner) to forward credential notifications.
+func (s *Session) rejectIfUnknownFlow(flowID, messageID string, msgType MessageType) bool {
+	s.flowsMu.RLock()
+	_, ok := s.flows[flowID]
+	_, outstanding := s.outstandingRequests[messageID]
+	s.flowsMu.RUnlock()
+	if ok || (messageID != "" && outstanding) {
+		return false
+	}
+	// Debug, not Warn: the flow_id is client-controlled and this path is
+	// reachable by any authenticated client, so it must not flood the logs.
+	s.logger.Debug("Message for unknown flow",
+		zap.String("type", string(msgType)),
+		zap.String("flow_id", truncateForLog(flowID, 64)))
+	if s.unknownFlowLimiter == nil {
+		s.unknownFlowLimiter = rate.NewLimiter(unknownFlowErrorRate, unknownFlowErrorBurst)
+	}
+	if !s.unknownFlowLimiter.Allow() {
+		return true // abusive volume: dropped, not answered
+	}
+	_ = s.SendFlowError(flowID, "", ErrCodeUnknownFlow, "Flow not found or already completed")
+	return true
+}
+
+func truncateForLog(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
+}
+
 func (m *Manager) handleSession(session *Session) {
 	defer func() {
 		close(session.stopPing) // stop the ping goroutine
@@ -484,15 +566,10 @@ func (m *Manager) handleSession(session *Session) {
 				_ = session.SendFlowError(msg.FlowID, "", ErrCodeInvalidMessage, "Invalid flow_action format")
 				continue
 			}
-			// Check if flow exists before routing - prevents action loss for unknown flows
-			session.flowsMu.RLock()
-			_, flowExists := session.flows[actionMsg.FlowID]
-			session.flowsMu.RUnlock()
-			if !flowExists {
-				session.logger.Warn("Action for unknown flow",
-					zap.String("flow_id", actionMsg.FlowID),
-					zap.String("action", actionMsg.Action))
-				_ = session.SendFlowError(actionMsg.FlowID, "", ErrCodeUnknownFlow, "Flow not found or already completed")
+			// Check if flow exists before routing - prevents action loss for
+			// unknown flows. The client is always told (flow_error
+			// UNKNOWN_FLOW), never left waiting on a flow that is gone.
+			if session.rejectIfUnknownFlow(actionMsg.FlowID, "", msg.Type) {
 				continue
 			}
 			// Route to the flow - send error if channel full instead of dropping
@@ -511,6 +588,12 @@ func (m *Manager) handleSession(session *Session) {
 				session.logger.Warn("Invalid sign_response", zap.Error(err))
 				continue
 			}
+			// Responses that name a flow that no longer exists are answered
+			// with UNKNOWN_FLOW. A response without a flow_id is correlated
+			// by message_id alone and routed as before.
+			if signMsg.FlowID != "" && session.rejectIfUnknownFlow(signMsg.FlowID, signMsg.MessageID, msg.Type) {
+				continue
+			}
 			// Route to waiting flow - send error if channel full instead of dropping
 			select {
 			case session.signCh <- &signMsg:
@@ -524,6 +607,9 @@ func (m *Manager) handleSession(session *Session) {
 			var matchMsg MatchResponseMessage
 			if err := json.Unmarshal(message, &matchMsg); err != nil {
 				session.logger.Warn("Invalid match_response", zap.Error(err))
+				continue
+			}
+			if matchMsg.FlowID != "" && session.rejectIfUnknownFlow(matchMsg.FlowID, matchMsg.MessageID, msg.Type) {
 				continue
 			}
 			// Route to waiting flow - send error if channel full instead of dropping
@@ -1241,6 +1327,7 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 		Params: params,
 	}
 
+	defer s.trackRequest(messageID)()
 	if err := s.Send(&msg); err != nil {
 		return nil, err
 	}
@@ -1288,6 +1375,7 @@ func (s *Session) RequestMatch(ctx context.Context, flowID string, dcql json.Raw
 		DCQLQuery: dcql,
 	}
 
+	defer s.trackRequest(messageID)()
 	if err := s.Send(&msg); err != nil {
 		return nil, err
 	}

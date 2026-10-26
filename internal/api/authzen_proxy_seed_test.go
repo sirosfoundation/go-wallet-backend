@@ -47,3 +47,31 @@ func TestSanitizeSecretSeedAdvertisement_DropsSignedJWTOnlyWhenConfigRemoved(t *
 	_, has := md["signed_metadata"]
 	assert.False(t, has, "removing a configuration also drops the original JWT")
 }
+
+func TestSanitizeHolderCommitmentsAdvertisement(t *testing.T) {
+	var md map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(`{"signed_metadata":"JWT","credential_configurations_supported":{
+		"valid":{"credential_metadata":{"org.siros.holder_commitments":{"commitments":["psc"]}}},
+		"hex":{"credential_metadata":{"org.siros.holder_commitments":{"psc":"deadbeefdeadbeefdeadbeef"}}},
+		"hexname":{"credential_metadata":{"org.siros.holder_commitments":{"commitments":["deadbeefdeadbeefdeadbeef"]}}},
+		"scalar":{"credential_metadata":{"org.siros.holder_commitments":"deadbeef"}},
+		"toomany":{"credential_metadata":{"org.siros.holder_commitments":{"commitments":["a","b","c","d","e"]}}},
+		"plain":{"credential_metadata":{"display":[]}}, "d":"junk"}}`), &md))
+	sanitizeHolderCommitmentsAdvertisement(md)
+	ccs := md["credential_configurations_supported"].(map[string]interface{})
+	assert.Contains(t, ccs, "valid")
+	assert.Contains(t, ccs, "plain")
+	for _, id := range []string{"hex", "hexname", "scalar", "toomany"} {
+		assert.NotContains(t, ccs, id)
+	}
+	out, _ := json.Marshal(md)
+	assert.NotContains(t, string(out), "deadbeef")
+	assert.NotContains(t, md, "signed_metadata")
+
+	var ok map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(`{"signed_metadata":"JWT","credential_configurations_supported":{
+		"a":{"credential_metadata":{"org.siros.holder_commitments":{"commitments":["psc"]}}}}}`), &ok))
+	sanitizeHolderCommitmentsAdvertisement(ok)
+	assert.Equal(t, "JWT", ok["signed_metadata"])
+	sanitizeHolderCommitmentsAdvertisement(map[string]interface{}{})
+}

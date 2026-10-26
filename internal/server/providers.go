@@ -211,6 +211,9 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		walletProvider := protected.Group("/wallet-provider")
 		{
 			walletProvider.POST("/key-attestation/generate", middleware.MustHaveTAC("w"), p.handlers.GenerateKeyAttestation)
+			// Dry-run of the assurance decisions; verifies a FIDO2 attestation, so
+			// it is rate-limited like the WIA routes.
+			walletProvider.POST("/assurance-preview", middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier), middleware.MustHaveTAC("w"), p.handlers.AssurancePreview)
 			if p.cfg.WalletProvider.WIA.Enabled && p.services.WIA != nil {
 				wiaLimit := middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier)
 				walletProvider.POST("/wia/challenge", wiaLimit, middleware.MustHaveTAC("w"), p.handlers.WIAChallenge)
@@ -1248,6 +1251,7 @@ func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
 	wp.Use(middleware.RequireAudience("wallet-backend"))
 	{
 		wp.POST("/key-attestation/generate", middleware.MustHaveTAC("w"), p.handlers.GenerateKeyAttestation)
+		wp.POST("/assurance-preview", middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier), middleware.MustHaveTAC("w"), p.handlers.AssurancePreview)
 		if p.cfg.WalletProvider.WIA.Enabled && p.services.WIA != nil {
 			wiaLimit := middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier)
 			wp.POST("/wia/challenge", wiaLimit, middleware.MustHaveTAC("w"), p.handlers.WIAChallenge)

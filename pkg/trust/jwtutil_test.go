@@ -732,3 +732,41 @@ func TestExtractVerifierAttestation(t *testing.T) {
 		}
 	})
 }
+
+// A JWK carrying a "keys" member is a key set in disguise: the top-level key
+// would verify the signature while downstream normalisation prefers "keys".
+func TestVerifyJWTWithEmbeddedKey_RejectsKeysMember(t *testing.T) {
+	signer, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	victim, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := func(k *ecdsa.PrivateKey) map[string]any {
+		return map[string]any{
+			"kty": "EC", "crv": "P-256",
+			"x": base64.RawURLEncoding.EncodeToString(k.PublicKey.X.FillBytes(make([]byte, 32))),
+			"y": base64.RawURLEncoding.EncodeToString(k.PublicKey.Y.FillBytes(make([]byte, 32))),
+		}
+	}
+	sign := func(jwk map[string]any) string {
+		token := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{"sub": "t"})
+		token.Header["jwk"] = jwk
+		s, err := token.SignedString(signer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+
+	mixed := pub(signer)
+	mixed["keys"] = []any{pub(victim)}
+	if _, err := VerifyJWTWithEmbeddedKey(sign(mixed)); err == nil {
+		t.Error("a JWK with a keys member must be rejected")
+	}
+	if _, err := VerifyJWTWithEmbeddedKey(sign(pub(signer))); err != nil {
+		t.Errorf("a plain single JWK must still verify: %v", err)
+	}
+}
