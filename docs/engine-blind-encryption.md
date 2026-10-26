@@ -91,7 +91,7 @@ defence against an actively malicious engine.
 
 - `sign_presentation` carries `verified_request`
   (`client_id`, `client_id_scheme`, `response_mode`, `response_uri`, `signed`,
-  `signature_verification`, `client_metadata`). The client takes the JARM
+  `signature_verification`, `client_metadata`, capped at 64 KB by the engine). The client takes the JARM
   `aud` from `verified_request.client_id`. Only the engine POSTs, and only to
   `verified_request.response_uri`.
 - `sign_request` also carries, for `direct_post.jwt` only:

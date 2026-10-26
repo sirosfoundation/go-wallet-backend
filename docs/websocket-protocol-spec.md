@@ -1002,6 +1002,12 @@ verbatim from the validated request object (inline, or fetched from
 `client_metadata_uri`). It is omitted when the request had none. Clients MUST
 ignore members they do not understand.
 
+The engine bounds the object at 64 KB (`MaxClientMetadataBytes`) however it
+arrives, because it is relayed three times per flow. Larger inline metadata
+fails the request parse (`request_parse_error`); a larger
+`client_metadata_uri` response is treated like an unusable one: no metadata is
+used or relayed, and the flow continues without it. Nothing is truncated.
+
 The engine only models the members it uses itself, so this object is how a
 wallet sees the rest, notably `vp_formats_supported`. For a `zkp_req`
 presentation (typically `response_mode=direct_post.jwt`) that carries the

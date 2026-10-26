@@ -475,8 +475,12 @@ func (h *OID4VPHandler) parseRequestFromURL(u *url.URL) (*AuthorizationRequest, 
 		if err := json.Unmarshal([]byte(cmStr), &cm); err != nil {
 			return nil, fmt.Errorf("invalid client_metadata: %w", err)
 		}
+		raw, err := boundedRawObject(json.RawMessage(cmStr))
+		if err != nil {
+			return nil, err
+		}
 		authReq.ClientMetadata = &cm
-		authReq.ClientMetadataRaw = rawObject(json.RawMessage(cmStr))
+		authReq.ClientMetadataRaw = raw
 	}
 	authReq.ClientMetadataURI = q.Get("client_metadata_uri")
 
@@ -506,7 +510,10 @@ func (h *OID4VPHandler) parseRequestJWT(jwtStr string) (*AuthorizationRequest, e
 		return nil, fmt.Errorf("failed to parse JWT payload: %w", err)
 	}
 
-	authReq.ClientMetadataRaw = extractRawClientMetadata(payload)
+	authReq.ClientMetadataRaw, err = extractRawClientMetadata(payload)
+	if err != nil {
+		return nil, err
+	}
 
 	// Store the raw JWT so we can extract key material from its header later
 	authReq.RequestJWT = jwtStr
@@ -593,7 +600,7 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 		if err != nil {
 			err = fmt.Errorf("failed to parse request: %w", err)
 		} else {
-			authReq.ClientMetadataRaw = extractRawClientMetadata([]byte(bodyStr))
+			authReq.ClientMetadataRaw, err = extractRawClientMetadata([]byte(bodyStr))
 		}
 	} else {
 		// Likely a JWT
@@ -1667,9 +1674,14 @@ func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*C
 		return nil, nil, fmt.Errorf("metadata fetch returned status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))
+	// Read one byte past the limit so an oversize body is refused rather than
+	// silently truncated (which would also hand back invalid JSON).
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxClientMetadataBytes+1))
 	if err != nil {
 		return nil, nil, err
+	}
+	if len(body) > MaxClientMetadataBytes {
+		return nil, nil, errClientMetadataTooLarge
 	}
 
 	var cm ClientMetadata
@@ -1678,6 +1690,19 @@ func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*C
 	}
 
 	return &cm, rawObject(json.RawMessage(body)), nil
+}
+
+// errClientMetadataTooLarge reports a client_metadata over
+// MaxClientMetadataBytes. It carries no remote-supplied text.
+var errClientMetadataTooLarge = fmt.Errorf("client_metadata exceeds %d bytes", MaxClientMetadataBytes)
+
+// boundedRawObject is rawObject with the MaxClientMetadataBytes bound applied,
+// so a padded value cannot be retained and relayed however it arrived.
+func boundedRawObject(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) > MaxClientMetadataBytes {
+		return nil, errClientMetadataTooLarge
+	}
+	return rawObject(raw), nil
 }
 
 // rawObject returns raw when it is a JSON object and nil otherwise.
@@ -1690,14 +1715,16 @@ func rawObject(raw json.RawMessage) json.RawMessage {
 
 // extractRawClientMetadata returns the request object's client_metadata
 // member verbatim, or nil when it is absent or not an object.
-func extractRawClientMetadata(requestObject []byte) json.RawMessage {
+// It fails with errClientMetadataTooLarge when the member exceeds
+// MaxClientMetadataBytes.
+func extractRawClientMetadata(requestObject []byte) (json.RawMessage, error) {
 	var probe struct {
 		ClientMetadata json.RawMessage `json:"client_metadata"`
 	}
 	if err := json.Unmarshal(requestObject, &probe); err != nil {
-		return nil
+		return nil, nil
 	}
-	return rawObject(probe.ClientMetadata)
+	return boundedRawObject(probe.ClientMetadata)
 }
 
 // requestCredentialSelection sends dcql_query + verifier to the client in a single
