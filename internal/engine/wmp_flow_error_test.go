@@ -86,3 +86,17 @@ func TestRequestSign_ReturnsClientReportedError(t *testing.T) {
 	assert.Equal(t, "declined", se.ClientText())
 	assert.NotContains(t, err.Error(), "declined")
 }
+
+// The client's error_code is client-controlled and Error() is logged: only a
+// code the engine acts on survives, anything else must not reach the string.
+func TestSignResult_UnknownClientErrorCodeNeverInErrorString(t *testing.T) {
+	_, err := signResult(&SignResponseMessage{Error: "x", ErrorCode: "evil\ninjected log line"})
+	var se *SignError
+	require.ErrorAs(t, err, &se)
+	assert.Empty(t, se.Code)
+	assert.NotContains(t, err.Error(), "injected")
+
+	_, err = signResult(&SignResponseMessage{Error: "x", ErrorCode: ErrCodeUnsupportedTransactionData})
+	require.ErrorAs(t, err, &se)
+	assert.Equal(t, ErrCodeUnsupportedTransactionData, se.Code)
+}

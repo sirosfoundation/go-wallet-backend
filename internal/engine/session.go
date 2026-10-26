@@ -1635,11 +1635,21 @@ func (e *SignError) Error() string {
 	return "client failed the sign request"
 }
 
+// allowedSignErrorCode keeps only the client-supplied codes the engine acts on.
+// Anything else is client-controlled text that could end up in logs (Error()
+// prints the code), so it is dropped.
+func allowedSignErrorCode(c ErrorCode) ErrorCode {
+	if c == ErrCodeUnsupportedTransactionData || c == ErrCodeSignRefused {
+		return c
+	}
+	return ""
+}
+
 // signResult turns a client-reported sign failure into an error.
 func signResult(resp *SignResponseMessage) (*SignResponseMessage, error) {
 	// A refusal needs no text: the code alone ends the wait.
 	if resp.Error != "" || resp.ErrorCode == ErrCodeSignRefused {
-		return nil, &SignError{text: resp.Error, Code: resp.ErrorCode}
+		return nil, &SignError{text: resp.Error, Code: allowedSignErrorCode(resp.ErrorCode)}
 	}
 	return resp, nil
 }
