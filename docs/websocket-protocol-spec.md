@@ -415,6 +415,56 @@ Client → Server:
 }
 ```
 
+#### Holder commitments (`org.siros.psc`)
+
+A credential configuration can ask the wallet to give the issuer a commitment
+derived from a per-issuer secret the engine never sees (SIROS extension,
+tracked in https://github.com/SUNET/vc/issues/823). The issuer advertises names
+only, never values:
+
+```
+credential_configurations_supported[cfg].credential_metadata["org.siros.holder_commitments"]
+  = {"commitments": ["psc"]}
+```
+
+The member must be an object with exactly one member, `commitments`: 1 to 4
+distinct names of 1 to 32 characters (`[a-z][a-z0-9_]*`), none of them a
+hex-looking string (16 or more hex characters). Anything else makes the
+configuration not offered: the engine drops it when decoding issuer metadata
+and the resolve endpoint removes it from the metadata it serves (dropping
+`signed_metadata`, as for `org.siros.secret_seed`). Unknown but well-formed
+names are ignored. Without the advertisement, behaviour is unchanged.
+
+When the selected configuration advertises `psc`, the `generate_proof`
+`sign_request` carries three more params (`credential_type` is the
+configuration's `vct`, or its `doctype` for mdoc; `credential_issuer` is the
+exact `credential_issuer` string of the issuer metadata):
+
+```
+"params": {
+  "audience": "https://issuer.example.com", "nonce": "...",
+  "holder_commitments": ["psc"],
+  "credential_type": "urn:eudi:pid:1",
+  "credential_issuer": "https://issuer.example.com"
+}
+```
+
+The wallet derives `private_seed` for (`credential_type`, `credential_issuer`)
+and adds the claim `org.siros.psc` = base64url, WITHOUT padding (RFC 7515 s2), of
+the 32-byte `SHA-256(private_seed)` to the payload of every proof JWT before
+signing. The engine does not compute the value. On each returned proof it
+verifies that the proof is a JWT whose payload holds `org.siros.psc` as an
+unpadded base64url string of exactly 32 bytes; otherwise the issuance fails with
+`SIGN_ERROR` and nothing is sent to the issuer. The value is never logged or
+placed in an error.
+
+If the issuer's credential endpoint answers HTTP 400 with an `error_description`
+beginning `org.siros.psc_conflict:` (it already holds a different commitment for
+the subject; nothing was issued), the engine sends a `flow_error` with code
+`PSC_CONFLICT`, step `requesting_credential`, and `error.message` set to the
+issuer's text (control characters removed, at most 512 bytes), and does not
+retry. The flow-error path is shared by every transport (WebSocket and WMP).
+
 #### Client Authentication (Signing)
 
 Two further `sign_request` actions let the client authenticate the engine's
@@ -969,6 +1019,7 @@ Server → Client:
 | `AUTHORIZATION_FAILED` | OAuth authorization flow failed |
 | `TOKEN_ERROR` | Token endpoint returned error |
 | `CREDENTIAL_ERROR` | Credential endpoint returned error |
+| `PSC_CONFLICT` | Issuer already holds a different holder commitment (`org.siros.psc`) for this subject; message is the issuer's text |
 | `SIGN_TIMEOUT` | Client did not respond to sign request |
 | `SIGN_ERROR` | Client signature was invalid |
 | `PRESENTATION_ERROR` | VP creation or submission failed |
