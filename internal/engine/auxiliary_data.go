@@ -111,17 +111,8 @@ func secretDeliveryOf(config *CredentialConfig) (secretDelivery, error) {
 		}
 		d.requireEncryption = true
 	}
-	// Any other configured secret member in issuer metadata is malformed:
-	// secret members never appear there.
-	if len(config.CredentialMetadata) > 0 {
-		var md map[string]json.RawMessage
-		if json.Unmarshal(config.CredentialMetadata, &md) == nil {
-			for k := range md {
-				if k != secretSeedMember && isSecretMember(k) {
-					return d, fmt.Errorf("%w: %s in credential_metadata", errMalformedAdvertisement, k)
-				}
-			}
-		}
+	if err := rejectOtherSecretMembers(config.CredentialMetadata); err != nil {
+		return d, err
 	}
 	if len(config.AuxiliaryDataSupported) > 0 {
 		aux, err := parseAuxiliaryDataSupported(config.AuxiliaryDataSupported)
@@ -133,6 +124,25 @@ func secretDeliveryOf(config *CredentialConfig) (secretDelivery, error) {
 		d.toIssuerRecognised = aux.toIssuerRecognised
 	}
 	return d, nil
+}
+
+// rejectOtherSecretMembers refuses any configured secret member other than the
+// legacy one in issuer metadata: secret members never appear there. A document
+// that is not an object is not judged here.
+func rejectOtherSecretMembers(credentialMetadata json.RawMessage) error {
+	if len(credentialMetadata) == 0 {
+		return nil
+	}
+	var md map[string]json.RawMessage
+	if json.Unmarshal(credentialMetadata, &md) != nil {
+		return nil
+	}
+	for k := range md {
+		if k != secretSeedMember && isSecretMember(k) {
+			return fmt.Errorf("%w: %s in credential_metadata", errMalformedAdvertisement, k)
+		}
+	}
+	return nil
 }
 
 // AdvertisementMalformed reports whether the secret delivery advertisement of
@@ -165,12 +175,8 @@ func advertisementMembers(configuration json.RawMessage) (cm, aux json.RawMessag
 	if err := json.Unmarshal(configuration, &m); err != nil || m == nil {
 		return nil, nil, errors.New("credential configuration is not an object")
 	}
-	for k := range m {
-		for _, name := range []string{"credential_metadata", "auxiliary_data_supported"} {
-			if k != name && strings.EqualFold(k, name) {
-				return nil, nil, fmt.Errorf("%w: ambiguous %s member", errMalformedAdvertisement, name)
-			}
-		}
+	if name, ok := caseVariantOf(m, "credential_metadata", "auxiliary_data_supported"); ok {
+		return nil, nil, fmt.Errorf("%w: ambiguous %s member", errMalformedAdvertisement, name)
 	}
 	return m["credential_metadata"], m["auxiliary_data_supported"], nil
 }
@@ -212,12 +218,8 @@ func parseAuxiliaryDataSupported(raw json.RawMessage) (*auxAdvertisement, error)
 	if json.Unmarshal(raw, &top) != nil || top == nil {
 		return nil, fmt.Errorf("%w: auxiliary_data_supported is not an object", errMalformedAdvertisement)
 	}
-	for k := range top {
-		for _, name := range []string{"to_wallet", "to_issuer"} {
-			if k != name && strings.EqualFold(k, name) {
-				return nil, fmt.Errorf("%w: ambiguous %s member", errMalformedAdvertisement, name)
-			}
-		}
+	if name, ok := caseVariantOf(top, "to_wallet", "to_issuer"); ok {
+		return nil, fmt.Errorf("%w: ambiguous %s member", errMalformedAdvertisement, name)
 	}
 	toWallet, hasW := top["to_wallet"]
 	toIssuer, hasI := top["to_issuer"]
@@ -230,11 +232,7 @@ func parseAuxiliaryDataSupported(raw json.RawMessage) (*auxAdvertisement, error)
 		if err != nil {
 			return nil, err
 		}
-		for _, e := range entries {
-			if e.typ == auxTypeHashCommitment {
-				out.toWalletSecret = true
-			}
-		}
+		out.toWalletSecret = hasHashCommitment(entries)
 	}
 	if hasI {
 		entries, rawEntries, err := parseAuxEntries(toIssuer, "to_issuer")
@@ -242,13 +240,32 @@ func parseAuxiliaryDataSupported(raw json.RawMessage) (*auxAdvertisement, error)
 			return nil, err
 		}
 		out.toIssuer = rawEntries
-		for _, e := range entries {
-			if e.typ == auxTypeHashCommitment {
-				out.toIssuerRecognised = true
+		out.toIssuerRecognised = hasHashCommitment(entries)
+	}
+	return out, nil
+}
+
+// hasHashCommitment reports whether any entry is of the one type the engine knows.
+func hasHashCommitment(entries []auxEntry) bool {
+	for _, e := range entries {
+		if e.typ == auxTypeHashCommitment {
+			return true
+		}
+	}
+	return false
+}
+
+// caseVariantOf returns the first of names that some key of m spells in another
+// letter case (a case-insensitive decoder would read it as the canonical one).
+func caseVariantOf(m map[string]json.RawMessage, names ...string) (string, bool) {
+	for k := range m {
+		for _, name := range names {
+			if k != name && strings.EqualFold(k, name) {
+				return name, true
 			}
 		}
 	}
-	return out, nil
+	return "", false
 }
 
 // auxEntryMembers are the members of an auxiliary data entry the engine knows.
@@ -257,6 +274,11 @@ var auxEntryMembers = []string{"type", "alg", "path", "required", "opening", "co
 type auxEntry struct {
 	typ string
 }
+
+// errAuxEntry is a malformed entry; the text says why and never carries content.
+type errAuxEntry string
+
+func (e errAuxEntry) Error() string { return string(e) }
 
 func parseAuxEntries(raw json.RawMessage, list string) ([]auxEntry, []json.RawMessage, error) {
 	bad := func(why string) ([]auxEntry, []json.RawMessage, error) {
@@ -269,64 +291,11 @@ func parseAuxEntries(raw json.RawMessage, list string) ([]auxEntry, []json.RawMe
 	seen := make(map[string]struct{}, len(rawEntries))
 	entries := make([]auxEntry, 0, len(rawEntries))
 	for _, re := range rawEntries {
-		var m map[string]json.RawMessage
-		if json.Unmarshal(re, &m) != nil || m == nil {
-			return bad("has an entry that is not an object")
+		e, pathKey, err := parseAuxEntry(re, list)
+		if err != nil {
+			return bad(err.Error())
 		}
-		// A member spelled in another case ("Opening", "TYPE") is read as the
-		// canonical one by a case-insensitive decoder: refuse the entry.
-		for k := range m {
-			for _, name := range auxEntryMembers {
-				if k != name && strings.EqualFold(k, name) {
-					return bad("has an entry with a case-variant member name")
-				}
-			}
-		}
-		// Values, never metadata: no opening or commitment member at any depth,
-		// in any letter case, whatever the entry's type (a raw token walk, so a
-		// repeated member cannot shadow it).
-		if values, _, err := scanMemberNames(re, "opening", "commitment"); err != nil || values {
-			return bad("has an entry carrying an opening or a commitment")
-		}
-		var typ string
-		if json.Unmarshal(m["type"], &typ) != nil || typ == "" {
-			return bad("has an entry without a string type")
-		}
-		e := auxEntry{typ: typ}
-		if rawReq, ok := m["required"]; ok {
-			if list != "to_issuer" {
-				return bad("has a required member")
-			}
-			var req *bool // JSON null decodes to nil: not a boolean
-			if json.Unmarshal(rawReq, &req) != nil || req == nil {
-				return bad("has a required member that is not a boolean")
-			}
-		}
-		pathKey := ""
-		if typ == auxTypeHashCommitment {
-			var alg string
-			if json.Unmarshal(m["alg"], &alg) != nil || alg == "" {
-				return bad("has a hash_commitment entry without a string alg")
-			}
-			p, ok := claimsPathKey(m["path"])
-			if !ok {
-				return bad("has a hash_commitment entry without a valid claims path")
-			}
-			pathKey = p
-		} else if p, has := m["path"]; has {
-			// Unrecognised type: only duplicate detection, on the decoded
-			// value so escapes and whitespace cannot hide a duplicate.
-			var v interface{}
-			if json.Unmarshal(p, &v) != nil {
-				return bad("has an entry with an invalid path")
-			}
-			norm, err := json.Marshal(v)
-			if err != nil {
-				return bad("has an entry with an invalid path")
-			}
-			pathKey = string(norm)
-		}
-		dup := typ + "\x00" + pathKey
+		dup := e.typ + "\x00" + pathKey
 		if _, d := seen[dup]; d {
 			return bad("has two entries of the same type and path")
 		}
@@ -334,6 +303,84 @@ func parseAuxEntries(raw json.RawMessage, list string) ([]auxEntry, []json.RawMe
 		entries = append(entries, e)
 	}
 	return entries, rawEntries, nil
+}
+
+// parseAuxEntry validates one entry and returns it with its duplicate-detection
+// path key. The error text is the reason, without content.
+func parseAuxEntry(re json.RawMessage, list string) (auxEntry, string, error) {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(re, &m) != nil || m == nil {
+		return auxEntry{}, "", errAuxEntry("has an entry that is not an object")
+	}
+	// A member spelled in another case ("Opening", "TYPE") is read as the
+	// canonical one by a case-insensitive decoder: refuse the entry.
+	if _, ok := caseVariantOf(m, auxEntryMembers...); ok {
+		return auxEntry{}, "", errAuxEntry("has an entry with a case-variant member name")
+	}
+	// Values, never metadata: no opening or commitment member at any depth,
+	// in any letter case, whatever the entry's type (a raw token walk, so a
+	// repeated member cannot shadow it).
+	if values, _, err := scanMemberNames(re, "opening", "commitment"); err != nil || values {
+		return auxEntry{}, "", errAuxEntry("has an entry carrying an opening or a commitment")
+	}
+	var typ string
+	if json.Unmarshal(m["type"], &typ) != nil || typ == "" {
+		return auxEntry{}, "", errAuxEntry("has an entry without a string type")
+	}
+	if err := checkAuxRequired(m, list); err != nil {
+		return auxEntry{}, "", err
+	}
+	pathKey, err := auxEntryPathKey(typ, m)
+	if err != nil {
+		return auxEntry{}, "", err
+	}
+	return auxEntry{typ: typ}, pathKey, nil
+}
+
+// checkAuxRequired: only to_issuer entries may carry required, and it is a boolean.
+func checkAuxRequired(m map[string]json.RawMessage, list string) error {
+	rawReq, ok := m["required"]
+	if !ok {
+		return nil
+	}
+	if list != "to_issuer" {
+		return errAuxEntry("has a required member")
+	}
+	var req *bool // JSON null decodes to nil: not a boolean
+	if json.Unmarshal(rawReq, &req) != nil || req == nil {
+		return errAuxEntry("has a required member that is not a boolean")
+	}
+	return nil
+}
+
+// auxEntryPathKey returns the duplicate-detection key of an entry's path.
+func auxEntryPathKey(typ string, m map[string]json.RawMessage) (string, error) {
+	if typ == auxTypeHashCommitment {
+		var alg string
+		if json.Unmarshal(m["alg"], &alg) != nil || alg == "" {
+			return "", errAuxEntry("has a hash_commitment entry without a string alg")
+		}
+		p, ok := claimsPathKey(m["path"])
+		if !ok {
+			return "", errAuxEntry("has a hash_commitment entry without a valid claims path")
+		}
+		return p, nil
+	}
+	p, has := m["path"]
+	if !has {
+		return "", nil
+	}
+	// Unrecognised type: only duplicate detection, on the decoded
+	// value so escapes and whitespace cannot hide a duplicate.
+	var v interface{}
+	if json.Unmarshal(p, &v) != nil {
+		return "", errAuxEntry("has an entry with an invalid path")
+	}
+	norm, err := json.Marshal(v)
+	if err != nil {
+		return "", errAuxEntry("has an entry with an invalid path")
+	}
+	return string(norm), nil
 }
 
 // claimsPathKey validates a claims path pointer (OpenID4VCI Appendix C): a
@@ -374,6 +421,8 @@ func claimsPathKey(raw json.RawMessage) (string, bool) {
 // returns; the flow then fails with AUXILIARY_DATA_PROOF_INVALID. Errors never
 // include a commitment or opening value.
 var errAuxiliaryDataProof = errors.New("key proofs cannot be forwarded: auxiliary_data is not safe to relay")
+
+const msgPayloadNotObject = "proof payload is not a JSON object"
 
 func auxProofErr(why string) error { return fmt.Errorf("%w: %s", errAuxiliaryDataProof, why) }
 
@@ -459,12 +508,9 @@ func scanMemberNames(raw json.RawMessage, names ...string) (found, isArray bool,
 // name. A decode into maps would drop the repeated member, which is why the
 // token stream is used.
 func walkMembers(raw json.RawMessage, names ...string) (found, isArray, duplicate bool, err error) {
-	type frame struct {
-		obj, expectKey bool
-		keys           map[string]struct{}
-	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
-	var stack []frame
+	var w memberWalk
+	w.names = names
 	first := true
 	for {
 		tok, err := dec.Token()
@@ -479,48 +525,80 @@ func walkMembers(raw json.RawMessage, names ...string) (found, isArray, duplicat
 			isArray = ok && d == '['
 			first = false
 		}
-		top := len(stack) - 1
-		if d, ok := tok.(json.Delim); ok {
-			switch d {
-			case '{', '[':
-				if top >= 0 && stack[top].obj {
-					stack[top].expectKey = true // this container is the member's value
-				}
-				f := frame{obj: d == '{', expectKey: d == '{'}
-				if f.obj {
-					f.keys = map[string]struct{}{}
-				}
-				stack = append(stack, f)
-			default:
-				if top >= 0 {
-					stack = stack[:top]
-				}
-			}
-			continue
-		}
-		if top >= 0 && stack[top].obj {
-			if stack[top].expectKey {
-				if key, ok := tok.(string); ok {
-					if _, seen := stack[top].keys[key]; seen {
-						duplicate = true
-					}
-					stack[top].keys[key] = struct{}{}
-					for _, n := range names {
-						if strings.EqualFold(key, n) {
-							found = true
-						}
-					}
-				}
-				stack[top].expectKey = false
-			} else {
-				stack[top].expectKey = true
-			}
-		}
+		w.step(tok)
 	}
-	if len(stack) != 0 {
+	if len(w.stack) != 0 {
 		return false, false, false, io.ErrUnexpectedEOF
 	}
-	return found, isArray, duplicate, nil
+	return w.found, isArray, w.duplicate, nil
+}
+
+// memberFrame is one open container of a member walk.
+type memberFrame struct {
+	obj, expectKey bool
+	keys           map[string]struct{}
+}
+
+// memberWalk is the state of walkMembers: the stack of open containers and what
+// has been seen so far.
+type memberWalk struct {
+	names     []string
+	stack     []memberFrame
+	found     bool
+	duplicate bool
+}
+
+// step consumes one token.
+func (w *memberWalk) step(tok json.Token) {
+	if d, ok := tok.(json.Delim); ok {
+		w.delim(d)
+		return
+	}
+	top := len(w.stack) - 1
+	if top < 0 || !w.stack[top].obj {
+		return
+	}
+	f := &w.stack[top]
+	if !f.expectKey {
+		f.expectKey = true
+		return
+	}
+	if key, ok := tok.(string); ok {
+		w.key(f, key)
+	}
+	f.expectKey = false
+}
+
+// delim opens or closes a container.
+func (w *memberWalk) delim(d json.Delim) {
+	top := len(w.stack) - 1
+	if d != '{' && d != '[' {
+		if top >= 0 {
+			w.stack = w.stack[:top]
+		}
+		return
+	}
+	if top >= 0 && w.stack[top].obj {
+		w.stack[top].expectKey = true // this container is the member's value
+	}
+	f := memberFrame{obj: d == '{', expectKey: d == '{'}
+	if f.obj {
+		f.keys = map[string]struct{}{}
+	}
+	w.stack = append(w.stack, f)
+}
+
+// key records a member name of the object f.
+func (w *memberWalk) key(f *memberFrame, key string) {
+	if _, seen := f.keys[key]; seen {
+		w.duplicate = true
+	}
+	f.keys[key] = struct{}{}
+	for _, n := range w.names {
+		if strings.EqualFold(key, n) {
+			w.found = true
+		}
+	}
 }
 
 // SignedMetadataMayCarryOpening reports whether a signed_metadata JWT (kept
@@ -566,7 +644,7 @@ func proofAuxiliaryDataClaim(token string) (json.RawMessage, bool, error) {
 	// auxiliary_data member is seen (a map keeps only one of them).
 	dec := json.NewDecoder(bytes.NewReader(payload))
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
-		return nil, false, auxProofErr("proof payload is not a JSON object")
+		return nil, false, auxProofErr(msgPayloadNotObject)
 	}
 	var claim json.RawMessage
 	found := false
@@ -574,11 +652,11 @@ func proofAuxiliaryDataClaim(token string) (json.RawMessage, bool, error) {
 		keyTok, err := dec.Token()
 		key, isString := keyTok.(string)
 		if err != nil || !isString {
-			return nil, false, auxProofErr("proof payload is not a JSON object")
+			return nil, false, auxProofErr(msgPayloadNotObject)
 		}
 		var value json.RawMessage
 		if err := dec.Decode(&value); err != nil {
-			return nil, false, auxProofErr("proof payload is not a JSON object")
+			return nil, false, auxProofErr(msgPayloadNotObject)
 		}
 		if strings.EqualFold(key, auxiliaryDataMember) {
 			if found || key != auxiliaryDataMember {
@@ -588,7 +666,7 @@ func proofAuxiliaryDataClaim(token string) (json.RawMessage, bool, error) {
 		}
 	}
 	if _, err := dec.Token(); err != nil {
-		return nil, false, auxProofErr("proof payload is not a JSON object")
+		return nil, false, auxProofErr(msgPayloadNotObject)
 	}
 	// Nothing may follow the object: a decoder that stops after the first
 	// value would see a different claim set than one that reads on.

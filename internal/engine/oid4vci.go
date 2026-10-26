@@ -1936,43 +1936,9 @@ func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMe
 	// Token exchange with DPoP nonce (RFC 9449 §8) and attestation challenge
 	// (attestation-based client auth) retries.
 	for attempt := 0; attempt < 3; attempt++ {
-		// Resolve client auth first: whether the request is attested decides
-		// the form-body auth, and each attempt needs a fresh DPoP proof (new
-		// nonce) and, in client-held mode, a fresh attestation PoP.
-		auth, err := h.resolveClientAuth(ctx, clientAuthNeeds{
-			attestation: true,
-			dpop:        true,
-			htm:         "POST",
-			htu:         tokenEndpoint,
-		})
+		resp, err := h.sendTokenRequest(ctx, metadata, tokenEndpoint, setGrantParams)
 		if err != nil {
 			return nil, err
-		}
-
-		data := url.Values{}
-		setGrantParams(data)
-		// RFC 8707 resource indicator (cross-origin AS/issuer only): applied here
-		// so every grant type (pre-authorized_code, authorization_code,
-		// refresh_token) audience-restricts the access token to the Credential
-		// Issuer, matching the PAR-time decision (both derive it from the same
-		// metadata, as RFC 8707 requires).
-		if !sameOrigin(h.authServerIssuer, metadata.CredentialIssuer) {
-			data.Set("resource", metadata.CredentialIssuer)
-		}
-		if err := h.setClientAuth(data, auth.attested()); err != nil {
-			return nil, err
-		}
-
-		req, err := http.NewRequestWithContext(ctx, "POST", tokenEndpoint, strings.NewReader(data.Encode()))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		auth.apply(req)
-
-		resp, err := h.httpClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("token request failed: %w", err)
 		}
 
 		// Check for DPoP nonce requirement — retry with server-provided nonce
@@ -2008,6 +1974,49 @@ func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMe
 	}
 
 	return nil, fmt.Errorf("%s request failed after nonce/challenge retries", logContext)
+}
+
+// sendTokenRequest builds and sends one token request. Resolving client auth
+// comes first: whether the request is attested decides the form-body auth, and
+// each attempt needs a fresh DPoP proof (new nonce) and, in client-held mode, a
+// fresh attestation PoP.
+func (h *OID4VCIHandler) sendTokenRequest(ctx context.Context, metadata *IssuerMetadata, tokenEndpoint string, setGrantParams func(data url.Values)) (*http.Response, error) {
+	auth, err := h.resolveClientAuth(ctx, clientAuthNeeds{
+		attestation: true,
+		dpop:        true,
+		htm:         "POST",
+		htu:         tokenEndpoint,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	data := url.Values{}
+	setGrantParams(data)
+	// RFC 8707 resource indicator (cross-origin AS/issuer only): applied here
+	// so every grant type (pre-authorized_code, authorization_code,
+	// refresh_token) audience-restricts the access token to the Credential
+	// Issuer, matching the PAR-time decision (both derive it from the same
+	// metadata, as RFC 8707 requires).
+	if !sameOrigin(h.authServerIssuer, metadata.CredentialIssuer) {
+		data.Set("resource", metadata.CredentialIssuer)
+	}
+	if err := h.setClientAuth(data, auth.attested()); err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", tokenEndpoint, strings.NewReader(data.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	auth.apply(req)
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("token request failed: %w", err)
+	}
+	return resp, nil
 }
 
 // exchangeRefreshToken performs an OAuth 2.0 refresh_token grant against the
@@ -2940,172 +2949,218 @@ var (
 // answer goes to the client exactly like the first response, with
 // deferred=true.
 func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, transactionID string, interval int, respEnc *responseEncryption, config *CredentialConfig) (*CredentialResponse, error) {
-	// A request that carried auxiliary data may be answered with text that
-	// echoes a commitment: then neither the body nor the description is logged
-	// or returned, only the status and the OAuth error code.
-	quiet := config != nil && len(config.AuxiliaryDataSupported) > 0
-
-	// Determine deferred endpoint (OpenID4VCI spec: {credential_issuer}/deferred_credential or from metadata)
-	deferredEndpoint := strings.TrimSuffix(metadata.CredentialIssuer, "/") + "/deferred_credential"
-
-	// Default polling interval and max attempts
-	wait := deferredPollDefaultInterval
-	if interval > 0 {
-		wait = time.Duration(interval) * deferredPollIntervalUnit
+	p := &deferredPoll{
+		h:        h,
+		metadata: metadata,
+		token:    token,
+		respEnc:  respEnc,
+		// A request that carried auxiliary data may be answered with text that
+		// echoes a commitment: then neither the body nor the description is
+		// logged or returned, only the status and the OAuth error code.
+		quiet:         config != nil && len(config.AuxiliaryDataSupported) > 0,
+		transactionID: transactionID,
+		// Determine deferred endpoint (OpenID4VCI spec: {credential_issuer}/deferred_credential or from metadata)
+		endpoint: strings.TrimSuffix(metadata.CredentialIssuer, "/") + "/deferred_credential",
+		// Default polling interval
+		wait: deferredPollDefaultInterval,
 	}
-	maxAttempts := 60 // 5 minutes at 5 second intervals
+	if interval > 0 {
+		p.wait = time.Duration(interval) * deferredPollIntervalUnit
+	}
+	const maxAttempts = 60 // 5 minutes at 5 second intervals
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(wait):
+		case <-time.After(p.wait):
 		}
-
-		// Send progress update
-		_ = h.Progress(StepDeferred, map[string]interface{}{
-			"transaction_id": transactionID,
-			"attempt":        attempt + 1,
-			"max_attempts":   maxAttempts,
-			"message":        fmt.Sprintf("Polling for credential (attempt %d/%d)", attempt+1, maxAttempts),
-		})
-
-		// Build request body
-		reqBody := map[string]interface{}{
-			"transaction_id": transactionID,
-		}
-		if respEnc != nil {
-			// The client keeps its key for the whole flow; without this the
-			// issuer answers the deferred request in clear (§9.1).
-			reqBody["credential_response_encryption"] = respEnc.requestMember()
-		}
-		bodyBytes, _ := json.Marshal(reqBody)
-		contentType := "application/json"
-		// OID4VCI 1.0 §9.1: the deferred request is encrypted like the
-		// credential request when the issuer requires it, or when it asks for
-		// an encrypted response (an issuer may refuse that in a plain request).
-		if reqEnc := metadata.CredentialRequestEncryption; reqEnc != nil && (reqEnc.EncryptionRequired || respEnc != nil) {
-			jwe, err := reqEnc.encryptRequest(bodyBytes)
-			if err != nil {
-				return nil, fmt.Errorf("cannot encrypt deferred credential request: %w", err)
-			}
-			bodyBytes = []byte(jwe)
-			contentType = "application/jwt"
-		}
-
-		req, err := http.NewRequestWithContext(ctx, "POST", deferredEndpoint, strings.NewReader(string(bodyBytes)))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", contentType)
-		h.setAuthorizationHeader(req, token)
-		if strings.EqualFold(token.TokenType, "DPoP") {
-			auth, err := h.resolveClientAuth(ctx, clientAuthNeeds{dpop: true, htm: "POST", htu: deferredEndpoint, accessToken: token.AccessToken})
-			if err != nil {
-				return nil, err
-			}
-			auth.apply(req)
-		}
-
-		resp, err := h.httpClient.Do(req)
-		if err != nil {
-			h.Logger.Warn("Deferred polling request failed", zap.Error(err), zap.Int("attempt", attempt+1))
-			continue // Retry on network errors
-		}
-
-		// Handle DPoP nonce on deferred responses
-		h.updateDPoPNonce(resp)
-		if isDPoPNonceError(resp) {
-			_ = resp.Body.Close()
-			continue // Retry immediately with new nonce (counts as one attempt)
-		}
-
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))
-		_ = resp.Body.Close()
-
-		// An issuer answers a request that asked for an encrypted response
-		// with a JWE whatever the status: 200 carries the credentials, 202 a
-		// still-pending answer (transaction_id, interval) that is just as
-		// encrypted. Handle that before any status-specific JSON parsing,
-		// which would silently drop it.
-		if respEnc != nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted) {
-			mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-			if mediaType == "application/jwt" || mediaType == "application/jose" {
-				// Encrypted to the client's key: relay it unread. The initial
-				// response may have been plain (no notification context yet),
-				// and the client may reject what it decrypts and then owes the
-				// issuer a credential_failure notification, so the context
-				// must exist before the client answers.
-				h.registerNotificationContext(metadata, token, &CredentialResponse{Encrypted: true})
-				answer, err := h.relayEncryptedResponse(ctx, string(body), true, respEnc)
-				if err != nil {
-					return nil, err
-				}
-				if answer.TransactionID != "" {
-					// Still not ready: keep polling with what the client reported.
-					transactionID = answer.TransactionID
-					if answer.Interval > 0 {
-						wait = time.Duration(answer.Interval) * deferredPollIntervalUnit
-					}
-					continue
-				}
-				if resp.StatusCode == http.StatusAccepted {
-					// 202 means "not ready": credentials in it are a protocol violation.
-					return nil, errors.New("issuer answered a pending deferred request with credentials")
-				}
-				h.Logger.Info("Deferred credential received", zap.String("transaction_id", transactionID))
-				return answer, nil
-			}
-			if respEnc.Seed {
-				// A seed is never delivered in clear: refuse unread.
-				return nil, errors.New("issuer answered a secret seed deferred request without encrypting the response")
-			}
-		}
-
-		switch resp.StatusCode {
-		case http.StatusOK:
-			// Credential is ready
-			var credResp CredentialResponse
-			if err := json.Unmarshal(body, &credResp); err != nil {
-				return nil, errors.New("failed to parse deferred credential response")
-			}
-			h.Logger.Info("Deferred credential received", zap.String("transaction_id", transactionID))
-			return &credResp, nil
-
-		case http.StatusAccepted:
-			// Still pending, continue polling
-			// Check for new interval if provided in response
-			var pendingResp struct {
-				Interval int `json:"interval,omitempty"`
-			}
-			if err := json.Unmarshal(body, &pendingResp); err == nil && pendingResp.Interval > 0 {
-				wait = time.Duration(pendingResp.Interval) * deferredPollIntervalUnit
-			}
-			h.Logger.Debug("Deferred credential still pending",
-				zap.String("transaction_id", transactionID),
-				zap.Int("attempt", attempt+1))
-			continue
-
-		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
-			// Non-retryable errors
-			if quiet {
-				return nil, fmt.Errorf("deferred credential request failed with status %d: %w", resp.StatusCode, oauthErrorCodeOnly(resp.StatusCode, body))
-			}
-			return nil, fmt.Errorf("deferred credential request failed with status %d: %s", resp.StatusCode, string(body))
-
-		default:
-			if quiet {
-				h.Logger.Warn("Unexpected deferred response status", zap.Int("status", resp.StatusCode))
-			} else {
-				h.Logger.Warn("Unexpected deferred response status",
-					zap.Int("status", resp.StatusCode),
-					zap.String("body", string(body)))
-			}
-			continue // Retry on unexpected responses
+		cred, done, err := p.once(ctx, attempt, maxAttempts)
+		if done || err != nil {
+			return cred, err
 		}
 	}
 
 	return nil, fmt.Errorf("deferred credential polling timeout after %d attempts", maxAttempts)
+}
+
+// deferredPoll is the state of one deferred credential polling loop.
+type deferredPoll struct {
+	h             *OID4VCIHandler
+	metadata      *IssuerMetadata
+	token         *TokenResponse
+	respEnc       *responseEncryption
+	quiet         bool
+	endpoint      string
+	transactionID string
+	wait          time.Duration
+}
+
+// request builds one deferred credential request.
+func (p *deferredPoll) request(ctx context.Context) (*http.Request, error) {
+	reqBody := map[string]interface{}{
+		"transaction_id": p.transactionID,
+	}
+	if p.respEnc != nil {
+		// The client keeps its key for the whole flow; without this the
+		// issuer answers the deferred request in clear (§9.1).
+		reqBody["credential_response_encryption"] = p.respEnc.requestMember()
+	}
+	bodyBytes, _ := json.Marshal(reqBody)
+	contentType := "application/json"
+	// OID4VCI 1.0 §9.1: the deferred request is encrypted like the
+	// credential request when the issuer requires it, or when it asks for
+	// an encrypted response (an issuer may refuse that in a plain request).
+	if reqEnc := p.metadata.CredentialRequestEncryption; reqEnc != nil && (reqEnc.EncryptionRequired || p.respEnc != nil) {
+		jwe, err := reqEnc.encryptRequest(bodyBytes)
+		if err != nil {
+			return nil, fmt.Errorf("cannot encrypt deferred credential request: %w", err)
+		}
+		bodyBytes = []byte(jwe)
+		contentType = "application/jwt"
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", p.endpoint, strings.NewReader(string(bodyBytes)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	p.h.setAuthorizationHeader(req, p.token)
+	if strings.EqualFold(p.token.TokenType, "DPoP") {
+		auth, err := p.h.resolveClientAuth(ctx, clientAuthNeeds{dpop: true, htm: "POST", htu: p.endpoint, accessToken: p.token.AccessToken})
+		if err != nil {
+			return nil, err
+		}
+		auth.apply(req)
+	}
+	return req, nil
+}
+
+// once makes one polling attempt. done is false when polling continues.
+func (p *deferredPoll) once(ctx context.Context, attempt, maxAttempts int) (cred *CredentialResponse, done bool, err error) {
+	h := p.h
+	// Send progress update
+	_ = h.Progress(StepDeferred, map[string]interface{}{
+		"transaction_id": p.transactionID,
+		"attempt":        attempt + 1,
+		"max_attempts":   maxAttempts,
+		"message":        fmt.Sprintf("Polling for credential (attempt %d/%d)", attempt+1, maxAttempts),
+	})
+
+	req, err := p.request(ctx)
+	if err != nil {
+		return nil, true, err
+	}
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		h.Logger.Warn("Deferred polling request failed", zap.Error(err), zap.Int("attempt", attempt+1))
+		return nil, false, nil // Retry on network errors
+	}
+
+	// Handle DPoP nonce on deferred responses
+	h.updateDPoPNonce(resp)
+	if isDPoPNonceError(resp) {
+		_ = resp.Body.Close()
+		return nil, false, nil // Retry immediately with new nonce (counts as one attempt)
+	}
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))
+	_ = resp.Body.Close()
+
+	// An issuer answers a request that asked for an encrypted response
+	// with a JWE whatever the status: 200 carries the credentials, 202 a
+	// still-pending answer (transaction_id, interval) that is just as
+	// encrypted. Handle that before any status-specific JSON parsing,
+	// which would silently drop it.
+	if p.respEnc != nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted) {
+		return p.encryptedAnswer(ctx, resp, body, attempt)
+	}
+	return p.plainAnswer(resp.StatusCode, body, attempt)
+}
+
+// encryptedAnswer handles a 200 or 202 answer to a request that asked for an
+// encrypted response. done is false when polling continues.
+func (p *deferredPoll) encryptedAnswer(ctx context.Context, resp *http.Response, body []byte, attempt int) (*CredentialResponse, bool, error) {
+	h := p.h
+	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if mediaType != "application/jwt" && mediaType != "application/jose" {
+		if p.respEnc.Seed {
+			// A seed is never delivered in clear: refuse unread.
+			return nil, true, errors.New("issuer answered a secret seed deferred request without encrypting the response")
+		}
+		return p.plainAnswer(resp.StatusCode, body, attempt)
+	}
+	// Encrypted to the client's key: relay it unread. The initial
+	// response may have been plain (no notification context yet),
+	// and the client may reject what it decrypts and then owes the
+	// issuer a credential_failure notification, so the context
+	// must exist before the client answers.
+	h.registerNotificationContext(p.metadata, p.token, &CredentialResponse{Encrypted: true})
+	answer, err := h.relayEncryptedResponse(ctx, string(body), true, p.respEnc)
+	if err != nil {
+		return nil, true, err
+	}
+	if answer.TransactionID != "" {
+		// Still not ready: keep polling with what the client reported.
+		p.transactionID = answer.TransactionID
+		if answer.Interval > 0 {
+			p.wait = time.Duration(answer.Interval) * deferredPollIntervalUnit
+		}
+		return nil, false, nil
+	}
+	if resp.StatusCode == http.StatusAccepted {
+		// 202 means "not ready": credentials in it are a protocol violation.
+		return nil, true, errors.New("issuer answered a pending deferred request with credentials")
+	}
+	h.Logger.Info("Deferred credential received", zap.String("transaction_id", p.transactionID))
+	return answer, true, nil
+}
+
+// plainAnswer interprets an unencrypted answer by status. done is false when
+// polling continues.
+func (p *deferredPoll) plainAnswer(status int, body []byte, attempt int) (*CredentialResponse, bool, error) {
+	h := p.h
+	switch status {
+	case http.StatusOK:
+		// Credential is ready
+		var credResp CredentialResponse
+		if err := json.Unmarshal(body, &credResp); err != nil {
+			return nil, true, errors.New("failed to parse deferred credential response")
+		}
+		h.Logger.Info("Deferred credential received", zap.String("transaction_id", p.transactionID))
+		return &credResp, true, nil
+
+	case http.StatusAccepted:
+		// Still pending, continue polling
+		// Check for new interval if provided in response
+		var pendingResp struct {
+			Interval int `json:"interval,omitempty"`
+		}
+		if err := json.Unmarshal(body, &pendingResp); err == nil && pendingResp.Interval > 0 {
+			p.wait = time.Duration(pendingResp.Interval) * deferredPollIntervalUnit
+		}
+		h.Logger.Debug("Deferred credential still pending",
+			zap.String("transaction_id", p.transactionID),
+			zap.Int("attempt", attempt+1))
+		return nil, false, nil
+
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
+		// Non-retryable errors
+		if p.quiet {
+			return nil, true, fmt.Errorf("deferred credential request failed with status %d: %w", status, oauthErrorCodeOnly(status, body))
+		}
+		return nil, true, fmt.Errorf("deferred credential request failed with status %d: %s", status, string(body))
+
+	default:
+		if p.quiet {
+			h.Logger.Warn("Unexpected deferred response status", zap.Int("status", status))
+		} else {
+			h.Logger.Warn("Unexpected deferred response status",
+				zap.Int("status", status),
+				zap.String("body", string(body)))
+		}
+		return nil, false, nil // Retry on unexpected responses
+	}
 }
 
 func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo) []CredentialResult {
