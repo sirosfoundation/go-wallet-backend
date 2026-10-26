@@ -2,9 +2,11 @@
 
 Status: draft. The presentation half is implemented by
 https://github.com/sirosfoundation/go-wallet-backend/pull/471. The issuance half
-below is the agreed contract and lands with
-https://github.com/sirosfoundation/go-wallet-backend/pull/469; it is not yet
-implemented in the engine.
+is implemented in the engine and merged
+(https://github.com/sirosfoundation/go-wallet-backend/pull/469): the engine
+passes the client's encryption JWK to the issuer and relays the issuer's JWE
+with `decrypt_credential_response`. Clients must implement it; there is no
+fallback.
 
 The engine relays ciphertext and never sees credential contents, the
 `org.siros.secret_seed`, or a `vp_token`. It still sees metadata: which issuer
