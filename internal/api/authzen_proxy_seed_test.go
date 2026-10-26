@@ -62,12 +62,13 @@ func TestSanitize_DropsSignedMetadataCarryingShadowedOpening(t *testing.T) {
 		jwt  string
 		keep bool
 	}{
-		"clean":                    {jwtOf(`{"credential_configurations_supported":{"a":` + cfg + `}}`), true},
-		"shadowed nested opening":  {jwtOf(`{"credential_configurations_supported":{"a":{"x":{"opening":"SECRET"},"x":null}}}`), false},
-		"shadowed configuration":   {jwtOf(`{"credential_configurations_supported":{"a":{"auxiliary_data_supported":{"to_wallet":[{"type":"hash_commitment","opening":"SECRET"}]}},"a":` + cfg + `}}`), false},
-		"case-variant opening":     {jwtOf(`{"credential_configurations_supported":{"a":{"Opening":"SECRET"}}}`), false},
-		"unreadable token":         {"not-a-jwt", false},
-		"payload is not an object": {jwtOf(`[`), false},
+		"clean":                             {jwtOf(`{"credential_configurations_supported":{"a":` + cfg + `}}`), true},
+		"shadowed nested opening":           {jwtOf(`{"credential_configurations_supported":{"a":{"x":{"opening":"SECRET"},"x":null}}}`), false},
+		"shadowed configuration":            {jwtOf(`{"credential_configurations_supported":{"a":{"auxiliary_data_supported":{"to_wallet":[{"type":"hash_commitment","opening":"SECRET"}]}},"a":` + cfg + `}}`), false},
+		"configured secret member shadowed": {jwtOf(`{"credential_configurations_supported":{"a":{"credential_metadata":{"x.secret":"SECRET"}},"a":{"format":"mso_mdoc"}}}`), false},
+		"case-variant opening":              {jwtOf(`{"credential_configurations_supported":{"a":{"Opening":"SECRET"}}}`), false},
+		"unreadable token":                  {"not-a-jwt", false},
+		"payload is not an object":          {jwtOf(`[`), false},
 	} {
 		t.Run(name, func(t *testing.T) {
 			md := map[string]interface{}{

@@ -88,6 +88,9 @@ type secretDelivery struct {
 	// toIssuer are the advertised auxiliary_data_supported.to_issuer entries,
 	// verbatim, for the wallet to place in its key proofs.
 	toIssuer []json.RawMessage
+	// toIssuerRecognised: at least one to_issuer entry is of a type the engine
+	// knows (hash_commitment), so the wallet needs the credential type.
+	toIssuerRecognised bool
 }
 
 // errMalformedAdvertisement never carries the offending content.
@@ -127,6 +130,7 @@ func secretDeliveryOf(config *CredentialConfig) (secretDelivery, error) {
 		}
 		d.requireEncryption = d.requireEncryption || aux.toWalletSecret
 		d.toIssuer = aux.toIssuer
+		d.toIssuerRecognised = aux.toIssuerRecognised
 	}
 	return d, nil
 }
@@ -190,8 +194,9 @@ func (c *CredentialConfig) UnmarshalJSON(data []byte) error {
 }
 
 type auxAdvertisement struct {
-	toWalletSecret bool
-	toIssuer       []json.RawMessage
+	toWalletSecret     bool
+	toIssuer           []json.RawMessage
+	toIssuerRecognised bool
 }
 
 // parseAuxiliaryDataSupported validates auxiliary_data_supported (Auxiliary
@@ -232,11 +237,16 @@ func parseAuxiliaryDataSupported(raw json.RawMessage) (*auxAdvertisement, error)
 		}
 	}
 	if hasI {
-		_, rawEntries, err := parseAuxEntries(toIssuer, "to_issuer")
+		entries, rawEntries, err := parseAuxEntries(toIssuer, "to_issuer")
 		if err != nil {
 			return nil, err
 		}
 		out.toIssuer = rawEntries
+		for _, e := range entries {
+			if e.typ == auxTypeHashCommitment {
+				out.toIssuerRecognised = true
+			}
+		}
 	}
 	return out, nil
 }
@@ -432,13 +442,27 @@ func checkProofsForwardNoOpening(proofs []ProofObject, inspect bool) error {
 // repeated member is discarded, and reports whether any object at any depth has
 // a member named "opening" in any letter case, and whether the claim is an array.
 func scanClaimForOpening(raw json.RawMessage) (hasOpening, isArray bool, err error) {
-	return scanMemberNames(raw, "opening")
+	hasOpening, isArray, _, err = walkMembers(raw, "opening")
+	return hasOpening, isArray, err
 }
 
 // scanMemberNames is the token walk behind scanClaimForOpening for any set of
 // member names.
-func scanMemberNames(raw json.RawMessage, names ...string) (hasOpening, isArray bool, err error) {
-	type frame struct{ obj, expectKey bool }
+func scanMemberNames(raw json.RawMessage, names ...string) (found, isArray bool, err error) {
+	found, isArray, _, err = walkMembers(raw, names...)
+	return found, isArray, err
+}
+
+// walkMembers walks raw JSON token by token. It reports whether any object at
+// any depth has a member whose name equals one of names in any letter case,
+// whether the document is an array, and whether any object repeats a member
+// name. A decode into maps would drop the repeated member, which is why the
+// token stream is used.
+func walkMembers(raw json.RawMessage, names ...string) (found, isArray, duplicate bool, err error) {
+	type frame struct {
+		obj, expectKey bool
+		keys           map[string]struct{}
+	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	var stack []frame
 	first := true
@@ -448,7 +472,7 @@ func scanMemberNames(raw json.RawMessage, names ...string) (hasOpening, isArray 
 			break
 		}
 		if err != nil {
-			return false, false, err
+			return false, false, false, err
 		}
 		if first {
 			d, ok := tok.(json.Delim)
@@ -462,7 +486,11 @@ func scanMemberNames(raw json.RawMessage, names ...string) (hasOpening, isArray 
 				if top >= 0 && stack[top].obj {
 					stack[top].expectKey = true // this container is the member's value
 				}
-				stack = append(stack, frame{obj: d == '{', expectKey: d == '{'})
+				f := frame{obj: d == '{', expectKey: d == '{'}
+				if f.obj {
+					f.keys = map[string]struct{}{}
+				}
+				stack = append(stack, f)
 			default:
 				if top >= 0 {
 					stack = stack[:top]
@@ -473,9 +501,13 @@ func scanMemberNames(raw json.RawMessage, names ...string) (hasOpening, isArray 
 		if top >= 0 && stack[top].obj {
 			if stack[top].expectKey {
 				if key, ok := tok.(string); ok {
+					if _, seen := stack[top].keys[key]; seen {
+						duplicate = true
+					}
+					stack[top].keys[key] = struct{}{}
 					for _, n := range names {
 						if strings.EqualFold(key, n) {
-							hasOpening = true
+							found = true
 						}
 					}
 				}
@@ -486,14 +518,17 @@ func scanMemberNames(raw json.RawMessage, names ...string) (hasOpening, isArray 
 		}
 	}
 	if len(stack) != 0 {
-		return false, false, io.ErrUnexpectedEOF
+		return false, false, false, io.ErrUnexpectedEOF
 	}
-	return hasOpening, isArray, nil
+	return found, isArray, duplicate, nil
 }
 
 // SignedMetadataMayCarryOpening reports whether a signed_metadata JWT (kept
-// verbatim by the resolver) might carry an opening: its payload has a member
-// named "opening", in any letter case at any depth, or cannot be read. The
+// verbatim by the resolver) might carry a secret the decoded document does not
+// show: its payload has a member named "opening" in any letter case at any
+// depth, repeats a member name in any object (the decoded document keeps only
+// one of the repeats, so a configured secret member or an opening in the other
+// would go unseen), or cannot be read. The
 // resolver decodes the payload into maps before the advertisement is checked,
 // and a map drops a repeated member, so the check of the decoded document
 // cannot see what the original payload still holds; the JWT is scanned on its
@@ -508,8 +543,8 @@ func SignedMetadataMayCarryOpening(token string) bool {
 	if err != nil {
 		return true
 	}
-	found, _, err := scanMemberNames(payload, "opening")
-	return err != nil || found
+	found, _, duplicate, err := walkMembers(payload, "opening")
+	return err != nil || found || duplicate
 }
 
 // errAmbiguousAuxClaim: the payload has the auxiliary_data member more than

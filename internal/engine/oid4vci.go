@@ -1183,7 +1183,7 @@ func (h *OID4VCIHandler) issueCredential(ctx context.Context, metadata *IssuerMe
 		})
 
 		// Poll for deferred credential
-		deferredResp, err := h.pollDeferredCredential(ctx, metadata, token, credential.TransactionID, credential.Interval, credential.ResponseEncryption)
+		deferredResp, err := h.pollDeferredCredential(ctx, metadata, token, credential.TransactionID, credential.Interval, credential.ResponseEncryption, selectedConfig)
 		if err != nil {
 			h.Logger.Debug("deferred polling failed", zap.Error(err))
 			_ = h.Error(StepDeferred, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
@@ -2476,7 +2476,11 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 		if credType == "" {
 			credType = config.Doctype
 		}
-		if credType == "" {
+		// The type is what the wallet derives a commitment from, so it is
+		// needed only for an entry type the wallet recognises; an entry of an
+		// unrecognised type is ignored (Auxiliary Data: recipients ignore
+		// types they do not know) and must not stop ordinary proof generation.
+		if credType == "" && delivery.toIssuerRecognised {
 			return nil, nil, errors.New("issuer advertises auxiliary data for the issuer but the credential configuration has no vct or doctype")
 		}
 		params.AuxiliaryDataToIssuer = delivery.toIssuer
@@ -2877,7 +2881,12 @@ var (
 // deferred request asks for the same (OID4VCI 1.0 §9.1), and an encrypted
 // answer goes to the client exactly like the first response, with
 // deferred=true.
-func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, transactionID string, interval int, respEnc *responseEncryption) (*CredentialResponse, error) {
+func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, transactionID string, interval int, respEnc *responseEncryption, config *CredentialConfig) (*CredentialResponse, error) {
+	// A request that carried auxiliary data may be answered with text that
+	// echoes a commitment: then neither the body nor the description is logged
+	// or returned, only the status and the OAuth error code.
+	quiet := config != nil && len(config.AuxiliaryDataSupported) > 0
+
 	// Determine deferred endpoint (OpenID4VCI spec: {credential_issuer}/deferred_credential or from metadata)
 	deferredEndpoint := strings.TrimSuffix(metadata.CredentialIssuer, "/") + "/deferred_credential"
 
@@ -3021,12 +3030,19 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 
 		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
 			// Non-retryable errors
+			if quiet {
+				return nil, fmt.Errorf("deferred credential request failed with status %d: %w", resp.StatusCode, oauthErrorCodeOnly(resp.StatusCode, body))
+			}
 			return nil, fmt.Errorf("deferred credential request failed with status %d: %s", resp.StatusCode, string(body))
 
 		default:
-			h.Logger.Warn("Unexpected deferred response status",
-				zap.Int("status", resp.StatusCode),
-				zap.String("body", string(body)))
+			if quiet {
+				h.Logger.Warn("Unexpected deferred response status", zap.Int("status", resp.StatusCode))
+			} else {
+				h.Logger.Warn("Unexpected deferred response status",
+					zap.Int("status", resp.StatusCode),
+					zap.String("body", string(body)))
+			}
 			continue // Retry on unexpected responses
 		}
 	}

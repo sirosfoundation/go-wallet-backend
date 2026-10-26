@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -680,6 +681,55 @@ func TestCredentialErrorTextNotLoggedWithAuxiliaryData(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The same policy holds for deferred polling: an error or an unexpected answer
+// that echoes a commitment is neither returned nor logged when the credential
+// carries auxiliary data, and is still returned for one that does not.
+func TestDeferredPollingErrorTextNotLoggedWithAuxiliaryData(t *testing.T) {
+	const echo = "COMMITMENT-ECHO-Zm9vYmFy"
+	for name, status := range map[string]int{"400": 400, "unexpected 500": 500} {
+		for _, withAux := range []bool{true, false} {
+			t.Run(fmt.Sprintf("%s/aux=%v", name, withAux), func(t *testing.T) {
+				fastDeferredPolling(t)
+				st := newIssuerStub(t, `{"credential":"c"}`)
+				st.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.WriteHeader(status)
+					_, _ = w.Write([]byte(`{"error":"invalid_transaction_id","error_description":"the commitment ` + echo + ` is wrong"}`))
+				})
+				fc := &fakeClient{t: t}
+				h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
+				defer cleanup()
+				cfg := &CredentialConfig{Format: "x"}
+				if withAux {
+					cfg = auxCfg(auxAdvFull)
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+				defer cancel()
+				_, err := h.pollDeferredCredential(ctx, st.metadata(nil), tokenBearer(), "tx", 0, nil, cfg)
+				require.Error(t, err)
+				if withAux {
+					assert.NotContains(t, err.Error(), echo)
+					assert.NotContains(t, logDump(logs), echo)
+				} else if status == 400 {
+					assert.Contains(t, err.Error(), echo, "without auxiliary data the existing behaviour is unchanged")
+				}
+			})
+		}
+	}
+}
+
+// An optional entry of a type the wallet does not recognise must not stop
+// ordinary proof generation for a configuration without vct or doctype.
+func TestGenerateProof_UnrecognisedToIssuerNeedsNoCredentialType(t *testing.T) {
+	st := newIssuerStub(t, `{"credential":"c"}`)
+	fc := &fakeClient{t: t}
+	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
+	defer cleanup()
+	cfg := auxCfg(`{"to_issuer":[{"type":"https://issuer.example/optional"}]}`)
+	cfg.VCT, cfg.Doctype = "", ""
+	require.NoError(t, h.issueCredential(context.Background(), st.metadata(nil), tokenBearer(), "cfg", cfg, nil, ""))
+	assert.NotEmpty(t, st.requests)
 }
 
 // A body that fails mid-read is neither logged, classified nor retried.
