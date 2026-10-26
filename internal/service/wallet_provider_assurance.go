@@ -190,6 +190,11 @@ func (s *WalletProviderService) fido2EvidenceFor(ctx context.Context, thumbprint
 				return nil
 			}
 		}
+		// Only FIDO2 records are fido2 evidence; a record of another kind
+		// (instance-key evidence from later stages) is not.
+		if fido2VerifiedFromRecord(rec) == nil {
+			return nil
+		}
 		if i == 0 {
 			aaguid = rec.AAGUID
 		} else if rec.AAGUID != aaguid {

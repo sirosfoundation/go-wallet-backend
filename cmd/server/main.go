@@ -118,6 +118,9 @@ func main() {
 		if err := assurance.CheckConfig(backendCfg.WalletProvider.Attestation.Assurance); err != nil {
 			logger.Fatal("Invalid assurance policy", zap.Error(err))
 		}
+		if err := service.CheckAndroidKeyAttestationConfig(backendCfg.WalletProvider.Attestation.AndroidKeyAttestation); err != nil {
+			logger.Fatal("Invalid android key attestation configuration", zap.Error(err))
+		}
 	}
 
 	checkPKCS11Support(backendCfg, logger)

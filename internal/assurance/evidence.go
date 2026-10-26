@@ -12,7 +12,11 @@ import (
 // removed or reordered: positional matching means rules written against an
 // older order silently stop matching. It is surfaced in startup logs, the
 // audit line and the policy info metric.
-const SchemaVersion = 1
+//
+// Version 2 appended the verified instance_key slot after hsm. Appending
+// keeps rules written against version 1 matching: a rule lists a prefix of
+// the slots and queries may carry trailing elements.
+const SchemaVersion = 2
 
 // UVPresent is the Fido2Verified.UV value for proven user verification.
 const UVPresent = "present"
@@ -54,6 +58,33 @@ type HSMVerified struct {
 	ID string
 }
 
+// InstanceKeyVerified is what the backend verified about the wallet's
+// INSTANCE key (the WIA PoP key) from per-key evidence about that very key
+// (domain.KeyAttestationRecord looked up by the key's thumbprint). It is KEY
+// evidence about the instance key, not about credential keys: no shipped rule
+// derives a credential key's level from it. Empty fields render none.
+type InstanceKeyVerified struct {
+	// Kind is the evidence family (fido2, android_key, app_attest_assertion).
+	Kind string
+	// Home is where the evidence puts the key (strongbox, tee,
+	// secure_enclave_asserted, fido2_hw, hsm).
+	Home string
+	// Level is the security level the evidence reports.
+	Level string
+	// Boot is the verified boot state the evidence reports.
+	Boot string
+	// Binding is how the evidence is bound to the key: BindingAttested (a
+	// certificate chain or attestation object covers the key) or
+	// BindingAssertion (an assertion ties the key to an attested device).
+	Binding string
+}
+
+// Binding values of InstanceKeyVerified.Binding.
+const (
+	BindingAttested  = "attested"
+	BindingAssertion = "assertion"
+)
+
 // Claimed is what the client asserted in the request. It is never copied
 // into the verified group. Empty strings render none.
 type Claimed struct {
@@ -68,7 +99,10 @@ type Evidence struct {
 	Fido2    *Fido2Verified
 	Platform *PlatformVerified
 	HSM      *HSMVerified
-	Claimed  Claimed
+	// InstanceKey is the verified evidence about the instance key; only the
+	// WIA path fills it. Nothing derived from Claimed can reach it.
+	InstanceKey *InstanceKeyVerified
+	Claimed     Claimed
 }
 
 // atom builds an atom from untrusted text. Empty or over-long values become
@@ -92,7 +126,8 @@ func field(tag, v string) *sexp.List { return sexp.NewList(tag, atom(v)) }
 //	  (verified
 //	    (fido2 (mds3 trusted|none)(aaguid X)(uv present|none)(cert C))
 //	    (platform (source S)(app_id A))
-//	    (hsm (id I)))
+//	    (hsm (id I))
+//	    (instance_key (kind K)(home H)(level L)(boot B)(binding attested|assertion)))
 //	  (claimed (plugin P)(key_storage T)(user_authentication T)(certification C)))
 //
 // An absent verified slot is (slot none). Every slot is always emitted:
@@ -123,8 +158,22 @@ func (e Evidence) Element() *sexp.List {
 	if e.HSM != nil {
 		hsm = sexp.NewList("hsm", field("id", e.HSM.ID))
 	}
+	instanceKey := sexp.NewList("instance_key", sexp.NewAtom(None))
+	if e.InstanceKey != nil {
+		binding := None
+		if e.InstanceKey.Binding == BindingAttested || e.InstanceKey.Binding == BindingAssertion {
+			binding = e.InstanceKey.Binding
+		}
+		instanceKey = sexp.NewList("instance_key",
+			field("kind", e.InstanceKey.Kind),
+			field("home", e.InstanceKey.Home),
+			field("level", e.InstanceKey.Level),
+			field("boot", e.InstanceKey.Boot),
+			field("binding", binding),
+		)
+	}
 	return sexp.NewList("evidence",
-		sexp.NewList("verified", fido2, platform, hsm),
+		sexp.NewList("verified", fido2, platform, hsm, instanceKey),
 		sexp.NewList("claimed",
 			field("plugin", e.Claimed.Plugin),
 			field("key_storage", e.Claimed.KeyStorage),

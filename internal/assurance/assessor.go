@@ -98,7 +98,10 @@ type Facts struct {
 	Fido2    *Fido2Verified
 	Platform *PlatformVerified
 	HSM      *HSMVerified
-	Claims   Claims
+	// InstanceKey is verified evidence about the WIA instance key; set by the
+	// WIA path only (key attestation leaves it nil: K and S are orthogonal).
+	InstanceKey *InstanceKeyVerified
+	Claims      Claims
 }
 
 // DimensionResult is the outcome for key_storage or user_authentication.
@@ -246,7 +249,7 @@ func (a *Assessor) Evidence(f Facts) Evidence {
 	_, ksAtom, _ := a.claimIndex(a.ks, f.Claims.KeyStorage)
 	_, uaAtom, _ := a.claimIndex(a.ua, f.Claims.UserAuthentication)
 	return Evidence{
-		Fido2: f.Fido2, Platform: f.Platform, HSM: f.HSM,
+		Fido2: f.Fido2, Platform: f.Platform, HSM: f.HSM, InstanceKey: f.InstanceKey,
 		Claimed: Claimed{
 			Plugin:             f.Claims.Plugin,
 			KeyStorage:         ksAtom,
