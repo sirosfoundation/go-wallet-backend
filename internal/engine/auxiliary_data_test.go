@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -48,7 +49,6 @@ func TestAuxiliaryDataSupported_Valid(t *testing.T) {
 	d, err := secretDeliveryOf(auxCfg(auxAdvFull))
 	require.NoError(t, err)
 	assert.True(t, d.requireEncryption)
-	assert.True(t, d.requiredToIssuer)
 	require.Len(t, d.toIssuer, 1)
 	assert.JSONEq(t, auxToIssuerPSC, string(d.toIssuer[0]))
 
@@ -56,14 +56,12 @@ func TestAuxiliaryDataSupported_Valid(t *testing.T) {
 	d, err = secretDeliveryOf(auxCfg(`{"to_issuer":[{"type":"hash_commitment","alg":"sha-256","path":["a","b"]}]}`))
 	require.NoError(t, err)
 	assert.False(t, d.requireEncryption)
-	assert.False(t, d.requiredToIssuer)
 	assert.Len(t, d.toIssuer, 1)
 
 	// An unrecognised type is ignored, not an error, and carries no secret.
 	d, err = secretDeliveryOf(auxCfg(`{"to_wallet":[{"type":"https://x.example/t","foo":1}],"to_issuer":[{"type":"https://x.example/t","required":true}]}`))
 	require.NoError(t, err)
 	assert.False(t, d.requireEncryption)
-	assert.True(t, d.requiredToIssuer)
 	assert.JSONEq(t, `{"type":"https://x.example/t","required":true}`, string(d.toIssuer[0]))
 
 	// Path elements may be strings, nulls and non-negative integers.
@@ -270,18 +268,16 @@ func TestGenerateProof_NoToIssuerNoField(t *testing.T) {
 	assert.NotContains(t, generateProofParams(t, fc), "auxiliary_data_to_issuer")
 }
 
-func TestRequiredToIssuerWithoutProofTypeRefused(t *testing.T) {
-	h, ch, cleanup := captureHandler(t)
+// A required to_issuer entry with no proof type declared is not the engine's to
+// refuse: the request goes out and the issuer, which owns the rule, refuses it.
+func TestRequiredToIssuerWithoutProofTypeLeftToIssuer(t *testing.T) {
+	st := newIssuerStub(t, `{"credential":"c"}`)
+	fc := &fakeClient{t: t}
+	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
-	noProof := &CredentialConfig{Format: "x", AuxiliaryDataSupported: json.RawMessage(`{"to_issuer":[` + auxToIssuerPSC + `]}`)}
-	require.Error(t, h.checkRequiredAuxiliaryDataNeedsProof(noProof))
-	assert.JSONEq(t, `"flow_error"`, string(nextMsg(t, ch)["type"]))
-
-	// Optional entry, or a proof type present: fine.
-	optional := &CredentialConfig{Format: "x", AuxiliaryDataSupported: json.RawMessage(`{"to_issuer":[{"type":"hash_commitment","alg":"sha-256","path":["a"]}]}`)}
-	require.NoError(t, h.checkRequiredAuxiliaryDataNeedsProof(optional))
-	withProof := auxCfg(`{"to_issuer":[` + auxToIssuerPSC + `]}`)
-	require.NoError(t, h.checkRequiredAuxiliaryDataNeedsProof(withProof))
+	cfg := &CredentialConfig{Format: "x", VCT: "urn:v", AuxiliaryDataSupported: json.RawMessage(`{"to_issuer":[` + auxToIssuerPSC + `]}`)}
+	require.NoError(t, h.issueCredential(context.Background(), st.metadata(nil), tokenBearer(), "cfg", cfg, nil, ""))
+	assert.NotEmpty(t, st.requests, "the issuer, not the engine, decides")
 }
 
 func conflictStub(t *testing.T, body string, dpopNonce bool) (*issuerStub, *int) {
@@ -444,12 +440,9 @@ func validAuxClaim(t *testing.T, advertised []json.RawMessage, seed byte) []map[
 	return out
 }
 
-func TestVerifyProofsCarryAuxiliaryData(t *testing.T) {
-	adv := []json.RawMessage{
-		json.RawMessage(auxToIssuerPSC), // required
-		json.RawMessage(`{"type":"hash_commitment","alg":"sha-256","path":["n","opt"]}`),
-	}
-	good := func() []map[string]interface{} { return validAuxClaim(t, adv[:1], 1) }
+func TestCheckProofsForwardNoOpening(t *testing.T) {
+	adv := []json.RawMessage{json.RawMessage(auxToIssuerPSC)}
+	good := func() []map[string]interface{} { return validAuxClaim(t, adv, 1) }
 	proofs := func(claims ...interface{}) []ProofObject {
 		var ps []ProofObject
 		for _, c := range claims {
@@ -457,79 +450,74 @@ func TestVerifyProofsCarryAuxiliaryData(t *testing.T) {
 		}
 		return ps
 	}
-	with := func(f func(e map[string]interface{})) []map[string]interface{} {
+	entry := func(f func(e map[string]interface{})) []map[string]interface{} {
 		c := good()
 		f(c[0])
 		return c
 	}
 
-	ok := map[string]struct {
-		proofs []ProofObject
-	}{
-		"valid, one proof":           {proofs(good())},
-		"valid, same value in all":   {proofs(good(), good(), good())},
-		"optional entry present":     {proofs(validAuxClaim(t, adv, 1))},
-		"unknown extra entry":        {proofs(append(good(), map[string]interface{}{"type": "https://x.example/t", "foo": 1}))},
-		"member order is irrelevant": {proofs(good(), []map[string]interface{}{{"commitment": good()[0]["commitment"], "path": good()[0]["path"], "alg": "sha-256", "type": "hash_commitment"}})},
-	}
-	for name, c := range ok {
-		t.Run("ok/"+name, func(t *testing.T) {
-			require.NoError(t, verifyProofsCarryAuxiliaryData(c.proofs, adv))
-		})
-	}
-	// Optional only, nothing sent: fine.
-	require.NoError(t, verifyProofsCarryAuxiliaryData(proofs(nil, nil), adv[1:]))
-	// Nothing advertised: nothing to check, even for non-JWT test proofs.
-	require.NoError(t, verifyProofsCarryAuxiliaryData([]ProofObject{{ProofType: "jwt", JWT: "proof-0"}}, nil))
-
-	bad := map[string][]ProofObject{
+	// Acceptance rules are the issuer's: none of these is the engine's to
+	// refuse, whether or not to_issuer is advertised.
+	left := map[string][]ProofObject{
+		"valid":                       proofs(good()),
 		"no claim":                    proofs(nil),
 		"empty claim":                 proofs([]interface{}{}),
-		"claim not an array":          proofs("x"),
-		"required missing, unknown":   proofs([]map[string]interface{}{{"type": "https://x.example/t"}}),
-		"wrong type":                  proofs(with(func(e map[string]interface{}) { e["type"] = "other" })),
-		"wrong alg":                   proofs(with(func(e map[string]interface{}) { e["alg"] = "sha-512" })),
-		"wrong path":                  proofs(with(func(e map[string]interface{}) { e["path"] = []string{"n", "xxx"} })),
-		"missing in second proof":     proofs(good(), nil),
-		"differing values":            proofs(good(), validAuxClaim(t, adv[:1], 2)),
-		"differing extra entries":     proofs(good(), append(good(), map[string]interface{}{"type": "https://x.example/t"})),
-		"commitment missing":          proofs(with(func(e map[string]interface{}) { delete(e, "commitment") })),
-		"commitment wrong length":     proofs(with(func(e map[string]interface{}) { e["commitment"] = "AAAA" })),
-		"commitment padded":           proofs(with(func(e map[string]interface{}) { e["commitment"] = good()[0]["commitment"].(string) + "=" })),
-		"commitment not a string":     proofs(with(func(e map[string]interface{}) { e["commitment"] = 7 })),
-		"opening instead":             proofs(with(func(e map[string]interface{}) { e["opening"] = "x" })),
+		"wrong alg":                   proofs(entry(func(e map[string]interface{}) { e["alg"] = "sha-512" })),
+		"unlisted path":               proofs(entry(func(e map[string]interface{}) { e["path"] = []string{"n", "xxx"} })),
+		"commitment wrong length":     proofs(entry(func(e map[string]interface{}) { e["commitment"] = "AAAA" })),
+		"commitment missing":          proofs(entry(func(e map[string]interface{}) { delete(e, "commitment") })),
 		"duplicate entry":             proofs(append(good(), good()...)),
-		"optional with wrong alg":     proofs(append(good(), map[string]interface{}{"type": "hash_commitment", "alg": "sha-512", "path": []string{"n", "opt"}, "commitment": good()[0]["commitment"]})),
-		"unadvertised opening":        proofs(append(good(), map[string]interface{}{"type": "hash_commitment", "alg": "sha-256", "path": []string{"n", "other"}, "opening": "SECRET"})),
-		"unadvertised bad commitment": proofs(append(good(), map[string]interface{}{"type": "hash_commitment", "alg": "sha-256", "path": []string{"n", "other"}, "commitment": "AAAA"})),
-		"unadvertised no path":        proofs(append(good(), map[string]interface{}{"type": "hash_commitment", "alg": "sha-256", "commitment": good()[0]["commitment"]})),
-		"unadvertised no alg":         proofs(append(good(), map[string]interface{}{"type": "hash_commitment", "path": []string{"n", "z"}, "commitment": good()[0]["commitment"]})),
-		"not a JWT":                   {{ProofType: "jwt", JWT: "proof-0"}},
-		"attestation w/o claim":       {{ProofType: "attestation", Attestation: auxProofJWT(t, nil)}},
-		"unknown proof type":          {{ProofType: "di_vp"}},
-		"no proofs":                   nil,
+		"required missing":            proofs([]map[string]interface{}{{"type": "https://x.example/t"}}),
+		"proofs carry different data": proofs(good(), nil),
+		"entry without type":          proofs([]map[string]interface{}{{"path": []string{"a"}}}),
 	}
-	for name, ps := range bad {
-		t.Run("bad/"+name, func(t *testing.T) {
-			err := verifyProofsCarryAuxiliaryData(ps, adv)
+	for name, ps := range left {
+		for _, inspect := range []bool{true, false} {
+			t.Run(fmt.Sprintf("left to issuer/%s/inspect=%v", name, inspect), func(t *testing.T) {
+				require.NoError(t, checkProofsForwardNoOpening(ps, inspect))
+			})
+		}
+	}
+	require.NoError(t, checkProofsForwardNoOpening(nil, true))
+	require.NoError(t, checkProofsForwardNoOpening([]ProofObject{{ProofType: "attestation", Attestation: auxProofJWT(t, good())}}, true))
+
+	// The engine's own rule: no opening is ever forwarded, advertised path or not.
+	withOpening := map[string][]ProofObject{
+		"opening instead of commitment": proofs(entry(func(e map[string]interface{}) { e["opening"] = "SECRET" })),
+		"opening on an unlisted path": proofs(append(good(), map[string]interface{}{
+			"type": "hash_commitment", "alg": "sha-256", "path": []string{"n", "other"}, "opening": "SECRET"})),
+		"opening in the second proof": proofs(good(), entry(func(e map[string]interface{}) { e["opening"] = "SECRET" })),
+		"opening in an attestation":   {{ProofType: "attestation", Attestation: auxProofJWT(t, entry(func(e map[string]interface{}) { e["opening"] = "SECRET" }))}},
+	}
+	for name, ps := range withOpening {
+		for _, inspect := range []bool{true, false} {
+			t.Run(fmt.Sprintf("opening/%s/inspect=%v", name, inspect), func(t *testing.T) {
+				err := checkProofsForwardNoOpening(ps, inspect)
+				require.Error(t, err)
+				assert.ErrorIs(t, err, errAuxiliaryDataProof)
+				assert.NotContains(t, err.Error(), "SECRET")
+			})
+		}
+	}
+
+	// A proof the engine cannot inspect: refused when it promised to look
+	// (to_issuer advertised), left to the issuer's proof verification otherwise.
+	uninspectable := map[string][]ProofObject{
+		"not a JWT":                  {{ProofType: "jwt", JWT: "proof-0"}},
+		"payload not base64url":      {{ProofType: "jwt", JWT: "a.!!.c"}},
+		"unknown proof type":         {{ProofType: "di_vp"}},
+		"claim not an array":         proofs("x"),
+		"claim an array of non-objs": proofs([]interface{}{5}),
+	}
+	for name, ps := range uninspectable {
+		t.Run("uninspectable/"+name, func(t *testing.T) {
+			err := checkProofsForwardNoOpening(ps, true)
 			require.Error(t, err)
 			assert.ErrorIs(t, err, errAuxiliaryDataProof)
-			assert.NotContains(t, err.Error(), good()[0]["commitment"].(string))
 		})
 	}
-	// Attestation proofs are checked like JWTs.
-	require.NoError(t, verifyProofsCarryAuxiliaryData([]ProofObject{{ProofType: "attestation", Attestation: auxProofJWT(t, good())}}, adv))
-}
-
-// Non-required entries absent from every proof are fine, but a differing claim
-// between proofs is not even then.
-func TestVerifyProofsOptionalOnly(t *testing.T) {
-	adv := []json.RawMessage{json.RawMessage(`{"type":"hash_commitment","alg":"sha-256","path":["n","opt"]}`)}
-	a := validAuxClaim(t, adv, 1)
-	require.NoError(t, verifyProofsCarryAuxiliaryData([]ProofObject{{ProofType: "jwt", JWT: auxProofJWT(t, a)}, {ProofType: "jwt", JWT: auxProofJWT(t, a)}}, adv))
-	require.Error(t, verifyProofsCarryAuxiliaryData([]ProofObject{{ProofType: "jwt", JWT: auxProofJWT(t, a)}, {ProofType: "jwt", JWT: auxProofJWT(t, nil)}}, adv))
-	// An empty auxiliary_data array is prohibited even when nothing is required.
-	require.Error(t, verifyProofsCarryAuxiliaryData([]ProofObject{{ProofType: "jwt", JWT: auxProofJWT(t, []interface{}{})}}, adv))
+	require.NoError(t, checkProofsForwardNoOpening(uninspectable["not a JWT"], false))
+	require.NoError(t, checkProofsForwardNoOpening(uninspectable["unknown proof type"], false))
 }
 
 func TestGenerateProof_CarriesCredentialTypeAndIssuer(t *testing.T) {
@@ -572,11 +560,14 @@ func TestGenerateProof_CarriesCredentialTypeAndIssuer(t *testing.T) {
 	require.Error(t, h2.issueCredential(context.Background(), st2.metadata(nil), tokenBearer(), "cfg", noType, nil, ""))
 }
 
-// A client that omits a required entry fails the flow with its own code, and
+// A client that returns an opening fails the flow with its own code, and
 // nothing reaches the issuer.
-func TestIssuance_RequiredAuxiliaryDataMissingFailsClosed(t *testing.T) {
+func TestIssuance_OpeningInProofFailsClosed(t *testing.T) {
 	st := newIssuerStub(t, `{"credential":"c"}`)
-	fc := &fakeClient{t: t, proofMaker: func(int, *SignRequestMessage) string { return auxProofJWT(t, nil) }}
+	adv := []json.RawMessage{json.RawMessage(auxToIssuerPSC)}
+	claim := validAuxClaim(t, adv, 1)
+	claim[0]["opening"] = "SECRET"
+	fc := &fakeClient{t: t, proofMaker: func(int, *SignRequestMessage) string { return auxProofJWT(t, claim) }}
 	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
 	cfg := auxCfg(`{"to_issuer":[` + auxToIssuerPSC + `]}`)

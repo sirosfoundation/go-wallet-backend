@@ -1099,11 +1099,6 @@ func (h *OID4VCIHandler) issueCredential(ctx context.Context, metadata *IssuerMe
 	if err != nil {
 		return err
 	}
-	// A required to_issuer entry can only travel in a key proof: with no proof
-	// type declared the request would bypass it, so refuse (fail closed).
-	if err := h.checkRequiredAuxiliaryDataNeedsProof(selectedConfig); err != nil {
-		return err
-	}
 	var credential *CredentialResponse
 	for retries := 0; retries <= 1; retries++ {
 		var proofs []ProofObject
@@ -2509,7 +2504,7 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 		}
 	}
 
-	if err := verifyProofsCarryAuxiliaryData(resp.Proofs, delivery.toIssuer); err != nil {
+	if err := checkProofsForwardNoOpening(resp.Proofs, len(delivery.toIssuer) > 0); err != nil {
 		return nil, nil, err
 	}
 
@@ -3189,16 +3184,4 @@ func (h *OID4VCIHandler) relayAuxiliaryDataConflict(resp *http.Response) error {
 	_ = resp.Body.Close()
 	resp.Body = io.NopCloser(bytes.NewReader(body))
 	return nil
-}
-
-// checkRequiredAuxiliaryDataNeedsProof fails the flow when the configuration
-// has a required to_issuer entry but declares no proof type to carry it:
-// sending a credential request without it would bypass the issuer's rule.
-func (h *OID4VCIHandler) checkRequiredAuxiliaryDataNeedsProof(config *CredentialConfig) error {
-	d, _ := secretDeliveryOf(config) // a malformed advertisement was refused at negotiation
-	if !d.requiredToIssuer || h.needsProof(config) {
-		return nil
-	}
-	_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
-	return errors.New("issuer requires auxiliary data in key proofs but declares no proof type to carry it")
 }

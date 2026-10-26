@@ -721,18 +721,19 @@ credential_configurations_supported[cfg].auxiliary_data_supported
   params, with the same names, types and meaning, as the holder commitment
   (`psc`) request of go-wallet-backend#468; a configuration with neither `vct`
   nor `doctype` fails the flow.
-- The engine checks the returned proofs before anything is sent to the issuer.
-  Every proof must be a JWT (or a key attestation JWT) whose body has an
-  `auxiliary_data` array in which each advertised `required: true` entry appears
-  with the same `type`, `alg` and `path`; a `hash_commitment` entry holds a
-  `commitment` of canonical unpadded base64url with the output length of `alg`
-  (32 bytes for `sha-256`) and no `opening`; no two entries share a type and
-  path; an entry for an advertised (type, path) agrees on `alg`; and the whole
-  claim is identical across the proofs of the request. Unknown extra entries and
-  absent optional entries are accepted. Any violation fails the flow with
-  `AUXILIARY_DATA_PROOF_INVALID`, step `requesting_credential`, and no request
-  reaches the issuer. The engine only compares and validates structure; it never
-  logs or returns a commitment value.
+- The engine does not judge whether the returned `auxiliary_data` is acceptable:
+  that the proofs carry identical entries, that each entry matches an advertised
+  `to_issuer` entry by `path` and `alg`, the commitment length, and that every
+  `required: true` entry is sent are rules of Credential Auxiliary Data section
+  6.4 that the issuer owns and enforces (and answers with `invalid_proof`). The
+  engine checks one thing of its own before a proof is forwarded: no
+  `hash_commitment` entry carries an `opening`, a secret the engine must never
+  relay. When the issuer advertised `to_issuer` entries the engine also refuses a
+  proof it cannot inspect (a type other than `jwt` or `attestation`, an unreadable
+  JWT, an `auxiliary_data` claim that is not an array of objects). A violation
+  fails the flow with `AUXILIARY_DATA_PROOF_INVALID`, step `requesting_credential`,
+  and no request reaches the issuer. The engine never logs or returns a
+  commitment or opening value.
 
 If the credential endpoint answers HTTP 400 with the OAuth error code
 `auxiliary_data_conflict` (an entry conflicts with a value the issuer holds for
@@ -1084,7 +1085,7 @@ Server → Client:
 | `AUTHORIZATION_FAILED` | OAuth authorization flow failed |
 | `TOKEN_ERROR` | Token endpoint returned error |
 | `CREDENTIAL_ERROR` | Credential endpoint returned error |
-| `AUXILIARY_DATA_PROOF_INVALID` | The key proofs do not carry the issuer's required `auxiliary_data` entries correctly; nothing was sent to the issuer |
+| `AUXILIARY_DATA_PROOF_INVALID` | A key proof carries an `opening`, or cannot be inspected for one while the issuer advertised `to_issuer` entries; nothing was sent to the issuer |
 | `AUXILIARY_DATA_CONFLICT` | Issuer rejected the credential request with `auxiliary_data_conflict`; `error.details.error` carries that code |
 | `SIGN_TIMEOUT` | Client did not respond to sign request |
 | `SIGN_ERROR` | Client signature was invalid |

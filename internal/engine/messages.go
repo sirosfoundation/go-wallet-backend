@@ -127,9 +127,9 @@ const (
 	// The flow_error details carry the issuer's code unchanged under "error";
 	// no other issuer text is relayed.
 	ErrCodeAuxiliaryDataConflict ErrorCode = "AUXILIARY_DATA_CONFLICT"
-	// ErrCodeAuxiliaryDataProofInvalid: the key proofs the client returned do
-	// not carry the issuer's required auxiliary_data entries correctly. Nothing
-	// was sent to the issuer.
+	// ErrCodeAuxiliaryDataProofInvalid: a key proof the client returned carries
+	// an opening (a secret) or cannot be inspected for one. Nothing was sent to
+	// the issuer. Whether the entries are acceptable is the issuer's to decide.
 	ErrCodeAuxiliaryDataProofInvalid ErrorCode = "AUXILIARY_DATA_PROOF_INVALID"
 )
 
@@ -184,7 +184,7 @@ func (c ErrorCode) UserFacingMessage() string {
 	case ErrCodeTooManyRequests:
 		return "Too many requests"
 	case ErrCodeAuxiliaryDataProofInvalid:
-		return "The wallet did not attach the data the issuer requires"
+		return "The wallet's key proof carries auxiliary data that cannot be sent to the issuer"
 	case ErrCodeAuxiliaryDataConflict:
 		return "The issuer holds a conflicting value for you; it must be resolved with the issuer"
 	default:
