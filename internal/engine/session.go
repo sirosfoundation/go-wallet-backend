@@ -1390,17 +1390,17 @@ func (s *Session) SendProgress(flowID string, step FlowStep, payload interface{}
 
 // SendFlowComplete sends a flow completion message
 func (s *Session) SendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string) error {
-	return s.sendFlowComplete(flowID, credentials, redirectURI, "", "", "", nil)
+	return s.sendFlowComplete(flowID, credentials, redirectURI, "", "", "", false, nil)
 }
 
 // SendFlowCompleteWithRefreshToken is SendFlowComplete plus an OID4VCI
 // refresh_token (and the DPoP key it's bound to) to relay to the client -
 // see FlowCompleteMessage.RefreshToken/DPoPJWK.
 func (s *Session) SendFlowCompleteWithRefreshToken(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string, dpopKeyID string) error {
-	return s.sendFlowComplete(flowID, credentials, redirectURI, refreshToken, dpopJWK, dpopKeyID, nil)
+	return s.sendFlowComplete(flowID, credentials, redirectURI, refreshToken, dpopJWK, dpopKeyID, false, nil)
 }
 
-func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string, dpopKeyID string, md *CredentialMetadataRelay) error {
+func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string, dpopKeyID string, responseEncrypted bool, displayMD json.RawMessage) error {
 	s.flowsMu.RLock()
 	flow := s.flows[flowID]
 	s.flowsMu.RUnlock()
@@ -1411,15 +1411,13 @@ func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult
 			FlowID:    flowID,
 			Timestamp: Now(),
 		},
-		Credentials:  credentials,
-		RedirectURI:  redirectURI,
-		RefreshToken: refreshToken,
-		DPoPJWK:      dpopJWK,
-		DPoPKeyID:    dpopKeyID,
-	}
-	if md != nil {
-		msg.CredentialMetadata = md.Metadata
-		msg.CredentialMetadataEncryptedResponse = md.Encrypted
+		Credentials:                 credentials,
+		RedirectURI:                 redirectURI,
+		RefreshToken:                refreshToken,
+		DPoPJWK:                     dpopJWK,
+		DPoPKeyID:                   dpopKeyID,
+		CredentialResponseEncrypted: responseEncrypted,
+		CredentialMetadata:          displayMD,
 	}
 	if flow != nil {
 		flow.mu.RLock()
@@ -1617,24 +1615,31 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 var signResponseTimeout = 3 * time.Minute
 
 // SignError is a sign failure reported by the client, with the client's
-// classification of it.
+// classification of it. The client's text is client-controlled and might echo
+// request or response content (a JWE plaintext, a seed), so it is unexported,
+// Error() never includes it, and it is not serialised if the error is dumped.
+// Callers must not relay ClientText; log it only where the request carried no
+// secret (a presentation refusal), never on the decrypt/relay paths.
 type SignError struct {
-	Message string
-	Code    ErrorCode
+	text string
+	Code ErrorCode
 }
 
+// ClientText is the client's own description of the failure (untrusted).
+func (e *SignError) ClientText() string { return e.text }
+
 func (e *SignError) Error() string {
-	if e.Message == "" {
-		return "client reported a sign failure"
+	if e.Code != "" {
+		return "client failed the sign request (" + string(e.Code) + ")"
 	}
-	return e.Message
+	return "client failed the sign request"
 }
 
 // signResult turns a client-reported sign failure into an error.
 func signResult(resp *SignResponseMessage) (*SignResponseMessage, error) {
 	// A refusal needs no text: the code alone ends the wait.
 	if resp.Error != "" || resp.ErrorCode == ErrCodeSignRefused {
-		return nil, &SignError{Message: resp.Error, Code: resp.ErrorCode}
+		return nil, &SignError{text: resp.Error, Code: resp.ErrorCode}
 	}
 	return resp, nil
 }

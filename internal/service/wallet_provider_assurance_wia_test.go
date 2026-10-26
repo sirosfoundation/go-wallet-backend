@@ -669,3 +669,78 @@ func TestPreview_StaleInstanceIsUnknown(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// Registration ignores a submission that would downgrade stored evidence, so
+// the dry run must answer from the stored record, not from the submission.
+func TestPreview_IgnoredDowngradeAnswersFromStoredRecord(t *testing.T) {
+	aaguid := uuid.MustParse("00000000-0000-0000-0000-0000000000aa")
+	svc, _, keys := previewSvc(t, strings.ReplaceAll(previewRules, "aa1", aaguid.String()), true)
+
+	noUV, tp := fido2Submission(t, aaguid, 0x40|0x01)
+	got, err := svc.PreviewAssurance(context.Background(), &AssurancePreviewRequest{FIDO2: noUV})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UserAuthentication[0] != "iso_18045_basic" {
+		t.Fatalf("without stored evidence the submission decides: %+v", got)
+	}
+
+	// The same key is already stored with UV (what Verify would keep).
+	if err := keys.MarkKeyAttested(context.Background(), &domain.KeyAttestationRecord{KeyThumbprint: tp, AAGUID: aaguid.String(), UV: true, VerifiedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = svc.PreviewAssurance(context.Background(), &AssurancePreviewRequest{FIDO2: noUV})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.UserAuthentication[0] != "iso_18045_moderate" {
+		t.Fatalf("preview reflects a downgrade the store would ignore: %+v", got)
+	}
+}
+
+// Policy disabled: a stored instance-key record that outranks a FIDO2
+// submission becomes the preview's overlay, and the no-JWKS fallback must not
+// treat it as FIDO2 evidence (actual issuance clamps).
+func TestPreview_PolicyDisabledFallbackIgnoresInstanceKeyOverlay(t *testing.T) {
+	svc, _, keys := previewSvc(t, "", true)
+	svc.cfg.WalletProvider.Attestation.Assurance.Enabled = false
+	aaguid := uuid.MustParse("00000000-0000-0000-0000-0000000000aa")
+	sub, tp := fido2Submission(t, aaguid, 0x40|0x04|0x01)
+	req := &AssurancePreviewRequest{FIDO2: sub, SecurityProperties: &SecurityProperties{KeyStorage: []string{"iso_18045_high"}}}
+
+	// Control: with no stored record the FIDO2 submission itself vouches.
+	got, err := svc.PreviewAssurance(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.KeyStorage[0] != "iso_18045_high" {
+		t.Fatalf("control: %+v", got)
+	}
+	// A stored android_key record of equal rank is not superseded by the submission.
+	putRecord(t, keys, domain.KeyAttestationRecord{KeyThumbprint: tp, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox, TenantID: domain.DefaultTenantID})
+	got, err = svc.PreviewAssurance(context.Background(), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.KeyStorage[0] == "iso_18045_high" {
+		t.Fatalf("an instance-key overlay vouched for key storage: %+v", got)
+	}
+}
+
+type failingKeyLookup struct{ storage.KeyAttestationStore }
+
+func (failingKeyLookup) GetByKeyThumbprint(context.Context, string) (*domain.KeyAttestationRecord, error) {
+	return nil, errors.New("database timeout")
+}
+
+// A storage error while reading the stored record must fail the preview, not
+// silently preview the submission as if nothing were stored.
+func TestPreview_StoredEvidenceLookupErrorIsReturned(t *testing.T) {
+	svc, _, keys := previewSvc(t, strings.ReplaceAll(previewRules, "aa1", "00000000-0000-0000-0000-0000000000aa"), true)
+	svc.keyAttestations = failingKeyLookup{keys}
+	sub, _ := fido2Submission(t, uuid.MustParse("00000000-0000-0000-0000-0000000000aa"), 0x40|0x01)
+	got, err := svc.PreviewAssurance(context.Background(), &AssurancePreviewRequest{FIDO2: sub})
+	if err == nil || !strings.Contains(err.Error(), "database timeout") {
+		t.Fatalf("want the lookup error, got %+v, %v", got, err)
+	}
+}

@@ -213,6 +213,13 @@ const (
 	// means it does not, and the engine falls back to its own DPoP key plus
 	// a single SignActionRequestAttestation.
 	SignActionSignClientAuth SignAction = "sign_client_auth"
+	// SignActionDecryptCredentialResponse relays the issuer's encrypted
+	// Credential (or Deferred Credential) Response to the client, which alone
+	// holds the response-encryption key. The client decrypts and keeps the
+	// credentials and the response-level credential_metadata; it answers with
+	// control fields only (transaction_id, interval, credential_count), so the
+	// engine never sees a credential, a seed or the JWE plaintext.
+	SignActionDecryptCredentialResponse SignAction = "decrypt_credential_response"
 )
 
 // Message is the base message envelope for all WebSocket messages
@@ -370,26 +377,6 @@ func (m *FlowStartMessage) Supports(feature string) bool {
 	return false
 }
 
-// CredentialMetadataRelay is a validated response-level credential_metadata
-// and whether the issuer response carrying it was JWE-encrypted.
-type CredentialMetadataRelay struct {
-	Metadata  json.RawMessage
-	Encrypted bool
-}
-
-// Redacted returns a copy of the message with the credential_metadata object
-// (which may hold secrets) removed, together with its encrypted flag. It is
-// meant for event buffering only. It is NOT safe to log: the copy still carries
-// Credentials, RefreshToken and DPoPJWK (a private key); logging requires
-// redacting those as well. Whether a buffered completion message must also
-// drop credentials, the refresh token and the DPoP key is up to the buffering
-// party's replay semantics.
-func (m FlowCompleteMessage) Redacted() FlowCompleteMessage {
-	m.CredentialMetadata = nil
-	m.CredentialMetadataEncryptedResponse = false
-	return m
-}
-
 // authorizationDetailTypeOpenIDCredential is the only `type` OID4VCI 1.0
 // §5.1.1 defines for a credential authorization detail.
 const authorizationDetailTypeOpenIDCredential = "openid_credential"
@@ -466,17 +453,21 @@ type FlowCompleteMessage struct {
 	// The client stores it with RefreshToken and presents it back as
 	// FlowStartMessage.DPoPKeyID on renewal.
 	DPoPKeyID string `json:"dpop_key_id,omitempty"`
-	// CredentialMetadata is the OID4VCI 1.1 response-level credential_metadata
-	// object of the issuer's Credential (or Deferred Credential) Response,
-	// relayed verbatim (compacted) and applying to every credential in
-	// Credentials. Unknown members are preserved. It may carry secrets
-	// (org.siros.secret_seed): never log it, and use Redacted before buffering.
+	// CredentialResponseEncrypted is true when the issuer's response was
+	// encrypted to a key only the client holds. The engine relayed the JWE
+	// without being able to read it, so Credentials carry no credential value
+	// and the response-level credential_metadata (which may hold a secret
+	// seed) is never relayed: the client already holds both from
+	// decrypt_credential_response and pairs Credentials[i] with the i-th
+	// decrypted credential. A count mismatch is an error on the client.
+	CredentialResponseEncrypted bool `json:"credential_response_encrypted,omitempty"`
+	// CredentialMetadata is set only for a PLAIN (unencrypted) issuer
+	// response: the display members (see displayMetadataMembers) of its
+	// response-level credential_metadata, applying to every credential in
+	// Credentials. Every other member, in particular the namespaced
+	// org.siros.secret_seed, is dropped by the engine and never relayed or
+	// logged. Never present when CredentialResponseEncrypted is true.
 	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
-	// CredentialMetadataEncryptedResponse is true only when CredentialMetadata
-	// came in a JWE-encrypted issuer response. Absent alongside a
-	// CredentialMetadata means it arrived as plain TLS-protected JSON (always
-	// the case for deferred issuance), so a client should refuse secret values.
-	CredentialMetadataEncryptedResponse bool `json:"credential_metadata_encrypted_response,omitempty"`
 }
 
 // CredentialNotificationMessage carries an OID4VCI §10 credential lifecycle
@@ -616,6 +607,30 @@ type SignRequestParams struct {
 	// (draft-ietf-oauth-attestation-based-client-auth). Set after an AS rejects
 	// a PAR/token request with `use_attestation_challenge`.
 	AttestationChallenge string `json:"attestation_challenge,omitempty"`
+
+	// CredentialResponseEncryption, on generate_proof, asks the client for a
+	// fresh ephemeral response-encryption key for this request (the engine
+	// negotiated the alg/enc pair from the issuer metadata). The client keeps
+	// the private key, keyed by flow id, and returns the public JWK as
+	// SignResponseMessage.CredentialResponseEncryptionJWK. With no
+	// ProofTypesSupported the request is for the key alone: return no proofs.
+	CredentialResponseEncryption *CredentialResponseEncryptionParams `json:"credential_response_encryption,omitempty"`
+	// JWE is, on decrypt_credential_response, the issuer's compact JWE
+	// (a Credential or Deferred Credential Response), relayed unread.
+	JWE string `json:"jwe,omitempty"`
+	// Deferred is, on decrypt_credential_response, true when the JWE answers a
+	// Deferred Credential Request (always sent, false included).
+	Deferred *bool `json:"deferred,omitempty"`
+}
+
+// CredentialResponseEncryptionParams is the negotiated credential response
+// encryption the engine asks the client to generate a key for. Required means
+// the engine fails the issuance when the client declines (the issuer demands
+// encryption, or advertises org.siros.secret_seed).
+type CredentialResponseEncryptionParams struct {
+	Alg      string `json:"alg"`
+	Enc      string `json:"enc"`
+	Required bool   `json:"required"`
 }
 
 // CredentialRef references a credential for signing
@@ -656,8 +671,23 @@ type SignResponseMessage struct {
 	// given.
 	DPoPKeyID string `json:"dpop_key_id,omitempty"`
 	DPoPProof string `json:"dpop_proof,omitempty"`
-	// Error is set when the client failed the sign request (for WMP, a
-	// wmp.flow.error); RequestSign returns it instead of waiting for a timeout.
+	// CredentialResponseEncryptionJWK answers generate_proof when the request
+	// carried credential_response_encryption: the client's fresh ephemeral
+	// public JWK ({kty:"EC", crv:"P-256", x, y, use:"enc", alg}, kid optional).
+	// Absent or empty means the client declined.
+	CredentialResponseEncryptionJWK json.RawMessage `json:"credential_response_encryption_jwk,omitempty"`
+	// TransactionID, Interval and CredentialCount answer
+	// decrypt_credential_response and are the ONLY things the client reports
+	// from the decrypted response: transaction_id (+ optional interval) when
+	// the issuer deferred issuance, credential_count (the number of
+	// credentials the response held) otherwise. Exactly one of the two.
+	TransactionID   string `json:"transaction_id,omitempty"`
+	Interval        int    `json:"interval,omitempty"`
+	CredentialCount int    `json:"credential_count,omitempty"`
+	// Error reports a client-side failure of the request (for example a JWE
+	// that does not decrypt, or for WMP a wmp.flow.error); RequestSign returns
+	// it instead of waiting for a timeout. The engine never logs or relays its
+	// text, as it is client-controlled and might echo response content.
 	Error string `json:"error,omitempty"`
 	// ErrorCode classifies Error. Two values are acted on:
 	// ErrCodeUnsupportedTransactionData (the client refused the request's
@@ -704,8 +734,10 @@ type ErrorMessage struct {
 
 // CredentialResult represents an issued credential
 type CredentialResult struct {
-	Format       string          `json:"format"`
-	Credential   string          `json:"credential"`
+	Format string `json:"format"`
+	// Credential is empty (and omitted) when the issuer response was encrypted
+	// to the client's key: see FlowCompleteMessage.CredentialResponseEncrypted.
+	Credential   string          `json:"credential,omitempty"`
 	VCT          string          `json:"vct,omitempty"`
 	TypeMetadata json.RawMessage `json:"type_metadata,omitempty"`
 	// NotificationID is the OID4VCI §10 notification identifier returned by the

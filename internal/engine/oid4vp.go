@@ -2716,7 +2716,7 @@ func (h *OID4VPHandler) failSign(ctx context.Context, authReq *AuthorizationRequ
 // may carry the reason for the refusal - an untrusted verifier, a missing
 // thumbprint - which is the wallet's business, so it is only logged here.
 func (h *OID4VPHandler) failSignRefused(ctx context.Context, authReq *AuthorizationRequest, signErr *SignError) {
-	h.Logger.Info("client refused to sign the presentation", zap.String("client_reason", signErr.Message))
+	h.Logger.Info("client refused to sign the presentation", zap.String("client_reason", signErr.ClientText()))
 	if redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", ""); redirectURI != "" {
 		_ = h.ErrorWithDetails(StepSubmittingResponse, ErrCodePresentationError, "User declined the request",
 			map[string]interface{}{"redirect_uri": redirectURI})

@@ -259,7 +259,7 @@ func TestResolveClientAuth_ClientHeld_ResourceRequestCarriesATHOnly(t *testing.T
 
 	metadata := &IssuerMetadata{CredentialEndpoint: srv.URL}
 	token := &TokenResponse{AccessToken: "the-token", TokenType: "DPoP"}
-	_, err := h.requestCredential(context.Background(), metadata, token, "cfg", &CredentialConfig{Format: "dc+sd-jwt"}, nil)
+	_, err := h.requestCredential(context.Background(), metadata, token, "cfg", &CredentialConfig{Format: "dc+sd-jwt"}, nil, nil)
 	require.NoError(t, err)
 
 	assert.Equal(t, "dpop-proof-1", got.Get("DPoP"))

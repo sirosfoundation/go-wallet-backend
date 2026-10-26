@@ -538,23 +538,19 @@ the WebView's volatile `sessionStorage`), HTTP+SSE provides defense in depth:
 #### `credential_metadata` on `wmp.flow.complete` (OpenID4VCI 1.1)
 
 For an OpenID4VCI flow the `wmp.flow.complete` `result` is the engine's
-`FlowCompleteMessage`. Besides `credentials[]` it can carry, as top-level
-members, the OpenID4VCI 1.1 response-level `credential_metadata` object of the
-issuer's Credential (or Deferred Credential) Response, relayed verbatim and
-applying to every credential in `credentials[]`, and
-`credential_metadata_encrypted_response` (`true` only when the issuer response
-was a JWE; absent means plain JSON, always the case for deferred issuance).
-The `org.siros.secret_seed` member (privatedata-spec 5A) is a delivered secret:
-the engine validates it, requires an encrypted response and a `notification_id`,
-and the client must refuse it in a completion that lacks the encrypted flag.
-The object may carry secrets, so it must never be logged. See
-`docs/websocket-protocol-spec.md` for the validation rules.
+`FlowCompleteMessage`. Besides `credentials[]` it can carry
+`credential_response_encrypted` (`true` when the issuer response was a JWE the
+engine relayed without reading; `credentials[]` then carry no credential value
+and no `credential_metadata` is relayed) and, for a plain response only,
+`credential_metadata`: the display members of the issuer's response-level
+object. Every other member, in particular `org.siros.secret_seed`, is dropped by
+the engine and never relayed or logged (a plain response carrying a seed is
+refused). See `docs/websocket-protocol-spec.md` for the rules.
 
 Replay and the event ring. The SSE event buffer (200 events per session,
 `Last-Event-ID` replay and `wmp.session.resume`) never holds the secret members
 of a completion: `credential_metadata` (the whole object, display data included,
-matching `FlowCompleteMessage.Redacted()`), `credential_metadata_encrypted_response`,
-`refresh_token`, `dpop_jwk` and `dpop_key_id`. The completion is delivered in
+as defence in depth), `refresh_token`, `dpop_jwk` and `dpop_key_id`. The completion is delivered in
 full, once, to the SSE connection streaming when it is emitted. The copy retained
 for replay has those members removed, keeps `credentials[]` and everything else,
 and carries a single marker `"redacted_members": [...]` in `result` listing, in
