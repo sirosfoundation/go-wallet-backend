@@ -266,6 +266,7 @@ type IssuerDisplay struct {
 type CredentialConfig struct {
 	Format              string                 `json:"format"`
 	VCT                 string                 `json:"vct,omitempty"`
+	Doctype             string                 `json:"doctype,omitempty"`
 	Scope               string                 `json:"scope,omitempty"`
 	Display             []CredentialDisplay    `json:"display,omitempty"`
 	ProofTypesSupported map[string]interface{} `json:"proof_types_supported,omitempty"`
@@ -314,6 +315,10 @@ func (c *CredentialConfigurations) UnmarshalJSON(data []byte) error {
 		// A malformed org.siros.secret_seed advertisement means the
 		// configuration is not offered (privatedata-spec 5A.3).
 		if present, ok := SecretSeedAdvertisement(cfg.CredentialMetadata); present && !ok {
+			continue
+		}
+		// Likewise for a malformed org.siros.holder_commitments advertisement.
+		if present, _, ok := HolderCommitmentsAdvertisement(cfg.CredentialMetadata); present && !ok {
 			continue
 		}
 		parsed[id] = cfg
@@ -1097,6 +1102,9 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 			nonce = n
 		}
 	}
+	if err := h.checkPSCNeedsProof(selectedConfig); err != nil {
+		return err
+	}
 	var credential *CredentialResponse
 	for retries := 0; retries <= 1; retries++ {
 		var proofs []ProofObject
@@ -1434,6 +1442,10 @@ func (h *OID4VCIHandler) logIgnoredCredentialConfigurations(source map[string]in
 		} else if present, ok := SecretSeedAdvertisement(cfg.CredentialMetadata); present && !ok {
 			// Never log the member: a malformed one may carry seed values.
 			h.Logger.Warn("ignoring credential configuration with a malformed secret seed advertisement",
+				zap.String("credential_configuration_id", id))
+		} else if present, _, ok := HolderCommitmentsAdvertisement(cfg.CredentialMetadata); present && !ok {
+			// Never log the member: a malformed one may carry commitment values.
+			h.Logger.Warn("ignoring credential configuration with a malformed holder commitments advertisement",
 				zap.String("credential_configuration_id", id))
 		}
 	}
@@ -2425,14 +2437,32 @@ func credentialBatchSize(metadata *IssuerMetadata) int {
 func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMetadata, config *CredentialConfig, nonce string, reissuanceKid string) ([]ProofObject, error) {
 	count := credentialBatchSize(metadata)
 
-	resp, err := h.RequestSign(ctx, SignActionGenerateProof, SignRequestParams{
+	params := SignRequestParams{
 		Audience:            metadata.CredentialIssuer,
 		Nonce:               nonce,
 		Issuer:              h.clientID,
 		ProofTypesSupported: config.ProofTypesSupported,
 		Count:               count,
 		ReissuanceKid:       reissuanceKid,
-	})
+	}
+	wantPSC, err := holderCommitmentPSCAdvertised(config)
+	if err != nil {
+		return nil, err
+	}
+	if wantPSC {
+		credType := config.VCT
+		if credType == "" {
+			credType = config.Doctype
+		}
+		if credType == "" {
+			return nil, errors.New("issuer advertises a holder commitment but the credential configuration has no vct or doctype")
+		}
+		params.HolderCommitments = []string{HolderCommitmentPSC}
+		params.CredentialType = credType
+		params.CredentialIssuer = metadata.CredentialIssuer
+	}
+
+	resp, err := h.RequestSign(ctx, SignActionGenerateProof, params)
 	if err != nil {
 		return nil, err
 	}
@@ -2459,6 +2489,11 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 		}
 		if _, ok := config.ProofTypesSupported[proof.ProofType]; !ok {
 			return nil, fmt.Errorf("unsupported proof type %q: not listed in proof_types_supported", proof.ProofType)
+		}
+		if wantPSC {
+			if err := verifyProofCarriesPSC(proof); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -2693,6 +2728,11 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		// Check for DPoP nonce requirement — retry once with server-provided nonce
 		if attempt == 0 && isDPoPNonceError(resp) {
 			h.updateDPoPNonce(resp)
+			// A psc conflict is terminal even when the response also carries a
+			// DPoP-Nonce header: never retry it, never hide it.
+			if conflictErr := h.relayPSCConflict(resp); conflictErr != nil {
+				return nil, conflictErr
+			}
 			_ = resp.Body.Close()
 			continue
 		}
@@ -2702,6 +2742,12 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 			_ = resp.Body.Close()
 			h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+
+			// A holder commitment conflict is a final, user-actionable outcome:
+			// relay it as its own flow error code (never retried).
+			if conflictErr := h.pscConflictError(resp.StatusCode, body); conflictErr != nil {
+				return nil, conflictErr
+			}
 
 			// Check whether the error response contains a refreshed c_nonce so the
 			// caller can re-request proofs and retry. Do NOT send a flow error here —
@@ -3166,4 +3212,203 @@ func credentialToString(cred interface{}) string {
 		b, _ := json.Marshal(v)
 		return string(b)
 	}
+}
+
+// Holder commitments (SIROS extension): the wallet derives a commitment from a
+// per-issuer secret it never shares and puts it in the proof JWT, so the issuer
+// can bind the credential subject to it. The engine only relays the request and
+// verifies the claim is present and well-formed; it never computes or logs it.
+const (
+	holderCommitmentsMember = "org.siros.holder_commitments"
+	// HolderCommitmentPSC is the commitment name SHA-256(private_seed).
+	HolderCommitmentPSC = "psc"
+	// PSCProofClaim is the proof JWT payload claim carrying the psc value.
+	PSCProofClaim = "org.siros.psc"
+	// PSCConflictPrefix starts the error_description of the issuer's 400
+	// response when it already holds a different psc for the subject.
+	PSCConflictPrefix = "org.siros.psc_conflict:"
+
+	maxHolderCommitments       = 4
+	maxHolderCommitmentNameLen = 32
+	maxPSCConflictMessageBytes = 512
+)
+
+var holderCommitmentNameRE = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+
+// validHolderCommitmentName: a short lowercase name that does not look like a
+// hex value (16 or more hex characters), so a value can never pass as a name.
+func validHolderCommitmentName(n string) bool {
+	if n == "" || len(n) > maxHolderCommitmentNameLen || !holderCommitmentNameRE.MatchString(n) {
+		return false
+	}
+	if len(n) >= 16 {
+		allHex := true
+		for _, c := range n {
+			if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+				allHex = false
+				break
+			}
+		}
+		if allHex {
+			return false
+		}
+	}
+	return true
+}
+
+// HolderCommitmentsAdvertisement inspects the credential_metadata of one
+// credential configuration for the org.siros.holder_commitments member. present
+// reports whether the member exists; ok is true only for the valid form
+// {"commitments": [1..4 distinct short names]}. Anything else (extra members,
+// values instead of names, hex-looking strings, wrong counts) is malformed
+// (present && !ok). Unknown but well-formed names are kept in names.
+func HolderCommitmentsAdvertisement(credentialMetadata json.RawMessage) (present bool, names []string, ok bool) {
+	if len(credentialMetadata) == 0 {
+		return false, nil, false
+	}
+	var md map[string]json.RawMessage
+	if json.Unmarshal(credentialMetadata, &md) != nil {
+		return false, nil, false
+	}
+	raw, present := md[holderCommitmentsMember]
+	if !present {
+		return false, nil, false
+	}
+	var adv map[string]json.RawMessage
+	if json.Unmarshal(raw, &adv) != nil || len(adv) != 1 {
+		return true, nil, false
+	}
+	var ns []string
+	if json.Unmarshal(adv["commitments"], &ns) != nil || len(ns) == 0 || len(ns) > maxHolderCommitments {
+		return true, nil, false
+	}
+	seen := make(map[string]struct{}, len(ns))
+	for _, n := range ns {
+		if !validHolderCommitmentName(n) {
+			return true, nil, false
+		}
+		if _, dup := seen[n]; dup {
+			return true, nil, false
+		}
+		seen[n] = struct{}{}
+	}
+	return true, ns, true
+}
+
+// holderCommitmentPSCAdvertised reports whether the configuration advertises
+// the psc commitment. A malformed advertisement returns an error that never
+// includes the offending content.
+func holderCommitmentPSCAdvertised(config *CredentialConfig) (bool, error) {
+	if config == nil {
+		return false, nil
+	}
+	present, names, ok := HolderCommitmentsAdvertisement(config.CredentialMetadata)
+	if present && !ok {
+		return false, fmt.Errorf("issuer metadata %s advertisement is malformed", holderCommitmentsMember)
+	}
+	for _, n := range names {
+		if n == HolderCommitmentPSC {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// verifyProofCarriesPSC checks that a returned proof is a JWT whose payload has
+// org.siros.psc as an unpadded base64url encoding of exactly 32 bytes. Errors
+// never include the value.
+func verifyProofCarriesPSC(proof ProofObject) error {
+	if proof.ProofType != "jwt" || proof.JWT == "" {
+		return errors.New("a holder commitment was requested but the proof is not a JWT")
+	}
+	parts := strings.Split(proof.JWT, ".")
+	if len(parts) != 3 {
+		return errors.New("a holder commitment was requested but the proof is not a compact JWT")
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return errors.New("a holder commitment was requested but the proof payload is not base64url")
+	}
+	var claims map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return errors.New("a holder commitment was requested but the proof payload is not a JSON object")
+	}
+	rawClaim, has := claims[PSCProofClaim]
+	if !has {
+		return fmt.Errorf("a holder commitment was requested but the proof lacks %s", PSCProofClaim)
+	}
+	var val string
+	if json.Unmarshal(rawClaim, &val) != nil {
+		return fmt.Errorf("%s in the proof is not a string", PSCProofClaim)
+	}
+	// Re-encoding must reproduce the input: the decoder ignores CR/LF and
+	// accepts nonzero trailing bits, neither of which is canonical base64url.
+	dec, err := base64.RawURLEncoding.DecodeString(val)
+	if err != nil || len(dec) != 32 || base64.RawURLEncoding.EncodeToString(dec) != val {
+		return fmt.Errorf("%s in the proof is not a 32-byte base64url value", PSCProofClaim)
+	}
+	return nil
+}
+
+// checkPSCNeedsProof fails the flow when the configuration advertises a psc
+// commitment but declares no proof type, since the commitment can only travel
+// in a proof: sending a credential request without it would bypass the binding.
+func (h *OID4VCIHandler) checkPSCNeedsProof(config *CredentialConfig) error {
+	adv, err := holderCommitmentPSCAdvertised(config)
+	if err == nil && adv && !h.needsProof(config) {
+		err = errors.New("issuer advertises a holder commitment but declares no proof type to carry it")
+	}
+	if err != nil {
+		_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+	}
+	return err
+}
+
+// pscConflictError relays the issuer's psc conflict, if body is one, as a
+// PSC_CONFLICT flow error and returns the error to fail the flow with; nil when
+// the response is not a conflict.
+func (h *OID4VCIHandler) pscConflictError(status int, body []byte) error {
+	msg, ok := pscConflictMessage(status, body)
+	if !ok {
+		return nil
+	}
+	_ = h.Error(StepRequestingCredential, ErrCodePSCConflict, msg)
+	return parseOAuthError(status, body)
+}
+
+// relayPSCConflict reads (and closes) the body of a 400 response and relays it
+// as a psc conflict if it is one. Other responses are left for the caller.
+func (h *OID4VCIHandler) relayPSCConflict(resp *http.Response) error {
+	if resp.StatusCode != http.StatusBadRequest {
+		return nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+	if err := h.pscConflictError(resp.StatusCode, body); err != nil {
+		_ = resp.Body.Close()
+		return err
+	}
+	return nil
+}
+
+// pscConflictMessage recognises the issuer's psc conflict response (HTTP 400,
+// error_description starting with PSCConflictPrefix) and returns the issuer's
+// message, control characters removed and length capped.
+func pscConflictMessage(status int, body []byte) (string, bool) {
+	if status != http.StatusBadRequest {
+		return "", false
+	}
+	var e OAuthError
+	if json.Unmarshal(body, &e) != nil || !strings.HasPrefix(e.ErrorDescription, PSCConflictPrefix) {
+		return "", false
+	}
+	msg := strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, e.ErrorDescription)
+	if len(msg) > maxPSCConflictMessageBytes {
+		msg = strings.ToValidUTF8(msg[:maxPSCConflictMessageBytes], "")
+	}
+	return msg, true
 }

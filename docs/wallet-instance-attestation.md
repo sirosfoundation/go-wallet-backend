@@ -10,9 +10,14 @@ See `docs/CONFIGURATION.md`'s `wallet_provider.wia.*` section for the full field
 |----------|---------|
 | `POST /wallet-provider/wia/challenge` | Issues a single-use nonce. The caller signs it into a PoP JWT to prove possession of the attestation key before a WIA is issued for it. |
 | `POST /wallet-provider/wia/generate` | Verifies the challenge PoP, then issues a WIA (`wallet_instance_attestation`) bound to the caller's key. |
+| `POST /wallet-provider/assurance-preview` | Dry run: what a Key Attestation and a WIA would carry for this wallet under the assurance policy. Nothing is stored or issued. See `docs/assurance-policy.md`. |
 | `GET /.well-known/jwks.json` | Serves the wallet provider's own signing public key (`RegisterWalletProviderJWKSRoute`, `internal/service/wallet_provider_jwks.go`). Only registered when a wallet-provider signing key is configured. |
 | `GET /.well-known/oauth-authorization-server` | RFC 8414 metadata pointing at the JWKS above (`issuer` + `jwks_uri`). Only registered in `ietf` mode (see below) with `wallet_provider.wia.issuer` explicitly set - no fallback to `wallet_provider_uri` (see below). |
 | `GET /wallet-provider/status-list` | The Token Status List that every WIA's `client_status` and every KA's `key_storage_status` references (WE BUILD CS-04 §7.1.2/§7.1.3 require those claims). Always served all-VALID: this wallet provider does not revoke through the list — short WIA/KA lifetimes bound exposure instead — so no bit in it is ever set. Turn the claims off with `wallet_provider.attestation.status_list.enabled: false`, at the cost of CS-04 conformance (`RegisterWalletProviderStatusListRoute`, `internal/service/wallet_provider_statuslist.go`). |
+
+## Assurance policy
+
+With `wallet_provider.attestation.assurance.enabled`, the backend's policy decides whether a WIA is issued (`403 WIA_REFUSED_BY_POLICY` otherwise), which S profile `attestation_source` carries, and which `wallet_solution_certification_information` applies. See `docs/assurance-policy.md`. Disabled (the default), WIAs are issued exactly as described here.
 
 ## Two identity formats: x5c vs. `iss`-based
 
