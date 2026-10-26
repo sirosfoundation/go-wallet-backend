@@ -52,6 +52,20 @@ var (
 		Help:      "Total number of WIA generation failures.",
 	})
 
+	// Instance-key evidence (key_attestation) metrics
+	instanceKeyNotQualifying = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "siros",
+		Subsystem: "wia",
+		Name:      "instance_key_not_qualifying_total",
+		Help:      "Well formed instance-key evidence that could not name a home, by reason and enforcement mode (ignore: the WIA issued with the home unknown; reject: the WIA was refused).",
+	}, []string{"reason", "enforcement"})
+	instanceKeyRecheck = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "siros",
+		Subsystem: "wia",
+		Name:      "instance_key_recheck_total",
+		Help:      "Re-checks of stored instance-key evidence on use, by outcome: ok, revoked (marked now), already_revoked, expired, not_qualifying (no longer accepted by the current configuration), legacy_unknown (no stored serials or no checker), unavailable (no fresh status list), replaced_stale (a stale stored record replaced by a fresh submission in one conditional write).",
+	}, []string{"outcome"})
+
 	// KA metrics
 	kaGeneratedTotal = promauto.NewCounter(prometheus.CounterOpts{
 		Namespace: "siros",

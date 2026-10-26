@@ -2,11 +2,14 @@ package service
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
 
 // SetFIDO2Verifier installs the FIDO2 attestation verifier the assurance
@@ -82,6 +85,20 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 			return nil, err
 		}
 		overlay = rec
+		// The dry run must answer what the real registration would leave in
+		// place: a stored record that the submission would not supersede
+		// (weaker or absent evidence is never written over it) wins.
+		if s.keyAttestations != nil {
+			if stored, err := s.keyAttestations.GetByKeyThumbprint(ctx, rec.KeyThumbprint); err == nil {
+				if !rec.Supersedes(stored) {
+					overlay = stored
+				}
+			} else if !errors.Is(err, storage.ErrNotFound) {
+				// Without the stored record the dry run cannot say whether the
+				// submission would replace it; a wrong preview is worse than none.
+				return nil, fmt.Errorf("look up stored key evidence: %w", err)
+			}
+		}
 	}
 
 	var thumbprints []string
@@ -110,7 +127,7 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 			// A FIDO2 attestation verified in this request vouches for the
 			// batch just as a stored record would.
 			trusted = s.keyAttestationTrustsBatchWith(ctx, req.WalletInstanceID, req.JWKS, overlay) ||
-				(len(req.JWKS) == 0 && overlay != nil)
+				(len(req.JWKS) == 0 && overlay != nil && isFIDO2KeyEvidence(overlay))
 		}
 		n := normalizeSecurityProperties(req.SecurityProperties, trusted)
 		out.KeyStorage, out.UserAuthentication, out.Certification = n.KeyStorage, n.UserAuthentication, n.Certification
@@ -132,9 +149,31 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 			UserAuthentication: sp.UserAuthentication, Certification: sp.Certification,
 		}
 	}
-	// The WIA request carries no FIDO2 evidence and no claims: its facts are
-	// the platform source only, exactly as GenerateWIA builds them.
+	// The WIA request carries no claims and no FIDO2 submission: its facts are
+	// the platform source plus whatever verified evidence the store holds for
+	// the instance key (the instance id is its thumbprint), exactly as
+	// GenerateWIA builds them. The dry-run overlay never applies here.
 	wiaFacts := assurance.Facts{Platform: &assurance.PlatformVerified{Source: wiaSource, AppID: appID}}
+	if req.WalletInstanceID != "" && s.keyAttestations != nil {
+		if rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, req.WalletInstanceID); err == nil {
+			if caller, ok := ctx.Value(callerCtxKey{}).(KeyAttestationCaller); ok && !instanceEvidenceInScope(rec, caller.TenantID, caller.UserID) {
+				rec = nil
+			}
+			// The preview cannot answer 503: evidence that cannot be
+			// re-checked (or no longer stands) is absent, the lowest tier.
+			if rec != nil {
+				var uerr error
+				if rec, uerr = s.keyChecker.usable(ctx, s.keyAttestations, rec); uerr != nil {
+					s.logger.Warn("instance key evidence cannot be re-checked; treating as none in the preview", zap.Error(uerr))
+					rec = nil
+				}
+			}
+			wiaFacts.Fido2 = fido2VerifiedFromRecord(rec)
+			wiaFacts.InstanceKey = instanceKeyVerifiedFromRecord(rec)
+		} else if !errors.Is(err, storage.ErrNotFound) {
+			s.logger.Warn("instance key evidence lookup failed; treating as none", zap.Error(err))
+		}
+	}
 
 	ka, _ := s.assessor.Simulate(ctx, kaFacts)
 	_, wia := s.assessor.Simulate(ctx, wiaFacts)
