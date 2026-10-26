@@ -31,6 +31,12 @@ type KeyAttestationRecord struct {
 	// go-trust's fidomds3 registry.
 	AAGUID string `json:"aaguid" bson:"aaguid"`
 
+	// UV is the user-verified (UV) flag of the authenticator data of the
+	// verified attestation: the authenticator itself reported that the user
+	// was verified (PIN or biometric) when the key was created. Records
+	// stored before this field existed read as false ("uv none").
+	UV bool `json:"uv" bson:"uv"`
+
 	// VerifiedAt is when this key's attestation was verified.
 	VerifiedAt time.Time `json:"verified_at" bson:"verified_at"`
 

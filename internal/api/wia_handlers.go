@@ -113,6 +113,18 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 				"error":   "INSTANCE_DEACTIVATED",
 				"message": "This wallet instance has been suspended or revoked",
 			})
+		case errors.Is(err, service.ErrWIARefusedByPolicy):
+			h.logger.Warn("WIA refused by assurance policy", zap.Error(err))
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":   "WIA_REFUSED_BY_POLICY",
+				"message": "The wallet provider's assurance policy does not permit a Wallet Instance Attestation for this request",
+			})
+		case errors.Is(err, service.ErrAssuranceUnavailable):
+			h.logger.Error("WIA assurance policy unavailable", zap.Error(err))
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":   "ASSURANCE_UNAVAILABLE",
+				"message": "The assurance policy is enabled but not loaded",
+			})
 		default:
 			h.logger.Error("Failed to generate WIA", zap.Error(err))
 			c.JSON(http.StatusInternalServerError, gin.H{
