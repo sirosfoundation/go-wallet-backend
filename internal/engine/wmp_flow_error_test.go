@@ -27,7 +27,10 @@ func TestWMP_FlowError_FailsParentSign(t *testing.T) {
 		assert.Equal(t, "msg-s", got.MessageID)
 		_, err := signResult(got)
 		require.Error(t, err)
-		assert.Contains(t, err.Error(), "user declined")
+		var se *SignError
+		require.ErrorAs(t, err, &se)
+		assert.Equal(t, "user declined", se.ClientText())
+		assert.NotContains(t, err.Error(), "user declined", "client text must not surface in the error string")
 	case <-time.After(time.Second):
 		t.Fatal("child sign error not propagated")
 	}
@@ -78,5 +81,8 @@ func TestRequestSign_ReturnsClientReportedError(t *testing.T) {
 	// Bypass Send by pre-seeding through the same helper RequestSign uses.
 	_, err := signResult(<-s.signCh)
 	require.Error(t, err)
-	assert.Equal(t, "declined", err.Error())
+	var se *SignError
+	require.ErrorAs(t, err, &se)
+	assert.Equal(t, "declined", se.ClientText())
+	assert.NotContains(t, err.Error(), "declined")
 }

@@ -11,9 +11,10 @@
 # tier, there is no implicit "at or below". There is no negation: deny is the
 # absence of a rule. The floor level is always granted.
 #
-# Slot order is FIXED (schema version 1) because lists match by position:
+# Slot order is FIXED (schema version 2) because lists match by position:
 #   (assure-ks (tier T)(evidence
-#       (verified (fido2 (mds3)(aaguid)(uv)(cert))(platform (source)(app_id))(hsm (id)))
+#       (verified (fido2 (mds3)(aaguid)(uv)(cert))(platform (source)(app_id))(hsm (id))
+#           (instance_key (kind)(home)(level)(boot)(binding)))
 #       (claimed (plugin)(key_storage)(user_authentication)(certification))))
 # Write a prefix of the slots; use the bare empty list, e.g. (platform), as
 # "don't care". Only the (verified ...) group is backend-verified evidence;
@@ -62,6 +63,33 @@
 # id: wia-issue-all
 (assure-wia-issue (evidence))
 
+# Optional, STRICTER issuance gate (template, stays commented): issue a WIA
+# only when the backend holds VERIFIED evidence that the wallet's instance key
+# (the WIA PoP key) is an Android Keystore key, that is an android_key
+# attestation chain it verified for that very key (key_attestation
+# {type android_key} on /wallet-provider/wia/generate, against the operator
+# pinned roots in wallet_provider.attestation.android_key_attestation) and
+# that is still standing at this request (the stored chain is checked again
+# against Google's revocation list on every use; a revoked, expired or
+# unverifiable record reads as (instance_key none)). Every wallet without it
+# is refused, including iOS and web wallets, so use it only for an
+# Android-only deployment. To use it, REPLACE the wia-issue-all rule above
+# (the rules are alternatives: while wia-issue-all stands everyone still
+# gets a WIA), uncomment this one and put an id line before it:
+# "# id: wia-issue-android-key". Narrow it with (home (* set strongbox tee))
+# or (boot verified) in the instance_key group if needed.
+#
+# WHAT THIS DOES NOT DETECT. Android key attestation proves the key lives in
+# the device's TEE or StrongBox and reports the boot state the device's own
+# trusted software reports. It does not detect a rooted phone that keeps a
+# locked bootloader and spoofs its boot state (an attacker who controls the
+# trusted environment's inputs); it says nothing about the device after the
+# key was generated. Play Integrity (native_attestation) is complementary:
+# it judges the app and device now, but does not bind a key. Require both
+# where that matters.
+#
+# (assure-wia-issue (evidence (verified (fido2)(platform)(hsm)(instance_key (kind android_key)))))
+
 # assure-wia: the S profile. Profiles are probed highest first; the scheme
 # floor (s3-backend-only) is what remains. The platform slot is the native
 # attestation source verified in THIS request (platform_attested after an
@@ -70,6 +98,40 @@
 
 # id: wia-s1-platform
 (assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform (source platform_attested)))))
+
+# Optional S1 template that also requires VERIFIED evidence about where the
+# wallet's instance key (the WIA PoP key) lives, instead of trusting the
+# platform attestation alone. The (instance_key ...) slot is filled only from
+# per-key evidence the backend verified for that very key: an Android Key
+# Attestation chain submitted as key_attestation {type android_key} on
+# /wallet-provider/wia/generate (verified against the operator-pinned roots in
+# wallet_provider.attestation.android_key_attestation, see
+# docs/assurance-policy.md), or FIDO2. The client's claims can never populate
+# it. (kind) is "don't care" but must stand in position 1 because slots match
+# by position. A WIA without such evidence has (instance_key none) and this
+# rule does not match. It is a template: it stays commented until your wallets
+# submit android_key evidence. To also constrain the boot state use the
+# fourth field, e.g. (instance_key (kind android_key)(home (* set strongbox tee))(level)(boot verified)).
+# Uncomment, put a "# id: wia-s1-instance-key" line before it, and drop or
+# narrow the plain wia-s1-platform rule above if S1 must require it:
+#
+# (assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform (source platform_attested))(hsm)(instance_key (kind)(home (* set strongbox tee))))))
+
+# Optional S1 template for iOS wallets: the instance key carries an App Attest
+# ASSERTION. It requires binding assertion, which means "an attested app
+# instance (an App Attest key Apple attested for this app) endorsed this
+# instance key". It is NOT evidence that the key lives in the Secure Enclave and
+# it is never a hardware attestation, which is why it is a separate, explicit
+# rule and why no assure-ks or assure-ua rule may be built on instance_key.
+# Slots match by position, so the bare (home)(level)(boot) hold their places.
+# The platform slot is a bare "don't care" on purpose: a renewal WIA carries no
+# native attestation object (the App Attest key was attested once, earlier), so
+# its platform source is backend_attested; the assertion itself is what proves
+# an attested app instance is behind this request.
+# Uncomment, put a "# id: wia-s1-app-attest-assertion" line before it, and drop
+# or narrow the plain wia-s1-platform rule above if S1 must require it:
+#
+# (assure-wia (profile s1-full-client)(evidence (verified (fido2)(platform)(hsm)(instance_key (kind app_attest_assertion)(home)(level)(boot)(binding assertion)))))
 
 # assure-wia-cert: selects a wallet_solution_certification_information entry
 # from the wia_certification catalogue (none: the static

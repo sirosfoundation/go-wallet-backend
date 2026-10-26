@@ -362,12 +362,11 @@ func pumpEvents(ctx context.Context, ct *wmp.ChannelTransport, buf *wmpEventBuff
 const wmpRedactedMembersKey = "redacted_members"
 
 // wmpSecretResultMembers are the flow-complete result members withheld from the
-// replay copy: the whole credential_metadata object (it may carry
-// org.siros.secret_seed) with its encrypted flag, and the OID4VCI refresh token
-// with the DPoP key it is bound to. credentials[] is deliberately kept.
+// replay copy: the whole credential_metadata object (the engine relays only its
+// display members, but replay stays withheld as defence in depth), and the
+// OID4VCI refresh token with the DPoP key it is bound to. credentials[] is deliberately kept.
 var wmpSecretResultMembers = []string{
 	"credential_metadata",
-	"credential_metadata_encrypted_response",
 	"dpop_jwk",
 	"dpop_key_id",
 	"refresh_token",
