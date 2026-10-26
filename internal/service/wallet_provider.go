@@ -46,11 +46,19 @@ type WalletProviderService struct {
 	certChain       []string
 	instances       storage.WalletInstanceStore
 	keyAttestations storage.KeyAttestationStore
-	assessor        *assurance.Assessor
+
+	// keyChecker re-checks stored instance-key evidence (revocation, expiry)
+	// before the preview shows what a WIA would carry.
+	keyChecker *instanceKeyChecker
+	assessor   *assurance.Assessor
 	// fido2 is the FIDO2 attestation verifier, used only by the assurance
 	// preview (dry run). May be nil.
 	fido2 *FIDO2AttestationService
 }
+
+// SetInstanceKeyChecker installs the shared re-check of stored instance-key
+// evidence (see instance_key_recheck.go).
+func (s *WalletProviderService) SetInstanceKeyChecker(c *instanceKeyChecker) { s.keyChecker = c }
 
 // NewWalletProviderService creates a new WalletProviderService.
 // instances is used to corroborate a KA request's self-reported security
@@ -474,6 +482,17 @@ func (s *WalletProviderService) keyAttestationTrustsBatch(ctx context.Context, w
 	return s.keyAttestationTrustsBatchWith(ctx, walletInstanceID, jwks, nil)
 }
 
+// isFIDO2KeyEvidence reports whether rec is a verified FIDO2 hardware-key
+// attestation, the only per-key evidence this legacy gate speaks for. Records
+// of other kinds (android_key and app_attest_assertion describe the WIA
+// INSTANCE key) are not evidence about a credential key's storage: key storage
+// and the instance key are orthogonal, and an instance-key record must never
+// unlock client-selected key_storage, user_authentication or certification
+// claims.
+func isFIDO2KeyEvidence(rec *domain.KeyAttestationRecord) bool {
+	return fido2VerifiedFromRecord(rec) != nil
+}
+
 // keyAttestationTrustsBatchWith is keyAttestationTrustsBatch with an optional
 // overlay: a record verified in this request but not persisted (the preview's
 // dry run) that answers for its own key thumbprint.
@@ -499,12 +518,16 @@ func (s *WalletProviderService) keyAttestationTrustsBatchWith(ctx context.Contex
 			return false
 		}
 		if overlay != nil && overlay.KeyThumbprint == thumbprint {
+			if !isFIDO2KeyEvidence(overlay) {
+				return false
+			}
 			continue
 		}
 		if s.keyAttestations == nil {
 			return false
 		}
-		if _, err := s.keyAttestations.GetByKeyThumbprint(ctx, thumbprint); err != nil {
+		rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, thumbprint)
+		if err != nil || !isFIDO2KeyEvidence(rec) {
 			return false
 		}
 	}
