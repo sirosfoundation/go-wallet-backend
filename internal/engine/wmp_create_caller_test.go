@@ -3,11 +3,13 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/sirosfoundation/go-tokenauth/claims"
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 )
 
@@ -26,7 +28,7 @@ func callerFor(t *testing.T, m *Manager, token string) wmpCaller {
 	t.Helper()
 	id, err := m.validateTokenAuth(context.Background(), token)
 	require.NoError(t, err)
-	return wmpCaller{UserID: id.UserID, TenantID: id.TenantID, TokenID: id.JTI, TAC: id.TAC, EnforceTAC: id.EnforceTAC}
+	return id.caller()
 }
 
 func errReason(t *testing.T, resp []byte) string {
@@ -103,4 +105,21 @@ func mustRPC(t *testing.T, a *WMPAdapter, ctx context.Context, c wmpCaller, body
 	resp, err := a.HandleRPCAs(ctx, "", c, body)
 	require.NoError(t, err)
 	return resp
+}
+
+// Every identity carried from a validated token to a wmpCaller must keep all five
+// fields: the SSE endpoint once rebuilt the caller by hand and dropped the two
+// capability fields. tokenIdentity.caller is the only conversion, so this pins it
+// (reflection makes a field added to tokenIdentity later fail here until mapped).
+func TestTokenIdentityCaller_CarriesEveryField(t *testing.T) {
+	id := tokenIdentity{UserID: "u", TenantID: "t", JTI: "j", TAC: claims.TAC("ir"), EnforceTAC: true}
+	c := id.caller()
+	assert.Equal(t, wmpCaller{UserID: "u", TenantID: "t", TokenID: "j", TAC: claims.TAC("ir"), EnforceTAC: true}, c)
+
+	rt := reflect.TypeOf(id)
+	rv := reflect.ValueOf(id)
+	for i := 0; i < rt.NumField(); i++ {
+		assert.False(t, rv.Field(i).IsZero(), "fixture must set tokenIdentity.%s so a dropped copy is visible", rt.Field(i).Name)
+	}
+	assert.Equal(t, rt.NumField(), reflect.TypeOf(c).NumField(), "tokenIdentity and wmpCaller must stay field-for-field in step")
 }

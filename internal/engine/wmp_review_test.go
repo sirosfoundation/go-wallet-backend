@@ -1191,7 +1191,7 @@ func TestWMP_FlowStart_EndSessionBetweenBuildAndPublish(t *testing.T) {
 	a.mu.RLock()
 	sess := a.peers[sid].session
 	a.mu.RUnlock()
-	sess.testHookBeforePublish = sess.endSession
+	a.testHookBeforePublish = sess.endSession
 
 	resp, err := a.HandleRPC(context.Background(), sid, "", "", startFlowBody(sid, "counter", "late"))
 	require.NoError(t, err)

@@ -91,7 +91,7 @@ func (a *WMPAdapter) HandleWMPRPC(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	caller := wmpCaller{UserID: id.UserID, TenantID: id.TenantID, TokenID: id.JTI, TAC: id.TAC, EnforceTAC: id.EnforceTAC}
+	caller := id.caller()
 
 	// For methods that target an existing session, verify ownership.
 	if sessionID != "" {
@@ -177,16 +177,17 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Verify the session belongs to the authenticated user.
-	if !a.verifySessionOwnership(sessionID, wmpCaller{UserID: id.UserID, TenantID: id.TenantID, TokenID: id.JTI}) {
+	caller := id.caller()
+	if !a.verifySessionOwnership(sessionID, caller) {
 		http.Error(w, "session not found", http.StatusNotFound)
 		return
 	}
 
 	// Same user and tenant is not enough: the token must grant every capability
 	// the session was created with.
-	if !a.tokenCoversSession(sessionID, id.TAC, id.EnforceTAC) {
+	if !a.tokenCoversSession(sessionID, caller.TAC, caller.EnforceTAC) {
 		a.logger.Warn("WMP SSE rejected - token lacks the session's capabilities",
-			zap.String("request_tac", string(id.TAC)))
+			zap.String("request_tac", string(caller.TAC)))
 		http.Error(w, "token lacks the session's capabilities", http.StatusForbidden)
 		return
 	}
