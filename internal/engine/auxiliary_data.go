@@ -485,7 +485,31 @@ func scanMemberNames(raw json.RawMessage, names ...string) (hasOpening, isArray 
 			}
 		}
 	}
+	if len(stack) != 0 {
+		return false, false, io.ErrUnexpectedEOF
+	}
 	return hasOpening, isArray, nil
+}
+
+// SignedMetadataMayCarryOpening reports whether a signed_metadata JWT (kept
+// verbatim by the resolver) might carry an opening: its payload has a member
+// named "opening", in any letter case at any depth, or cannot be read. The
+// resolver decodes the payload into maps before the advertisement is checked,
+// and a map drops a repeated member, so the check of the decoded document
+// cannot see what the original payload still holds; the JWT is scanned on its
+// raw tokens instead. An unreadable token is treated as carrying one (fail
+// closed).
+func SignedMetadataMayCarryOpening(token string) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return true
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return true
+	}
+	found, _, err := scanMemberNames(payload, "opening")
+	return err != nil || found
 }
 
 // errAmbiguousAuxClaim: the payload has the auxiliary_data member more than

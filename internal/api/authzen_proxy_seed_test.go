@@ -1,6 +1,7 @@
 package api
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"testing"
 
@@ -34,18 +35,50 @@ func TestSanitizeSecretSeedAdvertisement(t *testing.T) {
 func TestSanitizeSecretSeedAdvertisement_DropsSignedJWTOnlyWhenConfigRemoved(t *testing.T) {
 	mk := func(adv string) map[string]interface{} {
 		var md map[string]interface{}
-		require.NoError(t, json.Unmarshal([]byte(`{"signed_metadata":"JWT-WITH-PAYLOAD","credential_configurations_supported":{
+		require.NoError(t, json.Unmarshal([]byte(`{"signed_metadata":"`+jwtOf(`{"iss":"x"}`)+`","credential_configurations_supported":{
 			"a":{"credential_metadata":{"org.siros.secret_seed":`+adv+`}}}}`), &md))
 		return md
 	}
 	md := mk(`{"namespaces":["x"]}`)
 	sanitizeSecretSeedAdvertisement(md)
-	assert.Equal(t, "JWT-WITH-PAYLOAD", md["signed_metadata"], "valid advertisement keeps the JWT")
+	assert.Equal(t, jwtOf(`{"iss":"x"}`), md["signed_metadata"], "valid advertisement keeps the JWT")
 
 	md = mk(`{"ns":"deadbeef"}`)
 	sanitizeSecretSeedAdvertisement(md)
 	_, has := md["signed_metadata"]
 	assert.False(t, has, "removing a configuration also drops the original JWT")
+}
+
+func jwtOf(payload string) string {
+	return "e30." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".c2ln"
+}
+
+// The resolver decodes the signed payload into maps, so a repeated member can
+// hide an opening from the checks of the decoded document while the original
+// JWT, which is served unchanged, still carries it.
+func TestSanitize_DropsSignedMetadataCarryingShadowedOpening(t *testing.T) {
+	cfg := `{"auxiliary_data_supported":{"to_wallet":[{"type":"hash_commitment","alg":"sha-256","path":["n","s"]}]}}`
+	for name, tc := range map[string]struct {
+		jwt  string
+		keep bool
+	}{
+		"clean":                    {jwtOf(`{"credential_configurations_supported":{"a":` + cfg + `}}`), true},
+		"shadowed nested opening":  {jwtOf(`{"credential_configurations_supported":{"a":{"x":{"opening":"SECRET"},"x":null}}}`), false},
+		"shadowed configuration":   {jwtOf(`{"credential_configurations_supported":{"a":{"auxiliary_data_supported":{"to_wallet":[{"type":"hash_commitment","opening":"SECRET"}]}},"a":` + cfg + `}}`), false},
+		"case-variant opening":     {jwtOf(`{"credential_configurations_supported":{"a":{"Opening":"SECRET"}}}`), false},
+		"unreadable token":         {"not-a-jwt", false},
+		"payload is not an object": {jwtOf(`[`), false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			md := map[string]interface{}{
+				"signed_metadata":                     tc.jwt,
+				"credential_configurations_supported": map[string]interface{}{"a": map[string]interface{}{}},
+			}
+			sanitizeSecretSeedAdvertisement(md)
+			_, has := md["signed_metadata"]
+			assert.Equal(t, tc.keep, has)
+		})
+	}
 }
 
 func TestSanitizeAuxiliaryDataAdvertisement(t *testing.T) {

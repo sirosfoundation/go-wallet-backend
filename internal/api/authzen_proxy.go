@@ -1000,10 +1000,17 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 // the resolver for legacy signed metadata) is also dropped from the served
 // document: its base64url payload still carries the rejected configuration,
 // and editing the payload would invalidate the signature. The wallet then
-// receives the sanitized claims without that JWT. The signature was verified
+// receives the sanitized claims without that JWT. The same happens when the JWT
+// payload carries an opening member anywhere or cannot be read. The signature was verified
 // and the trust decision taken before this runs; the effect is only that the
 // wallet cannot re-verify the (by now modified) document itself.
 func sanitizeSecretSeedAdvertisement(metadata map[string]interface{}) {
+	// The decoded document cannot show an opening a repeated member shadowed
+	// during decoding; the retained original JWT still holds it. Scan that on
+	// its raw tokens and drop it if it may carry one.
+	if jwt, ok := metadata["signed_metadata"].(string); ok && engine.SignedMetadataMayCarryOpening(jwt) {
+		delete(metadata, "signed_metadata")
+	}
 	ccs, ok := metadata["credential_configurations_supported"].(map[string]interface{})
 	if !ok {
 		return
