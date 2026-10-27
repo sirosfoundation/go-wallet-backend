@@ -78,7 +78,9 @@ func Walk(data []byte, depth int, rules Rules) error {
 	for {
 		tok, err := dec.Token()
 		if errors.Is(err, io.EOF) {
-			break
+			// Empty or cut off before the value was complete (a complete
+			// value leaves the loop below).
+			return io.ErrUnexpectedEOF
 		}
 		if err != nil {
 			return err

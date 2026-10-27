@@ -158,3 +158,19 @@ func TestWalk_Rules(t *testing.T) {
 		})
 	}
 }
+
+// The walk is a validator: empty and cut-off documents are errors, not ambiguity.
+func TestWalk_EmptyAndTruncatedAreSyntaxErrors(t *testing.T) {
+	for name, in := range map[string]string{
+		"empty": ``, "blank": `  `, "open object": `{"a":1`, "open array": `[1`,
+		"open nested": `{"a":{"b":[1,2}`, "key without value": `{"a":`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := Check([]byte(in), -1)
+			require.Error(t, err)
+			assert.NotErrorIs(t, err, ErrAmbiguous)
+		})
+	}
+	require.NoError(t, Check([]byte(`1`), -1))
+	require.NoError(t, Check([]byte(`{"a":[1]}`), -1))
+}
