@@ -1208,7 +1208,11 @@ in the response mode of the request, and ends the flow with a `flow_error`
 when the response mode produced a verifier redirect. The client's `error` text
 is only logged; it is never sent to the verifier. Any other `sign_response` with
 `error` (and no `SIGN_REFUSED`) stays a `SIGN_ERROR` and the verifier is not
-contacted. Over WMP the refusal is a `wmp.flow.error` on the `sign` child flow
+contacted, with one exception: when the request carries `transaction_data`,
+`error_code` `UNSUPPORTED_TRANSACTION_DATA` ends the flow with an
+`UNSUPPORTED_TRANSACTION_DATA` `flow_error` and the verifier is told
+`invalid_transaction_data` (except in `direct_post.jwt` mode, where no error
+response is sent). Over WMP the refusal is a `wmp.flow.error` on the `sign` child flow
 with `data.reason` `rejected` and the parent flow ends with `-31006`.
 
 #### Response Submission
