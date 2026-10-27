@@ -20,7 +20,9 @@ import (
 )
 
 // maxWMPRPCBodyBytes is the maximum allowed body size for WMP JSON-RPC requests.
-// JSON-RPC messages are small; 256KB is generous for any flow action payload.
+// It matches go-wmp's default message decoder limit (1 MiB): a child sign
+// completion carries the full vp_token, and a larger-than-256KiB presentation
+// that the decoder accepts must not be refused at the HTTP layer first.
 // Public paths of the WMP endpoints, advertised by the discovery document.
 //
 // go-wmp's HTTPS+SSE client takes ONE base URL, POSTs JSON-RPC to it and
@@ -33,7 +35,7 @@ const (
 	WMPClientEventsPath = WMPRPCPath + "/events"
 )
 
-const maxWMPRPCBodyBytes = 256 * 1024
+const maxWMPRPCBodyBytes = 1 << 20
 
 // wmpSSEWriteTimeout bounds each SSE write/flush: the stream outlives the
 // http.Server WriteTimeout, but a non-reading client must not pin the handler

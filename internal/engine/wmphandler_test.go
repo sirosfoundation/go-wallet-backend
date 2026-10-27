@@ -2401,6 +2401,23 @@ func TestWMP_HTTPEndpoint_RPC_OversizedBody(t *testing.T) {
 	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
 }
 
+// A body between the old 256 KiB cap and go-wmp's 1 MiB decoder limit (a large
+// vp_token completion) must reach the decoder, not be refused with 413.
+func TestWMP_HTTPEndpoint_RPC_LargePresentationBodyNotRefused(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+
+	body := wmpRequest("1", "wmp.flow.complete", map[string]string{"vp_token": strings.Repeat("x", 300*1024)})
+	require.Greater(t, len(body), 256*1024)
+	req := httptest.NewRequest(http.MethodPost, "/wmp/rpc", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testToken("user-1", "tenant-a"))
+	w := httptest.NewRecorder()
+
+	a.HandleWMPRPC(w, req)
+
+	assert.NotEqual(t, http.StatusRequestEntityTooLarge, w.Code)
+}
+
 // TestWMP_HTTPEndpoint_RPC_Notification_Accepted: an id-less notification gets 202
 // with no body even though dispatch fails. HandleWMPRPC's error-envelope fallback
 // (HandleRPC returning a non-nil error) is unreachable through this endpoint.
