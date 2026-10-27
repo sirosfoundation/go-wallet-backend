@@ -23,6 +23,7 @@ type Store struct {
 	invites         *InviteStore
 	walletInstances *WalletInstanceStore
 	keyAttestations *KeyAttestationStore
+	appAttestKeys   *AppAttestKeyStore
 }
 
 // NewStore creates a new in-memory store
@@ -39,6 +40,7 @@ func NewStore() *Store {
 		invites:         &InviteStore{data: make(map[string]*domain.Invite)},
 		walletInstances: &WalletInstanceStore{data: make(map[string]*domain.WalletInstance)},
 		keyAttestations: &KeyAttestationStore{data: make(map[string]*domain.KeyAttestationRecord)},
+		appAttestKeys:   &AppAttestKeyStore{data: make(map[string]*domain.AppAttestKeyRecord)},
 	}
 
 	// Create default tenant
@@ -65,6 +67,7 @@ func (s *Store) Verifiers() storage.VerifierStore             { return s.verifie
 func (s *Store) Invites() storage.InviteStore                 { return s.invites }
 func (s *Store) WalletInstances() storage.WalletInstanceStore { return s.walletInstances }
 func (s *Store) KeyAttestations() storage.KeyAttestationStore { return s.keyAttestations }
+func (s *Store) AppAttestKeys() storage.AppAttestKeyStore     { return s.appAttestKeys }
 func (s *Store) Close() error                                 { return nil }
 func (s *Store) Ping(ctx context.Context) error               { return nil }
 
