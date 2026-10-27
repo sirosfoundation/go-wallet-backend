@@ -52,7 +52,7 @@ func TestRedisSessionStore_PutGetByUserDelete(t *testing.T) {
 	_, err = store.GetByUser(ctx, "t2", "u1")
 	assert.ErrorIs(t, err, ErrSessionNotFound)
 
-	require.NoError(t, store.Delete(ctx, "s1"))
+	require.NoError(t, store.Delete(ctx, "t1", "u1", "s1"))
 	_, err = store.GetByUser(ctx, "t1", "u1")
 	assert.ErrorIs(t, err, ErrSessionNotFound)
 }
@@ -83,7 +83,7 @@ func TestRedisSessionStore_DeleteKeepsReplacementPointer(t *testing.T) {
 
 	require.NoError(t, store.Put(ctx, redisSess("old", "t1", "u1", time.Hour)))
 	require.NoError(t, store.Put(ctx, redisSess("new", "t1", "u1", time.Hour)))
-	require.NoError(t, store.Delete(ctx, "old"))
+	require.NoError(t, store.Delete(ctx, "t1", "u1", "old"))
 
 	got, err := store.GetByUser(ctx, "t1", "u1")
 	require.NoError(t, err)
@@ -136,7 +136,7 @@ func TestRedisSessionStore_DeletePointerUsesSingleAtomicScript(t *testing.T) {
 
 	rec := &cmdRecorder{key: store.userKey("t1", "u1")}
 	store.client.AddHook(rec)
-	require.NoError(t, store.Delete(ctx, "s1"))
+	require.NoError(t, store.Delete(ctx, "t1", "u1", "s1"))
 
 	require.NotEmpty(t, rec.cmds)
 	for _, c := range rec.cmds {
@@ -148,7 +148,7 @@ func TestRedisSessionStore_DeleteRemovesOwnPointer(t *testing.T) {
 	store, mr := newTestRedisStore(t)
 	ctx := context.Background()
 	require.NoError(t, store.Put(ctx, redisSess("s1", "t1", "u1", time.Hour)))
-	require.NoError(t, store.Delete(ctx, "s1"))
+	require.NoError(t, store.Delete(ctx, "t1", "u1", "s1"))
 	assert.False(t, mr.Exists(store.userKey("t1", "u1")))
 }
 
@@ -215,7 +215,7 @@ func TestRedisSessionStore_DeleteRemovesUserSetMember(t *testing.T) {
 	ctx := context.Background()
 	require.NoError(t, store.Put(ctx, redisSess("s1", "t1", "u1", time.Hour)))
 	require.NoError(t, store.Put(ctx, redisSess("s2", "t2", "u1", time.Hour)))
-	require.NoError(t, store.Delete(ctx, "s1"))
+	require.NoError(t, store.Delete(ctx, "t1", "u1", "s1"))
 	members, err := mr.ZMembers(store.userSetKey("u1"))
 	require.NoError(t, err)
 	assert.Equal(t, []string{"s2"}, members)
@@ -309,7 +309,7 @@ func TestRedisSessionStore_LegacyDeleteRemovesLegacyPointer(t *testing.T) {
 	store, mr := newTestRedisStore(t)
 	seedLegacySession(t, store, redisSess("old", "t1", "u1", time.Hour), time.Hour)
 
-	require.NoError(t, store.Delete(context.Background(), "old"))
+	require.NoError(t, store.Delete(context.Background(), "t1", "u1", "old"))
 	assert.False(t, mr.Exists(store.legacyUserKey("u1")))
 	assert.False(t, mr.Exists(store.sessionKey("old")))
 }
@@ -320,7 +320,7 @@ func TestRedisSessionStore_LegacyDeleteKeepsLegacyPointerToOtherSession(t *testi
 	seedLegacySession(t, store, redisSess("old", "t1", "u1", time.Hour), time.Hour)
 	require.NoError(t, store.Put(ctx, redisSess("new", "t2", "u1", time.Hour)))
 
-	require.NoError(t, store.Delete(ctx, "new"))
+	require.NoError(t, store.Delete(ctx, "t2", "u1", "new"))
 	assert.True(t, mr.Exists(store.legacyUserKey("u1")))
 }
 
@@ -499,7 +499,7 @@ func TestRedisSessionStore_LegacyAndScopedKeysDoNotCollide(t *testing.T) {
 	assert.Equal(t, "legacy", got.ID)
 
 	// Deleting one never touches the other.
-	require.NoError(t, store.Delete(ctx, "fresh"))
+	require.NoError(t, store.Delete(ctx, "default", "u", "fresh"))
 	got, err = store.GetByUser(ctx, "t1", "default:u")
 	require.NoError(t, err)
 	assert.Equal(t, "legacy", got.ID)
@@ -568,7 +568,7 @@ func TestRedisSessionStore_SpecialCharacterIDsAreIsolated(t *testing.T) {
 	}
 
 	// Delete one: all others remain.
-	require.NoError(t, store.Delete(ctx, "sA"))
+	require.NoError(t, store.Delete(ctx, pairs[0][0], pairs[0][1], "sA"))
 	for i, p := range pairs[1:] {
 		got, err := store.GetByUser(ctx, p[0], p[1])
 		require.NoError(t, err)
@@ -685,7 +685,7 @@ func TestRedisSessionStore_DeleteCleansPointersInSameTransaction(t *testing.T) {
 
 	rec := &standaloneRecorder{}
 	store.client.AddHook(rec)
-	require.NoError(t, store.Delete(ctx, "s1"))
+	require.NoError(t, store.Delete(ctx, "t1", "u1", "s1"))
 
 	assert.Equal(t, []string{"get"}, rec.cmds, "pointer cleanup must not use separate round trips")
 	assert.False(t, mr.Exists(store.userKey("t1", "u1")))
@@ -719,10 +719,155 @@ func TestRedisSessionStore_IndexExpiryNeverLowered(t *testing.T) {
 	require.NoError(t, store.Put(ctx, redisSess("s1", "t1", "u1", 2*time.Hour)))
 
 	// A stale reader re-adds the session with the older, shorter expiry.
-	_, err := userSessionsAddScript.Run(ctx, store.client, []string{store.userSetKey("u1")},
+	_, err := indexAddScript.Run(ctx, store.client, []string{store.userSetKey("u1")},
 		(10 * time.Minute).Milliseconds(), "s1").Result()
 	require.NoError(t, err)
 
 	assert.InDelta(t, (2 * time.Hour).Seconds(), mr.TTL(store.userSetKey("u1")).Seconds(), 5,
 		"the set must keep the later expiry")
+}
+
+// The tenant index is an expiry-scored set that expires with its
+// longest-lived member, like the user index.
+func TestRedisSessionStore_TenantSetTTLTracksLongestMember(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	tset := store.tenantKey("t1")
+
+	require.NoError(t, store.Put(ctx, redisSess("s1", "t1", "u1", 10*time.Minute)))
+	require.NoError(t, store.Put(ctx, redisSess("s2", "t1", "u2", 30*time.Minute)))
+	assert.InDelta(t, (30 * time.Minute).Seconds(), mr.TTL(tset).Seconds(), 5, "set TTL tracks longest-lived member")
+
+	require.NoError(t, store.Put(ctx, redisSess("s3", "t1", "u3", time.Minute)))
+	assert.InDelta(t, (30 * time.Minute).Seconds(), mr.TTL(tset).Seconds(), 5, "a shorter member must not shorten it")
+
+	advanceRedis(mr, 31*time.Minute)
+	assert.False(t, mr.Exists(tset), "set disappears with its last member")
+}
+
+// Members of replicas that died without Delete are pruned by the next add.
+func TestRedisSessionStore_TenantSetPrunedOnAdd(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	tset := store.tenantKey("t1")
+
+	require.NoError(t, store.Put(ctx, redisSess("short", "t1", "u1", time.Minute)))
+	require.NoError(t, store.Put(ctx, redisSess("long", "t1", "u2", time.Hour)))
+	advanceRedis(mr, 2*time.Minute)
+	members, err := mr.ZMembers(tset)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"short", "long"}, members)
+
+	require.NoError(t, store.Put(ctx, redisSess("fresh", "t1", "u3", time.Hour)))
+	members, err = mr.ZMembers(tset)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"long", "fresh"}, members, "expired member pruned on add")
+}
+
+// A delayed backfill that read the session before Update extended it must not
+// lower the tenant index expiry.
+func TestRedisSessionStore_TenantIndexExpiryNeverLowered(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	require.NoError(t, store.Put(ctx, redisSess("s1", "t1", "u1", 2*time.Hour)))
+
+	_, err := indexAddScript.Run(ctx, store.client, []string{store.tenantKey("t1")},
+		(10 * time.Minute).Milliseconds(), "s1").Result()
+	require.NoError(t, err)
+	assert.InDelta(t, (2 * time.Hour).Seconds(), mr.TTL(store.tenantKey("t1")).Seconds(), 5)
+
+	// The same through the real path: a legacy backfill of a session that
+	// Update has since extended.
+	seedLegacySession(t, store, redisSess("old", "t2", "u2", time.Hour), time.Hour)
+	_, err = store.GetByUser(ctx, "t2", "u2")
+	require.NoError(t, err)
+	require.NoError(t, store.Update(ctx, redisSess("old", "t2", "u2", 3*time.Hour)))
+	_, err = indexAddScript.Run(ctx, store.client, []string{store.tenantKey("t2")},
+		time.Hour.Milliseconds(), "old").Result()
+	require.NoError(t, err)
+	assert.InDelta(t, (3 * time.Hour).Seconds(), mr.TTL(store.tenantKey("t2")).Seconds(), 5)
+}
+
+// Update re-indexes with the renewed expiry.
+func TestRedisSessionStore_UpdateExtendsTenantIndex(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	require.NoError(t, store.Put(ctx, redisSess("s1", "t1", "u1", time.Hour)))
+	require.NoError(t, store.Update(ctx, redisSess("s1", "t1", "u1", 5*time.Hour)))
+	assert.InDelta(t, (5 * time.Hour).Seconds(), mr.TTL(store.tenantKey("t1")).Seconds(), 5)
+}
+
+// Delete of a session whose record is already gone (expired past the TTL, as
+// for a WebSocket open longer than the session lifetime) must still clean every
+// index, using the caller's tenant and user.
+func TestRedisSessionStore_DeleteNotFoundRecordStillCleansIndexes(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	require.NoError(t, store.Put(ctx, redisSess("s1", "t1", "u1", time.Hour)))
+	require.NoError(t, store.Put(ctx, redisSess("s2", "t1", "u2", 2*time.Hour)))
+	// Record gone, indexes still naming it.
+	mr.Del(store.sessionKey("s1"))
+
+	require.NoError(t, store.Delete(ctx, "t1", "u1", "s1"))
+
+	members, err := mr.ZMembers(store.tenantKey("t1"))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"s2"}, members, "tenant index must drop the gone session")
+	assert.False(t, mr.Exists(store.userSetKey("u1")), "user index must drop it too")
+	assert.False(t, mr.Exists(store.userKey("t1", "u1")), "pointer naming it must go")
+	got, err := store.GetByUser(ctx, "t1", "u2")
+	require.NoError(t, err)
+	assert.Equal(t, "s2", got.ID)
+
+	// An empty tenant argument means the default tenant.
+	require.NoError(t, store.Put(ctx, redisSess("d1", "", "u3", time.Hour)))
+	mr.Del(store.sessionKey("d1"))
+	require.NoError(t, store.Delete(ctx, "", "u3", "d1"))
+	assert.False(t, mr.Exists(store.tenantKey("default")))
+}
+
+// DeleteByUser removes the user's members from the tenant index.
+func TestRedisSessionStore_DeleteByUserCleansTenantIndex(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	require.NoError(t, store.Put(ctx, redisSess("a", "t1", "u1", time.Hour)))
+	require.NoError(t, store.Put(ctx, redisSess("b", "t1", "u2", time.Hour)))
+	require.NoError(t, store.DeleteByUser(ctx, "u1"))
+	members, err := mr.ZMembers(store.tenantKey("t1"))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"b"}, members)
+}
+
+// List serves both the new index and the legacy SET of the previous release,
+// and drains stale members from each.
+func TestRedisSessionStore_ListMergesLegacySetAndPrunesStale(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	require.NoError(t, store.Put(ctx, redisSess("new", "t1", "u1", time.Hour)))
+	seedLegacySession(t, store, redisSess("old", "t1", "u2", time.Hour), time.Hour)
+	require.NoError(t, store.client.SAdd(ctx, store.legacyTenantKey("t1"), "ghost-legacy").Err())
+	require.NoError(t, store.client.ZAdd(ctx, store.tenantKey("t1"),
+		redis.Z{Score: float64(time.Now().Add(time.Hour).UnixMilli()), Member: "ghost"}).Err())
+
+	got, err := store.List(ctx, "t1")
+	require.NoError(t, err)
+	var ids []string
+	for _, s := range got {
+		ids = append(ids, s.ID)
+	}
+	assert.ElementsMatch(t, []string{"new", "old"}, ids)
+
+	members, _ := mr.ZMembers(store.tenantKey("t1"))
+	assert.NotContains(t, members, "ghost")
+	legacy, _ := mr.SMembers(store.legacyTenantKey("t1"))
+	assert.NotContains(t, legacy, "ghost-legacy")
+}
+
+// Delete also drains the legacy tenant SET.
+func TestRedisSessionStore_DeleteRemovesLegacyTenantSetMember(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	seedLegacySession(t, store, redisSess("old", "t1", "u1", time.Hour), time.Hour)
+	require.NoError(t, store.Delete(ctx, "t1", "u1", "old"))
+	assert.False(t, mr.Exists(store.legacyTenantKey("t1")))
 }

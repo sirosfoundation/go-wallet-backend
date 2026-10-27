@@ -8,11 +8,14 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 )
 
 var (
@@ -45,8 +48,10 @@ type SessionStore interface {
 	// Update updates an existing session.
 	Update(ctx context.Context, session *SessionData) error
 
-	// Delete removes a session by ID.
-	Delete(ctx context.Context, sessionID string) error
+	// Delete removes a session by ID. tenantID and userID name the session's
+	// indexes: they are the fallback when the record itself is already gone
+	// (expired or lost), so the indexes are cleaned even then.
+	Delete(ctx context.Context, tenantID, userID, sessionID string) error
 
 	// DeleteByUser removes the user's sessions in every tenant (user-wide
 	// revocation, e.g. account deletion).
@@ -124,8 +129,14 @@ func (m *MemorySessionStore) Put(ctx context.Context, session *SessionData) erro
 		return ErrSessionExists
 	}
 
+	// A user holds one session per tenant: the one the index names is superseded
+	// and dropped, so replaced sessions do not accumulate until Cleanup.
+	k := userKey{TenantID: normalizeTenant(session.TenantID), UserID: session.UserID}
+	if old, ok := m.userIndex[k]; ok {
+		delete(m.sessions, old)
+	}
 	m.sessions[session.ID] = session
-	m.userIndex[userKey{TenantID: normalizeTenant(session.TenantID), UserID: session.UserID}] = session.ID
+	m.userIndex[k] = session.ID
 	return nil
 }
 
@@ -142,12 +153,18 @@ func (m *MemorySessionStore) Update(ctx context.Context, session *SessionData) e
 	return nil
 }
 
-func (m *MemorySessionStore) Delete(ctx context.Context, sessionID string) error {
+func (m *MemorySessionStore) Delete(ctx context.Context, tenantID, userID, sessionID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	session, exists := m.sessions[sessionID]
 	if !exists {
+		// The record is gone (e.g. dropped by Cleanup) but the index entry may
+		// still name it: remove it by the caller's (tenant, user).
+		k := userKey{TenantID: normalizeTenant(tenantID), UserID: userID}
+		if m.userIndex[k] == sessionID {
+			delete(m.userIndex, k)
+		}
 		return nil // Idempotent
 	}
 
@@ -227,14 +244,17 @@ end
 return 0
 `)
 
-// userSessionAddLua records ARGV[idArg] in the sorted set KEYS[setKey], scored
-// by expiry (unix ms), drops expired members and expires the set with its
-// longest-lived member, so a set cannot outlive the sessions it indexes. Time
+// indexAddLua records a session ID in an expiry-scored sorted set (the user set
+// and the tenant set share it), scored by expiry (unix ms), drops expired
+// members and expires the set with its longest-lived member, so a set cannot
+// outlive the sessions it indexes. It is wrapped in do/end so it can be
+// repeated in one script. Time
 // comes from the Redis server so replicas with skewed clocks agree. ZADD GT
 // never lowers an existing member's expiry: a delayed legacy backfill that read
 // a session before Update extended it must not overwrite the renewed score with
 // the older, shorter one.
-const userSessionAddLua = `
+const indexAddLua = `
+do
 local t = redis.call("TIME")
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 redis.call("ZADD", %[1]s, "GT", string.format("%%.0f", now + tonumber(%[2]s)), %[3]s)
@@ -243,11 +263,12 @@ local top = redis.call("ZRANGE", %[1]s, -1, -1, "WITHSCORES")
 if top[2] then
 	redis.call("PEXPIREAT", %[1]s, string.format("%%.0f", tonumber(top[2])))
 end
+end
 `
 
-// userSessionsAddScript adds a session to the user's sorted set.
+// indexAddScript adds a session to one expiry-scored sorted set.
 // KEYS[1] = set, ARGV[1] = session TTL (ms), ARGV[2] = session ID.
-var userSessionsAddScript = redis.NewScript(fmt.Sprintf(userSessionAddLua, "KEYS[1]", "ARGV[1]", "ARGV[2]") + `
+var indexAddScript = redis.NewScript(fmt.Sprintf(indexAddLua, "KEYS[1]", "ARGV[1]", "ARGV[2]") + `
 return 1
 `)
 
@@ -255,15 +276,15 @@ return 1
 // returns 0 when the session key already exists: a duplicate ID must not
 // repoint the user's pointer or add index entries for data that was not
 // stored.
-// KEYS = session, user pointer, tenant set, user set;
+// KEYS = session, user pointer, tenant set, user set (both expiry-scored);
 // ARGV = session JSON, TTL (ms), session ID.
 var putSessionScript = redis.NewScript(`
 if not redis.call("SET", KEYS[1], ARGV[1], "NX", "PX", ARGV[2]) then
 	return 0
 end
 redis.call("SET", KEYS[2], ARGV[3], "PX", ARGV[2])
-redis.call("SADD", KEYS[3], ARGV[3])
-` + fmt.Sprintf(userSessionAddLua, "KEYS[4]", "ARGV[2]", "ARGV[3]") + `
+` + fmt.Sprintf(indexAddLua, "KEYS[3]", "ARGV[2]", "ARGV[3]") +
+	fmt.Sprintf(indexAddLua, "KEYS[4]", "ARGV[2]", "ARGV[3]") + `
 return 1
 `)
 
@@ -353,13 +374,20 @@ func (r *RedisSessionStore) legacyUserKey(userID string) string {
 	return r.keyPrefix + "user:" + userID
 }
 
-// legacyTenantKey is the pre-normalisation tenant set (raw tenant ID).
+// legacyTenantKey is the pre-expiry-scoring tenant SET (`tenant:<raw tenant
+// ID>`), which had no TTL. Never written now; List reads it and Delete,
+// DeleteByUser and List remove members from it so sessions of replicas on the
+// previous release stay visible during a rolling upgrade and the set drains.
 func (r *RedisSessionStore) legacyTenantKey(tenantID string) string {
 	return r.keyPrefix + "tenant:" + tenantID
 }
 
+// tenantKey is the expiry-scored sorted set of a tenant's session IDs, indexed
+// like userSetKey: pruned on every add and expired with its longest-lived
+// member. It lives in its own namespace because the legacy `tenant:` key is a
+// plain SET and a sorted set cannot share its name.
 func (r *RedisSessionStore) tenantKey(tenantID string) string {
-	return r.keyPrefix + "tenant:" + normalizeTenant(tenantID)
+	return r.keyPrefix + "tenantx:" + url.PathEscape(normalizeTenant(tenantID))
 }
 
 func (r *RedisSessionStore) Get(ctx context.Context, sessionID string) (*SessionData, error) {
@@ -433,8 +461,7 @@ func (r *RedisSessionStore) getByLegacyUser(ctx context.Context, tenantID, userI
 		// unconditional SET would repoint the user to this older one. The set
 		// memberships below are idempotent.
 		pipe.SetNX(ctx, r.userKey(session.TenantID, session.UserID), session.ID, ttl)
-		pipe.SAdd(ctx, r.tenantKey(session.TenantID), session.ID)
-		r.indexUserSession(ctx, pipe, session, ttl)
+		r.indexSession(ctx, pipe, session, ttl)
 		if _, err := pipe.Exec(ctx); err != nil {
 			r.logger.Warn("Failed to backfill legacy session indexes", zap.Error(err))
 		}
@@ -470,10 +497,13 @@ func (r *RedisSessionStore) Put(ctx context.Context, session *SessionData) error
 	return nil
 }
 
-// indexUserSession queues the expiry-scored user-set update on pipe.
-func (r *RedisSessionStore) indexUserSession(ctx context.Context, pipe redis.Pipeliner, session *SessionData, ttl time.Duration) {
-	userSessionsAddScript.Eval(ctx, pipe, []string{r.userSetKey(session.UserID)},
-		ttl.Milliseconds(), session.ID)
+// indexSession queues the expiry-scored tenant-set and user-set updates on
+// pipe. Both use ZADD GT, so a delayed backfill never lowers an expiry that
+// Update has extended.
+func (r *RedisSessionStore) indexSession(ctx context.Context, pipe redis.Pipeliner, session *SessionData, ttl time.Duration) {
+	for _, key := range []string{r.tenantKey(session.TenantID), r.userSetKey(session.UserID)} {
+		indexAddScript.Eval(ctx, pipe, []string{key}, ttl.Milliseconds(), session.ID)
+	}
 }
 
 func (r *RedisSessionStore) Update(ctx context.Context, session *SessionData) error {
@@ -499,20 +529,24 @@ func (r *RedisSessionStore) Update(ctx context.Context, session *SessionData) er
 	pipe := r.client.TxPipeline()
 	pipe.Set(ctx, r.sessionKey(session.ID), data, ttl)
 	pipe.Set(ctx, r.userKey(session.TenantID, session.UserID), session.ID, ttl)
-	r.indexUserSession(ctx, pipe, session, ttl)
+	r.indexSession(ctx, pipe, session, ttl)
 
 	_, err = pipe.Exec(ctx)
 	return err
 }
 
-func (r *RedisSessionStore) Delete(ctx context.Context, sessionID string) error {
-	// Get session first to clean up indexes
-	session, err := r.Get(ctx, sessionID)
-	if err == ErrSessionNotFound {
-		return nil // Idempotent
-	}
-	if err != nil {
+func (r *RedisSessionStore) Delete(ctx context.Context, tenantID, userID, sessionID string) error {
+	// The record, if present (even past ExpiresAt, until Redis drops the key),
+	// names the indexes authoritatively. When it is gone - a WebSocket open
+	// longer than the session TTL, or a lost record - the caller's tenant and
+	// user still name them, so the indexes are cleaned either way instead of
+	// keeping a member for a session that no longer exists.
+	session, err := r.rawSession(ctx, sessionID)
+	if err != nil && err != ErrSessionNotFound {
 		return err
+	}
+	if err == nil {
+		tenantID, userID = session.TenantID, session.UserID
 	}
 
 	// Everything goes in one transaction, so a connection failure cannot commit
@@ -524,15 +558,25 @@ func (r *RedisSessionStore) Delete(ctx context.Context, sessionID string) error 
 	// A legacy pointer naming this session must go too (rolling upgrade).
 	pipe := r.client.TxPipeline()
 	pipe.Del(ctx, r.sessionKey(sessionID))
-	pipe.SRem(ctx, r.tenantKey(session.TenantID), sessionID)
-	pipe.ZRem(ctx, r.userSetKey(session.UserID), sessionID)
-	if raw := r.legacyTenantKey(session.TenantID); raw != r.tenantKey(session.TenantID) {
-		pipe.SRem(ctx, raw, sessionID)
+	pipe.ZRem(ctx, r.tenantKey(tenantID), sessionID)
+	pipe.ZRem(ctx, r.userSetKey(userID), sessionID)
+	for _, legacy := range r.legacyTenantKeys(tenantID) {
+		pipe.SRem(ctx, legacy, sessionID)
 	}
-	compareAndDeleteScript.Eval(ctx, pipe, []string{r.legacyUserKey(session.UserID)}, sessionID)
-	compareAndDeleteScript.Eval(ctx, pipe, []string{r.userKey(session.TenantID, session.UserID)}, sessionID)
+	compareAndDeleteScript.Eval(ctx, pipe, []string{r.legacyUserKey(userID)}, sessionID)
+	compareAndDeleteScript.Eval(ctx, pipe, []string{r.userKey(tenantID, userID)}, sessionID)
 	_, err = pipe.Exec(ctx)
 	return err
+}
+
+// legacyTenantKeys returns the legacy tenant SET keys that may hold a session
+// of tenantID: the normalised ID's and, when it differs, the raw one's.
+func (r *RedisSessionStore) legacyTenantKeys(tenantID string) []string {
+	keys := []string{r.legacyTenantKey(normalizeTenant(tenantID))}
+	if raw := r.legacyTenantKey(tenantID); raw != keys[0] {
+		keys = append(keys, raw)
+	}
+	return keys
 }
 
 // deleteBatchSize bounds how many sessions one DeleteByUser script call
@@ -541,17 +585,19 @@ const deleteBatchSize = 100
 
 // deleteUserBatchScript atomically removes a batch of one user's sessions and
 // ZREMs exactly those members (a concurrent Put's member is found next round).
-// KEYS[1] = user set, ARGV[1] = legacy pointer key, then groups of 5: session
-// ID, session key, pointer key, tenant set key, raw tenant set key. Empty keys
+// KEYS[1] = user set, ARGV[1] = legacy pointer key, then groups of 6: session
+// ID, session key, pointer key, tenant set key, legacy tenant set key, raw
+// legacy tenant set key. Empty keys
 // are skipped. Pointers are removed only if they still name the session.
 var deleteUserBatchScript = redis.NewScript(`
-for i = 2, #ARGV, 5 do
+for i = 2, #ARGV, 6 do
 	local id = ARGV[i]
 	if ARGV[i+1] ~= "" then redis.call("DEL", ARGV[i+1]) end
 	if ARGV[i+2] ~= "" and redis.call("GET", ARGV[i+2]) == id then redis.call("DEL", ARGV[i+2]) end
 	if redis.call("GET", ARGV[1]) == id then redis.call("DEL", ARGV[1]) end
-	if ARGV[i+3] ~= "" then redis.call("SREM", ARGV[i+3], id) end
+	if ARGV[i+3] ~= "" then redis.call("ZREM", ARGV[i+3], id) end
 	if ARGV[i+4] ~= "" then redis.call("SREM", ARGV[i+4], id) end
+	if ARGV[i+5] ~= "" then redis.call("SREM", ARGV[i+5], id) end
 	redis.call("ZREM", KEYS[1], id)
 end
 return 1
@@ -641,27 +687,30 @@ func (r *RedisSessionStore) userDeleteCandidates(ctx context.Context, userID str
 
 // deleteBatchArgs builds the deleteUserBatchScript arguments for ids: the
 // legacy pointer key, then per session its ID, session key, scoped pointer
-// key, tenant set key and raw tenant set key. A session that is already gone
+// key, tenant set key, legacy tenant set key and raw legacy tenant set key. A
+// session that is already gone
 // contributes only its ID (to be ZREMed); the legacy session is only deleted
 // if it really belongs to userID.
 func (r *RedisSessionStore) deleteBatchArgs(ctx context.Context, userID string, ids []string, hasLegacy bool) ([]any, error) {
 	args := []any{r.legacyUserKey(userID)}
 	for i, id := range ids {
 		isLegacy := hasLegacy && i == len(ids)-1
-		var sk, pk, tk, rtk string
+		var sk, pk, tk, ltk, rtk string
 		sess, err := r.rawSession(ctx, id)
 		switch {
 		case err == nil && (!isLegacy || sess.UserID == userID):
 			sk = r.sessionKey(id)
 			pk = r.userKey(sess.TenantID, sess.UserID)
 			tk = r.tenantKey(sess.TenantID)
-			if raw := r.legacyTenantKey(sess.TenantID); raw != tk {
-				rtk = raw
+			legacy := r.legacyTenantKeys(sess.TenantID)
+			ltk = legacy[0]
+			if len(legacy) > 1 {
+				rtk = legacy[1]
 			}
 		case err != nil && err != ErrSessionNotFound:
 			return nil, err
 		}
-		args = append(args, id, sk, pk, tk, rtk)
+		args = append(args, id, sk, pk, tk, ltk, rtk)
 	}
 	return args, nil
 }
@@ -683,18 +732,33 @@ func (r *RedisSessionStore) rawSession(ctx context.Context, sessionID string) (*
 }
 
 func (r *RedisSessionStore) List(ctx context.Context, tenantID string) ([]*SessionData, error) {
-	// Sessions written by replicas on the previous release with no tenant claim
-	// sit in the raw empty-tenant set, which now means the default tenant, so
-	// list both until they expire.
-	keys := []string{r.tenantKey(tenantID)}
-	if raw := r.legacyTenantKey(""); normalizeTenant(tenantID) == defaultTenant && raw != keys[0] {
-		keys = append(keys, raw)
+	seen := make(map[string]struct{})
+	ids, err := r.client.ZRange(ctx, r.tenantKey(tenantID), 0, -1).Result()
+	if err != nil {
+		return nil, err
+	}
+	result, err := r.liveSessions(ctx, ids, tenantID, seen, func(id string) {
+		r.client.ZRem(ctx, r.tenantKey(tenantID), id)
+	})
+	if err != nil {
+		return nil, err
 	}
 
-	var result []*SessionData
-	seen := make(map[string]struct{})
+	// Sessions written by replicas on the previous release sit in plain SETs
+	// (the raw empty-tenant one now means the default tenant), so read those
+	// too until they expire.
+	keys := r.legacyTenantKeys(tenantID)
+	if raw := r.legacyTenantKey(""); normalizeTenant(tenantID) == domain.DefaultTenantID.String() && !slices.Contains(keys, raw) {
+		keys = append(keys, raw)
+	}
 	for _, key := range keys {
-		sessions, err := r.listSet(ctx, key, tenantID, seen)
+		ids, err := r.client.SMembers(ctx, key).Result()
+		if err != nil {
+			return nil, err
+		}
+		sessions, err := r.liveSessions(ctx, ids, tenantID, seen, func(id string) {
+			r.client.SRem(ctx, key, id)
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -703,24 +767,19 @@ func (r *RedisSessionStore) List(ctx context.Context, tenantID string) ([]*Sessi
 	return result, nil
 }
 
-// listSet returns the live sessions of the tenant set at key that belong to
-// tenantID (after normalisation) and are not already in seen, recording what it
-// returns in seen. Members whose session is gone are removed from the set.
-func (r *RedisSessionStore) listSet(ctx context.Context, key, tenantID string, seen map[string]struct{}) ([]*SessionData, error) {
-	sessionIDs, err := r.client.SMembers(ctx, key).Result()
-	if err != nil {
-		return nil, err
-	}
+// liveSessions returns the live sessions among ids that belong to tenantID
+// (after normalisation) and are not already in seen, recording each id it
+// visits in seen. onStale is called for ids whose session is gone.
+func (r *RedisSessionStore) liveSessions(ctx context.Context, ids []string, tenantID string, seen map[string]struct{}, onStale func(id string)) ([]*SessionData, error) {
 	var result []*SessionData
-	for _, id := range sessionIDs {
+	for _, id := range ids {
 		if _, dup := seen[id]; dup {
 			continue
 		}
 		seen[id] = struct{}{}
 		session, err := r.Get(ctx, id)
 		if err == ErrSessionNotFound {
-			// Clean up stale reference
-			r.client.SRem(ctx, key, id)
+			onStale(id)
 			continue
 		}
 		if err != nil {
@@ -733,11 +792,13 @@ func (r *RedisSessionStore) listSet(ctx context.Context, key, tenantID string, s
 	return result, nil
 }
 
+// Cleanup is a no-op for Redis, which needs no sweep: session keys carry a TTL
+// and both indexes are expiry-scored sorted sets pruned of expired members on
+// every add and expired with their longest-lived member, so none grows without
+// bound. Only the legacy tenant SETs (written by the previous release, never by
+// this one) are drained lazily, by List, Delete and DeleteByUser.
 func (r *RedisSessionStore) Cleanup(ctx context.Context) (int64, error) {
-	// Redis handles TTL-based expiration of session keys automatically.
-	// User session sets are pruned on every add (userSessionsAddScript); tenant
-	// set members lazily by List. Nothing to do here.
-	r.logger.Debug("Redis cleanup - TTL handles session expiration")
+	r.logger.Debug("Redis cleanup - TTL and expiry-scored indexes handle expiration")
 	return 0, nil
 }
 

@@ -158,7 +158,7 @@ func TestMemorySessionStore_Delete(t *testing.T) {
 	err := store.Put(ctx, session)
 	require.NoError(t, err)
 
-	err = store.Delete(ctx, "sess-1")
+	err = store.Delete(ctx, "tenant-1", "user-1", "sess-1")
 	require.NoError(t, err)
 
 	_, err = store.Get(ctx, "sess-1")
@@ -174,7 +174,7 @@ func TestMemorySessionStore_DeleteIdempotent(t *testing.T) {
 	ctx := context.Background()
 
 	// Delete non-existent should not error
-	err := store.Delete(ctx, "non-existent")
+	err := store.Delete(ctx, "", "", "non-existent")
 	require.NoError(t, err)
 }
 
@@ -331,8 +331,30 @@ func TestMemorySessionStore_Delete_KeepsNewerSessionIndex(t *testing.T) {
 	require.NoError(t, store.Put(ctx, &SessionData{ID: "old", UserID: "u", TenantID: "t", ExpiresAt: exp}))
 	require.NoError(t, store.Put(ctx, &SessionData{ID: "new", UserID: "u", TenantID: "t", ExpiresAt: exp}))
 
-	require.NoError(t, store.Delete(ctx, "old"))
+	require.NoError(t, store.Delete(ctx, "t", "u", "old"))
 	got, err := store.GetByUser(ctx, "t", "u")
 	require.NoError(t, err)
 	assert.Equal(t, "new", got.ID)
+}
+
+// Delete of a record that is already gone still drops an index entry naming
+// it, and a replaced session does not linger after its successor is Put.
+func TestMemorySessionStore_DeleteNotFoundCleansIndex(t *testing.T) {
+	store := NewMemorySessionStore(zap.NewNop())
+	ctx := context.Background()
+	exp := time.Now().Add(time.Hour)
+	require.NoError(t, store.Put(ctx, &SessionData{ID: "s", UserID: "u", TenantID: "t", ExpiresAt: exp}))
+	delete(store.sessions, "s") // record lost, index remains
+	require.NoError(t, store.Delete(ctx, "t", "u", "s"))
+	assert.Empty(t, store.userIndex)
+}
+
+func TestMemorySessionStore_PutDropsSupersededSession(t *testing.T) {
+	store := NewMemorySessionStore(zap.NewNop())
+	ctx := context.Background()
+	exp := time.Now().Add(time.Hour)
+	require.NoError(t, store.Put(ctx, &SessionData{ID: "old", UserID: "u", TenantID: "t", ExpiresAt: exp}))
+	require.NoError(t, store.Put(ctx, &SessionData{ID: "new", UserID: "u", TenantID: "t", ExpiresAt: exp}))
+	assert.Len(t, store.sessions, 1)
+	assert.Len(t, store.userIndex, 1)
 }

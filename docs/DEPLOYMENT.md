@@ -243,7 +243,12 @@ kubectl apply -f k8s/deployment.yaml
 Earlier releases kept the per-user session pointer at `<prefix>user:<userID>`.
 This release scopes it by tenant at `<prefix>usert:<b64url(tenant)>:<b64url(userID)>`
 (unpadded base64url, so the `:` separator is unambiguous) and adds a
-`<prefix>userall:<userID>` index used for account deletion. The new pointer
+`<prefix>userall:<userID>` index used for account deletion. The per-tenant
+index moves from the TTL-less set `<prefix>tenant:<tenantID>` to the sorted set
+`<prefix>tenantx:<tenantID>`; both indexes are scored by expiry, pruned on every
+add and expire with their longest-lived member, so neither grows without bound.
+The legacy `tenant:` sets are no longer written; `List`, `Delete` and
+`DeleteByUser` drain them. The new pointer
 deliberately does not reuse the `user:` namespace: the legacy key is the raw
 user ID, so with `:` in IDs a legacy user `default:u` and the new
 (tenant `default`, user `u`) would otherwise share one key and could overwrite

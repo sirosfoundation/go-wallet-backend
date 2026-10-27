@@ -1318,7 +1318,7 @@ func TestMemorySessionStore_DeleteByUser_AllTenants(t *testing.T) {
 	} {
 		require.NoError(t, store.Put(ctx, s))
 	}
-	require.NoError(t, store.Delete(ctx, "a"))
+	require.NoError(t, store.Delete(ctx, "ta", "u", "a"))
 	_, err := store.GetByUser(ctx, "tb", "u")
 	require.NoError(t, err, "deleting tenant A's session must not drop tenant B's index")
 

@@ -21,6 +21,7 @@ import (
 	"github.com/sirosfoundation/go-tokenauth/claims"
 	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	ws "github.com/sirosfoundation/go-wallet-backend/internal/websocket"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -174,17 +175,13 @@ type userKey struct {
 	UserID   string
 }
 
-// defaultTenant is the tenant a token without a tenant_id claim belongs to
-// (matches pkg/middleware/tokenauth.go).
-const defaultTenant = "default"
-
 // normalizeTenant maps a missing tenant claim to the default tenant. It is
 // the single normalisation shared by WebSocket session creation, the
 // (tenant, user) index and the persisted store, so the same tokenless-tenant
 // user always resolves to the same tenant.
 func normalizeTenant(t string) string {
 	if t == "" {
-		return defaultTenant
+		return domain.DefaultTenantID.String()
 	}
 	return t
 }
@@ -987,7 +984,7 @@ func (m *Manager) registerSession(session *Session) bool {
 			delete(m.sessions, existing.ID)
 			// Also remove from persistent store
 			if m.sessionStore != nil {
-				_ = m.sessionStore.Delete(context.Background(), existing.ID)
+				_ = m.sessionStore.Delete(context.Background(), existing.TenantID, existing.UserID, existing.ID)
 			}
 		}
 	}
@@ -1026,7 +1023,7 @@ func (m *Manager) unregisterSession(session *Session) {
 
 	// Remove from persistent store
 	if m.sessionStore != nil {
-		_ = m.sessionStore.Delete(context.Background(), session.ID)
+		_ = m.sessionStore.Delete(context.Background(), session.TenantID, session.UserID, session.ID)
 	}
 
 	// "session" (session.logger's bound field) is the user's short ID, not
