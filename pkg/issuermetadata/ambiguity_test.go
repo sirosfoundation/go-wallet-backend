@@ -92,7 +92,7 @@ func ingresses() []ingress {
 					[]byte(strings.ReplaceAll(strings.ReplaceAll(doc, "ISS", srv.URL), `"iat":1`, fmt.Sprintf(`"iat":%d`, time.Now().Unix()))))))
 			}))
 			t.Cleanup(srv.Close)
-			r, err := New(Config{CacheTTL: time.Minute, AllowHTTP: true})
+			r, err := New(Config{HTTPClient: testHTTPClient(), CacheTTL: time.Minute, AllowHTTP: true})
 			if err != nil {
 				t.Fatal(err)
 			}
