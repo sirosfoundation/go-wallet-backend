@@ -3200,64 +3200,34 @@ func credentialToString(cred interface{}) string {
 // code the engine relays to the wallet unchanged.
 const auxiliaryDataConflictCode = "auxiliary_data_conflict"
 
-// isAuxiliaryDataConflict reports whether a credential endpoint error response
-// is an auxiliary_data_conflict: HTTP 400 with the OAuth error code exactly
-// auxiliary_data_conflict. Only the code is read, never error_description.
-func isAuxiliaryDataConflict(status int, body []byte) bool {
-	if status != http.StatusBadRequest {
-		return false
-	}
-	// Exact "error" key: struct decoding is case-insensitive, so a look-alike
-	// key could otherwise overwrite the code and hide a terminal conflict.
-	var m map[string]json.RawMessage
-	if json.Unmarshal(body, &m) != nil {
-		return false
-	}
-	var code string
-	return json.Unmarshal(m["error"], &code) == nil && code == auxiliaryDataConflictCode
-}
-
-// hasRepeatedErrorMember reports whether the top-level JSON object of body has
-// more than one member named "error" in any letter case. A body that is not a
-// JSON object is not judged here.
-func hasRepeatedErrorMember(body []byte) bool {
-	dec := json.NewDecoder(bytes.NewReader(body))
-	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
-		return false
-	}
-	n := 0
-	for dec.More() {
-		keyTok, err := dec.Token()
-		key, ok := keyTok.(string)
-		if err != nil || !ok {
-			return false
-		}
-		var skip json.RawMessage
-		if dec.Decode(&skip) != nil {
-			return false
-		}
-		if strings.EqualFold(key, "error") {
-			n++
-		}
-	}
-	return n > 1
+// errorBodyWire is the member of a credential endpoint error body the engine
+// classifies on.
+type errorBodyWire struct {
+	Error string `json:"error"`
 }
 
 // auxiliaryDataConflictError relays the issuer's auxiliary_data_conflict, if
-// body is one, as a flow error with code AUXILIARY_DATA_CONFLICT and the
-// issuer's code under details.error, and returns the error to fail the flow
+// the 400 body is one, as a flow error with code AUXILIARY_DATA_CONFLICT and
+// the issuer's code under details.error, and returns the error to fail the flow
 // with; nil when the response is not a conflict. No other issuer text is
 // relayed.
+//
+// The body is read once, strictly (see decodeStrict). One that repeats a member
+// or spells one in another case is read differently by different decoders, so
+// it cannot be classified: it might be a conflict whose text echoes a
+// commitment. Such a body is terminal and generic, and nothing of it is
+// retried on, logged or returned.
 func (h *OID4VCIHandler) auxiliaryDataConflictError(status int, body []byte) error {
-	if status == http.StatusBadRequest && hasRepeatedErrorMember(body) {
-		// A repeated (or case-variant) "error" member is read differently by
-		// different decoders, so the response cannot be classified: it might be
-		// a conflict whose text echoes a commitment. Terminal, generic, and
-		// nothing of the body is retried on, logged or returned.
+	if status != http.StatusBadRequest {
+		return nil
+	}
+	var e errorBodyWire
+	err := decodeStrict(body, &e)
+	if errors.Is(err, errAmbiguousJSON) {
 		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 		return errors.New("credential endpoint returned an ambiguous error response")
 	}
-	if !isAuxiliaryDataConflict(status, body) {
+	if err != nil || e.Error != auxiliaryDataConflictCode {
 		return nil
 	}
 	_ = h.ErrorWithDetails(StepRequestingCredential, ErrCodeAuxiliaryDataConflict,

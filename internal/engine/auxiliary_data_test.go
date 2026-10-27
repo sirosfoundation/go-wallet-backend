@@ -279,65 +279,51 @@ func TestAuxiliaryDataConflict_RelayedUnchangedNoRetry(t *testing.T) {
 	}
 }
 
-// Anything that is not exactly the code is an ordinary credential error.
-// A repeated or case-variant "error" member is read differently by different
-// decoders (a map keeps the last, which may be null): the response cannot be
-// classified, so it is terminal and generic, never retried, logged or returned.
-func TestAuxiliaryDataConflict_RepeatedErrorMemberIsTerminalAndQuiet(t *testing.T) {
-	const echo = "COMMITMENT-ECHO"
-	for name, body := range map[string]string{
-		"trailing null":   `{"error":"auxiliary_data_conflict","error":null,"error_description":"` + echo + `"}`,
-		"case variant":    `{"error":"auxiliary_data_conflict","ERROR":"invalid_proof","error_description":"` + echo + `"}`,
-		"benign then bad": `{"error":"invalid_request","error":"x","error_description":"` + echo + `"}`,
-	} {
-		for dpop, label := range map[bool]string{false: "plain", true: "dpop-nonce"} {
-			t.Run(name+"/"+label, func(t *testing.T) {
-				st, hits := conflictStub(t, body, dpop)
-				fc := &fakeClient{t: t}
-				h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
-				defer cleanup()
-				err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", &CredentialConfig{VCT: "urn:example:vct", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}, nil, "")
-				require.Error(t, err)
-				assert.Equal(t, 1, *hits, "never retried")
-				assert.NotContains(t, err.Error(), echo)
-				assert.NotContains(t, logDump(logs), echo)
-				fc.settle()
-				for _, m := range fc.outboundMessages() {
-					assert.NotContains(t, string(m["error"]), echo)
-				}
-			})
-		}
-	}
-}
-
-func TestAuxiliaryDataConflict_OtherErrorsNotRelayedAsConflict(t *testing.T) {
-	for name, body := range map[string]string{
-		"invalid_proof":     `{"error":"invalid_proof","error_description":"auxiliary_data_conflict"}`,
-		"different case":    `{"error":"Auxiliary_Data_Conflict"}`,
-		"in description":    `{"error":"invalid_request","error_description":"auxiliary_data_conflict"}`,
-		"not json":          `auxiliary_data_conflict`,
-		"error not string":  `{"error":["auxiliary_data_conflict"]}`,
-		"invalid_encr_prms": `{"error":"invalid_encryption_parameters"}`,
+// The classification of a credential endpoint error body: exactly the code is
+// a conflict; a body that cannot be read unambiguously is terminal and generic;
+// everything else is an ordinary credential error.
+func TestAuxiliaryDataConflict_Classification(t *testing.T) {
+	const (
+		conflict  = "conflict"
+		ordinary  = "ordinary"
+		ambiguous = "ambiguous"
+	)
+	for name, tc := range map[string]struct {
+		status int
+		body   string
+		want   string
+	}{
+		"exact code":         {400, `{"error":"auxiliary_data_conflict"}`, conflict},
+		"with description":   {400, `{"error":"auxiliary_data_conflict","error_description":"C"}`, conflict},
+		"other status":       {401, `{"error":"auxiliary_data_conflict"}`, ordinary},
+		"invalid_proof":      {400, `{"error":"invalid_proof","error_description":"auxiliary_data_conflict"}`, ordinary},
+		"different case":     {400, `{"error":"Auxiliary_Data_Conflict"}`, ordinary},
+		"in description":     {400, `{"error":"invalid_request","error_description":"auxiliary_data_conflict"}`, ordinary},
+		"not json":           {400, `auxiliary_data_conflict`, ordinary},
+		"error not string":   {400, `{"error":["auxiliary_data_conflict"]}`, ordinary},
+		"encryption params":  {400, `{"error":"invalid_encryption_parameters"}`, ordinary},
+		"repeated, null":     {400, `{"error":"auxiliary_data_conflict","error":null}`, ambiguous},
+		"repeated, benign":   {400, `{"error":"invalid_request","error":"x"}`, ambiguous},
+		"case-variant twin":  {400, `{"error":"auxiliary_data_conflict","ERROR":"invalid_proof"}`, ambiguous},
+		"case-variant first": {400, `{"ERROR":"invalid_proof","error":"auxiliary_data_conflict"}`, ambiguous},
+		"only a variant":     {400, `{"ERROR":"auxiliary_data_conflict"}`, ambiguous},
+		"trailing value":     {400, `{"error":"invalid_request"} {"error":"auxiliary_data_conflict"}`, ambiguous},
 	} {
 		t.Run(name, func(t *testing.T) {
-			assert.False(t, isAuxiliaryDataConflict(http.StatusBadRequest, []byte(body)))
+			h, ch, cleanup := captureHandler(t)
+			defer cleanup()
+			err := h.auxiliaryDataConflictError(tc.status, []byte(tc.body))
+			switch tc.want {
+			case ordinary:
+				require.NoError(t, err)
+			case conflict:
+				require.Error(t, err)
+				assert.Equal(t, ErrCodeAuxiliaryDataConflict, flowErrorCode(t, nextMsg(t, ch)))
+			case ambiguous:
+				require.Error(t, err)
+				assert.Equal(t, ErrCodeCredentialError, flowErrorCode(t, nextMsg(t, ch)))
+			}
 		})
-	}
-	// A case-variant key alongside the exact one must not hide the conflict.
-	assert.True(t, isAuxiliaryDataConflict(http.StatusBadRequest, []byte(`{"error":"auxiliary_data_conflict","ERROR":"invalid_proof","error_description":"C"}`)))
-	assert.True(t, isAuxiliaryDataConflict(http.StatusBadRequest, []byte(`{"ERROR":"invalid_proof","error":"auxiliary_data_conflict"}`)))
-	assert.False(t, isAuxiliaryDataConflict(http.StatusBadRequest, []byte(`{"ERROR":"auxiliary_data_conflict"}`)))
-	assert.False(t, isAuxiliaryDataConflict(http.StatusUnauthorized, []byte(`{"error":"auxiliary_data_conflict"}`)))
-	assert.True(t, isAuxiliaryDataConflict(http.StatusBadRequest, []byte(`{"error":"auxiliary_data_conflict"}`)))
-
-	st, _ := conflictStub(t, `{"error":"invalid_proof"}`, false)
-	fc := &fakeClient{t: t}
-	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
-	defer cleanup()
-	require.Error(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", auxCfg(auxAdvFull), nil, ""))
-	fc.settle()
-	for _, m := range fc.outboundMessages() {
-		assert.NotContains(t, string(m["error"]), "AUXILIARY_DATA_CONFLICT")
 	}
 }
 

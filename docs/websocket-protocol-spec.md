@@ -764,18 +764,27 @@ credential_configurations_supported[cfg].auxiliary_data_supported
   `required: true` entry is sent are rules of Credential Auxiliary Data section
   6.4 that the issuer owns and enforces (and answers with `invalid_proof`). The
   engine checks one thing of its own before a proof is forwarded: no
-  entry carries an `opening`, a secret the engine must never relay (the member
-  name is matched in any letter case, at any depth, in an entry of any type, and
-  on the raw JSON so a repeated member cannot hide it; a repeated or
-  case-variant `auxiliary_data` member is refused). When the issuer advertised `to_issuer` entries the engine also refuses a
+  entry carries an `opening`, a secret the engine must never relay (an `opening`
+  member anywhere in the claim). When the issuer advertised `to_issuer` entries the engine also refuses a
   proof it cannot inspect (a type other than `jwt` or `attestation`, an unreadable
-  JWT, an `auxiliary_data` claim that is not an array). A violation
+JWT, an `auxiliary_data` claim that is not an array). A violation
   fails the flow with `AUXILIARY_DATA_PROOF_INVALID`, step `requesting_credential`,
   and no request reaches the issuer. The engine never logs or returns a
   commitment or opening value. For a credential configuration that advertises
   `auxiliary_data_supported`, an error response from the credential endpoint is
   neither logged nor returned beyond its OAuth error code, because the issuer's
   text may echo a commitment.
+
+JSON that an issuer or the client hands the engine for secret delivery (an
+advertisement, a credential endpoint error body, a key proof payload) is read in
+one strict decoding step before it is decoded into typed values. It is refused
+when an object repeats a member name, has two names that differ only in letter
+case, spells a member this section names (`type`, `alg`, `path`, `opening`,
+`commitment`, `error`, ...) in another letter case, or has data after the value;
+the refusal says why and never quotes the document. A proof or error body
+refused this way is never forwarded, relayed or retried, whether or not
+`to_issuer` entries were advertised. Issuer metadata is public: the engine does
+not scan the retained `signed_metadata` JWT.
 
 If the credential endpoint answers HTTP 400 with the OAuth error code
 `auxiliary_data_conflict` (an entry conflicts with a value the issuer holds for
