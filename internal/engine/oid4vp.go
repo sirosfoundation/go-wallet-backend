@@ -2150,7 +2150,7 @@ func validateResponseJWE(jwe string, want *ResponseEncryption) error {
 	if len(jwe) > maxResponseJWEBytes {
 		return errors.New("direct_post.jwt: response_jwe is too large")
 	}
-	parts := strings.Split(jwe, ".")
+	parts := strings.SplitN(jwe, ".", 6)
 	if len(parts) != 5 {
 		return errors.New("direct_post.jwt: response_jwe is not a compact JWE")
 	}
