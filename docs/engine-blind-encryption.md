@@ -91,9 +91,11 @@ read what it relays (OID4VCI section 13.4 covers this setup). The honest-but-cur
    https://github.com/sirosfoundation/go-wallet-backend/pull/480 (not part of
    this PR; this branch still carries the old engine-side seed handling until
    that PR lands). Whatever the wallet validates and stores from the decrypted
-   response stays wallet-side: `credential_count` and `transaction_id` remain
-   the only client-supplied answers in the encrypted-response relay, and the
-   engine never receives auxiliary data from the client.
+   response stays wallet-side: the only client-supplied answers in the
+   encrypted-response relay stay `credential_count` (1 to 256) or
+   `transaction_id` (with an optional `interval`), or an `error` whose text the
+   engine never logs or relays; the engine never receives auxiliary data from
+   the client.
 10. If the issuer offers no response encryption, the response is plaintext and
     the engine sees it; that is the issuer's choice.
 

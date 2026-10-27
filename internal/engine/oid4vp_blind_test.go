@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -390,15 +391,29 @@ func TestRequestVPSignature_DirectPostJWT_Refusals(t *testing.T) {
 				assert.NotContains(t, fmt.Sprintf("%v %v", e.Message, e.ContextMap()), blindSentinel)
 			}
 
-			// The verifier is told access_denied, with the generic description.
-			posted := make(chan url.Values, 1)
+			// A direct_post.jwt verifier is NOT contacted: an error for that mode
+			// must be a JARM JWT, and the plain form fields would be rejected.
+			var hits atomic.Int32
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				_ = r.ParseForm()
-				posted <- r.PostForm
+				hits.Add(1)
 			}))
 			defer srv.Close()
 			f.authReq.ResponseURI = srv.URL
 			f.h.httpClient = srv.Client()
+			assert.Empty(t, f.h.refuseVerifierOnEncryptionError(context.Background(), f.authReq, err))
+			assert.Zero(t, hits.Load(), "no plain error post to a direct_post.jwt verifier")
+
+			// The same refusal in a plain response mode still tells the verifier
+			// access_denied with the generic description.
+			posted := make(chan url.Values, 1)
+			srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = r.ParseForm()
+				posted <- r.PostForm
+			}))
+			defer srv2.Close()
+			f.authReq.ResponseMode = ResponseModeDirectPost
+			f.authReq.ResponseURI = srv2.URL
+			f.h.httpClient = srv2.Client()
 			f.h.refuseVerifierOnEncryptionError(context.Background(), f.authReq, err)
 			form := <-posted
 			assert.Equal(t, "access_denied", form.Get("error"))
@@ -408,40 +423,27 @@ func TestRequestVPSignature_DirectPostJWT_Refusals(t *testing.T) {
 	}
 }
 
-func TestFailSign_RedirectURIReachesFlowError(t *testing.T) {
-	for name, tc := range map[string]struct {
-		body string
-		want any
-	}{
-		"redirect":    {`{"redirect_uri":"https://verifier.example/done"}`, "https://verifier.example/done"},
-		"no redirect": {`{}`, nil},
-	} {
-		t.Run(name, func(t *testing.T) {
-			f := newBlindFixture(t)
-			defer f.cleanup()
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				require.NoError(t, r.ParseForm())
-				assert.Equal(t, "access_denied", r.PostForm.Get("error"))
-				assert.Equal(t, verifierRefusedDescription, r.PostForm.Get("error_description"))
-				_, _ = w.Write([]byte(tc.body))
-			}))
-			defer srv.Close()
-			f.authReq.ResponseURI = srv.URL
-			f.h.httpClient = srv.Client()
+func TestFailSign_DirectPostJWTDoesNotContactVerifier(t *testing.T) {
+	f := newBlindFixture(t)
+	defer f.cleanup()
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		_, _ = w.Write([]byte(`{"redirect_uri":"https://verifier.example/done"}`))
+	}))
+	defer srv.Close()
+	f.authReq.ResponseURI = srv.URL
+	f.h.httpClient = srv.Client()
 
-			f.h.failSign(context.Background(), f.authReq, &responseEncryptionError{errors.New("SECRET detail")})
-			msg := awaitMessage(t, f.received, string(TypeFlowError))
-			flowErr := msg["error"].(map[string]any)
-			assert.Equal(t, string(ErrCodeSignError), flowErr["code"])
-			details, _ := flowErr["details"].(map[string]any)
-			assert.Equal(t, tc.want, details["redirect_uri"])
-			if tc.want == nil {
-				assert.Empty(t, details)
-			}
-			b, _ := json.Marshal(msg)
-			assert.NotContains(t, string(b), "SECRET")
-		})
-	}
+	f.h.failSign(context.Background(), f.authReq, &responseEncryptionError{errors.New("SECRET detail")})
+	msg := awaitMessage(t, f.received, string(TypeFlowError))
+	flowErr := msg["error"].(map[string]any)
+	assert.Equal(t, string(ErrCodeSignError), flowErr["code"])
+	details, _ := flowErr["details"].(map[string]any)
+	assert.Empty(t, details)
+	assert.Zero(t, hits.Load())
+	b, _ := json.Marshal(msg)
+	assert.NotContains(t, string(b), "SECRET")
 }
 
 func TestResolveResponseEncryption_KeyAlgMismatch(t *testing.T) {

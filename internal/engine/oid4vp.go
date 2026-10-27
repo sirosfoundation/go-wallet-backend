@@ -2081,6 +2081,14 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 func (h *OID4VPHandler) refuseVerifierOnEncryptionError(ctx context.Context, authReq *AuthorizationRequest, err error) string {
 	var encErr *responseEncryptionError
 	if errors.As(err, &encErr) {
+		if authReq.ResponseMode == ResponseModeDirectPostJWT {
+			// An error for direct_post.jwt must itself be a JWT (JARM), which
+			// submitErrorResponse does not build: it posts plain form fields
+			// that such a verifier rejects. As in failTransactionData, the
+			// verifier is not contacted and its session ends by timeout.
+			h.Logger.Info("not notifying a direct_post.jwt verifier of the response encryption failure: error responses in this mode are not implemented")
+			return ""
+		}
 		return h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)
 	}
 	return ""
