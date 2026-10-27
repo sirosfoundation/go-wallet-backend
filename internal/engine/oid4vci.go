@@ -1936,9 +1936,43 @@ func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMe
 	// Token exchange with DPoP nonce (RFC 9449 §8) and attestation challenge
 	// (attestation-based client auth) retries.
 	for attempt := 0; attempt < 3; attempt++ {
-		resp, err := h.sendTokenRequest(ctx, metadata, tokenEndpoint, setGrantParams)
+		// Resolve client auth first: whether the request is attested decides
+		// the form-body auth, and each attempt needs a fresh DPoP proof (new
+		// nonce) and, in client-held mode, a fresh attestation PoP.
+		auth, err := h.resolveClientAuth(ctx, clientAuthNeeds{
+			attestation: true,
+			dpop:        true,
+			htm:         "POST",
+			htu:         tokenEndpoint,
+		})
 		if err != nil {
 			return nil, err
+		}
+
+		data := url.Values{}
+		setGrantParams(data)
+		// RFC 8707 resource indicator (cross-origin AS/issuer only): applied here
+		// so every grant type (pre-authorized_code, authorization_code,
+		// refresh_token) audience-restricts the access token to the Credential
+		// Issuer, matching the PAR-time decision (both derive it from the same
+		// metadata, as RFC 8707 requires).
+		if !sameOrigin(h.authServerIssuer, metadata.CredentialIssuer) {
+			data.Set("resource", metadata.CredentialIssuer)
+		}
+		if err := h.setClientAuth(data, auth.attested()); err != nil {
+			return nil, err
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "POST", tokenEndpoint, strings.NewReader(data.Encode()))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		auth.apply(req)
+
+		resp, err := h.httpClient.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("token request failed: %w", err)
 		}
 
 		// Check for DPoP nonce requirement — retry with server-provided nonce
@@ -1974,49 +2008,6 @@ func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMe
 	}
 
 	return nil, fmt.Errorf("%s request failed after nonce/challenge retries", logContext)
-}
-
-// sendTokenRequest builds and sends one token request. Resolving client auth
-// comes first: whether the request is attested decides the form-body auth, and
-// each attempt needs a fresh DPoP proof (new nonce) and, in client-held mode, a
-// fresh attestation PoP.
-func (h *OID4VCIHandler) sendTokenRequest(ctx context.Context, metadata *IssuerMetadata, tokenEndpoint string, setGrantParams func(data url.Values)) (*http.Response, error) {
-	auth, err := h.resolveClientAuth(ctx, clientAuthNeeds{
-		attestation: true,
-		dpop:        true,
-		htm:         "POST",
-		htu:         tokenEndpoint,
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	data := url.Values{}
-	setGrantParams(data)
-	// RFC 8707 resource indicator (cross-origin AS/issuer only): applied here
-	// so every grant type (pre-authorized_code, authorization_code,
-	// refresh_token) audience-restricts the access token to the Credential
-	// Issuer, matching the PAR-time decision (both derive it from the same
-	// metadata, as RFC 8707 requires).
-	if !sameOrigin(h.authServerIssuer, metadata.CredentialIssuer) {
-		data.Set("resource", metadata.CredentialIssuer)
-	}
-	if err := h.setClientAuth(data, auth.attested()); err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", tokenEndpoint, strings.NewReader(data.Encode()))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	auth.apply(req)
-
-	resp, err := h.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("token request failed: %w", err)
-	}
-	return resp, nil
 }
 
 // exchangeRefreshToken performs an OAuth 2.0 refresh_token grant against the
