@@ -297,3 +297,26 @@ func TestParseRequestJWT_RefusesOversizeRequestObject(t *testing.T) {
 	assert.Contains(t, err.Error(), "exceeds")
 	assert.NotContains(t, err.Error(), "AAAA", "the value is never echoed")
 }
+
+func TestExtractRawClientMetadata_RefusesDuplicateMembers(t *testing.T) {
+	big := strings.Repeat("a", 100)
+	for name, obj := range map[string]string{
+		"exact duplicate":  `{"client_metadata":{"client_name":"` + big + `"},"client_metadata":{}}`,
+		"case variant":     `{"client_metadata":{"client_name":"x"},"Client_Metadata":{}}`,
+		"separated by key": `{"client_metadata":{},"nonce":"n","CLIENT_METADATA":{"a":1}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := extractRawClientMetadata([]byte(obj))
+			require.ErrorIs(t, err, errClientMetadataDuplicate)
+		})
+	}
+	raw, err := extractRawClientMetadata([]byte(`{"nonce":"n","x":{"client_metadata":{}},"client_metadata":{"a":1}}`))
+	require.NoError(t, err, "a nested client_metadata is not a duplicate")
+	assert.JSONEq(t, `{"a":1}`, string(raw))
+
+	// Both request-object paths go through it.
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}}
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"client_metadata":{"a":1},"client_metadata":{}}`))
+	_, err = h.parseRequestJWT("e30." + payload + ".sig")
+	require.ErrorIs(t, err, errClientMetadataDuplicate)
+}

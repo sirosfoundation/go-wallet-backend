@@ -1716,11 +1716,45 @@ func rawObject(raw json.RawMessage) json.RawMessage {
 	return nil
 }
 
+var errClientMetadataDuplicate = errors.New("client_metadata appears more than once in the request")
+
+// countClientMetadataMembers counts the top-level members of the JSON object
+// whose name matches client_metadata the way encoding/json does (ASCII case
+// folding). A malformed or non-object input yields 0; the caller's own decode
+// reports it.
+func countClientMetadataMembers(object []byte) int {
+	dec := json.NewDecoder(bytes.NewReader(object))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return 0
+	}
+	n := 0
+	for dec.More() {
+		k, err := dec.Token()
+		if err != nil {
+			return n
+		}
+		if name, ok := k.(string); ok && strings.EqualFold(name, "client_metadata") {
+			n++
+		}
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return n
+		}
+	}
+	return n
+}
+
 // extractRawClientMetadata returns the request object's client_metadata
 // member verbatim, or nil when it is absent or not an object.
 // It fails with errClientMetadataTooLarge when the member exceeds
 // MaxClientMetadataBytes.
 func extractRawClientMetadata(requestObject []byte) (json.RawMessage, error) {
+	if countClientMetadataMembers(requestObject) > 1 {
+		// The typed decoder merges every occurrence while this raw copy keeps
+		// the last, so a duplicate would let an oversized earlier object stay in
+		// the engine past the size bound. Go also matches names case-insensitively.
+		return nil, errClientMetadataDuplicate
+	}
 	var probe struct {
 		ClientMetadata json.RawMessage `json:"client_metadata"`
 	}
