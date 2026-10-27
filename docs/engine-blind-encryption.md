@@ -8,8 +8,8 @@ passes the client's encryption JWK to the issuer and relays the issuer's JWE
 with `decrypt_credential_response`. Clients must implement it; there is no
 fallback.
 
-The engine relays ciphertext and never sees credential contents, the
-`org.siros.secret_seed`, or a `vp_token`. It still sees metadata: which issuer
+The engine relays ciphertext and never sees credential contents, any secret
+the issuer delivers alongside a credential, or a `vp_token`. It still sees metadata: which issuer
 or verifier, the public verifier request, timing and sizes. Every key used for
 this lives in the client (wallet-frontend, Kotlin SDK, Swift SDK). The change
 is made in the engine and the clients together; there is no fallback for
@@ -21,7 +21,7 @@ Before this change the engine generated the OID4VCI response-encryption key and
 decrypted the issuer's JWE itself, and it built and encrypted the OID4VP
 `direct_post.jwt` response. So the engine process, and any TLS terminator in
 front of it, saw every issued credential, every presentation and every
-delivered seed in clear. Seed delivery (privatedata-spec section 5A) requires
+issuer-delivered secret in clear. Delivering a secret to the wallet requires
 an encrypted issuer response, which made that exposure unavoidable.
 
 ## Threat model
@@ -52,7 +52,7 @@ read what it relays (OID4VCI section 13.4 covers this setup). The honest-but-cur
    negotiates the pair from issuer metadata. Supported: `ECDH-ES`,
    `ECDH-ES+A128KW`, `ECDH-ES+A256KW` with `A128GCM`, `A256GCM`,
    `A128CBC-HS256`, `A256CBC-HS512`. It is present when the issuer supports
-   response encryption or advertises `org.siros.secret_seed`.
+   response encryption.
 2. The client generates a fresh ephemeral P-256 key per `generate_proof`
    request, keeps the private key in memory keyed by flow id, and returns the
    public JWK as `credential_response_encryption_jwk` in the `sign_response`
@@ -77,17 +77,23 @@ read what it relays (OID4VCI section 13.4 covers this setup). The honest-but-cur
    marks it. The client fills entry i from the i-th decrypted credential; a
    count mismatch is an error. For an encrypted response `flow_complete` carries
    no `credential_metadata`. For a plain response the engine may relay only the
-   display-only members (`display`, `claims`); extension members such as
-   `org.siros.secret_seed` are never relayed from a plain response (the engine
-   drops them, and a plain response carrying a seed fails the issuance). Clients
-   ignore extension members arriving in `flow_complete`.
+   display-only members (`display`, `claims`); extension members are never
+   relayed from a plain response (the engine drops them). Clients ignore
+   extension members arriving in `flow_complete`.
 8. The client sends the `notification_id` itself in `credential_notification`;
    the engine's notification context holds an empty id, which already matches
    any.
-9. Seed validation, size and depth caps, "a seed needs an encrypted response and
-   a notification_id", strip-before-merge and the `SHA256(seed) == ssc` check
-   are wallet-side. The engine keeps only the rule that an advertised
-   `org.siros.secret_seed` makes `required` true.
+9. Seed delivery is gone. The superseded shapes (`org.siros.secret_seed`,
+   `org.siros.holder_commitments`, `org.siros.psc`, `secret_members`) are
+   refused by the wallet clients, on immediate, deferred and plain
+   completions. The replacement is Credential Auxiliary Data (`auxiliary_data`),
+   implemented in the engine by
+   https://github.com/sirosfoundation/go-wallet-backend/pull/480 (not part of
+   this PR; this branch still carries the old engine-side seed handling until
+   that PR lands). Whatever the wallet validates and stores from the decrypted
+   response stays wallet-side: `credential_count` and `transaction_id` remain
+   the only client-supplied answers in the encrypted-response relay, and the
+   engine never receives auxiliary data from the client.
 10. If the issuer offers no response encryption, the response is plaintext and
     the engine sees it; that is the issuer's choice.
 
@@ -165,5 +171,4 @@ copy is silently dropped. The sign result is decoded from JSON as is, so
 
 ## Residuals
 
-The engine still sees proof JWTs (holder public key; the `psc` commitment is
-hiding by design), the verifier request, DPoP traffic, timing and sizes.
+The engine still sees proof JWTs (holder public key), the verifier request, DPoP traffic, timing and sizes.

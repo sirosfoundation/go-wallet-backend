@@ -613,19 +613,15 @@ no credential value and no `credential_metadata`:
 (and no `notification_id`); the client pairs entry `i` with the `i`-th
 credential it decrypted itself (see "Credential response encryption" below), and
 a count mismatch is an error on the client. The response-level
-`credential_metadata` (OpenID4VCI 1.1, openid/OpenID4VCI#721), which may carry
-`org.siros.secret_seed`, is never relayed by the engine: the client already holds
-it from its own decryption. An issuer that does not encrypt its response is
+`credential_metadata` (OpenID4VCI 1.1, openid/OpenID4VCI#721), is never relayed by
+the engine: the client already holds it from its own decryption. An issuer that does not encrypt its response is
 visible to the engine, which relays its credentials as before (no
 `credential_response_encrypted`, `credential` present). For such a plain
 response `flow_complete` also carries a top-level `credential_metadata`
 containing ONLY the display-only members `display` and `claims` of the
 response-level `credential_metadata` (omitted when it has neither); every other
-member (extensions) is dropped by the engine and never relayed or logged. A plain
-response whose `credential_metadata` carries `org.siros.secret_seed` is refused
-with `CREDENTIAL_ERROR` and no `flow_complete`, advertised or not (privatedata-spec
-5A.4); errors and logs contain no values. Clients ignore extension members
-arriving in `flow_complete`. An encrypted response never yields `credential_metadata`
+member (extensions) is dropped by the engine and never relayed or logged. Clients
+ignore extension members arriving in `flow_complete`. An encrypted response never yields `credential_metadata`
 on `flow_complete`.
 
 #### Credential response encryption (engine-blind)
@@ -647,12 +643,11 @@ response in clear. Every key lives in the client.
        "credential_response_encryption": { "alg": "ECDH-ES", "enc": "A256GCM", "required": true } } }
    ```
 
-   `required` is `true` when the issuer marks encryption as required or the
-   configuration advertises `org.siros.secret_seed`
-   (`credential_configurations_supported[cfg].credential_metadata["org.siros.secret_seed"]
-   = {"namespaces": [...]}`, privatedata-spec 5A.4). A seed advertisement with no
-   usable issuer encryption (none offered, or no mutually supported pair) fails
-   the issuance with `CREDENTIAL_ERROR` before any request is sent. A configuration
+   `required` is `true` when the issuer marks encryption as required. (The
+   superseded `org.siros.secret_seed` advertisement also forced it on and
+   failed the issuance without usable encryption; that handling is removed by
+   https://github.com/sirosfoundation/go-wallet-backend/pull/480, and the wallet
+   clients now refuse the seed shapes.) A configuration
    without `proof_types_supported` still gets this request when encryption is
    wanted: it is then for the key alone and the client returns no proofs.
 2. **Key.** The client generates a FRESH ephemeral P-256 key per `generate_proof`
@@ -688,10 +683,13 @@ response in clear. Every key lives in the client.
    `deferred` is always present. A body that is not a compact JWE (empty,
    JSON, ...) is refused with no relay.
 5. **Answer.** The client decrypts with the flow's key, STORES the credentials and
-   the response-level `credential_metadata` locally, validates the seed
-   (privatedata-spec 5A: namespaces, hex, size/depth caps, "a seed needs an
-   encrypted response and a non-empty `notification_id`", strip-before-merge,
-   `SHA256(seed) == ssc`) and answers with control fields ONLY:
+   the response-level `credential_metadata` locally, validates what it needs
+   from it (the superseded seed shapes `org.siros.secret_seed`,
+   `org.siros.holder_commitments`, `org.siros.psc` and `secret_members` are
+   refused; Credential Auxiliary Data, `auxiliary_data`, is the replacement,
+   implemented in the engine by
+   https://github.com/sirosfoundation/go-wallet-backend/pull/480) and answers
+   with control fields ONLY:
 
    ```
    { "type": "sign_response", "credential_count": 2 }                 // credentials issued
@@ -709,8 +707,7 @@ response in clear. Every key lives in the client.
    encryption or the request asks for an encrypted response. Each encrypted answer
    goes through step 4 with `"deferred": true`; an answer that again reports a
    `transaction_id` keeps the polling going. (Before this change the engine did
-   not decrypt deferred answers at all.) A plain deferred answer to a
-   seed-advertising configuration is refused unread.
+   not decrypt deferred answers at all.)
 7. **Notification.** The client supplies `notification_id` (from the decrypted
    body) in `credential_notification`. For an encrypted response the engine
    registers its notification context with an empty id, which matches any id the
@@ -718,24 +715,18 @@ response in clear. Every key lives in the client.
    issuer's own endpoint through the engine, which adds the issuer access token).
    The context is registered before the first JWE is relayed, so a
    `credential_failure` still reaches the issuer when the client rejects what it
-   decrypted (for example a seed that fails its checks).
+   decrypted (for example auxiliary data that fails its checks).
 
-What the engine still sees: the proof JWTs (holder public key; the `psc`
-commitment is hiding by design), DPoP traffic, the issuer metadata, timing and
+What the engine still sees: the proof JWTs (holder public key), DPoP traffic, the issuer metadata, timing and
 sizes, and `credential_count`/`transaction_id`/`interval`. It never sees a
-credential, a seed or the response plaintext when the issuer encrypts. The same
+credential, auxiliary data or the response plaintext when the issuer encrypts. The same
 messages are carried by the WMP sign sub-flow (go-wallet-backend#163) once its translation copies the new fields.
 
-A malformed seed advertisement (hex or other values instead of a name list,
-wrong counts, duplicate or over-long names) means the configuration is not
-offered (privatedata-spec 5A.3): the engine drops it when decoding issuer
-metadata (logging only the configuration id) and the resolve endpoint removes the
-whole configuration from the metadata it serves. For legacy signed metadata the
-resolver also keeps the original `signed_metadata` JWT, whose payload still
-carries the rejected configuration; when a configuration is removed that JWT is
-dropped from the served document too (editing the payload would break the
-signature). A valid advertisement is public names-only data and is served to the
-wallet unchanged; the wallet needs it to request encryption.
+Engine-side handling of the superseded `org.siros.secret_seed` and
+`org.siros.holder_commitments` advertisements (dropping malformed ones when
+decoding issuer metadata, sanitising them in the resolve endpoint) predates this
+change and is replaced by Credential Auxiliary Data in
+https://github.com/sirosfoundation/go-wallet-backend/pull/480.
 
 Deferred issuance:
 
