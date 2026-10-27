@@ -888,8 +888,8 @@ func (m *Manager) handleSession(session *Session) {
 
 // requiredTACForProtocol maps each flow protocol to the TAC permission its
 // action semantically requires: OID4VP shares an existing credential (read),
-// OID4VCI receives a new one (insert). Only enforced when the session
-// actually has a TAC to check - see handleFlowStart.
+// OID4VCI receives a new one (insert). Enforced for every session, including
+// one whose token carries an empty TAC - see handleFlowStart.
 var requiredTACForProtocol = map[Protocol]string{
 	ProtocolOID4VP:  "r",
 	ProtocolOID4VCI: "i",
@@ -1008,6 +1008,15 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	logger.Info("Flow completed")
 }
 
+// userRevokedAnywhere reports whether userID is revoked according to the
+// engine's own always-on signal or the optional token blacklist.
+func (m *Manager) userRevokedAnywhere(userID string) bool {
+	if m.isUserRevoked(userID) {
+		return true
+	}
+	return m.blacklist != nil && m.blacklist.IsUserRevoked(context.Background(), userID)
+}
+
 // registerSession adds session to the manager's live-session bookkeeping
 // and returns true, unless userID was revoked between validateToken's own
 // check (in handleNewConnection, immediately before this call) and this
@@ -1051,12 +1060,10 @@ func (m *Manager) registerSession(session *Session) bool {
 		session.closeWithReason("server shutting down")
 		return false
 	}
-	if session.UserID != "" {
-		if m.userRevoked(session.UserID) {
-			m.sessionsMu.Unlock()
-			session.closeWithReason("account deleted")
-			return false
-		}
+	if session.UserID != "" && m.userRevokedAnywhere(session.UserID) {
+		m.sessionsMu.Unlock()
+		session.closeWithReason("account deleted")
+		return false
 	}
 	// onSuperseded runs after sessionsMu is released: it takes the adapter's lock,
 	// and adapters take their lock before consulting the manager.
@@ -1330,13 +1337,7 @@ func (m *Manager) RevokeUser(userID string) {
 // userRevoked reports whether userID is revoked according to either the
 // engine's own always-on set or the optional token blacklist.
 func (m *Manager) userRevoked(userID string) bool {
-	if userID == "" {
-		return false
-	}
-	if m.isUserRevoked(userID) {
-		return true
-	}
-	return m.blacklist != nil && m.blacklist.IsUserRevoked(context.Background(), userID)
+	return userID != "" && m.userRevokedAnywhere(userID)
 }
 
 // isUserRevoked reports whether userID was marked revoked via RevokeUser.

@@ -37,15 +37,15 @@ func NormalizeIssuerURL(rawURL string) string {
 		return rawURL
 	}
 	if parsed.Path == "/" {
-		// Clear only the parsed root path so a "/" in the query or fragment is untouched.
-		parsed.Path = ""
-		parsed.RawPath = ""
-		// url.Parse lowercases the scheme; keep the identifier's own spelling so
-		// the root-slash and no-slash forms of "HTTPS://host" stay the same string.
-		if i := strings.Index(rawURL, ":"); i > 0 {
-			parsed.Scheme = rawURL[:i]
+		// Drop only the literal root slash, the first "/" after the authority,
+		// from the original string. Rebuilding via parsed.String() would also
+		// respell the fragment ("#" becomes "") and percent-encoding.
+		if i := strings.Index(rawURL, "//"); i >= 0 {
+			if j := strings.IndexByte(rawURL[i+2:], '/'); j >= 0 {
+				k := i + 2 + j
+				return rawURL[:k] + rawURL[k+1:]
+			}
 		}
-		return parsed.String()
 	}
 	return rawURL
 }

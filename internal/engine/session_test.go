@@ -1482,3 +1482,62 @@ func TestSession_RequestSign_ConcurrentWaitersGetOwnReplies(t *testing.T) {
 		}
 	}
 }
+
+// TestHandleNewConnection_EmptyTACRefusedOnFlowStart drives the real WebSocket
+// handshake and flow_start with real go-tokenauth tokens: a token with an
+// empty TAC is authenticated (the handshake completes) but gets no
+// permissions, so flow_start is refused for a protocol that needs one; a token
+// with a sufficient TAC works.
+func TestHandleNewConnection_EmptyTACRefusedOnFlowStart(t *testing.T) {
+	m := newManagerWithStubOID4VCIHandler(t)
+	v, key, issuer := setupEngineTokenValidatorTest(t)
+	m.SetTokenValidator(v)
+
+	server := httptest.NewServer(http.HandlerFunc(m.HandleConnection))
+	t.Cleanup(server.Close)
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	token := func(tac claims.TAC) string {
+		return signEngineToken(t, key, issuer, claims.AccessTokenClaims{
+			Claims:   gojosejwt.Claims{Audience: gojosejwt.Audience{"wallet-backend"}, Subject: "user-0123456789"},
+			TenantID: "test-tenant",
+			TAC:      tac,
+			ACR:      "urn:siros:acr:passkey",
+		})
+	}
+
+	cases := []struct {
+		name      string
+		tac       claims.TAC
+		forbidden bool
+	}{
+		{"empty TAC refused", "", true},
+		{"insufficient TAC refused", "r", true},
+		{"sufficient TAC allowed", claims.TAC(requiredTACForProtocol[ProtocolOID4VCI]), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+			require.NoError(t, err)
+			defer func() { _ = ws.Close() }()
+			require.NoError(t, ws.WriteJSON(HandshakeMessage{Message: Message{Type: TypeHandshake}, AppToken: token(tc.tac)}))
+			var complete HandshakeCompleteMessage
+			require.NoError(t, ws.ReadJSON(&complete))
+			require.Equal(t, TypeHandshakeComplete, complete.Type)
+
+			require.NoError(t, ws.WriteJSON(FlowStartMessage{
+				Message:  Message{Type: TypeFlowStart, FlowID: "flow-1234"},
+				Protocol: ProtocolOID4VCI,
+			}))
+			_ = ws.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			var fe FlowErrorMessage
+			err = ws.ReadJSON(&fe)
+			if tc.forbidden {
+				require.NoError(t, err)
+				assert.Equal(t, ErrCodeForbidden, fe.Error.Code)
+			} else {
+				assert.Error(t, err, "no flow_error expected")
+			}
+		})
+	}
+}
