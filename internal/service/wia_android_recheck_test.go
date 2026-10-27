@@ -1,0 +1,571 @@
+package service
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"math/big"
+	"sync"
+	"testing"
+	"time"
+
+	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+)
+
+// recheckClock drives both the status list's cache and the checker's notion
+// of now.
+type recheckClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *recheckClock) Now() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.t }
+func (c *recheckClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}
+
+// rcWIA is an akWIA whose clock is controlled and whose first WIA, with
+// verified evidence, has been issued.
+type rcWIA struct {
+	*akWIA
+	clock *recheckClock
+	key   *ecdsa.PrivateKey
+	jkt   string
+	// leafSerial is the serial of the leaf the evidence carried.
+	leafSerial int64
+}
+
+func newRCWIA(t *testing.T, rules string) *rcWIA { return newRCWIAWith(t, rules, nil, time.Time{}) }
+
+// newRCWIAWith issues the first WIA with the evidence adjusted by mut and a
+// leaf valid until notAfter (zero: the fixture default).
+func newRCWIAWith(t *testing.T, rules string, mut func(*kdParams), notAfter time.Time) *rcWIA {
+	t.Helper()
+	a := newAKWIA(t, rules)
+	if rules == "" {
+		a.svc.cfg.WalletProvider.Attestation.Assurance.Enabled = false
+	}
+	clock := &recheckClock{t: time.Now().UTC()}
+	a.svc.keyVerifiers[KeyAttestationAndroidKey].(*AndroidKeyAttestationVerifier).setStatusClock(clock.Now)
+	a.svc.keyChecker.now = clock.Now
+	ctx := context.Background()
+	challenge, _, err := a.svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pop, key := createTestPop(t, challenge)
+	a.fx.serial += 100
+	serial := a.fx.serial // later fixture serials count on from here
+	kd := goodParams(InstanceKeyAttestationChallenge(challenge))
+	if mut != nil {
+		mut(&kd)
+	}
+	chain := a.fx.leaf(&key.PublicKey, encodeKeyDescription(kd), leafOpts{Serial: serial, NotAfter: notAfter})
+	raw, _ := json.Marshal(map[string]any{"type": "android_key", "x5c": b64chain(chain)})
+	if _, err := a.svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{Pop: pop, Challenge: challenge, KeyAttestation: &KeyAttestation{Type: KeyAttestationAndroidKey, Raw: raw}}); err != nil {
+		t.Fatalf("first WIA: %v", err)
+	}
+	return &rcWIA{akWIA: a, clock: clock, key: key, jkt: expectedThumbprint(t, &key.PublicKey), leafSerial: serial}
+}
+
+// later issues a WIA for the same key with no key_attestation field.
+func (r *rcWIA) later() (string, error) {
+	r.t.Helper()
+	c, _, err := r.svc.CreateChallenge(context.Background(), domain.DefaultTenantID)
+	if err != nil {
+		r.t.Fatal(err)
+	}
+	return r.svc.GenerateWIA(context.Background(), domain.DefaultTenantID, nil, &WIARequest{Pop: signPopWithKey(r.t, r.key, c), Challenge: c})
+}
+
+func (r *rcWIA) revokeLeaf() {
+	r.fetch.body = `{"entries":{"` + big.NewInt(r.leafSerial).Text(16) + `":{"status":"REVOKED","reason":"KEY_COMPROMISE"}}}`
+	r.clock.Advance(2 * time.Hour) // past the cached list's life
+}
+
+func (r *rcWIA) wscd() domain.WSCDType { return instanceType(r.t, r.inst, r.jkt) }
+
+func TestRecheck_StoredRecordCarriesTheChainSerials(t *testing.T) {
+	r := newRCWIA(t, "")
+	rec := r.record(r.jkt)
+	if len(rec.CertSerials) != 3 || rec.CertSerials[0] != normalizeSerialHex(big.NewInt(r.leafSerial).Text(16)) {
+		t.Fatalf("cert serials = %v", rec.CertSerials)
+	}
+	if rec.Revoked() {
+		t.Fatal("fresh record is revoked")
+	}
+	root := sha256.Sum256(r.fx.rootDER)
+	if rec.TrustAnchorFingerprint != hex.EncodeToString(root[:]) {
+		t.Fatalf("trust anchor fingerprint = %q, want the pinned root's", rec.TrustAnchorFingerprint)
+	}
+}
+
+// A serial revoked AFTER submission flips the slot: the next WIA sees no
+// instance key, the type reads unknown, and the record is marked, not deleted.
+func TestRecheck_RevokedAfterSubmissionFlipsTheSlot(t *testing.T) {
+	r := newRCWIA(t, wiaNeedsAndroidRules)
+	// While good, a WIA with no submission still issues from the record.
+	if _, err := r.later(); err != nil {
+		t.Fatalf("good record: %v", err)
+	}
+	if r.wscd() != domain.WSCDTypeNativeAndroid {
+		t.Fatalf("wscd = %s", r.wscd())
+	}
+
+	r.revokeLeaf()
+	if _, err := r.later(); !errors.Is(err, ErrWIARefusedByPolicy) {
+		t.Fatalf("a revoked record still satisfied (instance_key (kind android_key)): %v", err)
+	}
+	rec := r.record(r.jkt) // never deleted
+	if !rec.Revoked() || rec.RevokedReason != RecheckReasonRevoked || rec.Home != domain.KeyHomeTEE {
+		t.Fatalf("record not marked: %+v", rec)
+	}
+	// The stored evidence stays marked on later reads, with no more list traffic needed.
+	calls := r.fetch.callCount()
+	if _, err := r.later(); !errors.Is(err, ErrWIARefusedByPolicy) {
+		t.Fatalf("err = %v", err)
+	}
+	if r.fetch.callCount() != calls {
+		t.Fatal("a marked record triggered another fetch")
+	}
+}
+
+// With the policy off the same WIA issues, but the instance reads wscd unknown.
+func TestRecheck_RevokedRecordReadsWSCDUnknown(t *testing.T) {
+	r := newRCWIA(t, "")
+	r.svc.cfg.WalletProvider.Attestation.Assurance.Enabled = false
+	if _, err := r.later(); err != nil || r.wscd() != domain.WSCDTypeNativeAndroid {
+		t.Fatalf("err=%v wscd=%s", err, r.wscd())
+	}
+	r.revokeLeaf()
+	if _, err := r.later(); err != nil {
+		t.Fatal(err)
+	}
+	if r.wscd() != domain.WSCDTypeUnknown {
+		t.Fatalf("wscd = %s after revocation", r.wscd())
+	}
+}
+
+// A fresh valid re-submission replaces a revoked record, whatever its rank.
+func TestRecheck_FreshSubmissionSupersedesARevokedRecord(t *testing.T) {
+	r := newRCWIA(t, wiaNeedsAndroidRules)
+	r.revokeLeaf()
+	if _, err := r.later(); !errors.Is(err, ErrWIARefusedByPolicy) {
+		t.Fatalf("err = %v", err)
+	}
+	if !r.record(r.jkt).Revoked() {
+		t.Fatal("not marked")
+	}
+	// Fresh chain (new serial, not on the list) from the same key: first a
+	// strongbox one (stronger than the revoked TEE record), then, once that
+	// is revoked too, a TEE one: weaker than the revoked strongbox record it
+	// replaces, which the no-downgrade rule must not protect.
+	for _, strong := range []bool{true, false} {
+		ctx := context.Background()
+		c, _, _ := r.svc.CreateChallenge(ctx, domain.DefaultTenantID)
+		k := goodParams(InstanceKeyAttestationChallenge(c))
+		if strong {
+			k.AttLevel, k.KmLevel = androidLevelStrongBox, androidLevelStrongBox
+		}
+		chain := r.fx.leaf(&r.key.PublicKey, encodeKeyDescription(k), leafOpts{})
+		raw, _ := json.Marshal(map[string]any{"type": "android_key", "x5c": b64chain(chain)})
+		if _, err := r.svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{Pop: signPopWithKey(t, r.key, c), Challenge: c, KeyAttestation: &KeyAttestation{Type: KeyAttestationAndroidKey, Raw: raw}}); err != nil {
+			t.Fatalf("fresh submission (strong=%v): %v", strong, err)
+		}
+		rec := r.record(r.jkt)
+		if rec.Revoked() {
+			t.Fatalf("the fresh record is marked revoked (strong=%v)", strong)
+		}
+		if _, err := r.later(); err != nil {
+			t.Fatalf("WIA from the fresh record: %v", err)
+		}
+		if want := map[bool]domain.KeyHome{true: domain.KeyHomeStrongBox, false: domain.KeyHomeTEE}[strong]; rec.Home != want {
+			t.Fatalf("home = %s, want %s", rec.Home, want)
+		}
+		if !strong {
+			break
+		}
+		// Revoke the fresh strongbox record too, to try the weaker rank next.
+		r.fetch.body = `{"entries":{"` + rec.CertSerials[0] + `":{"status":"REVOKED"}}}`
+		r.clock.Advance(2 * time.Hour)
+		if _, err := r.later(); !errors.Is(err, ErrWIARefusedByPolicy) {
+			t.Fatalf("err = %v", err)
+		}
+	}
+}
+
+// A mark is only set on the record that was found revoked: a record a fresh
+// submission replaced in the meantime is left alone.
+func TestRecheck_MarkOnlyTheRecordThatWasChecked(t *testing.T) {
+	r := newRCWIA(t, "")
+	stale := r.record(r.jkt)
+	// Replace the record with another chain (a different fingerprint).
+	repl := stale.Clone()
+	repl.ChainFingerprint = "another-chain"
+	repl.Home = domain.KeyHomeStrongBox
+	if err := r.keys.MarkKeyAttested(context.Background(), repl); err != nil {
+		t.Fatal(err)
+	}
+	ok, err := r.keys.MarkKeyRevoked(context.Background(), r.jkt, stale.ChainFingerprint, RecheckReasonRevoked, time.Now())
+	if err != nil || ok {
+		t.Fatalf("marked a record it did not check: ok=%v err=%v", ok, err)
+	}
+	if r.record(r.jkt).Revoked() {
+		t.Fatal("replacement record was marked")
+	}
+}
+
+// List unavailable: a WIA issued from the record is 503; the preview, which
+// cannot answer 503, treats the evidence as absent and falls to the lowest tier.
+func TestRecheck_StatusListUnavailable(t *testing.T) {
+	r := newRCWIA(t, wiaNeedsAndroidRules)
+	svcP, instP, keysP := previewSvc(t, wiaNeedsAndroidRules, true)
+	svcP.SetInstanceKeyChecker(r.svc.keyChecker)
+	if err := instP.Upsert(context.Background(), &domain.WalletInstance{ID: r.jkt, TenantID: domain.DefaultTenantID, Status: domain.InstanceStatusActive, LastAttestedAt: time.Now().UTC()}); err != nil {
+		t.Fatal(err)
+	}
+	putRecord(t, keysP, *r.record(r.jkt))
+	preview := func() bool {
+		t.Helper()
+		got, err := svcP.PreviewAssurance(context.Background(), &AssurancePreviewRequest{WalletInstanceID: r.jkt})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return got.WIAIssue
+	}
+	if !preview() {
+		t.Fatal("preview does not see the good record")
+	}
+
+	r.fetch.err = errors.New("status endpoint down")
+	r.clock.Advance(2 * time.Hour) // the cached list is no longer fresh
+	_, err := r.later()
+	if !errors.Is(err, ErrWIAKeyAttestationUnavailable) {
+		t.Fatalf("WIA from a record whose status cannot be checked: %v", err)
+	}
+	if preview() {
+		t.Fatal("preview used evidence it could not re-check")
+	}
+	// Nothing was marked: an outage is not a revocation.
+	if r.record(r.jkt).Revoked() {
+		t.Fatal("outage marked the record revoked")
+	}
+	// The list returns: the evidence is good again.
+	r.fetch.err = nil
+	r.clock.Advance(10 * time.Second) // past the failure backoff
+	if _, err := r.later(); err != nil {
+		t.Fatalf("after recovery: %v", err)
+	}
+	if !preview() {
+		t.Fatal("preview did not recover")
+	}
+}
+
+// chain_not_after passed: the evidence is expired and the home unknown; the
+// record is neither deleted nor marked.
+func TestRecheck_ExpiredChainIsNoEvidence(t *testing.T) {
+	r := newRCWIA(t, wiaNeedsAndroidRules)
+	rec := r.record(r.jkt)
+	if rec.ChainNotAfter.IsZero() {
+		t.Fatal("no chain_not_after recorded")
+	}
+	r.clock.t = rec.ChainNotAfter.Add(time.Second)
+	// The list is still fresh enough? Make it unusable: expiry must not need it.
+	r.fetch.err = errors.New("down")
+	if _, err := r.later(); !errors.Is(err, ErrWIARefusedByPolicy) {
+		t.Fatalf("an expired chain still backed the slot: %v", err)
+	}
+	if got := r.record(r.jkt); got.Revoked() {
+		t.Fatalf("expiry marked the record: %+v", got)
+	}
+	r.svc.cfg.WalletProvider.Attestation.Assurance.Enabled = false
+	if _, err := r.later(); err != nil || r.wscd() != domain.WSCDTypeUnknown {
+		t.Fatalf("err=%v wscd=%s", err, r.wscd())
+	}
+}
+
+// A record stored before serials were kept cannot be re-checked: unknown, fail
+// closed, without consulting the list.
+func TestRecheck_LegacyRecordWithoutSerialsIsUnknown(t *testing.T) {
+	r := newRCWIA(t, wiaNeedsAndroidRules)
+	// A second key with a record shaped as an earlier release stored it: the
+	// same evidence, but no serials.
+	key2 := genKey(t)
+	legacy := r.record(r.jkt).Clone()
+	legacy.CertSerials = nil
+	legacy.KeyThumbprint = expectedThumbprint(t, &key2.PublicKey)
+	legacy.WalletInstanceID = legacy.KeyThumbprint
+	putRecord(t, r.keys, *legacy)
+	r.key, r.jkt = key2, legacy.KeyThumbprint
+	if got := r.record(r.jkt); len(got.CertSerials) != 0 {
+		t.Fatalf("legacy record kept serials: %v", got.CertSerials)
+	}
+	calls := r.fetch.callCount()
+	if _, err := r.later(); !errors.Is(err, ErrWIARefusedByPolicy) {
+		t.Fatalf("a legacy record backed the slot: %v", err)
+	}
+	if r.fetch.callCount() != calls {
+		t.Fatal("a legacy record caused a list fetch")
+	}
+	if got := r.record(r.jkt); got.Revoked() {
+		t.Fatal("legacy record marked revoked")
+	}
+	r.svc.cfg.WalletProvider.Attestation.Assurance.Enabled = false
+	if _, err := r.later(); err != nil || r.wscd() != domain.WSCDTypeUnknown {
+		t.Fatalf("err=%v wscd=%s", err, r.wscd())
+	}
+	// A fresh submission repairs it.
+	ctx := context.Background()
+	c, _, _ := r.svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	chain := r.fx.leaf(&r.key.PublicKey, encodeKeyDescription(goodParams(InstanceKeyAttestationChallenge(c))), leafOpts{})
+	raw, _ := json.Marshal(map[string]any{"type": "android_key", "x5c": b64chain(chain)})
+	if _, err := r.svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{Pop: signPopWithKey(t, r.key, c), Challenge: c, KeyAttestation: &KeyAttestation{Type: KeyAttestationAndroidKey, Raw: raw}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.record(r.jkt); len(got.CertSerials) == 0 {
+		t.Fatal("a fresh submission did not give the record serials")
+	}
+	if r.wscd() != domain.WSCDTypeNativeAndroid {
+		t.Fatalf("wscd = %s", r.wscd())
+	}
+}
+
+// FIDO2 records are not re-checked and keep backing the slot.
+func TestRecheck_FIDO2RecordsAreNotRechecked(t *testing.T) {
+	c := newInstanceKeyChecker(zap.NewNop())
+	rec := &domain.KeyAttestationRecord{KeyThumbprint: "k", Kind: domain.KeyEvidenceFIDO2, AAGUID: "a"}
+	got, err := c.usable(context.Background(), nil, rec)
+	if err != nil || got == nil {
+		t.Fatalf("got=%v err=%v", got, err)
+	}
+	// A nil checker still lets FIDO2 through but never an android_key record.
+	var none *instanceKeyChecker
+	if got, err := none.usable(context.Background(), nil, rec); err != nil || got == nil {
+		t.Fatalf("nil checker, fido2: got=%v err=%v", got, err)
+	}
+	ak := &domain.KeyAttestationRecord{KeyThumbprint: "k", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE, CertSerials: []string{"1"}, ChainNotAfter: time.Now().Add(time.Hour)}
+	if got, err := none.usable(context.Background(), nil, ak); err != nil || got != nil {
+		t.Fatalf("nil checker must fail closed for android_key: got=%v err=%v", got, err)
+	}
+	if got, err := c.usable(context.Background(), nil, ak); err != nil || got != nil {
+		t.Fatalf("checker without an android re-check must fail closed: got=%v err=%v", got, err)
+	}
+}
+
+// resubmit sends a fresh chain for the same key (made by mut).
+func (r *rcWIA) resubmit(mut func(*kdParams)) error {
+	r.t.Helper()
+	ctx := context.Background()
+	c, _, _ := r.svc.CreateChallenge(ctx, domain.DefaultTenantID)
+	k := goodParams(InstanceKeyAttestationChallenge(c))
+	if mut != nil {
+		mut(&k)
+	}
+	chain := r.fx.leaf(&r.key.PublicKey, encodeKeyDescription(k), leafOpts{})
+	raw, _ := json.Marshal(map[string]any{"type": "android_key", "x5c": b64chain(chain)})
+	_, err := r.svc.GenerateWIA(ctx, domain.DefaultTenantID, nil, &WIARequest{Pop: signPopWithKey(r.t, r.key, c), Challenge: c, KeyAttestation: &KeyAttestation{Type: KeyAttestationAndroidKey, Raw: raw}})
+	return err
+}
+
+func (r *rcWIA) verifier() *AndroidKeyAttestationVerifier {
+	return r.svc.keyVerifiers[KeyAttestationAndroidKey].(*AndroidKeyAttestationVerifier)
+}
+
+// A configuration tightened after submission applies to the evidence already
+// stored: a renewal that submits nothing must not keep an old approval alive,
+// and relaxing the configuration restores it (nothing is marked).
+func TestRecheck_TightenedConfigurationAppliesToStoredEvidence(t *testing.T) {
+	var savedFPs map[string]struct{}
+	for name, tc := range map[string]struct {
+		weak    func(*kdParams)
+		tighten func(*AndroidKeyAttestationVerifier)
+		relax   func(*AndroidKeyAttestationVerifier)
+	}{
+		"boot state": {
+			weak:    func(k *kdParams) { k.BootState = 2 },
+			tighten: func(v *AndroidKeyAttestationVerifier) { v.policy.reject = true },
+			relax:   func(v *AndroidKeyAttestationVerifier) { v.policy.verifiedBoot = false },
+		},
+		"unlocked bootloader": {
+			weak:    func(k *kdParams) { k.Locked = false },
+			tighten: func(v *AndroidKeyAttestationVerifier) { v.policy.reject = true },
+			relax:   func(v *AndroidKeyAttestationVerifier) { v.policy.lockedBoot = false },
+		},
+		"patch level": {
+			weak:    func(k *kdParams) { k.Patch = intp(202301) },
+			tighten: func(v *AndroidKeyAttestationVerifier) { v.policy.reject, v.policy.minPatchLevel = true, 202501 },
+			relax:   func(v *AndroidKeyAttestationVerifier) { v.policy.minPatchLevel = 0 },
+		},
+		"app digest narrowed": {
+			tighten: func(v *AndroidKeyAttestationVerifier) { v.digests = map[string]struct{}{"00": {}} },
+			relax:   func(v *AndroidKeyAttestationVerifier) { v.digests = map[string]struct{}{testAppDigestHex(): {}} },
+		},
+		"package narrowed": {
+			tighten: func(v *AndroidKeyAttestationVerifier) { v.packages = map[string]struct{}{"org.other.app": {}} },
+			relax:   func(v *AndroidKeyAttestationVerifier) { v.packages = map[string]struct{}{} },
+		},
+		"all trust removed": {
+			tighten: func(v *AndroidKeyAttestationVerifier) { v.numAnchors = 0 },
+			relax:   func(v *AndroidKeyAttestationVerifier) { v.numAnchors = 1 },
+		},
+		// Roots {A, B} become {B}: what A vouched for is withdrawn while the
+		// configuration stays non-empty.
+		"one root removed, another remains": {
+			tighten: func(v *AndroidKeyAttestationVerifier) {
+				savedFPs = v.anchorFPs
+				v.anchorFPs = map[string]struct{}{"another-root-fingerprint": {}}
+			},
+			relax: func(v *AndroidKeyAttestationVerifier) { v.anchorFPs = savedFPs },
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newRCWIAWith(t, wiaNeedsAndroidRules, tc.weak, time.Time{})
+			if _, err := r.later(); err != nil {
+				t.Fatalf("under the original configuration: %v", err)
+			}
+			svcP, instP, keysP := previewSvc(t, wiaNeedsAndroidRules, true)
+			svcP.SetInstanceKeyChecker(r.svc.keyChecker)
+			if err := instP.Upsert(context.Background(), &domain.WalletInstance{ID: r.jkt, TenantID: domain.DefaultTenantID, Status: domain.InstanceStatusActive, LastAttestedAt: time.Now().UTC()}); err != nil {
+				t.Fatal(err)
+			}
+			putRecord(t, keysP, *r.record(r.jkt))
+			preview := func() bool {
+				t.Helper()
+				got, err := svcP.PreviewAssurance(context.Background(), &AssurancePreviewRequest{WalletInstanceID: r.jkt})
+				if err != nil {
+					t.Fatal(err)
+				}
+				return got.WIAIssue
+			}
+			if !preview() {
+				t.Fatal("preview does not see the record")
+			}
+
+			tc.tighten(r.verifier())
+			if _, err := r.later(); !errors.Is(err, ErrWIARefusedByPolicy) {
+				t.Fatalf("a stored record that no longer qualifies still backed the slot: %v", err)
+			}
+			if preview() {
+				t.Fatal("the preview used a record that no longer qualifies")
+			}
+			if r.record(r.jkt).Revoked() {
+				t.Fatal("a configuration change marked the record revoked")
+			}
+			r.svc.cfg.WalletProvider.Attestation.Assurance.Enabled = false
+			if _, err := r.later(); err != nil || r.wscd() != domain.WSCDTypeUnknown {
+				t.Fatalf("err=%v wscd=%s", err, r.wscd())
+			}
+			r.svc.cfg.WalletProvider.Attestation.Assurance.Enabled = true
+
+			tc.relax(r.verifier())
+			if _, err := r.later(); err != nil {
+				t.Fatalf("after relaxing the configuration: %v", err)
+			}
+		})
+	}
+}
+
+// A stored record that no longer stands must not shield itself from a fresh
+// valid submission through the no-downgrade rule, even when nothing has marked
+// it yet (revoked on the list, expired).
+func TestRecheck_StaleStrongerRecordDoesNotDiscardAFreshSubmission(t *testing.T) {
+	strongbox := func(k *kdParams) { k.AttLevel, k.KmLevel = androidLevelStrongBox, androidLevelStrongBox }
+	for name, tc := range map[string]struct {
+		notAfter time.Duration
+		stale    func(r *rcWIA)
+	}{
+		"revoked on the list, not yet marked": {stale: func(r *rcWIA) { r.revokeLeaf() }},
+		"expired":                             {notAfter: time.Hour, stale: func(r *rcWIA) { r.clock.Advance(2 * time.Hour) }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var na time.Time
+			if tc.notAfter > 0 {
+				na = time.Now().Add(tc.notAfter)
+			}
+			r := newRCWIAWith(t, wiaNeedsAndroidRules, strongbox, na)
+			if r.record(r.jkt).Home != domain.KeyHomeStrongBox {
+				t.Fatal("no strongbox record")
+			}
+			tc.stale(r)
+			// No request has looked at the stored record since it went stale.
+			if r.record(r.jkt).Revoked() {
+				t.Fatal("already marked")
+			}
+			// A fresh, valid, weaker (TEE) submission must replace it and issue.
+			if err := r.resubmit(nil); err != nil {
+				t.Fatalf("fresh valid submission refused: %v", err)
+			}
+			rec := r.record(r.jkt)
+			if rec.Revoked() || rec.Home != domain.KeyHomeTEE {
+				t.Fatalf("the fresh submission was discarded: %+v", rec)
+			}
+			if _, err := r.later(); err != nil {
+				t.Fatalf("WIA from the fresh record: %v", err)
+			}
+		})
+	}
+	// Evidence that still stands keeps its protection: weaker evidence does
+	// not replace it.
+	r := newRCWIAWith(t, wiaNeedsAndroidRules, strongbox, time.Time{})
+	if err := r.resubmit(nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.record(r.jkt); got.Home != domain.KeyHomeStrongBox || got.Revoked() {
+		t.Fatalf("live stronger evidence was replaced: %+v", got)
+	}
+}
+
+// failingReplaceStore fails the conditional replacement (as a database outage
+// or a crash between two writes would).
+type failingReplaceStore struct{ storage.KeyAttestationStore }
+
+func (failingReplaceStore) ReplaceKeyEvidence(context.Context, *domain.KeyAttestationRecord, string) (bool, error) {
+	return false, errors.New("write failed")
+}
+
+// Replacing stale evidence is one conditional write: when it fails, the old
+// record is exactly as it was (not marked), so evidence that was only excluded
+// by the current configuration comes back when the configuration is relaxed.
+func TestRecheck_FailedReplacementLeavesTheStaleRecordUntouched(t *testing.T) {
+	strongboxUnverified := func(k *kdParams) {
+		k.AttLevel, k.KmLevel = androidLevelStrongBox, androidLevelStrongBox
+		k.BootState = 2 // accepted in ignore mode
+	}
+	r := newRCWIAWith(t, wiaNeedsAndroidRules, strongboxUnverified, time.Time{})
+	before := r.record(r.jkt)
+	r.verifier().policy.reject = true // the stored record no longer qualifies
+
+	real := r.svc.keyAttestations
+	r.svc.keyAttestations = failingReplaceStore{real}
+	err := r.resubmit(nil) // a fresh, verified, weaker (TEE) submission
+	if !errors.Is(err, ErrWIAKeyAttestationUnavailable) {
+		t.Fatalf("a failed replacement must be unavailable (503), got %v", err)
+	}
+	r.svc.keyAttestations = real
+	after := r.record(r.jkt)
+	if after.Revoked() || after.ChainFingerprint != before.ChainFingerprint || after.Home != domain.KeyHomeStrongBox {
+		t.Fatalf("the failed replacement changed the stored record: %+v", after)
+	}
+
+	// Relaxing the configuration restores the old evidence: nothing was marked.
+	r.verifier().policy.reject = false
+	if _, err := r.later(); err != nil {
+		t.Fatalf("after relaxing: %v", err)
+	}
+	// And with a working store the same submission replaces the stale record.
+	r.verifier().policy.reject = true
+	if err := r.resubmit(nil); err != nil {
+		t.Fatalf("replacement: %v", err)
+	}
+	if got := r.record(r.jkt); got.Home != domain.KeyHomeTEE || got.Revoked() {
+		t.Fatalf("not replaced: %+v", got)
+	}
+}
