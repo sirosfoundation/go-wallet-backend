@@ -28,6 +28,9 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
+// audienceWalletBackend is the token audience of this backend's own API.
+const audienceWalletBackend = "wallet-backend"
+
 // =============================================================================
 // Auth Provider - handles authentication routes only
 // =============================================================================
@@ -42,6 +45,9 @@ type AuthProvider struct {
 	roles          []string
 	tokenValidator *tokenvalidator.Validator
 	wiaRateLimiter *middleware.AuthRateLimiter
+	// statusRateLimiter limits the status list API per caller (user, else tenant);
+	// it holds counters only.
+	statusRateLimiter *middleware.AuthRateLimiter
 	// gateRateLimiter feeds the AS module's passkey OIDC gates (per-IP and per-tenant buckets).
 	gateRateLimiter *middleware.OIDCGateRateLimiter
 }
@@ -64,6 +70,8 @@ func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logg
 		roles:           roles,
 		wiaRateLimiter:  middleware.NewAuthRateLimiter(cfg.WalletProvider.WIA.RateLimit, logger.Named("wia")),
 		gateRateLimiter: middleware.NewOIDCGateRateLimiter(cfg.Security.OIDCGateRateLimit, logger),
+
+		statusRateLimiter: middleware.NewAuthRateLimiter(cfg.StatusCheck.RateLimit, logger.Named("status")),
 	}
 }
 
@@ -124,6 +132,21 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		public.POST("/helper/auth-check", p.handlers.AuthCheck)
 	}
 
+	// Verified status list API. Not in the protected group, whose
+	// NoCacheMiddleware would override this response's own Cache-Control.
+	// Always registered: when disabled the handler answers 503 STATUS_NOT_SUPPORTED.
+	statusGroup := router.Group("/status/v1")
+	statusGroup.Use(p.authMiddleware())
+	statusGroup.Use(middleware.RequireAudience(audienceWalletBackend))
+	statusGroup.POST("/lists",
+		requireCallerIdentity(),
+		middleware.AuthRateLimitMiddlewareWithResponse(p.statusRateLimiter, wiaCallerIdentifier, gin.H{
+			"error":   "RATE_LIMIT_EXCEEDED",
+			"message": "Too many status list requests, please retry later",
+		}),
+		middleware.MustHaveTAC("r"),
+		p.handlers.StatusLists)
+
 	// Protected auth routes (session management)
 	protected := router.Group("/")
 	protected.Use(
@@ -136,7 +159,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	// These are general user-facing routes, not the narrow-purpose calls
 	// (trust evaluation, engine transport) an identity-free anonymous token
 	// is scoped to - reject a wallet-registry-only token here.
-	protected.Use(middleware.RequireAudience("wallet-backend"))
+	protected.Use(middleware.RequireAudience(audienceWalletBackend))
 	{
 		// User session routes (authenticated)
 		session := protected.Group("/user/session")
@@ -232,6 +255,22 @@ func wiaCallerIdentifier(c *gin.Context) string {
 	return ""
 }
 
+// requireCallerIdentity refuses a request whose token carries no user or DID.
+// An identity-free anonymous token passes authentication and audience checks
+// but must not reach endpoints that are for identified callers only.
+func requireCallerIdentity() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.GetString("user_id") == "" && c.GetString("did") == "" {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"error":   "FORBIDDEN",
+				"message": middleware.AnonymousTokenMessage,
+			})
+			return
+		}
+		c.Next()
+	}
+}
+
 // authMiddleware returns the go-tokenauth middleware validating AS-issued
 // session tokens. See sessionAuthMiddleware for the no-validator case.
 func (p *AuthProvider) authMiddleware() gin.HandlerFunc {
@@ -303,7 +342,7 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 	// Credential storage is a general user-facing route, not one of the
 	// narrow purposes (trust evaluation, engine transport) an anonymous
 	// token is scoped to - reject a wallet-registry-only token here.
-	protected.Use(middleware.RequireAudience("wallet-backend"))
+	protected.Use(middleware.RequireAudience(audienceWalletBackend))
 	{
 		// Credential storage (gated)
 		if p.cfg.Features.CredentialStorageEnabled {
@@ -760,7 +799,7 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 		// Trust-evaluation calls are identity-free by design (see
 		// handleAnonymousTokenRequest) and only need a wallet-registry or
 		// wallet-backend audience - never require a broader one.
-		protected.Use(middleware.RequireAudience("wallet-registry", "wallet-backend"))
+		protected.Use(middleware.RequireAudience("wallet-registry", audienceWalletBackend))
 		v1 := protected.Group("/v1")
 		{
 			v1.POST("/evaluate", middleware.MustHaveTAC("r"), p.authzenHandler.Evaluate)
@@ -1275,7 +1314,7 @@ func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
 	// Key attestation / WIA are general user-facing routes, not one of the
 	// narrow purposes an anonymous token is scoped to - reject a
 	// wallet-registry-only token here.
-	wp.Use(middleware.RequireAudience("wallet-backend"))
+	wp.Use(middleware.RequireAudience(audienceWalletBackend))
 	{
 		wp.POST("/key-attestation/generate", middleware.MustHaveTAC("w"), p.handlers.GenerateKeyAttestation)
 		wp.POST("/assurance-preview", middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier), middleware.MustHaveTAC("w"), p.handlers.AssurancePreview)
