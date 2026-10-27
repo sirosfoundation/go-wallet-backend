@@ -20,7 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const seedMetadata = `{"org.siros.secret_seed":{"namespaces":["ns1"]}}`
+const seedMetadata = `{"auxiliary_data":[{"type":"hash_commitment","alg":"sha-256","path":["a"],"opening":"b3BlbmluZw"}]}`
 
 func issuerEncKey(t *testing.T, alg, use string) (*ecdsa.PrivateKey, json.RawMessage) {
 	t.Helper()
@@ -103,7 +103,7 @@ func TestRequestCredential_EncryptedRequestRoundTrip(t *testing.T) {
 		CredentialResponseEncryption: respEnc(),
 		CredentialRequestEncryption:  &CredentialRequestEncryptionConfig{JWKS: jwks, EncValuesSupported: []string{"A256GCM"}},
 	}
-	cfg := &CredentialConfig{Format: "vc+sd-jwt", CredentialMetadata: json.RawMessage(seedMetadata)}
+	cfg := &CredentialConfig{Format: "vc+sd-jwt", AuxiliaryDataSupported: json.RawMessage(toWalletAux)}
 	require.NoError(t, h.issueCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", cfg, nil, ""))
 	assert.Equal(t, "application/jwt", ct)
 	assert.NotEmpty(t, kid)
@@ -132,7 +132,7 @@ func TestRequestCredential_RequestEncryptionFailsClosed(t *testing.T) {
 			h, cleanup := testOID4VCIHandler(t, srv.Client())
 			defer cleanup()
 			md := &IssuerMetadata{CredentialEndpoint: srv.URL, CredentialResponseEncryption: respEnc(), CredentialRequestEncryption: rc}
-			cfg := &CredentialConfig{Format: "vc+sd-jwt", CredentialMetadata: json.RawMessage(seedMetadata)}
+			cfg := &CredentialConfig{Format: "vc+sd-jwt", AuxiliaryDataSupported: json.RawMessage(toWalletAux)}
 			_, err := h.requestCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", cfg, nil, clientRE(t))
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "cannot encrypt credential request")

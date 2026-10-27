@@ -126,10 +126,11 @@ const (
 	ErrCodeUnsupportedTransactionData ErrorCode = "UNSUPPORTED_TRANSACTION_DATA"
 	ErrCodeInternalError              ErrorCode = "INTERNAL_ERROR"
 	ErrCodeTooManyRequests            ErrorCode = "TOO_MANY_REQUESTS"
-	// ErrCodePSCConflict: the issuer already holds a different holder
-	// commitment (psc) for this subject. The message is the issuer's own text
-	// and tells the user what to do (operator-approved reset).
-	ErrCodePSCConflict ErrorCode = "PSC_CONFLICT"
+	// ErrCodeLegacySecretMember: an issuer advertised, or a plain credential
+	// response carried, a superseded secret-bearing credential_metadata member
+	// (org.siros.secret_seed, org.siros.holder_commitments, org.siros.psc).
+	// Refused, not supported: nothing is stored. auxiliary_data replaces them.
+	ErrCodeLegacySecretMember ErrorCode = "LEGACY_SECRET_MEMBER"
 	// ErrCodeAuxiliaryDataConflict: the issuer rejected the credential request
 	// with the OpenID4VCI Credential Auxiliary Data error code
 	// auxiliary_data_conflict (an entry conflicts with a value it holds for
@@ -199,8 +200,8 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "The wallet's key proof carries auxiliary data that cannot be sent to the issuer"
 	case ErrCodeAuxiliaryDataConflict:
 		return "The issuer holds a conflicting value for you; it must be resolved with the issuer"
-	case ErrCodePSCConflict:
-		return "The issuer holds a different holder commitment for you"
+	case ErrCodeLegacySecretMember:
+		return "The issuer uses a secret delivery format that this wallet no longer supports"
 	default:
 		return "An error occurred"
 	}
@@ -473,9 +474,9 @@ type FlowCompleteMessage struct {
 	// CredentialMetadata is set only for a PLAIN (unencrypted) issuer
 	// response: the display members (see displayMetadataMembers) of its
 	// response-level credential_metadata, applying to every credential in
-	// Credentials. Every other member, in particular the namespaced
-	// every configured secret member (issuance.secret_members), is dropped by the engine and never relayed or
-	// logged. Never present when CredentialResponseEncrypted is true.
+	// Credentials. Every other member, in particular auxiliary_data, is dropped
+	// by the engine and never relayed or logged (a plain response that carries
+	// auxiliary_data or a superseded secret-bearing member is refused). Never present when CredentialResponseEncrypted is true.
 	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
 }
 
@@ -590,17 +591,9 @@ type SignRequestParams struct {
 	// (OpenID4VCI Credential Auxiliary Data v0.1, section 6). The engine never
 	// computes or sees a commitment value.
 	AuxiliaryDataToIssuer []json.RawMessage `json:"auxiliary_data_to_issuer,omitempty"`
-	// HolderCommitments (generate_proof only; set when the issuer metadata
-	// advertises org.siros.holder_commitments with "psc"): the wallet MUST
-	// derive the commitment for (CredentialType, CredentialIssuer) and add the
-	// claim org.siros.psc = base64url(32 bytes) to every proof JWT payload
-	// before signing. The engine verifies the claim on the returned proofs and
-	// never computes or logs it.
-	HolderCommitments []string `json:"holder_commitments,omitempty"`
 	// CredentialType and CredentialIssuer (generate_proof only; set whenever
-	// AuxiliaryDataToIssuer is non-empty, and by the holder-commitment (psc)
-	// request of #468, with identical names, types and meaning): the wallet
-	// derives its per-issuer value for (CredentialType, CredentialIssuer).
+	// AuxiliaryDataToIssuer is non-empty): the wallet derives its per-issuer
+	// value for (CredentialType, CredentialIssuer).
 	// CredentialType is the configuration's `vct`, or its `doctype` for mdoc;
 	// CredentialIssuer is the exact `credential_issuer` string of the issuer
 	// metadata.

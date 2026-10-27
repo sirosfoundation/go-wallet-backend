@@ -1994,8 +1994,10 @@ func TestResolve_URLSubject_LogoInlining(t *testing.T) {
 								},
 							},
 						},
-						"credential_metadata": map[string]interface{}{
-							"org.siros.secret_seed": map[string]interface{}{"namespaces": []interface{}{"x"}},
+						"auxiliary_data_supported": map[string]interface{}{
+							"to_wallet": []interface{}{map[string]interface{}{
+								"type": "hash_commitment", "alg": "sha-256", "path": []interface{}{"x", "ssc"},
+							}},
 						},
 					},
 					"leaky": map[string]interface{}{
@@ -2068,14 +2070,13 @@ func TestResolve_URLSubject_LogoInlining(t *testing.T) {
 		t.Errorf("expected inlined data: URI for credential logo, got: %s", credLogoURI)
 	}
 
-	// A valid advertisement (names only) is public and is served; a malformed
-	// one (hex values) makes the configuration "not offered".
-	cm, _ := pid["credential_metadata"].(map[string]interface{})
-	if cm == nil || cm["org.siros.secret_seed"] == nil {
-		t.Error("valid org.siros.secret_seed advertisement must be served to the wallet")
+	// A valid advertisement is public and is served; a configuration with a
+	// superseded secret-bearing member is "not offered".
+	if pid["auxiliary_data_supported"] == nil {
+		t.Error("valid auxiliary_data_supported must be served to the wallet")
 	}
 	if _, present := ccs["leaky"]; present {
-		t.Error("configuration with a malformed secret seed member must not be offered")
+		t.Error("configuration with a superseded secret member must not be offered")
 	}
 	if strings.Contains(w.Body.String(), "00112233445566778899aabbccddeeff") {
 		t.Error("seed value must never reach the wallet")

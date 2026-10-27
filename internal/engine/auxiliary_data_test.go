@@ -18,20 +18,6 @@ import (
 	"go.uber.org/zap/zaptest/observer"
 )
 
-// secretSeedAdvertised is the legacy-only view of secretDeliveryOf that the
-// older advertisement tests use.
-func secretSeedAdvertised(c *CredentialConfig) (bool, error) {
-	d, err := secretDeliveryOf(c)
-	return d.requireEncryption, err
-}
-
-// withSecretMembers sets the configured secret member set for one test.
-func withSecretMembers(t *testing.T, names ...string) {
-	t.Helper()
-	SetSecretMembers(names)
-	t.Cleanup(func() { SetSecretMembers([]string{secretSeedMember, auxiliaryDataMember}) })
-}
-
 func auxCfg(aux string) *CredentialConfig {
 	c := &CredentialConfig{Format: "mso_mdoc", VCT: "urn:test", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}
 	if aux != "" {
@@ -143,62 +129,30 @@ func TestAuxiliaryDataSupported_Malformed(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// A secret member in the issuer metadata's credential_metadata is malformed
-// (auxiliary_data MUST NOT appear there), unless it is the legacy member in
-// its advertisement shape.
-func TestSecretMemberInIssuerMetadataIsMalformed(t *testing.T) {
-	_, err := secretDeliveryOf(seedCfg(`{"auxiliary_data":[{"type":"hash_commitment","opening":"SECRETOPENING"}]}`))
+// auxiliary_data MUST NOT appear in the issuer metadata's credential_metadata
+// (v0.1 section 7): the configuration is malformed, and no content is quoted.
+func TestAuxiliaryDataInIssuerMetadataIsMalformed(t *testing.T) {
+	cfg := &CredentialConfig{CredentialMetadata: json.RawMessage(`{"auxiliary_data":[{"type":"hash_commitment","opening":"SECRETOPENING"}]}`)}
+	_, err := secretDeliveryOf(cfg)
 	require.Error(t, err)
+	assert.NotErrorIs(t, err, errLegacySecretMember)
 	assert.NotContains(t, err.Error(), "SECRETOPENING")
-
-	d, err := secretDeliveryOf(seedCfg(advOK))
-	require.NoError(t, err)
-	assert.True(t, d.requireEncryption)
-
-	// Not configured as secret: ordinary metadata, ignored.
-	withSecretMembers(t, "x.secret")
-	d, err = secretDeliveryOf(seedCfg(`{"auxiliary_data":[1],"org.siros.secret_seed":"anything"}`))
-	require.NoError(t, err)
-	assert.Equal(t, secretDelivery{}, d)
-	_, err = secretDeliveryOf(seedCfg(`{"x.secret":{"namespaces":["a"]}}`))
-	require.Error(t, err)
 }
 
-func TestPlainResponse_ConfiguredSecretMembersRefused(t *testing.T) {
-	for _, member := range []string{"org.siros.secret_seed", "auxiliary_data"} {
-		t.Run(member, func(t *testing.T) {
-			core, logs := observer.New(zap.DebugLevel)
-			h, ch, cleanup := captureHandler(t)
-			defer cleanup()
-			h.Logger = zap.New(core)
-			var resp CredentialResponse
-			body := `{"credentials":["c0"],"credential_metadata":{"display":[{"name":"D"}],"` + member + `":[{"type":"hash_commitment","opening":"` + secretSeedA + `"}]}}`
-			require.NoError(t, json.Unmarshal([]byte(body), &resp))
-			err := h.finishIssuance(context.Background(), &resp, &CredentialConfig{Format: "x"}, nil, nil, &TokenResponse{})
-			require.Error(t, err)
-			assertNoSecrets(t, "error", err.Error())
-			m := nextMsg(t, ch)
-			assert.JSONEq(t, `"flow_error"`, string(m["type"]))
-			assertNoSecrets(t, "logs", logDump(logs))
-		})
-	}
-}
-
-func TestPlainResponse_SecretMemberSetIsConfigured(t *testing.T) {
-	withSecretMembers(t, "x.secret")
+func TestPlainResponse_AuxiliaryDataRefused(t *testing.T) {
+	core, logs := observer.New(zap.DebugLevel)
 	h, ch, cleanup := captureHandler(t)
 	defer cleanup()
+	h.Logger = zap.New(core)
 	var resp CredentialResponse
-	require.NoError(t, json.Unmarshal([]byte(`{"credentials":["c0"],"credential_metadata":{"x.secret":"S","display":[]}}`), &resp))
-	require.Error(t, h.finishIssuance(context.Background(), &resp, &CredentialConfig{Format: "x"}, nil, nil, &TokenResponse{}))
-	assert.JSONEq(t, `"flow_error"`, string(nextMsg(t, ch)["type"]))
-
-	// A member that is no longer in the set is not special (and the engine
-	// relays display members only, so it is dropped regardless).
-	resp = CredentialResponse{}
-	require.NoError(t, json.Unmarshal([]byte(`{"credentials":["c0"],"credential_metadata":{"auxiliary_data":[],"display":[]}}`), &resp))
-	require.NoError(t, h.finishIssuance(context.Background(), &resp, &CredentialConfig{Format: "x"}, nil, nil, &TokenResponse{}))
-	assert.JSONEq(t, `"flow_complete"`, string(nextMsg(t, ch)["type"]))
+	body := `{"credentials":["c0"],"credential_metadata":{"display":[{"name":"D"}],"auxiliary_data":[{"type":"hash_commitment","opening":"` + secretSeedA + `"}]}}`
+	require.NoError(t, json.Unmarshal([]byte(body), &resp))
+	err := h.finishIssuance(context.Background(), &resp, &CredentialConfig{Format: "x"}, nil, nil, &TokenResponse{})
+	require.Error(t, err)
+	assertNoSecrets(t, "error", err.Error())
+	m := nextMsg(t, ch)
+	assert.JSONEq(t, `"flow_error"`, string(m["type"]))
+	assertNoSecrets(t, "logs", logDump(logs))
 }
 
 func TestNegotiate_AuxiliaryDataToWalletRequiresEncryption(t *testing.T) {
@@ -277,18 +231,6 @@ func TestGenerateProof_NoToIssuerNoField(t *testing.T) {
 	assert.NotContains(t, generateProofParams(t, fc), "auxiliary_data_to_issuer")
 }
 
-// A required to_issuer entry with no proof type declared is not the engine's to
-// refuse: the request goes out and the issuer, which owns the rule, refuses it.
-func TestRequiredToIssuerWithoutProofTypeLeftToIssuer(t *testing.T) {
-	st := newIssuerStub(t, `{"credential":"c"}`)
-	fc := &fakeClient{t: t}
-	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
-	defer cleanup()
-	cfg := &CredentialConfig{Format: "x", VCT: "urn:v", AuxiliaryDataSupported: json.RawMessage(`{"to_issuer":[` + auxToIssuerPSC + `]}`)}
-	require.NoError(t, h.issueCredential(context.Background(), st.metadata(nil), tokenBearer(), "cfg", cfg, nil, ""))
-	assert.NotEmpty(t, st.requests, "the issuer, not the engine, decides")
-}
-
 func conflictStub(t *testing.T, body string, dpopNonce bool) (*issuerStub, *int) {
 	hits := 0
 	st := newIssuerStub(t, `{"credential":"c"}`)
@@ -354,7 +296,7 @@ func TestAuxiliaryDataConflict_RepeatedErrorMemberIsTerminalAndQuiet(t *testing.
 				fc := &fakeClient{t: t}
 				h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
 				defer cleanup()
-				err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", hcCfg(""), nil, "")
+				err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", &CredentialConfig{VCT: "urn:example:vct", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}, nil, "")
 				require.Error(t, err)
 				assert.Equal(t, 1, *hits, "never retried")
 				assert.NotContains(t, err.Error(), echo)

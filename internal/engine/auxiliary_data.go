@@ -8,62 +8,115 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"sync/atomic"
+
+	"go.uber.org/zap"
 )
 
-// Secret-bearing credential_metadata members and the OpenID4VCI Credential
-// Auxiliary Data advertisement.
+// Credential Auxiliary Data (OpenID4VCI Credential Auxiliary Data v0.1).
 //
 // The engine never handles a secret value: an issuer delivers it in an
-// encrypted response that the client decrypts. The engine only decides, from
-// member NAMES, whether a response or metadata member is secret. Which names
-// those are is configuration (issuance.secret_members) so that a move of the
-// standard to another member name needs no code change.
+// encrypted response that the client decrypts. `auxiliary_data` is the one
+// credential_metadata member that carries Secret Values (v0.1 section 8.4); the
+// engine decides from the advertisement alone whether the response must be
+// encrypted.
+//
+// The superseded SIROS members (see legacySecretMembers) are not supported.
+// They are refused, not ignored: ignoring an advertisement of one would make
+// the engine ask for no response encryption and let a seed travel in clear.
 
-// secretMembers is the configured set; see SetSecretMembers.
-var secretMembers atomic.Pointer[map[string]struct{}]
-
-func init() {
-	// The same names as config.DefaultSecretMembers (the engine's own tests and
-	// any embedder that never calls SetSecretMembers get them).
-	SetSecretMembers([]string{secretSeedMember, auxiliaryDataMember})
+// legacySecretMembers are the superseded secret-bearing credential_metadata
+// members, refused for at least one release (LEGACY_SECRET_MEMBER). The names
+// are the ones the Swift and Kotlin SDKs refuse.
+var legacySecretMembers = []string{
+	"org.siros.secret_seed",
+	"org.siros.holder_commitments",
+	"org.siros.psc",
+	"holder_commitments",
+	"secret_members",
 }
 
-// SetSecretMembers replaces the set of credential_metadata member names the
-// engine treats as secret-bearing. It is called once at startup from the
-// validated configuration and is safe for concurrent use.
-func SetSecretMembers(names []string) {
-	set := make(map[string]struct{}, len(names))
-	for _, n := range names {
-		set[n] = struct{}{}
+// isLegacySecretMember reports whether name is a superseded member, in any
+// letter case (fail closed).
+func isLegacySecretMember(name string) bool {
+	for _, n := range legacySecretMembers {
+		if strings.EqualFold(name, n) {
+			return true
+		}
 	}
-	secretMembers.Store(&set)
+	return false
 }
 
-// isSecretMember reports whether name is a configured secret-bearing member.
-func isSecretMember(name string) bool {
-	set := secretMembers.Load()
-	if set == nil {
-		return false
-	}
-	_, ok := (*set)[name]
-	return ok
-}
+// errLegacySecretMember never carries the offending content. The flow fails
+// with LEGACY_SECRET_MEMBER.
+var errLegacySecretMember = errors.New("a superseded secret-bearing credential_metadata member is not supported")
 
-// hasSecretMember reports whether a response-level credential_metadata object
-// has any configured secret-bearing member. A value that is not a JSON object
-// has none.
-func hasSecretMember(md json.RawMessage) bool {
+// hasLegacySecretMember reports whether a credential_metadata object has a
+// superseded member. A value that is not a JSON object has none.
+func hasLegacySecretMember(md json.RawMessage) bool {
 	var m map[string]json.RawMessage
 	if json.Unmarshal(md, &m) != nil {
 		return false
 	}
 	for k := range m {
-		if isSecretMember(k) {
+		if isLegacySecretMember(k) {
 			return true
 		}
 	}
 	return false
+}
+
+// hasAuxiliaryDataMember reports whether a response-level credential_metadata
+// object has the auxiliary_data member.
+func hasAuxiliaryDataMember(md json.RawMessage) bool {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(md, &m) != nil {
+		return false
+	}
+	_, ok := m[auxiliaryDataMember]
+	return ok
+}
+
+// refusePlainSecretMembers fails the flow when a PLAIN credential response
+// carries auxiliary_data (a Secret Value must never travel unencrypted, v0.1
+// section 7.1) or a superseded member. Nothing of the content is logged.
+func (h *OID4VCIHandler) refusePlainSecretMembers(md json.RawMessage) error {
+	if hasLegacySecretMember(md) {
+		return h.failLegacySecretMember(errors.New("credential response carries a superseded secret-bearing member"))
+	}
+	if hasAuxiliaryDataMember(md) {
+		err := errors.New("auxiliary_data arrived in a plain response")
+		h.Logger.Warn("rejecting credential response", zap.Error(err))
+		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer returned malformed credential metadata")
+		return err
+	}
+	return nil
+}
+
+// failLegacySecretMember fails the flow with LEGACY_SECRET_MEMBER. The error
+// text and the log line carry no content from the issuer or the client.
+func (h *OID4VCIHandler) failLegacySecretMember(err error) error {
+	h.Logger.Warn("refusing a superseded secret-bearing member", zap.Error(err))
+	_ = h.Error(StepRequestingCredential, ErrCodeLegacySecretMember, ErrCodeLegacySecretMember.UserFacingMessage())
+	return fmt.Errorf("%w", errLegacySecretMember)
+}
+
+// failSecretDelivery maps an error of secretDeliveryOf to the flow error.
+func (h *OID4VCIHandler) failSecretDelivery(err error) error {
+	if errors.Is(err, errLegacySecretMember) {
+		return h.failLegacySecretMember(err)
+	}
+	h.Logger.Warn("rejecting issuer metadata", zap.Error(err))
+	_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer advertised malformed secret delivery metadata")
+	return err
+}
+
+// refuseLegacySecretMember refuses to use a credential configuration that
+// advertises a superseded secret-bearing member, before any authorization.
+func (h *OID4VCIHandler) refuseLegacySecretMember(config *CredentialConfig) error {
+	if config != nil && hasLegacySecretMember(config.CredentialMetadata) {
+		return h.failLegacySecretMember(errLegacySecretMember)
+	}
+	return nil
 }
 
 const (
@@ -82,8 +135,7 @@ const (
 // advertisement of secret delivery.
 type secretDelivery struct {
 	// requireEncryption: the issuer delivers secret values to the wallet, so
-	// the response MUST be encrypted (Auxiliary Data v0.1 section 7.1, or the
-	// legacy member).
+	// the response MUST be encrypted (Auxiliary Data v0.1 section 7.1).
 	requireEncryption bool
 	// toIssuer are the advertised auxiliary_data_supported.to_issuer entries,
 	// verbatim, for the wallet to place in its key proofs.
@@ -97,21 +149,15 @@ type secretDelivery struct {
 var errMalformedAdvertisement = errors.New("issuer metadata secret delivery advertisement is malformed")
 
 // secretDeliveryOf evaluates the advertisement of a credential configuration:
-// the legacy credential_metadata member (when configured as secret-bearing) and
-// auxiliary_data_supported. Anything malformed is an error (fail closed); an
-// absent advertisement is the zero value.
+// auxiliary_data_supported, and a refusal of any superseded member in its
+// credential_metadata (errLegacySecretMember). Anything malformed is an error
+// (fail closed); an absent advertisement is the zero value.
 func secretDeliveryOf(config *CredentialConfig) (secretDelivery, error) {
 	var d secretDelivery
 	if config == nil {
 		return d, nil
 	}
-	if present, ok := SecretSeedAdvertisement(config.CredentialMetadata); present {
-		if !ok {
-			return d, fmt.Errorf("%w: %s", errMalformedAdvertisement, secretSeedMember)
-		}
-		d.requireEncryption = true
-	}
-	if err := rejectOtherSecretMembers(config.CredentialMetadata); err != nil {
+	if err := checkIssuerCredentialMetadata(config.CredentialMetadata); err != nil {
 		return d, err
 	}
 	if len(config.AuxiliaryDataSupported) > 0 {
@@ -126,10 +172,11 @@ func secretDeliveryOf(config *CredentialConfig) (secretDelivery, error) {
 	return d, nil
 }
 
-// rejectOtherSecretMembers refuses any configured secret member other than the
-// legacy one in issuer metadata: secret members never appear there. A document
-// that is not an object is not judged here.
-func rejectOtherSecretMembers(credentialMetadata json.RawMessage) error {
+// checkIssuerCredentialMetadata refuses a superseded member in issuer metadata
+// (errLegacySecretMember) and an auxiliary_data member (it MUST NOT appear in
+// Credential Issuer Metadata, v0.1 section 7: errMalformedAdvertisement). A
+// document that is not an object is not judged here.
+func checkIssuerCredentialMetadata(credentialMetadata json.RawMessage) error {
 	if len(credentialMetadata) == 0 {
 		return nil
 	}
@@ -137,10 +184,15 @@ func rejectOtherSecretMembers(credentialMetadata json.RawMessage) error {
 	if json.Unmarshal(credentialMetadata, &md) != nil {
 		return nil
 	}
+	malformed := false
 	for k := range md {
-		if k != secretSeedMember && isSecretMember(k) {
-			return fmt.Errorf("%w: %s in credential_metadata", errMalformedAdvertisement, k)
+		if isLegacySecretMember(k) {
+			return errLegacySecretMember
 		}
+		malformed = malformed || k == auxiliaryDataMember
+	}
+	if malformed {
+		return fmt.Errorf("%w: %s in credential_metadata", errMalformedAdvertisement, auxiliaryDataMember)
 	}
 	return nil
 }

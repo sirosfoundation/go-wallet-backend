@@ -428,56 +428,6 @@ Client → Server:
 }
 ```
 
-#### Holder commitments (`org.siros.psc`)
-
-A credential configuration can ask the wallet to give the issuer a commitment
-derived from a per-issuer secret the engine never sees (SIROS extension,
-tracked in https://github.com/SUNET/vc/issues/823). The issuer advertises names
-only, never values:
-
-```
-credential_configurations_supported[cfg].credential_metadata["org.siros.holder_commitments"]
-  = {"commitments": ["psc"]}
-```
-
-The member must be an object with exactly one member, `commitments`: 1 to 4
-distinct names of 1 to 32 characters (`[a-z][a-z0-9_]*`), none of them a
-hex-looking string (16 or more hex characters). Anything else makes the
-configuration not offered: the engine drops it when decoding issuer metadata
-and the resolve endpoint removes it from the metadata it serves (dropping
-`signed_metadata`, as for `org.siros.secret_seed`). Unknown but well-formed
-names are ignored. Without the advertisement, behaviour is unchanged.
-
-When the selected configuration advertises `psc`, the `generate_proof`
-`sign_request` carries three more params (`credential_type` is the
-configuration's `vct`, or its `doctype` for mdoc; `credential_issuer` is the
-exact `credential_issuer` string of the issuer metadata):
-
-```
-"params": {
-  "audience": "https://issuer.example.com", "nonce": "...",
-  "holder_commitments": ["psc"],
-  "credential_type": "urn:eudi:pid:1",
-  "credential_issuer": "https://issuer.example.com"
-}
-```
-
-The wallet derives `private_seed` for (`credential_type`, `credential_issuer`)
-and adds the claim `org.siros.psc` = base64url, WITHOUT padding (RFC 7515 s2), of
-the 32-byte `SHA-256(private_seed)` to the payload of every proof JWT before
-signing. The engine does not compute the value. On each returned proof it
-verifies that the proof is a JWT whose payload holds `org.siros.psc` as an
-unpadded base64url string of exactly 32 bytes; otherwise the issuance fails with
-`SIGN_ERROR` and nothing is sent to the issuer. The value is never logged or
-placed in an error.
-
-If the issuer's credential endpoint answers HTTP 400 with an `error_description`
-beginning `org.siros.psc_conflict:` (it already holds a different commitment for
-the subject; nothing was issued), the engine sends a `flow_error` with code
-`PSC_CONFLICT`, step `requesting_credential`, and `error.message` set to the
-issuer's text (control characters removed, at most 512 bytes), and does not
-retry. The flow-error path is shared by every transport (WebSocket and WMP).
-
 #### Client Authentication (Signing)
 
 Two further `sign_request` actions let the client authenticate the engine's
@@ -614,7 +564,7 @@ no credential value and no `credential_metadata`:
 credential it decrypted itself (see "Credential response encryption" below), and
 a count mismatch is an error on the client. The response-level
 `credential_metadata` (OpenID4VCI 1.1, openid/OpenID4VCI#721), which may carry
-`org.siros.secret_seed`, is never relayed by the engine: the client already holds
+`auxiliary_data`, is never relayed by the engine: the client already holds
 it from its own decryption. An issuer that does not encrypt its response is
 visible to the engine, which relays its credentials as before (no
 `credential_response_encrypted`, `credential` present). For such a plain
@@ -622,9 +572,12 @@ response `flow_complete` also carries a top-level `credential_metadata`
 containing ONLY the display-only members `display` and `claims` of the
 response-level `credential_metadata` (omitted when it has neither); every other
 member (extensions) is dropped by the engine and never relayed or logged. A plain
-response whose `credential_metadata` carries `org.siros.secret_seed` is refused
-with `CREDENTIAL_ERROR` and no `flow_complete`, advertised or not (privatedata-spec
-5A.4); errors and logs contain no values. Clients ignore extension members
+response whose `credential_metadata` carries `auxiliary_data` (a Secret Value
+never travels unencrypted, Auxiliary Data v0.1 section 7.1) is refused with
+`CREDENTIAL_ERROR` and no `flow_complete`, advertised or not; one that carries a
+superseded member (`org.siros.secret_seed`, `org.siros.holder_commitments`,
+`org.siros.psc`, `holder_commitments`, `secret_members`) is refused with
+`LEGACY_SECRET_MEMBER`. Errors and logs contain no values. Clients ignore extension members
 arriving in `flow_complete`. An encrypted response never yields `credential_metadata`
 on `flow_complete`.
 
@@ -648,10 +601,10 @@ response in clear. Every key lives in the client.
    ```
 
    `required` is `true` when the issuer marks encryption as required or the
-   configuration advertises `org.siros.secret_seed`
-   (`credential_configurations_supported[cfg].credential_metadata["org.siros.secret_seed"]
-   = {"namespaces": [...]}`, privatedata-spec 5A.4). A seed advertisement with no
-   usable issuer encryption (none offered, or no mutually supported pair) fails
+   configuration delivers a Secret Value to the wallet
+   (`credential_configurations_supported[cfg].auxiliary_data_supported.to_wallet`
+   lists a `hash_commitment` entry, Auxiliary Data v0.1 section 7.1). Such a
+   configuration with no usable issuer encryption (none offered, or no mutually supported pair) fails
    the issuance with `CREDENTIAL_ERROR` before any request is sent. A configuration
    without `proof_types_supported` still gets this request when encryption is
    wanted: it is then for the key alone and the client returns no proofs.
@@ -688,10 +641,10 @@ response in clear. Every key lives in the client.
    `deferred` is always present. A body that is not a compact JWE (empty,
    JSON, ...) is refused with no relay.
 5. **Answer.** The client decrypts with the flow's key, STORES the credentials and
-   the response-level `credential_metadata` locally, validates the seed
-   (privatedata-spec 5A: namespaces, hex, size/depth caps, "a seed needs an
-   encrypted response and a non-empty `notification_id`", strip-before-merge,
-   `SHA256(seed) == ssc`) and answers with control fields ONLY:
+   the response-level `credential_metadata` locally, validates the entries it
+   received and sent (Auxiliary Data v0.1 section 7.2: `SHA-256(opening)` equals
+   the commitment, every `to_wallet` entry present, removal of `auxiliary_data`
+   before merge) and answers with control fields ONLY:
 
    ```
    { "type": "sign_response", "credential_count": 2 }                 // credentials issued
@@ -710,7 +663,7 @@ response in clear. Every key lives in the client.
    goes through step 4 with `"deferred": true`; an answer that again reports a
    `transaction_id` keeps the polling going. (Before this change the engine did
    not decrypt deferred answers at all.) A plain deferred answer to a
-   seed-advertising configuration is refused unread.
+   configuration that delivers a Secret Value to the wallet is refused unread.
 7. **Notification.** The client supplies `notification_id` (from the decrypted
    body) in `credential_notification`. For an encrypted response the engine
    registers its notification context with an empty id, which matches any id the
@@ -718,36 +671,56 @@ response in clear. Every key lives in the client.
    issuer's own endpoint through the engine, which adds the issuer access token).
    The context is registered before the first JWE is relayed, so a
    `credential_failure` still reaches the issuer when the client rejects what it
-   decrypted (for example a seed that fails its checks).
+   decrypted (for example an opening that fails its check).
 
-What the engine still sees: the proof JWTs (holder public key; the `psc`
-commitment is hiding by design), DPoP traffic, the issuer metadata, timing and
+What the engine still sees: the proof JWTs (holder public key; the `to_issuer`
+commitments are hiding by design), DPoP traffic, the issuer metadata, timing and
 sizes, and `credential_count`/`transaction_id`/`interval`. It never sees a
-credential, a seed or the response plaintext when the issuer encrypts. The same
+credential, an opening or the response plaintext when the issuer encrypts. The same
 messages are carried by the WMP sign sub-flow (go-wallet-backend#163) once its translation copies the new fields.
 
-A malformed seed advertisement (hex or other values instead of a name list,
-wrong counts, duplicate or over-long names) means the configuration is not
-offered (privatedata-spec 5A.3): the engine drops it when decoding issuer
-metadata (logging only the configuration id) and the resolve endpoint removes the
-whole configuration from the metadata it serves. For legacy signed metadata the
+A malformed advertisement (see "Credential Auxiliary Data" below) means the
+configuration is not offered: the engine drops it when decoding issuer metadata
+(logging only the configuration id) and the resolve endpoint removes the whole
+configuration from the metadata it serves. For legacy signed metadata the
 resolver also keeps the original `signed_metadata` JWT, whose payload still
 carries the rejected configuration; when a configuration is removed that JWT is
 dropped from the served document too (editing the payload would break the
-signature). A valid advertisement is public names-only data and is served to the
-wallet unchanged; the wallet needs it to request encryption.
+signature). A valid advertisement is public data and is served to the wallet
+unchanged; the wallet needs it to request encryption.
+
+#### Superseded secret-bearing members (`LEGACY_SECRET_MEMBER`)
+
+`auxiliary_data` is the one secret-bearing `credential_metadata` member, and
+`AUXILIARY_DATA_CONFLICT` the one conflict. The earlier SIROS shapes
+(`org.siros.secret_seed`, `org.siros.holder_commitments`, `org.siros.psc`, the
+`holder_commitments` sign param, `PSC_CONFLICT`, and the `issuance.secret_members`
+setting) are removed. They are refused, not ignored, for at least one release,
+because ignoring an advertisement would make the engine request no response
+encryption and let a secret travel in clear:
+
+- Offer time: a credential configuration whose issuer-metadata
+  `credential_metadata` has `org.siros.secret_seed`, `org.siros.holder_commitments`,
+  `org.siros.psc`, `holder_commitments` or `secret_members` (any letter case) is
+  not offered (the resolve endpoint removes it), and selecting or using it fails
+  the flow with `LEGACY_SECRET_MEMBER` before any authorization or request.
+- Response time: a plain credential response (immediate or deferred) whose
+  `credential_metadata` carries one of them fails the flow with
+  `LEGACY_SECRET_MEMBER`, step `requesting_credential`; nothing is relayed or
+  completed. An encrypted response is not visible to the engine; the client
+  refuses it the same way (`LEGACY_SECRET_MEMBER`).
+
+The error carries a fixed message. No text of the issuer or the client reaches
+a log or a response.
 
 #### Credential Auxiliary Data
 
 The engine also understands the OpenID4VCI Credential Auxiliary Data
-advertisement (draft v0.1, sirosfoundation/nym_auth_rulebook#12), beside the
-legacy `org.siros.secret_seed` one. Which `credential_metadata` members count as
-secret-bearing is configuration: `issuance.secret_members` (default
-`org.siros.secret_seed` and `auxiliary_data`; see CONFIGURATION.md). The engine
-uses that one set to refuse a plain issuer response that has any such member, to
-keep it out of every relayed message and log, and to treat one in the issuer
-metadata's `credential_metadata` as malformed (`auxiliary_data` MUST NOT appear
-there).
+advertisement (draft v0.1, sirosfoundation/nym_auth_rulebook#12); `auxiliary_data`
+is the one secret-bearing member. The engine refuses a plain issuer response that
+has `auxiliary_data`, keeps it out of every relayed message and log, and treats
+one in the issuer metadata's `credential_metadata` as malformed (`auxiliary_data`
+MUST NOT appear there).
 
 The advertisement is read from the credential configuration:
 
@@ -763,12 +736,12 @@ credential_configurations_supported[cfg].auxiliary_data_supported
   `path` (a non-empty claims path of strings, nulls and non-negative integers)
   and must not carry `opening` or `commitment`. Entries of any other `type` are
   kept and otherwise ignored. Anything else makes the configuration not offered,
-  exactly like a malformed seed advertisement (same drop at decode, same removal
-  in the resolve endpoint).
+  exactly like any malformed advertisement (dropped at decode, removed in the
+  resolve endpoint).
 - When `to_wallet` has an entry of type `hash_commitment` (a type with a Secret
-  Value), the response MUST be encrypted: the engine behaves as for a seed
-  advertisement (encryption `required`, a plain answer is refused unread, no
-  encryption offered by the issuer fails the issuance before any request).
+  Value), the response MUST be encrypted: encryption is `required`, a plain
+  answer is refused unread, and no encryption offered by the issuer fails the
+  issuance before any request.
 - `to_issuer` entries go to the client on the `generate_proof` `sign_request`,
   verbatim, in the param `auxiliary_data_to_issuer` (an array of the entry
   objects as the issuer published them). The wallet places
@@ -781,9 +754,7 @@ credential_configurations_supported[cfg].auxiliary_data_supported
 - Whenever `auxiliary_data_to_issuer` is non-empty the request also carries
   `credential_issuer` (the exact `credential_issuer` string of the issuer
   metadata) and, when the configuration has one, `credential_type` (its `vct`,
-  or its `doctype` for mdoc), so the wallet can derive its per-issuer value. These are the same
-  params, with the same names, types and meaning, as the holder commitment
-  (`psc`) request of go-wallet-backend#468. A configuration with neither `vct`
+  or its `doctype` for mdoc), so the wallet can derive its per-issuer value. A configuration with neither `vct`
   nor `doctype` fails the flow only when some `to_issuer` entry is of a type the
   wallet recognises (`hash_commitment`); when every entry is of an unrecognised
   type (which the wallet ignores) the engine proceeds and omits `credential_type`.
@@ -1195,7 +1166,7 @@ Server → Client:
 | `CREDENTIAL_ERROR` | Credential endpoint returned error |
 | `AUXILIARY_DATA_PROOF_INVALID` | A key proof carries an `opening`, or cannot be inspected for one while the issuer advertised `to_issuer` entries; nothing was sent to the issuer |
 | `AUXILIARY_DATA_CONFLICT` | Issuer rejected the credential request with `auxiliary_data_conflict`; `error.details.error` carries that code |
-| `PSC_CONFLICT` | Issuer already holds a different holder commitment (`org.siros.psc`) for this subject; message is the issuer's text |
+| `LEGACY_SECRET_MEMBER` | The issuer advertised, or a plain response carried, a superseded secret-bearing member (`org.siros.secret_seed`, `org.siros.holder_commitments`, `org.siros.psc`); refused, nothing stored. Fixed message |
 | `SIGN_TIMEOUT` | Client did not respond to sign request |
 | `SIGN_ERROR` | Client signature was invalid |
 | `PRESENTATION_ERROR` | VP creation or submission failed |

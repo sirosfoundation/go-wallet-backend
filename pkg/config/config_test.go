@@ -3406,51 +3406,6 @@ jwt:
 	}
 }
 
-func TestIssuanceSecretMembers(t *testing.T) {
-	def := []string{"org.siros.secret_seed", "auxiliary_data"}
-	eq := func(a, b []string) bool { return strings.Join(a, "\x00") == strings.Join(b, "\x00") }
-
-	cfg := defaultConfig()
-	if got := cfg.Issuance.EffectiveSecretMembers(); !eq(got, def) {
-		t.Errorf("default set = %v", got)
-	}
-	got := cfg.Issuance.EffectiveSecretMembers()
-	got[0] = "x"
-	if DefaultSecretMembers[0] != "org.siros.secret_seed" {
-		t.Error("EffectiveSecretMembers must return a copy")
-	}
-
-	var zero IssuanceConfig
-	if err := zero.validate(); err != nil || !eq(zero.EffectiveSecretMembers(), def) {
-		t.Errorf("unset must mean the defaults, err=%v", err)
-	}
-
-	t.Setenv("WALLET_ISSUANCE_SECRET_MEMBERS", "a.b,auxiliary_data")
-	env := defaultConfig()
-	if err := envconfig.Process("WALLET", env); err != nil {
-		t.Fatal(err)
-	}
-	if !eq(env.Issuance.SecretMembers, []string{"a.b", "auxiliary_data"}) {
-		t.Errorf("env override not applied: %v", env.Issuance.SecretMembers)
-	}
-
-	for name, members := range map[string][]string{
-		"empty list": {}, "empty name": {"a", ""}, "duplicate": {"a", "a"}, "space": {"a b"},
-		"control": {"a\nb"}, "non-ascii": {"é"}, "too long": {strings.Repeat("a", 129)},
-	} {
-		c := validBaseConfig()
-		c.Issuance = IssuanceConfig{SecretMembers: members}
-		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "issuance.secret_members") {
-			t.Errorf("%s: want an issuance.secret_members error, got %v", name, err)
-		}
-	}
-	ok := validBaseConfig()
-	ok.Issuance = IssuanceConfig{SecretMembers: []string{"x.y"}}
-	if err := ok.Validate(); err != nil {
-		t.Errorf("valid custom set rejected: %v", err)
-	}
-}
-
 // An enabled AS fetches its own JWKS from as.external_url, so Validate must reject it without one
 // rather than letting startup fail later in the provider.
 func TestConfig_Validate_AS_RequiresExternalURL(t *testing.T) {
