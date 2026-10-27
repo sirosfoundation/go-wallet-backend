@@ -87,8 +87,9 @@ type Session struct {
 	ID       string
 	UserID   string
 	TenantID string
-	// TAC is the token's TAC claim. Empty means no TAC claim, not "no permissions":
-	// handleFlowStart skips the check.
+	// TAC is the token's TAC claim. Empty means no permissions: handleFlowStart
+	// refuses any protocol with a required permission (fail closed), exactly as
+	// the HTTP routes' MustHaveTAC does.
 	TAC claims.TAC
 	// tokenIssuedAt is the handshake token's iat, re-checked at each flow start.
 	tokenIssuedAt time.Time
@@ -842,8 +843,8 @@ func (m *Manager) handleSession(session *Session) {
 
 // requiredTACForProtocol maps each flow protocol to the TAC permission its
 // action semantically requires: OID4VP shares an existing credential (read),
-// OID4VCI receives a new one (insert). Only enforced when the session
-// actually has a TAC to check - see handleFlowStart.
+// OID4VCI receives a new one (insert). Enforced for every session, including
+// one whose token carries an empty TAC - see handleFlowStart.
 var requiredTACForProtocol = map[Protocol]string{
 	ProtocolOID4VP:  "r",
 	ProtocolOID4VCI: "i",
@@ -902,17 +903,17 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		return
 	}
 
-	// TAC check: only enforced when the session actually has a TAC to check
-	// (empty means the token carries no TAC claim, not "no permissions").
-	if session.TAC != "" {
-		if required, ok := requiredTACForProtocol[msg.Protocol]; ok && !session.TAC.HasAll(required) {
-			_ = session.SendFlowError(flowID, "", ErrCodeForbidden, "insufficient permissions for protocol: "+string(msg.Protocol))
-			logger.Warn("Rejected flow start - insufficient TAC",
-				zap.String("tac", string(session.TAC)),
-				zap.String("required", required),
-			)
-			return
-		}
+	// TAC check, always enforced. Every token is an AS-issued go-tokenauth
+	// token (legacy tokens, which had no TAC concept, are gone), so an empty
+	// TAC means "no permissions" and is refused - fail closed, matching the
+	// HTTP routes (middleware.MustHaveTAC).
+	if required, ok := requiredTACForProtocol[msg.Protocol]; ok && !session.TAC.HasAll(required) {
+		_ = session.SendFlowError(flowID, "", ErrCodeForbidden, "insufficient permissions for protocol: "+string(msg.Protocol))
+		logger.Warn("Rejected flow start - insufficient TAC",
+			zap.String("tac", string(session.TAC)),
+			zap.String("required", required),
+		)
+		return
 	}
 
 	// Check concurrent flow limit and register atomically to prevent race condition.
@@ -980,6 +981,15 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	logger.Info("Flow completed")
 }
 
+// userRevokedAnywhere reports whether userID is revoked according to the
+// engine's own always-on signal or the optional token blacklist.
+func (m *Manager) userRevokedAnywhere(userID string) bool {
+	if m.isUserRevoked(userID) {
+		return true
+	}
+	return m.blacklist != nil && m.blacklist.IsUserRevoked(context.Background(), userID)
+}
+
 // registerSession adds session to the manager's live-session bookkeeping
 // and returns true, unless userID was revoked between validateToken's own
 // check (in handleNewConnection, immediately before this call) and this
@@ -1016,16 +1026,10 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 func (m *Manager) registerSession(session *Session) bool {
 	m.sessionsMu.Lock()
 
-	if session.UserID != "" {
-		revoked := m.isUserRevoked(session.UserID)
-		if !revoked && m.blacklist != nil {
-			revoked = m.blacklist.IsUserRevoked(context.Background(), session.UserID)
-		}
-		if revoked {
-			m.sessionsMu.Unlock()
-			session.closeWithReason("account deleted")
-			return false
-		}
+	if session.UserID != "" && m.userRevokedAnywhere(session.UserID) {
+		m.sessionsMu.Unlock()
+		session.closeWithReason("account deleted")
+		return false
 	}
 	defer m.sessionsMu.Unlock()
 

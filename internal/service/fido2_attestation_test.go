@@ -401,6 +401,23 @@ func TestFIDO2AttestationService_VerifyEvidenceRefusesUntrusted(t *testing.T) {
 	}
 }
 
+// An unknown instance is refused before the expensive verification: the trust
+// evaluator is never consulted.
+func TestFIDO2AttestationService_VerifyRefusesUnknownInstanceBeforeVerifying(t *testing.T) {
+	store := memory.NewStore()
+	eval := &stubEvaluator{decision: true}
+	svc := NewFIDO2AttestationService(testFIDO2AttestationConfig(true), store.WalletInstances(), store.KeyAttestations(), newTestTrustService(t, eval), zap.NewNop())
+	hash := make([]byte, 32)
+	attObj, _ := buildTestAttestationObjectFlags(t, uuid.New(), hash, 0x40|0x04)
+	err := svc.Verify(context.Background(), &FIDO2AttestationRequest{WalletInstanceID: "no-such-instance", AttestationObject: attObj, ClientDataHash: hash})
+	if !errors.Is(err, ErrKeyAttestationInstanceRefused) {
+		t.Fatalf("err = %v, want ErrKeyAttestationInstanceRefused", err)
+	}
+	if eval.gotSubjectID != "" || eval.gotResourceID != "" {
+		t.Errorf("trust evaluation ran for a refused instance (subject %q)", eval.gotSubjectID)
+	}
+}
+
 // buildTestU2FAttestationObject builds a valid "fido-u2f" attestation. Its
 // signature covers 0x00||rpIdHash||clientDataHash||credentialId||publicKey and
 // NOT the authenticator data flags, which is why flags is a free parameter.
