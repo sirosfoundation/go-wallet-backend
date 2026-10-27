@@ -96,8 +96,9 @@ type Session struct {
 	ID       string
 	UserID   string
 	TenantID string
-	// TAC is the token's TAC claim. Empty means no TAC claim, not "no permissions":
-	// handleFlowStart skips the check.
+	// TAC is the token's TAC claim. Empty means no permissions: handleFlowStart
+	// refuses any protocol with a required permission (fail closed), exactly as
+	// the HTTP routes' MustHaveTAC does.
 	TAC     claims.TAC
 	conn    *websocket.Conn
 	sendMu  sync.Mutex
@@ -793,8 +794,8 @@ func (m *Manager) handleSession(session *Session) {
 
 // requiredTACForProtocol maps each flow protocol to the TAC permission its
 // action semantically requires: OID4VP shares an existing credential (read),
-// OID4VCI receives a new one (insert). Only enforced when the session
-// actually has a TAC to check - see handleFlowStart.
+// OID4VCI receives a new one (insert). Enforced for every session, including
+// one whose token carries an empty TAC - see handleFlowStart.
 var requiredTACForProtocol = map[Protocol]string{
 	ProtocolOID4VP:  "r",
 	ProtocolOID4VCI: "i",
@@ -833,17 +834,17 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		return
 	}
 
-	// TAC check: only enforced when the session actually has a TAC to check
-	// (empty means the token carries no TAC claim, not "no permissions").
-	if session.TAC != "" {
-		if required, ok := requiredTACForProtocol[msg.Protocol]; ok && !session.TAC.HasAll(required) {
-			_ = session.SendFlowError(flowID, "", ErrCodeForbidden, "insufficient permissions for protocol: "+string(msg.Protocol))
-			logger.Warn("Rejected flow start - insufficient TAC",
-				zap.String("tac", string(session.TAC)),
-				zap.String("required", required),
-			)
-			return
-		}
+	// TAC check, always enforced. Every token is an AS-issued go-tokenauth
+	// token (legacy tokens, which had no TAC concept, are gone), so an empty
+	// TAC means "no permissions" and is refused - fail closed, matching the
+	// HTTP routes (middleware.MustHaveTAC).
+	if required, ok := requiredTACForProtocol[msg.Protocol]; ok && !session.TAC.HasAll(required) {
+		_ = session.SendFlowError(flowID, "", ErrCodeForbidden, "insufficient permissions for protocol: "+string(msg.Protocol))
+		logger.Warn("Rejected flow start - insufficient TAC",
+			zap.String("tac", string(session.TAC)),
+			zap.String("required", required),
+		)
+		return
 	}
 
 	// Check concurrent flow limit and register atomically to prevent race condition.
@@ -905,6 +906,28 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	logger.Info("Flow completed")
 }
 
+// checkSharedRevocation consults the shared revocation store before
+// registerSession takes sessionsMu. It closes the session and returns false
+// when the user is revoked or the store cannot answer (fail closed).
+func (m *Manager) checkSharedRevocation(session *Session) bool {
+	if session.UserID == "" || m.blacklist == nil {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), revocationCheckTimeout)
+	revoked, err := m.blacklist.IsUserRevoked(ctx, session.UserID)
+	cancel()
+	if err != nil {
+		m.logger.Error("Session refused: revocation check failed", zap.Error(err))
+		session.closeWithReason("revocation check unavailable")
+		return false
+	}
+	if revoked {
+		session.closeWithReason("account deleted")
+		return false
+	}
+	return true
+}
+
 // registerSession adds session to the manager's live-session bookkeeping
 // and returns true, unless userID was revoked between validateToken's own
 // check (in handleNewConnection, immediately before this call) and this
@@ -944,30 +967,16 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 // revokedUsers, which is what orders against RevokeUser, is still checked
 // under the lock.
 func (m *Manager) registerSession(session *Session) bool {
-	if session.UserID != "" && m.blacklist != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), revocationCheckTimeout)
-		revoked, err := m.blacklist.IsUserRevoked(ctx, session.UserID)
-		cancel()
-		if err != nil {
-			m.logger.Error("Session refused: revocation check failed", zap.Error(err))
-			session.closeWithReason("revocation check unavailable")
-			return false
-		}
-		if revoked {
-			session.closeWithReason("account deleted")
-			return false
-		}
+	if !m.checkSharedRevocation(session) {
+		return false
 	}
 
 	m.sessionsMu.Lock()
 
-	if session.UserID != "" {
-		revoked := m.isUserRevoked(session.UserID)
-		if revoked {
-			m.sessionsMu.Unlock()
-			session.closeWithReason("account deleted")
-			return false
-		}
+	if session.UserID != "" && m.isUserRevoked(session.UserID) {
+		m.sessionsMu.Unlock()
+		session.closeWithReason("account deleted")
+		return false
 	}
 	defer m.sessionsMu.Unlock()
 
