@@ -1189,6 +1189,28 @@ Client → Server:
 }
 ```
 
+#### Refusing the Sign Request
+
+A client that will not sign (the user declined, the wallet does not trust the
+verifier, a value the signature must bind is missing) answers the
+`sign_request` with the refusal code instead of waiting for the sign timeout:
+
+```
+Client → Server:
+{ "type": "sign_response", "flow_id": "<uuid>", "message_id": "<uuid>",
+  "error_code": "SIGN_REFUSED", "error": "<optional, wallet-private>" }
+```
+
+`RequestSign` returns at once. The engine answers the verifier `access_denied`
+with the request's `state` and **no** `error_description` (OpenID4x 3.2.6),
+in the response mode of the request, and ends the flow with a `flow_error`
+`PRESENTATION_ERROR` ("User declined the request"), carrying `details.redirect_uri`
+when the response mode produced a verifier redirect. The client's `error` text
+is only logged; it is never sent to the verifier. Any other `sign_response` with
+`error` (and no `SIGN_REFUSED`) stays a `SIGN_ERROR` and the verifier is not
+contacted. Over WMP the refusal is a `wmp.flow.error` on the `sign` child flow
+with `data.reason` `rejected` and the parent flow ends with `-31006`.
+
 #### Response Submission
 
 ```
