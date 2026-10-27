@@ -381,7 +381,8 @@ func (r *RedisSessionStore) Get(ctx context.Context, sessionID string) (*Session
 }
 
 func (r *RedisSessionStore) GetByUser(ctx context.Context, tenantID, userID string) (*SessionData, error) {
-	sessionID, err := r.client.Get(ctx, r.userKey(tenantID, userID)).Result()
+	uk := r.userKey(tenantID, userID)
+	sessionID, err := r.client.Get(ctx, uk).Result()
 	if err == redis.Nil {
 		return r.getByLegacyUser(ctx, tenantID, userID)
 	}
@@ -389,7 +390,18 @@ func (r *RedisSessionStore) GetByUser(ctx context.Context, tenantID, userID stri
 		return nil, err
 	}
 
-	return r.Get(ctx, sessionID)
+	session, err := r.Get(ctx, sessionID)
+	if err != ErrSessionNotFound {
+		return session, err
+	}
+	// The pointer names a session that is gone. During a rolling upgrade an old
+	// replica deletes a (backfilled) session and writes its replacement under
+	// the legacy pointer only, leaving this pointer stale. Drop it - only if it
+	// still names the dead session - and resolve through the legacy pointer.
+	if err := compareAndDeleteScript.Run(ctx, r.client, []string{uk}, sessionID).Err(); err != nil {
+		return nil, err
+	}
+	return r.getByLegacyUser(ctx, tenantID, userID)
 }
 
 // getByLegacyUser resolves a session through the legacy pointer. It is
@@ -635,23 +647,40 @@ func (r *RedisSessionStore) rawSession(ctx context.Context, sessionID string) (*
 }
 
 func (r *RedisSessionStore) List(ctx context.Context, tenantID string) ([]*SessionData, error) {
-	sessionIDs, err := r.client.SMembers(ctx, r.tenantKey(tenantID)).Result()
-	if err != nil {
-		return nil, err
+	// Sessions written by replicas on the previous release with no tenant claim
+	// sit in the raw empty-tenant set, which now means the default tenant, so
+	// list both until they expire.
+	keys := []string{r.tenantKey(tenantID)}
+	if raw := r.legacyTenantKey(""); normalizeTenant(tenantID) == defaultTenant && raw != keys[0] {
+		keys = append(keys, raw)
 	}
 
 	var result []*SessionData
-	for _, id := range sessionIDs {
-		session, err := r.Get(ctx, id)
-		if err == ErrSessionNotFound {
-			// Clean up stale reference
-			r.client.SRem(ctx, r.tenantKey(tenantID), id)
-			continue
-		}
+	seen := make(map[string]struct{})
+	for _, key := range keys {
+		sessionIDs, err := r.client.SMembers(ctx, key).Result()
 		if err != nil {
 			return nil, err
 		}
-		result = append(result, session)
+		for _, id := range sessionIDs {
+			if _, dup := seen[id]; dup {
+				continue
+			}
+			seen[id] = struct{}{}
+			session, err := r.Get(ctx, id)
+			if err == ErrSessionNotFound {
+				// Clean up stale reference
+				r.client.SRem(ctx, key, id)
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			if normalizeTenant(session.TenantID) != normalizeTenant(tenantID) {
+				continue
+			}
+			result = append(result, session)
+		}
 	}
 
 	return result, nil

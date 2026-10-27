@@ -592,3 +592,60 @@ func TestRedisSessionStore_LegacyUserIDShapedLikeScopedKeyDoesNotCollide(t *test
 
 	assert.NotEqual(t, store.legacyUserKey(legacyID), store.userKey("default", "u"))
 }
+
+// Sessions of the previous release that carry no tenant claim live in the raw
+// empty-tenant set; listing the default tenant must include them before any
+// per-user lookup has backfilled them.
+func TestRedisSessionStore_ListDefaultTenantIncludesLegacyEmptyTenantSessions(t *testing.T) {
+	store, _ := newTestRedisStore(t)
+	ctx := context.Background()
+	seedLegacySession(t, store, redisSess("legacy-empty", "", "u1", time.Hour), time.Hour)
+	require.NoError(t, store.Put(ctx, redisSess("new-default", "default", "u2", time.Hour)))
+	seedLegacySession(t, store, redisSess("legacy-other", "t1", "u3", time.Hour), time.Hour)
+
+	for _, tenant := range []string{"", "default"} {
+		got, err := store.List(ctx, tenant)
+		require.NoError(t, err)
+		var ids []string
+		for _, s := range got {
+			ids = append(ids, s.ID)
+		}
+		assert.ElementsMatch(t, []string{"legacy-empty", "new-default"}, ids, "tenant %q", tenant)
+	}
+
+	got, err := store.List(ctx, "t1")
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "legacy-other", got[0].ID)
+}
+
+// After a legacy session is backfilled, an old replica can delete it and write
+// a replacement under the legacy pointer only. The stale scoped pointer must
+// not hide the live replacement.
+func TestRedisSessionStore_StaleScopedPointerFallsBackToLegacyReplacement(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	seedLegacySession(t, store, redisSess("old", "t1", "u1", time.Hour), time.Hour)
+	got, err := store.GetByUser(ctx, "t1", "u1") // backfills the scoped pointer
+	require.NoError(t, err)
+	require.Equal(t, "old", got.ID)
+	require.True(t, mr.Exists(store.userKey("t1", "u1")))
+
+	// Old replica: deletes the session and its legacy pointer, writes a new
+	// session with a legacy pointer; it never touches the scoped pointer.
+	require.NoError(t, store.client.Del(ctx, store.sessionKey("old"), store.legacyUserKey("u1")).Err())
+	seedLegacySession(t, store, redisSess("replacement", "t1", "u1", time.Hour), time.Hour)
+
+	got, err = store.GetByUser(ctx, "t1", "u1")
+	require.NoError(t, err)
+	assert.Equal(t, "replacement", got.ID)
+	scoped, err := store.client.Get(ctx, store.userKey("t1", "u1")).Result()
+	require.NoError(t, err)
+	assert.Equal(t, "replacement", scoped, "lookup re-backfills the scoped pointer to the live session")
+
+	// With no replacement at all, the dead pointer is dropped and nothing is found.
+	require.NoError(t, store.client.Del(ctx, store.sessionKey("replacement"), store.legacyUserKey("u1")).Err())
+	_, err = store.GetByUser(ctx, "t1", "u1")
+	assert.ErrorIs(t, err, ErrSessionNotFound)
+	assert.False(t, mr.Exists(store.userKey("t1", "u1")), "the stale pointer is removed")
+}

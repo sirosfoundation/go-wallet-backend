@@ -253,6 +253,11 @@ during a rolling upgrade, the store falls back to the legacy pointer:
 - `GetByUser` uses the legacy pointer when the new one is absent, returns the
   session only if its user and (normalised) tenant match the request, and
   lazily backfills the new pointer and index.
+  If the new pointer names a session that no longer exists (an old replica
+  deleted it and wrote a replacement under the legacy pointer only), the stale
+  pointer is dropped and the lookup resolves through the legacy pointer.
+- Listing the `default` tenant also includes sessions that old replicas wrote
+  with no tenant claim (the raw empty-tenant set).
 - `DeleteByUser` and `Delete` also remove the legacy pointer, and delete the
   session it names only if that session belongs to the target user.
 
