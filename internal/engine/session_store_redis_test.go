@@ -649,3 +649,47 @@ func TestRedisSessionStore_StaleScopedPointerFallsBackToLegacyReplacement(t *tes
 	assert.ErrorIs(t, err, ErrSessionNotFound)
 	assert.False(t, mr.Exists(store.userKey("t1", "u1")), "the stale pointer is removed")
 }
+
+// standaloneRecorder records the names of commands sent outside a pipeline.
+type standaloneRecorder struct {
+	mu   sync.Mutex
+	cmds []string
+}
+
+func (h *standaloneRecorder) DialHook(next redis.DialHook) redis.DialHook { return next }
+func (h *standaloneRecorder) ProcessPipelineHook(next redis.ProcessPipelineHook) redis.ProcessPipelineHook {
+	return next
+}
+func (h *standaloneRecorder) ProcessHook(next redis.ProcessHook) redis.ProcessHook {
+	return func(ctx context.Context, cmd redis.Cmder) error {
+		h.mu.Lock()
+		if cmd.Name() != "hello" { // connection setup, not a store command
+			h.cmds = append(h.cmds, cmd.Name())
+		}
+		h.mu.Unlock()
+		return next(ctx, cmd)
+	}
+}
+
+// The session deletion and both pointer compare-and-deletes must commit in one
+// transaction: if the connection failed between separate round trips, a retry
+// would find the session already gone and never clean the pointers up. The
+// only standalone command Delete may issue is the initial read of the session.
+func TestRedisSessionStore_DeleteCleansPointersInSameTransaction(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	seedLegacySession(t, store, redisSess("s1", "t1", "u1", time.Hour), time.Hour)
+	require.NoError(t, store.Put(ctx, redisSess("s1x", "t1", "u2", time.Hour)))
+	// A scoped pointer and a legacy pointer both naming s1.
+	require.NoError(t, store.client.Set(ctx, store.userKey("t1", "u1"), "s1", time.Hour).Err())
+
+	rec := &standaloneRecorder{}
+	store.client.AddHook(rec)
+	require.NoError(t, store.Delete(ctx, "s1"))
+
+	assert.Equal(t, []string{"get"}, rec.cmds, "pointer cleanup must not use separate round trips")
+	assert.False(t, mr.Exists(store.userKey("t1", "u1")))
+	assert.False(t, mr.Exists(store.legacyUserKey("u1")))
+	assert.False(t, mr.Exists(store.sessionKey("s1")))
+	assert.True(t, mr.Exists(store.userKey("t1", "u2")), "other users are untouched")
+}

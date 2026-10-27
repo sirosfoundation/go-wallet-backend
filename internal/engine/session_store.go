@@ -512,6 +512,13 @@ func (r *RedisSessionStore) Delete(ctx context.Context, sessionID string) error 
 		return err
 	}
 
+	// Everything goes in one transaction, so a connection failure cannot commit
+	// the session deletion but lose the pointer cleanup (a retry would find the
+	// session already gone and never clean the pointers up). The pointers are
+	// dropped only if they still name this session, atomically inside the
+	// transaction: a separate GET and DEL would let another replica repoint a
+	// pointer in between and the DEL would remove the live replacement's.
+	// A legacy pointer naming this session must go too (rolling upgrade).
 	pipe := r.client.TxPipeline()
 	pipe.Del(ctx, r.sessionKey(sessionID))
 	pipe.SRem(ctx, r.tenantKey(session.TenantID), sessionID)
@@ -519,21 +526,10 @@ func (r *RedisSessionStore) Delete(ctx context.Context, sessionID string) error 
 	if raw := r.legacyTenantKey(session.TenantID); raw != r.tenantKey(session.TenantID) {
 		pipe.SRem(ctx, raw, sessionID)
 	}
-
+	compareAndDeleteScript.Eval(ctx, pipe, []string{r.legacyUserKey(session.UserID)}, sessionID)
+	compareAndDeleteScript.Eval(ctx, pipe, []string{r.userKey(session.TenantID, session.UserID)}, sessionID)
 	_, err = pipe.Exec(ctx)
-	if err != nil {
-		return err
-	}
-	// A legacy pointer naming this session must go too (rolling upgrade).
-	if err := compareAndDeleteScript.Run(ctx, r.client,
-		[]string{r.legacyUserKey(session.UserID)}, sessionID).Err(); err != nil {
-		return err
-	}
-	// Drop the pointer only if it still names this session, atomically: with a
-	// separate GET and DEL another replica could repoint it in between and the
-	// DEL would remove the live replacement's pointer.
-	return compareAndDeleteScript.Run(ctx, r.client,
-		[]string{r.userKey(session.TenantID, session.UserID)}, sessionID).Err()
+	return err
 }
 
 // deleteBatchSize bounds how many sessions one DeleteByUser script call
