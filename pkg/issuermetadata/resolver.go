@@ -76,8 +76,13 @@ type Config struct {
 
 	// HTTPClient is the HTTP client used for outbound requests.
 	// The caller is responsible for configuring timeouts, TLS settings,
-	// and SSRF protections (e.g. blocking private IP ranges).
-	// If nil, http.DefaultClient is used.
+	// and SSRF protections (e.g. blocking private IP ranges); production
+	// callers build it with config.HTTPClientConfig.NewHTTPClient.
+	// Required: issuer URLs are caller-controlled, so there is deliberately no
+	// default client. New returns ErrHTTPClientRequired when it is nil rather
+	// than fall back to http.DefaultClient, which reaches private, loopback and
+	// cloud-metadata addresses. (This package cannot build the guarded client
+	// itself: pkg/config imports it, so importing pkg/config here is a cycle.)
 	HTTPClient *http.Client
 
 	// AllowHTTP permits non-TLS issuer URLs.
@@ -241,8 +246,12 @@ type Resolver struct {
 	group singleflight.Group
 }
 
+// ErrHTTPClientRequired is returned by New when Config.HTTPClient is nil.
+var ErrHTTPClientRequired = errors.New("issuermetadata: Config.HTTPClient is required (build one with config.HTTPClientConfig.NewHTTPClient)")
+
 // New creates a Resolver with the given configuration.
-// Sensible defaults are applied for zero-value fields.
+// Sensible defaults are applied for zero-value fields, except HTTPClient, which
+// is required.
 func New(cfg Config) (*Resolver, error) {
 	if cfg.CacheTTL == 0 {
 		cfg.CacheTTL = 5 * time.Minute
@@ -263,7 +272,7 @@ func New(cfg Config) (*Resolver, error) {
 
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		return nil, ErrHTTPClientRequired
 	}
 
 	return &Resolver{

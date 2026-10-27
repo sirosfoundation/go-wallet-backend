@@ -266,3 +266,87 @@ func TestEvaluator_EvaluateX5C(t *testing.T) {
 		t.Error("expected Decision=true")
 	}
 }
+
+// TestEvaluator_FailureContract asserts that every adapter method reports
+// transport/PDP failures in-band with Failed=true, while a genuine deny
+// stays Failed=false.
+func TestEvaluator_FailureContract(t *testing.T) {
+	type pdp struct {
+		name       string
+		handler    http.HandlerFunc // nil => unreachable
+		wantFailed bool
+	}
+	pdps := []pdp{
+		{"500", func(w http.ResponseWriter, _ *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}, true},
+		{"unreachable", nil, true},
+		{"malformed JSON", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte("{not json"))
+		}, true},
+		{"genuine deny", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(gotrust.EvaluationResponse{Decision: false})
+		}, false},
+	}
+
+	methods := map[string]func(e *Evaluator) (*trust.EvaluationResponse, error){
+		"Evaluate": func(e *Evaluator) (*trust.EvaluationResponse, error) {
+			return e.Evaluate(context.Background(), &trust.EvaluationRequest{
+				SubjectID: "s", KeyType: trust.ResourceTypeJWK,
+				Key: []interface{}{map[string]interface{}{"kty": "EC"}},
+			})
+		},
+		"Resolve": func(e *Evaluator) (*trust.EvaluationResponse, error) {
+			return e.Resolve(context.Background(), "did:web:example.com")
+		},
+		"EvaluateX5C": func(e *Evaluator) (*trust.EvaluationResponse, error) {
+			return e.EvaluateX5C(context.Background(), "s", []string{"c"}, "credential-issuer")
+		},
+	}
+
+	for _, p := range pdps {
+		for mname, call := range methods {
+			t.Run(mname+"/"+p.name, func(t *testing.T) {
+				var url string
+				if p.handler == nil {
+					srv := httptest.NewServer(http.NotFoundHandler())
+					url = srv.URL
+					srv.Close()
+				} else {
+					srv := httptest.NewServer(p.handler)
+					defer srv.Close()
+					url = srv.URL
+				}
+				e, err := NewEvaluator(&Config{BaseURL: url, Timeout: 2 * time.Second})
+				if err != nil {
+					t.Fatal(err)
+				}
+				resp, err := call(e)
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				if resp.Decision {
+					t.Error("Decision must be false")
+				}
+				if resp.Failed != p.wantFailed {
+					t.Errorf("Failed = %v, want %v (reason %q)", resp.Failed, p.wantFailed, resp.Reason)
+				}
+			})
+		}
+	}
+
+	t.Run("Evaluate/request build error", func(t *testing.T) {
+		e, _ := NewEvaluator(&Config{BaseURL: "http://127.0.0.1:1"})
+		resp, err := e.Evaluate(context.Background(), &trust.EvaluationRequest{
+			SubjectID: "s", KeyType: trust.ResourceTypeX5C, // no key material
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Decision || !resp.Failed {
+			t.Errorf("want Decision=false Failed=true, got %+v", resp)
+		}
+	})
+}

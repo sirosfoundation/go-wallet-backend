@@ -9,11 +9,13 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,7 +25,7 @@ import (
 
 func newTestResolver(t *testing.T) *Resolver {
 	t.Helper()
-	r, err := New(Config{
+	r, err := New(Config{HTTPClient: testHTTPClient(),
 		CacheTTL:     5 * time.Minute,
 		AllowHTTP:    true,
 		MetadataType: MetadataTypeAny, // one request, no staging
@@ -38,7 +40,7 @@ func newTestResolver(t *testing.T) *Resolver {
 // prefer-signed policy.
 func newTestResolverPreferSigned(t *testing.T) *Resolver {
 	t.Helper()
-	r, err := New(Config{
+	r, err := New(Config{HTTPClient: testHTTPClient(),
 		CacheTTL:     5 * time.Minute,
 		AllowHTTP:    true,
 		MetadataType: MetadataTypePreferSigned,
@@ -493,7 +495,7 @@ func TestResolve_TrailingSlashStripped(t *testing.T) {
 }
 
 func TestResolve_RejectsHTTPByDefault(t *testing.T) {
-	r, _ := New(Config{}) // AllowHTTP = false
+	r, _ := New(Config{HTTPClient: testHTTPClient()}) // AllowHTTP = false
 	_, err := r.Resolve(context.Background(), "http://issuer.example.com")
 	if err == nil {
 		t.Error("expected error for HTTP URL, got nil")
@@ -601,7 +603,7 @@ func TestResolve_PreferUnsigned_RetriesSignedOn406(t *testing.T) {
 	}))
 	defer server.Close()
 
-	r, err := New(Config{AllowHTTP: true, MetadataType: MetadataTypePreferUnsigned})
+	r, err := New(Config{HTTPClient: testHTTPClient(), AllowHTTP: true, MetadataType: MetadataTypePreferUnsigned})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -697,7 +699,7 @@ func TestResolve_CacheTTLExpiry(t *testing.T) {
 	}))
 	defer server.Close()
 
-	r, _ := New(Config{
+	r, _ := New(Config{HTTPClient: testHTTPClient(),
 		CacheTTL:  1 * time.Millisecond, // very short TTL
 		AllowHTTP: true,
 	})
@@ -817,7 +819,7 @@ func TestResolveWithInfo_Validated_SignedMetadata(t *testing.T) {
 	defer server.Close()
 
 	evaluator := &mockTrustEvaluator{decision: true}
-	resolver, _ := New(Config{
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(),
 		AllowHTTP:      true,
 		TrustEvaluator: evaluator,
 	})
@@ -904,7 +906,7 @@ func TestResolve_ApplicationJWT_WithX5C(t *testing.T) {
 	}
 	token = signClaimsWithX5C(t, priv, []*x509.Certificate{cert}, "openidvci-issuer-metadata+jwt", claims)
 
-	resolver, err := New(Config{
+	resolver, err := New(Config{HTTPClient: testHTTPClient(),
 		CacheTTL:       5 * time.Minute,
 		AllowHTTP:      true,
 		TrustEvaluator: evaluator,
@@ -959,7 +961,7 @@ func TestResolve_ApplicationJWT_TrustEvaluatorRejects(t *testing.T) {
 	}
 	token = signClaimsWithX5C(t, priv, []*x509.Certificate{cert}, "openidvci-issuer-metadata+jwt", claims)
 
-	resolver, _ := New(Config{
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(),
 		CacheTTL:       5 * time.Minute,
 		AllowHTTP:      true,
 		TrustEvaluator: evaluator,
@@ -994,7 +996,7 @@ func TestResolve_ApplicationJWT_WrongTyp(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(),
 		AllowHTTP: true,
 	})
 
@@ -1025,7 +1027,7 @@ func TestResolve_ApplicationJWT_MissingSub(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{AllowHTTP: true})
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(), AllowHTTP: true})
 	_, err := resolver.Resolve(context.Background(), server.URL)
 	if err == nil {
 		t.Error("expected error for missing sub claim")
@@ -1050,7 +1052,7 @@ func TestResolve_ApplicationJWT_SubMismatch(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{AllowHTTP: true})
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(), AllowHTTP: true})
 	_, err := resolver.Resolve(context.Background(), server.URL)
 	if err == nil {
 		t.Error("expected error for sub mismatch")
@@ -1078,7 +1080,7 @@ func TestResolve_ApplicationJWT_MissingIat(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{AllowHTTP: true})
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(), AllowHTTP: true})
 	_, err := resolver.Resolve(context.Background(), server.URL)
 	if err == nil {
 		t.Error("expected error for missing iat claim")
@@ -1108,7 +1110,7 @@ func TestResolve_SignedMetadata_TrustEvaluatorCalled(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(),
 		AllowHTTP:      true,
 		TrustEvaluator: evaluator,
 	})
@@ -1151,7 +1153,7 @@ func TestResolve_SignedMetadata_TrustEvaluatorRejects(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(),
 		AllowHTTP:      true,
 		TrustEvaluator: evaluator,
 	})
@@ -1172,7 +1174,7 @@ func TestResolve_AcceptHeader(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{AllowHTTP: true})
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(), AllowHTTP: true})
 	resolver.Resolve(context.Background(), server.URL) //nolint:errcheck
 
 	// Default is prefer-signed: the first request advertises only
@@ -1190,7 +1192,7 @@ func TestResolve_UnsupportedContentType(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{AllowHTTP: true})
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(), AllowHTTP: true})
 	_, err := resolver.Resolve(context.Background(), server.URL)
 	if err == nil {
 		t.Error("expected error for unsupported Content-Type")
@@ -1221,7 +1223,7 @@ func TestResolve_TrustEvaluatorError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(),
 		AllowHTTP:      true,
 		TrustEvaluator: evaluator,
 	})
@@ -1245,7 +1247,7 @@ func TestResolve_FallbackOnByDefault(t *testing.T) {
 	}))
 	defer server.Close()
 
-	r, err := New(Config{AllowHTTP: true})
+	r, err := New(Config{HTTPClient: testHTTPClient(), AllowHTTP: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1325,3 +1327,54 @@ func TestValidateIssuerClaims_RootSlashAndQuery(t *testing.T) {
 		}
 	}
 }
+// testHTTPClient is an unguarded client for tests that fetch from loopback
+// httptest servers. Production code passes a client from
+// config.HTTPClientConfig.NewHTTPClient; the SSRF behaviour of that client is
+// tested in pkg/config and, through the resolver, in internal/server.
+func testHTTPClient() *http.Client { return &http.Client{Timeout: 10 * time.Second} }
+
+// There is no default client: New must refuse to build a resolver that would
+// fall back to http.DefaultClient (private, loopback and metadata addresses
+// reachable), and must use the caller's client when one is given.
+func TestNew_HTTPClientRequired(t *testing.T) {
+	for _, cfg := range []Config{{}, {AllowHTTP: true}, {HTTPClient: nil, CacheTTL: time.Minute}} {
+		if r, err := New(cfg); !errors.Is(err, ErrHTTPClientRequired) || r != nil {
+			t.Fatalf("New(%+v) = (%v, %v), want ErrHTTPClientRequired", cfg, r, err)
+		}
+	}
+	c := &http.Client{}
+	r, err := New(Config{HTTPClient: c})
+	if err != nil {
+		t.Fatalf("New with a client: %v", err)
+	}
+	if r.httpClient != c {
+		t.Fatal("resolver must use the caller's client")
+	}
+}
+
+// A guarded client supplied by the caller is what stops a loopback issuer; the
+// resolver does not bypass it.
+func TestResolve_UsesCallerSuppliedGuardedClient(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+	}))
+	defer srv.Close()
+	refuse := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("refused by guard")
+	})}
+	r, err := New(Config{HTTPClient: refuse, AllowHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Resolve(context.Background(), srv.URL); err == nil || !strings.Contains(err.Error(), "refused by guard") {
+		t.Fatalf("expected the caller's client to refuse, got %v", err)
+	}
+	if hits.Load() != 0 {
+		t.Fatal("server was reached despite the guard")
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
