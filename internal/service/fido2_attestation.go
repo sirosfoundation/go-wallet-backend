@@ -92,6 +92,16 @@ func (s *FIDO2AttestationService) Verify(ctx context.Context, req *FIDO2Attestat
 	if req != nil && req.WalletInstanceID == "" && s.IsEnabled() {
 		return fmt.Errorf("%w: empty wallet_instance_id", ErrFIDO2AttestationInvalid)
 	}
+	// Refuse a foreign, unknown or revoked instance before the expensive
+	// verification (CBOR, signature, MDS3/PDP trust evaluation): the route is not
+	// behind the WIA rate limiter, so a caller must not be able to make the server
+	// do that work for a request that is bound to be refused. The check after the
+	// verification stays, for the race.
+	if req != nil && s.IsEnabled() {
+		if _, err := refuseWalletInstance(ctx, s.instances, req.WalletInstanceID, true); err != nil {
+			return err
+		}
+	}
 	rec, err := s.VerifyEvidence(ctx, req)
 	if err != nil {
 		return err
