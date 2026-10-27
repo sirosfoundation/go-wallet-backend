@@ -255,8 +255,8 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 
 	// The bearer token was only checked when the stream opened. It expires, or is
 	// revoked (per jti, per user, per refresh-token family), while the stream is
-	// open, so it is validated again with the same checks before every
-	// events and on every heartbeat. Fail closed: any failure ends the stream (the
+	// open, so it is validated again with the same checks before every event
+	// and on every heartbeat. Fail closed: any failure ends the stream (the
 	// session and its replayable events stay; the client reconnects with a valid
 	// token).
 	stillAuthorized := func() bool {
