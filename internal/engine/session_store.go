@@ -578,56 +578,90 @@ return 0
 // gate refuses and closes it.
 func (r *RedisSessionStore) DeleteByUser(ctx context.Context, userID string) error {
 	for {
-		// Oldest-expiring first; expired members' keys are simply absent.
-		ids, err := r.client.ZRange(ctx, r.userSetKey(userID), 0, deleteBatchSize-1).Result()
+		ids, hasLegacy, err := r.userDeleteCandidates(ctx, userID)
 		if err != nil {
 			return err
 		}
-		// Pre-upgrade sessions are known only via the legacy pointer: include the
-		// session it names (if this user's) and always remove the pointer.
-		legacyID, err := r.client.Get(ctx, r.legacyUserKey(userID)).Result()
-		if err != nil && err != redis.Nil {
-			return err
-		}
-		hasLegacy := err == nil
-		if hasLegacy {
-			ids = append(ids, legacyID)
-		}
-
 		if len(ids) == 0 {
-			done, err := deleteUserSetIfEmptyScript.Run(ctx, r.client, []string{r.userSetKey(userID)}).Int()
-			if err != nil {
+			done, err := r.dropUserSetIfEmpty(ctx, userID)
+			if err != nil || done {
 				return err
-			}
-			if done == 1 {
-				return nil
 			}
 			continue
 		}
-
-		args := []any{r.legacyUserKey(userID)}
-		for i, id := range ids {
-			isLegacy := hasLegacy && i == len(ids)-1
-			var sk, pk, tk, rtk string
-			if sess, gerr := r.rawSession(ctx, id); gerr == nil && (!isLegacy || sess.UserID == userID) {
-				sk = r.sessionKey(id)
-				pk = r.userKey(sess.TenantID, sess.UserID)
-				tk = r.tenantKey(sess.TenantID)
-				if raw := r.legacyTenantKey(sess.TenantID); raw != tk {
-					rtk = raw
-				}
-			} else if gerr != nil && gerr != ErrSessionNotFound {
-				return gerr
-			}
-			args = append(args, id, sk, pk, tk, rtk)
-		}
-		if err := deleteUserBatchScript.Run(ctx, r.client, []string{r.userSetKey(userID)}, args...).Err(); err != nil {
+		if err := r.deleteBatch(ctx, userID, ids, hasLegacy); err != nil {
 			return err
 		}
-		if r.betweenDeleteBatches != nil {
-			r.betweenDeleteBatches()
-		}
 	}
+}
+
+// dropUserSetIfEmpty atomically removes the user's set if it is empty and
+// reports whether it is gone.
+func (r *RedisSessionStore) dropUserSetIfEmpty(ctx context.Context, userID string) (bool, error) {
+	done, err := deleteUserSetIfEmptyScript.Run(ctx, r.client, []string{r.userSetKey(userID)}).Int()
+	return done == 1, err
+}
+
+// deleteBatch removes one batch of the user's sessions atomically.
+func (r *RedisSessionStore) deleteBatch(ctx context.Context, userID string, ids []string, hasLegacy bool) error {
+	args, err := r.deleteBatchArgs(ctx, userID, ids, hasLegacy)
+	if err != nil {
+		return err
+	}
+	if err := deleteUserBatchScript.Run(ctx, r.client, []string{r.userSetKey(userID)}, args...).Err(); err != nil {
+		return err
+	}
+	if r.betweenDeleteBatches != nil {
+		r.betweenDeleteBatches()
+	}
+	return nil
+}
+
+// userDeleteCandidates returns the next batch of the user's session IDs,
+// oldest-expiring first (expired members' keys are simply absent). Pre-upgrade
+// sessions are known only via the legacy pointer, so the session it names, if
+// any, is appended last and hasLegacy is true.
+func (r *RedisSessionStore) userDeleteCandidates(ctx context.Context, userID string) (ids []string, hasLegacy bool, err error) {
+	ids, err = r.client.ZRange(ctx, r.userSetKey(userID), 0, deleteBatchSize-1).Result()
+	if err != nil {
+		return nil, false, err
+	}
+	legacyID, err := r.client.Get(ctx, r.legacyUserKey(userID)).Result()
+	if err != nil && err != redis.Nil {
+		return nil, false, err
+	}
+	if err == nil {
+		ids = append(ids, legacyID)
+		hasLegacy = true
+	}
+	return ids, hasLegacy, nil
+}
+
+// deleteBatchArgs builds the deleteUserBatchScript arguments for ids: the
+// legacy pointer key, then per session its ID, session key, scoped pointer
+// key, tenant set key and raw tenant set key. A session that is already gone
+// contributes only its ID (to be ZREMed); the legacy session is only deleted
+// if it really belongs to userID.
+func (r *RedisSessionStore) deleteBatchArgs(ctx context.Context, userID string, ids []string, hasLegacy bool) ([]any, error) {
+	args := []any{r.legacyUserKey(userID)}
+	for i, id := range ids {
+		isLegacy := hasLegacy && i == len(ids)-1
+		var sk, pk, tk, rtk string
+		sess, err := r.rawSession(ctx, id)
+		switch {
+		case err == nil && (!isLegacy || sess.UserID == userID):
+			sk = r.sessionKey(id)
+			pk = r.userKey(sess.TenantID, sess.UserID)
+			tk = r.tenantKey(sess.TenantID)
+			if raw := r.legacyTenantKey(sess.TenantID); raw != tk {
+				rtk = raw
+			}
+		case err != nil && err != ErrSessionNotFound:
+			return nil, err
+		}
+		args = append(args, id, sk, pk, tk, rtk)
+	}
+	return args, nil
 }
 
 // rawSession reads a session without the expiry check, for cleanup.
@@ -658,31 +692,42 @@ func (r *RedisSessionStore) List(ctx context.Context, tenantID string) ([]*Sessi
 	var result []*SessionData
 	seen := make(map[string]struct{})
 	for _, key := range keys {
-		sessionIDs, err := r.client.SMembers(ctx, key).Result()
+		sessions, err := r.listSet(ctx, key, tenantID, seen)
 		if err != nil {
 			return nil, err
 		}
-		for _, id := range sessionIDs {
-			if _, dup := seen[id]; dup {
-				continue
-			}
-			seen[id] = struct{}{}
-			session, err := r.Get(ctx, id)
-			if err == ErrSessionNotFound {
-				// Clean up stale reference
-				r.client.SRem(ctx, key, id)
-				continue
-			}
-			if err != nil {
-				return nil, err
-			}
-			if normalizeTenant(session.TenantID) != normalizeTenant(tenantID) {
-				continue
-			}
+		result = append(result, sessions...)
+	}
+	return result, nil
+}
+
+// listSet returns the live sessions of the tenant set at key that belong to
+// tenantID (after normalisation) and are not already in seen, recording what it
+// returns in seen. Members whose session is gone are removed from the set.
+func (r *RedisSessionStore) listSet(ctx context.Context, key, tenantID string, seen map[string]struct{}) ([]*SessionData, error) {
+	sessionIDs, err := r.client.SMembers(ctx, key).Result()
+	if err != nil {
+		return nil, err
+	}
+	var result []*SessionData
+	for _, id := range sessionIDs {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		session, err := r.Get(ctx, id)
+		if err == ErrSessionNotFound {
+			// Clean up stale reference
+			r.client.SRem(ctx, key, id)
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if normalizeTenant(session.TenantID) == normalizeTenant(tenantID) {
 			result = append(result, session)
 		}
 	}
-
 	return result, nil
 }
 
