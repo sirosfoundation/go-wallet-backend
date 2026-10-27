@@ -133,7 +133,7 @@ func TestRequestCredentialSelection_ConsentCheckModes(t *testing.T) {
 		verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			require.NoError(t, r.ParseForm())
 			assert.Equal(t, "access_denied", r.PostForm.Get("error"))
-			assert.Equal(t, verifierRefusedDescription, r.PostForm.Get("error_description"))
+			assert.False(t, r.PostForm.Has("error_description"), "uniform refusal shape: no description")
 			atomic.AddInt32(&n, 1)
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"redirect_uri":"https://verifier.example/done"}`))

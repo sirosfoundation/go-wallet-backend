@@ -4005,7 +4005,7 @@ func TestRequestCredentialSelection_NoMatchFailsFast(t *testing.T) {
 	case form := <-posted:
 		assert.Equal(t, "access_denied", form.Get("error"))
 		assert.Equal(t, "state-123", form.Get("state"))
-		assert.Equal(t, verifierRefusedDescription, form.Get("error_description"))
+		assert.False(t, form.Has("error_description"), "uniform refusal shape: no description")
 		assert.NotContains(t, form.Get("error_description"), "urn:eudi:pid:arf-1.8:1")
 	case <-time.After(5 * time.Second):
 		t.Fatal("verifier was never notified")

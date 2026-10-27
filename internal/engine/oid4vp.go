@@ -1814,12 +1814,14 @@ func (h *OID4VPHandler) waitForSelectionActionUntil(ctx context.Context, authReq
 }
 
 // verifierRefusedDescription is the error_description every refusal sends to
-// the verifier, whether the user declined or the wallet held nothing that
-// matched. OpenID4VP answers both with access_denied so a verifier cannot
-// learn which happened - and therefore cannot probe what a holder has by
-// asking and watching the reason. Two different descriptions would hand that
-// distinction straight back.
-const verifierRefusedDescription = "The wallet did not fulfil the request"
+// the verifier, whether the user declined, the wallet held nothing that
+// matched, or the wallet refused to sign: none. OpenID4VP answers all of them
+// with access_denied so a verifier cannot learn which happened - and therefore
+// cannot probe what a holder has by asking and watching the reason. Two
+// different descriptions, or a description for some and none for others, would
+// hand that distinction straight back. OpenID4x 3.2.6 requires none for a sign
+// refusal, so the uniform shape is none.
+const verifierRefusedDescription = ""
 
 // failNoMatchingCredential ends the flow when the wallet holds nothing the
 // verifier asked for. The verifier is told as well, so its session ends now
@@ -1839,7 +1841,7 @@ func (h *OID4VPHandler) failNoMatchingCredential(ctx context.Context, authReq *A
 	if reason != "" {
 		details["no_match_reason"] = reason
 	}
-	// The verifier gets the same description a decline sends, not this
+	// The verifier gets the same (empty) description a decline sends, not this
 	// message: naming what the wallet does not hold would tell the verifier
 	// whether the holder has a credential it asked about, which is exactly
 	// what one access_denied for both outcomes is there to prevent. The
@@ -2699,14 +2701,14 @@ func (h *OID4VPHandler) failSign(ctx context.Context, authReq *AuthorizationRequ
 // verifier gets access_denied at once, as for a decline at consent, and the
 // client gets the same decline error with the verifier's redirect, if any.
 //
-// The verifier is sent access_denied with the request's state and NO
-// error_description (OpenID4x 3.2.6): the wallet's reason - an untrusted
+// The verifier is sent access_denied with the request's state and no
+// error_description (OpenID4x 3.2.6), the same public shape as every other
+// refusal (verifierRefusedDescription). The wallet's reason - an untrusted
 // verifier, a missing thumbprint - is the wallet's business and must not reach
-// the verifier in any form, so even the fixed description the other refusals
-// use is left out. The client's own text (signErr) is only logged here.
+// the verifier in any form. The client's own text (signErr) is only logged here.
 func (h *OID4VPHandler) failSignRefused(ctx context.Context, authReq *AuthorizationRequest, signErr *SignError) {
 	h.Logger.Info("client refused to sign the presentation", zap.String("client_reason", signErr.ClientText()))
-	if redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", ""); redirectURI != "" {
+	if redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription); redirectURI != "" {
 		_ = h.ErrorWithDetails(StepSubmittingResponse, ErrCodePresentationError, "User declined the request",
 			map[string]interface{}{"redirect_uri": redirectURI})
 		return

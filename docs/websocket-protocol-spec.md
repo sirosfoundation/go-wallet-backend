@@ -1202,7 +1202,9 @@ Client → Server:
 ```
 
 `RequestSign` returns at once. The engine answers the verifier `access_denied`
-with the request's `state` and **no** `error_description` (OpenID4x 3.2.6),
+with the request's `state` and **no** `error_description` (OpenID4x 3.2.6; the same
+shape as a consent decline or an empty credential match, so a verifier cannot tell the
+refusals apart),
 in the response mode of the request, and ends the flow with a `flow_error`
 `PRESENTATION_ERROR` ("User declined the request"), carrying `details.redirect_uri`
 when the response mode produced a verifier redirect. The client's `error` text
