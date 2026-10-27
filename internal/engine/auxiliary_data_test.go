@@ -989,3 +989,19 @@ func TestAuxiliaryDataConflict_DeferredIsTerminalAndReportedOnce(t *testing.T) {
 		})
 	}
 }
+
+// An unexpected deferred status with an ambiguous body ends the issuance
+// before it is retried or its body logged.
+func TestDeferredUnexpectedStatus_AmbiguousBodyIsTerminal(t *testing.T) {
+	h, _, cleanup := captureHandler(t)
+	defer cleanup()
+	p := &deferredPoll{h: h}
+	_, done, err := p.plainAnswer(http.StatusInternalServerError, []byte(`{"error":"x","error":"SECRET-ISSUER-TEXT"}`), 0)
+	require.Error(t, err)
+	assert.True(t, done)
+	assert.NotContains(t, err.Error(), "SECRET-ISSUER-TEXT")
+	// An unambiguous one is still retried.
+	_, done, err = p.plainAnswer(http.StatusInternalServerError, []byte(`{"error":"x"}`), 0)
+	require.NoError(t, err)
+	assert.False(t, done)
+}

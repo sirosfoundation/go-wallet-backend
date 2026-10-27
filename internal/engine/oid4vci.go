@@ -3162,6 +3162,11 @@ func (p *deferredPoll) plainAnswer(status int, body []byte, attempt int) (*Crede
 		return nil, true, fmt.Errorf("deferred credential request failed with status %d: %s", status, string(body))
 
 	default:
+		// An ambiguous body is terminal before the status is retried or its
+		// body logged, whatever the status.
+		if err := h.auxiliaryDataConflictError(status, body); err != nil {
+			return nil, true, err
+		}
 		if p.quiet {
 			h.Logger.Warn("Unexpected deferred response status", zap.Int("status", status))
 		} else {
