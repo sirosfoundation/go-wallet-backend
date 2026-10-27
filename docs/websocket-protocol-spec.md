@@ -129,6 +129,19 @@ including how to request a token with the `tac` your client needs.
 Clients SHOULD send ping frames every 30 seconds. Servers MUST respond with pong.
 Connections idle for >60 seconds without ping/pong MAY be terminated.
 
+The engine's own cadence is reported in `handshake_complete.config.ping_interval_ms`
+(default 3000 ms). The engine pings at that interval and closes the connection
+when it has seen no sign of life for `ping_interval + pong_timeout` (default
+3 s + 5 s = 8 s). A pong, a client ping (answered with a pong) or inbound data
+(including each fragment of a message still being received, even an empty
+continuation frame) counts as a sign of life and restarts that window; any
+bytes read from the socket restart it, with the deadline refreshed at most
+once per eighth of the window. The engine's pings are not serialized behind
+the application's send lock; they are still ordered behind a data write that
+is stuck in the socket, and a ping that merely waits too long for that write is retried
+on the next tick, while a ping whose own socket write times out closes the
+connection.
+
 ### Reconnection
 
 On unexpected disconnect:
@@ -584,91 +597,145 @@ Server → Client:
 }
 ```
 
-Response-level `credential_metadata` (optional): when the issuer's Credential
-Response (or Deferred Credential Response) carries the OpenID4VCI 1.1
-response-level `credential_metadata` object (openid/OpenID4VCI#721), the engine
-validates it and relays it as ONE top-level member of `flow_complete`. It applies
-to every credential in `credentials[]`:
+Encrypted issuer response (engine-blind): when the issuer's Credential
+Response is encrypted to a key only the client holds, `flow_complete` carries
+no credential value and no `credential_metadata`:
 
 ```
 {
   "type": "flow_complete",
-  "credentials": [{"format": "mso_mdoc", "credential": "<mdoc>"}],
-  "credential_metadata": {
-    "org.siros.secret_seed": {"<namespace>": "<lowercase hex>"}
-  },
-  "credential_metadata_encrypted_response": true
+  "credentials": [{"format": "mso_mdoc", "vct": "...", "type_metadata": { ... }}],
+  "credential_response_encrypted": true
 }
 ```
 
-- The value must be a JSON object. Members are relayed verbatim, in order and
-  with number spelling (`1.50`, `2.0`, integers beyond float64) preserved; only
-  insignificant whitespace is removed and the JSON encoder may write `<`, `>`, `&`
-  as `\u` escapes (value-identical). Unknown members are relayed untouched:
-  wallets ignore members they do not know.
-- `org.siros.secret_seed`, when present, must be an object of 1 to 8 members
-  mapping a namespace (1 to 64 UTF-8 bytes, not the reserved name `namespaces`)
-  to a seed of exactly 32 lowercase hex characters (privatedata-spec 5A.1). The
-  advertisement form (`{"namespaces": [...]}`) in a response is therefore
-  rejected, as is uppercase or wrong-length hex.
-- Limits (abuse caps only, since the object is mostly display metadata such as
-  `display[]`, `logo.uri` data: URIs, `background_image` and `claims[]`): at most
-  1 MiB encoded (room for several embedded data: URI images; the raw HTTP body
-  is capped separately), nesting depth at most 16 (the object itself is depth 1),
-  at most 256 members in any one object, member names at most 256 bytes, and no
-  duplicate member names at the top level or inside `org.siros.secret_seed`
-  (elsewhere the display data is relayed as received). A value over a cap, or
-  `null`, an array or a non-object, fails the issuance with a `CREDENTIAL_ERROR`
-  flow error and no `flow_complete`; it is never dropped silently. Error messages
-  and logs never contain its contents. Only the `org.siros.secret_seed` member
-  is validated strictly (above); everything else is relayed verbatim.
-- `credential_metadata_encrypted_response` is `true` only when the issuer's
-  response was JWE-encrypted. When `credential_metadata` is present and this flag
-  is absent, the value arrived as plain JSON (always so for deferred issuance);
-  clients must refuse secret values in that case. The engine decrypts the JWE
-  itself, so the engine (and any TLS terminator) sees the values in clear.
-- A response whose `credential_metadata` carries `org.siros.secret_seed` must
-  also carry a non-empty response-level `notification_id` (privatedata-spec
-  5A.2); otherwise the issuance fails with `CREDENTIAL_ERROR` and no
-  `flow_complete`. This applies to normal and deferred completion alike.
-  Display-only `credential_metadata` needs no `notification_id`.
-- Seed delivery requires encryption. When the issuer metadata of the requested
-  credential configuration advertises seed delivery
-  (`credential_configurations_supported[cfg].credential_metadata["org.siros.secret_seed"]
-  = {"namespaces": [...]}`: 1 to 8 distinct names of 1 to 64 bytes, none named
-  `namespaces`, no other member; privatedata-spec 5A.4), the engine MUST request
-  response encryption (`credential_response_encryption`, same alg/enc negotiation
-  as always, even when the issuer does not mark encryption as required) and
-  refuses the issuance with `CREDENTIAL_ERROR` if the issuer offers no usable
-  encryption (no request is sent) or answers with a plain response (the body is
-  not parsed). Independently of any advertisement, a plain response (including
-  every deferred response) that carries `org.siros.secret_seed` is refused.
-  Errors and logs contain no values.
-- A malformed advertisement (hex or other values instead of a name list, wrong
-  counts, duplicate or over-long names) means the configuration is not offered
-  (privatedata-spec 5A.3): the engine drops it when decoding issuer metadata
-  (logging only the configuration id) and the resolve endpoint removes the whole
-  configuration from the metadata it serves, so no value reaches the wallet.
-  For legacy signed metadata the resolver also keeps the original
-  `signed_metadata` JWT, whose payload still carries the rejected configuration;
-  when a configuration is removed that JWT is dropped from the served document
-  too (editing the payload would break the signature). Signature verification
-  and the trust decision happen before this, so they are unaffected; the wallet
-  just cannot re-verify the modified document itself.
-- A valid advertisement is public names-only data and is served to the wallet
-  unchanged in the issuer metadata; the wallet needs it to request encryption.
-  The engine never merges `org.siros.secret_seed`, from issuer metadata or from
-  a response, into display metadata it computes; the response-level object is
-  relayed only on `flow_complete` as above, and the wallet strips the member
-  before merging display data.
-- The engine never logs or persists these values. Any buffer of completion
-  messages (e.g. a WMP event ring) must store `FlowCompleteMessage.Redacted()`,
-  which drops the whole `credential_metadata` object (display data included, not
-  only the seed) and the encrypted flag. It is for buffering only, not for
-  logging: the copy still holds the credentials, refresh token and DPoP key. Only seed delivery requires encryption:
-  a plain response without the seed member and with display-only
-  `credential_metadata` is relayed as usual (flag absent). Absent member: no
-  field. The same `flow_complete` payload is what `wmp.flow.complete` carries.
+`credentials[i]` has `format`, `vct` and `type_metadata` but no `credential`
+(and no `notification_id`); the client pairs entry `i` with the `i`-th
+credential it decrypted itself (see "Credential response encryption" below), and
+a count mismatch is an error on the client. The response-level
+`credential_metadata` (OpenID4VCI 1.1, openid/OpenID4VCI#721), which may carry
+`org.siros.secret_seed`, is never relayed by the engine: the client already holds
+it from its own decryption. An issuer that does not encrypt its response is
+visible to the engine, which relays its credentials as before (no
+`credential_response_encrypted`, `credential` present). For such a plain
+response `flow_complete` also carries a top-level `credential_metadata`
+containing ONLY the display-only members `display` and `claims` of the
+response-level `credential_metadata` (omitted when it has neither); every other
+member (extensions) is dropped by the engine and never relayed or logged. A plain
+response whose `credential_metadata` carries `org.siros.secret_seed` is refused
+with `CREDENTIAL_ERROR` and no `flow_complete`, advertised or not (privatedata-spec
+5A.4); errors and logs contain no values. Clients ignore extension members
+arriving in `flow_complete`. An encrypted response never yields `credential_metadata`
+on `flow_complete`.
+
+#### Credential response encryption (engine-blind)
+
+The engine never holds a response-encryption key and never sees an encrypted
+response in clear. Every key lives in the client.
+
+1. **Negotiation.** From the issuer metadata (`credential_response_encryption`)
+   the engine picks an `alg`/`enc` pair exactly as before (prefer `ECDH-ES`
+   over `ECDH-ES+A256KW`, `+A192KW`, `+A128KW`, and `A256GCM` over `A128GCM`,
+   `A256CBC-HS512`, `A128CBC-HS256`; the gdc issuer needs `ECDH-ES+A256KW`).
+   It sends the pair in `generate_proof` (present only when the issuer offers
+   response encryption):
+
+   ```
+   { "type": "sign_request", "action": "generate_proof",
+     "params": { "audience": "...", "nonce": "...", "count": 1,
+       "proof_types_supported": { ... },
+       "credential_response_encryption": { "alg": "ECDH-ES", "enc": "A256GCM", "required": true } } }
+   ```
+
+   `required` is `true` when the issuer marks encryption as required or the
+   configuration advertises `org.siros.secret_seed`
+   (`credential_configurations_supported[cfg].credential_metadata["org.siros.secret_seed"]
+   = {"namespaces": [...]}`, privatedata-spec 5A.4). A seed advertisement with no
+   usable issuer encryption (none offered, or no mutually supported pair) fails
+   the issuance with `CREDENTIAL_ERROR` before any request is sent. A configuration
+   without `proof_types_supported` still gets this request when encryption is
+   wanted: it is then for the key alone and the client returns no proofs.
+2. **Key.** The client generates a FRESH ephemeral P-256 key per `generate_proof`
+   request (so the `c_nonce` retry loop gets a new key each time), keeps the
+   private key in memory keyed by flow id, and returns the public JWK:
+
+   ```
+   { "type": "sign_response", "proofs": [ ... ],
+     "credential_response_encryption_jwk":
+       { "kty": "EC", "crv": "P-256", "x": "...", "y": "...", "use": "enc", "alg": "ECDH-ES" } }
+   ```
+
+   `kid` is optional. An absent or empty JWK means the client declines: with
+   `required: true` the engine fails the issuance (`SIGN_ERROR`), otherwise it
+   sends a plain request. A JWK that is present but unusable (not valid JSON, not
+   a public P-256 EC key, `use` other than `enc`, `alg` different from the
+   negotiated one) always fails the issuance closed. The engine forwards only the
+   key, with `use: "enc"` and the negotiated `alg`.
+3. **Request.** The engine puts the JWK in the Credential Request's
+   `credential_response_encryption` (`{alg, enc, jwk}`). Request encryption to the
+   issuer's key (`credential_request_encryption`, OID4VCI 1.0 §10) is unchanged and
+   stays engine-side: the request holds only proofs, the configuration id and a
+   public JWK.
+4. **Relay.** The issuer answers with a compact JWE (`application/jwt` or
+   `application/jose`). The engine checks only that it has the shape of a compact
+   JWE (five base64url segments), then sends it unread:
+
+   ```
+   { "type": "sign_request", "action": "decrypt_credential_response",
+     "params": { "jwe": "<compact JWE>", "deferred": false } }
+   ```
+
+   `deferred` is always present. A body that is not a compact JWE (empty,
+   JSON, ...) is refused with no relay.
+5. **Answer.** The client decrypts with the flow's key, STORES the credentials and
+   the response-level `credential_metadata` locally, validates the seed
+   (privatedata-spec 5A: namespaces, hex, size/depth caps, "a seed needs an
+   encrypted response and a non-empty `notification_id`", strip-before-merge,
+   `SHA256(seed) == ssc`) and answers with control fields ONLY:
+
+   ```
+   { "type": "sign_response", "credential_count": 2 }                 // credentials issued
+   { "type": "sign_response", "transaction_id": "tx-1", "interval": 5 } // deferred
+   { "type": "sign_response", "error": "..." }                         // failure
+   ```
+
+   Exactly one of `transaction_id` and `credential_count` (1 to 256) must be
+   present; anything else fails the issuance. The `error` text is client-controlled
+   and is never logged or relayed by the engine.
+6. **Deferred.** With a `transaction_id` the engine polls the deferred endpoint.
+   The Deferred Credential Request repeats `credential_response_encryption` with
+   the same JWK (OID4VCI 1.0 §9.1; without it the issuer answers in clear), and is
+   encrypted to the issuer's request key when the issuer requires request
+   encryption or the request asks for an encrypted response. Each encrypted answer
+   goes through step 4 with `"deferred": true`; an answer that again reports a
+   `transaction_id` keeps the polling going. (Before this change the engine did
+   not decrypt deferred answers at all.) A plain deferred answer to a
+   seed-advertising configuration is refused unread.
+7. **Notification.** The client supplies `notification_id` (from the decrypted
+   body) in `credential_notification`. For an encrypted response the engine
+   registers its notification context with an empty id, which matches any id the
+   client sends (the engine never sees the real one; the client sends it to the
+   issuer's own endpoint through the engine, which adds the issuer access token).
+   The context is registered before the first JWE is relayed, so a
+   `credential_failure` still reaches the issuer when the client rejects what it
+   decrypted (for example a seed that fails its checks).
+
+What the engine still sees: the proof JWTs (holder public key; the `psc`
+commitment is hiding by design), DPoP traffic, the issuer metadata, timing and
+sizes, and `credential_count`/`transaction_id`/`interval`. It never sees a
+credential, a seed or the response plaintext when the issuer encrypts. The same
+messages are carried by the WMP sign sub-flow (go-wallet-backend#163) once its translation copies the new fields.
+
+A malformed seed advertisement (hex or other values instead of a name list,
+wrong counts, duplicate or over-long names) means the configuration is not
+offered (privatedata-spec 5A.3): the engine drops it when decoding issuer
+metadata (logging only the configuration id) and the resolve endpoint removes the
+whole configuration from the metadata it serves. For legacy signed metadata the
+resolver also keeps the original `signed_metadata` JWT, whose payload still
+carries the rejected configuration; when a configuration is removed that JWT is
+dropped from the served document too (editing the payload would break the
+signature). A valid advertisement is public names-only data and is served to the
+wallet unchanged; the wallet needs it to request encryption.
 
 Deferred issuance:
 
@@ -684,17 +751,9 @@ Server → Client:
 }
 ```
 
-Later, server polls and pushes result:
-
-```
-Server → Client:
-{
-  "type": "push",
-  "push_type": "credential_ready",
-  "flow_id": "<uuid>",
-  "credentials": [ ... ]
-}
-```
+The engine then polls the deferred endpoint and completes with `flow_complete`
+as above (for an encrypted issuer, through `decrypt_credential_response` with
+`"deferred": true`, see "Credential response encryption").
 
 #### Flow Errors
 

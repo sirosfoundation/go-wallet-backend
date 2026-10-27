@@ -123,7 +123,7 @@ func (s *WalletProviderService) assuranceFacts(ctx context.Context, walletInstan
 		}
 	}
 
-	f.Fido2 = s.fido2Evidence(ctx, jwks)
+	f.Fido2 = s.fido2Evidence(ctx, walletInstanceID, jwks)
 
 	if secProps != nil {
 		f.Claims = assurance.Claims{
@@ -155,22 +155,29 @@ func batchThumbprints(jwks []map[string]interface{}) ([]string, bool) {
 // mixed batch has no single model to assert, so it is treated as
 // unverified). User verification is "present" only when EVERY record carries
 // the authenticator's user-verified flag.
-func (s *WalletProviderService) fido2Evidence(ctx context.Context, jwks []map[string]interface{}) *assurance.Fido2Verified {
+func (s *WalletProviderService) fido2Evidence(ctx context.Context, walletInstanceID string, jwks []map[string]interface{}) *assurance.Fido2Verified {
 	tps, ok := batchThumbprints(jwks)
 	if !ok {
 		return nil
 	}
-	return s.fido2EvidenceFor(ctx, tps, nil)
+	return s.fido2EvidenceFor(ctx, walletInstanceID, tps, nil)
 }
 
 // fido2EvidenceFor is fido2Evidence over thumbprints. overlay, when set, is
 // a record the backend verified in this very request but did not persist (the
 // preview's dry run); it answers for its own thumbprint, every other key is
 // looked up in the store.
-func (s *WalletProviderService) fido2EvidenceFor(ctx context.Context, thumbprints []string, overlay *domain.KeyAttestationRecord) *assurance.Fido2Verified {
+func (s *WalletProviderService) fido2EvidenceFor(ctx context.Context, walletInstanceID string, thumbprints []string, overlay *domain.KeyAttestationRecord) *assurance.Fido2Verified {
 	if len(thumbprints) == 0 || (s.keyAttestations == nil && overlay == nil) {
 		return nil
 	}
+	// Stored per-key evidence is only lent while the instance it was recorded
+	// for is live (and, when the request names an instance, is that instance and
+	// the caller's): a revoked, suspended, deactivated or foreign instance lends
+	// none. A record with no instance (stored before the field existed) cannot
+	// be tied to one and keeps the behaviour it had. An overlay (the preview's
+	// own dry run) is not stored evidence and answers for itself.
+	storedOK := walletInstanceID == "" || s.instanceMayLendKeyEvidence(ctx, walletInstanceID)
 	aaguid := ""
 	uv := true
 	for i, thumbprint := range thumbprints {
@@ -178,7 +185,7 @@ func (s *WalletProviderService) fido2EvidenceFor(ctx context.Context, thumbprint
 		if overlay != nil && overlay.KeyThumbprint == thumbprint {
 			rec = overlay
 		} else {
-			if s.keyAttestations == nil {
+			if s.keyAttestations == nil || !storedOK {
 				return nil
 			}
 			var err error
@@ -188,6 +195,19 @@ func (s *WalletProviderService) fido2EvidenceFor(ctx context.Context, thumbprint
 					s.logger.Warn("failed to look up key attestation for assurance evidence", zap.Error(err))
 				}
 				return nil
+			}
+		}
+		// Only FIDO2 records are fido2 evidence; a record of another kind
+		// (instance-key evidence from later stages) is not.
+		if fido2VerifiedFromRecord(rec) == nil {
+			return nil
+		}
+		if rec != overlay {
+			if walletInstanceID != "" && rec.WalletInstanceID != walletInstanceID {
+				return nil // recorded for another instance (or none): it does not vouch for this one
+			}
+			if walletInstanceID == "" && rec.WalletInstanceID != "" && !s.instanceMayLendKeyEvidence(ctx, rec.WalletInstanceID) {
+				return nil // the instance it was recorded for is not live (or not the caller's)
 			}
 		}
 		if i == 0 {
@@ -253,4 +273,16 @@ func (s *WalletProviderService) applyAssurance(ctx context.Context, walletInstan
 	}
 	idx := assuranceBucketIndex(out.KeyStorage.Scheme.StatusBucket(out.KeyStorage.LevelIndex))
 	return props, idx, nil
+}
+
+// instanceMayLendKeyEvidence reports whether the named wallet instance is a live
+// one the caller owns, so stored per-key evidence may count for it. An empty id
+// lends nothing (fail closed); a non-live, foreign or unreadable instance lends
+// none; an id the store does not know is not judged (as at the minting gate).
+func (s *WalletProviderService) instanceMayLendKeyEvidence(ctx context.Context, walletInstanceID string) bool {
+	if walletInstanceID == "" || s.instances == nil {
+		return walletInstanceID != ""
+	}
+	_, err := refuseWalletInstance(ctx, s.instances, walletInstanceID, false)
+	return err == nil
 }
