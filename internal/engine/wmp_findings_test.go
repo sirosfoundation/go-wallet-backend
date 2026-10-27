@@ -2,6 +2,8 @@ package engine
 
 import (
 	"context"
+	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -182,6 +184,9 @@ func TestTokenlessTenant_WebSocketAndWMPShareDefaultTenantIndex(t *testing.T) {
 		_ = ws.SetReadDeadline(time.Now().Add(5 * time.Second))
 		for {
 			if _, _, err := ws.ReadMessage(); err != nil {
+				var ne net.Error
+				require.False(t, errors.As(err, &ne) && ne.Timeout(),
+					"the superseded WebSocket was not closed within the deadline: %v", err)
 				return
 			}
 		}
