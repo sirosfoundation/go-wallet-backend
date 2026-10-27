@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -34,6 +35,12 @@ type ReplaceableTransport interface {
 type wsTransport struct {
 	conn   *websocket.Conn
 	sendMu sync.Mutex
+
+	// readWindow, when positive, makes ReadMessage count any inbound frame
+	// (including a data message that arrives in fragments) as liveness by
+	// pushing the read deadline out by this much. Set once before the read
+	// loop starts.
+	readWindow time.Duration
 }
 
 func newWSTransport(conn *websocket.Conn) *wsTransport {
@@ -47,6 +54,10 @@ func (t *wsTransport) SendJSON(msg interface{}) error {
 }
 
 func (t *wsTransport) ReadMessage(_ context.Context) ([]byte, error) {
+	if t.readWindow > 0 {
+		_, data, err := readMessageRefreshingDeadline(t.conn, t.readWindow)
+		return data, err
+	}
 	_, data, err := t.conn.ReadMessage()
 	return data, err
 }
