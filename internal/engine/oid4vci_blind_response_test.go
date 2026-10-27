@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -815,6 +816,20 @@ func TestBlind_FreshKeyPerProofRequest(t *testing.T) {
 }
 
 // --- the JWE relay itself ---
+
+// A failure that is not the client's report (here the flow's context ending) is
+// passed through unchanged, not rewritten as a client decryption failure.
+func TestRelayEncryptedResponse_NonClientFailureIsNotRewritten(t *testing.T) {
+	fc := &fakeClient{t: t}
+	h, _, cleanup := newBlindHandler(t, fc, http.DefaultClient)
+	defer cleanup()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := h.relayEncryptedResponse(ctx, "a.b.c.d.e", false, &responseEncryption{})
+	require.ErrorIs(t, err, context.Canceled)
+	var se *SignError
+	assert.False(t, errors.As(err, &se))
+}
 
 func TestRelayEncryptedResponse_RefusesMalformedJWE(t *testing.T) {
 	for name, jwe := range map[string]string{
