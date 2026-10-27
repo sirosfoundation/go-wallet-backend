@@ -747,7 +747,7 @@ credential_configurations_supported[cfg].auxiliary_data_supported
   objects as the issuer published them). The wallet places
   `{type, alg, path, commitment}` in the signed part of every key proof it
   returns, the same value in all proofs of the request, and MUST send each entry
-  with `required: true`. The engine never computes or sees a commitment. A
+  with `required: true`. The engine never computes or logs a commitment (it reads the returned proofs only to check that no `opening` is present; an opening stays with the client, and with response encryption only the client sees it). A
   `hash_commitment` entry the wallet cannot send (an `alg` other than `sha-256`,
   or an `encoding` other than `base64url`, `base64` or `hex`; section 4.1) is not
   passed on. Whether the entries sent are acceptable is the issuer's to enforce.

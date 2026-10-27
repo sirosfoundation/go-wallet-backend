@@ -597,7 +597,8 @@ type SignRequestParams struct {
 	// in the SIGNED part of every key proof it returns, the same value in all
 	// proofs of the request, and it MUST send every entry with required=true
 	// (OpenID4VCI Credential Auxiliary Data v0.1, section 6). The engine never
-	// computes or sees a commitment value.
+	// computes or logs a commitment value; it reads the returned proofs only to
+	// check that no opening is present.
 	AuxiliaryDataToIssuer []json.RawMessage `json:"auxiliary_data_to_issuer,omitempty"`
 	// AuxiliaryDataToWallet (generate_proof only): the issuer's advertised
 	// to_wallet entries, verbatim. The client uses them to check the entries of
