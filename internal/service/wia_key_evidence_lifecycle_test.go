@@ -235,3 +235,37 @@ func TestFIDO2EvidenceFor_LifecycleAndInstanceScope(t *testing.T) {
 		t.Fatal("a revoked instance lent evidence (unnamed request)")
 	}
 }
+
+// The preview's authenticated caller scopes stored FIDO2 evidence: another
+// user's (or tenant's) live instance, or a record tied to no instance, lends
+// nothing to it, named or not.
+func TestFIDO2EvidenceFor_PreviewCallerOwnership(t *testing.T) {
+	svc, instances, keys := assuranceSvc(t, nil, uvRules)
+	ctx := context.Background()
+	alice, bob := domain.UserIDFromString("alice"), domain.UserIDFromString("bob")
+	for id, u := range map[string]*domain.UserID{"alice-inst": &alice, "bob-inst": &bob} {
+		if err := instances.Upsert(ctx, &domain.WalletInstance{ID: id, TenantID: domain.DefaultTenantID, UserID: u, Status: domain.InstanceStatusActive}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	putRecord(t, keys, domain.KeyAttestationRecord{KeyThumbprint: "k-alice", WalletInstanceID: "alice-inst", AAGUID: "aa1", UV: true})
+	putRecord(t, keys, domain.KeyAttestationRecord{KeyThumbprint: "k-legacy", AAGUID: "aa1", UV: true})
+	asAlice := WithKeyAttestationCaller(ctx, KeyAttestationCaller{TenantID: domain.DefaultTenantID, UserID: alice.String()})
+	asBob := WithKeyAttestationCaller(ctx, KeyAttestationCaller{TenantID: domain.DefaultTenantID, UserID: bob.String()})
+	asOtherTenant := WithKeyAttestationCaller(ctx, KeyAttestationCaller{TenantID: "other", UserID: alice.String()})
+
+	if svc.fido2EvidenceFor(asAlice, "alice-inst", []string{"k-alice"}, nil) == nil || svc.fido2EvidenceFor(asAlice, "", []string{"k-alice"}, nil) == nil {
+		t.Fatal("the owner's own evidence was not lent")
+	}
+	for name, c := range map[string]context.Context{"other user": asBob, "other tenant": asOtherTenant} {
+		if svc.fido2EvidenceFor(c, "alice-inst", []string{"k-alice"}, nil) != nil {
+			t.Errorf("%s: evidence lent (named instance)", name)
+		}
+		if svc.fido2EvidenceFor(c, "", []string{"k-alice"}, nil) != nil {
+			t.Errorf("%s: evidence lent (unnamed request)", name)
+		}
+	}
+	if svc.fido2EvidenceFor(asAlice, "", []string{"k-legacy"}, nil) != nil {
+		t.Error("a record tied to no instance was lent to a known caller")
+	}
+}
