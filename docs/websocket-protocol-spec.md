@@ -1260,6 +1260,13 @@ Server → Client:
 | `PRESENTATION_ERROR` | VP creation or submission failed |
 | `INTERNAL_ERROR` | Server-side error |
 
+Over WMP (`docs/wmp-migration-analysis.md`, "Error Code Mapping") the same
+codes travel as integer `wmp.flow.error` codes. Two are not `-31006`:
+`UNSUPPORTED_TRANSACTION_DATA` is `-31005` with `data` `{"unsupported":
+"transaction_data"}` (OpenID4x 2.3), and `wmp.flow.start` of a flow type the
+session did not negotiate is `-31005` as well (Core 10.3). `SIGN_ERROR` is
+`-31006`, not `-31010`.
+
 ## Protocol Extensibility
 
 The WebSocket protocol is designed to support multiple credential protocols beyond

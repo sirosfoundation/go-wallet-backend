@@ -9,7 +9,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -187,7 +186,7 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 
 	// Same user and tenant is not enough: the token must grant every capability
 	// the session was created with.
-	if !a.tokenCoversSession(sessionID, caller.TAC, caller.EnforceTAC) {
+	if !a.tokenCoversSession(sessionID, caller.TAC) {
 		a.logger.Warn("WMP SSE rejected - token lacks the session's capabilities",
 			zap.String("request_tac", string(caller.TAC)))
 		http.Error(w, "token lacks the session's capabilities", http.StatusForbidden)
@@ -375,44 +374,16 @@ func isLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// legacySessionEffectiveTAC is what a legacy-token session is treated as
-// holding: every permission authorizeProtocol gates on. A modern token must
-// cover it, so an empty-TAC token cannot read such a session.
-func legacySessionEffectiveTAC() claims.TAC {
-	var b []byte
-	for _, perm := range requiredTACForProtocol {
-		for i := 0; i < len(perm); i++ {
-			if !strings.Contains(string(b), perm[i:i+1]) {
-				b = append(b, perm[i])
-			}
-		}
-	}
-	sort.Slice(b, func(i, j int) bool { return b[i] < b[j] })
-	return claims.TAC(b)
-}
-
 // tokenCoversSession reports whether the token may observe the session: it
-// must grant every capability the session holds (legacy-created sessions hold
-// legacySessionEffectiveTAC, which a legacy token trivially covers).
-func (a *WMPAdapter) tokenCoversSession(sessionID string, tac claims.TAC, enforce bool) bool {
+// must grant every capability the session holds.
+func (a *WMPAdapter) tokenCoversSession(sessionID string, tac claims.TAC) bool {
 	a.mu.RLock()
 	ws, ok := a.peers[sessionID]
 	a.mu.RUnlock()
 	if !ok {
 		return false
 	}
-	sess := ws.session
-	// A legacy token has no TAC concept and, exactly like authorizeProtocol, is
-	// exempt from the session's permissions: it must not be refused here while the
-	// same token may drive the session.
-	if !enforce && tac == "" {
-		return true
-	}
-	if sess.TACEnforced || sess.TAC != "" {
-		return sess.TAC.IsSubsetOf(tac)
-	}
-	// Legacy-created session (a legacy token returned above).
-	return legacySessionEffectiveTAC().IsSubsetOf(tac)
+	return ws.session.TAC.IsSubsetOf(tac)
 }
 
 // HandleWMPConfiguration serves /.well-known/wmp-configuration using go-wmp's

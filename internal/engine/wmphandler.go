@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -362,11 +364,12 @@ func pumpEvents(ctx context.Context, ct *wmp.ChannelTransport, buf *wmpEventBuff
 const wmpRedactedMembersKey = "redacted_members"
 
 // wmpSecretResultMembers are the flow-complete result members withheld from the
-// replay copy: the whole credential_metadata object (the engine relays only its
-// display members, but replay stays withheld as defence in depth), and the
-// OID4VCI refresh token with the DPoP key it is bound to. credentials[] is deliberately kept.
+// replay copy: the OID4VCI refresh token and the DPoP key it is bound to
+// (OpenID4x 3.1.4.2). Every other member, credential_metadata included, is kept.
+// credential_metadata is not a secret: the engine relays only its display
+// members (see restrictToDisplayMetadata), and go-wmp's ValidateCompletionResult
+// rejects a redacted_members entry that is not one of these three.
 var wmpSecretResultMembers = []string{
-	"credential_metadata",
 	"dpop_jwk",
 	"dpop_key_id",
 	"refresh_token",
@@ -528,40 +531,27 @@ type wmpCaller struct {
 	TenantID string
 	TokenID  string // jti; may be empty
 	// TAC is this request's token-authorized-capabilities. It bounds the request
-	// independently of the session's creation-time TAC. Empty means legacy auth.
+	// independently of the session's creation-time TAC. Empty means no
+	// permissions.
 	TAC claims.TAC
-	// EnforceTAC is true for a modern token, whose TAC is authoritative even
-	// when empty; false only for a legacy token. A non-empty TAC is always
-	// enforced.
-	EnforceTAC bool
 }
 
 // caller is the identity as a wmpCaller. It is the single conversion, so every
-// request path carries the same five fields (user, tenant, jti, TAC, enforce).
+// request path carries the same four fields (user, tenant, jti, TAC).
 func (id tokenIdentity) caller() wmpCaller {
-	return wmpCaller{UserID: id.UserID, TenantID: id.TenantID, TokenID: id.JTI, TAC: id.TAC, EnforceTAC: id.EnforceTAC}
+	return wmpCaller{UserID: id.UserID, TenantID: id.TenantID, TokenID: id.JTI, TAC: id.TAC}
 }
 
 var _ ReplaceableTransport = (*wmpSessionTransport)(nil)
 
-// wmpCallerTACKey carries the request's wmpTACInfo in the context.
+// wmpCallerTACKey carries the request token's TAC in the context.
 type wmpCallerTACKey struct{}
 
-type wmpTACInfo struct {
-	TAC     claims.TAC
-	Enforce bool
-}
-
 // requestTAC returns the TAC of the token that authenticated the current
-// request (empty when none, i.e. legacy auth or an in-process call).
-func requestTAC(ctx context.Context) claims.TAC {
-	return requestTACInfo(ctx).TAC
-}
-
-// requestTACInfo returns the request token's TAC and whether it is enforced.
-func requestTACInfo(ctx context.Context) wmpTACInfo {
-	t, _ := ctx.Value(wmpCallerTACKey{}).(wmpTACInfo)
-	return t
+// request; ok is false for a context without one (an in-process call).
+func requestTAC(ctx context.Context) (claims.TAC, bool) {
+	t, ok := ctx.Value(wmpCallerTACKey{}).(claims.TAC)
+	return t, ok
 }
 
 // NewWMPAdapter creates an adapter bridging WMP JSON-RPC to the engine.
@@ -795,7 +785,7 @@ func (a *WMPAdapter) touchSession(sessionID string) {
 
 // HandleRPC handles one JSON-RPC request in-process (not network-reachable). For
 // session.create the identity comes from params.auth; otherwise it is
-// HandleRPCAs for a caller with no token ID.
+// HandleRPCAs for a caller with no token ID and inProcessTAC permissions.
 func (a *WMPAdapter) HandleRPC(ctx context.Context, sessionID, userID, tenantID string, body []byte) ([]byte, error) {
 	if msg, err := wmp.DecodeMessage(body); err == nil && msg.Method == wmp.MethodSessionCreate {
 		var params wmp.SessionCreateParams
@@ -805,7 +795,18 @@ func (a *WMPAdapter) HandleRPC(ctx context.Context, sessionID, userID, tenantID 
 			}
 		}
 	}
-	return a.HandleRPCAs(ctx, sessionID, wmpCaller{UserID: userID, TenantID: tenantID}, body)
+	return a.HandleRPCAs(ctx, sessionID, wmpCaller{UserID: userID, TenantID: tenantID, TAC: inProcessTAC()}, body)
+}
+
+// inProcessTAC is the TAC of an in-process caller, which presents no token and
+// is trusted: every permission the engine gates a protocol on.
+func inProcessTAC() claims.TAC {
+	var perms []string
+	for _, p := range requiredTACForProtocol {
+		perms = append(perms, p)
+	}
+	sort.Strings(perms)
+	return claims.TAC(strings.Join(perms, ""))
 }
 
 // HandleRPCAs handles one JSON-RPC request. sessionID comes from the Wmp-
@@ -853,7 +854,7 @@ func (a *WMPAdapter) HandleRPCAs(ctx context.Context, sessionID string, caller w
 
 // withCallerTAC carries the caller's token permissions to the method handlers.
 func withCallerTAC(ctx context.Context, caller wmpCaller) context.Context {
-	return context.WithValue(ctx, wmpCallerTACKey{}, wmpTACInfo{TAC: caller.TAC, Enforce: caller.EnforceTAC || caller.TAC != ""})
+	return context.WithValue(ctx, wmpCallerTACKey{}, caller.TAC)
 }
 
 // Events returns the session's outbound notifications (retained events, then
@@ -1072,7 +1073,7 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, caller wmpCaller, 
 	}
 	userID, tokenID := caller.UserID, caller.TokenID
 	tenantID := normalizeTenant(caller.TenantID)
-	tac, enforceTAC := caller.TAC, caller.EnforceTAC
+	tac := caller.TAC
 
 	// Anonymous sessions are told apart only by jti; without one, fail closed.
 	if userID == "" && tokenID == "" {
@@ -1109,7 +1110,7 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, caller wmpCaller, 
 		sessionID: sessionID,
 	}
 
-	peer := wmp.NewPeer(ct, handler, wmp.WithLogger(slog.Default()))
+	peer := a.newPeer(ct, handler)
 
 	// Engine transport that translates engine messages to WMP notifications.
 	wmpTransport := newWMPSessionTransport(peer, ct)
@@ -1120,7 +1121,6 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, caller wmpCaller, 
 		UserID:        userID,
 		TenantID:      tenantID,
 		TAC:           tac,
-		TACEnforced:   enforceTAC,
 		transport:     wmpTransport,
 		flows:         make(map[string]*Flow),
 		logger:        a.logger.With(zap.String("session", userID[:min(8, len(userID))])),
@@ -1326,18 +1326,98 @@ func (a *WMPAdapter) issueResumptionToken(sessionID string, ws *wmpSession, prev
 	return token, true
 }
 
+// newPeer builds the session's Peer with the engine's request guard.
+func (a *WMPAdapter) newPeer(ct *wmp.ChannelTransport, handler *wmpEngineHandler) *wmp.Peer {
+	peer := wmp.NewPeer(ct, handler, wmp.WithLogger(slog.Default()))
+	peer.UseMiddleware(handler.requireNegotiatedMessaging)
+	return peer
+}
+
+// messageMethodCapability names the capability that gates each Core 5 message
+// method: wmp.message.deliver and wmp.message.ack need messaging, and
+// wmp.message.status (the offline queue's delivery notice) needs offline.
+var messageMethodCapability = map[string]string{
+	wmp.MethodMessageDeliver: "messaging",
+	wmp.MethodMessageAck:     "messaging",
+	wmp.MethodMessageStatus:  "offline",
+}
+
+// requireNegotiatedMessaging rejects an inbound Core 5 message method whose
+// capability the session did not negotiate (Core 10.3: -31005). This engine
+// advertises neither messaging nor offline: it is the orchestrator of OpenID4x
+// flows, has no participant to deliver to and no offline queue, so go-wmp's
+// no-op BaseHandler would otherwise drop such a request silently. A
+// notification has no response, so the rejection is only visible for a request.
+func (h *wmpEngineHandler) requireNegotiatedMessaging(ctx context.Context, method string, params json.RawMessage, next wmp.MiddlewareFunc) (interface{}, error) {
+	capName, gated := messageMethodCapability[method]
+	if !gated {
+		return next(ctx, method, params)
+	}
+	h.adapter.mu.RLock()
+	ws, ok := h.adapter.peers[h.sessionID]
+	h.adapter.mu.RUnlock()
+	if ok {
+		if _, negotiated := ws.capabilities[capName]; negotiated {
+			return next(ctx, method, params)
+		}
+	}
+	return nil, wmp.NewRPCError(wmp.ErrCapabilityNotSupported, map[string]string{"unsupported": capName})
+}
+
+// wmpFlowTypeCapability returns the capability a client must negotiate to start
+// a flow of this type over WMP (Core 6.5, 10.3): the flow type's own name, as
+// for oid4vci and oid4vp. vctm is not a WMP flow type (OpenID4x 2 routes VCTM
+// through wmp.resolve), so it has none and is never startable over WMP.
+func wmpFlowTypeCapability(p Protocol) (string, bool) {
+	if p == ProtocolVCTM {
+		return "", false
+	}
+	return string(p), true
+}
+
+// wmpOpenID4xCapability is the advertised parameter object of a flow type's
+// capability: the OpenID4x 2.1 and 2.2 parameters for oid4vci and oid4vp, an
+// empty object for any other registered type.
+func wmpOpenID4xCapability(p Protocol) json.RawMessage {
+	var v interface{}
+	switch p {
+	case ProtocolOID4VCI:
+		v = openid4x.OID4VCICapability{
+			SupportedGrants:  []string{"authorization_code", "pre-authorized_code"},
+			SupportedFormats: openid4x.AllFormats(),
+		}
+	case ProtocolOID4VP:
+		v = openid4x.OID4VPCapability{
+			SupportedResponseModes: []string{ResponseModeDirectPost, ResponseModeDirectPostJWT},
+			SupportedFormats:       openid4x.AllFormats(),
+		}
+	default:
+		v = struct{}{}
+	}
+	b, _ := json.Marshal(v)
+	return b
+}
+
 // serverCapabilities builds the capability map from registered flow handlers
 // (spec §4.2.1).
 func (a *WMPAdapter) serverCapabilities() wmp.Capabilities {
 	caps := wmp.Capabilities{
 		"sign": json.RawMessage(`{"proof_types": ["jwt"]}`),
 	}
+	// Each registered flow type is advertised as the capability that gates it,
+	// so oid4vci and oid4vp appear as the capabilities of OpenID4x 2.1 and 2.2.
+	// A flow type without a WMP capability (vctm) is not served over WMP; see
+	// wmpFlowTypeCapability.
 	a.manager.handlersMu.RLock()
-	flowTypes := make([]string, 0, len(a.manager.flowHandlers))
+	var flowTypes []string
 	for p := range a.manager.flowHandlers {
-		flowTypes = append(flowTypes, string(p))
+		if capName, ok := wmpFlowTypeCapability(p); ok {
+			flowTypes = append(flowTypes, string(p))
+			caps[capName] = wmpOpenID4xCapability(p)
+		}
 	}
 	a.manager.handlersMu.RUnlock()
+	sort.Strings(flowTypes)
 
 	flowsJSON, _ := json.Marshal(map[string]interface{}{
 		"max_concurrent": MaxPendingFlowsPerSession,
@@ -1444,7 +1524,7 @@ func (a *WMPAdapter) handleSessionResume(_ context.Context, caller wmpCaller, ms
 		session:   oldWS.session,
 		children:  oldWS.handler.table(), // shared, not moved: a losing resume leaves it untouched
 	}
-	peer := wmp.NewPeer(ct, handler, wmp.WithLogger(slog.Default()))
+	peer := a.newPeer(ct, handler)
 	wmpTransport := newWMPSessionTransport(peer, ct)
 	wmpTransport.handler = handler
 
@@ -1674,17 +1754,15 @@ func (h *wmpEngineHandler) logger() *zap.Logger {
 // protocol.
 //
 // Both the session's creation-time TAC and the current request's TAC must grant
-// it. A TAC is skipped only for a legacy token; a modern token with an empty TAC
-// has no permissions.
+// it. An empty TAC has no permissions. A context carrying no request TAC (an
+// in-process call) is checked against the session's TAC only.
 func (h *wmpEngineHandler) authorizeProtocol(ctx context.Context, protocol Protocol, logger *zap.Logger) *wmp.RPCError {
 	required, ok := requiredTACForProtocol[protocol]
 	if !ok {
 		return nil
 	}
-	req := requestTACInfo(ctx)
-	reqTAC := req.TAC
-	if ((h.session.TACEnforced || h.session.TAC != "") && !h.session.TAC.HasAll(required)) ||
-		((req.Enforce || reqTAC != "") && !reqTAC.HasAll(required)) {
+	reqTAC, hasReq := requestTAC(ctx)
+	if !h.session.TAC.HasAll(required) || (hasReq && !reqTAC.HasAll(required)) {
 		logger.Warn("Rejected WMP request - insufficient TAC",
 			zap.String("session_tac", string(h.session.TAC)),
 			zap.String("request_tac", string(reqTAC)),
@@ -1730,6 +1808,25 @@ func (h *wmpEngineHandler) declaredFeatures() []string {
 	return features
 }
 
+// flowTypeNegotiated reports whether the session negotiated the capability that
+// gates the flow type (Core 10.3). The negotiated set, not what the client
+// offered, decides: negotiation falls back to every server capability when a
+// client offers none.
+func (h *wmpEngineHandler) flowTypeNegotiated(p Protocol) bool {
+	capName, ok := wmpFlowTypeCapability(p)
+	if !ok {
+		return false
+	}
+	h.adapter.mu.RLock()
+	ws, found := h.adapter.peers[h.sessionID]
+	h.adapter.mu.RUnlock()
+	if !found {
+		return false
+	}
+	_, negotiated := ws.capabilities[capName]
+	return negotiated
+}
+
 // FlowStart handles wmp.flow.start — launches an engine flow goroutine.
 func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartParams) (*wmp.FlowStartResult, error) {
 	protocol := Protocol(params.FlowType)
@@ -1748,12 +1845,20 @@ func (h *wmpEngineHandler) FlowStart(ctx context.Context, params *wmp.FlowStartP
 		zap.String("protocol", string(protocol)),
 	)
 
+	// Core 10.3: a flow type whose capability was not negotiated (or that this
+	// engine does not serve over WMP) is refused with -31005.
+	if !h.flowTypeNegotiated(protocol) {
+		return nil, wmp.NewRPCError(wmp.ErrCapabilityNotSupported, map[string]string{
+			"unsupported": params.FlowType,
+		})
+	}
+
 	h.adapter.manager.handlersMu.RLock()
 	factory, ok := h.adapter.manager.flowHandlers[protocol]
 	h.adapter.manager.handlersMu.RUnlock()
 	if !ok {
-		return nil, wmp.NewRPCError(wmp.ErrInvalidParams, map[string]string{
-			"reason": "unsupported flow type",
+		return nil, wmp.NewRPCError(wmp.ErrCapabilityNotSupported, map[string]string{
+			"unsupported": params.FlowType,
 		})
 	}
 
@@ -2344,10 +2449,20 @@ func (t *wmpSessionTransport) SendJSON(msg interface{}) error {
 
 	case *FlowErrorMessage:
 		// Carry Error.Details (e.g. OID4VP's redirect_uri) in Data, as on
-		// WebSocket.
+		// WebSocket. A transaction_data refusal also names the capability
+		// (OpenID4x 2.3: data {"unsupported": "transaction_data"}); the redirect
+		// stays as an extension member (Core 9.5).
+		details := m.Error.Details
+		if m.Error.Code == ErrCodeUnsupportedTransactionData {
+			details = make(map[string]interface{}, len(m.Error.Details)+1)
+			for k, v := range m.Error.Details {
+				details[k] = v
+			}
+			details["unsupported"] = wmp.CapabilityTransactionData
+		}
 		var data json.RawMessage
-		if len(m.Error.Details) > 0 {
-			b, err := json.Marshal(m.Error.Details)
+		if len(details) > 0 {
+			b, err := json.Marshal(details)
 			if err != nil {
 				return err
 			}
@@ -2516,8 +2631,9 @@ func mapErrorCode(code ErrorCode) int {
 		return wmp.ErrNotAuthorized
 	case ErrCodeInvalidMessage:
 		return wmp.ErrInvalidRequest
-	case ErrCodeSignError:
-		return wmp.ErrSignatureInvalid
+	case ErrCodeUnsupportedTransactionData:
+		// OpenID4x 2.3: transaction_data to a wallet without the capability.
+		return wmp.ErrCapabilityNotSupported
 	case ErrCodeTooManyRequests:
 		return wmp.ErrRateLimited
 	case ErrCodeInternalError:
@@ -2648,5 +2764,5 @@ func (a *WMPAdapter) authorizeResponse(ctx context.Context, caller wmpCaller, se
 			}
 		}
 	}
-	return a.tokenCoversSession(sessionID, caller.TAC, caller.EnforceTAC || caller.TAC != "")
+	return a.tokenCoversSession(sessionID, caller.TAC)
 }

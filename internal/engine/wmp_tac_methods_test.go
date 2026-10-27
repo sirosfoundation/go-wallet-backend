@@ -211,9 +211,8 @@ func TestWMP_SSE_RequiresTokenCoveringSessionCapabilities(t *testing.T) {
 	assert.Equal(t, http.StatusOK, open(tokenWith("irw")).Code, "a superset is allowed")
 }
 
-// A modern token whose TAC is empty has NO permissions; it must not be
-// treated like a legacy token (which has no TAC concept) and skip the check.
-var tacModernEmpty = wmpCaller{EnforceTAC: true}
+// A token whose TAC is empty has NO permissions; the check is never skipped.
+var tacModernEmpty = wmpCaller{}
 
 func TestWMP_ModernEmptyTAC_RefusedOnEveryStateChangingMethod(t *testing.T) {
 	f := newTACMethodFixture(t)
@@ -268,27 +267,11 @@ func TestWMP_ModernEmptyTAC_RefusedOnEveryStateChangingMethod(t *testing.T) {
 	}
 }
 
-// Legacy tokens (no TAC concept) are unaffected: only the session's own TAC
-// is consulted, so a legacy caller on a legacy session still works.
-func TestWMP_LegacyCaller_SkipsTACCheck(t *testing.T) {
-	f := newTACMethodFixture(t)
-	f.sess.TAC = "" // legacy session
-	f.sess.TACEnforced = false
-	resp, err := f.a.HandleRPCAs(context.Background(), f.sid, wmpCaller{},
-		wmpRequest("5", wmp.MethodFlowCancel, wmp.FlowCancelParams{WMP: f.meta(), FlowID: "f-i"}))
-	require.NoError(t, err)
-	var r wmp.Response
-	require.NoError(t, json.Unmarshal(resp, &r))
-	assert.Nil(t, r.Error)
-	assert.EqualValues(t, 1, f.handler.cancels.Load())
-}
-
-// A session created by a modern token with an empty TAC is authoritative:
+// A session created by a token with an empty TAC is authoritative:
 // it can start nothing, even when the later request is also modern-empty.
 func TestWMP_ModernEmptyTAC_SessionCannotStartFlows(t *testing.T) {
 	f := newTACMethodFixture(t)
 	f.sess.TAC = ""
-	f.sess.TACEnforced = true
 	resp, err := f.a.HandleRPCAs(context.Background(), f.sid, wmpCaller{},
 		startFlowBody(f.sid, string(ProtocolOID4VCI), "f-x"))
 	require.NoError(t, err)
@@ -308,12 +291,12 @@ func TestWMP_HTTP_ModernEmptyTAC_Refused(t *testing.T) {
 			TenantID: "t", TAC: claims.TAC(tac), ACR: "urn:siros:acr:passkey",
 		})
 	}
-	sid, _, _ := createSessionFull(t, a, "u", "t", func(p *wmp.SessionCreateParams) { p.Auth.Token = tokenWith("ir") })
 	h := &blockingHandler{release: make(chan struct{})}
 	defer close(h.release)
 	m.RegisterFlowHandler(ProtocolOID4VCI, func(*Flow, *config.Config, *zap.Logger, *TrustService, *RegistryClient, storage.VerifierStore, *TrustCache) (FlowHandler, error) {
 		return h, nil
 	})
+	sid, _, _ := createSessionFull(t, a, "u", "t", func(p *wmp.SessionCreateParams) { p.Auth.Token = tokenWith("ir") })
 
 	post := func(tok string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, WMPRPCPath, strings.NewReader(string(startFlowBody(sid, string(ProtocolOID4VCI), "f-h"))))
@@ -336,43 +319,6 @@ func TestWMP_HTTP_ModernEmptyTAC_Refused(t *testing.T) {
 	sw := httptest.NewRecorder()
 	a.HandleWMPEvents(sw, req)
 	assert.Equal(t, http.StatusForbidden, sw.Code)
-}
-
-// A legacy-token session's permissions are what the legacy RPC path allows: a modern empty-TAC token must not stream it; a covering modern token or a legacy token may.
-func TestWMP_SSE_LegacySessionRequiresEffectivePermissionsFromModernToken(t *testing.T) {
-	a, m := testWMPAdapter()
-	defer cleanupWMP(a, m)
-	sid, _, _ := createSessionFull(t, a, "u", "t", nil)
-	a.mu.RLock()
-	sess := a.peers[sid].session
-	a.mu.RUnlock()
-	// The HMAC token path is gone, so no token mints a legacy session any more;
-	// the adapter still handles one (TAC not applicable), so build its state here.
-	sess.TAC, sess.TACEnforced = "", false
-	require.False(t, sess.TACEnforced)
-	require.Empty(t, sess.TAC)
-
-	require.Equal(t, claims.TAC("ir"), legacySessionEffectiveTAC())
-
-	assert.False(t, a.tokenCoversSession(sid, "", true), "modern empty TAC must not cover a legacy session")
-	assert.False(t, a.tokenCoversSession(sid, "r", true), "partial modern TAC must not cover")
-	assert.True(t, a.tokenCoversSession(sid, "ir", true))
-	assert.True(t, a.tokenCoversSession(sid, "irw", true))
-	assert.True(t, a.tokenCoversSession(sid, "", false), "legacy token streams its own legacy session")
-
-	v, key, issuer := setupEngineTokenValidatorTest(t)
-	m.SetTokenValidator(v)
-	modern := signEngineToken(t, key, issuer, claims.AccessTokenClaims{
-		Claims:   gojosejwt.Claims{Audience: gojosejwt.Audience{"wallet-registry"}, Subject: "u"},
-		TenantID: "t", ACR: "urn:siros:acr:passkey",
-	})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	req := httptest.NewRequest(http.MethodGet, "/api/v2/wallet/events?session_id="+sid, nil).WithContext(ctx)
-	req.Header.Set("Authorization", "Bearer "+modern)
-	w := httptest.NewRecorder()
-	a.HandleWMPEvents(w, req)
-	assert.Equal(t, http.StatusForbidden, w.Code)
 }
 
 // A response to a server-initiated request can fail the flow that awaits it, so

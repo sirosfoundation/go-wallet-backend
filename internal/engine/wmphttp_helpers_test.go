@@ -27,7 +27,6 @@ import (
 
 const (
 	testSecret = "test-secret-for-wmp"
-	// Legacy tokens are only accepted when pinned to jwt.issuer.
 	testIssuer = "test-issuer"
 )
 

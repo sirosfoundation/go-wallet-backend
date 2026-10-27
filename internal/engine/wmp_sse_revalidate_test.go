@@ -94,10 +94,9 @@ func TestWMP_SSE_EndsOnHeartbeatWhenTokenRevokedWhileIdle(t *testing.T) {
 	expectStreamEnds(t, br, "never-sent")
 }
 
-// A legacy token (no TAC concept, enforcement off) may reconnect to a session created
-// with a modern token holding permissions, as authorizeProtocol lets it drive that
-// session; a modern empty-TAC token must still be refused.
-func TestWMP_SSE_LegacyTokenMayReadSessionWithPermissions(t *testing.T) {
+// A token must grant every capability of the session it reconnects to; an
+// empty-TAC token has none.
+func TestWMP_SSE_TokenMustCoverSessionPermissions(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
 	sid, _, _ := createSessionFull(t, a, "u", "t", nil)
@@ -105,13 +104,12 @@ func TestWMP_SSE_LegacyTokenMayReadSessionWithPermissions(t *testing.T) {
 	sess := a.peers[sid].session
 	a.mu.RUnlock()
 	a.mu.Lock()
-	sess.TAC, sess.TACEnforced = "ir", true
+	sess.TAC = "ir"
 	a.mu.Unlock()
 
-	assert.True(t, a.tokenCoversSession(sid, "", false), "legacy token is exempt from the session's permissions")
-	assert.False(t, a.tokenCoversSession(sid, "", true), "modern empty-TAC token must be refused")
-	assert.False(t, a.tokenCoversSession(sid, "r", true))
-	assert.True(t, a.tokenCoversSession(sid, "ir", true))
+	assert.False(t, a.tokenCoversSession(sid, ""), "empty-TAC token must be refused")
+	assert.False(t, a.tokenCoversSession(sid, "r"))
+	assert.True(t, a.tokenCoversSession(sid, "ir"))
 }
 
 // revokeAfterFirstEventWriter revokes the user once the first event has been

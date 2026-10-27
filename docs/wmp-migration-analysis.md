@@ -549,8 +549,12 @@ refused). See `docs/websocket-protocol-spec.md` for the rules.
 
 Replay and the event ring. The SSE event buffer (200 events per session,
 `Last-Event-ID` replay and `wmp.session.resume`) never holds the secret members
-of a completion: `credential_metadata` (the whole object, display data included,
-as defence in depth), `refresh_token`, `dpop_jwk` and `dpop_key_id`. The completion is delivered in
+of a completion: `refresh_token`, `dpop_jwk` and `dpop_key_id` (OpenID4x 3.1.4.2).
+`credential_metadata` is not one of them: it is display-only, and the sender
+restricts it to `display` and `claims` where the completion is built
+(`restrictToDisplayMetadata`), so a seed can never reach it or the replay copy;
+go-wmp's `ValidateCompletionResult` rejects any other `redacted_members` entry.
+The completion is delivered in
 full, once, to the SSE connection streaming when it is emitted. The copy retained
 for replay has those members removed, keeps `credentials[]` and everything else,
 and carries a single marker `"redacted_members": [...]` in `result` listing, in
@@ -567,6 +571,31 @@ Connecting the SSE stream before starting the flow is therefore required for
 seed-bearing issuance. Nothing is added to the Redis session store, which holds
 only session bookkeeping.
 
+
+#### Capabilities, flow types and the Core 5 message methods
+
+- `serverCapabilities` advertises one capability per registered flow type, named
+  as the flow type: `oid4vci` and `oid4vp` carry the parameters of OpenID4x 2.1
+  and 2.2. `wmp.flow.start` is refused with `-31005` unless the flow type's
+  capability is in the session's negotiated set (a client that offers no
+  capabilities negotiates all of them). Note for clients: a client that offers
+  capabilities must therefore offer `oid4vci` / `oid4vp` as well as
+  `transaction_data`.
+- `vctm` stays a WebSocket flow type and is not a WMP one: it is in no WMP
+  document, and OpenID4x 2 routes VCTM through `wmp.resolve`. Serving that is
+  blocked on go-wmp: v0.9.1 `ResolveResult` carries `metadata`, while Core 5.8.1
+  requires `content_type` and `body`.
+- The `match` sub-flow type (engine to client) is likewise defined in no WMP
+  document and has no namespace prefix (Core 9.1). It stays until the spec
+  defines a client-side match flow or `FlowContext.RequestMatch` exists in
+  go-wmp.
+- `wmp.message.deliver`, `wmp.message.ack` and `wmp.message.status` need the
+  `messaging` and `offline` capabilities (Core 5). This engine orchestrates
+  OpenID4x flows, has no participant to deliver to and no offline queue, and
+  negotiates neither; a request for them is rejected with `-31005` (Core 10.3)
+  by a middleware instead of reaching go-wmp's no-op handler. A notification has
+  no response and is dropped. The engine's own outbound `wmp.message.deliver`
+  (the credential notification ack) is unchanged.
 
 ### Session Model
 
@@ -803,7 +832,7 @@ frontend (no need to handle a separate resolve call outside the flow context).
 |-----------------|---------------|---------|
 | `AUTH_FAILED` | `ErrNotAuthorized (-31002)` | Direct |
 | `INVALID_MESSAGE` | `ErrInvalidRequest (-32600)` | Standard JSON-RPC |
-| `UNKNOWN_FLOW` | `ErrFlowError (-31006)` | Subsume under flow error |
+| `UNKNOWN_FLOW` | `ErrCapabilityNotSupported (-31005)` | `wmp.flow.start` of a flow type the session did not negotiate (Core 10.3); `data` `{"unsupported": "<flow_type>"}` |
 | `FLOW_TIMEOUT` | `ErrFlowError (-31006)` | With timeout data |
 | `OFFER_PARSE_ERROR` | `ErrInvalidParams (-32602)` | Standard JSON-RPC |
 | `OFFER_FETCH_ERROR` | `ErrFlowError (-31006)` | With fetch error data |
@@ -814,7 +843,8 @@ frontend (no need to handle a separate resolve call outside the flow context).
 | `TOKEN_ERROR` | `ErrFlowError (-31006)` | With token error data |
 | `CREDENTIAL_ERROR` | `ErrFlowError (-31006)` | With credential error data |
 | `SIGN_TIMEOUT` | `ErrFlowError (-31006)` | With timeout data |
-| `SIGN_ERROR` | `ErrSignatureInvalid (-31010)` | Direct |
+| `SIGN_ERROR` | `ErrFlowError (-31006)` | A failed sign is a flow failure; -31010 is signature verification failure (Core 3.8). A refusal (`data.reason` `rejected`) ends the `oid4vp` flow as `PRESENTATION_ERROR` and answers the verifier `access_denied` (OpenID4x 3.2.6, PR 472) |
+| `UNSUPPORTED_TRANSACTION_DATA` | `ErrCapabilityNotSupported (-31005)` | `data` `{"unsupported": "transaction_data"}` plus the verifier `redirect_uri` as an extension member (OpenID4x 2.3) |
 | `PRESENTATION_ERROR` | `ErrFlowError (-31006)` | With presentation error data |
 | `INTERNAL_ERROR` | `ErrInternalError (-32603)` | Standard JSON-RPC |
 | `TOO_MANY_REQUESTS` | `ErrRateLimited (-31007)` | Direct |

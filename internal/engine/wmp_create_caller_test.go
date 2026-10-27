@@ -107,14 +107,13 @@ func mustRPC(t *testing.T, a *WMPAdapter, ctx context.Context, c wmpCaller, body
 	return resp
 }
 
-// Every identity carried from a validated token to a wmpCaller must keep all five
-// fields: the SSE endpoint once rebuilt the caller by hand and dropped the two
-// capability fields. tokenIdentity.caller is the only conversion, so this pins it
+// Every identity carried from a validated token to a wmpCaller must keep all four
+// fields: the SSE endpoint once rebuilt the caller by hand and dropped fields. tokenIdentity.caller is the only conversion, so this pins it
 // (reflection makes a field added to tokenIdentity later fail here until mapped).
 func TestTokenIdentityCaller_CarriesEveryField(t *testing.T) {
-	id := tokenIdentity{UserID: "u", TenantID: "t", JTI: "j", TAC: claims.TAC("ir"), EnforceTAC: true}
+	id := tokenIdentity{UserID: "u", TenantID: "t", JTI: "j", TAC: claims.TAC("ir")}
 	c := id.caller()
-	assert.Equal(t, wmpCaller{UserID: "u", TenantID: "t", TokenID: "j", TAC: claims.TAC("ir"), EnforceTAC: true}, c)
+	assert.Equal(t, wmpCaller{UserID: "u", TenantID: "t", TokenID: "j", TAC: claims.TAC("ir")}, c)
 
 	rt := reflect.TypeOf(id)
 	rv := reflect.ValueOf(id)
