@@ -55,6 +55,7 @@ server:
       - "Last-Event-ID"
     exposed_headers:
       - "X-Private-Data-ETag"
+      - "Retry-After"
     # Can be true with specific origins
     allow_credentials: true
     max_age: 43200

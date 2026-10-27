@@ -50,6 +50,7 @@ server:
     # Response headers exposed to browser
     exposed_headers:
       - "X-Private-Data-ETag"
+      - "Retry-After"
     # Allow credentials (cannot be true with allowed_origins: ["*"])
     allow_credentials: false
     # Preflight cache duration in seconds
