@@ -34,6 +34,7 @@ type Store struct {
 	invites         *InviteStore
 	walletInstances *WalletInstanceStore
 	keyAttestations *KeyAttestationStore
+	appAttestKeys   *AppAttestKeyStore
 }
 
 // Connect opens a client for cfg (including TLS settings) and verifies the
@@ -107,6 +108,7 @@ func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
 	s.invites = &InviteStore{collection: database.Collection("invites")}
 	s.walletInstances = &WalletInstanceStore{collection: database.Collection("wallet_instances")}
 	s.keyAttestations = &KeyAttestationStore{collection: database.Collection("key_attestations")}
+	s.appAttestKeys = &AppAttestKeyStore{collection: database.Collection("app_attest_keys")}
 
 	// Initialize default tenant
 	if err := s.initializeDefaultTenant(ctx); err != nil {
@@ -234,6 +236,15 @@ func (s *Store) createIndexes(ctx context.Context) error {
 		return fmt.Errorf("failed to create key attestation indexes: %w", err)
 	}
 
+	// App Attest keys collection indexes (the primary key is the key id)
+	_, err = s.appAttestKeys.collection.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}}},
+		{Keys: bson.D{{Key: "wallet_instance_id", Value: 1}}},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create app attest key indexes: %w", err)
+	}
+
 	return nil
 }
 
@@ -274,6 +285,7 @@ func (s *Store) Verifiers() storage.VerifierStore             { return s.verifie
 func (s *Store) Invites() storage.InviteStore                 { return s.invites }
 func (s *Store) WalletInstances() storage.WalletInstanceStore { return s.walletInstances }
 func (s *Store) KeyAttestations() storage.KeyAttestationStore { return s.keyAttestations }
+func (s *Store) AppAttestKeys() storage.AppAttestKeyStore     { return s.appAttestKeys }
 
 // Database returns the underlying MongoDB database for creating additional
 // collections (e.g., WIA challenge store with TTL indexes).

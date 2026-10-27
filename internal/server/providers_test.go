@@ -109,6 +109,10 @@ func (b *memoryBackend) WalletInstances() storage.WalletInstanceStore {
 func (b *memoryBackend) KeyAttestations() storage.KeyAttestationStore {
 	return b.store.KeyAttestations()
 }
+func (b *memoryBackend) AppAttestKeys() storage.AppAttestKeyStore {
+	return b.store.AppAttestKeys()
+}
+
 func (b *memoryBackend) Ping(ctx context.Context) error { return b.store.Ping(ctx) }
 func (b *memoryBackend) Close() error                   { return b.store.Close() }
 
@@ -366,6 +370,7 @@ func (m *mockBackend) Verifiers() storage.VerifierStore             { return nil
 func (m *mockBackend) Invites() storage.InviteStore                 { return nil }
 func (m *mockBackend) WalletInstances() storage.WalletInstanceStore { return nil }
 func (m *mockBackend) KeyAttestations() storage.KeyAttestationStore { return nil }
+func (m *mockBackend) AppAttestKeys() storage.AppAttestKeyStore     { return nil }
 
 // Verify mockBackend implements backend.Backend
 var _ backend.Backend = (*mockBackend)(nil)

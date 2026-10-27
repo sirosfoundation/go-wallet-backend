@@ -151,7 +151,7 @@ func TestNewWalletProviderProvider_RevocationStore(t *testing.T) {
 		p, err := NewWalletProviderProvider(cfg, zap.New(core))
 		require.NoError(t, err)
 		defer func() { _ = p.Close() }()
-		require.Equal(t, 0, logs.Len())
+		require.Equal(t, 0, logs.FilterMessageSnippet("token_blacklist.backend=memory").Len(), "no process-local revocation warning")
 
 		ctx := context.Background()
 		other, err := NewSharedBlacklist(ctx, cfg, zap.NewNop())

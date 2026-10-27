@@ -923,10 +923,12 @@ func (b *testPopBuilder) withAudience(aud ...string) *testPopBuilder {
 	b.claims.Audience = aud
 	return b
 }
+
 func (b *testPopBuilder) withIssuedAt(t time.Time) *testPopBuilder {
 	b.claims.IssuedAt = jwt.NewNumericDate(t)
 	return b
 }
+
 func (b *testPopBuilder) withExpiresAt(t time.Time) *testPopBuilder {
 	b.claims.ExpiresAt = jwt.NewNumericDate(t)
 	return b
@@ -1320,5 +1322,24 @@ func TestCreateChallenge_DefaultTTL(t *testing.T) {
 	diff := expiresAt.Sub(expected)
 	if diff < -2*time.Second || diff > 2*time.Second {
 		t.Errorf("default TTL should be ~5min, got expiry diff %v", diff)
+	}
+}
+
+func TestWSCDTypeFromKeyHome(t *testing.T) {
+	cases := map[domain.KeyHome]domain.WSCDType{
+		domain.KeyHomeStrongBox: domain.WSCDTypeNativeAndroid,
+		domain.KeyHomeTEE:       domain.WSCDTypeNativeAndroid,
+		// An App Attest assertion shows an attested app endorsed the key, not
+		// Secure Enclave residency, so the home never yields native_ios.
+		domain.KeyHomeSecureEnclaveAsserted: domain.WSCDTypeUnknown,
+		domain.KeyHomeFIDO2Hardware:         domain.WSCDTypeFIDO2Hardware,
+		domain.KeyHomeHSM:                   domain.WSCDTypeRemote,
+		"":                                  domain.WSCDTypeUnknown,
+		"software":                          domain.WSCDTypeUnknown,
+	}
+	for home, want := range cases {
+		if got := wscdTypeFromKeyHome(home); got != want {
+			t.Errorf("%q: got %q want %q", home, got, want)
+		}
 	}
 }

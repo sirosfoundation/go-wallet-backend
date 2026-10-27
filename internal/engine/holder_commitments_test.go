@@ -121,7 +121,7 @@ func runProofs(t *testing.T, cfg *CredentialConfig, jwt string) (SignRequestPara
 	}()
 	h := &OID4VCIHandler{}
 	h.BaseHandler = BaseHandler{Flow: &Flow{ID: "f", Session: session, Data: map[string]interface{}{}}, Logger: zap.NewNop()}
-	proofs, err := h.requestProofs(context.Background(), &IssuerMetadata{CredentialIssuer: "https://issuer.example.com"}, cfg, "n", "")
+	proofs, _, err := h.requestProofs(context.Background(), &IssuerMetadata{CredentialIssuer: "https://issuer.example.com"}, cfg, "n", "", nil)
 	var p SignRequestParams
 	select {
 	case p = <-paramsCh:
@@ -231,7 +231,7 @@ func TestPSCConflict_Relayed(t *testing.T) {
 		defer c2()
 		h.Flow.Session.conn = conn
 		_, err := h.requestCredential(context.Background(), &IssuerMetadata{CredentialEndpoint: srv.URL},
-			&TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", hcCfg(hcAdv), nil)
+			&TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", hcCfg(hcAdv), nil, nil)
 		select {
 		case m := <-got:
 			return &ErrorCodeAndMsg{m.Error.Code, m.Error.Message}, err

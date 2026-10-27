@@ -101,9 +101,9 @@ func (s *notificationContextStore) take(flowID string) *notificationContext {
 // hasValid reports whether a non-expired notification context exists for the
 // given flow ID whose stored notification_id matches the supplied value. It
 // does not consume the context. An empty stored notificationID matches any
-// supplied value (issuer returned a notification endpoint but no id), which is
-// effectively unreachable because put requires a non-empty endpoint and the
-// caller only registers a context when an id was present.
+// supplied value. That is the normal case for an encrypted issuer response: the
+// engine cannot read the notification_id, registers the context with an empty
+// id and the client supplies the real one (see registerNotificationContext).
 func (s *notificationContextStore) hasValid(flowID, notificationID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
