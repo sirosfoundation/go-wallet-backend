@@ -2868,10 +2868,16 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			return nil, errOf(resp.StatusCode, body)
 		}
 
-		body, err := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))
+		body, err := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes+1))
 		_ = resp.Body.Close()
 		if err != nil {
 			return nil, fmt.Errorf("failed to read credential response: %w", err)
+		}
+		if len(body) > MaxHTTPResponseBodyBytes {
+			// A prefix is not the response: a strict check of it could pass
+			// what the whole body fails (trailing data after padding).
+			_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
+			return nil, errors.New("credential response is too large")
 		}
 
 		// Detect encrypted response (JWE compact serialization)

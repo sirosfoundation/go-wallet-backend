@@ -1043,3 +1043,18 @@ func TestDeferredAnswer_UnreadableOrOversizedIsTerminal(t *testing.T) {
 		})
 	}
 }
+
+// A success body over the limit is refused whole, not decoded as a prefix.
+func TestCredentialResponse_OversizedIsRefused(t *testing.T) {
+	body := `{"credential":"c"}` + strings.Repeat(" ", MaxHTTPResponseBodyBytes) + `{"x":1}`
+	st := newIssuerStub(t, body)
+	fc := &fakeClient{t: t}
+	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
+	defer cleanup()
+	err := h.issueCredential(context.Background(), st.metadata(nil), tokenBearer(), "cfg", auxCfg(""), nil, "")
+	require.Error(t, err)
+	fc.settle()
+	for _, m := range fc.outboundMessages() {
+		assert.NotEqual(t, `"flow_complete"`, string(m["type"]))
+	}
+}
