@@ -1005,3 +1005,41 @@ func TestDeferredUnexpectedStatus_AmbiguousBodyIsTerminal(t *testing.T) {
 	require.NoError(t, err)
 	assert.False(t, done)
 }
+
+// A deferred answer that cannot be read whole ends the issuance: its body is
+// neither classified, logged nor retried.
+func TestDeferredAnswer_UnreadableOrOversizedIsTerminal(t *testing.T) {
+	old1, old2 := deferredPollDefaultInterval, deferredPollIntervalUnit
+	deferredPollDefaultInterval, deferredPollIntervalUnit = time.Millisecond, time.Millisecond
+	defer func() { deferredPollDefaultInterval, deferredPollIntervalUnit = old1, old2 }()
+	big := `{"error":"auxiliary_data_conflict","error_description":"SECRET-ISSUER-TEXT ` + strings.Repeat("x", MaxHTTPResponseBodyBytes) + `"}`
+	for name, serve := range map[string]func(w http.ResponseWriter){
+		"oversized": func(w http.ResponseWriter) { w.WriteHeader(http.StatusBadRequest); _, _ = w.Write([]byte(big)) },
+		"cut short": func(w http.ResponseWriter) {
+			w.Header().Set("Content-Length", "1000")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"x","error_description":"SECRET-ISSUER-TEXT"`))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			polls := 0
+			st := newIssuerStub(t, `{"transaction_id":"t"}`)
+			st.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasSuffix(r.URL.Path, "/deferred_credential") {
+					_, _ = w.Write([]byte(`{"transaction_id":"t"}`))
+					return
+				}
+				polls++
+				serve(w)
+			})
+			fc := &fakeClient{t: t}
+			h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
+			defer cleanup()
+			err := h.issueCredential(context.Background(), st.metadata(nil), tokenBearer(), "cfg", auxCfg(""), nil, "")
+			require.Error(t, err)
+			assert.Equal(t, 1, polls, "never retried")
+			assert.NotContains(t, logDump(logs), "SECRET-ISSUER-TEXT")
+			assert.NotContains(t, err.Error(), "SECRET-ISSUER-TEXT")
+		})
+	}
+}

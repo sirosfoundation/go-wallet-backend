@@ -3059,8 +3059,14 @@ func (p *deferredPoll) once(ctx context.Context, attempt, maxAttempts int) (cred
 		return nil, false, nil // Retry immediately with new nonce (counts as one attempt)
 	}
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes+1))
 	_ = resp.Body.Close()
+	if readErr != nil || len(body) > MaxHTTPResponseBodyBytes {
+		// Unreadable or cut short: it cannot be classified (it may be a
+		// conflict that echoes a commitment) and must not be logged or acted
+		// on. Terminal and generic.
+		return nil, true, errors.New("deferred response is unreadable or too large")
+	}
 
 	// An issuer answers a request that asked for an encrypted response
 	// with a JWE whatever the status: 200 carries the credentials, 202 a
