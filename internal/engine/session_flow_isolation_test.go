@@ -302,12 +302,12 @@ func TestSession_ActionsForOneFlowStayInOrderAcrossWaiters(t *testing.T) {
 
 	readFirst := make(chan struct{})
 	release := make(chan struct{})
+	var once sync.Once
 	s.stash.afterForeignActionRead = func() {
-		select {
-		case readFirst <- struct{}{}:
-			<-release // pause the waiter that read flow-b's first action
-		default:
-		}
+		once.Do(func() {
+			close(readFirst) // persistent signal, never lost if the test is not yet receiving
+			<-release        // pause the waiter that read flow-b's first action
+		})
 	}
 
 	// flow-a's waiter competes for the channel but never gets an action.
@@ -320,7 +320,12 @@ func TestSession_ActionsForOneFlowStayInOrderAcrossWaiters(t *testing.T) {
 	time.Sleep(50 * time.Millisecond) // flow-a's waiter is reading the channel
 
 	s.actionCh <- &FlowActionMessage{Message: Message{FlowID: flowName(1)}, Action: "first"}
-	<-readFirst // flow-a's waiter holds flow-b's first action, not yet parked
+	select {
+	case <-readFirst: // flow-a's waiter holds flow-b's first action, not yet parked
+	case <-time.After(3 * time.Second):
+		close(release)
+		t.Fatal("flow-a's waiter never read flow-b's first action")
+	}
 	s.actionCh <- &FlowActionMessage{Message: Message{FlowID: flowName(1)}, Action: "second"}
 
 	got := make(chan string, 2)
@@ -337,8 +342,9 @@ func TestSession_ActionsForOneFlowStayInOrderAcrossWaiters(t *testing.T) {
 	time.Sleep(100 * time.Millisecond) // flow-b's waiter has had every chance to read "second"
 	close(release)
 
-	assert.Equal(t, "first", <-got)
-	assert.Equal(t, "second", <-got)
+	// Fatal on the first mismatch: after an error the worker sends nothing more.
+	require.Equal(t, "first", <-got)
+	require.Equal(t, "second", <-got)
 	cancelA()
 	<-doneA
 }
