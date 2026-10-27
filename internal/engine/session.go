@@ -896,6 +896,15 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	logger.Info("Flow completed")
 }
 
+// userRevokedAnywhere reports whether userID is revoked according to the
+// engine's own always-on signal or the optional token blacklist.
+func (m *Manager) userRevokedAnywhere(userID string) bool {
+	if m.isUserRevoked(userID) {
+		return true
+	}
+	return m.blacklist != nil && m.blacklist.IsUserRevoked(context.Background(), userID)
+}
+
 // registerSession adds session to the manager's live-session bookkeeping
 // and returns true, unless userID was revoked between validateToken's own
 // check (in handleNewConnection, immediately before this call) and this
@@ -932,16 +941,10 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 func (m *Manager) registerSession(session *Session) bool {
 	m.sessionsMu.Lock()
 
-	if session.UserID != "" {
-		revoked := m.isUserRevoked(session.UserID)
-		if !revoked && m.blacklist != nil {
-			revoked = m.blacklist.IsUserRevoked(context.Background(), session.UserID)
-		}
-		if revoked {
-			m.sessionsMu.Unlock()
-			session.closeWithReason("account deleted")
-			return false
-		}
+	if session.UserID != "" && m.userRevokedAnywhere(session.UserID) {
+		m.sessionsMu.Unlock()
+		session.closeWithReason("account deleted")
+		return false
 	}
 	defer m.sessionsMu.Unlock()
 
