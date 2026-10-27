@@ -2243,6 +2243,14 @@ func (c *TokenBlacklistConfig) SetDefaults() {
 	}
 }
 
+// Upper bounds for DeletionTombstoneConfig, so the conversions to time.Duration
+// cannot overflow: an oversized interval would wrap and make time.NewTicker
+// panic, an oversized margin would wrap the retention into the past.
+const (
+	MaxDeletionTombstoneCleanupIntervalSeconds = 365 * 24 * 3600 // one year
+	MaxDeletionTombstoneRetentionMarginDays    = 36500           // 100 years
+)
+
 // LifecycleConfig configures wallet instance lifecycle background work.
 type LifecycleConfig struct {
 	// Reconciler finishes erasures that a revocation left incomplete.
@@ -2280,6 +2288,20 @@ type ErasureReconcilerConfig struct {
 	BatchSize int `yaml:"batch_size" envconfig:"BATCH_SIZE"`
 }
 
+// MaxReconcilerSeconds bounds the reconciler's interval and grace period (one
+// year): larger values would overflow the time.Duration conversion.
+const MaxReconcilerSeconds = 365 * 24 * 3600
+
+func (c ErasureReconcilerConfig) validate() error {
+	if c.IntervalSeconds < 0 || c.IntervalSeconds > MaxReconcilerSeconds {
+		return fmt.Errorf("lifecycle.reconciler.interval_seconds must be between 0 and %d", MaxReconcilerSeconds)
+	}
+	if c.GracePeriodSeconds < 0 || c.GracePeriodSeconds > MaxReconcilerSeconds {
+		return fmt.Errorf("lifecycle.reconciler.grace_period_seconds must be between 0 and %d", MaxReconcilerSeconds)
+	}
+	return nil
+}
+
 // SetDefaults sets default values for the erasure reconciler (Enabled is not defaulted here).
 func (c *ErasureReconcilerConfig) SetDefaults() {
 	if c.IntervalSeconds <= 0 {
@@ -2299,12 +2321,14 @@ type DeletionTombstoneConfig struct {
 	// CleanupIntervalSeconds is how often expired tombstones are swept.
 	// The sweeper is what expires tombstones on backends without a TTL index
 	// (memory) and a backstop on MongoDB.
+	// Must be between 0 and 31536000 (one year); 0 means the default.
 	// Default: 3600 (1 hour)
 	CleanupIntervalSeconds int `yaml:"cleanup_interval_seconds" envconfig:"CLEANUP_INTERVAL_SECONDS"`
 
 	// RetentionMarginDays is the safety margin added to the longest token
 	// lifetime (access token, refresh token, AS session; itself floored at one
 	// year, see MinTokenRetention) when a tombstone's expiry is computed.
+	// Must be between 0 and 36500; 0 means the default.
 	// Default: 30
 	RetentionMarginDays int `yaml:"retention_margin_days" envconfig:"RETENTION_MARGIN_DAYS"`
 }
@@ -2336,8 +2360,8 @@ func (c *Config) DeletionTombstoneRetention() time.Duration {
 	margin := c.Security.DeletionTombstone
 	margin.SetDefaults()
 
-	longest := time.Duration(c.JWT.ExpiryHours) * time.Hour
-	if r := time.Duration(c.JWT.RefreshDays) * 24 * time.Hour; r > longest {
+	longest := saturatingDuration(c.JWT.ExpiryHours, time.Hour)
+	if r := saturatingDuration(c.JWT.RefreshDays, 24*time.Hour); r > longest {
 		longest = r
 	}
 	if c.AS.DefaultTokenTTL > longest {
@@ -2358,7 +2382,24 @@ func (c *Config) DeletionTombstoneRetention() time.Duration {
 	if longest < MinTokenRetention {
 		longest = MinTokenRetention
 	}
-	return longest + time.Duration(margin.RetentionMarginDays)*24*time.Hour
+	m := saturatingDuration(margin.RetentionMarginDays, 24*time.Hour)
+	if longest > math.MaxInt64-m {
+		return time.Duration(math.MaxInt64)
+	}
+	return longest + m
+}
+
+// saturatingDuration is n*unit clamped to [0, MaxInt64]: a retention must never
+// wrap into the past, which would let a tombstone be swept while the tokens it
+// guards are still valid.
+func saturatingDuration(n int, unit time.Duration) time.Duration {
+	if n <= 0 {
+		return 0
+	}
+	if int64(n) > math.MaxInt64/int64(unit) {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(n) * unit
 }
 
 // SessionStoreConfig contains WebSocket session store configuration
@@ -2820,11 +2861,14 @@ func (c *Config) Validate() error {
 	if err := c.Server.validateTrustedProxies(); err != nil {
 		return err
 	}
-	if c.Security.DeletionTombstone.CleanupIntervalSeconds < 0 {
-		return fmt.Errorf("security.deletion_tombstone.cleanup_interval_seconds must not be negative")
+	if n := c.Security.DeletionTombstone.CleanupIntervalSeconds; n < 0 || n > MaxDeletionTombstoneCleanupIntervalSeconds {
+		return fmt.Errorf("security.deletion_tombstone.cleanup_interval_seconds must be between 0 and %d", MaxDeletionTombstoneCleanupIntervalSeconds)
 	}
-	if c.Security.DeletionTombstone.RetentionMarginDays < 0 {
-		return fmt.Errorf("security.deletion_tombstone.retention_margin_days must not be negative")
+	if n := c.Security.DeletionTombstone.RetentionMarginDays; n < 0 || n > MaxDeletionTombstoneRetentionMarginDays {
+		return fmt.Errorf("security.deletion_tombstone.retention_margin_days must be between 0 and %d", MaxDeletionTombstoneRetentionMarginDays)
+	}
+	if err := c.Lifecycle.Reconciler.validate(); err != nil {
+		return err
 	}
 
 	// Validate wallet-provider port when explicitly configured
