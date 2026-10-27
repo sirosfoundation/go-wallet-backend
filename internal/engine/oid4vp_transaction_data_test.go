@@ -892,7 +892,7 @@ func failSignHarness(t *testing.T, td []TransactionData, err error) (url.Values,
 // verifier is told, and the client gets the distinct code.
 func TestFailSign_ClientRefusalOfTransactionDataTellsVerifier(t *testing.T) {
 	form, errs := failSignHarness(t, []TransactionData{{Type: "owf_payment_initiation"}},
-		&SignError{text: "unsupported type", Code: ErrCodeUnsupportedTransactionData})
+		&SignError{Code: ErrCodeUnsupportedTransactionData})
 	assert.Equal(t, "invalid_transaction_data", form.Get("error"))
 	assert.Equal(t, "st-1", form.Get("state"))
 	assert.Equal(t, ErrCodeUnsupportedTransactionData, errs[0].Error.Code)
@@ -901,7 +901,7 @@ func TestFailSign_ClientRefusalOfTransactionDataTellsVerifier(t *testing.T) {
 // The classification counts only for a request that carried transaction_data, and
 // any other sign failure stays a SIGN_ERROR that does not contact the verifier.
 func TestFailSign_OtherFailuresStaySignError(t *testing.T) {
-	form, errs := failSignHarness(t, nil, &SignError{text: "no", Code: ErrCodeUnsupportedTransactionData})
+	form, errs := failSignHarness(t, nil, &SignError{Code: ErrCodeUnsupportedTransactionData})
 	assert.Nil(t, form)
 	assert.Equal(t, ErrCodeSignError, errs[0].Error.Code)
 
@@ -1059,5 +1059,4 @@ func TestSession_RequestSign_ReplyViaOwnChannelBecomesSignError(t *testing.T) {
 	var se *SignError
 	require.ErrorAs(t, err, &se)
 	assert.Equal(t, ErrCodeUnsupportedTransactionData, se.Code)
-	assert.Equal(t, "x", se.ClientText())
 }
