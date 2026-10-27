@@ -39,20 +39,16 @@ func NormalizeIssuerURL(rawURL string) string {
 	if err != nil || parsed.Path != "/" {
 		return rawURL
 	}
-	// The root slash is the first "/" after "scheme://authority", and the path is
-	// exactly "/" so it is followed by "?", "#" or the end.
-	_, rest, ok := strings.Cut(rawURL, "://")
-	if !ok {
+	// Only the "scheme://authority/" form has a root slash to remove. The "://"
+	// must be the one that follows the scheme, not one inside the query.
+	schemeEnd := strings.Index(rawURL, "://")
+	if schemeEnd < 0 || !strings.EqualFold(rawURL[:schemeEnd], parsed.Scheme) {
 		return rawURL
 	}
-	authEnd := strings.IndexAny(rest, "/?#")
-	if authEnd < 0 || rest[authEnd] != '/' {
-		return rawURL
-	}
-	if next := authEnd + 1; next < len(rest) && rest[next] != '?' && rest[next] != '#' {
-		return rawURL
-	}
-	pos := len(rawURL) - len(rest) + authEnd
+	// The path is exactly "/", so the first "/" after the authority is the root
+	// slash (an earlier "?" or "#" would have made the path empty).
+	rest := rawURL[schemeEnd+3:]
+	pos := schemeEnd + 3 + strings.IndexByte(rest, '/')
 	return rawURL[:pos] + rawURL[pos+1:]
 }
 

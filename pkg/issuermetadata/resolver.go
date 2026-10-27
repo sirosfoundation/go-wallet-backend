@@ -352,10 +352,7 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 
 		// RFC 8615 well-known URI construction (required since OID4VCI draft 16):
 		// https://{host}/.well-known/openid-credential-issuer{path}
-		metadataURL, err := oidc.WellKnownURL(issuerURL, "openid-credential-issuer")
-		if err != nil {
-			return nil, fmt.Errorf("building well-known URL: %w", err)
-		}
+		metadataURL, _ := oidc.WellKnownURL(issuerURL, "openid-credential-issuer") // already validated above
 		fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer fetchCancel()
 		result, err := r.fetch(fetchCtx, issuerURL, metadataURL)
