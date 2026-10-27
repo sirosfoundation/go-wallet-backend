@@ -203,3 +203,70 @@ func TestResponseStash_ActionsBoundedAndDroppedWithFlow(t *testing.T) {
 	s.stash.dropFlow("f")
 	assert.Empty(t, s.stash.actions)
 }
+
+// A reply parked for a request is discarded when the request ends, and a late
+// reply for it is not parked afterwards: nothing can consume either, and they
+// would fill the stash's bounded capacity.
+func TestSession_ParkedRepliesDropWhenRequestEnds(t *testing.T) {
+	s, _ := newIsolationSession(t)
+
+	done := s.trackRequest("req")
+	s.stashSign(&SignResponseMessage{Message: Message{MessageID: "req"}})
+	s.stashMatch(&MatchResponseMessage{Message: Message{FlowID: "f", MessageID: "req"}})
+	require.Len(t, s.stash.signs, 1)
+	require.Len(t, s.stash.matches, 1)
+
+	done() // the request timed out or was cancelled before consuming its reply
+	assert.Empty(t, s.stash.signs)
+	assert.Empty(t, s.stash.matches)
+
+	s.stashSign(&SignResponseMessage{Message: Message{MessageID: "req"}})
+	s.stashMatch(&MatchResponseMessage{Message: Message{FlowID: "f", MessageID: "req"}})
+	assert.Empty(t, s.stash.signs)
+	assert.Empty(t, s.stash.matches)
+}
+
+// A reply carrying the right message ID but the wrong flow ID must not replace
+// (or block) the valid parked reply for that request.
+func TestSession_WrongFlowMatchReplyDoesNotOverwriteValidOne(t *testing.T) {
+	s, _ := newIsolationSession(t)
+	done := s.trackRequest("req")
+	defer done()
+
+	s.stashMatch(&MatchResponseMessage{Message: Message{FlowID: "flow-a", MessageID: "req"}, Error: "valid"})
+	s.stashMatch(&MatchResponseMessage{Message: Message{FlowID: "flow-wrong", MessageID: "req"}, Error: "impostor"})
+
+	got := s.stash.takeMatch("flow-a", "req")
+	require.NotNil(t, got)
+	assert.Equal(t, "valid", got.Error)
+}
+
+// Flow teardown (delete under the write lock, then dropFlow) must never leave
+// a parked-action queue behind, even when actions for the ending flow are being
+// stashed concurrently.
+func TestSession_StashAction_RacingFlowTeardownLeavesNoQueue(t *testing.T) {
+	s, _ := newIsolationSession(t)
+	for round := 0; round < 200; round++ {
+		s.flowsMu.Lock()
+		s.flows["f"] = &Flow{ID: "f"}
+		s.flowsMu.Unlock()
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 5; i++ {
+				s.stashAction(&FlowActionMessage{Message: Message{FlowID: "f"}, Action: "x"})
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			s.flowsMu.Lock()
+			delete(s.flows, "f")
+			s.flowsMu.Unlock()
+			s.stash.dropFlow("f")
+		}()
+		wg.Wait()
+		require.Empty(t, s.stash.actions, "round %d left a queue for an ended flow", round)
+	}
+}

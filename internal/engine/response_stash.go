@@ -18,9 +18,14 @@ type responseStash struct {
 	mu      sync.Mutex
 	actions map[string][]*FlowActionMessage // by flow ID
 	signs   map[string]*SignResponseMessage // by message ID
-	matches map[string]*MatchResponseMessage
+	matches map[matchKey]*MatchResponseMessage
 	wake    chan struct{}
 }
+
+// matchKey keys a parked match response by both its flow and message ID, so a
+// reply with the right message ID but the wrong flow ID can never replace the
+// valid reply for that request.
+type matchKey struct{ flowID, messageID string }
 
 // waitChan returns a channel closed on the next put. Callers must obtain it
 // BEFORE checking the stash so a put in between is never missed.
@@ -42,12 +47,13 @@ func (r *responseStash) broadcastLocked() {
 }
 
 // stashAction parks an action for another flow, unless that flow no longer
-// exists (nothing would ever consume it).
+// exists (nothing would ever consume it). flowsMu is held for reading through
+// the insertion so flow teardown (which deletes the flow under the write lock
+// and then calls dropFlow) cannot overtake it and leave a queue behind.
 func (s *Session) stashAction(a *FlowActionMessage) {
 	s.flowsMu.RLock()
-	_, ok := s.flows[a.FlowID]
-	s.flowsMu.RUnlock()
-	if !ok {
+	defer s.flowsMu.RUnlock()
+	if _, ok := s.flows[a.FlowID]; !ok {
 		return
 	}
 	r := &s.stash
@@ -63,21 +69,16 @@ func (s *Session) stashAction(a *FlowActionMessage) {
 	r.broadcastLocked()
 }
 
-// isOutstanding reports whether messageID is a sign/match request still
-// awaiting its response (see trackRequest).
-func (s *Session) isOutstanding(messageID string) bool {
-	s.flowsMu.RLock()
-	defer s.flowsMu.RUnlock()
-	_, ok := s.outstandingRequests[messageID]
-	return ok
-}
-
 // stashSign parks a sign response for the request that is still waiting for
 // it. A response for a request that is no longer pending (it timed out or was
 // cancelled) is dropped: nothing would ever consume it, and it would use up
-// the stash's bounded capacity.
+// the stash's bounded capacity. flowsMu is held for reading through the
+// insertion, and trackRequest's cleanup removes the request under the write
+// lock, so a request cannot end between the pending check and the insertion.
 func (s *Session) stashSign(m *SignResponseMessage) {
-	if !s.isOutstanding(m.MessageID) {
+	s.flowsMu.RLock()
+	defer s.flowsMu.RUnlock()
+	if _, ok := s.outstandingRequests[m.MessageID]; !ok {
 		return
 	}
 	r := &s.stash
@@ -95,19 +96,22 @@ func (s *Session) stashSign(m *SignResponseMessage) {
 
 // stashMatch is stashSign for match responses.
 func (s *Session) stashMatch(m *MatchResponseMessage) {
-	if !s.isOutstanding(m.MessageID) {
+	s.flowsMu.RLock()
+	defer s.flowsMu.RUnlock()
+	if _, ok := s.outstandingRequests[m.MessageID]; !ok {
 		return
 	}
 	r := &s.stash
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.matches == nil {
-		r.matches = make(map[string]*MatchResponseMessage)
+		r.matches = make(map[matchKey]*MatchResponseMessage)
 	}
-	if len(r.matches) >= maxStashedResponses {
+	k := matchKey{m.FlowID, m.MessageID}
+	if _, dup := r.matches[k]; !dup && len(r.matches) >= maxStashedResponses {
 		return
 	}
-	r.matches[m.MessageID] = m
+	r.matches[k] = m
 	r.broadcastLocked()
 }
 
@@ -154,12 +158,23 @@ func (r *responseStash) takeSign(messageID string) *SignResponseMessage {
 func (r *responseStash) takeMatch(flowID, messageID string) *MatchResponseMessage {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	m := r.matches[messageID]
-	if m == nil || m.FlowID != flowID {
-		return nil
-	}
-	delete(r.matches, messageID)
+	k := matchKey{flowID, messageID}
+	m := r.matches[k]
+	delete(r.matches, k)
 	return m
+}
+
+// dropRequest discards any response still parked for a sign/match request that
+// is no longer pending. The caller holds the session's flowsMu for writing.
+func (r *responseStash) dropRequest(messageID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.signs, messageID)
+	for k := range r.matches {
+		if k.messageID == messageID {
+			delete(r.matches, k)
+		}
+	}
 }
 
 // dropFlow discards anything still parked for a flow that has ended.

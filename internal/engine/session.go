@@ -145,6 +145,10 @@ func (s *Session) trackRequest(messageID string) (done func()) {
 	return func() {
 		s.flowsMu.Lock()
 		delete(s.outstandingRequests, messageID)
+		// A reply parked for this request can never be consumed now. Removing it
+		// under the same lock stashSign/stashMatch hold while inserting means it
+		// cannot be re-added after this point.
+		s.stash.dropRequest(messageID)
 		s.flowsMu.Unlock()
 	}
 }
@@ -894,6 +898,15 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	logger.Info("Flow completed")
 }
 
+// userRevokedAnywhere reports whether userID is revoked according to the
+// engine's own always-on signal or the optional token blacklist.
+func (m *Manager) userRevokedAnywhere(userID string) bool {
+	if m.isUserRevoked(userID) {
+		return true
+	}
+	return m.blacklist != nil && m.blacklist.IsUserRevoked(context.Background(), userID)
+}
+
 // registerSession adds session to the manager's live-session bookkeeping
 // and returns true, unless userID was revoked between validateToken's own
 // check (in handleNewConnection, immediately before this call) and this
@@ -930,16 +943,10 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 func (m *Manager) registerSession(session *Session) bool {
 	m.sessionsMu.Lock()
 
-	if session.UserID != "" {
-		revoked := m.isUserRevoked(session.UserID)
-		if !revoked && m.blacklist != nil {
-			revoked = m.blacklist.IsUserRevoked(context.Background(), session.UserID)
-		}
-		if revoked {
-			m.sessionsMu.Unlock()
-			session.closeWithReason("account deleted")
-			return false
-		}
+	if session.UserID != "" && m.userRevokedAnywhere(session.UserID) {
+		m.sessionsMu.Unlock()
+		session.closeWithReason("account deleted")
+		return false
 	}
 	defer m.sessionsMu.Unlock()
 
@@ -1536,23 +1543,12 @@ func (s *Session) RequestMatch(ctx context.Context, flowID string, dcql json.Raw
 		wake := s.stash.waitChan()
 		resp := s.stash.takeMatch(flowID, messageID)
 		if resp == nil {
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-timer.C:
-				return nil, ErrMatchTimeout
-			case <-s.closeCh:
-				return nil, errors.New("session closed")
-			case <-wake:
+			var err error
+			if resp, err = s.awaitMatch(ctx, timer, wake, flowID, messageID); err != nil {
+				return nil, err
+			}
+			if resp == nil {
 				continue
-			case r := <-s.matchCh:
-				// Verify both flow_id and message_id for proper correlation
-				if r.FlowID != flowID || r.MessageID != messageID {
-					// Another request's response: park it for its waiter.
-					s.stashMatch(r)
-					continue
-				}
-				resp = r
 			}
 		}
 		// Check for error in response
@@ -1560,6 +1556,30 @@ func (s *Session) RequestMatch(ctx context.Context, flowID string, dcql json.Raw
 			return nil, errors.New(resp.Error)
 		}
 		return resp, nil
+	}
+}
+
+// awaitMatch blocks until the stash is woken or a match response arrives. It
+// returns the response if it answers (flowID, messageID); for any other
+// response it parks it for its owner and returns nil, as it does on a wake-up.
+func (s *Session) awaitMatch(ctx context.Context, timer *time.Timer, wake <-chan struct{}, flowID, messageID string) (*MatchResponseMessage, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, ErrMatchTimeout
+	case <-s.closeCh:
+		return nil, errors.New("session closed")
+	case <-wake:
+		return nil, nil
+	case r := <-s.matchCh:
+		// Verify both flow_id and message_id for proper correlation
+		if r.FlowID != flowID || r.MessageID != messageID {
+			// Another request's response: park it for its waiter.
+			s.stashMatch(r)
+			return nil, nil
+		}
+		return r, nil
 	}
 }
 
