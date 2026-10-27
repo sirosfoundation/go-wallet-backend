@@ -291,12 +291,12 @@ func TestWMP_HTTP_ModernEmptyTAC_Refused(t *testing.T) {
 			TenantID: "t", TAC: claims.TAC(tac), ACR: "urn:siros:acr:passkey",
 		})
 	}
-	sid, _, _ := createSessionFull(t, a, "u", "t", func(p *wmp.SessionCreateParams) { p.Auth.Token = tokenWith("ir") })
 	h := &blockingHandler{release: make(chan struct{})}
 	defer close(h.release)
 	m.RegisterFlowHandler(ProtocolOID4VCI, func(*Flow, *config.Config, *zap.Logger, *TrustService, *RegistryClient, storage.VerifierStore, *TrustCache) (FlowHandler, error) {
 		return h, nil
 	})
+	sid, _, _ := createSessionFull(t, a, "u", "t", func(p *wmp.SessionCreateParams) { p.Auth.Token = tokenWith("ir") })
 
 	post := func(tok string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodPost, WMPRPCPath, strings.NewReader(string(startFlowBody(sid, string(ProtocolOID4VCI), "f-h"))))

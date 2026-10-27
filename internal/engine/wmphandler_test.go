@@ -661,8 +661,9 @@ func TestWMP_FlowStart_UnknownProtocol(t *testing.T) {
 
 	var rpcResp wmp.Response
 	require.NoError(t, json.Unmarshal(resp, &rpcResp))
-	assert.NotNil(t, rpcResp.Error)
-	assert.Equal(t, wmp.ErrInvalidParams, rpcResp.Error.Code)
+	require.NotNil(t, rpcResp.Error)
+	assert.Equal(t, wmp.ErrCapabilityNotSupported, rpcResp.Error.Code, "Core 10.3")
+	assert.JSONEq(t, `{"unsupported":"nonexistent_protocol"}`, string(rpcResp.Error.Data))
 }
 
 func TestWMP_FlowStart_WithMockHandler(t *testing.T) {
@@ -1551,7 +1552,7 @@ func TestWmpSessionTransport_SendJSON_FlowError(t *testing.T) {
 		require.NoError(t, json.Unmarshal(data, &notif))
 		assert.Equal(t, wmp.MethodFlowError, notif.Method)
 		assert.Equal(t, "flow-1", notif.Params.FlowID)
-		assert.Equal(t, wmp.ErrSignatureInvalid, notif.Params.Code)
+		assert.Equal(t, wmp.ErrFlowError, notif.Params.Code, "a failed sign is a flow error, not -31010 (signature verification failure)")
 		assert.Equal(t, "boom", notif.Params.Message)
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for flow.error notification")
@@ -1701,7 +1702,8 @@ func TestWMP_MapErrorCode(t *testing.T) {
 		{ErrCodeAuthFailed, wmp.ErrNotAuthorized},
 		{ErrCodeAuthorizationFail, wmp.ErrNotAuthorized},
 		{ErrCodeInvalidMessage, wmp.ErrInvalidRequest},
-		{ErrCodeSignError, wmp.ErrSignatureInvalid},
+		{ErrCodeSignError, wmp.ErrFlowError},
+		{ErrCodeUnsupportedTransactionData, wmp.ErrCapabilityNotSupported},
 		{ErrCodeTooManyRequests, wmp.ErrRateLimited},
 		{ErrCodeInternalError, wmp.ErrInternalError},
 		{ErrCodeOfferParseError, wmp.ErrFlowError},

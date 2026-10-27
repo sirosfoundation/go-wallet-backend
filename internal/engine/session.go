@@ -1521,6 +1521,16 @@ func (s *Session) SendFlowCompleteWithRefreshToken(flowID string, credentials []
 	return s.sendFlowComplete(flowID, credentials, redirectURI, refreshToken, dpopJWK, dpopKeyID, false, nil)
 }
 
+// completionCredentialMetadata is the credential_metadata a completion may carry:
+// only the display members, and none when the issuer's response was encrypted
+// (OpenID4x 3.1.4.1).
+func completionCredentialMetadata(responseEncrypted bool, md json.RawMessage) json.RawMessage {
+	if responseEncrypted {
+		return nil
+	}
+	return restrictToDisplayMetadata(md)
+}
+
 func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult, redirectURI string, refreshToken string, dpopJWK string, dpopKeyID string, responseEncrypted bool, displayMD json.RawMessage) error {
 	s.flowsMu.RLock()
 	flow := s.flows[flowID]
@@ -1538,7 +1548,7 @@ func (s *Session) sendFlowComplete(flowID string, credentials []CredentialResult
 		DPoPJWK:                     dpopJWK,
 		DPoPKeyID:                   dpopKeyID,
 		CredentialResponseEncrypted: responseEncrypted,
-		CredentialMetadata:          displayMD,
+		CredentialMetadata:          completionCredentialMetadata(responseEncrypted, displayMD),
 	}
 	if flow != nil {
 		flow.mu.RLock()

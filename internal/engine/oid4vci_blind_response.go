@@ -222,11 +222,22 @@ var displayMetadataMembers = []string{"display", "claims"}
 // metadata. A value that is not an object yields nil; no error or log ever
 // quotes the content.
 func displayMetadata(resp *CredentialResponse) json.RawMessage {
-	if resp == nil || resp.Encrypted || len(resp.CredentialMetadata) == 0 {
+	if resp == nil || resp.Encrypted {
+		return nil
+	}
+	return restrictToDisplayMetadata(resp.CredentialMetadata)
+}
+
+// restrictToDisplayMetadata keeps only displayMetadataMembers of a
+// credential_metadata object, compacted, or returns nil. It is applied again
+// where the completion is built, so no caller can relay another member
+// (OpenID4x 3.1.4.1: the sender drops every other member).
+func restrictToDisplayMetadata(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
 		return nil
 	}
 	var members map[string]json.RawMessage
-	if json.Unmarshal(resp.CredentialMetadata, &members) != nil {
+	if json.Unmarshal(raw, &members) != nil {
 		return nil
 	}
 	out := make(map[string]json.RawMessage, len(displayMetadataMembers))

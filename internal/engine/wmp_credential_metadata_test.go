@@ -18,13 +18,18 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/sirosfoundation/go-wmp/pkg/wmp/openid4x"
 )
 
 const (
-	cmSeedHex  = "00112233445566778899aabbccddeeff"
+	cmSeedHex = "00112233445566778899aabbccddeeff"
+	// cmSeedMD is a credential_metadata carrying a seed: the worst case for the
+	// sender-side restriction, which must drop it.
 	cmSeedMD   = `{"org.siros.secret_seed":{"ns1":"` + cmSeedHex + `"},"display":[{"name":"Card"}]}`
+	cmCardMD   = `{"display":[{"name":"Card"}]}`
 	cmDisplay  = `{"display":[{"name":"DeferredCard"}]}`
-	cmSecretIn = cmSeedHex
+	cmSecretIn = cmRefresh
 	cmRefresh  = "rt-SECRET-refresh-token"
 	cmDPoPJWK  = `{\"kty\":\"EC\",\"d\":\"DPOP-PRIVATE-D\"}`
 	cmDPoPKID  = "dpop-key-id-SECRET"
@@ -36,10 +41,9 @@ func cmSendFull(t *testing.T, sess *Session, md json.RawMessage) {
 	require.NoError(t, sess.sendFlowComplete("f1", cmCreds(), "", cmRefresh, `{"kty":"EC","d":"DPOP-PRIVATE-D"}`, cmDPoPKID, false, md))
 }
 
-// cmSeedRelay is credential_metadata carrying a seed. The engine never relays
-// one (oid4vci drops everything but display members), so this is the worst case
-// the replay redaction must still withhold.
-func cmSeedRelay() json.RawMessage { return json.RawMessage(cmSeedMD) }
+// cmSeedRelay is what the engine relays for a response whose credential_metadata
+// carried a seed: only the display members (see restrictToDisplayMetadata).
+func cmSeedRelay() json.RawMessage { return json.RawMessage(cmCardMD) }
 
 // assertNoSecrets checks s holds none of the secret values.
 func cmAssertNoSecrets(t *testing.T, s string) {
@@ -56,7 +60,8 @@ func redactedMembers(t *testing.T, res map[string]json.RawMessage) []string {
 	return m
 }
 
-var cmAllWithheld = []string{"credential_metadata", "dpop_jwk", "dpop_key_id", "refresh_token"}
+// cmAllWithheld are the secret members of OpenID4x 3.1.4.2.
+var cmAllWithheld = []string{"dpop_jwk", "dpop_key_id", "refresh_token"}
 
 func cmCreds() []CredentialResult {
 	return []CredentialResult{{Format: "mso_mdoc", Credential: "cred-bytes"}}
@@ -139,7 +144,7 @@ func TestWMP_FlowComplete_LiveCarriesCredentialMetadata(t *testing.T) {
 
 	res := sseCompleteResults(t, w.String())
 	require.Len(t, res, 1)
-	assert.JSONEq(t, cmSeedMD, string(res[0]["credential_metadata"]))
+	assert.JSONEq(t, cmCardMD, string(res[0]["credential_metadata"]))
 	assert.Equal(t, `"`+cmRefresh+`"`, string(res[0]["refresh_token"]), "live copy is the full completion")
 	assert.Contains(t, string(res[0]["dpop_jwk"]), "DPOP-PRIVATE-D")
 	assert.Equal(t, `"`+cmDPoPKID+`"`, string(res[0]["dpop_key_id"]))
@@ -164,8 +169,9 @@ func TestWMP_FlowComplete_RingNeverHoldsSecrets(t *testing.T) {
 	for _, k := range cmAllWithheld {
 		assert.NotContains(t, stored, `"`+k+`":`, "member %s must not be a key of the retained copy", k)
 	}
-	assert.Contains(t, stored, `"redacted_members":["credential_metadata","dpop_jwk","dpop_key_id","refresh_token"]`)
+	assert.Contains(t, stored, `"redacted_members":["dpop_jwk","dpop_key_id","refresh_token"]`)
 	assert.Contains(t, stored, "cred-bytes", "credentials stay replayable")
+	assert.Contains(t, stored, `"credential_metadata":`, "credential_metadata is not a secret: replay keeps it (OpenID4x 3.1.4.2)")
 
 	// Replay to a reconnecting client (no cursor and old cursor): marker, no secrets.
 	for _, cursor := range []string{"", "0"} {
@@ -181,6 +187,11 @@ func TestWMP_FlowComplete_RingNeverHoldsSecrets(t *testing.T) {
 			_, has := res[0][k]
 			assert.False(t, has, k)
 		}
+		assert.JSONEq(t, cmCardMD, string(res[0]["credential_metadata"]))
+		// go-wmp accepts the replayed completion.
+		replayed, err := json.Marshal(res[0])
+		require.NoError(t, err)
+		require.NoError(t, openid4x.ValidateCompletionResult(replayed))
 	}
 
 	// A cursor past the completion replays nothing of it.
@@ -259,10 +270,10 @@ func TestWMP_FlowComplete_DeferredPath(t *testing.T) {
 	_, flag := res[0]["credential_response_encrypted"]
 	assert.False(t, flag, "plain response: encrypted flag absent")
 
-	// The whole object is withheld from the ring, display data included.
+	// Display metadata is not a secret: the replay copy keeps it and withholds nothing.
 	stored := ringBytes(buf)
-	assert.NotContains(t, stored, "DeferredCard")
-	assert.Contains(t, stored, `"redacted_members":["credential_metadata"]`)
+	assert.Contains(t, stored, "DeferredCard")
+	assert.NotContains(t, stored, wmpRedactedMembersKey)
 }
 
 // A completion without credential_metadata is stored and replayed untouched.
@@ -317,7 +328,7 @@ func TestFlowComplete_CredentialMetadata_WebSocketAndWMPParity(t *testing.T) {
 	}
 
 	assert.JSONEq(t, string(wsMsg["credential_metadata"]), string(res[0]["credential_metadata"]))
-	assert.Contains(t, string(wsMsg["credential_metadata"]), cmSeedHex)
+	assert.NotContains(t, string(wsMsg["credential_metadata"]), cmSeedHex)
 }
 
 // logCapture collects slog records (go-wmp logs through slog.Default).
@@ -401,13 +412,13 @@ func TestWMP_FlowComplete_RedisHoldsNoSeed(t *testing.T) {
 }
 
 func TestSplitFlowCompleteSecrets(t *testing.T) {
-	complete := `{"jsonrpc":"2.0","method":"wmp.flow.complete","params":{"wmp":{"version":"1"},"flow_id":"f","result":{"credentials":[{"credential":"c"}],"credential_metadata":` + cmSeedMD + `,"refresh_token":"rt","dpop_jwk":"{}","dpop_key_id":"k","unknown_member":1.50}}}`
+	complete := `{"jsonrpc":"2.0","method":"wmp.flow.complete","params":{"wmp":{"version":"1"},"flow_id":"f","result":{"credentials":[{"credential":"c"}],"credential_metadata":` + cmCardMD + `,"refresh_token":"rt","dpop_jwk":"{}","dpop_key_id":"k","unknown_member":1.50}}}`
 	replay, live, ok := splitFlowCompleteSecrets([]byte(complete))
 	require.True(t, ok)
 	assert.Equal(t, complete, string(live))
-	assert.NotContains(t, string(replay), cmSeedHex)
 	assert.Contains(t, string(replay), `"unknown_member":1.50`, "other members are preserved verbatim")
-	assert.Contains(t, string(replay), `"redacted_members":["credential_metadata","dpop_jwk","dpop_key_id","refresh_token"]`)
+	assert.Contains(t, string(replay), `"credential_metadata":`+cmCardMD, "credential_metadata is kept")
+	assert.Contains(t, string(replay), `"redacted_members":["dpop_jwk","dpop_key_id","refresh_token"]`)
 	assert.NotContains(t, string(replay), `"rt"`)
 
 	// A completion with none of them is untouched.
@@ -417,7 +428,7 @@ func TestSplitFlowCompleteSecrets(t *testing.T) {
 	assert.Equal(t, plain, string(r1))
 	assert.Nil(t, l1)
 
-	// Not a flow.complete, even though it mentions credential_metadata.
+	// Not a flow.complete, even though it mentions a secret member.
 	progress := `{"jsonrpc":"2.0","method":"wmp.flow.progress","params":{"payload":{"credential_metadata":1,"refresh_token":"x"}}}`
 	r2, l2, ok := splitFlowCompleteSecrets([]byte(progress))
 	require.True(t, ok)
@@ -425,8 +436,32 @@ func TestSplitFlowCompleteSecrets(t *testing.T) {
 	assert.Nil(t, l2)
 
 	// Fail closed.
-	_, _, ok = splitFlowCompleteSecrets([]byte(`{"method":"wmp.flow.complete","params":"credential_metadata"`))
+	_, _, ok = splitFlowCompleteSecrets([]byte(`{"method":"wmp.flow.complete","params":"refresh_token"`))
 	assert.False(t, ok)
 	_, _, ok = splitFlowCompleteSecrets([]byte(`{"method":"wmp.flow.complete","params":{"result":[1]},"refresh_token":"x"}`))
 	assert.False(t, ok)
+}
+
+// The sender relays only the display members of credential_metadata (OpenID4x
+// 3.1.4.1), whatever it is handed, and none for an encrypted response.
+func TestSendFlowComplete_CredentialMetadataRestrictedToDisplayMembers(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	sid, sess, _ := cmSession(t, a)
+	w, stop := cmConnect(t, a, sid, "")
+	defer stop()
+	time.Sleep(50 * time.Millisecond)
+
+	require.NoError(t, sess.sendFlowComplete("f1", cmCreds(), "", "", "", "", false, json.RawMessage(cmSeedMD)))
+	cmWaitFor(t, w, "wmp.flow.complete")
+	cmAssertNoSecrets(t, w.String())
+	res := sseCompleteResults(t, w.String())
+	require.Len(t, res, 1)
+	assert.JSONEq(t, cmCardMD, string(res[0]["credential_metadata"]))
+
+	require.NoError(t, sess.sendFlowComplete("f2", cmCreds(), "", "", "", "", true, json.RawMessage(cmSeedMD)))
+	require.Eventually(t, func() bool { return len(sseCompleteResults(t, w.String())) == 2 }, 2*time.Second, 10*time.Millisecond)
+	res = sseCompleteResults(t, w.String())
+	_, has := res[1]["credential_metadata"]
+	assert.False(t, has, "an encrypted response carries no credential_metadata")
 }

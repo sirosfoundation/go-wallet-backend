@@ -25,12 +25,19 @@ func (h featureCapture) Execute(_ context.Context, msg *FlowStartMessage) error 
 func (featureCapture) HandleAction(context.Context, *FlowActionMessage) error { return nil }
 func (featureCapture) Cancel()                                                {}
 
-func startCaptureFlow(t *testing.T, a *WMPAdapter, sessionID, user, tenant string, flowParams string) *FlowStartMessage {
-	t.Helper()
+// registerCapture registers the "capture" flow type. It must run before the
+// session is created: a flow type is startable only if its capability was
+// negotiated at session.create (Core 10.3).
+func registerCapture(m *Manager) chan *FlowStartMessage {
 	got := make(chan *FlowStartMessage, 1)
-	a.manager.RegisterFlowHandler("capture", func(*Flow, *config.Config, *zap.Logger, *TrustService, *RegistryClient, storage.VerifierStore, *TrustCache) (FlowHandler, error) {
+	m.RegisterFlowHandler("capture", func(*Flow, *config.Config, *zap.Logger, *TrustService, *RegistryClient, storage.VerifierStore, *TrustCache) (FlowHandler, error) {
 		return featureCapture{got: got}, nil
 	})
+	return got
+}
+
+func startCaptureFlow(t *testing.T, a *WMPAdapter, got chan *FlowStartMessage, sessionID, user, tenant string, flowParams string) *FlowStartMessage {
+	t.Helper()
 	var params json.RawMessage
 	if flowParams != "" {
 		params = json.RawMessage(flowParams)
@@ -58,7 +65,10 @@ func startCaptureFlow(t *testing.T, a *WMPAdapter, sessionID, user, tenant strin
 func offered(raw string) func(*wmp.SessionCreateParams) {
 	return func(p *wmp.SessionCreateParams) {
 		if raw != "" {
-			p.CapabilitiesOffered = wmp.Capabilities{"transaction_data": json.RawMessage(raw)}
+			p.CapabilitiesOffered = wmp.Capabilities{
+				"transaction_data": json.RawMessage(raw),
+				"capture":          json.RawMessage(`{}`),
+			}
 		}
 	}
 }
@@ -68,9 +78,10 @@ func offered(raw string) func(*wmp.SessionCreateParams) {
 func TestWMP_FlowStart_DeclaresTransactionDataWhenOffered(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
+	got := registerCapture(m)
 	sid, _, _ := createSessionFull(t, a, "u", "t", offered(`{"versions":[1],"hash_algs":["sha-256"]}`))
 
-	msg := startCaptureFlow(t, a, sid, "u", "t", "")
+	msg := startCaptureFlow(t, a, got, sid, "u", "t", "")
 	assert.True(t, msg.Supports(FeatureTransactionDataV1))
 }
 
@@ -104,9 +115,10 @@ func TestWMP_FlowStart_DoesNotDeclareWhenNotOffered(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			a, m := testWMPAdapter()
 			defer cleanupWMP(a, m)
+			got := registerCapture(m)
 			sid, _, _ := createSessionFull(t, a, "u", "t", offered(raw))
 
-			msg := startCaptureFlow(t, a, sid, "u", "t", "")
+			msg := startCaptureFlow(t, a, got, sid, "u", "t", "")
 			assert.False(t, msg.Supports(FeatureTransactionDataV1))
 			assert.Empty(t, msg.Features)
 		})
@@ -117,9 +129,10 @@ func TestWMP_FlowStart_DoesNotDeclareWhenNotOffered(t *testing.T) {
 func TestWMP_FlowStart_FeaturesInFlowParamsCannotForgeTheCapability(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
+	got := registerCapture(m)
 	sid, _, _ := createSessionFull(t, a, "u", "t", offered(""))
 
-	msg := startCaptureFlow(t, a, sid, "u", "t", `{"features":["transaction_data.v1"]}`)
+	msg := startCaptureFlow(t, a, got, sid, "u", "t", `{"features":["transaction_data.v1"]}`)
 	assert.False(t, msg.Supports(FeatureTransactionDataV1), "a flow-param declaration must be ignored")
 }
 
@@ -127,12 +140,13 @@ func TestWMP_FlowStart_FeaturesInFlowParamsCannotForgeTheCapability(t *testing.T
 func TestWMP_FlowStart_DeclarationSurvivesResume(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
+	got := registerCapture(m)
 	sid, token, _ := createSessionFull(t, a, "u", "t", offered(`{"versions":[1]}`))
 
 	_, rpcErr := doResume(t, a, "u", "t", resumeBody(sid, token, ""))
 	require.Nil(t, rpcErr)
 
-	msg := startCaptureFlow(t, a, sid, "u", "t", "")
+	msg := startCaptureFlow(t, a, got, sid, "u", "t", "")
 	assert.True(t, msg.Supports(FeatureTransactionDataV1))
 }
 
@@ -140,11 +154,12 @@ func TestWMP_FlowStart_DeclarationSurvivesResume(t *testing.T) {
 func TestWMP_FlowStart_NonDeclarationSurvivesResume(t *testing.T) {
 	a, m := testWMPAdapter()
 	defer cleanupWMP(a, m)
+	got := registerCapture(m)
 	sid, token, _ := createSessionFull(t, a, "u", "t", offered(""))
 
 	_, rpcErr := doResume(t, a, "u", "t", resumeBody(sid, token, ""))
 	require.Nil(t, rpcErr)
 
-	msg := startCaptureFlow(t, a, sid, "u", "t", "")
+	msg := startCaptureFlow(t, a, got, sid, "u", "t", "")
 	assert.False(t, msg.Supports(FeatureTransactionDataV1))
 }
