@@ -643,11 +643,13 @@ response in clear. Every key lives in the client.
        "credential_response_encryption": { "alg": "ECDH-ES", "enc": "A256GCM", "required": true } } }
    ```
 
-   `required` is `true` when the issuer marks encryption as required. (The
-   superseded `org.siros.secret_seed` advertisement also forced it on and
-   failed the issuance without usable encryption; that handling is removed by
-   https://github.com/sirosfoundation/go-wallet-backend/pull/480, and the wallet
-   clients now refuse the seed shapes.) A configuration
+   `required` is `true` when the issuer marks encryption as required. On this
+   branch the engine ALSO still sets it when the configuration advertises the
+   superseded `org.siros.secret_seed`, and then fails the issuance with
+   `CREDENTIAL_ERROR` before any request is sent if there is no usable issuer
+   encryption (and refuses a plain response carrying a seed). That handling is
+   removed by https://github.com/sirosfoundation/go-wallet-backend/pull/480; the
+   wallet clients now refuse the seed shapes. A configuration
    without `proof_types_supported` still gets this request when encryption is
    wanted: it is then for the key alone and the client returns no proofs.
 2. **Key.** The client generates a FRESH ephemeral P-256 key per `generate_proof`
@@ -1235,8 +1237,10 @@ protected header; clients SHOULD NOT set `cty`, the plaintext is plain JSON
 claims, and the engine does not check it). The engine POSTs `response=<jwe>` to the
 validated `response_uri` and relays the verifier's `redirect_uri`. It refuses an
 empty, oversized, non-compact or mismatching `response_jwe`, and a
-`sign_response` that also carries `vp_token`, with a `SIGN_ERROR` flow error and
-an `access_denied` response to the verifier; it never encrypts for the client.
+`sign_response` that also carries `vp_token`, with a `SIGN_ERROR` flow error (no
+`details.redirect_uri`); the verifier is not contacted, because an error for
+`direct_post.jwt` would itself have to be a JARM JWT, which the engine does not
+build, so the verifier session ends by timeout. It never encrypts for the client.
 The key and algorithms are resolved by the engine (`client_metadata.jwks`
 `use=enc`, else the request JWT's `x5c`; `alg` from `client_metadata`, else the
 JWK, else the key type; `enc` defaults to `A128GCM`); when none can be resolved

@@ -52,7 +52,10 @@ read what it relays (OID4VCI section 13.4 covers this setup). The honest-but-cur
    negotiates the pair from issuer metadata. Supported: `ECDH-ES`,
    `ECDH-ES+A128KW`, `ECDH-ES+A256KW` with `A128GCM`, `A256GCM`,
    `A128CBC-HS256`, `A256CBC-HS512`. It is present when the issuer supports
-   response encryption.
+   response encryption. On this branch the engine also still sets `required`
+   when the configuration advertises the superseded `org.siros.secret_seed`
+   (and refuses a plain response carrying it); that handling is removed by
+   https://github.com/sirosfoundation/go-wallet-backend/pull/480.
 2. The client generates a fresh ephemeral P-256 key per `generate_proof`
    request, keeps the private key in memory keyed by flow id, and returns the
    public JWK as `credential_response_encryption_jwk` in the `sign_response`
@@ -132,8 +135,10 @@ read what it relays (OID4VCI section 13.4 covers this setup). The honest-but-cur
   validated `response_uri` and relays the verifier's `redirect_uri`.
 - The engine cannot decrypt the JWE and never falls back to building it. It
   accepts a `response_jwe` only when all of these hold, and otherwise fails the
-  flow with `SIGN_ERROR` and posts `access_denied` (with the same generic
-  description every refusal carries, nothing about the cause) to the verifier:
+  flow with `SIGN_ERROR`. The verifier is not contacted in this mode: an error
+  for `direct_post.jwt` would itself have to be a JARM JWT, which the engine
+  does not build, and plain `error` fields would be rejected, so the verifier
+  session ends by timeout (as for a `transaction_data` failure):
   it is non-empty and at most 4 MiB; it has five base64url segments, none empty
   except the encrypted key of a direct `ECDH-ES` agreement; the protected header
   names the requested `alg` and `enc`, and the JWK's `kid` when it has one; the
@@ -145,15 +150,15 @@ read what it relays (OID4VCI section 13.4 covers this setup). The honest-but-cur
   least 2048 bits; `enc` must be one of `A128GCM`, `A256GCM`, `A128CBC-HS256`
   or `A256CBC-HS512`. Any other pairing is refused the same way. A client that
   still answers with a plain `vp_token` is refused, never encrypted for.
-- When the verifier answers that `access_denied` POST with a `redirect_uri`, the
-  `SIGN_ERROR` flow error carries it as `details.redirect_uri` (the same detail
-  the decline and no-matching-credential errors carry); without one, there are
-  no details. Nothing else the verifier sent is passed on.
+- Because the verifier is not contacted for these `direct_post.jwt` failures,
+  the `SIGN_ERROR` flow error has no `details.redirect_uri` and no details at
+  all. (The decline and no-matching-credential errors still carry a verifier
+  `redirect_uri` when one is returned.)
 - Sign refusals are not distinguished yet. `SignResponseMessage` has no `error`
   or `error_code` field in this change, so a correlated reply that carries only
   an error is returned by `Session.RequestSign` as an empty reply: for
   `direct_post.jwt` it has no `response_jwe` and takes the encryption-failure
-  path above (`access_denied` to the verifier, `SIGN_ERROR` to the client). A
+  path above (`SIGN_ERROR` to the client, no verifier notification). A
   separate sign-refusal path needs those fields and a handler for them, which
   is the work of the sign-refusal change (feat/engine-sign-refusal).
 - Plain `direct_post` and query/fragment modes are unchanged and the engine
