@@ -54,6 +54,7 @@ func checkUnambiguous(data []byte, depth int) error {
 	dec.UseNumber()
 	var stack []map[string]struct{} // names of each open object; nil for an array
 	expectKey := []bool{}
+	objects := 0 // open objects in stack
 	for {
 		tok, err := dec.Token()
 		if errors.Is(err, io.EOF) {
@@ -70,11 +71,15 @@ func checkUnambiguous(data []byte, depth int) error {
 				}
 				if d == '{' {
 					stack = append(stack, map[string]struct{}{})
+					objects++
 				} else {
 					stack = append(stack, nil)
 				}
 				expectKey = append(expectKey, d == '{')
 			default:
+				if stack[len(stack)-1] != nil {
+					objects--
+				}
 				stack, expectKey = stack[:len(stack)-1], expectKey[:len(expectKey)-1]
 			}
 			if len(stack) == 0 {
@@ -94,7 +99,7 @@ func checkUnambiguous(data []byte, depth int) error {
 			continue
 		}
 		expectKey[n-1] = false
-		if depth >= 0 && objectDepth(stack) > depth {
+		if depth >= 0 && objects > depth {
 			continue
 		}
 		if key, ok := tok.(string); ok {
@@ -109,17 +114,6 @@ func checkUnambiguous(data []byte, depth int) error {
 		return errAmbiguousJSON
 	}
 	return nil
-}
-
-// objectDepth counts the open objects in stack.
-func objectDepth(stack []map[string]struct{}) int {
-	n := 0
-	for _, s := range stack {
-		if s != nil {
-			n++
-		}
-	}
-	return n
 }
 
 // recordName adds a member name to an object's set, refusing a repeat, a

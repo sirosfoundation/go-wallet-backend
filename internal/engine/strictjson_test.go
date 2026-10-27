@@ -98,3 +98,23 @@ func TestCheckUnambiguous_ManyNamesIsLinear(t *testing.T) {
 	require.NoError(t, checkUnambiguous([]byte(b.String()), -1))
 	assert.Less(t, time.Since(start), 5*time.Second)
 }
+
+// Depth tracking is constant work per token: a deeply nested document with many
+// members below the checked depth is walked in linear time.
+func TestCheckUnambiguous_DeepAndWideIsLinear(t *testing.T) {
+	const depth, width = 5000, 1000000
+	var b strings.Builder
+	b.WriteString(strings.Repeat(`{"a":`, depth))
+	b.WriteString("{")
+	for i := 0; i < width; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `"k%d":1`, i)
+	}
+	b.WriteString("}")
+	b.WriteString(strings.Repeat(`}`, depth))
+	start := time.Now()
+	require.NoError(t, checkUnambiguous([]byte(b.String()), 1))
+	assert.Less(t, time.Since(start), time.Second)
+}
