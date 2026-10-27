@@ -27,27 +27,33 @@ func WellKnownURL(baseURL, suffix string) (string, error) {
 	return fmt.Sprintf("%s://%s/.well-known/%s%s", parsed.Scheme, parsed.Host, suffix, path), nil
 }
 
-// NormalizeIssuerURL trims a bare trailing "/" from rawURL when the path is empty or
-// "/", so both spellings of an issuer produce the same WellKnownURL. Issuers with a
-// real path are unchanged. Use it before WellKnownURL; for comparing identifiers use
-// SameIssuerIdentifier.
+// NormalizeIssuerURL removes a bare root slash from rawURL when the path is empty
+// or "/", so both spellings of an issuer produce the same WellKnownURL. It deletes
+// only that one character from the original string: every other byte (percent-
+// escape case, an empty "#" or "?", scheme spelling, a "/" in the query or
+// fragment) is preserved, because the result is compared and used as a cache key.
+// Issuers with a real path are unchanged. Use it before WellKnownURL; for comparing
+// identifiers use SameIssuerIdentifier.
 func NormalizeIssuerURL(rawURL string) string {
 	parsed, err := url.Parse(rawURL)
-	if err != nil {
+	if err != nil || parsed.Path != "/" {
 		return rawURL
 	}
-	if parsed.Path == "/" {
-		// Clear only the parsed root path so a "/" in the query or fragment is untouched.
-		parsed.Path = ""
-		parsed.RawPath = ""
-		// url.Parse lowercases the scheme; keep the identifier's own spelling so
-		// the root-slash and no-slash forms of "HTTPS://host" stay the same string.
-		if i := strings.Index(rawURL, ":"); i > 0 {
-			parsed.Scheme = rawURL[:i]
-		}
-		return parsed.String()
+	// The root slash is the first "/" after "scheme://authority", and the path is
+	// exactly "/" so it is followed by "?", "#" or the end.
+	_, rest, ok := strings.Cut(rawURL, "://")
+	if !ok {
+		return rawURL
 	}
-	return rawURL
+	authEnd := strings.IndexAny(rest, "/?#")
+	if authEnd < 0 || rest[authEnd] != '/' {
+		return rawURL
+	}
+	if next := authEnd + 1; next < len(rest) && rest[next] != '?' && rest[next] != '#' {
+		return rawURL
+	}
+	pos := len(rawURL) - len(rest) + authEnd
+	return rawURL[:pos] + rawURL[pos+1:]
 }
 
 // SameIssuerIdentifier reports whether two issuer identifiers denote the same issuer.

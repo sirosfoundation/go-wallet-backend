@@ -91,6 +91,13 @@ func TestNormalizeIssuerURL(t *testing.T) {
 		{"meaningful path keeps query", "https://issuer.example.com/tenant/?a=b/", "https://issuer.example.com/tenant/?a=b/"},
 		{"uppercase scheme keeps its spelling", "HTTPS://issuer.example.com/", "HTTPS://issuer.example.com"},
 		{"uppercase scheme without slash unchanged", "HTTPS://issuer.example.com", "HTTPS://issuer.example.com"},
+		{"escaped authority keeps its escape case", "https://%c3%bc.example/", "https://%c3%bc.example"},
+		{"empty fragment is kept", "https://issuer.example/#", "https://issuer.example#"},
+		{"empty fragment without slash unchanged", "https://issuer.example#", "https://issuer.example#"},
+		{"empty query is kept", "https://issuer.example/?", "https://issuer.example?"},
+		{"port and root slash", "https://issuer.example:8443/", "https://issuer.example:8443"},
+		{"userinfo and root slash", "https://u:p@issuer.example/", "https://u:p@issuer.example"},
+		{"escaped path is not a root slash", "https://issuer.example/%2f", "https://issuer.example/%2f"},
 		{"invalid URL returned unchanged", "://not-a-url", "://not-a-url"},
 	}
 	for _, tt := range tests {
