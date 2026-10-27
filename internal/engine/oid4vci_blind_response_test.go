@@ -818,11 +818,22 @@ func TestBlind_FreshKeyPerProofRequest(t *testing.T) {
 // --- the JWE relay itself ---
 
 // A failure that is not the client's report (here the flow's context ending) is
-// passed through unchanged, not rewritten as a client decryption failure.
+// passed through unchanged, not rewritten as a client decryption failure. The
+// client never answers, so the context ending is the only way out of RequestSign
+// and the outcome does not depend on a reply racing the cancellation.
 func TestRelayEncryptedResponse_NonClientFailureIsNotRewritten(t *testing.T) {
-	fc := &fakeClient{t: t}
-	h, _, cleanup := newBlindHandler(t, fc, http.DefaultClient)
+	conn, cleanup := wsTestServer(t, func(srv *websocket.Conn) {
+		defer srv.Close()
+		for {
+			if _, _, err := srv.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
 	defer cleanup()
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop(), Flow: &Flow{ID: "f-blind", Session: testSession(conn), Data: map[string]interface{}{}}}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	_, err := h.relayEncryptedResponse(ctx, "a.b.c.d.e", false, &responseEncryption{})
