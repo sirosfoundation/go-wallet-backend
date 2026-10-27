@@ -479,18 +479,23 @@ func TestResolve_Cached(t *testing.T) {
 	}
 }
 
-func TestResolve_TrailingSlashStripped(t *testing.T) {
+// Section 12.2.2: a terminating slash is removed from the identifier only when
+// building the well-known URL; the identifier (and credential_issuer) keep it.
+func TestResolve_TrailingSlashOnlyRemovedFromWellKnownURL(t *testing.T) {
+	var gotPath string
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL}) //nolint:errcheck
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL + "/tenant/"}) //nolint:errcheck
 	}))
 	defer server.Close()
 
-	r := newTestResolver(t)
-	// URL with trailing slash should work the same
-	if _, err := r.Resolve(context.Background(), server.URL+"/"); err != nil {
-		t.Fatalf("Resolve() with trailing slash error: %v", err)
+	if _, err := newTestResolver(t).Resolve(context.Background(), server.URL+"/tenant/"); err != nil {
+		t.Fatalf("Resolve() error: %v", err)
+	}
+	if gotPath != "/.well-known/openid-credential-issuer/tenant" {
+		t.Fatalf("well-known path = %q", gotPath)
 	}
 }
 
@@ -1257,19 +1262,20 @@ func TestResolve_FallbackOnByDefault(t *testing.T) {
 	}
 }
 
-// The credential_issuer claim is compared as an identifier: a root slash on
-// either the requested or the declared side must not cause a rejection, while
-// a path difference (including a trailing slash on a path) still does.
-func TestResolve_CredentialIssuerRootSlashSymmetric(t *testing.T) {
+// OpenID4VCI 1.0 section 12.2.4: credential_issuer MUST be identical to the
+// Credential Issuer Identifier, simple string comparison, no normalisation.
+// A root slash on either side is therefore a mismatch, in both directions.
+func TestResolve_CredentialIssuerExactComparison(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		reqSlash  bool
 		declSlash bool
+		ok        bool
 	}{
-		{"neither", false, false},
-		{"requested only", true, false},
-		{"declared only", false, true},
-		{"both", true, true},
+		{"neither slash", false, false, true},
+		{"both slash", true, true, true},
+		{"requested only", true, false, false},
+		{"declared only", false, true, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var server *httptest.Server
@@ -1286,14 +1292,18 @@ func TestResolve_CredentialIssuerRootSlashSymmetric(t *testing.T) {
 			if tc.reqSlash {
 				req += "/"
 			}
-			if _, err := newTestResolver(t).Resolve(context.Background(), req); err != nil {
+			_, err := newTestResolver(t).Resolve(context.Background(), req)
+			if tc.ok && err != nil {
 				t.Fatalf("Resolve(%q) error: %v", req, err)
+			}
+			if !tc.ok && (err == nil || !strings.Contains(err.Error(), "does not match")) {
+				t.Fatalf("Resolve(%q) must refuse a differing slash, got %v", req, err)
 			}
 		})
 	}
 }
 
-func TestResolve_CredentialIssuerPathSlashStillExact(t *testing.T) {
+func TestResolve_CredentialIssuerPathSlashExact(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1306,17 +1316,19 @@ func TestResolve_CredentialIssuerPathSlashStillExact(t *testing.T) {
 	}
 }
 
-func TestValidateIssuerClaims_RootSlashAndQuery(t *testing.T) {
+// credential_issuer and the signed-metadata sub are compared exactly.
+func TestValidateIssuerClaims_Exact(t *testing.T) {
 	cases := []struct {
 		claim, issuer string
 		ok            bool
 	}{
-		{"https://i.example.com/", "https://i.example.com", true},
-		{"https://i.example.com", "https://i.example.com/", true},
+		{"https://i.example.com", "https://i.example.com", true},
+		{"https://i.example.com/", "https://i.example.com/", true},
+		{"https://i.example.com/", "https://i.example.com", false},
+		{"https://i.example.com", "https://i.example.com/", false},
 		{"https://i.example.com/t", "https://i.example.com/t/", false},
 		{"https://i.example.com/t/", "https://i.example.com/t", false},
-		{"https://i.example.com?r=https://c/", "https://i.example.com?r=https://c/", true},
-		{"https://i.example.com?r=https://c", "https://i.example.com?r=https://c/", false},
+		{"HTTPS://i.example.com", "https://i.example.com", false},
 	}
 	for _, c := range cases {
 		if got := validateCredentialIssuerClaim(map[string]interface{}{"credential_issuer": c.claim}, c.issuer) == nil; got != c.ok {
@@ -1327,6 +1339,38 @@ func TestValidateIssuerClaims_RootSlashAndQuery(t *testing.T) {
 		}
 	}
 }
+
+// The two spellings of a root identifier are different identifiers and must not
+// share a cache entry: metadata validated for one is never served for the other.
+func TestResolve_CacheIsolatedBetweenSlashSpellings(t *testing.T) {
+	var hits atomic.Int32
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL}) //nolint:errcheck
+	}))
+	defer server.Close()
+	res := newTestResolver(t)
+	if _, err := res.Resolve(context.Background(), server.URL); err != nil {
+		t.Fatal(err)
+	}
+	// Cached for the bare spelling; the slash spelling must not be served from it.
+	if _, err := res.Resolve(context.Background(), server.URL+"/"); err == nil {
+		t.Fatal("slash spelling must not be answered from the bare spelling's cache entry")
+	}
+	if hits.Load() != 2 {
+		t.Fatalf("slash spelling must be fetched and validated itself; got %d fetches", hits.Load())
+	}
+	// Still cached under its own key.
+	r1, err := res.ResolveWithInfo(context.Background(), server.URL)
+	if err != nil || !r1.Cached {
+		t.Fatalf("bare spelling should stay cached: %v cached=%v", err, r1 != nil && r1.Cached)
+	}
+}
+
+// Signed metadata: sub is compared exactly too (checked at the claim level in
+// TestValidateIssuerClaims_Exact).
 // testHTTPClient is an unguarded client for tests that fetch from loopback
 // httptest servers. Production code passes a client from
 // config.HTTPClientConfig.NewHTTPClient; the SSRF behaviour of that client is

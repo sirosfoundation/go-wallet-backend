@@ -305,7 +305,8 @@ type ResolveResult struct {
 // using a TTL-cached result when available.
 //
 // The issuerURL must use HTTPS (unless AllowHTTP is set in Config).
-// Any trailing slash in the issuer URL path is stripped per OID4VCI §12.2.1.
+// The identifier is used exactly as given (no normalisation); only the
+// well-known URL construction removes a terminating slash (section 12.2.2).
 // The endpoint queried follows RFC 8615:
 // https://{host}/.well-known/openid-credential-issuer{path}.
 //
@@ -339,10 +340,10 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 		return nil, err
 	}
 
-	// Normalize trailing slash for consistent cache keys, but only when the
-	// path is empty or just "/". Issuers with meaningful paths (e.g.
-	// https://host/issuer/) retain their trailing slash per RFC 8615.
-	issuerURL = oidc.NormalizeIssuerURL(issuerURL)
+	// issuerURL is used exactly as received, including as the cache and
+	// singleflight key: "https://i.example" and "https://i.example/" are
+	// different identifiers (OpenID4VCI 1.0 section 12.2.4, simple string
+	// comparison, no normalisation), so they never share an entry.
 
 	if entry := r.getCachedEntry(issuerURL); entry != nil {
 		return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial}, nil
@@ -586,7 +587,7 @@ func validateCredentialIssuerClaim(claims map[string]interface{}, issuerURL stri
 	if credentialIssuer == "" {
 		return fmt.Errorf("metadata missing required 'credential_issuer' claim")
 	}
-	if !oidc.SameIssuerIdentifier(credentialIssuer, issuerURL) {
+	if credentialIssuer != issuerURL {
 		return fmt.Errorf("metadata 'credential_issuer' claim %q does not match issuer URL %q", credentialIssuer, issuerURL)
 	}
 	return nil
@@ -758,7 +759,7 @@ func validateJWTClaims(claims map[string]interface{}, issuerURL string) error {
 	if sub == "" {
 		return fmt.Errorf("JWT payload missing required 'sub' claim")
 	}
-	if !oidc.SameIssuerIdentifier(sub, issuerURL) {
+	if sub != issuerURL {
 		return fmt.Errorf("JWT 'sub' claim %q does not match issuer URL %q", sub, issuerURL)
 	}
 
