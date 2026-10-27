@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"net/netip"
@@ -202,15 +203,43 @@ type parsedList struct {
 	km      *trust.KeyMaterial
 }
 
-// size is what the entry costs against the cache byte limit: the bitmap, the
-// compressed list and the retained signer material, which an accepted token
-// can pad with unused JWK members.
+// entryOverhead is a flat charge for the entry's fixed-size fields (struct,
+// pointers to exp, ttl and max-age, the bits and timestamps).
+const entryOverhead = 256
+
+// overBudget is the size reported for signer material that cannot be measured
+// within bounds (nested past maxJWKDepth, or of a type this walk does not know).
+// It exceeds every cache limit, so such an entry is never cached.
+const overBudget = math.MaxInt32
+
+// maxJWKDepth bounds the walk over a JWK; deeper material is uncacheable.
+const maxJWKDepth = 16
+
+// maxUpstreamETagBytes bounds the list host's ETag we are willing to keep and
+// replay in If-None-Match. A longer one is ignored (the list is simply not
+// revalidated conditionally); real ETags are a few dozen bytes.
+const maxUpstreamETagBytes = 1024
+
+// size is what the entry costs against the cache byte limit: every retained
+// value that originates from the list host or the trust decision, namely the
+// bitmap, the compressed list, the token-derived strings (subject, derived
+// etag, upstream ETag, signer action), the retained signer material (which an
+// accepted token can pad with unused JWK members) and a flat overhead for the
+// fixed-size fields. The cache key is charged separately (keyCost). An entry
+// holding signer material that cannot be measured costs overBudget.
 func (p parsedList) size() int {
-	return len(p.list) + len(p.lst) + len(p.subject) + keyMaterialSize(p.km)
+	n := entryOverhead + len(p.list) + len(p.lst) + len(p.subject) +
+		len(p.etag) + len(p.upstreamETag) + len(p.signerAction) + keyMaterialSize(p.km)
+	if n > overBudget {
+		return overBudget
+	}
+	return n
 }
 
 // keyMaterialSize approximates the memory km retains: the lengths of its
-// strings, map keys and certificates, walked rather than marshalled.
+// strings, map keys and certificates, walked rather than marshalled. It
+// returns overBudget when the JWK is nested deeper than maxJWKDepth or holds a
+// type it cannot measure, so that material is never cached unaccounted.
 func keyMaterialSize(km *trust.KeyMaterial) int {
 	if km == nil {
 		return 0
@@ -219,32 +248,42 @@ func keyMaterialSize(km *trust.KeyMaterial) int {
 	for _, c := range km.X5C {
 		n += len(c)
 	}
-	return n + jwkSize(km.JWK, 0)
+	return addSize(n, jwkSize(km.JWK, 0))
+}
+
+// addSize adds two sizes, saturating at overBudget.
+func addSize(a, b int) int {
+	if a >= overBudget-b || b >= overBudget {
+		return overBudget
+	}
+	return a + b
 }
 
 func jwkSize(v any, depth int) int {
-	if depth > 16 {
-		return 0
+	if depth > maxJWKDepth {
+		return overBudget
 	}
 	switch t := v.(type) {
+	case nil, bool, float64, int, int64:
+		return 8
 	case string:
 		return len(t)
 	case map[string]any:
 		n := 0
 		for k, e := range t {
-			n += len(k) + jwkSize(e, depth+1)
+			n = addSize(n, addSize(len(k), jwkSize(e, depth+1)))
 		}
 		return n
 	case []any:
 		n := 0
 		for _, e := range t {
-			n += jwkSize(e, depth+1)
+			n = addSize(n, jwkSize(e, depth+1))
 		}
 		return n
 	case []map[string]any:
 		n := 0
 		for _, e := range t {
-			n += jwkSize(e, depth+1)
+			n = addSize(n, jwkSize(e, depth+1))
 		}
 		return n
 	case json.RawMessage:
@@ -252,9 +291,13 @@ func jwkSize(v any, depth int) int {
 	case []byte:
 		return len(t)
 	default:
-		return 8
+		return overBudget
 	}
 }
+
+// keyCost is what the cache key (tenant and exact uri, both caller-supplied)
+// costs; it is charged beside the entry.
+func keyCost(key string) int { return len(key) }
 
 type cachedList = parsedList
 
@@ -531,7 +574,7 @@ func (c *Checker) refresh(ctx context.Context, old parsedList, res fetchResult) 
 // dropLocked removes a cache entry (c.mu held).
 func (c *Checker) dropLocked(key string) {
 	if e, ok := c.cache[key]; ok {
-		c.cacheBytes -= e.size()
+		c.cacheBytes -= e.size() + keyCost(key)
 		delete(c.cache, key)
 	}
 }
@@ -559,7 +602,7 @@ func (c *Checker) store(key string, pl parsedList, f *flight) parsedList {
 		}
 		return pl
 	}
-	if pl.expires.After(now) && pl.size() <= c.cacheLimit {
+	if pl.expires.After(now) && pl.size()+keyCost(key) <= c.cacheLimit {
 		c.insertLocked(key, pl, old, had)
 	} else if had {
 		// Do not leave the older version behind to be served as fresh.
@@ -572,14 +615,15 @@ func (c *Checker) store(key string, pl parsedList, f *flight) parsedList {
 // the cache first when it would exceed its entry or byte limit. c.mu is held.
 func (c *Checker) insertLocked(key string, pl, old parsedList, had bool) {
 	if had {
-		c.cacheBytes -= old.size()
+		c.cacheBytes -= old.size() + keyCost(key)
 	}
-	if (!had && len(c.cache) >= maxCacheEntries) || c.cacheBytes+pl.size() > c.cacheLimit {
+	cost := pl.size() + keyCost(key)
+	if (!had && len(c.cache) >= maxCacheEntries) || c.cacheBytes+cost > c.cacheLimit {
 		c.cache = map[string]cachedList{}
 		c.cacheBytes = 0
 	}
 	c.cache[key] = pl
-	c.cacheBytes += pl.size()
+	c.cacheBytes += cost
 }
 
 // fetchResult is one upstream response.
@@ -679,7 +723,7 @@ func (c *Checker) fetch(ctx context.Context, uri, ifNoneMatch string) (fetchResu
 		return fetchResult{}, classify(ReasonFetchFailed, fmt.Errorf("fetch status list: %w", err))
 	}
 	defer func() { _ = resp.Body.Close() }()
-	res := fetchResult{etag: strings.TrimSpace(resp.Header.Get("ETag")), maxAge: maxAgeOf(resp.Header.Get("Cache-Control")), age: ageOf(resp.Header.Get("Age")), received: c.now()}
+	res := fetchResult{etag: boundedETag(resp.Header.Get("ETag")), maxAge: maxAgeOf(resp.Header.Get("Cache-Control")), age: ageOf(resp.Header.Get("Age")), received: c.now()}
 	if resp.StatusCode == http.StatusNotModified && ifNoneMatch != "" {
 		res.notModified = true
 		return res, nil
@@ -703,6 +747,17 @@ func (c *Checker) fetch(ctx context.Context, uri, ifNoneMatch string) (fetchResu
 		return fetchResult{}, classify(ReasonTooLarge, errors.New("status list token too large"))
 	}
 	return res, nil
+}
+
+// boundedETag trims an upstream ETag and drops one longer than
+// maxUpstreamETagBytes, so a list host cannot make us retain (and replay) an
+// arbitrarily large header value.
+func boundedETag(h string) string {
+	h = strings.TrimSpace(h)
+	if len(h) > maxUpstreamETagBytes {
+		return ""
+	}
+	return h
 }
 
 // maxAgeOf reads Cache-Control's max-age; no-store and no-cache count as 0, a

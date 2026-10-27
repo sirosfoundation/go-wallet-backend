@@ -348,7 +348,7 @@ func TestStore_NeverReplacesNewerVersion(t *testing.T) {
 	if len(list) != 1 || list[0] != 0x02 {
 		t.Fatalf("older load answered with %v, want the newer list", list)
 	}
-	if got := c.cache["k"]; got.iat != 200 || c.cacheBytes != 1 {
+	if got := c.cache["k"]; got.iat != 200 || c.cacheBytes != newer.size()+keyCost("k") {
 		t.Fatalf("cache entry = iat %d, %d bytes; older replaced the newer", got.iat, c.cacheBytes)
 	}
 	// Same or newer iat does replace.
