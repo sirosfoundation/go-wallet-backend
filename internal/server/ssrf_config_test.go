@@ -35,7 +35,8 @@ func TestMetadataResolverConfig_HTTPRejectedByDefault(t *testing.T) {
 	defer srv.Close()
 
 	resolver, err := issuermetadata.New(issuermetadata.Config{
-		AllowHTTP: false, // default — HTTPS required
+		HTTPClient: config.HTTPClientConfig{}.NewHTTPClient(10 * time.Second),
+		AllowHTTP:  false, // default — HTTPS required
 	})
 	if err != nil {
 		t.Fatalf("failed to create resolver: %v", err)
@@ -60,7 +61,8 @@ func TestMetadataResolverConfig_HTTPAllowedWhenSet(t *testing.T) {
 	defer srv.Close()
 
 	resolver, err := issuermetadata.New(issuermetadata.Config{
-		AllowHTTP: true,
+		HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true}.NewHTTPClient(10 * time.Second), // loopback test server
+		AllowHTTP:  true,
 	})
 	if err != nil {
 		t.Fatalf("failed to create resolver: %v", err)
