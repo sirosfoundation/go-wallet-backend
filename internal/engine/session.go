@@ -962,26 +962,20 @@ func (m *Manager) registerSession(session *Session) bool {
 		m.userIndex[session.UserID] = session
 	}
 
-	m.persistSession(session)
+	// Persist to store
+	if m.sessionStore != nil {
+		sessionData := &SessionData{
+			ID:        session.ID,
+			UserID:    session.UserID,
+			TenantID:  session.TenantID,
+			CreatedAt: time.Now(),
+			ExpiresAt: time.Now().Add(24 * time.Hour), // TODO: configurable
+		}
+		if err := m.sessionStore.Put(context.Background(), sessionData); err != nil {
+			m.logger.Warn("Failed to persist session", zap.Error(err))
+		}
+	}
 	return true
-}
-
-// persistSession writes session to the persistent store, if one is configured.
-// Failures are logged, not returned: the in-memory registration stands.
-func (m *Manager) persistSession(session *Session) {
-	if m.sessionStore == nil {
-		return
-	}
-	sessionData := &SessionData{
-		ID:        session.ID,
-		UserID:    session.UserID,
-		TenantID:  session.TenantID,
-		CreatedAt: time.Now(),
-		ExpiresAt: time.Now().Add(24 * time.Hour), // TODO: configurable
-	}
-	if err := m.sessionStore.Put(context.Background(), sessionData); err != nil {
-		m.logger.Warn("Failed to persist session", zap.Error(err))
-	}
 }
 
 func (m *Manager) unregisterSession(session *Session) {
