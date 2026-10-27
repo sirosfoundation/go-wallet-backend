@@ -882,3 +882,65 @@ func TestGenerateProof_OptionalEntryWithoutProofTypeNeedsNoCredentialType(t *tes
 	require.NoError(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", cfg, nil, ""))
 	assert.NotContains(t, generateProofParams(t, fc), "auxiliary_data_to_issuer")
 }
+
+// The response JSON is read strictly: a repeated credential_metadata cannot
+// shadow a forbidden member, and a pending body that cannot be read ends the
+// issuance instead of being skipped. Exactly one terminal flow_error is sent,
+// the one naming the reason.
+func TestPlainResponse_AmbiguousOrUnreadableEndsIssuance(t *testing.T) {
+	old1, old2 := deferredPollDefaultInterval, deferredPollIntervalUnit
+	deferredPollDefaultInterval, deferredPollIntervalUnit = time.Millisecond, time.Millisecond
+	defer func() { deferredPollDefaultInterval, deferredPollIntervalUnit = old1, old2 }()
+	secret := `"auxiliary_data":[{"type":"hash_commitment","opening":"` + secretSeedA + `"}]`
+	legacy := `"org.siros.secret_seed":{"ns":"` + secretSeedA + `"}`
+	for name, tc := range map[string]struct {
+		first, deferred string
+		deferredStatus  int
+		code            ErrorCode
+	}{
+		"immediate, shadowed by a repeated member": {`{"credential":"c","credential_metadata":{` + secret + `},"credential_metadata":null}`, "", 0, ErrCodeCredentialError},
+		"deferred 200, shadowed":                   {`{"transaction_id":"t"}`, `{"credential":"c","credential_metadata":{` + secret + `},"credential_metadata":null}`, 200, ErrCodeCredentialError},
+		"deferred 202, shadowed":                   {`{"transaction_id":"t"}`, `{"credential_metadata":{` + secret + `},"credential_metadata":null}`, 202, ErrCodeCredentialError},
+		"deferred 202, unreadable interval":        {`{"transaction_id":"t"}`, `{"interval":"bad","credential_metadata":{` + legacy + `}}`, 202, ErrCodeCredentialError},
+		"deferred 202, legacy member":              {`{"transaction_id":"t"}`, `{"credential_metadata":{` + legacy + `}}`, 202, ErrCodeLegacySecretMember},
+		"deferred 202, auxiliary_data":             {`{"transaction_id":"t"}`, `{"credential_metadata":{` + secret + `}}`, 202, ErrCodeCredentialError},
+	} {
+		t.Run(name, func(t *testing.T) {
+			st := newIssuerStub(t, tc.first)
+			st.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/deferred_credential") {
+					w.WriteHeader(tc.deferredStatus)
+					_, _ = w.Write([]byte(tc.deferred))
+					return
+				}
+				_, _ = w.Write([]byte(tc.first))
+			})
+			fc := &fakeClient{t: t}
+			h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
+			defer cleanup()
+			err := h.issueCredential(context.Background(), st.metadata(nil), tokenBearer(), "cfg", auxCfg(""), nil, "")
+			require.Error(t, err)
+			assertNoSecrets(t, "error", err.Error())
+			assertNoSecrets(t, "logs", logDump(logs))
+			fc.settle()
+			var codes []ErrorCode
+			for _, m := range fc.outboundMessages() {
+				switch string(m["type"]) {
+				case `"flow_error"`:
+					var e FlowError
+					require.NoError(t, json.Unmarshal(m["error"], &e))
+					codes = append(codes, e.Code)
+				case `"flow_complete"`:
+					t.Fatal("the issuance must not complete")
+				}
+			}
+			if tc.code == ErrCodeCredentialError && tc.first == tc.deferred {
+				return
+			}
+			assert.Len(t, codes, 1, "exactly one terminal error")
+			if len(codes) == 1 {
+				assert.Equal(t, tc.code, codes[0])
+			}
+		})
+	}
+}

@@ -1196,7 +1196,9 @@ func (h *OID4VCIHandler) issueCredential(ctx context.Context, metadata *IssuerMe
 		deferredResp, err := h.pollDeferredCredential(ctx, metadata, token, credential.TransactionID, credential.Interval, credential.ResponseEncryption, selectedConfig)
 		if err != nil {
 			h.Logger.Debug("deferred polling failed", zap.Error(err))
-			_ = h.Error(StepDeferred, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
+			if !errors.Is(err, errFlowReported) {
+				_ = h.Error(StepDeferred, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
+			}
 			return err
 		}
 
@@ -2903,7 +2905,9 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		}
 
 		var credResp CredentialResponse
-		if err := json.Unmarshal(body, &credResp); err != nil {
+		if err := decodeStrict(body, &credResp); err != nil {
+			// Terminal and generic: nothing of the body is logged or returned.
+			_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 			return nil, errors.New("failed to parse credential response")
 		}
 		credResp.ResponseEncryption = respEnc
@@ -3111,7 +3115,7 @@ func (p *deferredPoll) plainAnswer(status int, body []byte, attempt int) (*Crede
 	case http.StatusOK:
 		// Credential is ready
 		var credResp CredentialResponse
-		if err := json.Unmarshal(body, &credResp); err != nil {
+		if err := decodeStrict(body, &credResp); err != nil {
 			return nil, true, errors.New("failed to parse deferred credential response")
 		}
 		h.Logger.Info("Deferred credential received", zap.String("transaction_id", p.transactionID))
@@ -3124,7 +3128,13 @@ func (p *deferredPoll) plainAnswer(status int, body []byte, attempt int) (*Crede
 			Interval           int             `json:"interval,omitempty"`
 			CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
 		}
-		if err := json.Unmarshal(body, &pendingResp); err == nil {
+		// The one strict decoding step: a body that cannot be read
+		// unambiguously, or at all, ends the issuance rather than being
+		// skipped (it may hide a forbidden member).
+		if len(bytes.TrimSpace(body)) > 0 {
+			if err := decodeStrict(body, &pendingResp); err != nil {
+				return nil, true, errors.New("failed to parse deferred pending response")
+			}
 			if err := h.refusePlainSecretMembers(pendingResp.CredentialMetadata); err != nil {
 				return nil, true, err
 			}

@@ -45,6 +45,10 @@ func isLegacySecretMember(name string) bool {
 	return false
 }
 
+// errFlowReported marks an error whose terminal flow_error has already been
+// sent, so a caller does not send a second one.
+var errFlowReported = errors.New("flow error already reported")
+
 // errLegacySecretMember never carries the offending content. The flow fails
 // with LEGACY_SECRET_MEMBER.
 var errLegacySecretMember = errors.New("a superseded secret-bearing credential_metadata member is not supported")
@@ -83,7 +87,7 @@ func (h *OID4VCIHandler) refusePlainSecretMembers(md json.RawMessage) error {
 		return h.failLegacySecretMember(errors.New("credential response carries a superseded secret-bearing member"))
 	}
 	if hasAuxiliaryDataMember(md) {
-		err := errors.New("auxiliary_data arrived in a plain response")
+		err := fmt.Errorf("%w: auxiliary_data arrived in a plain response", errFlowReported)
 		h.Logger.Warn("rejecting credential response", zap.Error(err))
 		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer returned malformed credential metadata")
 		return err
@@ -96,7 +100,7 @@ func (h *OID4VCIHandler) refusePlainSecretMembers(md json.RawMessage) error {
 func (h *OID4VCIHandler) failLegacySecretMember(err error) error {
 	h.Logger.Warn("refusing a superseded secret-bearing member", zap.Error(err))
 	_ = h.Error(StepRequestingCredential, ErrCodeLegacySecretMember, ErrCodeLegacySecretMember.UserFacingMessage())
-	return fmt.Errorf("%w", errLegacySecretMember)
+	return fmt.Errorf("%w: %w", errLegacySecretMember, errFlowReported)
 }
 
 // failSecretDelivery maps an error of secretDeliveryOf to the flow error.
