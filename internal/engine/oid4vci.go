@@ -370,9 +370,9 @@ type CredentialResponse struct {
 	Interval        int           `json:"interval,omitempty"`
 	NotificationID  string        `json:"notification_id,omitempty"`
 	// CredentialMetadata is the raw response-level credential_metadata of a
-	// PLAIN response. It may carry a secret (a configured secret member, by
-	// default org.siros.secret_seed or auxiliary_data): never log
-	// it; only displayMetadata(...) of it may leave the engine.
+	// PLAIN response. It may carry a secret (auxiliary_data, or a superseded
+	// member that is refused): never log it; only displayMetadata(...) of it
+	// may leave the engine.
 	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
 
 	// The fields below are local state, never part of the wire format.
@@ -3056,8 +3056,8 @@ func (p *deferredPoll) encryptedAnswer(ctx context.Context, resp *http.Response,
 	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	if mediaType != "application/jwt" && mediaType != "application/jose" {
 		if p.respEnc.Seed {
-			// A seed is never delivered in clear: refuse unread.
-			return nil, true, errors.New("issuer answered a secret seed deferred request without encrypting the response")
+			// A Secret Value is never delivered in clear: refuse unread.
+			return nil, true, errors.New("issuer answered an auxiliary data deferred request without encrypting the response")
 		}
 		return p.plainAnswer(resp.StatusCode, body, attempt)
 	}
