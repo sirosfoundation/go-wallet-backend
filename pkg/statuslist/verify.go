@@ -560,20 +560,26 @@ func (c *Checker) store(key string, pl parsedList, f *flight) parsedList {
 		return pl
 	}
 	if pl.expires.After(now) && pl.size() <= c.cacheLimit {
-		if had {
-			c.cacheBytes -= old.size()
-		}
-		if (!had && len(c.cache) >= maxCacheEntries) || c.cacheBytes+pl.size() > c.cacheLimit {
-			c.cache = map[string]cachedList{}
-			c.cacheBytes = 0
-		}
-		c.cache[key] = pl
-		c.cacheBytes += pl.size()
+		c.insertLocked(key, pl, old, had)
 	} else if had {
 		// Do not leave the older version behind to be served as fresh.
 		c.dropLocked(key)
 	}
 	return pl
+}
+
+// insertLocked caches pl under key (old/had: the entry it replaces), emptying
+// the cache first when it would exceed its entry or byte limit. c.mu is held.
+func (c *Checker) insertLocked(key string, pl, old parsedList, had bool) {
+	if had {
+		c.cacheBytes -= old.size()
+	}
+	if (!had && len(c.cache) >= maxCacheEntries) || c.cacheBytes+pl.size() > c.cacheLimit {
+		c.cache = map[string]cachedList{}
+		c.cacheBytes = 0
+	}
+	c.cache[key] = pl
+	c.cacheBytes += pl.size()
 }
 
 // fetchResult is one upstream response.
@@ -884,35 +890,9 @@ func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial,
 	if time.Unix(*lc.iat, 0).After(now) {
 		return parsedList{}, classify(ReasonNotYetValid, errors.New("status list token is issued in the future (iat)"))
 	}
-	// ttl is the freshness window from iat; without it, a default window from
-	// now. exp and maxCacheTTL cap it.
-	expires := now.Add(defaultCacheTTL)
-	if lc.ttl != nil {
-		// ttl must be a positive integer; a present zero or negative is malformed.
-		if *lc.ttl <= 0 {
-			return parsedList{}, fmt.Errorf("status list ttl %d is not a positive integer", *lc.ttl)
-		}
-		// Clamp first: seconds*1e9 would overflow int64 above ~292 years.
-		secs := *lc.ttl
-		if secs > maxTTLSeconds {
-			secs = maxTTLSeconds
-		}
-		expires = time.Unix(*lc.iat, 0).Add(time.Duration(secs) * time.Second)
-	}
-	if lc.nbf != nil && now.Before(time.Unix(*lc.nbf, 0)) {
-		return parsedList{}, classify(ReasonNotYetValid, errors.New("status list token is not yet valid (nbf)"))
-	}
-	if lc.exp != nil {
-		exp := time.Unix(*lc.exp, 0)
-		if !now.Before(exp) {
-			return parsedList{}, classify(ReasonExpired, errors.New("status list token has expired"))
-		}
-		if exp.Before(expires) {
-			expires = exp
-		}
-	}
-	if limit := now.Add(maxCacheTTL); expires.After(limit) {
-		expires = limit
+	expires, err := freshUntil(lc, now)
+	if err != nil {
+		return parsedList{}, err
 	}
 	// An already-expired deadline is used for this check but not cached (see store).
 	switch lc.bits {
@@ -946,6 +926,43 @@ func (c *Checker) accept(ctx context.Context, uri string, km *trust.KeyMaterial,
 		etag:    `"` + hex.EncodeToString(h.Sum(nil)[:16]) + `"`,
 		subject: subject, km: km,
 	}, nil
+}
+
+// freshUntil derives when a token with the claims lc (iat already checked
+// present) stops being fresh, and refuses one that is not yet valid or has
+// expired.
+func freshUntil(lc listClaims, now time.Time) (time.Time, error) {
+	// ttl is the freshness window from iat; without it, a default window from
+	// now. exp and maxCacheTTL cap it.
+	expires := now.Add(defaultCacheTTL)
+	if lc.ttl != nil {
+		// ttl must be a positive integer; a present zero or negative is malformed.
+		if *lc.ttl <= 0 {
+			return time.Time{}, fmt.Errorf("status list ttl %d is not a positive integer", *lc.ttl)
+		}
+		// Clamp first: seconds*1e9 would overflow int64 above ~292 years.
+		secs := *lc.ttl
+		if secs > maxTTLSeconds {
+			secs = maxTTLSeconds
+		}
+		expires = time.Unix(*lc.iat, 0).Add(time.Duration(secs) * time.Second)
+	}
+	if lc.nbf != nil && now.Before(time.Unix(*lc.nbf, 0)) {
+		return time.Time{}, classify(ReasonNotYetValid, errors.New("status list token is not yet valid (nbf)"))
+	}
+	if lc.exp != nil {
+		exp := time.Unix(*lc.exp, 0)
+		if !now.Before(exp) {
+			return time.Time{}, classify(ReasonExpired, errors.New("status list token has expired"))
+		}
+		if exp.Before(expires) {
+			expires = exp
+		}
+	}
+	if limit := now.Add(maxCacheTTL); expires.After(limit) {
+		expires = limit
+	}
+	return expires, nil
 }
 
 // canonicalOrigin returns uri's origin in canonical form (lowercase, punycode

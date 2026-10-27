@@ -26,6 +26,9 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
+// audienceWalletBackend is the token audience of this backend's own API.
+const audienceWalletBackend = "wallet-backend"
+
 // =============================================================================
 // Auth Provider - handles authentication routes only
 // =============================================================================
@@ -132,7 +135,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	// Always registered: when disabled the handler answers 503 STATUS_NOT_SUPPORTED.
 	statusGroup := router.Group("/status/v1")
 	statusGroup.Use(p.authMiddleware())
-	statusGroup.Use(middleware.RequireAudience("wallet-backend"))
+	statusGroup.Use(middleware.RequireAudience(audienceWalletBackend))
 	statusGroup.POST("/lists",
 		requireCallerIdentity(),
 		middleware.AuthRateLimitMiddlewareWithResponse(p.statusRateLimiter, wiaCallerIdentifier, gin.H{
@@ -151,7 +154,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	// These are general user-facing routes, not the narrow-purpose calls
 	// (trust evaluation, engine transport) an identity-free anonymous token
 	// is scoped to - reject a wallet-registry-only token here.
-	protected.Use(middleware.RequireAudience("wallet-backend"))
+	protected.Use(middleware.RequireAudience(audienceWalletBackend))
 	{
 		// User session routes (authenticated)
 		session := protected.Group("/user/session")
@@ -325,7 +328,7 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 	// Credential storage is a general user-facing route, not one of the
 	// narrow purposes (trust evaluation, engine transport) an anonymous
 	// token is scoped to - reject a wallet-registry-only token here.
-	protected.Use(middleware.RequireAudience("wallet-backend"))
+	protected.Use(middleware.RequireAudience(audienceWalletBackend))
 	{
 		// Credential storage (gated)
 		if p.cfg.Features.CredentialStorageEnabled {
@@ -750,7 +753,7 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 		// Trust-evaluation calls are identity-free by design (see
 		// handleAnonymousTokenRequest) and only need a wallet-registry or
 		// wallet-backend audience - never require a broader one.
-		protected.Use(middleware.RequireAudience("wallet-registry", "wallet-backend"))
+		protected.Use(middleware.RequireAudience("wallet-registry", audienceWalletBackend))
 		v1 := protected.Group("/v1")
 		{
 			v1.POST("/evaluate", middleware.MustHaveTAC("r"), p.authzenHandler.Evaluate)
@@ -1248,7 +1251,7 @@ func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
 	// Key attestation / WIA are general user-facing routes, not one of the
 	// narrow purposes an anonymous token is scoped to - reject a
 	// wallet-registry-only token here.
-	wp.Use(middleware.RequireAudience("wallet-backend"))
+	wp.Use(middleware.RequireAudience(audienceWalletBackend))
 	{
 		wp.POST("/key-attestation/generate", middleware.MustHaveTAC("w"), p.handlers.GenerateKeyAttestation)
 		wp.POST("/assurance-preview", middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier), middleware.MustHaveTAC("w"), p.handlers.AssurancePreview)

@@ -429,13 +429,83 @@ type evaluateOptions struct {
 	redact bool
 }
 
+// attachKeyMaterial sets req's key type, resource and key from km.
+func (s *Service) attachKeyMaterial(req *EvaluationRequest, km *KeyMaterial, subjectID string, subjectField func() []zap.Field) {
+	switch km.Type {
+	case "x5c":
+		req.KeyType = KeyTypeX5C
+		req.Resource = Resource{
+			Type: ResourceTypeX5C,
+			ID:   subjectID,
+			Key:  km.X5C,
+		}
+		req.Key = km.X5C
+		s.logger.Debug("Trust evaluation with x5c",
+			append(subjectField(), zap.Int("cert_count", len(km.X5C)))...)
+	case "jwk":
+		// Normalize JWKS/JWK into a flat slice of individual JWK objects
+		normalized := NormalizeJWKS(km.JWK)
+		req.KeyType = KeyTypeJWK
+		req.Resource = Resource{
+			Type: ResourceTypeJWK,
+			ID:   subjectID,
+			Key:  normalized,
+		}
+		req.Key = normalized
+		s.logger.Debug("Trust evaluation with JWK",
+			append(subjectField(), zap.Int("key_count", len(normalized)))...)
+	case "":
+		// Type not set but key material provided; try to infer
+		if len(km.X5C) > 0 {
+			req.KeyType = KeyTypeX5C
+			req.Resource = Resource{Type: ResourceTypeX5C, ID: subjectID, Key: km.X5C}
+			req.Key = km.X5C
+		} else if km.JWK != nil {
+			normalized := NormalizeJWKS(km.JWK)
+			req.KeyType = KeyTypeJWK
+			req.Resource = Resource{Type: ResourceTypeJWK, ID: subjectID, Key: normalized}
+			req.Key = normalized
+		}
+	}
+}
+
+// buildEvaluationRequest shapes the AuthZEN request for subjectID, role and
+// opts, attaching the subject's key material when there is some.
+func (s *Service) buildEvaluationRequest(subjectID string, role Role, opts evaluateOptions, subjectField func() []zap.Field) *EvaluationRequest {
+	req := &EvaluationRequest{
+		Subject: Subject{
+			Type: SubjectTypeKey,
+			ID:   subjectID,
+		},
+	}
+	req.SubjectID = subjectID
+	req.Role = role
+	if role == "" && opts.action != "" {
+		req.Action = opts.action
+	}
+	if opts.evalContext != nil {
+		req.Context = opts.evalContext
+	}
+
+	// Set credential type if provided
+	if opts.keyMaterial != nil && opts.keyMaterial.CredentialType != "" {
+		req.CredentialType = opts.keyMaterial.CredentialType
+	}
+
+	// Set key material if provided
+	if opts.keyMaterial != nil {
+		s.attachKeyMaterial(req, opts.keyMaterial, subjectID, subjectField)
+	} else {
+		s.logger.Debug("Trust evaluation resolution-only", subjectField()...)
+	}
+	return req
+}
+
 // evaluate is the shared implementation for issuer, verifier, and FIDO2
 // attestation trust evaluation. See evaluateOptions for opts' fields.
 func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint string, role Role, opts evaluateOptions) (*TrustInfo, error) {
-	action := opts.action
-	keyMaterial := opts.keyMaterial
 	logLabel := opts.logLabel
-	evalContext := opts.evalContext
+	keyMaterial := opts.keyMaterial
 	subjectField := func() []zap.Field {
 		if opts.redact {
 			return nil
@@ -463,68 +533,7 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 		}, nil
 	}
 
-	// Create evaluation request
-	req := &EvaluationRequest{
-		Subject: Subject{
-			Type: SubjectTypeKey,
-			ID:   subjectID,
-		},
-	}
-	req.SubjectID = subjectID
-	req.Role = role
-	if role == "" && action != "" {
-		req.Action = action
-	}
-	if evalContext != nil {
-		req.Context = evalContext
-	}
-
-	// Set credential type if provided
-	if keyMaterial != nil && keyMaterial.CredentialType != "" {
-		req.CredentialType = keyMaterial.CredentialType
-	}
-
-	// Set key material if provided
-	if keyMaterial != nil {
-		switch keyMaterial.Type {
-		case "x5c":
-			req.KeyType = KeyTypeX5C
-			req.Resource = Resource{
-				Type: ResourceTypeX5C,
-				ID:   subjectID,
-				Key:  keyMaterial.X5C,
-			}
-			req.Key = keyMaterial.X5C
-			s.logger.Debug("Trust evaluation with x5c",
-				append(subjectField(), zap.Int("cert_count", len(keyMaterial.X5C)))...)
-		case "jwk":
-			// Normalize JWKS/JWK into a flat slice of individual JWK objects
-			normalized := NormalizeJWKS(keyMaterial.JWK)
-			req.KeyType = KeyTypeJWK
-			req.Resource = Resource{
-				Type: ResourceTypeJWK,
-				ID:   subjectID,
-				Key:  normalized,
-			}
-			req.Key = normalized
-			s.logger.Debug("Trust evaluation with JWK",
-				append(subjectField(), zap.Int("key_count", len(normalized)))...)
-		case "":
-			// Type not set but key material provided; try to infer
-			if len(keyMaterial.X5C) > 0 {
-				req.KeyType = KeyTypeX5C
-				req.Resource = Resource{Type: ResourceTypeX5C, ID: subjectID, Key: keyMaterial.X5C}
-				req.Key = keyMaterial.X5C
-			} else if keyMaterial.JWK != nil {
-				normalized := NormalizeJWKS(keyMaterial.JWK)
-				req.KeyType = KeyTypeJWK
-				req.Resource = Resource{Type: ResourceTypeJWK, ID: subjectID, Key: normalized}
-				req.Key = normalized
-			}
-		}
-	} else {
-		s.logger.Debug("Trust evaluation resolution-only", subjectField()...)
-	}
+	req := s.buildEvaluationRequest(subjectID, role, opts, subjectField)
 
 	// Delegate evaluation to the trust endpoint
 	resp, err := eval.Evaluate(ctx, req)
