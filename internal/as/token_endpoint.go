@@ -39,7 +39,14 @@ func refuseRevocationUnavailable(c *gin.Context, logger *zap.Logger, err error) 
 // is already revoked). When it returns true a response has been written and
 // the caller must stop: 401 for a revoked owner, 503 when the revocation
 // store cannot say. Without a wired blacklist there is nothing to check.
-func sessionOwnerRevoked(c *gin.Context, deps *tokenDeps, session *Session) bool {
+//
+// deletionOnly names the one token a revoked owner may still obtain: exactly
+// the deletion permission, which is all DELETE /user/session needs and the
+// only call the resource middleware lets a revoked user reach. It lets an
+// interrupted deletion be completed after the previous access token expired,
+// while every other token (including any anonymous one, whose missing "sub"
+// would bypass the user revocation) stays refused.
+func sessionOwnerRevoked(c *gin.Context, deps *tokenDeps, session *Session, deletionOnly bool, tac TAC) bool {
 	if deps.blacklist == nil {
 		return false
 	}
@@ -48,11 +55,14 @@ func sessionOwnerRevoked(c *gin.Context, deps *tokenDeps, session *Session) bool
 		refuseRevocationUnavailable(c, deps.logger, err)
 		return true
 	}
-	if revoked {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
-		return true
+	if !revoked {
+		return false
 	}
-	return false
+	if deletionOnly && tac == TAC(string(TACDelete)) {
+		return false
+	}
+	c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
+	return true
 }
 
 // tokenDeps groups the shared dependencies for token issuance handlers.
@@ -172,9 +182,6 @@ func handleSessionTokenRequest(
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
 		return
 	}
-	if sessionOwnerRevoked(c, deps, session) {
-		return
-	}
 
 	tenantID := req.TenantID
 	if tenantID == "" {
@@ -211,6 +218,10 @@ func handleSessionTokenRequest(
 		return
 	}
 
+	if sessionOwnerRevoked(c, deps, session, true, tac) {
+		return
+	}
+
 	issueToken(c, deps, session.UserID, req.Audience, tenantID, tac, session.ACR)
 }
 
@@ -242,7 +253,7 @@ func handleAnonymousTokenRequest(
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
 		return
 	}
-	if sessionOwnerRevoked(c, deps, session) {
+	if sessionOwnerRevoked(c, deps, session, false, "") {
 		return
 	}
 

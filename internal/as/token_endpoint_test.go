@@ -1164,3 +1164,33 @@ func TestTokenEndpoint_SessionCookie_RevokedOwner(t *testing.T) {
 		})
 	}
 }
+
+// An interrupted account deletion must stay completable after the previous
+// access token expired: the revoked owner's session may still obtain a token
+// that carries exactly the deletion permission (all DELETE /user/session
+// needs), and nothing broader.
+func TestTokenEndpoint_SessionCookie_RevokedOwnerMayObtainDeletionOnlyToken(t *testing.T) {
+	issuer := newTestTokenIssuer(t)
+	router, store := setupRouterWithIssuer(t, issuer, nil, &fakeBlacklist{revokedUsers: map[string]bool{"user-1": true}})
+	_ = store.Create(context.Background(), &Session{
+		JTI: "sess-del", UserID: "user-1", TenantID: "tenant-1", ACR: "urn:siros:acr:passkey",
+		MaxTAC: TAC("rwlid"), CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+	})
+	post := func(tac string) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: tac})
+		req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-del"})
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+	if w := post("d"); w.Code != http.StatusOK {
+		t.Errorf("deletion-only token: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	for _, tac := range []string{"", "rd", "r", "rwlid"} {
+		if w := post(tac); w.Code != http.StatusUnauthorized {
+			t.Errorf("tac %q: expected 401 for a revoked owner, got %d: %s", tac, w.Code, w.Body.String())
+		}
+	}
+}
