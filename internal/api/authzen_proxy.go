@@ -765,6 +765,10 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	// after key extraction and the trust decision above, so dropping the
 	// original signed_metadata JWT here cannot change that decision.
 	sanitizeAuxiliaryDataAdvertisement(result.Metadata)
+	if len(result.AmbiguousConfigurations) > 0 {
+		// The resolver removed them; the retained JWT still carries them.
+		delete(result.Metadata, "signed_metadata")
+	}
 
 	// Step 6: Evaluate whether this provider is entitled to issue what it is
 	// offering. Distinct from the PDP decision above, which answers whether the

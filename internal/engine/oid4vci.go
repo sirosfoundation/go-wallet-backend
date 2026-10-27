@@ -1343,7 +1343,9 @@ func (h *OID4VCIHandler) parseOffer(ctx context.Context, msg *FlowStartMessage) 
 	}
 
 	var offer CredentialOffer
-	if err := json.Unmarshal([]byte(offerStr), &offer); err != nil {
+	// A credential offer is read by the engine and by the client that handed it
+	// over: a repeated member (two grants, two issuers) would let them differ.
+	if err := decodeStrict([]byte(offerStr), &offer); err != nil {
 		return nil, fmt.Errorf("invalid offer JSON: %w", err)
 	}
 
@@ -1372,8 +1374,12 @@ func (h *OID4VCIHandler) fetchOfferFromURI(ctx context.Context, uri string) (*Cr
 		return nil, fmt.Errorf("offer fetch returned status %d", resp.StatusCode)
 	}
 
+	offerBody, err := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes+1))
+	if err != nil || len(offerBody) > MaxHTTPResponseBodyBytes {
+		return nil, errors.New("failed to read offer")
+	}
 	var offer CredentialOffer
-	if err := json.NewDecoder(resp.Body).Decode(&offer); err != nil {
+	if err := decodeStrict(offerBody, &offer); err != nil {
 		return nil, fmt.Errorf("failed to parse offer: %w", err)
 	}
 
@@ -1406,6 +1412,11 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*met
 		return nil, fmt.Errorf("failed to parse metadata: %w", err)
 	}
 	h.logIgnoredCredentialConfigurations(result.Metadata, metadata.CredentialConfigurationsSupported)
+	if len(result.AmbiguousConfigurations) > 0 {
+		// Ids only: the configurations are not offered, their content is not logged.
+		h.Logger.Warn("ignoring credential configurations with ambiguous members",
+			zap.Strings("credential_configuration_ids", result.AmbiguousConfigurations))
+	}
 
 	// Look up registered issuer record from backend storage when a lookup is wired.
 	// Errors are non-fatal: the issuer may simply not be registered in this tenant.

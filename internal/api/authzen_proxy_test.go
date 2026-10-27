@@ -2260,6 +2260,48 @@ func TestResolve_URLSubject_SignedMetadata_MalformedSeedConfigAndJWTNotServed(t 
 	}
 }
 
+// When the resolver removed a configuration for ambiguity, the retained
+// signed_metadata JWT (whose payload still carries it) is not served.
+func TestResolve_URLSubject_AmbiguousConfigurationDropsSignedMetadata(t *testing.T) {
+	pdpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(gotrust.EvaluationResponse{Decision: true})
+	}))
+	defer pdpServer.Close()
+	for removed, wantJWT := range map[bool]bool{true: false, false: true} {
+		var ids []string
+		if removed {
+			ids = []string{"gone"}
+		}
+		resolver := &mockMetadataResolver{result: &issuermetadata.ResolveResult{
+			Signed:                  true,
+			AmbiguousConfigurations: ids,
+			Metadata: map[string]interface{}{
+				"credential_issuer":                   "https://signed.example.com",
+				"jwks":                                map[string]interface{}{"keys": []interface{}{map[string]interface{}{"kty": "EC"}}},
+				"signed_metadata":                     "e30.e30.c2ln",
+				"credential_configurations_supported": map[string]interface{}{"kept": map[string]interface{}{"format": "vc+sd-jwt"}},
+			},
+		}}
+		cfg := &config.AuthZENProxyConfig{Enabled: true, PDPURL: pdpServer.URL, Timeout: 30, AllowResolution: true}
+		handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, http.DefaultClient, zap.NewNop())
+		router := gin.New()
+		router.Use(func(c *gin.Context) { c.Set("tenant_id", "test-tenant"); c.Next() })
+		router.POST("/v1/resolve", handler.Resolve)
+		body, _ := json.Marshal(map[string]string{"subject_id": "https://signed.example.com", "subject_type": "url"})
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+		req.Header.Set("Content-Type", "application/json")
+		router.ServeHTTP(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", w.Code, w.Body.String())
+		}
+		if got := strings.Contains(w.Body.String(), "signed_metadata"); got != wantJWT {
+			t.Errorf("removed=%v: signed_metadata served=%v, want %v", removed, got, wantJWT)
+		}
+	}
+}
+
 // mockIssuerLookup implements IssuerLookup for testing.
 type mockIssuerLookup struct {
 	issuer *domain.CredentialIssuer

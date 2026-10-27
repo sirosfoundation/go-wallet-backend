@@ -796,12 +796,25 @@ case, spells a member this section names (`type`, `alg`, `path`, `opening`,
 `commitment`, `error`, ...) in another letter case, or has data after the value;
 the refusal says why and never quotes the document. A proof or error body
 refused this way is never forwarded, relayed or retried, whether or not
-`to_issuer` entries were advertised. Issuer metadata is public: the engine does
-not scan the retained `signed_metadata` JWT, and the resolver has already decoded
-the metadata document into maps, so a repeated member in it is resolved to one
-value before the engine, the resolve endpoint and the wallet read it; all three
-see the same document. The strict step covers the case-variant and type rules
-for that document, and the bytes the engine reads itself.
+`to_issuer` entries were advertised. The engine does not scan the retained `signed_metadata` JWT
+(issuer metadata is public); the resolver checks the raw metadata bytes instead
+(next paragraph). The same step reads a credential offer: a repeated or
+case-variant member (two `grants`, two issuers) refuses the offer.
+
+**Issuer metadata, all issuers (behaviour change).** The metadata resolver
+(`pkg/issuermetadata`) decodes an issuer's metadata into maps, which keep only the
+last of a repeated member. It therefore checks the raw bytes first, on every path
+(plain JSON, the `signed_metadata` JWT payload, and an `application/jwt`
+response), with the same decoder (`pkg/strictjson`):
+
+| Where the ambiguity is (repeated name, or two names differing only in letter case) | Result |
+|---|---|
+| a member of one credential configuration: its own member names, or anywhere inside `auxiliary_data_supported`, `credential_metadata` or `proof_types_supported` | that configuration is not offered (removed from the metadata, listed in `ResolveResult.AmbiguousConfigurations`; the served document drops the retained `signed_metadata` JWT, as for any removed configuration; the engine logs only the ids) |
+| the document's own member names, anywhere inside `credential_response_encryption` or `credential_request_encryption`, or a repeated `credential_configurations_supported` or configuration id | the fetch fails closed (no configuration can be dropped for it) |
+| any other member (`display`, `claims`, ...) | not judged; the configuration stays offered |
+
+A valid document is unchanged. This applies to every issuer, not only to those
+that use auxiliary data.
 
 If the credential endpoint answers HTTP 400 with the OAuth error code
 `auxiliary_data_conflict` (an entry conflicts with a value the issuer holds for
