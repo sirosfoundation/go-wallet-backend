@@ -62,6 +62,8 @@ func TestDecodeStrict_Ambiguity(t *testing.T) {
 	// Unambiguous documents are read: other claim names, equal names in
 	// different objects, whitespace around the value.
 	var d doc
+	// A number a float cannot hold is still valid JSON.
+	require.NoError(t, decodeStrict([]byte(`{"n":1e400,"type":"a"}`), &d))
 	require.NoError(t, decodeStrict([]byte(` {"type":"a","other":{"type":"b"},"Another":null,"sub":{"path":["p"]}} `), &d))
 	assert.Equal(t, "a", d.Type)
 	assert.Equal(t, []string{"p"}, d.Sub.Path)

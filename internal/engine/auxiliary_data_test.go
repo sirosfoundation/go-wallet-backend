@@ -307,6 +307,7 @@ func TestAuxiliaryDataConflict_Classification(t *testing.T) {
 		"case-variant first": {400, `{"ERROR":"invalid_proof","error":"auxiliary_data_conflict"}`, ambiguous},
 		"only a variant":     {400, `{"ERROR":"auxiliary_data_conflict"}`, ambiguous},
 		"trailing value":     {400, `{"error":"invalid_request"} {"error":"auxiliary_data_conflict"}`, ambiguous},
+		"huge number":        {400, `{"x":1e400,"error":"auxiliary_data_conflict"}`, conflict},
 	} {
 		t.Run(name, func(t *testing.T) {
 			h, ch, cleanup := captureHandler(t)
@@ -481,6 +482,7 @@ func TestCheckProofsForwardNoOpening(t *testing.T) {
 		"nested opening":                 `{"auxiliary_data":[{"type":"x","v":{"Opening":"SECRET"}}]}`,
 		"trailing object with opening":   `{"nonce":"n"}{"auxiliary_data":` + secretEntry + `}`,
 		"trailing value after claim":     `{"auxiliary_data":` + benign + `} 1`,
+		"opening beside a huge number":   `{"ignored":1e400,"auxiliary_data":` + secretEntry + `}`,
 	} {
 		withOpening["raw/jwt/"+name] = []ProofObject{{ProofType: "jwt", JWT: rawProofJWT(payload)}}
 		withOpening["raw/attestation/"+name] = []ProofObject{{ProofType: "attestation", Attestation: rawProofJWT(payload)}}
@@ -747,6 +749,7 @@ func TestAuxiliaryData_UnusableConfigurationRefusedBeforeAnyRequest(t *testing.T
 		"to_wallet unknown type ignored":     {adv: `{"to_wallet":[{"type":"https://x.example/t","alg":"x"}]}`},
 		"optional to_issuer bad alg ignored": {adv: `{"to_issuer":[{"type":"hash_commitment","alg":"sha-1","path":["a"]}]}`},
 		"optional to_issuer unknown ignored": {adv: `{"to_issuer":[{"type":"https://x.example/t"}]}`},
+		"unknown type with a numeric alg":    {adv: `{"to_issuer":[{"type":"https://x.example/t","alg":123}]}`},
 		"required to_issuer, jwt proof":      {adv: `{"to_issuer":[` + hc(`,"required":true`) + `]}`},
 		"optional to_issuer without a proof": {adv: `{"to_issuer":[` + hc("") + `]}`, noJWT: true},
 	} {
@@ -822,4 +825,16 @@ func TestGenerateProof_CarriesToWalletAndSendableToIssuer(t *testing.T) {
 	assert.JSONEq(t, toWallet, string(w[0]))
 	require.Len(t, i, 1, "an entry the wallet cannot send is not passed on")
 	assert.JSONEq(t, auxToIssuerPSC, string(i[0]))
+}
+
+// An optional entry the wallet drops does not make the credential type
+// mandatory: only an entry it will send does.
+func TestGenerateProof_DroppedEntryNeedsNoCredentialType(t *testing.T) {
+	st := newIssuerStub(t, `{"credential":"c"}`)
+	fc := &fakeClient{t: t}
+	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
+	defer cleanup()
+	cfg := auxCfg(`{"to_issuer":[{"type":"hash_commitment","alg":"sha-1","path":["a"]},{"type":"https://x.example/t","alg":123}]}`)
+	cfg.VCT = ""
+	require.NoError(t, h.issueCredential(context.Background(), st.metadata(nil), tokenBearer(), "cfg", cfg, nil, ""))
 }

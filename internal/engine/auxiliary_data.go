@@ -334,7 +334,7 @@ type auxSupportedWire struct {
 // members are the type's own and pass through verbatim.
 type auxEntryWire struct {
 	Type     string          `json:"type"`
-	Alg      string          `json:"alg"`
+	Alg      json.RawMessage `json:"alg"`
 	Encoding json.RawMessage `json:"encoding"`
 	Path     json.RawMessage `json:"path"`
 	Required json.RawMessage `json:"required"`
@@ -377,7 +377,6 @@ func parseAuxiliaryDataSupported(raw json.RawMessage) (*auxAdvertisement, error)
 		if err != nil {
 			return nil, err
 		}
-		out.toIssuerRecognised = hasHashCommitment(entries)
 		for i, e := range entries {
 			switch {
 			case e.typ == auxTypeHashCommitment && !e.sendable:
@@ -389,6 +388,9 @@ func parseAuxiliaryDataSupported(raw json.RawMessage) (*auxAdvertisement, error)
 			case e.typ != auxTypeHashCommitment && e.required:
 				out.unusable = "a required to_issuer entry is of a type this wallet does not recognise"
 			}
+			// The credential type is needed only for an entry the wallet will
+			// send, not for one dropped above.
+			out.toIssuerRecognised = out.toIssuerRecognised || e.typ == auxTypeHashCommitment
 			out.requiredToIssuer = out.requiredToIssuer || e.required
 			out.toIssuer = append(out.toIssuer, rawEntries[i])
 		}
@@ -467,9 +469,19 @@ func parseAuxEntry(re json.RawMessage, list string) (auxEntry, string, error) {
 	}
 	e := auxEntry{typ: w.Type, required: string(w.Required) == "true"}
 	if w.Type == auxTypeHashCommitment {
-		e.sendable = contains(auxSupportedAlgs, w.Alg) && encodingSupported(w.Encoding)
+		e.sendable = contains(auxSupportedAlgs, algOf(w)) && encodingSupported(w.Encoding)
 	}
 	return e, pathKey, nil
+}
+
+// algOf returns the alg of an entry, empty when absent or not a string. Only a
+// hash_commitment entry needs one; the parameters of any other type are its own.
+func algOf(w auxEntryWire) string {
+	var alg string
+	if json.Unmarshal(w.Alg, &alg) != nil {
+		return ""
+	}
+	return alg
 }
 
 // encodingSupported: encoding is absent, or a string the spec defines.
@@ -499,7 +511,7 @@ func checkAuxRequired(w auxEntryWire, list string) error {
 // auxEntryPathKey returns the duplicate-detection key of an entry's path.
 func auxEntryPathKey(w auxEntryWire) (string, error) {
 	if w.Type == auxTypeHashCommitment {
-		if w.Alg == "" {
+		if algOf(w) == "" {
 			return "", errAuxEntry("has a hash_commitment entry without a string alg")
 		}
 		p, ok := claimsPathKey(w.Path)

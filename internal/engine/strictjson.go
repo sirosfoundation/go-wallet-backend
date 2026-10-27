@@ -48,6 +48,9 @@ func decodeStrict(data []byte, v any) error {
 // a negative depth checks the whole document.
 func checkUnambiguous(data []byte, depth int) error {
 	dec := json.NewDecoder(bytes.NewReader(data))
+	// Numbers are not converted: a value such as 1e400 is valid JSON that the
+	// walk must pass over, not an error that makes a caller skip the check.
+	dec.UseNumber()
 	var stack []map[string]struct{} // names of each open object; nil for an array
 	expectKey := []bool{}
 	for {
