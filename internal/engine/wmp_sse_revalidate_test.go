@@ -2,9 +2,11 @@ package engine
 
 import (
 	"bufio"
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -110,4 +112,49 @@ func TestWMP_SSE_LegacyTokenMayReadSessionWithPermissions(t *testing.T) {
 	assert.False(t, a.tokenCoversSession(sid, "", true), "modern empty-TAC token must be refused")
 	assert.False(t, a.tokenCoversSession(sid, "r", true))
 	assert.True(t, a.tokenCoversSession(sid, "ir", true))
+}
+
+// revokeAfterFirstEventWriter revokes the user once the first event has been
+// written, i.e. in the middle of a replay batch.
+type revokeAfterFirstEventWriter struct {
+	*syncRecorder
+	revoke func()
+	once   sync.Once
+}
+
+func (w *revokeAfterFirstEventWriter) Write(b []byte) (int, error) {
+	n, err := w.syncRecorder.Write(b)
+	if strings.Contains(string(b), "data: ") {
+		w.once.Do(w.revoke)
+	}
+	return n, err
+}
+
+// A token revoked while a multi-event replay batch is being written must stop the
+// batch: authorization is re-checked before every event, not once per batch.
+func TestWMP_SSE_RevalidatesBeforeEveryEventOfABatch(t *testing.T) {
+	a, m := testWMPAdapter()
+	defer cleanupWMP(a, m)
+	sid := createWMPSession(t, a)
+	buf := a.getOrCreateEventBuffer(sid)
+	buf.append([]byte(`{"n":1}`))
+	buf.append([]byte(`{"secret":"second-event"}`))
+	buf.append([]byte(`{"secret":"third-event"}`))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodGet, WMPEventsPath+"?session_id="+sid, nil).WithContext(ctx)
+	req.Header.Set("Authorization", "Bearer "+testToken("user-1", "tenant-a"))
+	w := &revokeAfterFirstEventWriter{syncRecorder: &syncRecorder{ResponseRecorder: httptest.NewRecorder()}, revoke: func() { revokeWithoutClosing(m, "user-1") }}
+	done := make(chan struct{})
+	go func() { a.HandleWMPEvents(w, req); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the stream kept running after its token was revoked mid-batch")
+	}
+	body := w.String()
+	assert.Contains(t, body, `"n":1`)
+	assert.NotContains(t, body, "second-event")
+	assert.NotContains(t, body, "third-event")
 }

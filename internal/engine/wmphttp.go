@@ -255,7 +255,7 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 
 	// The bearer token was only checked when the stream opened. It expires, or is
 	// revoked (per jti, per user, per refresh-token family), while the stream is
-	// open, so it is validated again with the same checks before every batch of
+	// open, so it is validated again with the same checks before every
 	// events and on every heartbeat. Fail closed: any failure ends the stream (the
 	// session and its replayable events stay; the client reconnects with a valid
 	// token).
@@ -270,10 +270,12 @@ func (a *WMPAdapter) HandleWMPEvents(w http.ResponseWriter, r *http.Request) {
 
 	for {
 		events, wake := buf.after(cursor)
-		if len(events) > 0 && !stillAuthorized() {
-			return
-		}
 		for _, ev := range events {
+			// Before every event, not once per batch: the token can expire or be
+			// revoked during an earlier write, and a slow reader prolongs it.
+			if !stillAuthorized() {
+				return
+			}
 			// A superseded or closed stream must not keep replaying: each write
 			// gets a fresh deadline, so a slow reader could drag a long batch on.
 			select {
