@@ -62,15 +62,27 @@ func (s *WalletProviderService) lookupOwnedInstance(ctx context.Context, walletI
 			zap.String("wallet_instance_id", walletInstanceID), zap.Time("last_attested_at", instance.LastAttestedAt))
 		return nil, storage.ErrNotFound
 	}
-	if caller, ok := ctx.Value(callerCtxKey{}).(KeyAttestationCaller); ok {
-		if instance.TenantID != caller.TenantID ||
-			(instance.UserID != nil && caller.UserID != "" && instance.UserID.String() != caller.UserID) {
-			s.logger.Warn("wallet instance does not belong to the key attestation caller; ignoring its evidence",
-				zap.String("wallet_instance_id", walletInstanceID))
-			return nil, storage.ErrNotFound
-		}
+	if !instanceBelongsToCaller(ctx, instance) {
+		s.logger.Warn("wallet instance does not belong to the key attestation caller; ignoring its evidence",
+			zap.String("wallet_instance_id", walletInstanceID))
+		return nil, storage.ErrNotFound
 	}
 	return instance, nil
+}
+
+// instanceBelongsToCaller applies the authenticated caller recorded by
+// WithKeyAttestationCaller (when there is one): the instance must be in the
+// caller's tenant and, when both record a user, be that user's. A context
+// without a caller is not judged here.
+func instanceBelongsToCaller(ctx context.Context, instance *domain.WalletInstance) bool {
+	caller, ok := ctx.Value(callerCtxKey{}).(KeyAttestationCaller)
+	if !ok {
+		return true
+	}
+	if instance.TenantID != caller.TenantID {
+		return false
+	}
+	return instance.UserID == nil || caller.UserID == "" || instance.UserID.String() == caller.UserID
 }
 
 // platformEvidenceMaxAge is how long after its last WIA an instance's
@@ -209,6 +221,9 @@ func (s *WalletProviderService) fido2EvidenceFor(ctx context.Context, walletInst
 			if walletInstanceID == "" && rec.WalletInstanceID != "" && !s.instanceMayLendKeyEvidence(ctx, rec.WalletInstanceID) {
 				return nil // the instance it was recorded for is not live (or not the caller's)
 			}
+			if _, known := ctx.Value(callerCtxKey{}).(KeyAttestationCaller); known && rec.WalletInstanceID == "" {
+				return nil // a known caller cannot be shown to own a record with no instance
+			}
 		}
 		if i == 0 {
 			aaguid = rec.AAGUID
@@ -283,6 +298,11 @@ func (s *WalletProviderService) instanceMayLendKeyEvidence(ctx context.Context, 
 	if walletInstanceID == "" || s.instances == nil {
 		return walletInstanceID != ""
 	}
-	_, err := refuseWalletInstance(ctx, s.instances, walletInstanceID, false)
-	return err == nil
+	instance, err := refuseWalletInstance(ctx, s.instances, walletInstanceID, false)
+	if err != nil {
+		return false
+	}
+	// refuseWalletInstance judges the tenant and the token subject; the caller
+	// the preview records (WithKeyAttestationCaller) is applied here too.
+	return instance == nil || instanceBelongsToCaller(ctx, instance)
 }
