@@ -1,8 +1,10 @@
 package engine
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -77,4 +79,22 @@ func TestCheckUnambiguous_Depth(t *testing.T) {
 	require.NoError(t, checkUnambiguous([]byte(in), 1))
 	require.Error(t, checkUnambiguous([]byte(`{"c":1,"C":2}`), 1))
 	require.NoError(t, checkUnambiguous([]byte(strings.Repeat(`[`, 3)+strings.Repeat(`]`, 3)), 1))
+}
+
+// Validation is linear in the number of names: an object of 200,000 distinct
+// names is checked in well under a second (a scan of every earlier name would
+// need some 2e10 comparisons).
+func TestCheckUnambiguous_ManyNamesIsLinear(t *testing.T) {
+	var b strings.Builder
+	b.WriteString("{")
+	for i := 0; i < 200000; i++ {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		fmt.Fprintf(&b, `"k%d":1`, i)
+	}
+	b.WriteString("}")
+	start := time.Now()
+	require.NoError(t, checkUnambiguous([]byte(b.String()), -1))
+	assert.Less(t, time.Since(start), 5*time.Second)
 }

@@ -797,7 +797,11 @@ case, spells a member this section names (`type`, `alg`, `path`, `opening`,
 the refusal says why and never quotes the document. A proof or error body
 refused this way is never forwarded, relayed or retried, whether or not
 `to_issuer` entries were advertised. Issuer metadata is public: the engine does
-not scan the retained `signed_metadata` JWT.
+not scan the retained `signed_metadata` JWT, and the resolver has already decoded
+the metadata document into maps, so a repeated member in it is resolved to one
+value before the engine, the resolve endpoint and the wallet read it; all three
+see the same document. The strict step covers the case-variant and type rules
+for that document, and the bytes the engine reads itself.
 
 If the credential endpoint answers HTTP 400 with the OAuth error code
 `auxiliary_data_conflict` (an entry conflicts with a value the issuer holds for

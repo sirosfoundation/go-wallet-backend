@@ -838,3 +838,47 @@ func TestGenerateProof_DroppedEntryNeedsNoCredentialType(t *testing.T) {
 	cfg.VCT = ""
 	require.NoError(t, h.issueCredential(context.Background(), st.metadata(nil), tokenBearer(), "cfg", cfg, nil, ""))
 }
+
+// A pending response (immediate or deferred) is a plain response too: a
+// forbidden member ends the issuance there, before its metadata is discarded.
+func TestPendingPlainResponse_ForbiddenMemberRefused(t *testing.T) {
+	for name, member := range map[string]string{
+		"auxiliary_data": `"auxiliary_data":[{"type":"hash_commitment","opening":"` + secretSeedA + `"}]`,
+		"legacy":         `"org.siros.secret_seed":{"ns":"` + secretSeedA + `"}`,
+	} {
+		pending := `{"transaction_id":"t1","interval":1,"credential_metadata":{` + member + `}}`
+		t.Run("credential response/"+name, func(t *testing.T) {
+			st := newIssuerStub(t, pending)
+			fc := &fakeClient{t: t}
+			h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
+			defer cleanup()
+			err := h.issueCredential(context.Background(), st.metadata(nil), tokenBearer(), "cfg", auxCfg(""), nil, "")
+			require.Error(t, err)
+			assert.Len(t, st.requests, 1, "no polling follows")
+			assertNoSecrets(t, "error", err.Error())
+			assertNoSecrets(t, "logs", logDump(logs))
+		})
+		t.Run("deferred 202/"+name, func(t *testing.T) {
+			h, _, cleanup := captureHandler(t)
+			defer cleanup()
+			p := &deferredPoll{h: h}
+			_, done, err := p.plainAnswer(http.StatusAccepted, []byte(pending), 0)
+			require.Error(t, err)
+			assert.True(t, done)
+			assertNoSecrets(t, "error", err.Error())
+		})
+	}
+}
+
+// An optional to_issuer entry with no proof type to carry it must not break an
+// issuance that only asks the client for a response-encryption key.
+func TestGenerateProof_OptionalEntryWithoutProofTypeNeedsNoCredentialType(t *testing.T) {
+	st := newIssuerStub(t, seedResponse)
+	fc := &fakeClient{t: t}
+	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
+	defer cleanup()
+	cfg := auxCfg(`{"to_wallet":[` + auxToWalletSSC + `],"to_issuer":[{"type":"hash_commitment","alg":"sha-256","path":["a","b"]}]}`)
+	cfg.VCT, cfg.ProofTypesSupported, cfg.Format = "", nil, "vc+sd-jwt"
+	require.NoError(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", cfg, nil, ""))
+	assert.NotContains(t, generateProofParams(t, fc), "auxiliary_data_to_issuer")
+}

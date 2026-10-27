@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"strings"
+	"unicode"
 )
 
 // The one decoding step for JSON that an issuer or the client hands the engine
@@ -124,21 +125,42 @@ func objectDepth(stack []map[string]struct{}) int {
 // recordName adds a member name to an object's set, refusing a repeat, a
 // case-variant of another name, and a case-variant of a protocol member.
 func recordName(names map[string]struct{}, key string) error {
-	if _, seen := names[key]; seen {
+	// Names are indexed by their simple case folding, so a lookup replaces a
+	// scan of every earlier name (EqualFold semantics, linear time).
+	folded := foldName(key)
+	if _, seen := names[folded]; seen {
 		return errAmbiguousJSON
 	}
-	for other := range names {
-		if strings.EqualFold(other, key) {
-			return errAmbiguousJSON
-		}
+	if p, ok := protocolFolded[folded]; ok && key != p {
+		return errAmbiguousJSON
 	}
-	for _, p := range protocolMembers {
-		if key != p && strings.EqualFold(key, p) {
-			return errAmbiguousJSON
-		}
-	}
-	names[key] = struct{}{}
+	names[folded] = struct{}{}
 	return nil
+}
+
+// protocolFolded maps the folded form of each protocol member to its name.
+var protocolFolded = func() map[string]string {
+	m := make(map[string]string, len(protocolMembers))
+	for _, p := range protocolMembers {
+		m[foldName(p)] = p
+	}
+	return m
+}()
+
+// foldName maps every rune to the smallest member of its simple case folding
+// orbit, the equivalence strings.EqualFold uses.
+func foldName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		min := r
+		for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+			if f < min {
+				min = f
+			}
+		}
+		b.WriteRune(min)
+	}
+	return b.String()
 }
 
 // containsMember reports whether any object anywhere in a decoded JSON value

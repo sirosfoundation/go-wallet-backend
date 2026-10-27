@@ -2519,7 +2519,9 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 		return nil, nil, err
 	}
 	params.AuxiliaryDataToWallet = delivery.toWallet
-	if len(delivery.toIssuer) > 0 {
+	// Entries travel in a key proof: with no proof type declared there is
+	// nothing to place them in (a required one was refused at selection).
+	if len(delivery.toIssuer) > 0 && h.needsProof(config) {
 		credType := config.VCT
 		if credType == "" {
 			credType = config.Doctype
@@ -2905,6 +2907,11 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			return nil, errors.New("failed to parse credential response")
 		}
 		credResp.ResponseEncryption = respEnc
+		// Every plain response, a pending one too, is checked: a forbidden
+		// member must end the issuance before its metadata is discarded.
+		if err := h.refusePlainSecretMembers(credResp.CredentialMetadata); err != nil {
+			return nil, err
+		}
 
 		return &credResp, nil
 	}
@@ -3114,9 +3121,15 @@ func (p *deferredPoll) plainAnswer(status int, body []byte, attempt int) (*Crede
 		// Still pending, continue polling
 		// Check for new interval if provided in response
 		var pendingResp struct {
-			Interval int `json:"interval,omitempty"`
+			Interval           int             `json:"interval,omitempty"`
+			CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
 		}
-		if err := json.Unmarshal(body, &pendingResp); err == nil && pendingResp.Interval > 0 {
+		if err := json.Unmarshal(body, &pendingResp); err == nil {
+			if err := h.refusePlainSecretMembers(pendingResp.CredentialMetadata); err != nil {
+				return nil, true, err
+			}
+		}
+		if pendingResp.Interval > 0 {
 			p.wait = time.Duration(pendingResp.Interval) * deferredPollIntervalUnit
 		}
 		h.Logger.Debug("Deferred credential still pending",
