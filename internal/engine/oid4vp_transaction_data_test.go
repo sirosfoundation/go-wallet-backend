@@ -516,13 +516,14 @@ func TestValidateTransactionData_EmptyArrayIsRejected(t *testing.T) {
 type executeRecorder struct {
 	verifierHits chan url.Values
 	clientErrors chan FlowErrorMessage
+	signRequests chan SignRequestMessage
 	verifierURL  string
 	handler      *OID4VPHandler
 }
 
 func newExecuteRecorder(t *testing.T, cfg *config.Config, trustSvc *TrustService) *executeRecorder {
 	t.Helper()
-	r := &executeRecorder{verifierHits: make(chan url.Values, 4), clientErrors: make(chan FlowErrorMessage, 8)}
+	r := &executeRecorder{verifierHits: make(chan url.Values, 4), clientErrors: make(chan FlowErrorMessage, 8), signRequests: make(chan SignRequestMessage, 4)}
 
 	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		_ = req.ParseForm()
@@ -542,6 +543,10 @@ func newExecuteRecorder(t *testing.T, cfg *config.Config, trustSvc *TrustService
 			var m FlowErrorMessage
 			if json.Unmarshal(data, &m) == nil && m.Type == TypeFlowError {
 				r.clientErrors <- m
+			}
+			var sr SignRequestMessage
+			if json.Unmarshal(data, &sr) == nil && sr.Type == TypeSignRequest {
+				r.signRequests <- sr
 			}
 		}
 	})
@@ -964,4 +969,95 @@ func TestSignResult_UnknownClientErrorCodeNeverInErrorString(t *testing.T) {
 	_, err = signResult(&SignResponseMessage{Error: "x", ErrorCode: ErrCodeUnsupportedTransactionData})
 	require.ErrorAs(t, err, &se)
 	assert.Equal(t, ErrCodeUnsupportedTransactionData, se.Code)
+}
+
+// End to end: a trusted verifier's transaction_data request reaches a client that
+// declared support; the client then refuses the transaction type in its
+// sign_response (error + error_code). Execute must tell the verifier
+// invalid_transaction_data and give the client the distinct code, not leave the
+// verifier waiting behind a bare SIGN_ERROR.
+func TestExecute_ClientRefusesTransactionDataAtSign_VerifierIsTold(t *testing.T) {
+	const (
+		did      = "did:web:verifier.example"
+		clientID = ClientIDSchemeDecentralizedIdentifier + ":" + did
+		kid      = did + "#jwk-1"
+	)
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	stub := &stubDIDResolver{
+		didDoc: map[string]interface{}{
+			"id": did,
+			"verificationMethod": []interface{}{map[string]interface{}{
+				"id": kid, "type": "JsonWebKey2020", "controller": did, "publicKeyJwk": ecPublicJWK(&key.PublicKey, kid),
+			}},
+		},
+		decisionOk: true, decision: true,
+	}
+	cfg := testConfig()
+	cfg.Trust.PDPURL = "http://pdp.test"
+	trustSvc := trust.NewService(cfg, zap.NewNop(), func(_ string, _ time.Duration) (trust.TrustEvaluator, error) { return stub, nil })
+	r := newExecuteRecorder(t, cfg, trustSvc)
+
+	payload, err := json.Marshal(map[string]any{
+		"client_id": clientID, "response_type": "vp_token", "response_mode": ResponseModeDirectPost,
+		"response_uri": r.verifierURL, "nonce": "n-1", "state": "st-1",
+		"dcql_query":       json.RawMessage(`{"credentials":[{"id":"pay","format":"dc+sd-jwt","meta":{"vct_values":["x"]}}]}`),
+		"transaction_data": []string{string(owfRawEntry(t))},
+	})
+	require.NoError(t, err)
+	q := url.Values{}
+	q.Set("client_id", clientID)
+	q.Set("request", signedKidJWT(t, key, kid, payload))
+
+	session := r.handler.Flow.Session
+	feedAction(t, session, "flow-1", ActionConsent, ConsentPayload{
+		SelectedCredentials: []ConsentSelection{{CredentialQueryID: "pay", CredentialID: "cred-1"}},
+	})
+	go func() {
+		req := <-r.signRequests
+		session.signCh <- &SignResponseMessage{
+			Message:   Message{Type: TypeSignResponse, FlowID: req.FlowID, MessageID: req.MessageID},
+			Error:     "unsupported transaction type",
+			ErrorCode: ErrCodeUnsupportedTransactionData,
+		}
+	}()
+
+	err = r.run(t, &FlowStartMessage{Protocol: ProtocolOID4VP, RequestURI: "openid4vp://?" + q.Encode(), Features: []string{FeatureTransactionDataV1}})
+	var signErr *SignError
+	require.ErrorAs(t, err, &signErr)
+	assert.Equal(t, ErrCodeUnsupportedTransactionData, signErr.Code)
+
+	select {
+	case form := <-r.verifierHits:
+		assert.Equal(t, "invalid_transaction_data", form.Get("error"))
+		assert.Equal(t, "st-1", form.Get("state"))
+	case <-time.After(2 * time.Second):
+		t.Fatal("the verifier was not told the client refused the transaction data")
+	}
+	assert.Equal(t, ErrCodeUnsupportedTransactionData, r.clientError(t).Error.Code)
+}
+
+// A reply delivered straight to the waiting request (the per-request channel,
+// as another request's waiter does) carries the client's refusal the same way.
+func TestSession_RequestSign_ReplyViaOwnChannelBecomesSignError(t *testing.T) {
+	srvConnCh := make(chan *websocket.Conn, 1)
+	clientConn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) { srvConnCh <- srvConn })
+	defer cleanup()
+	session := testSession(<-srvConnCh)
+
+	go func() {
+		var req SignRequestMessage
+		if clientConn.ReadJSON(&req) != nil {
+			return
+		}
+		session.signWaitersMu.Lock()
+		mine := session.signWaiters[req.MessageID]
+		session.signWaitersMu.Unlock()
+		mine <- &SignResponseMessage{Message: Message{MessageID: req.MessageID}, Error: "x", ErrorCode: ErrCodeUnsupportedTransactionData}
+	}()
+	_, err := session.RequestSign(context.Background(), "f", SignActionSignPresentation, SignRequestParams{})
+	var se *SignError
+	require.ErrorAs(t, err, &se)
+	assert.Equal(t, ErrCodeUnsupportedTransactionData, se.Code)
+	assert.Equal(t, "x", se.ClientText())
 }
