@@ -56,6 +56,11 @@ func setupFIDO2AttestationTestHandlers(t *testing.T, enabled bool, trustDecision
 	cfg.Trust.PDPURL = "http://pdp.invalid"
 
 	store := memory.NewStore()
+	// Verify refuses an unknown instance before verifying the attestation, so the
+	// instance the requests name must exist for them to reach the verifier.
+	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{ID: "inst-1", TenantID: domain.DefaultTenantID, Status: domain.InstanceStatusActive}); err != nil {
+		t.Fatalf("seed instance: %v", err)
+	}
 	trustSvc := trust.NewService(cfg, logger, func(endpoint string, timeout time.Duration) (trust.TrustEvaluator, error) {
 		return &stubFIDO2TrustEvaluator{decision: trustDecision}, nil
 	})
