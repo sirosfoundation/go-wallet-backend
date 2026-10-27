@@ -22,7 +22,8 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 )
 
-// An AS passkey session's access token has at most the default max TAC `rwl`.
+// A restricted AS passkey session's access token has at most the max TAC `rwl`
+// (the default `rwlid` also holds `d`).
 // These tests run DELETE /user/session through the real go-tokenauth chain.
 
 type deleteTACEnv struct {
@@ -108,8 +109,8 @@ func (e *deleteTACEnv) stepUpBody(t *testing.T, confirm string) []byte {
 	return body
 }
 
-// The bodyless request needs TAC `d`, which a passkey session (max `rwl`)
-// never holds: this is why the step-up assertion is the route's authorisation.
+// The bodyless request needs TAC `d`, which a passkey session restricted to
+// `rwl` does not hold: there the step-up assertion is the route's authorisation.
 func TestDeleteAccount_TAC_BodylessNeedsDeleteScope(t *testing.T) {
 	e := newDeleteTACEnv(t, false, "rwl")
 	w := e.do(http.MethodDelete, "/user/session", nil)

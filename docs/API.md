@@ -456,8 +456,8 @@ still sweeps the DID-keyed credentials and presentations in every tenant.
 
 Start deleting the account. The caller must confirm it with a fresh passkey
 assertion, so a stolen bearer token alone cannot erase an account. Needs `w` in
-the token's TAC (it stores a short-lived challenge); a passkey session's default
-maximum TAC `rwl` is enough.
+the token's TAC (it stores a short-lived challenge); any passkey session
+qualifies, including one restricted to `rwl`.
 
 **Response:** `200`
 ```json
@@ -513,8 +513,12 @@ after `409` needs a fresh `delete-begin` and assertion.
 | 400 | `CONFIRMATION_REQUIRED` | `confirm` is not `DELETE`; the assertion is not consumed, so the request can be sent again |
 
 A request with a body is authorised by its assertion alone: it does not need
-`d` in the token's TAC, which a passkey session never holds. The bodyless
-request still needs `d`, so it only works for a token that has it.
+`d` in the token's TAC. The bodyless request still needs `d`. Passkey sessions
+hold `d` under the current defaults (`as.default_max_tac` is `rwlid`, and
+`/auth/token` issues the session's maximum when no TAC is requested), so a
+default passkey token can still delete an account without an assertion while
+`user.delete.require_step_up` is false. Restricting `as.default_max_tac` to
+`rwl` makes the assertion the only way for passkey sessions.
 
 **Rollout.** For one release the bodyless `DELETE /user/session` still works,
 so the backend can ship before the clients. Set

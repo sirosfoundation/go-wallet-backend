@@ -172,7 +172,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 			session.DELETE("/", requireTACUnlessStepUp("d"), p.handlers.DeleteUser)
 			// Step-up for DELETE /user/session: only mints assertion options, so `w` (it
 			// stores a short-lived challenge) rather than `d`, which a passkey session
-			// (default max TAC `rwl`) never holds.
+			// holds only under the default max TAC `rwlid`, not when restricted to `rwl`.
 			session.POST("/delete-begin", middleware.MustHaveTAC("w"), p.handlers.BeginDeleteAccount)
 			// Logout: blacklists the caller's own current token (see
 			// api.Handlers.Logout / #382). This handler existed since the
