@@ -1323,3 +1323,51 @@ func TestMemorySessionStore_DeleteByUser_AllTenants(t *testing.T) {
 	_, err = store.Get(ctx, "c")
 	assert.NoError(t, err)
 }
+
+// A token without a tenant_id claim belongs to the default tenant (as the
+// HTTP middleware already treats it), so a WebSocket session for it is
+// indexed and persisted under "default" rather than under an empty tenant.
+func TestManager_validateToken_MissingTenantNormalisedToDefault(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
+	m := NewManager(cfg, zap.NewNop())
+	v, key, issuer := setupEngineTokenValidatorTest(t)
+	m.SetTokenValidator(v)
+
+	token := signEngineToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims: gojosejwt.Claims{Audience: gojosejwt.Audience{"wallet-registry"}},
+		TAC:    "r",
+		ACR:    "urn:siros:acr:passkey",
+	})
+	_, tenantID, _, err := m.validateToken(context.Background(), token)
+	require.NoError(t, err)
+	assert.Equal(t, "default", tenantID)
+}
+
+func TestManager_RegisterSession_EmptyTenantIndexedAsDefault(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
+	m := NewManager(cfg, zap.NewNop())
+	store := NewMemorySessionStore(zap.NewNop())
+	m.SetSessionStore(store)
+	defer m.Close()
+	ctx := context.Background()
+
+	empty := newMultiTenantTestSession(t, "empty", "", "user-nt")
+	require.True(t, m.registerSession(empty))
+	got, err := m.GetSessionByUser("default", "user-nt")
+	require.NoError(t, err, "an empty-tenant session must be found under the default tenant")
+	assert.Same(t, empty, got)
+	_, err = m.GetSessionByUser("", "user-nt")
+	assert.NoError(t, err, "an empty tenant resolves to default on lookup too")
+	_, err = store.GetByUser(ctx, "default", "user-nt")
+	assert.NoError(t, err, "the persisted session must be under the default tenant")
+	listed, err := m.ListSessions(ctx, "")
+	require.NoError(t, err)
+	assert.Len(t, listed, 1)
+
+	// A session explicitly in the default tenant supersedes the empty-tenant one.
+	explicit := newMultiTenantTestSession(t, "explicit", "default", "user-nt")
+	require.True(t, m.registerSession(explicit))
+	assert.True(t, sessionConnClosed(empty))
+	assert.False(t, m.isCurrentSessionForTest(empty))
+	assert.True(t, m.isCurrentSessionForTest(explicit))
+}

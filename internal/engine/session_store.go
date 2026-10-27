@@ -97,7 +97,7 @@ func (m *MemorySessionStore) GetByUser(ctx context.Context, tenantID, userID str
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	sessionID, ok := m.userIndex[userKey{TenantID: tenantID, UserID: userID}]
+	sessionID, ok := m.userIndex[userKey{TenantID: normalizeTenant(tenantID), UserID: userID}]
 	if !ok {
 		return nil, ErrSessionNotFound
 	}
@@ -123,7 +123,7 @@ func (m *MemorySessionStore) Put(ctx context.Context, session *SessionData) erro
 	}
 
 	m.sessions[session.ID] = session
-	m.userIndex[userKey{TenantID: session.TenantID, UserID: session.UserID}] = session.ID
+	m.userIndex[userKey{TenantID: normalizeTenant(session.TenantID), UserID: session.UserID}] = session.ID
 	return nil
 }
 
@@ -136,7 +136,7 @@ func (m *MemorySessionStore) Update(ctx context.Context, session *SessionData) e
 	}
 
 	m.sessions[session.ID] = session
-	m.userIndex[userKey{TenantID: session.TenantID, UserID: session.UserID}] = session.ID
+	m.userIndex[userKey{TenantID: normalizeTenant(session.TenantID), UserID: session.UserID}] = session.ID
 	return nil
 }
 
@@ -150,7 +150,7 @@ func (m *MemorySessionStore) Delete(ctx context.Context, sessionID string) error
 	}
 
 	// Only drop the index entry if it still points at this session.
-	k := userKey{TenantID: session.TenantID, UserID: session.UserID}
+	k := userKey{TenantID: normalizeTenant(session.TenantID), UserID: session.UserID}
 	if m.userIndex[k] == sessionID {
 		delete(m.userIndex, k)
 	}
@@ -182,7 +182,7 @@ func (m *MemorySessionStore) List(ctx context.Context, tenantID string) ([]*Sess
 	var result []*SessionData
 	now := time.Now()
 	for _, session := range m.sessions {
-		if session.TenantID == tenantID && now.Before(session.ExpiresAt) {
+		if normalizeTenant(session.TenantID) == normalizeTenant(tenantID) && now.Before(session.ExpiresAt) {
 			result = append(result, session)
 		}
 	}
@@ -197,7 +197,7 @@ func (m *MemorySessionStore) Cleanup(ctx context.Context) (int64, error) {
 	now := time.Now()
 	for id, session := range m.sessions {
 		if now.After(session.ExpiresAt) {
-			k := userKey{TenantID: session.TenantID, UserID: session.UserID}
+			k := userKey{TenantID: normalizeTenant(session.TenantID), UserID: session.UserID}
 			if m.userIndex[k] == id {
 				delete(m.userIndex, k)
 			}
@@ -301,7 +301,7 @@ func (r *RedisSessionStore) sessionKey(sessionID string) string {
 
 // userKey is the per-(tenant, user) pointer to that user's current session.
 func (r *RedisSessionStore) userKey(tenantID, userID string) string {
-	return r.keyPrefix + "user:" + url.PathEscape(tenantID) + ":" + url.PathEscape(userID)
+	return r.keyPrefix + "user:" + url.PathEscape(normalizeTenant(tenantID)) + ":" + url.PathEscape(userID)
 }
 
 // userSetKey is the sorted set of the IDs of all of a user's sessions across
@@ -312,7 +312,7 @@ func (r *RedisSessionStore) userSetKey(userID string) string {
 }
 
 func (r *RedisSessionStore) tenantKey(tenantID string) string {
-	return r.keyPrefix + "tenant:" + tenantID
+	return r.keyPrefix + "tenant:" + normalizeTenant(tenantID)
 }
 
 func (r *RedisSessionStore) Get(ctx context.Context, sessionID string) (*SessionData, error) {
