@@ -626,8 +626,9 @@ shared between replicas:
   session TTL and the resumption tokens),
 - the active flows and their handler goroutines, and
 - the per-session SSE event buffer used for `Last-Event-ID` replay (a replayed
-  `wmp.flow.complete` never carries `credential_metadata`, `refresh_token`,
-  `dpop_jwk` or `dpop_key_id`; they are delivered only live, see
+  `wmp.flow.complete` never carries `refresh_token`, `dpop_jwk` or `dpop_key_id`
+  (OpenID4x 3.1.4.2); they are delivered only live. The display-only
+  `credential_metadata` is not a secret and is retained, see
   `docs/wmp-migration-analysis.md`).
 
 The Redis session store does **not** change this: it backs the WebSocket
