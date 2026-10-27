@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -172,7 +173,9 @@ func TestNewStandaloneEngineTokenValidator_ChecksJTIRevocation(t *testing.T) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
 	set := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &key.PublicKey, KeyID: "k1", Algorithm: "ES256"}}}
+	var jwksHits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		jwksHits.Add(1)
 		_ = json.NewEncoder(w).Encode(set)
 	}))
 	defer srv.Close()
@@ -198,14 +201,15 @@ func TestNewStandaloneEngineTokenValidator_ChecksJTIRevocation(t *testing.T) {
 		return c
 	}
 	start := func(t *testing.T, bl *service.TokenBlacklist) (*StandaloneValidator, *observer.ObservedLogs) {
+		hitsBefore := jwksHits.Load()
 		core, logs := observer.New(zap.WarnLevel)
 		v, err := NewStandaloneEngineTokenValidator(cfg(), zap.New(core), bl)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = v.Close() })
-		require.Eventually(t, func() bool {
-			_, err := v.Validate(context.Background(), token("probe"))
-			return err == nil || bl != nil // a blacklist may reject the probe; JWKS is then loaded by the next call
-		}, 3*time.Second, 20*time.Millisecond)
+		// Readiness is the JWKS having been served, not the outcome of a probe
+		// validation: a blacklist may legitimately reject the probe, and a
+		// failed fetch must not be mistaken for a revocation verdict.
+		require.Eventually(t, func() bool { return jwksHits.Load() > hitsBefore }, 3*time.Second, 10*time.Millisecond, "JWKS was never fetched")
 		return v, logs
 	}
 	enabled := config.TokenBlacklistConfig{Enabled: true}
@@ -225,10 +229,14 @@ func TestNewStandaloneEngineTokenValidator_ChecksJTIRevocation(t *testing.T) {
 
 	t.Run("store outage rejects", func(t *testing.T) {
 		bl := service.NewTokenBlacklistWithStore(enabled, zap.NewNop(), downRevocationStore{})
-		v, _ := start(t, bl)
-		time.Sleep(200 * time.Millisecond) // let the JWKS load
-		_, err := v.Validate(context.Background(), token("any"))
-		assert.Error(t, err)
+		v, logs := start(t, bl)
+		// Wait for evidence that the revocation checker itself rejected the
+		// token (it logs the store failure), so the keys are loaded and a
+		// JWKS problem cannot satisfy the assertion.
+		require.Eventually(t, func() bool {
+			_, err := v.Validate(context.Background(), token("any"))
+			return err != nil && logs.FilterMessageSnippet("Revocation check failed").Len() > 0
+		}, 3*time.Second, 20*time.Millisecond, "revocation checker never rejected the token")
 	})
 
 	t.Run("without a blacklist the revoked jti is accepted (documented gap, warned)", func(t *testing.T) {
