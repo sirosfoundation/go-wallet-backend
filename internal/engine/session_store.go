@@ -132,7 +132,9 @@ func (m *MemorySessionStore) Put(ctx context.Context, session *SessionData) erro
 	// A user holds one session per tenant: the one the index names is superseded
 	// and dropped, so replaced sessions do not accumulate until Cleanup.
 	k := userKey{TenantID: normalizeTenant(session.TenantID), UserID: session.UserID}
-	if old, ok := m.userIndex[k]; ok {
+	// Anonymous sessions (empty user ID) share one key and are independent, so
+	// they never supersede each other.
+	if old, ok := m.userIndex[k]; ok && session.UserID != "" {
 		delete(m.sessions, old)
 	}
 	m.sessions[session.ID] = session

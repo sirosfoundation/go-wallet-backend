@@ -358,3 +358,18 @@ func TestMemorySessionStore_PutDropsSupersededSession(t *testing.T) {
 	assert.Len(t, store.sessions, 1)
 	assert.Len(t, store.userIndex, 1)
 }
+
+// Anonymous sessions share the (tenant, "") index key but must not supersede
+// each other in the store.
+func TestMemorySessionStore_PutKeepsAnonymousSessions(t *testing.T) {
+	store := NewMemorySessionStore(zap.NewNop())
+	ctx := context.Background()
+	exp := time.Now().Add(time.Hour)
+	require.NoError(t, store.Put(ctx, &SessionData{ID: "a1", TenantID: "t", ExpiresAt: exp}))
+	require.NoError(t, store.Put(ctx, &SessionData{ID: "a2", TenantID: "t", ExpiresAt: exp}))
+	_, err := store.Get(ctx, "a1")
+	require.NoError(t, err)
+	listed, err := store.List(ctx, "t")
+	require.NoError(t, err)
+	assert.Len(t, listed, 2)
+}
