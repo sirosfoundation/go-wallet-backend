@@ -745,8 +745,13 @@ func signRequestFor(t *testing.T, authReq *AuthorizationRequest) SignRequestMess
 			// direct_post.jwt: the client answers with the finished JWE.
 			hdr, _ := json.Marshal(map[string]string{"alg": re.Alg, "enc": re.Enc})
 			seg := base64.RawURLEncoding.EncodeToString
+			// An encrypted key exists only for key-wrapping algorithms.
+			ek := ""
+			if re.Alg != "ECDH-ES" {
+				ek = seg([]byte("k"))
+			}
 			resp = &SignResponseMessage{Message: Message{MessageID: m.MessageID},
-				ResponseJWE: seg(hdr) + "." + seg([]byte("k")) + "." + seg([]byte("i")) + "." + seg([]byte("c")) + "." + seg([]byte("t"))}
+				ResponseJWE: seg(hdr) + "." + ek + "." + seg([]byte("i")) + "." + seg([]byte("c")) + "." + seg([]byte("t"))}
 		}
 		session.signCh <- resp
 		require.NoError(t, <-done)

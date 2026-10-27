@@ -2125,9 +2125,18 @@ func validateResponseJWE(jwe string, want *ResponseEncryption) error {
 		}
 		decoded[i] = b
 	}
-	// The encrypted key is empty only for direct ECDH-ES agreement.
+	// The encrypted key is empty exactly for direct ECDH-ES agreement (RFC
+	// 7516 section 5.1) and present for every key-wrapping algorithm; every
+	// other segment is always present.
+	direct := want.Alg == "ECDH-ES"
 	for i, b := range decoded {
-		if len(b) == 0 && (i != 1 || want.Alg != "ECDH-ES") {
+		if i == 1 && direct {
+			if len(b) != 0 {
+				return errors.New("direct_post.jwt: response_jwe is not a compact JWE")
+			}
+			continue
+		}
+		if len(b) == 0 {
 			return errors.New("direct_post.jwt: response_jwe is not a compact JWE")
 		}
 	}

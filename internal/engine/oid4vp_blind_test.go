@@ -199,6 +199,9 @@ func TestValidateResponseJWE(t *testing.T) {
 	// An encrypted key is required unless the key agreement is direct.
 	kw := &ResponseEncryption{JWK: want.JWK, Alg: "ECDH-ES+A128KW", Enc: "A128GCM"}
 	assert.Error(t, validateResponseJWE(strings.Join([]string{hdr("ECDH-ES+A128KW", "A128GCM", "kid-1"), "", seg[2], seg[3], seg[4]}, "."), kw))
+
+	// A direct ECDH-ES JWE must not carry an encrypted key.
+	assert.Error(t, validateResponseJWE(strings.Join([]string{seg[0], b64("k"), seg[2], seg[3], seg[4]}, "."), want), "ECDH-ES with a nonempty encrypted key")
 }
 
 // --- the sign request / response exchange ---
