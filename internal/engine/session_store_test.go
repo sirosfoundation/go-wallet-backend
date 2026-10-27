@@ -321,3 +321,18 @@ func TestSessionData_JSONRoundtrip(t *testing.T) {
 	assert.Equal(t, original.TenantID, decoded.TenantID)
 	assert.Equal(t, original.Metadata["key"], decoded.Metadata["key"])
 }
+
+// Deleting a superseded session must not drop the index entry of the newer
+// session that replaced it for the same (tenant, user).
+func TestMemorySessionStore_Delete_KeepsNewerSessionIndex(t *testing.T) {
+	store := NewMemorySessionStore(zap.NewNop())
+	ctx := context.Background()
+	exp := time.Now().Add(time.Hour)
+	require.NoError(t, store.Put(ctx, &SessionData{ID: "old", UserID: "u", TenantID: "t", ExpiresAt: exp}))
+	require.NoError(t, store.Put(ctx, &SessionData{ID: "new", UserID: "u", TenantID: "t", ExpiresAt: exp}))
+
+	require.NoError(t, store.Delete(ctx, "old"))
+	got, err := store.GetByUser(ctx, "t", "u")
+	require.NoError(t, err)
+	assert.Equal(t, "new", got.ID)
+}

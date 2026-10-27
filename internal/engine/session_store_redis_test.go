@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -579,4 +580,15 @@ func TestRedisSessionStore_SpecialCharacterIDsAreIsolated(t *testing.T) {
 	assert.ErrorIs(t, err, ErrSessionNotFound)
 	_, err = store.GetByUser(ctx, "a:b", "c")
 	assert.NoError(t, err)
+}
+
+// Even a legacy user ID that is literally the encoded (tenant, user) pair must
+// not share a key with the tenant-scoped pointer: they live in disjoint
+// namespaces (`user:` vs `usert:`).
+func TestRedisSessionStore_LegacyUserIDShapedLikeScopedKeyDoesNotCollide(t *testing.T) {
+	store, _ := newTestRedisStore(t)
+	enc := base64.RawURLEncoding
+	legacyID := enc.EncodeToString([]byte("default")) + ":" + enc.EncodeToString([]byte("u"))
+
+	assert.NotEqual(t, store.legacyUserKey(legacyID), store.userKey("default", "u"))
 }
