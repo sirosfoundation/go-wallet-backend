@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -768,5 +769,35 @@ func TestVerifyJWTWithEmbeddedKey_RejectsKeysMember(t *testing.T) {
 	}
 	if _, err := VerifyJWTWithEmbeddedKey(sign(pub(signer))); err != nil {
 		t.Errorf("a plain single JWK must still verify: %v", err)
+	}
+}
+
+func TestDecodeX5CCert(t *testing.T) {
+	raw := []byte{0xfb, 0xff, 0xfe, 0x01} // std: +//+AQ==, url: -__-AQ
+	std := base64.StdEncoding.EncodeToString(raw)
+	url := base64.RawURLEncoding.EncodeToString(raw)
+	if std == url {
+		t.Fatal("fixture must differ between alphabets")
+	}
+	for name, in := range map[string]string{"standard": std, "unpadded base64url": url} {
+		got, err := DecodeX5CCert(in)
+		if err != nil || string(got) != string(raw) {
+			t.Fatalf("%s: got %x, %v", name, got, err)
+		}
+	}
+
+	// "AB-+" is invalid in both alphabets, at different offsets (2 and 3).
+	const bad = "AB-+"
+	_, err := DecodeX5CCert(bad)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	_, stdErr := base64.StdEncoding.DecodeString(bad)
+	_, urlErr := base64.RawURLEncoding.DecodeString(bad)
+	if stdErr == urlErr {
+		t.Fatal("fixture must fail differently in the two alphabets")
+	}
+	if !errors.Is(err, stdErr) || !errors.Is(err, urlErr) {
+		t.Fatalf("error %q must carry both decode failures", err)
 	}
 }

@@ -4,7 +4,6 @@ import (
 	"math"
 	"net/http"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -205,7 +204,6 @@ func AuthRateLimitMiddlewareWithResponse(rl *AuthRateLimiter, extractID func(*gi
 
 		if !rl.Allow(identifier) {
 			c.Header("Retry-After", strconv.Itoa(rl.config.LockoutSeconds))
-			exposeRetryAfter(c.Writer.Header())
 			c.JSON(http.StatusTooManyRequests, body)
 			c.Abort()
 			return
@@ -213,29 +211,4 @@ func AuthRateLimitMiddlewareWithResponse(rl *AuthRateLimiter, extractID func(*gi
 
 		c.Next()
 	}
-}
-
-// exposeRetryAfter makes Retry-After readable by cross-origin browser clients.
-// The CORS middleware only lists the configured exposed headers, so append it
-// to Access-Control-Expose-Headers when the CORS middleware set that header
-// (i.e. this is a CORS request), preserving existing values.
-func exposeRetryAfter(h http.Header) {
-	const key = "Access-Control-Expose-Headers"
-	vals := h.Values(key)
-	if len(vals) == 0 {
-		return
-	}
-	var toks []string
-	for _, v := range vals {
-		for _, t := range strings.Split(v, ",") {
-			t = strings.TrimSpace(t)
-			if strings.EqualFold(t, "Retry-After") {
-				return
-			}
-			if t != "" {
-				toks = append(toks, t)
-			}
-		}
-	}
-	h.Set(key, strings.Join(append(toks, "Retry-After"), ", "))
 }

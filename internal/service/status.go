@@ -25,7 +25,9 @@ import (
 // accepted by the trust service (go-trust); everything else is "undetermined"
 // with a Reason. No outcome ever says a credential is valid.
 //
-// Privacy: the requested URIs reveal what a user holds, so this service never
+// Privacy: a requested list URI identifies a status list published by a
+// specific issuer, so asking for it reveals that the user holds a credential
+// from that issuer (though not which credential), and this service never
 // logs a URI or the Checker's errors (they contain URIs), emits no audit
 // events, persists nothing and is not handed the user. Its only state is the
 // Checker's in-process cache of public data.
@@ -35,7 +37,9 @@ type StatusService struct {
 	maxLists     int
 	timeout      time.Duration
 	maxListBytes int
-	now          func() time.Time
+	// allowHTTP accepts plain-http list URIs (http_client.AllowsPlaintext).
+	allowHTTP bool
+	now       func() time.Time
 }
 
 // StatusLister is the verified-list accessor of statuslist.Checker.
@@ -108,13 +112,21 @@ func NewStatusService(cfg *config.Config, trustSvc *trust.Service, logger *zap.L
 	if !sc.Enabled {
 		return nil
 	}
-	// The list URI is chosen by the caller, so the guards stay on even when the
-	// deployment's global opt-outs are set for its own internal services.
-	checker := statuslist.NewChecker(cfg.HTTPClient.NewStrictHTTPClient(0), false, nil).
+	// The list URI is chosen by the caller, so it is fetched like every other
+	// untrusted URL: through the operator's http_client policy. The defaults
+	// (HTTPS only, no private/loopback/link-local/metadata addresses, redirects
+	// and DNS answers re-checked) hold unless the operator opts out with
+	// allow_http, allow_private_ips or insecure_skip_verify, for example to
+	// check lists from a local test issuer. The fetched list is verified and
+	// its signer trust-evaluated whatever the policy.
+	allowHTTP := cfg.HTTPClient.AllowsPlaintext()
+	checker := statuslist.NewChecker(cfg.HTTPClient.NewHTTPClient(0), allowHTTP, nil).
 		WithSignerTrustAction(statusSignerTrust(trustSvc, sc.StatusListSignerFallback)).
 		WithMinEntries(sc.StatusListMinEntries).
 		WithMaxConcurrentLoads(sc.StatusListMaxConcurrentLoads)
-	return NewStatusServiceWithLister(checker, sc, logger)
+	svc := NewStatusServiceWithLister(checker, sc, logger)
+	svc.allowHTTP = allowHTTP
+	return svc
 }
 
 // NewStatusServiceWithLister builds the service around any StatusLister
@@ -183,20 +195,9 @@ func (s *StatusService) Lists(ctx context.Context, tenantID string, reqs []Statu
 	if len(reqs) > s.maxLists {
 		return nil, fmt.Errorf("%w: at most %d", ErrStatusTooManyLists, s.maxLists)
 	}
-	distinct := make([]StatusListRequest, 0, len(reqs))
-	seen := make(map[string]struct{}, len(reqs))
-	for _, r := range reqs {
-		if r.URI == "" {
-			return nil, fmt.Errorf("%w: an item has no uri", ErrStatusInvalidRequest)
-		}
-		if len(r.ETag) > maxStatusETagLength {
-			return nil, fmt.Errorf("%w: etag too long", ErrStatusInvalidRequest)
-		}
-		if _, dup := seen[r.URI]; dup {
-			continue
-		}
-		seen[r.URI] = struct{}{}
-		distinct = append(distinct, r)
+	distinct, err := distinctStatusRequests(reqs)
+	if err != nil {
+		return nil, err
 	}
 
 	start := s.now()
@@ -216,14 +217,44 @@ func (s *StatusService) Lists(ctx context.Context, tenantID string, reqs []Statu
 
 	// A token can expire while the batch waits on slower lists or on trust
 	// evaluation, so exp is rechecked at the end, not only at load.
-	end := s.now()
+	expireStale(results, s.now())
+	s.logSummary(results, start)
+	return results, nil
+}
+
+// distinctStatusRequests validates reqs and drops repeated uris (the first
+// etag of a uri wins), keeping first-occurrence order.
+func distinctStatusRequests(reqs []StatusListRequest) ([]StatusListRequest, error) {
+	distinct := make([]StatusListRequest, 0, len(reqs))
+	seen := make(map[string]struct{}, len(reqs))
+	for _, r := range reqs {
+		if r.URI == "" {
+			return nil, fmt.Errorf("%w: an item has no uri", ErrStatusInvalidRequest)
+		}
+		if len(r.ETag) > maxStatusETagLength {
+			return nil, fmt.Errorf("%w: etag too long", ErrStatusInvalidRequest)
+		}
+		if _, dup := seen[r.URI]; dup {
+			continue
+		}
+		seen[r.URI] = struct{}{}
+		distinct = append(distinct, r)
+	}
+	return distinct, nil
+}
+
+// expireStale turns every result whose token has expired by now into an
+// undetermined/expired one.
+func expireStale(results []StatusListResult, now time.Time) {
 	for i, r := range results {
-		if r.tokenExp != nil && !end.Before(*r.tokenExp) {
+		if r.tokenExp != nil && !now.Before(*r.tokenExp) {
 			results[i] = StatusListResult{URI: r.URI, State: StatusStateUndetermined, Reason: string(statuslist.ReasonExpired)}
 		}
 	}
+}
 
-	// Counts, outcomes and duration only: never a uri, never a user.
+// logSummary logs counts, outcomes and duration only: never a uri, never a user.
+func (s *StatusService) logSummary(results []StatusListResult, start time.Time) {
 	var verified, notModified, undetermined int
 	reasons := map[string]int{}
 	for _, r := range results {
@@ -246,7 +277,6 @@ func (s *StatusService) Lists(ctx context.Context, tenantID string, reqs []Statu
 		fields = append(fields, zap.Int("undetermined_"+reason, n))
 	}
 	s.logger.Debug("status lists served", fields...)
-	return results, nil
 }
 
 // one resolves a single list; anything but a complete List result is undetermined.
@@ -256,11 +286,11 @@ func (s *StatusService) one(ctx context.Context, r StatusListRequest) (res Statu
 	}
 	// gin does not recover this goroutine; a panic must not crash or read as success.
 	defer func() {
-		if p := recover(); p != nil {
+		if recover() != nil {
 			res = undetermined(statuslist.ReasonMalformed)
 		}
 	}()
-	if !statusURIAllowed(r.URI) {
+	if !statusURIAllowed(r.URI, s.allowHTTP) {
 		return undetermined(statuslist.ReasonURINotAllowed)
 	}
 	vl, err := s.lister.List(ctx, r.URI)
@@ -305,9 +335,9 @@ func (s *StatusService) one(ctx context.Context, r StatusListRequest) (res Statu
 	return out
 }
 
-// statusURIAllowed accepts an absolute https URI with a host, no userinfo and
-// no fragment, of bounded length.
-func statusURIAllowed(raw string) bool {
+// statusURIAllowed accepts an absolute https URI (http too when allowHTTP) with
+// a host, no userinfo and no fragment, of bounded length.
+func statusURIAllowed(raw string, allowHTTP bool) bool {
 	if len(raw) > maxStatusURILength {
 		return false
 	}
@@ -315,5 +345,6 @@ func statusURIAllowed(raw string) bool {
 	if err != nil {
 		return false
 	}
-	return u.Scheme == "https" && u.Hostname() != "" && u.User == nil && u.Fragment == "" && u.Opaque == ""
+	schemeOK := u.Scheme == "https" || (allowHTTP && u.Scheme == "http")
+	return schemeOK && u.Hostname() != "" && u.User == nil && u.Fragment == "" && u.Opaque == ""
 }

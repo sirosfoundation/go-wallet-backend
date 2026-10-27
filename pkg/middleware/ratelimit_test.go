@@ -320,11 +320,10 @@ func TestAuthRateLimiter_LockoutExpiry(t *testing.T) {
 	// The limiter may still reject due to rate limiting vs lockout
 }
 
-func TestAuthRateLimit429ExposesRetryAfter(t *testing.T) {
+func TestAuthRateLimit429SetsRetryAfter(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	rl := NewAuthRateLimiter(config.AuthRateLimitConfig{Enabled: true, MaxAttempts: 1, WindowSeconds: 60, LockoutSeconds: 30}, zap.NewNop())
 	router := gin.New()
-	router.Use(func(c *gin.Context) { c.Header("Access-Control-Expose-Headers", "X-Private-Data-ETag") })
 	router.POST("/a", AuthRateLimitMiddlewareWithResponse(rl, func(*gin.Context) string { return "u" }, gin.H{"error": "x"}), func(c *gin.Context) { c.String(200, "ok") })
 	var w *httptest.ResponseRecorder
 	for i := 0; i < 5; i++ {
@@ -335,33 +334,12 @@ func TestAuthRateLimit429ExposesRetryAfter(t *testing.T) {
 	if w.Code != http.StatusTooManyRequests {
 		t.Fatalf("code = %d", w.Code)
 	}
-	got := w.Header().Get("Access-Control-Expose-Headers")
-	if got != "X-Private-Data-ETag, Retry-After" {
-		t.Fatalf("expose = %q", got)
-	}
 	if w.Header().Get("Retry-After") != "30" {
 		t.Fatalf("Retry-After = %q", w.Header().Get("Retry-After"))
 	}
-}
-
-func TestExposeRetryAfter(t *testing.T) {
-	tests := []struct{ name, in, want string }{
-		{"no cors", "", ""},
-		{"append", "X-A", "X-A, Retry-After"},
-		{"wildcard still gets explicit", "*", "*, Retry-After"},
-		{"wildcard among others", "X-A, *", "X-A, *, Retry-After"},
-		{"already explicit", "X-A, retry-after", "X-A, retry-after"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h := http.Header{}
-			if tt.in != "" {
-				h.Set("Access-Control-Expose-Headers", tt.in)
-			}
-			exposeRetryAfter(h)
-			if got := h.Get("Access-Control-Expose-Headers"); got != tt.want {
-				t.Fatalf("got %q, want %q", got, tt.want)
-			}
-		})
+	// Cross-origin readability is the CORS configuration's job (its default
+	// exposed headers include Retry-After), not this middleware's.
+	if got := w.Header().Get("Access-Control-Expose-Headers"); got != "" {
+		t.Fatalf("middleware must not touch Access-Control-Expose-Headers, got %q", got)
 	}
 }

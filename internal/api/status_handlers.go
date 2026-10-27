@@ -6,12 +6,12 @@ import (
 	"io"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
 // maxStatusRequestBytes bounds the request body.
@@ -103,33 +103,11 @@ func (h *Handlers) StatusLists(c *gin.Context) {
 	c.JSON(http.StatusOK, StatusListsResponse{Results: results})
 }
 
-// addHeaderToken appends token to a comma-separated header (e.g. Vary)
-// without dropping values set earlier, such as Vary: Origin from the CORS
-// middleware, and without duplicating it (case-insensitive).
-func addHeaderToken(h http.Header, key, token string) {
-	var toks []string
-	for _, v := range h.Values(key) {
-		for _, t := range strings.Split(v, ",") {
-			t = strings.TrimSpace(t)
-			if t == "*" {
-				return
-			}
-			if strings.EqualFold(t, token) {
-				return
-			}
-			if t != "" {
-				toks = append(toks, t)
-			}
-		}
-	}
-	h.Set(key, strings.Join(append(toks, token), ", "))
-}
-
 // setStatusCacheHeaders sets private Cache-Control (max-age is the shortest
 // remaining freshness, capped by ttl; no-store if any list is undetermined)
 // and, for a single list, ETag.
 func setStatusCacheHeaders(c *gin.Context, results []service.StatusListResult, now time.Time) {
-	addHeaderToken(c.Writer.Header(), "Vary", "Authorization")
+	middleware.AddHeaderToken(c.Writer.Header(), "Vary", "Authorization")
 	maxAge := int64(-1)
 	for _, r := range results {
 		if r.State == service.StatusStateUndetermined || r.FreshUntil == nil {

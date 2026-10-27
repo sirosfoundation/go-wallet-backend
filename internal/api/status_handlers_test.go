@@ -98,7 +98,7 @@ func decodeStatus(t *testing.T, w *httptest.ResponseRecorder) StatusListsRespons
 	return resp
 }
 
-func errCode(t *testing.T, w *httptest.ResponseRecorder) string {
+func statusErrCode(t *testing.T, w *httptest.ResponseRecorder) string {
 	t.Helper()
 	var m map[string]any
 	if err := json.Unmarshal(w.Body.Bytes(), &m); err != nil {
@@ -111,7 +111,7 @@ func errCode(t *testing.T, w *httptest.ResponseRecorder) string {
 func TestStatusLists_NilService503(t *testing.T) {
 	_, router := setupStatusTestHandlers(t, nil, zap.NewNop(), nil)
 	w := postStatus(router, `{"lists":[{"uri":"https://a.example/l"}]}`)
-	if w.Code != http.StatusServiceUnavailable || errCode(t, w) != "STATUS_NOT_SUPPORTED" {
+	if w.Code != http.StatusServiceUnavailable || statusErrCode(t, w) != "STATUS_NOT_SUPPORTED" {
 		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
 	}
 }
@@ -218,7 +218,7 @@ func TestStatusLists_BadRequests(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			w := postStatus(router, tc.body)
-			if w.Code != http.StatusBadRequest || errCode(t, w) != tc.code {
+			if w.Code != http.StatusBadRequest || statusErrCode(t, w) != tc.code {
 				t.Fatalf("status = %d body = %s, want 400 %s", w.Code, w.Body.String(), tc.code)
 			}
 		})
@@ -233,7 +233,7 @@ func TestStatusLists_BodyTooLarge413(t *testing.T) {
 	fake := &statusFake{fn: func(context.Context, string) (*statuslist.VerifiedList, error) { return fakeVerified(), nil }}
 	_, router := setupStatusTestHandlers(t, fake, zap.NewNop(), nil)
 	w := postStatus(router, `{"lists":[{"uri":"https://a.example/`+strings.Repeat("a", maxStatusRequestBytes)+`"}]}`)
-	if w.Code != http.StatusRequestEntityTooLarge || errCode(t, w) != "REQUEST_TOO_LARGE" {
+	if w.Code != http.StatusRequestEntityTooLarge || statusErrCode(t, w) != "REQUEST_TOO_LARGE" {
 		t.Fatalf("status = %d body = %.200s", w.Code, w.Body.String())
 	}
 }
@@ -242,7 +242,7 @@ func TestStatusLists_OversizedTrailingWhitespace413(t *testing.T) {
 	fake := &statusFake{fn: func(context.Context, string) (*statuslist.VerifiedList, error) { return fakeVerified(), nil }}
 	_, router := setupStatusTestHandlers(t, fake, zap.NewNop(), nil)
 	w := postStatus(router, `{"lists":[{"uri":"https://a.example/1"}]}`+strings.Repeat(" ", maxStatusRequestBytes))
-	if w.Code != http.StatusRequestEntityTooLarge || errCode(t, w) != "REQUEST_TOO_LARGE" {
+	if w.Code != http.StatusRequestEntityTooLarge || statusErrCode(t, w) != "REQUEST_TOO_LARGE" {
 		t.Fatalf("status = %d body = %.200s", w.Code, w.Body.String())
 	}
 	// Modest trailing whitespace is fine.
@@ -380,15 +380,5 @@ func TestStatusLists_VaryPreservesExistingValues(t *testing.T) {
 	got := strings.Join(w.Header().Values("Vary"), ",")
 	if !strings.Contains(got, "Origin") || !strings.Contains(got, "Authorization") {
 		t.Fatalf("Vary = %q, want both Origin and Authorization", got)
-	}
-}
-
-func TestAddHeaderToken(t *testing.T) {
-	h := http.Header{}
-	h.Add("Vary", "Origin, Accept-Encoding")
-	addHeaderToken(h, "Vary", "authorization")
-	addHeaderToken(h, "Vary", "Authorization")
-	if got := h.Get("Vary"); got != "Origin, Accept-Encoding, authorization" {
-		t.Fatalf("Vary = %q", got)
 	}
 }

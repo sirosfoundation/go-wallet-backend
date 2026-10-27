@@ -93,7 +93,7 @@ components:
                 type: string
                 format: uri
                 maxLength: 2048
-                description: Exact status.status_list.uri of the credential; https only.
+                description: Exact status.status_list.uri of the credential; https only unless the operator allows plain HTTP (http_client.allow_http).
               etag:
                 type: string
                 maxLength: 128

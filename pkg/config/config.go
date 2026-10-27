@@ -438,7 +438,13 @@ const (
 // docs/adr/013-status-checking-outside-the-engine.md.
 type StatusCheckConfig struct {
 	// Enabled turns the API on; when false the route answers 503
-	// STATUS_NOT_SUPPORTED. Default: true. Env: WALLET_STATUS_CHECK_ENABLED
+	// STATUS_NOT_SUPPORTED. Default: true. Status list URIs are chosen by the
+	// caller, so lists are fetched like any other untrusted URL, under the
+	// http_client policy: HTTPS only and no private, loopback, link-local or
+	// cloud-metadata addresses unless http_client.allow_http or
+	// http_client.allow_private_ips (or insecure_skip_verify) is set, e.g. for
+	// a local test issuer. Fetched lists are always signature-verified and
+	// their signer trust-evaluated. Env: WALLET_STATUS_CHECK_ENABLED
 	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
 
 	// StatusListSignerFallback: when go-trust errors on the `status-list-signer`
@@ -500,7 +506,8 @@ type HTTPClientConfig struct {
 	AllowPrivateIPs bool `yaml:"allow_private_ips" envconfig:"ALLOW_PRIVATE_IPS"`
 	// AllowHTTP permits non-TLS (plain HTTP) for every fetch that goes through
 	// the client this configuration builds - request objects, issuer and
-	// verifier metadata, JWKS, logos, registry and proxy calls - not only for
+	// verifier metadata, JWKS, logos, registry and proxy calls and Token Status
+	// List fetches (status_check) - not only for
 	// metadata resolution, which was its scope while the resolver was the sole
 	// consumer. Code that builds its own client rather than taking this one is
 	// not governed by it; see NewHTTPClient for which paths those are.
@@ -583,16 +590,6 @@ type HTTPClientConfig struct {
 // address this process never saw. A deployment that relies on an egress proxy
 // should enforce its own egress policy there.
 func (c HTTPClientConfig) NewHTTPClient(timeoutOverride time.Duration) *http.Client {
-	return c.newHTTPClient(timeoutOverride, nil)
-}
-
-// NewStrictHTTPClient is NewHTTPClient with the address and scheme guards
-// always on: allow_private_ips, allow_http and insecure_skip_verify are
-// ignored. Use it for fetches whose URL a caller chooses and that must reach
-// public HTTPS hosts only, whatever the deployment allows for its own
-// internal services.
-func (c HTTPClientConfig) NewStrictHTTPClient(timeoutOverride time.Duration) *http.Client {
-	c.AllowPrivateIPs, c.AllowHTTP, c.InsecureSkipVerify = false, false, false
 	return c.newHTTPClient(timeoutOverride, nil)
 }
 
@@ -1234,6 +1231,9 @@ type CORSConfig struct {
 	AllowedHeaders []string `yaml:"allowed_headers" envconfig:"ALLOWED_HEADERS"`
 
 	// ExposedHeaders is a list of headers that browsers are allowed to access.
+	// Default: X-Private-Data-ETag and Retry-After (sent with every 429). An
+	// explicit list replaces the defaults, so it must keep Retry-After for
+	// cross-origin clients to read it.
 	ExposedHeaders []string `yaml:"exposed_headers" envconfig:"EXPOSED_HEADERS"`
 
 	// AllowCredentials indicates whether the request can include credentials.
@@ -1280,7 +1280,7 @@ func (c *CORSConfig) SetDefaults() {
 		}
 	}
 	if len(c.ExposedHeaders) == 0 {
-		c.ExposedHeaders = []string{"X-Private-Data-ETag"}
+		c.ExposedHeaders = []string{"X-Private-Data-ETag", "Retry-After"}
 	}
 	if c.MaxAge == 0 {
 		c.MaxAge = 43200 // 12 hours

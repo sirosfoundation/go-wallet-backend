@@ -5,10 +5,12 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -381,23 +383,110 @@ func TestStatusSignerTrust(t *testing.T) {
 	})
 }
 
-// The status fetch client keeps its address and scheme guards when the
-// deployment's global opt-outs are set.
-func TestNewStatusService_GuardsSurviveGlobalOptOuts(t *testing.T) {
-	var hits int
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hits++ }))
-	defer srv.Close()
+// reachProbe is a loopback server that records whether it was connected to
+// (conns) and whether a request got as far as the handler (hits), so a test can
+// tell which layer of the outbound policy stopped a fetch.
+type reachProbe struct {
+	srv   *httptest.Server
+	conns atomic.Int32
+	hits  atomic.Int32
+}
 
-	cfg := &config.Config{
-		StatusCheck: config.StatusCheckConfig{Enabled: true},
-		HTTPClient:  config.HTTPClientConfig{AllowPrivateIPs: true, AllowHTTP: true, InsecureSkipVerify: true},
+func newReachProbe(t *testing.T, tls bool) *reachProbe {
+	t.Helper()
+	p := &reachProbe{}
+	p.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		p.hits.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	p.srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			p.conns.Add(1)
+		}
 	}
-	svc := NewStatusService(cfg, nil, zap.NewNop())
-	res, err := svc.Lists(context.Background(), "t", []StatusListRequest{{URI: srv.URL + "/l/1"}})
-	if err != nil {
-		t.Fatal(err)
+	if tls {
+		p.srv.StartTLS()
+	} else {
+		p.srv.Start()
 	}
-	if res[0].State != StatusStateUndetermined || hits != 0 {
-		t.Fatalf("result = %+v, hits = %d: a loopback list host must not be reached", res[0], hits)
+	t.Cleanup(p.srv.Close)
+	return p
+}
+
+// The status fetcher follows the operator's http_client policy like every
+// other untrusted-URL fetch: strict by default, and each toggle relaxes
+// exactly its own restriction and nothing else. The list is then still
+// signature-verified and trust-evaluated (nil trust service here, so every
+// list ends undetermined; what differs is how far the fetch got).
+func TestNewStatusService_HonoursHTTPClientPolicy(t *testing.T) {
+	tests := []struct {
+		name string
+		http config.HTTPClientConfig
+		// Expected progress against a loopback http server and a loopback
+		// self-signed TLS server.
+		plainConn, tlsConn bool // a connection was made at all
+		tlsHit             bool // a TLS request reached the handler (certificate accepted)
+		allowsHTTPURI      bool
+	}{
+		{name: "default is strict"},
+		{name: "allow_http alone keeps the address guard", http: config.HTTPClientConfig{AllowHTTP: true}, allowsHTTPURI: true},
+		{name: "insecure_skip_verify alone keeps the address guard", http: config.HTTPClientConfig{InsecureSkipVerify: true}, allowsHTTPURI: true},
+		{name: "allow_private_ips reaches private hosts but still verifies certificates", http: config.HTTPClientConfig{AllowPrivateIPs: true},
+			plainConn: true, tlsConn: true, allowsHTTPURI: true},
+		{name: "private plus insecure_skip_verify accepts the certificate", http: config.HTTPClientConfig{AllowPrivateIPs: true, InsecureSkipVerify: true},
+			plainConn: true, tlsConn: true, tlsHit: true, allowsHTTPURI: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plain, tlsSrv := newReachProbe(t, false), newReachProbe(t, true)
+			cfg := &config.Config{StatusCheck: config.StatusCheckConfig{Enabled: true}, HTTPClient: tt.http}
+			svc := NewStatusService(cfg, nil, zap.NewNop())
+			if svc.allowHTTP != tt.allowsHTTPURI {
+				t.Fatalf("allowHTTP = %v, want %v", svc.allowHTTP, tt.allowsHTTPURI)
+			}
+			res, err := svc.Lists(context.Background(), "t", []StatusListRequest{
+				{URI: plain.srv.URL + "/l/1"}, {URI: tlsSrv.srv.URL + "/l/2"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, r := range res {
+				if r.State != StatusStateUndetermined {
+					t.Fatalf("result = %+v: a list from an unverifiable fetch must never be verified", r)
+				}
+			}
+			if got := plain.conns.Load() > 0; got != tt.plainConn {
+				t.Errorf("plain http server connected = %v, want %v", got, tt.plainConn)
+			}
+			if got := tlsSrv.conns.Load() > 0; got != tt.tlsConn {
+				t.Errorf("TLS server connected = %v, want %v", got, tt.tlsConn)
+			}
+			if got := tlsSrv.hits.Load() > 0; got != tt.tlsHit {
+				t.Errorf("TLS request reached handler = %v, want %v", got, tt.tlsHit)
+			}
+		})
+	}
+}
+
+func TestStatusURIAllowed(t *testing.T) {
+	for _, tt := range []struct {
+		uri       string
+		strict    bool
+		allowHTTP bool
+	}{
+		{"https://status.example/l", true, true},
+		{"http://status.example/l", false, true},
+		{"ftp://status.example/l", false, false},
+		{"https://user@status.example/l", false, false},
+		{"https://status.example/l#f", false, false},
+		{"https:///l", false, false},
+		{"//status.example/l", false, false},
+	} {
+		if got := statusURIAllowed(tt.uri, false); got != tt.strict {
+			t.Errorf("%q strict = %v, want %v", tt.uri, got, tt.strict)
+		}
+		if got := statusURIAllowed(tt.uri, true); got != tt.allowHTTP {
+			t.Errorf("%q allowHTTP = %v, want %v", tt.uri, got, tt.allowHTTP)
+		}
 	}
 }

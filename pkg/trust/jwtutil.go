@@ -508,14 +508,17 @@ func FetchJWKS(ctx context.Context, uri string, client *http.Client) (interface{
 }
 
 // DecodeX5CCert decodes one x5c certificate string: standard base64 (RFC 7515),
-// else unpadded base64url, which some publishers emit.
+// else unpadded base64url, which some publishers emit. When both fail the
+// error carries both decode failures.
 func DecodeX5CCert(s string) ([]byte, error) {
 	der, err := base64.StdEncoding.DecodeString(s)
 	if err == nil {
 		return der, nil
 	}
-	if der, err2 := base64.RawURLEncoding.DecodeString(s); err2 == nil {
+	der, urlErr := base64.RawURLEncoding.DecodeString(s)
+	if urlErr == nil {
 		return der, nil
 	}
-	return nil, err
+	// Neither alphabet decodes it: report both attempts, not just the first.
+	return nil, fmt.Errorf("x5c entry is neither standard base64 (%w) nor unpadded base64url (%w)", err, urlErr)
 }

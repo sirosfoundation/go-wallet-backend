@@ -303,7 +303,7 @@ tokens are rejected. Rate limited per user (falling back to the tenant), see
   (see Privacy); the server only enforces the cap.
 - `uri`: the exact `status.status_list.uri` string of the credential, `https`
   only. A repeated `uri` is collapsed: one result per distinct `uri`, in first-
-  occurrence order. A `uri` that is not an acceptable `https` URI gets a result
+  occurrence order. A `uri` that is not an acceptable `https` URI (or `http` when the operator allows plain HTTP) gets a result
   with `reason: "uri_not_allowed"` rather than failing the request.
 - `etag` (optional): the `etag` of the version the client already holds.
 
@@ -405,10 +405,25 @@ valid, and keep the last confirmed state (do not downgrade a credential to
 - Back off on `429`/`503`/`undetermined`; honour `Retry-After`.
 - Do not request lists for credentials that carry no `status.status_list`.
 
+##### Outbound fetch policy
+
+List URIs are chosen by the client, so the backend fetches them like every
+other untrusted URL, under the `http_client` settings. By default only HTTPS is
+accepted and private, loopback, link-local and cloud-metadata addresses are
+refused (on every redirect hop and DNS answer). An operator can relax this for
+a test or development deployment with `http_client.allow_http` (plain HTTP),
+`http_client.allow_private_ips` (private addresses; this also permits plain HTTP,
+see `AllowsPlaintext`) or `http_client.insecure_skip_verify`, each relaxing only
+its own restriction. Whatever is fetched is still signature-verified and its
+signer trust-evaluated, so a relaxed policy never makes a list `verified`
+without the signer being trusted.
+
 ##### Privacy properties
 
-The list URIs a user asks for reveal which issuers and credential types the
-user holds, so the backend is built not to learn or keep that:
+Each list URI a user asks for identifies a status list published by a specific
+issuer, so asking for it reveals that the user holds a credential from that
+issuer (though not which credential, as a list covers many). The backend is
+built not to learn or keep that:
 
 - The request is a `POST` body: URIs are not in URLs or access logs.
 - URIs are **never logged**, at any level, alone or with a user or subject
