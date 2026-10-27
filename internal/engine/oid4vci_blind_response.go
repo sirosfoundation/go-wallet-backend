@@ -190,10 +190,13 @@ func (h *OID4VCIHandler) relayEncryptedResponse(ctx context.Context, jwe string,
 	}
 	resp, err := h.RequestSign(ctx, SignActionDecryptCredentialResponse, SignRequestParams{JWE: jwe, Deferred: &deferred})
 	if err != nil {
+		// RequestSign turns a client-reported failure into a SignError; its text is
+		// the client's and is neither logged nor relayed.
+		var signErr *SignError
+		if errors.As(err, &signErr) {
+			return nil, errors.New("client could not decrypt the credential response")
+		}
 		return nil, err
-	}
-	if resp.Error != "" {
-		return nil, errors.New("client could not decrypt the credential response")
 	}
 	out := &CredentialResponse{Encrypted: true, ResponseEncryption: enc}
 	switch {

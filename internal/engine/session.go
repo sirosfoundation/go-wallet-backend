@@ -1496,10 +1496,10 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 		case <-s.closeCh:
 			return nil, errors.New("session closed")
 		case resp := <-mine:
-			return resp, nil
+			return signResult(resp)
 		case resp := <-s.signCh:
 			if resp.MessageID == messageID {
-				return resp, nil
+				return signResult(resp)
 			}
 			// Another pending request's reply: hand it to its owner.
 			s.signWaitersMu.Lock()
@@ -1513,6 +1513,45 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 			}
 		}
 	}
+}
+
+// SignError is a sign failure reported by the client, with the client's
+// classification of it. The client's text is client-controlled and might echo
+// request or response content (a JWE plaintext, a seed), so it is unexported,
+// Error() never includes it, and it is not serialised if the error is dumped.
+// Callers must not log or relay ClientText.
+type SignError struct {
+	text string
+	Code ErrorCode
+}
+
+// ClientText is the client's own description of the failure (untrusted; never
+// log or relay it).
+func (e *SignError) ClientText() string { return e.text }
+
+func (e *SignError) Error() string {
+	if e.Code != "" {
+		return "client failed the sign request (" + string(e.Code) + ")"
+	}
+	return "client failed the sign request"
+}
+
+// allowedSignErrorCode keeps only the client-supplied codes the engine acts on.
+// Anything else is client-controlled text that could end up in logs (Error()
+// prints the code), so it is dropped.
+func allowedSignErrorCode(c ErrorCode) ErrorCode {
+	if c == ErrCodeUnsupportedTransactionData {
+		return c
+	}
+	return ""
+}
+
+// signResult turns a client-reported sign failure into an error.
+func signResult(resp *SignResponseMessage) (*SignResponseMessage, error) {
+	if resp.Error != "" {
+		return nil, &SignError{text: resp.Error, Code: allowedSignErrorCode(resp.ErrorCode)}
+	}
+	return resp, nil
 }
 
 // MatchTimeout is the timeout for credential matching requests.

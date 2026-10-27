@@ -834,3 +834,134 @@ func TestValidateAuthorizationRequest_TransactionDataWithoutDCQLIsRefused(t *tes
 		})
 	}
 }
+
+// failSignHarness runs failSign against a verifier endpoint and a client socket,
+// returning what the verifier's response_uri received (nil when never contacted)
+// and the flow errors the client saw.
+func failSignHarness(t *testing.T, td []TransactionData, err error) (url.Values, []FlowErrorMessage) {
+	t.Helper()
+	var form url.Values
+	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.NoError(t, r.ParseForm())
+		form = r.PostForm
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer verifier.Close()
+
+	errs := make(chan FlowErrorMessage, 4)
+	conn, cleanup := wsTestServer(t, func(srv *websocket.Conn) {
+		defer srv.Close()
+		for {
+			_, data, err := srv.ReadMessage()
+			if err != nil {
+				return
+			}
+			var m FlowErrorMessage
+			if json.Unmarshal(data, &m) == nil && m.Type == TypeFlowError {
+				errs <- m
+			}
+		}
+	})
+	defer cleanup()
+
+	h := &OID4VPHandler{}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop(), Flow: &Flow{ID: "flow-1", Session: testSession(conn)}}
+	h.httpClient = verifier.Client()
+	authReq := &AuthorizationRequest{
+		ClientID: "https://verifier.example.com", ResponseMode: ResponseModeDirectPost,
+		ResponseURI: verifier.URL, State: "st-1", TransactionData: td,
+	}
+	h.failSign(context.Background(), authReq, err)
+
+	var got []FlowErrorMessage
+	select {
+	case m := <-errs:
+		got = append(got, m)
+	case <-time.After(2 * time.Second):
+		t.Fatal("client never received a flow_error")
+	}
+	return form, got
+}
+
+// A client that refuses the transaction type after the request validated: the
+// verifier is told, and the client gets the distinct code.
+func TestFailSign_ClientRefusalOfTransactionDataTellsVerifier(t *testing.T) {
+	form, errs := failSignHarness(t, []TransactionData{{Type: "owf_payment_initiation"}},
+		&SignError{text: "unsupported type", Code: ErrCodeUnsupportedTransactionData})
+	assert.Equal(t, "invalid_transaction_data", form.Get("error"))
+	assert.Equal(t, "st-1", form.Get("state"))
+	assert.Equal(t, ErrCodeUnsupportedTransactionData, errs[0].Error.Code)
+}
+
+// The classification counts only for a request that carried transaction_data, and
+// any other sign failure stays a SIGN_ERROR that does not contact the verifier.
+func TestFailSign_OtherFailuresStaySignError(t *testing.T) {
+	form, errs := failSignHarness(t, nil, &SignError{text: "no", Code: ErrCodeUnsupportedTransactionData})
+	assert.Nil(t, form)
+	assert.Equal(t, ErrCodeSignError, errs[0].Error.Code)
+
+	form, errs = failSignHarness(t, []TransactionData{{Type: "x"}}, errors.New("boom"))
+	assert.Nil(t, form)
+	assert.Equal(t, ErrCodeSignError, errs[0].Error.Code)
+}
+
+// A client's sign_response carrying error + error_code reaches RequestSign's
+// caller as a SignError. Only the allowlisted code survives, and neither the
+// client's text nor an arbitrary code is ever part of the error string (which is
+// logged).
+func TestSession_RequestSign_ClientErrorBecomesSignError(t *testing.T) {
+	srvConnCh := make(chan *websocket.Conn, 1)
+	clientConn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) { srvConnCh <- srvConn })
+	defer cleanup()
+	session := testSession(<-srvConnCh)
+
+	for _, tc := range []struct {
+		name     string
+		code     ErrorCode
+		wantCode ErrorCode
+		wantStr  string
+	}{
+		{"allowlisted", ErrCodeUnsupportedTransactionData, ErrCodeUnsupportedTransactionData, "client failed the sign request (UNSUPPORTED_TRANSACTION_DATA)"},
+		{"unlisted", "evil\ninjected log line", "", "client failed the sign request"},
+		{"absent", "", "", "client failed the sign request"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			go func() {
+				var req SignRequestMessage
+				if clientConn.ReadJSON(&req) != nil {
+					return
+				}
+				session.signCh <- &SignResponseMessage{
+					Message:   Message{Type: TypeSignResponse, MessageID: req.MessageID},
+					Error:     "secret client text",
+					ErrorCode: tc.code,
+				}
+			}()
+			_, err := session.RequestSign(context.Background(), "f", SignActionSignPresentation, SignRequestParams{})
+			var se *SignError
+			require.ErrorAs(t, err, &se)
+			assert.Equal(t, tc.wantCode, se.Code)
+			assert.Equal(t, tc.wantStr, err.Error())
+			assert.NotContains(t, err.Error(), "secret client text")
+		})
+	}
+}
+
+// error_code is read from the client's JSON sign_response.
+func TestSignResponseMessage_ErrorCodeDecodes(t *testing.T) {
+	var m SignResponseMessage
+	require.NoError(t, json.Unmarshal([]byte(`{"type":"sign_response","error":"x","error_code":"UNSUPPORTED_TRANSACTION_DATA"}`), &m))
+	assert.Equal(t, ErrCodeUnsupportedTransactionData, m.ErrorCode)
+}
+
+func TestSignResult_UnknownClientErrorCodeNeverInErrorString(t *testing.T) {
+	_, err := signResult(&SignResponseMessage{Error: "x", ErrorCode: "evil\ninjected log line"})
+	var se *SignError
+	require.ErrorAs(t, err, &se)
+	assert.Empty(t, se.Code)
+	assert.NotContains(t, err.Error(), "injected")
+
+	_, err = signResult(&SignResponseMessage{Error: "x", ErrorCode: ErrCodeUnsupportedTransactionData})
+	require.ErrorAs(t, err, &se)
+	assert.Equal(t, ErrCodeUnsupportedTransactionData, se.Code)
+}

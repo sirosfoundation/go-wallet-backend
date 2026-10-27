@@ -674,6 +674,10 @@ type SignResponseMessage struct {
 	// that does not decrypt). The engine never logs or relays its text, as it
 	// is client-controlled and might echo response content.
 	Error string `json:"error,omitempty"`
+	// ErrorCode classifies Error. Only ErrCodeUnsupportedTransactionData is acted
+	// on: the client refused the request's transaction_data. Any other value is
+	// dropped (see allowedSignErrorCode).
+	ErrorCode ErrorCode `json:"error_code,omitempty"`
 }
 
 // MatchRequestMessage requests client-side credential matching.
