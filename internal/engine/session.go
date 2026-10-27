@@ -873,6 +873,7 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		session.flowsMu.Lock()
 		delete(session.flows, flowID)
 		session.flowsMu.Unlock()
+		session.stash.dropFlow(flowID)
 		_ = session.SendFlowError(flowID, "", ErrCodeInternalError, "Failed to create flow handler")
 		logger.Error("Failed to create handler", zap.Error(err))
 		return
@@ -1617,11 +1618,19 @@ func (s *Session) WaitForActionWithTimeout(ctx context.Context, flowID string, t
 	}
 }
 
-// awaitAction blocks until the stash is woken or an action arrives. It returns
-// the action if it is one flowID expects; any other action is parked for its
-// own flow's waiter or dropped if unexpected, and nil is returned, as it is on
-// a wake-up.
+// awaitAction blocks until the stash is woken or an action for flowID arrives.
+// It returns the action if it is one flowID expects; any other action is parked
+// for its own flow's waiter or dropped if unexpected, and nil is returned, as it
+// is on a wake-up.
+//
+// Only one waiter at a time reads actionCh (the reader slot). The holder parks
+// every action for another flow before releasing the slot, and re-checks the
+// stash on acquiring it, so actions for one flow are always delivered in the
+// order the client sent them: without the slot, a waiter could read flow B's
+// first action, be descheduled before parking it, and let B's own waiter read
+// B's second action first.
 func (s *Session) awaitAction(ctx context.Context, timer *time.Timer, wake <-chan struct{}, flowID string, expectedActions []string) (*FlowActionMessage, error) {
+	slot := s.stash.readerSlot()
 	select {
 	case <-ctx.Done():
 		return nil, ctx.Err()
@@ -1631,10 +1640,28 @@ func (s *Session) awaitAction(ctx context.Context, timer *time.Timer, wake <-cha
 		return nil, errors.New("session closed")
 	case <-wake:
 		return nil, nil
+	case <-slot:
+	}
+	defer func() { slot <- struct{}{} }()
+
+	// The previous holder may have parked our action while we waited for the slot.
+	if action := s.stash.takeAction(flowID, expectedActions); action != nil {
+		return action, nil
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, ErrFlowTimeout
+	case <-s.closeCh:
+		return nil, errors.New("session closed")
 	case action := <-s.actionCh:
 		if action.FlowID != flowID {
 			// Another concurrent flow's action: park it for that flow's
 			// waiter instead of discarding it.
+			if hook := s.stash.afterForeignActionRead; hook != nil {
+				hook() // test seam: widen the read-to-park window
+			}
 			s.stashAction(action)
 			return nil, nil
 		}

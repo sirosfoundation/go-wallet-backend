@@ -11,6 +11,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
 // Concurrent flows (and requests) on one session share the actionCh, signCh
@@ -286,4 +289,76 @@ func TestSession_WrongFlowMatchRepliesCannotExhaustStash(t *testing.T) {
 
 	s.stashMatch(&MatchResponseMessage{Message: Message{FlowID: "flow-a", MessageID: "req"}})
 	require.NotNil(t, s.stash.takeMatch("flow-a", "req"))
+}
+
+// Actions for one flow are delivered in the order the client sent them, even
+// when another flow's waiter reads the first one off the shared channel and is
+// descheduled before parking it: the flow's own waiter must not be able to
+// read its second action in the meantime.
+func TestSession_ActionsForOneFlowStayInOrderAcrossWaiters(t *testing.T) {
+	s, _ := newIsolationSession(t)
+	s.flows[flowName(0)] = &Flow{ID: flowName(0)}
+	s.flows[flowName(1)] = &Flow{ID: flowName(1)}
+
+	readFirst := make(chan struct{})
+	release := make(chan struct{})
+	s.stash.afterForeignActionRead = func() {
+		select {
+		case readFirst <- struct{}{}:
+			<-release // pause the waiter that read flow-b's first action
+		default:
+		}
+	}
+
+	// flow-a's waiter competes for the channel but never gets an action.
+	ctxA, cancelA := context.WithCancel(context.Background())
+	doneA := make(chan struct{})
+	go func() {
+		defer close(doneA)
+		_, _ = s.WaitForActionWithTimeout(ctxA, flowName(0), 5*time.Second, "never")
+	}()
+	time.Sleep(50 * time.Millisecond) // flow-a's waiter is reading the channel
+
+	s.actionCh <- &FlowActionMessage{Message: Message{FlowID: flowName(1)}, Action: "first"}
+	<-readFirst // flow-a's waiter holds flow-b's first action, not yet parked
+	s.actionCh <- &FlowActionMessage{Message: Message{FlowID: flowName(1)}, Action: "second"}
+
+	got := make(chan string, 2)
+	go func() {
+		for i := 0; i < 2; i++ {
+			a, err := s.WaitForActionWithTimeout(context.Background(), flowName(1), 3*time.Second)
+			if err != nil {
+				got <- "error: " + err.Error()
+				return
+			}
+			got <- a.Action
+		}
+	}()
+	time.Sleep(100 * time.Millisecond) // flow-b's waiter has had every chance to read "second"
+	close(release)
+
+	assert.Equal(t, "first", <-got)
+	assert.Equal(t, "second", <-got)
+	cancelA()
+	<-doneA
+}
+
+// If the handler factory fails after the flow slot was reserved, actions that
+// other waiters parked for that flow in the meantime must not be left behind.
+func TestHandleFlowStart_FactoryFailureDropsParkedActions(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
+	m := NewManager(cfg, zap.NewNop())
+	s, _ := newIsolationSession(t)
+	s.TenantID, s.TAC = "default", "i"
+
+	m.RegisterFlowHandler(ProtocolOID4VCI, func(flow *Flow, _ *config.Config, _ *zap.Logger, _ *TrustService, _ *RegistryClient, _ storage.VerifierStore, _ *TrustCache) (FlowHandler, error) {
+		// The flow is registered while the factory runs; a concurrent waiter
+		// parks an action for it.
+		s.stashAction(&FlowActionMessage{Message: Message{FlowID: flow.ID}, Action: "x"})
+		return nil, assert.AnError
+	})
+
+	m.handleFlowStart(s, &FlowStartMessage{Message: Message{FlowID: "flow-factory-fails"}, Protocol: ProtocolOID4VCI})
+	assert.Empty(t, s.stash.actions)
+	assert.Empty(t, s.flows)
 }

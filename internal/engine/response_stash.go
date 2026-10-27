@@ -20,6 +20,11 @@ type responseStash struct {
 	signs   map[string]*SignResponseMessage // by message ID
 	matches map[matchKey]*MatchResponseMessage
 	wake    chan struct{}
+	reader  chan struct{} // holds one token: the right to read Session.actionCh
+
+	// afterForeignActionRead, if set (tests only), runs after a waiter read an
+	// action for another flow and before it parks it.
+	afterForeignActionRead func()
 }
 
 // matchKey keys a parked match response by both its flow and message ID, so a
@@ -36,6 +41,19 @@ func (r *responseStash) waitChan() <-chan struct{} {
 		r.wake = make(chan struct{})
 	}
 	return r.wake
+}
+
+// readerSlot returns the channel whose single token grants the right to read
+// the session's action channel (see awaitAction). Receive to acquire, send to
+// release.
+func (r *responseStash) readerSlot() chan struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.reader == nil {
+		r.reader = make(chan struct{}, 1)
+		r.reader <- struct{}{}
+	}
+	return r.reader
 }
 
 // broadcastLocked wakes every waiter. Callers must hold r.mu.
