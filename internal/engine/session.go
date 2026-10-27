@@ -98,15 +98,13 @@ type Session struct {
 	// Channels for flow coordination
 	actionCh chan *FlowActionMessage
 	signCh   chan *SignResponseMessage
-	// signWaiters maps the message ID of each pending RequestSign to its own
-	// reply channel. Several RequestSign calls can be pending at once (a flow
-	// waiting on a decryption while a notification worker asks for a DPoP
-	// proof), and they all read signCh: a waiter that reads another waiter's
-	// reply hands it over instead of discarding it.
-	signWaitersMu sync.Mutex
-	signWaiters   map[string]chan *SignResponseMessage
-	matchCh       chan *MatchResponseMessage
-	closeCh       chan struct{}
+	matchCh  chan *MatchResponseMessage
+	closeCh  chan struct{}
+	// stash parks client messages that a waiter read off the shared channels
+	// above but that belong to a different concurrent flow or request (several
+	// flows, or a flow and a notification worker, can wait on one session at
+	// once), so no waiter can consume - and lose - another's input.
+	stash responseStash
 
 	// notifications holds ephemeral, TTL-bounded OID4VCI §10 notification
 	// contexts keyed by flow ID. It lets the backend forward a client-reported
@@ -880,6 +878,7 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		session.flowsMu.Lock()
 		delete(session.flows, flowID)
 		session.flowsMu.Unlock()
+		session.stash.dropFlow(flowID)
 	}()
 
 	// Execute flow
@@ -1466,19 +1465,8 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 		Params: params,
 	}
 
-	// Register before sending, so a reply read by another waiter always finds us.
-	mine := make(chan *SignResponseMessage, 1)
-	s.signWaitersMu.Lock()
-	if s.signWaiters == nil {
-		s.signWaiters = make(map[string]chan *SignResponseMessage)
-	}
-	s.signWaiters[messageID] = mine
-	s.signWaitersMu.Unlock()
-	defer func() {
-		s.signWaitersMu.Lock()
-		delete(s.signWaiters, messageID)
-		s.signWaitersMu.Unlock()
-	}()
+	// trackRequest before sending, so a reply read by another waiter is known
+	// to be wanted and gets parked for us (see stashSign).
 	defer s.trackRequest(messageID)()
 	if err := s.Send(&msg); err != nil {
 		return nil, err
@@ -1488,6 +1476,12 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 	timer := time.NewTimer(3 * time.Minute)
 	defer timer.Stop()
 	for {
+		// Take the wake channel BEFORE checking the stash so a put in between
+		// is never missed.
+		wake := s.stash.waitChan()
+		if resp := s.stash.takeSign(messageID); resp != nil {
+			return resp, nil
+		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -1495,22 +1489,13 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 			return nil, ErrSignTimeout
 		case <-s.closeCh:
 			return nil, errors.New("session closed")
-		case resp := <-mine:
-			return resp, nil
+		case <-wake:
 		case resp := <-s.signCh:
 			if resp.MessageID == messageID {
 				return resp, nil
 			}
-			// Another pending request's reply: hand it to its owner.
-			s.signWaitersMu.Lock()
-			other := s.signWaiters[resp.MessageID]
-			s.signWaitersMu.Unlock()
-			if other != nil {
-				select {
-				case other <- resp:
-				default: // a duplicate reply for the same ID: drop it
-				}
-			}
+			// Another pending request's reply: park it for its waiter.
+			s.stashSign(resp)
 		}
 	}
 }
@@ -1548,24 +1533,33 @@ func (s *Session) RequestMatch(ctx context.Context, flowID string, dcql json.Raw
 	defer timer.Stop()
 
 	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-timer.C:
-			return nil, ErrMatchTimeout
-		case <-s.closeCh:
-			return nil, errors.New("session closed")
-		case resp := <-s.matchCh:
-			// Verify both flow_id and message_id for proper correlation
-			if resp.FlowID == flowID && resp.MessageID == messageID {
-				// Check for error in response
-				if resp.Error != "" {
-					return nil, errors.New(resp.Error)
+		wake := s.stash.waitChan()
+		resp := s.stash.takeMatch(flowID, messageID)
+		if resp == nil {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-timer.C:
+				return nil, ErrMatchTimeout
+			case <-s.closeCh:
+				return nil, errors.New("session closed")
+			case <-wake:
+				continue
+			case r := <-s.matchCh:
+				// Verify both flow_id and message_id for proper correlation
+				if r.FlowID != flowID || r.MessageID != messageID {
+					// Another request's response: park it for its waiter.
+					s.stashMatch(r)
+					continue
 				}
-				return resp, nil
+				resp = r
 			}
-			// Wrong flow_id or message_id, keep waiting
 		}
+		// Check for error in response
+		if resp.Error != "" {
+			return nil, errors.New(resp.Error)
+		}
+		return resp, nil
 	}
 }
 
@@ -1587,6 +1581,10 @@ func (s *Session) WaitForActionWithTimeout(ctx context.Context, flowID string, t
 	defer timer.Stop()
 
 	for {
+		wake := s.stash.waitChan()
+		if action := s.stash.takeAction(flowID, expectedActions); action != nil {
+			return action, nil
+		}
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
@@ -1594,9 +1592,13 @@ func (s *Session) WaitForActionWithTimeout(ctx context.Context, flowID string, t
 			return nil, ErrFlowTimeout
 		case <-s.closeCh:
 			return nil, errors.New("session closed")
+		case <-wake:
 		case action := <-s.actionCh:
 			if action.FlowID != flowID {
-				continue // Wrong flow
+				// Another concurrent flow's action: park it for that flow's
+				// waiter instead of discarding it.
+				s.stashAction(action)
+				continue
 			}
 			// Check if action is expected
 			if len(expectedActions) > 0 {
