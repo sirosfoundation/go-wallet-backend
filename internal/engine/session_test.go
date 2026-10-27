@@ -1355,3 +1355,59 @@ func TestManager_validateToken_CancelledContextFailsClosed(t *testing.T) {
 	assert.Equal(t, "test-tenant", tenantID)
 	assert.Equal(t, claims.TAC("rwl"), tac)
 }
+
+// Two RequestSign calls pending at once (a flow awaiting a decryption while a
+// notification worker asks for a DPoP proof) must each get their own reply,
+// whichever order the replies arrive in and whichever waiter reads them.
+func TestSession_RequestSign_ConcurrentWaitersGetOwnReplies(t *testing.T) {
+	srvConnCh := make(chan *websocket.Conn, 1)
+	clientConn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) { srvConnCh <- srvConn })
+	defer cleanup()
+	srvConn := <-srvConnCh
+	session := &Session{
+		ID:       "s",
+		conn:     srvConn,
+		flows:    make(map[string]*Flow),
+		logger:   zap.NewNop(),
+		signCh:   make(chan *SignResponseMessage, 20),
+		closeCh:  make(chan struct{}, 1),
+		stopPing: make(chan struct{}),
+	}
+
+	type result struct {
+		resp *SignResponseMessage
+		err  error
+	}
+	results := make(map[string]chan result)
+	for _, name := range []string{"a", "b"} {
+		ch := make(chan result, 1)
+		results[name] = ch
+		go func() {
+			r, err := session.RequestSign(context.Background(), "f", SignActionGenerateProof, SignRequestParams{JWE: name})
+			ch <- result{r, err}
+		}()
+	}
+
+	// Collect both requests, then answer in reverse order of arrival.
+	var reqs []SignRequestMessage
+	for len(reqs) < 2 {
+		var req SignRequestMessage
+		require.NoError(t, clientConn.ReadJSON(&req))
+		reqs = append(reqs, req)
+	}
+	for i := len(reqs) - 1; i >= 0; i-- {
+		session.signCh <- &SignResponseMessage{
+			Message:       Message{Type: TypeSignResponse, MessageID: reqs[i].MessageID},
+			TransactionID: reqs[i].Params.JWE, // tag the reply with its owner
+		}
+	}
+	for name, ch := range results {
+		select {
+		case r := <-ch:
+			require.NoError(t, r.err)
+			assert.Equal(t, name, r.resp.TransactionID, "waiter %s got another waiter's reply", name)
+		case <-time.After(5 * time.Second):
+			t.Fatalf("waiter %s never got its reply", name)
+		}
+	}
+}

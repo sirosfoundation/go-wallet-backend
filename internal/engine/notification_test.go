@@ -626,3 +626,20 @@ func TestBuildCredentialResults_OmitsNotificationIDWhenAbsent(t *testing.T) {
 	require.Len(t, results, 1)
 	assert.Empty(t, results[0].NotificationID)
 }
+
+// An encrypted response registers its notification context once per issuance:
+// a client that notified early (consuming it) must not find a fresh context
+// recreated by deferred polling or by completion.
+func TestRegisterNotificationContext_EncryptedRegistersOncePerIssuance(t *testing.T) {
+	h, session := newRegisterTestHandler("flow-enc")
+	meta := &IssuerMetadata{NotificationEndpoint: "https://issuer.example.com/notify"}
+	tok := &TokenResponse{AccessToken: "tok", TokenType: "Bearer"}
+
+	h.registerNotificationContext(meta, tok, &CredentialResponse{Encrypted: true})
+	require.NotNil(t, session.notifications.take("flow-enc"), "registered before the client answers")
+
+	// Deferred polling and completion register again.
+	h.registerNotificationContext(meta, tok, &CredentialResponse{Encrypted: true})
+	h.registerNotificationContext(meta, tok, &CredentialResponse{Encrypted: true})
+	assert.Nil(t, session.notifications.take("flow-enc"), "a consumed context is not recreated")
+}

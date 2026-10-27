@@ -56,13 +56,15 @@ func newAssessor(t *testing.T, cfg config.AssuranceConfig, rules string) *Assess
 
 func TestEvidence_FixedSlotOrderGolden(t *testing.T) {
 	full := Evidence{
-		Fido2:    &Fido2Verified{AAGUID: "a1", Cert: "c1"},
-		Platform: &PlatformVerified{Source: "platform_attested", AppID: "app"},
-		HSM:      &HSMVerified{ID: "h1"},
-		Claimed:  Claimed{Plugin: "soft", KeyStorage: "iso_18045_high", UserAuthentication: "iso_18045_basic", Certification: "EUCC/high"},
+		Fido2:       &Fido2Verified{AAGUID: "a1", Cert: "c1"},
+		Platform:    &PlatformVerified{Source: "platform_attested", AppID: "app"},
+		HSM:         &HSMVerified{ID: "h1"},
+		InstanceKey: &InstanceKeyVerified{Kind: "android_key", Home: "strongbox", Level: "strongbox", Boot: "verified", Binding: BindingAttested},
+		Claimed:     Claimed{Plugin: "soft", KeyStorage: "iso_18045_high", UserAuthentication: "iso_18045_basic", Certification: "EUCC/high"},
 	}
 	want := "(evidence (verified (fido2 (mds3 trusted)(aaguid a1)(uv none)(cert c1))" +
-		"(platform (source platform_attested)(app_id app))(hsm (id h1)))" +
+		"(platform (source platform_attested)(app_id app))(hsm (id h1))" +
+		"(instance_key (kind android_key)(home strongbox)(level strongbox)(boot verified)(binding attested)))" +
 		"(claimed (plugin soft)(key_storage iso_18045_high)(user_authentication iso_18045_basic)(certification EUCC/high)))"
 	if got := render(full.Element()); got != want {
 		t.Fatalf("evidence shape changed (bump SchemaVersion if intended)\n got: %s\nwant: %s", got, want)
@@ -70,7 +72,7 @@ func TestEvidence_FixedSlotOrderGolden(t *testing.T) {
 }
 
 func TestEvidence_AbsentSlotsAreNone(t *testing.T) {
-	want := "(evidence (verified (fido2 none)(platform none)(hsm none))" +
+	want := "(evidence (verified (fido2 none)(platform none)(hsm none)(instance_key none))" +
 		"(claimed (plugin none)(key_storage none)(user_authentication none)(certification none)))"
 	if got := render(Evidence{}.Element()); got != want {
 		t.Fatalf("got %s want %s", got, want)

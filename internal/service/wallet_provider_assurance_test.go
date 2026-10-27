@@ -368,8 +368,15 @@ func TestAssurance_AuditLineHasRuleIDsPolicyHashAndNoNonce(t *testing.T) {
 	svc, _, keys := assuranceSvc(t, nil, fidoRules)
 	core, logs := observer.New(zap.InfoLevel)
 	svc.logger = zap.New(core)
-	markAttested(t, keys, jwks[0], "aa1")
-	markAttested(t, keys, jwks[1], "aa1")
+	for _, j := range jwks {
+		tp, err := jwk.Thumbprint(j)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := keys.MarkKeyAttested(context.Background(), &domain.KeyAttestationRecord{KeyThumbprint: tp, WalletInstanceID: "inst-1", AAGUID: "aa1", VerifiedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	const nonce = "super-secret-nonce-value"
 	if _, err := svc.GenerateKeyAttestation(context.Background(), jwks, nonce, nil, "inst-1", ""); err != nil {
 		t.Fatal(err)
