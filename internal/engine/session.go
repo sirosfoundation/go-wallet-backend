@@ -127,20 +127,21 @@ type Session struct {
 	// rejectIfUnknownFlow). Only touched from the read loop goroutine.
 	unknownFlowLimiter *rate.Limiter
 
-	// outstandingRequests holds the message_id of every sign/match request
+	// outstandingRequests holds the message_id (mapped to the requesting flow's
+	// ID) of every sign/match request
 	// currently awaiting its response (guarded by flowsMu), so responses are
 	// still delivered after the requesting flow has completed.
-	outstandingRequests map[string]struct{}
+	outstandingRequests map[string]string
 }
 
 // trackRequest registers messageID as an outstanding request until the
 // returned func is called.
-func (s *Session) trackRequest(messageID string) (done func()) {
+func (s *Session) trackRequest(messageID, flowID string) (done func()) {
 	s.flowsMu.Lock()
 	if s.outstandingRequests == nil {
-		s.outstandingRequests = make(map[string]struct{})
+		s.outstandingRequests = make(map[string]string)
 	}
-	s.outstandingRequests[messageID] = struct{}{}
+	s.outstandingRequests[messageID] = flowID
 	s.flowsMu.Unlock()
 	return func() {
 		s.flowsMu.Lock()
@@ -1474,7 +1475,7 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 
 	// trackRequest before sending, so a reply read by another waiter is known
 	// to be wanted and gets parked for us (see stashSign).
-	defer s.trackRequest(messageID)()
+	defer s.trackRequest(messageID, flowID)()
 	if err := s.Send(&msg); err != nil {
 		return nil, err
 	}
@@ -1530,7 +1531,7 @@ func (s *Session) RequestMatch(ctx context.Context, flowID string, dcql json.Raw
 		DCQLQuery: dcql,
 	}
 
-	defer s.trackRequest(messageID)()
+	defer s.trackRequest(messageID, flowID)()
 	if err := s.Send(&msg); err != nil {
 		return nil, err
 	}
@@ -1602,38 +1603,44 @@ func (s *Session) WaitForActionWithTimeout(ctx context.Context, flowID string, t
 
 	for {
 		wake := s.stash.waitChan()
-		if action := s.stash.takeAction(flowID, expectedActions); action != nil {
-			return action, nil
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-timer.C:
-			return nil, ErrFlowTimeout
-		case <-s.closeCh:
-			return nil, errors.New("session closed")
-		case <-wake:
-		case action := <-s.actionCh:
-			if action.FlowID != flowID {
-				// Another concurrent flow's action: park it for that flow's
-				// waiter instead of discarding it.
-				s.stashAction(action)
+		action := s.stash.takeAction(flowID, expectedActions)
+		if action == nil {
+			var err error
+			if action, err = s.awaitAction(ctx, timer, wake, flowID, expectedActions); err != nil {
+				return nil, err
+			}
+			if action == nil {
 				continue
 			}
-			// Check if action is expected
-			if len(expectedActions) > 0 {
-				found := false
-				for _, expected := range expectedActions {
-					if action.Action == expected {
-						found = true
-						break
-					}
-				}
-				if !found {
-					continue // Unexpected action
-				}
-			}
-			return action, nil
 		}
+		return action, nil
+	}
+}
+
+// awaitAction blocks until the stash is woken or an action arrives. It returns
+// the action if it is one flowID expects; any other action is parked for its
+// own flow's waiter or dropped if unexpected, and nil is returned, as it is on
+// a wake-up.
+func (s *Session) awaitAction(ctx context.Context, timer *time.Timer, wake <-chan struct{}, flowID string, expectedActions []string) (*FlowActionMessage, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, ErrFlowTimeout
+	case <-s.closeCh:
+		return nil, errors.New("session closed")
+	case <-wake:
+		return nil, nil
+	case action := <-s.actionCh:
+		if action.FlowID != flowID {
+			// Another concurrent flow's action: park it for that flow's
+			// waiter instead of discarding it.
+			s.stashAction(action)
+			return nil, nil
+		}
+		if !actionExpected(action.Action, expectedActions) {
+			return nil, nil // Unexpected action
+		}
+		return action, nil
 	}
 }

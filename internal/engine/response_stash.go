@@ -98,7 +98,9 @@ func (s *Session) stashSign(m *SignResponseMessage) {
 func (s *Session) stashMatch(m *MatchResponseMessage) {
 	s.flowsMu.RLock()
 	defer s.flowsMu.RUnlock()
-	if _, ok := s.outstandingRequests[m.MessageID]; !ok {
+	// Only the flow that made the request can own its reply: a reply naming any
+	// other flow is never consumable, so it must not take up stash capacity.
+	if flowID, ok := s.outstandingRequests[m.MessageID]; !ok || flowID != m.FlowID {
 		return
 	}
 	r := &s.stash
@@ -115,6 +117,20 @@ func (s *Session) stashMatch(m *MatchResponseMessage) {
 	r.broadcastLocked()
 }
 
+// actionExpected reports whether action is one of expected (any, if expected
+// is empty).
+func actionExpected(action string, expected []string) bool {
+	if len(expected) == 0 {
+		return true
+	}
+	for _, e := range expected {
+		if action == e {
+			return true
+		}
+	}
+	return false
+}
+
 // takeAction removes and returns the oldest parked action for flowID that is
 // one of expected (any, if expected is empty). Parked actions for the flow
 // that are not expected are dropped, as WaitForAction always did.
@@ -123,14 +139,7 @@ func (r *responseStash) takeAction(flowID string, expected []string) *FlowAction
 	defer r.mu.Unlock()
 	q := r.actions[flowID]
 	for i, a := range q {
-		ok := len(expected) == 0
-		for _, e := range expected {
-			if a.Action == e {
-				ok = true
-				break
-			}
-		}
-		if ok {
+		if actionExpected(a.Action, expected) {
 			rest := q[i+1:]
 			if len(rest) == 0 {
 				delete(r.actions, flowID)

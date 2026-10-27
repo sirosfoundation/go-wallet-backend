@@ -179,7 +179,7 @@ func TestSession_StaleResponsesAreNotParked(t *testing.T) {
 	assert.Empty(t, s.stash.matches)
 
 	// A pending request's response is parked and consumed exactly once.
-	done := s.trackRequest("live")
+	done := s.trackRequest("live", "f")
 	defer done()
 	s.stashSign(&SignResponseMessage{Message: Message{MessageID: "live"}})
 	require.NotNil(t, s.stash.takeSign("live"))
@@ -210,7 +210,7 @@ func TestResponseStash_ActionsBoundedAndDroppedWithFlow(t *testing.T) {
 func TestSession_ParkedRepliesDropWhenRequestEnds(t *testing.T) {
 	s, _ := newIsolationSession(t)
 
-	done := s.trackRequest("req")
+	done := s.trackRequest("req", "f")
 	s.stashSign(&SignResponseMessage{Message: Message{MessageID: "req"}})
 	s.stashMatch(&MatchResponseMessage{Message: Message{FlowID: "f", MessageID: "req"}})
 	require.Len(t, s.stash.signs, 1)
@@ -230,7 +230,7 @@ func TestSession_ParkedRepliesDropWhenRequestEnds(t *testing.T) {
 // (or block) the valid parked reply for that request.
 func TestSession_WrongFlowMatchReplyDoesNotOverwriteValidOne(t *testing.T) {
 	s, _ := newIsolationSession(t)
-	done := s.trackRequest("req")
+	done := s.trackRequest("req", "flow-a")
 	defer done()
 
 	s.stashMatch(&MatchResponseMessage{Message: Message{FlowID: "flow-a", MessageID: "req"}, Error: "valid"})
@@ -269,4 +269,21 @@ func TestSession_StashAction_RacingFlowTeardownLeavesNoQueue(t *testing.T) {
 		wg.Wait()
 		require.Empty(t, s.stash.actions, "round %d left a queue for an ended flow", round)
 	}
+}
+
+// Replies with a pending message ID but many distinct wrong flow IDs must not
+// fill the match stash: only the requesting flow can own the reply, so a valid
+// reply arriving afterwards is still parked and delivered.
+func TestSession_WrongFlowMatchRepliesCannotExhaustStash(t *testing.T) {
+	s, _ := newIsolationSession(t)
+	done := s.trackRequest("req", "flow-a")
+	defer done()
+
+	for i := 0; i < maxStashedResponses+10; i++ {
+		s.stashMatch(&MatchResponseMessage{Message: Message{FlowID: "wrong-" + string(rune('a'+i%26)) + string(rune('a'+i/26)), MessageID: "req"}})
+	}
+	assert.Empty(t, s.stash.matches)
+
+	s.stashMatch(&MatchResponseMessage{Message: Message{FlowID: "flow-a", MessageID: "req"}})
+	require.NotNil(t, s.stash.takeMatch("flow-a", "req"))
 }
