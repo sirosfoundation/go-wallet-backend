@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -528,40 +530,27 @@ type wmpCaller struct {
 	TenantID string
 	TokenID  string // jti; may be empty
 	// TAC is this request's token-authorized-capabilities. It bounds the request
-	// independently of the session's creation-time TAC. Empty means legacy auth.
+	// independently of the session's creation-time TAC. Empty means no
+	// permissions.
 	TAC claims.TAC
-	// EnforceTAC is true for a modern token, whose TAC is authoritative even
-	// when empty; false only for a legacy token. A non-empty TAC is always
-	// enforced.
-	EnforceTAC bool
 }
 
 // caller is the identity as a wmpCaller. It is the single conversion, so every
-// request path carries the same five fields (user, tenant, jti, TAC, enforce).
+// request path carries the same four fields (user, tenant, jti, TAC).
 func (id tokenIdentity) caller() wmpCaller {
-	return wmpCaller{UserID: id.UserID, TenantID: id.TenantID, TokenID: id.JTI, TAC: id.TAC, EnforceTAC: id.EnforceTAC}
+	return wmpCaller{UserID: id.UserID, TenantID: id.TenantID, TokenID: id.JTI, TAC: id.TAC}
 }
 
 var _ ReplaceableTransport = (*wmpSessionTransport)(nil)
 
-// wmpCallerTACKey carries the request's wmpTACInfo in the context.
+// wmpCallerTACKey carries the request token's TAC in the context.
 type wmpCallerTACKey struct{}
 
-type wmpTACInfo struct {
-	TAC     claims.TAC
-	Enforce bool
-}
-
 // requestTAC returns the TAC of the token that authenticated the current
-// request (empty when none, i.e. legacy auth or an in-process call).
-func requestTAC(ctx context.Context) claims.TAC {
-	return requestTACInfo(ctx).TAC
-}
-
-// requestTACInfo returns the request token's TAC and whether it is enforced.
-func requestTACInfo(ctx context.Context) wmpTACInfo {
-	t, _ := ctx.Value(wmpCallerTACKey{}).(wmpTACInfo)
-	return t
+// request; ok is false for a context without one (an in-process call).
+func requestTAC(ctx context.Context) (claims.TAC, bool) {
+	t, ok := ctx.Value(wmpCallerTACKey{}).(claims.TAC)
+	return t, ok
 }
 
 // NewWMPAdapter creates an adapter bridging WMP JSON-RPC to the engine.
@@ -795,7 +784,7 @@ func (a *WMPAdapter) touchSession(sessionID string) {
 
 // HandleRPC handles one JSON-RPC request in-process (not network-reachable). For
 // session.create the identity comes from params.auth; otherwise it is
-// HandleRPCAs for a caller with no token ID.
+// HandleRPCAs for a caller with no token ID and inProcessTAC permissions.
 func (a *WMPAdapter) HandleRPC(ctx context.Context, sessionID, userID, tenantID string, body []byte) ([]byte, error) {
 	if msg, err := wmp.DecodeMessage(body); err == nil && msg.Method == wmp.MethodSessionCreate {
 		var params wmp.SessionCreateParams
@@ -805,7 +794,18 @@ func (a *WMPAdapter) HandleRPC(ctx context.Context, sessionID, userID, tenantID 
 			}
 		}
 	}
-	return a.HandleRPCAs(ctx, sessionID, wmpCaller{UserID: userID, TenantID: tenantID}, body)
+	return a.HandleRPCAs(ctx, sessionID, wmpCaller{UserID: userID, TenantID: tenantID, TAC: inProcessTAC()}, body)
+}
+
+// inProcessTAC is the TAC of an in-process caller, which presents no token and
+// is trusted: every permission the engine gates a protocol on.
+func inProcessTAC() claims.TAC {
+	var perms []string
+	for _, p := range requiredTACForProtocol {
+		perms = append(perms, p)
+	}
+	sort.Strings(perms)
+	return claims.TAC(strings.Join(perms, ""))
 }
 
 // HandleRPCAs handles one JSON-RPC request. sessionID comes from the Wmp-
@@ -853,7 +853,7 @@ func (a *WMPAdapter) HandleRPCAs(ctx context.Context, sessionID string, caller w
 
 // withCallerTAC carries the caller's token permissions to the method handlers.
 func withCallerTAC(ctx context.Context, caller wmpCaller) context.Context {
-	return context.WithValue(ctx, wmpCallerTACKey{}, wmpTACInfo{TAC: caller.TAC, Enforce: caller.EnforceTAC || caller.TAC != ""})
+	return context.WithValue(ctx, wmpCallerTACKey{}, caller.TAC)
 }
 
 // Events returns the session's outbound notifications (retained events, then
@@ -1072,7 +1072,7 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, caller wmpCaller, 
 	}
 	userID, tokenID := caller.UserID, caller.TokenID
 	tenantID := normalizeTenant(caller.TenantID)
-	tac, enforceTAC := caller.TAC, caller.EnforceTAC
+	tac := caller.TAC
 
 	// Anonymous sessions are told apart only by jti; without one, fail closed.
 	if userID == "" && tokenID == "" {
@@ -1120,7 +1120,6 @@ func (a *WMPAdapter) handleSessionCreate(ctx context.Context, caller wmpCaller, 
 		UserID:        userID,
 		TenantID:      tenantID,
 		TAC:           tac,
-		TACEnforced:   enforceTAC,
 		transport:     wmpTransport,
 		flows:         make(map[string]*Flow),
 		logger:        a.logger.With(zap.String("session", userID[:min(8, len(userID))])),
@@ -1674,17 +1673,15 @@ func (h *wmpEngineHandler) logger() *zap.Logger {
 // protocol.
 //
 // Both the session's creation-time TAC and the current request's TAC must grant
-// it. A TAC is skipped only for a legacy token; a modern token with an empty TAC
-// has no permissions.
+// it. An empty TAC has no permissions. A context carrying no request TAC (an
+// in-process call) is checked against the session's TAC only.
 func (h *wmpEngineHandler) authorizeProtocol(ctx context.Context, protocol Protocol, logger *zap.Logger) *wmp.RPCError {
 	required, ok := requiredTACForProtocol[protocol]
 	if !ok {
 		return nil
 	}
-	req := requestTACInfo(ctx)
-	reqTAC := req.TAC
-	if ((h.session.TACEnforced || h.session.TAC != "") && !h.session.TAC.HasAll(required)) ||
-		((req.Enforce || reqTAC != "") && !reqTAC.HasAll(required)) {
+	reqTAC, hasReq := requestTAC(ctx)
+	if !h.session.TAC.HasAll(required) || (hasReq && !reqTAC.HasAll(required)) {
 		logger.Warn("Rejected WMP request - insufficient TAC",
 			zap.String("session_tac", string(h.session.TAC)),
 			zap.String("request_tac", string(reqTAC)),
@@ -2634,5 +2631,5 @@ func (a *WMPAdapter) authorizeResponse(ctx context.Context, caller wmpCaller, se
 			}
 		}
 	}
-	return a.tokenCoversSession(sessionID, caller.TAC, caller.EnforceTAC || caller.TAC != "")
+	return a.tokenCoversSession(sessionID, caller.TAC)
 }

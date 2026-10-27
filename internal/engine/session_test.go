@@ -386,15 +386,16 @@ func TestManager_handleFlowStart_AllowsSufficientTAC(t *testing.T) {
 	}
 }
 
-// TestManager_handleFlowStart_NoOpWhenTACEmpty is a regression test: an
-// empty session.TAC means no TAC claim, not "no permissions"; such a session must not be blocked.
-func TestManager_handleFlowStart_NoOpWhenTACEmpty(t *testing.T) {
+// TestManager_handleFlowStart_RefusesEmptyTAC: every token is an AS-issued
+// session token, so an empty TAC means "no permissions" and must be refused.
+func TestManager_handleFlowStart_RefusesEmptyTAC(t *testing.T) {
 	m := newManagerWithStubOID4VCIHandler(t)
 
 	msg := runHandleFlowStart(t, m, "", ProtocolOID4VCI)
-	if msg != nil {
-		t.Fatalf("expected no flow_error, got code %q", msg.Error.Code)
+	if msg == nil {
+		t.Fatal("expected a flow_error, got none")
 	}
+	assert.Equal(t, ErrCodeForbidden, msg.Error.Code)
 }
 
 // TestManager_handleFlowStart_ShortFlowIDDoesNotPanic is a regression test:

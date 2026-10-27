@@ -86,15 +86,10 @@ type Session struct {
 	ID       string
 	UserID   string
 	TenantID string
-	// TAC is only ever populated on the go-tokenauth path - see
-	// Manager.validateToken. An empty TAC means "not applicable" (legacy
-	// auth, no TAC concept at all), not "no permissions" - handleFlowStart's
-	// per-protocol check must treat it as a no-op, exactly like
-	// requireTACIfEnforced does for HTTP routes.
+	// TAC is the token's TAC claim - see Manager.validateToken. Every token is
+	// an AS-issued session token, so the TAC is authoritative even when empty
+	// (no permissions): handleFlowStart checks it unconditionally.
 	TAC claims.TAC
-	// TACEnforced: the session was created by a modern token, so its TAC is
-	// authoritative even when empty. False only for legacy tokens.
-	TACEnforced bool
 
 	// onSuperseded, when set before registration, runs (without any manager lock)
 	// after a later registerSession for the same user replaces this session; the
@@ -456,7 +451,6 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		UserID:        userID,
 		TenantID:      tenantID,
 		TAC:           tac,
-		TACEnforced:   id.EnforceTAC,
 		transport:     transport,
 		flows:         make(map[string]*Flow),
 		logger:        m.logger.With(zap.String("session", logLabel)),
@@ -934,21 +928,15 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		return
 	}
 
-	// TAC check: only enforced when the session actually has a TAC to check
-	// (empty means legacy auth, which has no TAC concept - see
-	// Manager.validateToken - not "no permissions"), mirroring
-	// requireTACIfEnforced's identical conditional enforcement for HTTP
-	// routes (internal/server/providers.go).
-	// A modern token is always checked, even with an empty TAC ("no permissions").
-	if session.TACEnforced || session.TAC != "" {
-		if required, ok := requiredTACForProtocol[msg.Protocol]; ok && !session.TAC.HasAll(required) {
-			_ = session.SendFlowError(flowID, "", ErrCodeForbidden, "insufficient permissions for protocol: "+string(msg.Protocol))
-			logger.Warn("Rejected flow start - insufficient TAC",
-				zap.String("tac", string(session.TAC)),
-				zap.String("required", required),
-			)
-			return
-		}
+	// TAC check: every session token is an AS-issued token, so its TAC is
+	// authoritative; an empty TAC means "no permissions", not "not applicable".
+	if required, ok := requiredTACForProtocol[msg.Protocol]; ok && !session.TAC.HasAll(required) {
+		_ = session.SendFlowError(flowID, "", ErrCodeForbidden, "insufficient permissions for protocol: "+string(msg.Protocol))
+		logger.Warn("Rejected flow start - insufficient TAC",
+			zap.String("tac", string(session.TAC)),
+			zap.String("required", required),
+		)
+		return
 	}
 
 	// Check concurrent flow limit and register atomically to prevent race condition.
@@ -1193,40 +1181,31 @@ type tokenIdentity struct {
 	UserID, TenantID string
 	TAC              claims.TAC
 	JTI              string
-	// EnforceTAC: true for every modern token, even with an empty TAC ("no
-	// permissions"); false only for legacy tokens, which have no TAC concept.
-	EnforceTAC bool
 }
 
-// validateTokenAuth is validateTokenID that also reports token provenance
-// (see tokenIdentity.EnforceTAC).
+// validateTokenAuth is validateTokenID that returns the identity as a struct.
 func (m *Manager) validateTokenAuth(ctx context.Context, tokenString string) (tokenIdentity, error) {
-	userID, tenantID, tac, jti, enforce, err := m.validateTokenFull(ctx, tokenString)
-	return tokenIdentity{UserID: userID, TenantID: normalizeTenant(tenantID), TAC: tac, JTI: jti, EnforceTAC: enforce}, err
-}
-
-func (m *Manager) validateTokenFull(ctx context.Context, tokenString string) (userID, tenantID string, tac claims.TAC, jti string, enforceTAC bool, err error) {
 	if err := ctx.Err(); err != nil {
-		return "", "", "", "", false, fmt.Errorf("token validation aborted: %w", err)
+		return tokenIdentity{}, fmt.Errorf("token validation aborted: %w", err)
 	}
 	if m.tokenValidator == nil {
-		return "", "", "", "", false, errors.New("no token validator configured")
+		return tokenIdentity{}, errors.New("no token validator configured")
 	}
 	result, err := m.tokenValidator.Validate(ctx, tokenString)
 	if err != nil {
-		return "", "", "", "", false, err
+		return tokenIdentity{}, err
 	}
 	// The engine transport needs a wallet-registry or wallet-backend audience, nothing broader.
 	if !result.HasAudience("wallet-registry", "wallet-backend") {
-		return "", "", "", "", false, errors.New("token audience not permitted for engine transport")
+		return tokenIdentity{}, errors.New("token audience not permitted for engine transport")
 	}
 	// Per-jti revocation happens inside Validate; user-level revocation does not (the checker only
 	// sees a jti), so check the optional TokenBlacklist and the engine's own revokedUsers (#403).
 	if (m.blacklist != nil && m.blacklist.IsUserRevoked(ctx, result.UserID)) || m.isUserRevoked(result.UserID) {
-		return "", "", "", "", false, errors.New("token has been revoked")
+		return tokenIdentity{}, errors.New("token has been revoked")
 	}
 	// UserID may be empty for anonymous tokens — that is acceptable.
-	return result.UserID, result.TenantID, result.TAC, result.JTI, result.Mode != claims.ModeLegacy, nil
+	return tokenIdentity{UserID: result.UserID, TenantID: normalizeTenant(result.TenantID), TAC: result.TAC, JTI: result.JTI}, nil
 }
 
 func (m *Manager) getCapabilities() []string {
