@@ -4632,3 +4632,19 @@ func cacheKeyForX509SANDNS(t *testing.T, authReq *AuthorizationRequest, requestJ
 	require.NotEmpty(t, ctxHash)
 	return "x509_san_dns:" + authReq.ClientID + ":" + fp + "|ctx:" + ctxHash
 }
+
+func TestBuildErrorRedirect_DropsPreexistingErrorParams(t *testing.T) {
+	got := buildErrorRedirect("https://verifier.example/cb?error_description=old_reason&state=old&keep=1", "", "access_denied", "", false)
+	u, err := url.Parse(got)
+	require.NoError(t, err)
+	q := u.Query()
+	assert.Equal(t, "access_denied", q.Get("error"))
+	assert.False(t, q.Has("error_description"), "no description means none on the redirect")
+	assert.False(t, q.Has("state"), "a stale state is not this request's")
+	assert.Equal(t, "1", q.Get("keep"))
+
+	got = buildErrorRedirect("https://verifier.example/cb", "s1", "access_denied", "why", false)
+	u, _ = url.Parse(got)
+	assert.Equal(t, "why", u.Query().Get("error_description"))
+	assert.Equal(t, "s1", u.Query().Get("state"))
+}

@@ -2125,9 +2125,15 @@ func buildErrorRedirect(endpoint, state, errCode, errDesc string, inFragment boo
 	params.Set("error", errCode)
 	if errDesc != "" {
 		params.Set("error_description", errDesc)
+	} else {
+		// No description: drop one already on the callback URL.
+		params.Del("error_description")
 	}
 	if state != "" {
 		params.Set("state", state)
+	} else {
+		// A stale state on the callback URL is not this request's state.
+		params.Del("state")
 	}
 	if inFragment {
 		u.Fragment = params.Encode()
