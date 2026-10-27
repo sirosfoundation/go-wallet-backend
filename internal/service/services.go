@@ -27,12 +27,32 @@ type Services struct {
 	Helper           *HelperService
 	WalletProvider   *WalletProviderService
 	WIA              *WIAService
+	Status           *StatusService // verified Token Status List API; nil when status_check.enabled is false
 	FIDO2Attestation *FIDO2AttestationService
 	WalletLifecycle  *WalletLifecycleService
 	TokenBlacklist   *TokenBlacklist
 	ChallengeCleanup *ChallengeCleanupWorker
 	TombstoneSweeper *DeletionTombstoneSweeper
 	AAGUIDValidator  *AAGUIDValidator
+}
+
+// registerAppAttestAssertionVerifier registers the App Attest assertion
+// verifier. App Attest assertions as instance-key evidence need the stored
+// attested keys, so they exist only where native attestation does.
+func registerAppAttestAssertionVerifier(cfg *config.Config, store storage.Store, wiaSvc *WIAService, keyChecker *instanceKeyChecker, logger *zap.Logger) {
+	nat := cfg.WalletProvider.Attestation.NativeAttestation
+	if !nat.Enabled || nat.AppleAppID == "" || store.AppAttestKeys() == nil {
+		return
+	}
+	v, err := NewAppAttestAssertionVerifier(store.AppAttestKeys(), nat.AppleAppID, nat.AppleAppAttestEnvironment, logger)
+	if err != nil {
+		logger.Warn("app_attest_assertion key attestation is not available", zap.Error(err))
+		return
+	}
+	wiaSvc.RegisterInstanceKeyVerifier(v)
+	// Stored assertion evidence is re-checked against its App Attest key on
+	// every use (revocation, configuration).
+	keyChecker.register(v)
 }
 
 // NewServices creates a new Services instance
@@ -104,19 +124,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		wiaSvc.SetAssessor(assessor)
 		wiaSvc.SetKeyAttestations(store.KeyAttestations())
 		wiaSvc.SetAppAttestKeys(store.AppAttestKeys())
-		// App Attest assertions as instance-key evidence need the stored
-		// attested keys, so they exist only where native attestation does.
-		if nat := cfg.WalletProvider.Attestation.NativeAttestation; nat.Enabled && nat.AppleAppID != "" && store.AppAttestKeys() != nil {
-			v, err := NewAppAttestAssertionVerifier(store.AppAttestKeys(), nat.AppleAppID, nat.AppleAppAttestEnvironment, logger)
-			if err != nil {
-				logger.Warn("app_attest_assertion key attestation is not available", zap.Error(err))
-			} else {
-				wiaSvc.RegisterInstanceKeyVerifier(v)
-				// Stored assertion evidence is re-checked against its App
-				// Attest key on every use (revocation, configuration).
-				keyChecker.register(v)
-			}
-		}
+		registerAppAttestAssertionVerifier(cfg, store, wiaSvc, keyChecker, logger)
 		// Instance-key evidence verifiers, one line per key_attestation type.
 		wiaSvc.RegisterInstanceKeyVerifier(androidVerifier)
 		wiaSvc.SetInstanceKeyChecker(keyChecker)
@@ -148,6 +156,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	proxySvc := NewProxyService(cfg, logger)
 	proxySvc.SetUsers(store.Users())
 	fido2Svc.SetUsers(store.Users())
+	trustSvc := engine.NewTrustService(cfg, logger)
 	return &Services{
 		User:             userSvc,
 		Tenant:           NewTenantService(store, logger),
@@ -161,6 +170,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		Helper:           NewHelperService(logger, cfg.HTTPClient),
 		WalletProvider:   wpSvc,
 		WIA:              wiaSvc,
+		Status:           NewStatusService(cfg, trustSvc, logger.Named("status")),
 		FIDO2Attestation: fido2Svc,
 		WalletLifecycle:  lifecycle,
 		TokenBlacklist:   tokenBlacklist,

@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1329,6 +1331,22 @@ func TestCORSConfig_SetDefaults(t *testing.T) {
 		t.Error("AllowedHeaders should have default value")
 	}
 }
+
+func TestCORSConfig_DefaultExposedHeadersIncludeRetryAfter(t *testing.T) {
+	cfg := CORSConfig{}
+	cfg.SetDefaults()
+	want := []string{"X-Private-Data-ETag", "Retry-After"}
+	if !reflect.DeepEqual(cfg.ExposedHeaders, want) {
+		t.Fatalf("default ExposedHeaders = %v, want %v", cfg.ExposedHeaders, want)
+	}
+
+	explicit := CORSConfig{ExposedHeaders: []string{"X-Only"}}
+	explicit.SetDefaults()
+	if !reflect.DeepEqual(explicit.ExposedHeaders, []string{"X-Only"}) {
+		t.Fatalf("explicit list must be kept as is, got %v", explicit.ExposedHeaders)
+	}
+}
+
 func TestASConfig_SetDefaults(t *testing.T) {
 	cfg := &ASConfig{}
 	cfg.SetDefaults()
@@ -2263,6 +2281,19 @@ func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
 		{"rfc1918", "10.0.0.5", "private/loopback"},
 		{"rfc1918 172.16", "172.16.4.2", "private/loopback"},
 		{"link-local", "169.254.10.1", "private/loopback"},
+		{"cgnat", "100.64.0.1", "private/loopback"},
+		{"cgnat upper", "100.127.255.254", "private/loopback"},
+		{"alibaba metadata", "100.100.100.200", "cloud metadata"},
+		{"oracle metadata", "192.0.0.192", "cloud metadata"},
+		{"benchmarking", "198.19.1.1", "private/loopback"},
+		{"nat64 loopback", "64:ff9b::7f00:1", "private/loopback"},
+		{"nat64 rfc1918", "64:ff9b::a00:5", "private/loopback"},
+		{"nat64 link-local", "64:ff9b::a9fe:a00", "private/loopback"},
+		{"nat64 metadata", "64:ff9b::a9fe:a9fe", "cloud metadata"},
+		{"nat64 cgnat metadata", "64:ff9b::6464:64c8", "cloud metadata"},
+		{"nat64 unspecified", "64:ff9b::", "unspecified"},
+		{"nat64 local-use", "64:ff9b:1::1", "private/loopback"},
+		{"v4-mapped metadata", "::ffff:169.254.169.254", "cloud metadata"},
 		{"cloud metadata", "169.254.169.254", "cloud metadata"},
 		{"cloud metadata ipv6", "fd00::1", "cloud metadata"},
 		{"unspecified", "0.0.0.0", "unspecified"},
@@ -2285,6 +2316,19 @@ func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
 				t.Fatalf("connected to %v after refusing", dialed)
 			}
 		})
+	}
+}
+
+// A well-known NAT64 address that embeds a public IPv4 address is a normal
+// destination on a DNS64 network and must not be refused.
+func TestGuardedDial_AllowsNAT64WithPublicEmbeddedAddress(t *testing.T) {
+	var dialed []string
+	dial := guardedDial(staticLookup("64:ff9b::5db8:d822"), recordingDial(&dialed), nil)
+	if _, err := dial(context.Background(), "tcp", "v4only.example.com:443"); err != nil {
+		t.Fatalf("dial refused: %v", err)
+	}
+	if len(dialed) != 1 {
+		t.Fatalf("dialed %v, want one connection", dialed)
 	}
 }
 
@@ -2850,6 +2894,9 @@ func TestGuardedDial_TrustedHostMayBePrivate(t *testing.T) {
 		{"unlisted host, private ip", "other.internal", "10.1.2.3", true},
 		{"trusted host, metadata ip", "idp.internal", "169.254.169.254", true},
 		{"trusted host, unspecified ip", "idp.internal", "0.0.0.0", true},
+		{"trusted host, cgnat ip", "idp.internal", "100.64.0.9", false},
+		{"trusted host, alibaba metadata ip", "idp.internal", "100.100.100.200", true},
+		{"trusted host, oracle metadata ip", "idp.internal", "192.0.0.192", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3215,6 +3262,130 @@ func TestApplyASSecurityDefaults_Parity(t *testing.T) {
 	d.applyASSecurityDefaults()
 	if len(d.AS.Audiences) != 0 {
 		t.Errorf("AS disabled must not get audiences: %v", d.AS.Audiences)
+	}
+}
+
+func TestDefaultConfig_StatusCheck(t *testing.T) {
+	sc := defaultConfig().StatusCheck
+	if !sc.Enabled || !sc.StatusListSignerFallback {
+		t.Errorf("enabled/fallback must default to true: %+v", sc)
+	}
+	if sc.MaxListsPerRequest != 20 {
+		t.Errorf("max_lists_per_request default = %d, want 20", sc.MaxListsPerRequest)
+	}
+	if sc.RequestTimeoutSeconds != DefaultStatusRequestTimeoutSeconds || sc.RequestTimeoutSeconds >= 15 {
+		t.Errorf("request_timeout_seconds default = %d, must be well under the 15 s write timeout", sc.RequestTimeoutSeconds)
+	}
+	if sc.MaxListBytes != 2<<20 {
+		t.Errorf("max_list_bytes default = %d, want 2 MiB", sc.MaxListBytes)
+	}
+	if sc.StatusListMinEntries != 0 {
+		t.Error("status_list_min_entries must default to 0 (the draft sets no minimum)")
+	}
+	if !sc.RateLimit.Enabled || sc.RateLimit.MaxAttempts <= 0 {
+		t.Errorf("rate limit must default on: %+v", sc.RateLimit)
+	}
+}
+
+func TestConfig_Validate_StatusCheck(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*StatusCheckConfig)
+		want   string // "" = valid
+	}{
+		{"zero value", func(*StatusCheckConfig) {}, ""},
+		{"negative min entries", func(c *StatusCheckConfig) { c.StatusListMinEntries = -1 }, "status_list_min_entries"},
+		{"min entries", func(c *StatusCheckConfig) { c.StatusListMinEntries = 131072 }, ""},
+		{"negative loads", func(c *StatusCheckConfig) { c.StatusListMaxConcurrentLoads = -1 }, "status_list_max_concurrent_loads"},
+		{"loads", func(c *StatusCheckConfig) { c.StatusListMaxConcurrentLoads = 4 }, ""},
+		{"negative cap", func(c *StatusCheckConfig) { c.MaxListsPerRequest = -1 }, "max_lists_per_request"},
+		{"negative timeout", func(c *StatusCheckConfig) { c.RequestTimeoutSeconds = -1 }, "request_timeout_seconds"},
+		{"timeout over write timeout", func(c *StatusCheckConfig) { c.RequestTimeoutSeconds = MaxStatusRequestTimeoutSeconds + 1 }, "request_timeout_seconds"},
+		{"max timeout", func(c *StatusCheckConfig) { c.RequestTimeoutSeconds = MaxStatusRequestTimeoutSeconds }, ""},
+		{"negative size", func(c *StatusCheckConfig) { c.MaxListBytes = -1 }, "max_list_bytes"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validBaseConfig()
+			tc.mutate(&cfg.StatusCheck)
+			err := cfg.Validate()
+			switch {
+			case tc.want == "" && err != nil:
+				t.Fatalf("unexpected error: %v", err)
+			case tc.want != "" && (err == nil || !strings.Contains(err.Error(), "status_check."+tc.want)):
+				t.Fatalf("err = %v, want one naming status_check.%s", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_StatusCheckSection checks that yaml and env values override the defaults.
+func TestLoad_StatusCheckSection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	yaml := `
+server:
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+status_check:
+  enabled: false
+  status_list_signer_fallback: false
+  status_list_min_entries: 7
+  status_list_max_concurrent_loads: 3
+  max_lists_per_request: 5
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WALLET_STATUS_CHECK_REQUEST_TIMEOUT_SECONDS", "6")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := cfg.StatusCheck
+	if sc.Enabled || sc.StatusListSignerFallback || sc.StatusListMinEntries != 7 || sc.StatusListMaxConcurrentLoads != 3 ||
+		sc.MaxListsPerRequest != 5 || sc.RequestTimeoutSeconds != 6 {
+		t.Fatalf("status_check = %+v", sc)
+	}
+	// Defaults survive a partial section.
+	if sc.MaxListBytes != DefaultStatusMaxListBytes || !sc.RateLimit.Enabled {
+		t.Fatalf("defaults lost: %+v", sc)
+	}
+}
+
+// An operator-configured proxy on a private address must be dialable while
+// destinations stay guarded.
+func TestNewHTTPClient_PrivateProxyIsDialable(t *testing.T) {
+	var gotURL string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURL = r.URL.String()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer proxy.Close() // listens on 127.0.0.1
+
+	cfg := HTTPClientConfig{ProxyURL: proxy.URL, AllowHTTP: true}
+	resp, err := cfg.NewHTTPClient(5 * time.Second).Get("http://93.184.216.34/list")
+	if err != nil {
+		t.Fatalf("request through the private proxy failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if gotURL != "http://93.184.216.34/list" {
+		t.Fatalf("proxy saw %q", gotURL)
+	}
+
+	// The destination itself is still checked, even through the proxy.
+	if resp, err := cfg.NewHTTPClient(5 * time.Second).Get("http://10.1.2.3/list"); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("private destination reached through the proxy")
+	}
+
+	// And the proxy's address does not open up the rest of the network.
+	other := httptest.NewServer(http.NotFoundHandler())
+	defer other.Close()
+	noProxy := HTTPClientConfig{AllowHTTP: true}
+	if resp, err := noProxy.NewHTTPClient(5 * time.Second).Get(other.URL); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("loopback destination reached directly")
 	}
 }
 

@@ -1,6 +1,9 @@
-// Package statuslist builds the compressed, always-empty (all-VALID) bit
-// string for an IETF Token Status List (the `lst` value inside a
-// status_list JWT's payload) - not the JWT itself, which the service layer
+// Package statuslist implements both sides of IETF Token Status Lists
+// (draft-ietf-oauth-status-list) for the wallet backend.
+//
+// Publishing: it builds the compressed, always-empty (all-VALID) bit string
+// for the wallet-provider status list (the `lst` value inside a status_list
+// JWT's payload) - not the JWT itself, which the service layer
 // (RegisterWalletProviderStatusListRoute) wraps this value in.
 //
 // Every WIA's `client_status` and every KA's `key_storage_status` does
@@ -11,6 +14,11 @@
 // value this package returns is a constant. What actually bounds exposure
 // from a compromised or revoked wallet instance is the short WIA/KA
 // lifetime, not this list.
+//
+// Verifying: it fetches and verifies third-party Token Status Lists, in both
+// the JWT (JWS) and CWT (COSE_Sign1) representations, validates their signer
+// key material (x5c/jwk, or x5chain) and looks up a credential's entry (see
+// verify.go).
 package statuslist
 
 import (
