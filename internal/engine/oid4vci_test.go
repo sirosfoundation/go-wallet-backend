@@ -1943,7 +1943,7 @@ func TestRequestClientAttestation_WiresProviderFromResponse(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	// Route the sign_response from the WebSocket client side to signCh
+	// Route the sign_response from the WebSocket client side to the request that sent it
 	go func() {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
@@ -1953,10 +1953,10 @@ func TestRequestClientAttestation_WiresProviderFromResponse(t *testing.T) {
 		if err := json.Unmarshal(data, &signMsg); err != nil {
 			return
 		}
-		session.signCh <- &signMsg
+		session.dispatchSignResponse(&signMsg)
 	}()
 
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VCIHandler{}
 	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
 	h.authServerIssuer = "https://as.example.com"
@@ -2013,10 +2013,10 @@ func TestRequestClientAttestation_EmptyResponseLeavesProviderNil(t *testing.T) {
 		if err := json.Unmarshal(data, &signMsg); err != nil {
 			return
 		}
-		session.signCh <- &signMsg
+		session.dispatchSignResponse(&signMsg)
 	}()
 
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VCIHandler{}
 	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
 	h.authServerIssuer = "https://as.example.com"
@@ -2042,7 +2042,7 @@ func TestRequestClientAttestation_CancelledContextSkipsRequest(t *testing.T) {
 
 	session := testSession(conn)
 
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VCIHandler{}
 	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
 	h.authServerIssuer = "https://as.example.com"
@@ -2079,7 +2079,7 @@ func TestRequestClientAttestation_TimeoutLeavesProviderNil(t *testing.T) {
 
 	session := testSession(conn)
 
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VCIHandler{}
 	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
 	h.authServerIssuer = "https://as.example.com"
@@ -2125,7 +2125,7 @@ func TestRequestProofs_PassesProofTypesAndCount(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	// Route the sign_response from the WebSocket client side to signCh
+	// Route the sign_response from the WebSocket client side to the request that sent it
 	go func() {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
@@ -2135,10 +2135,10 @@ func TestRequestProofs_PassesProofTypesAndCount(t *testing.T) {
 		if err := json.Unmarshal(data, &signMsg); err != nil {
 			return
 		}
-		session.signCh <- &signMsg
+		session.dispatchSignResponse(&signMsg)
 	}()
 
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VCIHandler{}
 	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
 
@@ -2210,10 +2210,10 @@ func TestRequestProofs_PassesReissuanceKid(t *testing.T) {
 		if err := json.Unmarshal(data, &signMsg); err != nil {
 			return
 		}
-		session.signCh <- &signMsg
+		session.dispatchSignResponse(&signMsg)
 	}()
 
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VCIHandler{}
 	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
 
@@ -2271,10 +2271,10 @@ func TestRequestProofs_IssuerMatchesRedirectURI(t *testing.T) {
 		if err := json.Unmarshal(data, &signMsg); err != nil {
 			return
 		}
-		session.signCh <- &signMsg
+		session.dispatchSignResponse(&signMsg)
 	}()
 
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VCIHandler{
 		redirectURI: "https://wallet.example.com/callback",
 		clientID:    "https://wallet.example.com/callback",
@@ -2342,10 +2342,10 @@ func TestRequestProofs_BatchSizePassedAsCount(t *testing.T) {
 		if err := json.Unmarshal(data, &signMsg); err != nil {
 			return
 		}
-		session.signCh <- &signMsg
+		session.dispatchSignResponse(&signMsg)
 	}()
 
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VCIHandler{}
 	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
 
@@ -2402,10 +2402,10 @@ func TestRequestProofs_RejectsUnsupportedProofType(t *testing.T) {
 		if err := json.Unmarshal(data, &signMsg); err != nil {
 			return
 		}
-		session.signCh <- &signMsg
+		session.dispatchSignResponse(&signMsg)
 	}()
 
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VCIHandler{}
 	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
 
@@ -2453,10 +2453,10 @@ func TestRequestProofs_ErrorOnEmptyProofs(t *testing.T) {
 		if err := json.Unmarshal(data, &signMsg); err != nil {
 			return
 		}
-		session.signCh <- &signMsg
+		session.dispatchSignResponse(&signMsg)
 	}()
 
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VCIHandler{}
 	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
 
@@ -3013,7 +3013,7 @@ func TestFetchMetadata_Success(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	resolver := &mockMetadataResolver{
 		result: map[string]interface{}{
@@ -3048,7 +3048,7 @@ func TestFetchMetadata_ResolverError(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	resolver := &mockMetadataResolver{
 		err: errors.New("connection refused"),
@@ -3075,7 +3075,7 @@ func TestFetchMetadata_MapConversion(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	resolver := &mockMetadataResolver{
 		result: map[string]interface{}{
@@ -3198,7 +3198,7 @@ func TestFetchMetadata_SkipsCredentialWithBrokenFormat(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	resolver := &mockMetadataResolver{
 		result: map[string]interface{}{
@@ -3240,7 +3240,7 @@ func TestFetchMetadata_ValidatedFlag(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	resolver := &mockMetadataResolver{
 		result: map[string]interface{}{
@@ -3494,9 +3494,9 @@ func TestEvaluateTrust_PDPConfigured_EvaluatorError_FailsClosed(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
-	// Deliberately do NOT queue any trust_result action on session.actionCh:
+	// Deliberately do NOT queue any trust_result action on the flow's action channel:
 	// if the fix regresses and the code falls through to
 	// evaluateTrustViaFrontend, WaitForActionWithTimeout must block until the
 	// bounded context below expires rather than ever getting an answer.
@@ -3561,16 +3561,16 @@ func TestEvaluateTrust_NoPDPConfigured_FrontendFlowUnchanged(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	// Queue the frontend's verdict up front: evaluateTrustViaFrontend blocks on it.
 	resultPayload, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "eudi"})
 	require.NoError(t, err)
-	session.actionCh <- &FlowActionMessage{
+	session.dispatchAction(&FlowActionMessage{
 		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
 		Action:  ActionTrustResult,
 		Payload: resultPayload,
-	}
+	})
 
 	h := &OID4VCIHandler{BaseHandler: BaseHandler{
 		Flow:   flow,
@@ -3645,15 +3645,15 @@ func TestEvaluateTrustViaFrontend_DIDIssuer_PopulatesResolutionSubjectID(t *test
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	resultPayload, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "did-frontend-resolved"})
 	require.NoError(t, err)
-	session.actionCh <- &FlowActionMessage{
+	session.dispatchAction(&FlowActionMessage{
 		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
 		Action:  ActionTrustResult,
 		Payload: resultPayload,
-	}
+	})
 
 	h := &OID4VCIHandler{BaseHandler: BaseHandler{
 		Flow:   flow,

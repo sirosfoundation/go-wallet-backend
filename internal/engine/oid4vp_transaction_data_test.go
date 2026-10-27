@@ -740,7 +740,7 @@ func signRequestFor(t *testing.T, authReq *AuthorizationRequest) SignRequestMess
 
 	select {
 	case m := <-got:
-		session.signCh <- &SignResponseMessage{Message: Message{MessageID: m.MessageID}, VPToken: "vp"}
+		session.dispatchSignResponse(&SignResponseMessage{Message: Message{MessageID: m.MessageID}, VPToken: "vp"})
 		require.NoError(t, <-done)
 		return m
 	case <-time.After(2 * time.Second):

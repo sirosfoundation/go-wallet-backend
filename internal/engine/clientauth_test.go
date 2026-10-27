@@ -90,7 +90,7 @@ func newClientAuthHandler(t *testing.T, httpClient *http.Client, client *clientA
 			}
 			var msg SignResponseMessage
 			if json.Unmarshal(data, &msg) == nil {
-				session.signCh <- &msg
+				session.dispatchSignResponse(&msg)
 			}
 		}
 	}()
