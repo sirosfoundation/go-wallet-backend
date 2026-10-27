@@ -33,15 +33,37 @@ func refuseRevocationUnavailable(c *gin.Context, logger *zap.Logger, err error) 
 	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "revocation check unavailable"})
 }
 
+// sessionOwnerRevoked reports whether the session's user has been revoked
+// (account deletion revokes the user before the sessions are purged, so an
+// interrupted or unacknowledged deletion can leave a live session whose owner
+// is already revoked). When it returns true a response has been written and
+// the caller must stop: 401 for a revoked owner, 503 when the revocation
+// store cannot say. Without a wired blacklist there is nothing to check.
+func sessionOwnerRevoked(c *gin.Context, deps *tokenDeps, session *Session) bool {
+	if deps.blacklist == nil {
+		return false
+	}
+	revoked, err := deps.blacklist.IsUserRevoked(c.Request.Context(), session.UserID)
+	if err != nil {
+		refuseRevocationUnavailable(c, deps.logger, err)
+		return true
+	}
+	if revoked {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
+		return true
+	}
+	return false
+}
+
 // tokenDeps groups the shared dependencies for token issuance handlers.
 type tokenDeps struct {
 	issuer *TokenIssuer
 	policy PolicyEngine
 	// ttlFunc, audiences and blacklist are used differently across the two
-	// token-issuance paths: ttlFunc for both; audiences and blacklist only
-	// by handleDelegationTokenRequest, which is the only path that verifies
-	// an already-issued Bearer token rather than trusting a server-side
-	// session record.
+	// token-issuance paths: ttlFunc for both; audiences only by
+	// handleDelegationTokenRequest, which verifies an already-issued Bearer
+	// token. blacklist is used by every path: delegation checks the parent
+	// token, the session paths check the session owner (sessionOwnerRevoked).
 	ttlFunc   func(string) time.Duration
 	audiences []string
 	blacklist TokenBlacklistChecker
@@ -65,10 +87,11 @@ type TokenEndpointConfig struct {
 	Issuer  *TokenIssuer
 	Policy  PolicyEngine
 	TTLFunc func(string) time.Duration
-	// Audiences and Blacklist are used only by the delegation-exchange path
-	// (handleDelegationTokenRequest), which is the only one that verifies an
-	// already-issued Bearer token rather than trusting a server-side session
-	// record - see #381/#382.
+	// Audiences is used only by the delegation-exchange path
+	// (handleDelegationTokenRequest), which verifies an already-issued Bearer
+	// token - see #381/#382. Blacklist is consulted by every path: delegation
+	// checks the parent token; the session-cookie paths check that the
+	// session's owner has not been revoked (account deletion).
 	Audiences       []string
 	Blacklist       TokenBlacklistChecker
 	InsecureCookies bool
@@ -149,6 +172,9 @@ func handleSessionTokenRequest(
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
 		return
 	}
+	if sessionOwnerRevoked(c, deps, session) {
+		return
+	}
 
 	tenantID := req.TenantID
 	if tenantID == "" {
@@ -214,6 +240,9 @@ func handleAnonymousTokenRequest(
 	session, err := store.Get(c.Request.Context(), sessionID)
 	if err != nil || session == nil || !session.IsValid() {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
+		return
+	}
+	if sessionOwnerRevoked(c, deps, session) {
 		return
 	}
 

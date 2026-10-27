@@ -1128,3 +1128,39 @@ func TestTokenEndpoint_Delegation_RevocationStoreErrorRefuses(t *testing.T) {
 		}
 	}
 }
+
+// Account deletion revokes the user first and purges sessions after. If the
+// deletion is interrupted (or the revocation write's acknowledgement is lost)
+// the session survives, and its cookie must not mint tokens - identified or
+// anonymous - for a revoked owner, nor when revocation cannot be checked.
+func TestTokenEndpoint_SessionCookie_RevokedOwner(t *testing.T) {
+	issuer := newTestTokenIssuer(t)
+	post := func(bl TokenBlacklistChecker, anonymous bool) *httptest.ResponseRecorder {
+		router, store := setupRouterWithIssuer(t, issuer, nil, bl)
+		_ = store.Create(context.Background(), &Session{
+			JTI: "sess-del", UserID: "user-1", TenantID: "tenant-1", ACR: "urn:siros:acr:passkey",
+			MaxTAC: TAC("rwl"), CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+		})
+		body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r", Anonymous: anonymous})
+		req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-del"})
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+	for _, anonymous := range []bool{false, true} {
+		name := map[bool]string{false: "identified", true: "anonymous"}[anonymous]
+		t.Run(name, func(t *testing.T) {
+			if w := post(&fakeBlacklist{}, anonymous); w.Code != http.StatusOK {
+				t.Fatalf("positive control: expected 200, got %d: %s", w.Code, w.Body.String())
+			}
+			if w := post(&fakeBlacklist{revokedUsers: map[string]bool{"user-1": true}}, anonymous); w.Code != http.StatusUnauthorized {
+				t.Errorf("revoked owner: expected 401, got %d: %s", w.Code, w.Body.String())
+			}
+			if w := post(&fakeBlacklist{userErr: errors.New("store down")}, anonymous); w.Code != http.StatusServiceUnavailable {
+				t.Errorf("revocation lookup error: expected 503, got %d: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
