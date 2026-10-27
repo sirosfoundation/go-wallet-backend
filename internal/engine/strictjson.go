@@ -44,6 +44,24 @@ func decodeStrict(data []byte, v any) error {
 	return json.Unmarshal(data, v)
 }
 
+// decodeCredentialResponse decodes a plain credential response. The credentials
+// in it are opaque (their claims and JSON-LD contexts follow their own formats,
+// and may legitimately have a member such as "Type"): only the response's own
+// member names, and the whole of its credential_metadata (where a secret could
+// hide), must be unambiguous.
+func decodeCredentialResponse(data []byte, v *CredentialResponse) error {
+	if err := checkUnambiguous(data, 1); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, v); err != nil {
+		return err
+	}
+	if len(v.CredentialMetadata) > 0 {
+		return checkUnambiguous(v.CredentialMetadata, -1)
+	}
+	return nil
+}
+
 // checkUnambiguous is the walk behind decodeStrict. depth limits it to the
 // outermost depth levels of objects (1: only the top-level object's names);
 // a negative depth checks the whole document.

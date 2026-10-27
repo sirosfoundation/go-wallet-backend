@@ -99,22 +99,54 @@ func TestCheckUnambiguous_ManyNamesIsLinear(t *testing.T) {
 	assert.Less(t, time.Since(start), 5*time.Second)
 }
 
-// Depth tracking is constant work per token: a deeply nested document with many
-// members below the checked depth is walked in linear time.
+// Depth tracking is constant work per token: walking a deeply nested document
+// costs about what walking a flat one with as many members does. The comparison
+// is relative so that a slow machine cannot fail it.
 func TestCheckUnambiguous_DeepAndWideIsLinear(t *testing.T) {
-	const depth, width = 5000, 1000000
-	var b strings.Builder
-	b.WriteString(strings.Repeat(`{"a":`, depth))
-	b.WriteString("{")
-	for i := 0; i < width; i++ {
-		if i > 0 {
-			b.WriteString(",")
+	const depth, width = 5000, 400000
+	doc := func(depth int) []byte {
+		var b strings.Builder
+		b.WriteString(strings.Repeat(`{"a":`, depth))
+		b.WriteString("{")
+		for i := 0; i < width; i++ {
+			if i > 0 {
+				b.WriteString(",")
+			}
+			fmt.Fprintf(&b, `"k%d":1`, i)
 		}
-		fmt.Fprintf(&b, `"k%d":1`, i)
+		b.WriteString("}")
+		b.WriteString(strings.Repeat(`}`, depth))
+		return []byte(b.String())
 	}
-	b.WriteString("}")
-	b.WriteString(strings.Repeat(`}`, depth))
-	start := time.Now()
-	require.NoError(t, checkUnambiguous([]byte(b.String()), 1))
-	assert.Less(t, time.Since(start), time.Second)
+	flat, deep := doc(1), doc(depth)
+	best := func(d []byte) time.Duration {
+		min := time.Duration(1 << 62)
+		for i := 0; i < 3; i++ {
+			start := time.Now()
+			require.NoError(t, checkUnambiguous(d, 1))
+			if el := time.Since(start); el < min {
+				min = el
+			}
+		}
+		return min
+	}
+	assert.Less(t, best(deep), 3*best(flat))
+}
+
+// The credentials of a plain response are opaque: only the response's own
+// member names and its credential_metadata are held to the strict rules.
+func TestDecodeCredentialResponse(t *testing.T) {
+	var ok CredentialResponse
+	require.NoError(t, decodeCredentialResponse([]byte(`{"credentials":[{"credential":{"credentialSubject":{"Type":"x","type":"y"},"@context":[{"Type":1,"type":2}]}}],"credential_metadata":{"display":[]}}`), &ok))
+	for name, in := range map[string]string{
+		"repeated credential_metadata":     `{"credential_metadata":{"x":1},"credential_metadata":null}`,
+		"case-variant credential_metadata": `{"credential_metadata":{"x":1},"Credential_Metadata":null}`,
+		"repeated member in metadata":      `{"credential_metadata":{"a":1,"a":2}}`,
+		"trailing data":                    `{"credentials":[]} {}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var r CredentialResponse
+			require.ErrorIs(t, decodeCredentialResponse([]byte(in), &r), errAmbiguousJSON)
+		})
+	}
 }

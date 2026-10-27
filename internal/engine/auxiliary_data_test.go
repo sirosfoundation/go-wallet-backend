@@ -292,22 +292,24 @@ func TestAuxiliaryDataConflict_Classification(t *testing.T) {
 		body   string
 		want   string
 	}{
-		"exact code":         {400, `{"error":"auxiliary_data_conflict"}`, conflict},
-		"with description":   {400, `{"error":"auxiliary_data_conflict","error_description":"C"}`, conflict},
-		"other status":       {401, `{"error":"auxiliary_data_conflict"}`, ordinary},
-		"invalid_proof":      {400, `{"error":"invalid_proof","error_description":"auxiliary_data_conflict"}`, ordinary},
-		"different case":     {400, `{"error":"Auxiliary_Data_Conflict"}`, ordinary},
-		"in description":     {400, `{"error":"invalid_request","error_description":"auxiliary_data_conflict"}`, ordinary},
-		"not json":           {400, `auxiliary_data_conflict`, ordinary},
-		"error not string":   {400, `{"error":["auxiliary_data_conflict"]}`, ordinary},
-		"encryption params":  {400, `{"error":"invalid_encryption_parameters"}`, ordinary},
-		"repeated, null":     {400, `{"error":"auxiliary_data_conflict","error":null}`, ambiguous},
-		"repeated, benign":   {400, `{"error":"invalid_request","error":"x"}`, ambiguous},
-		"case-variant twin":  {400, `{"error":"auxiliary_data_conflict","ERROR":"invalid_proof"}`, ambiguous},
-		"case-variant first": {400, `{"ERROR":"invalid_proof","error":"auxiliary_data_conflict"}`, ambiguous},
-		"only a variant":     {400, `{"ERROR":"auxiliary_data_conflict"}`, ambiguous},
-		"trailing value":     {400, `{"error":"invalid_request"} {"error":"auxiliary_data_conflict"}`, ambiguous},
-		"huge number":        {400, `{"x":1e400,"error":"auxiliary_data_conflict"}`, conflict},
+		"exact code":           {400, `{"error":"auxiliary_data_conflict"}`, conflict},
+		"with description":     {400, `{"error":"auxiliary_data_conflict","error_description":"C"}`, conflict},
+		"other status":         {401, `{"error":"auxiliary_data_conflict"}`, ordinary},
+		"invalid_proof":        {400, `{"error":"invalid_proof","error_description":"auxiliary_data_conflict"}`, ordinary},
+		"different case":       {400, `{"error":"Auxiliary_Data_Conflict"}`, ordinary},
+		"in description":       {400, `{"error":"invalid_request","error_description":"auxiliary_data_conflict"}`, ordinary},
+		"not json":             {400, `auxiliary_data_conflict`, ordinary},
+		"error not string":     {400, `{"error":["auxiliary_data_conflict"]}`, ordinary},
+		"encryption params":    {400, `{"error":"invalid_encryption_parameters"}`, ordinary},
+		"repeated, null":       {400, `{"error":"auxiliary_data_conflict","error":null}`, ambiguous},
+		"repeated, benign":     {400, `{"error":"invalid_request","error":"x"}`, ambiguous},
+		"case-variant twin":    {400, `{"error":"auxiliary_data_conflict","ERROR":"invalid_proof"}`, ambiguous},
+		"case-variant first":   {400, `{"ERROR":"invalid_proof","error":"auxiliary_data_conflict"}`, ambiguous},
+		"only a variant":       {400, `{"ERROR":"auxiliary_data_conflict"}`, ambiguous},
+		"trailing value":       {400, `{"error":"invalid_request"} {"error":"auxiliary_data_conflict"}`, ambiguous},
+		"huge number":          {400, `{"x":1e400,"error":"auxiliary_data_conflict"}`, conflict},
+		"repeated member, 500": {500, `{"error":"x","error":"y","c_nonce":"n"}`, ambiguous},
+		"repeated member, 401": {401, `{"error":"auxiliary_data_conflict","ERROR":"x"}`, ambiguous},
 	} {
 		t.Run(name, func(t *testing.T) {
 			h, ch, cleanup := captureHandler(t)
@@ -941,6 +943,49 @@ func TestPlainResponse_AmbiguousOrUnreadableEndsIssuance(t *testing.T) {
 			if len(codes) == 1 {
 				assert.Equal(t, tc.code, codes[0])
 			}
+		})
+	}
+}
+
+// A conflict answered to a deferred request is terminal, with or without a
+// DPoP-Nonce header, and reported once with its own code.
+func TestAuxiliaryDataConflict_DeferredIsTerminalAndReportedOnce(t *testing.T) {
+	old1, old2 := deferredPollDefaultInterval, deferredPollIntervalUnit
+	deferredPollDefaultInterval, deferredPollIntervalUnit = time.Millisecond, time.Millisecond
+	defer func() { deferredPollDefaultInterval, deferredPollIntervalUnit = old1, old2 }()
+	for name, nonce := range map[string]bool{"plain": false, "with DPoP-Nonce header": true} {
+		t.Run(name, func(t *testing.T) {
+			polls := 0
+			st := newIssuerStub(t, `{"transaction_id":"t"}`)
+			st.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasSuffix(r.URL.Path, "/deferred_credential") {
+					_, _ = w.Write([]byte(`{"transaction_id":"t"}`))
+					return
+				}
+				polls++
+				if nonce {
+					w.Header().Set("DPoP-Nonce", "n1")
+				}
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"auxiliary_data_conflict","error_description":"SECRET-ISSUER-TEXT"}`))
+			})
+			fc := &fakeClient{t: t}
+			h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
+			defer cleanup()
+			require.Error(t, h.issueCredential(context.Background(), st.metadata(nil), tokenBearer(), "cfg", auxCfg(""), nil, ""))
+			assert.Equal(t, 1, polls, "never retried")
+			assertNoSecrets(t, "logs", logDump(logs))
+			assert.NotContains(t, logDump(logs), "SECRET-ISSUER-TEXT")
+			fc.settle()
+			var codes []ErrorCode
+			for _, m := range fc.outboundMessages() {
+				if string(m["type"]) == `"flow_error"` {
+					var e FlowError
+					require.NoError(t, json.Unmarshal(m["error"], &e))
+					codes = append(codes, e.Code)
+				}
+			}
+			assert.Equal(t, []ErrorCode{ErrCodeAuxiliaryDataConflict}, codes)
 		})
 	}
 }

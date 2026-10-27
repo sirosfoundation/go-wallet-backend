@@ -2905,7 +2905,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		}
 
 		var credResp CredentialResponse
-		if err := decodeStrict(body, &credResp); err != nil {
+		if err := decodeCredentialResponse(body, &credResp); err != nil {
 			// Terminal and generic: nothing of the body is logged or returned.
 			_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 			return nil, errors.New("failed to parse credential response")
@@ -3051,6 +3051,10 @@ func (p *deferredPoll) once(ctx context.Context, attempt, maxAttempts int) (cred
 	// Handle DPoP nonce on deferred responses
 	h.updateDPoPNonce(resp)
 	if isDPoPNonceError(resp) {
+		// A terminal conflict is never retried, with or without the header.
+		if err := h.relayAuxiliaryDataConflict(resp); err != nil {
+			return nil, true, err
+		}
 		_ = resp.Body.Close()
 		return nil, false, nil // Retry immediately with new nonce (counts as one attempt)
 	}
@@ -3115,7 +3119,7 @@ func (p *deferredPoll) plainAnswer(status int, body []byte, attempt int) (*Crede
 	case http.StatusOK:
 		// Credential is ready
 		var credResp CredentialResponse
-		if err := decodeStrict(body, &credResp); err != nil {
+		if err := decodeCredentialResponse(body, &credResp); err != nil {
 			return nil, true, errors.New("failed to parse deferred credential response")
 		}
 		h.Logger.Info("Deferred credential received", zap.String("transaction_id", p.transactionID))
@@ -3149,6 +3153,9 @@ func (p *deferredPoll) plainAnswer(status int, body []byte, attempt int) (*Crede
 
 	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
 		// Non-retryable errors
+		if err := h.auxiliaryDataConflictError(status, body); err != nil {
+			return nil, true, err
+		}
 		if p.quiet {
 			return nil, true, fmt.Errorf("deferred credential request failed with status %d: %w", status, oauthErrorCodeOnly(status, body))
 		}
@@ -3255,38 +3262,34 @@ type errorBodyWire struct {
 // commitment. Such a body is terminal and generic, and nothing of it is
 // retried on, logged or returned.
 func (h *OID4VCIHandler) auxiliaryDataConflictError(status int, body []byte) error {
-	if status != http.StatusBadRequest {
-		return nil
-	}
 	var e errorBodyWire
 	err := decodeStrict(body, &e)
 	if errors.Is(err, errAmbiguousJSON) {
+		// Whatever the status: a retry path (c_nonce, DPoP nonce) must not act
+		// on a body that two decoders read differently.
 		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
-		return errors.New("credential endpoint returned an ambiguous error response")
+		return fmt.Errorf("credential endpoint returned an ambiguous error response: %w", errFlowReported)
 	}
-	if err != nil || e.Error != auxiliaryDataConflictCode {
+	if status != http.StatusBadRequest || err != nil || e.Error != auxiliaryDataConflictCode {
 		return nil
 	}
 	_ = h.ErrorWithDetails(StepRequestingCredential, ErrCodeAuxiliaryDataConflict,
 		ErrCodeAuxiliaryDataConflict.UserFacingMessage(),
 		map[string]interface{}{"error": auxiliaryDataConflictCode})
-	return errors.New("credential request rejected: " + auxiliaryDataConflictCode)
+	return fmt.Errorf("credential request rejected: %s: %w", auxiliaryDataConflictCode, errFlowReported)
 }
 
 // relayAuxiliaryDataConflict reads (and closes) the body of a 400 response and
-// relays it if it is an auxiliary_data_conflict. Other responses are left for
-// the caller (their body is untouched when the status is not 400).
+// relays it if it is an auxiliary_data_conflict, or refuses it when it is
+// ambiguous. Other responses are left for the caller with their body restored.
 func (h *OID4VCIHandler) relayAuxiliaryDataConflict(resp *http.Response) error {
-	if resp.StatusCode != http.StatusBadRequest {
-		return nil
-	}
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes+1))
 	if readErr != nil || len(body) > MaxErrorBodyBytes {
 		// Unreadable or too large to classify (it may be a conflict): fail
 		// closed, no retry.
 		_ = resp.Body.Close()
 		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
-		return fmt.Errorf("credential endpoint returned status %d with an oversized error body", resp.StatusCode)
+		return fmt.Errorf("credential endpoint returned status %d with an oversized error body: %w", resp.StatusCode, errFlowReported)
 	}
 	if err := h.auxiliaryDataConflictError(resp.StatusCode, body); err != nil {
 		_ = resp.Body.Close()
