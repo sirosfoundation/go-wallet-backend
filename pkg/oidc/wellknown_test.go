@@ -91,6 +91,10 @@ func TestNormalizeIssuerURL(t *testing.T) {
 		{"meaningful path keeps query", "https://issuer.example.com/tenant/?a=b/", "https://issuer.example.com/tenant/?a=b/"},
 		{"uppercase scheme keeps its spelling", "HTTPS://issuer.example.com/", "HTTPS://issuer.example.com"},
 		{"uppercase scheme without slash unchanged", "HTTPS://issuer.example.com", "HTTPS://issuer.example.com"},
+		{"empty fragment is preserved", "https://issuer.example.com/#", "https://issuer.example.com#"},
+		{"empty fragment without slash unchanged", "https://issuer.example.com#", "https://issuer.example.com#"},
+		{"unicode fragment is preserved", "https://issuer.example.com/#\u00e5\u00e4\u00f6", "https://issuer.example.com#\u00e5\u00e4\u00f6"},
+		{"empty query is preserved", "https://issuer.example.com/?", "https://issuer.example.com?"},
 		{"invalid URL returned unchanged", "://not-a-url", "://not-a-url"},
 	}
 	for _, tt := range tests {
@@ -122,6 +126,8 @@ func TestSameIssuerIdentifier(t *testing.T) {
 		{"query slash value kept", "https://i.example.com?r=https://c/", "https://i.example.com?r=https://c", false},
 		{"query vs none", "https://i.example.com?x=1", "https://i.example.com", false},
 		{"uppercase scheme root slash", "HTTPS://i.example.com/", "HTTPS://i.example.com", true},
+		{"empty fragment, slash vs none", "https://i.example.com/#", "https://i.example.com#", true},
+		{"empty fragment vs no fragment", "https://i.example.com#", "https://i.example.com", false},
 		{"root slash then query equal", "https://i.example.com/?x=1", "https://i.example.com?x=1", true},
 	}
 	for _, tt := range tests {
