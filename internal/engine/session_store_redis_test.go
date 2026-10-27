@@ -421,7 +421,7 @@ func TestRedisSessionStore_DeleteUserSetIfEmptyKeepsNonEmptySet(t *testing.T) {
 	store, mr := newTestRedisStore(t)
 	ctx := context.Background()
 	require.NoError(t, store.Put(ctx, redisSess("s1", "t1", "u1", time.Hour)))
-	done, err := deleteUserSetIfEmptyScript.Run(ctx, store.client, []string{store.userSetKey("u1")}).Int()
+	done, err := deleteUserSetIfEmptyScript.Run(ctx, store.client, []string{store.userSetKey("u1"), store.legacyUserKey("u1")}).Int()
 	require.NoError(t, err)
 	assert.Equal(t, 0, done)
 	assert.True(t, mr.Exists(store.userSetKey("u1")))
@@ -692,4 +692,37 @@ func TestRedisSessionStore_DeleteCleansPointersInSameTransaction(t *testing.T) {
 	assert.False(t, mr.Exists(store.legacyUserKey("u1")))
 	assert.False(t, mr.Exists(store.sessionKey("s1")))
 	assert.True(t, mr.Exists(store.userKey("t1", "u2")), "other users are untouched")
+}
+
+// The final empty check must see a legacy session an old replica created after
+// DeleteByUser read the legacy pointer: such a session is indexed by no set.
+func TestRedisSessionStore_DeleteUserSetIfEmptyKeepsSetWhileLegacyPointerExists(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	seedLegacySession(t, store, redisSess("old", "t1", "u1", time.Hour), time.Hour)
+
+	done, err := deleteUserSetIfEmptyScript.Run(ctx, store.client, []string{store.userSetKey("u1"), store.legacyUserKey("u1")}).Int()
+	require.NoError(t, err)
+	assert.Equal(t, 0, done, "a legacy pointer means a live legacy session may exist")
+
+	// End to end: DeleteByUser removes the legacy session and its pointer.
+	require.NoError(t, store.DeleteByUser(ctx, "u1"))
+	assert.False(t, mr.Exists(store.sessionKey("old")))
+	assert.False(t, mr.Exists(store.legacyUserKey("u1")))
+}
+
+// A legacy backfill that read a session before Update extended its expiry must
+// not lower the user index's score for it.
+func TestRedisSessionStore_IndexExpiryNeverLowered(t *testing.T) {
+	store, mr := newTestRedisStore(t)
+	ctx := context.Background()
+	require.NoError(t, store.Put(ctx, redisSess("s1", "t1", "u1", 2*time.Hour)))
+
+	// A stale reader re-adds the session with the older, shorter expiry.
+	_, err := userSessionsAddScript.Run(ctx, store.client, []string{store.userSetKey("u1")},
+		(10 * time.Minute).Milliseconds(), "s1").Result()
+	require.NoError(t, err)
+
+	assert.InDelta(t, (2 * time.Hour).Seconds(), mr.TTL(store.userSetKey("u1")).Seconds(), 5,
+		"the set must keep the later expiry")
 }

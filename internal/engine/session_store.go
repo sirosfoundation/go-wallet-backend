@@ -230,11 +230,14 @@ return 0
 // userSessionAddLua records ARGV[idArg] in the sorted set KEYS[setKey], scored
 // by expiry (unix ms), drops expired members and expires the set with its
 // longest-lived member, so a set cannot outlive the sessions it indexes. Time
-// comes from the Redis server so replicas with skewed clocks agree.
+// comes from the Redis server so replicas with skewed clocks agree. ZADD GT
+// never lowers an existing member's expiry: a delayed legacy backfill that read
+// a session before Update extended it must not overwrite the renewed score with
+// the older, shorter one.
 const userSessionAddLua = `
 local t = redis.call("TIME")
 local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
-redis.call("ZADD", %[1]s, string.format("%%.0f", now + tonumber(%[2]s)), %[3]s)
+redis.call("ZADD", %[1]s, "GT", string.format("%%.0f", now + tonumber(%[2]s)), %[3]s)
 redis.call("ZREMRANGEBYSCORE", %[1]s, "-inf", string.format("%%.0f", now))
 local top = redis.call("ZRANGE", %[1]s, -1, -1, "WITHSCORES")
 if top[2] then
@@ -554,11 +557,14 @@ end
 return 1
 `)
 
-// deleteUserSetIfEmptyScript deletes KEYS[1] only if empty, returning 1 if
-// gone. Atomic, so a concurrent Put either lands before (caller loops) or
-// after (creates a fresh set that indexes it).
+// deleteUserSetIfEmptyScript deletes KEYS[1] (the user's set) only if it is
+// empty and no legacy pointer (KEYS[2]) exists, returning 1 if done. Atomic, so
+// a concurrent Put either lands before (caller loops) or after (creates a fresh
+// set that indexes it). The legacy pointer is checked too because a replica on
+// the previous release writes sessions that no set indexes: one created after
+// the caller read the pointer must not be reported as deleted.
 var deleteUserSetIfEmptyScript = redis.NewScript(`
-if redis.call("ZCARD", KEYS[1]) == 0 then
+if redis.call("ZCARD", KEYS[1]) == 0 and redis.call("EXISTS", KEYS[2]) == 0 then
 	redis.call("DEL", KEYS[1])
 	return 1
 end
@@ -594,7 +600,7 @@ func (r *RedisSessionStore) DeleteByUser(ctx context.Context, userID string) err
 // dropUserSetIfEmpty atomically removes the user's set if it is empty and
 // reports whether it is gone.
 func (r *RedisSessionStore) dropUserSetIfEmpty(ctx context.Context, userID string) (bool, error) {
-	done, err := deleteUserSetIfEmptyScript.Run(ctx, r.client, []string{r.userSetKey(userID)}).Int()
+	done, err := deleteUserSetIfEmptyScript.Run(ctx, r.client, []string{r.userSetKey(userID), r.legacyUserKey(userID)}).Int()
 	return done == 1, err
 }
 
