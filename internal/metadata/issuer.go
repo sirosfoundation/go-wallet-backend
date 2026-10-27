@@ -87,6 +87,7 @@ func DiscoverIssuer(ctx context.Context, issuerURL string, httpClient *http.Clie
 // Uses RFC 8615 well-known URI construction as required by OID4VCI draft 16+:
 // https://{host}/.well-known/openid-credential-issuer{path}
 func fetchIssuerMetadata(ctx context.Context, issuerURL string, client *http.Client) (*IssuerMetadata, error) {
+	issuerURL = oidc.NormalizeIssuerURL(issuerURL)
 	wellKnownURL, err := oidc.WellKnownURL(issuerURL, "openid-credential-issuer")
 	if err != nil {
 		return nil, err
