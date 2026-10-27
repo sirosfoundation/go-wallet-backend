@@ -16,3 +16,11 @@ const MaxErrorBodyBytes = 64 * 1024 // 64KB
 // MaxHTTPResponseBodyBytes. Real client_metadata is a few KB. Larger values
 // are refused, never truncated.
 const MaxClientMetadataBytes = 64 << 10 // 64KB
+
+// MaxRequestJWTBytes bounds a verifier's raw request object (JAR). The engine
+// forwards it verbatim to the client in trust_evaluation_request (DID schemes
+// resolved by the frontend), so it gets its own bound rather than
+// MaxHTTPResponseBodyBytes. It is larger than MaxClientMetadataBytes because
+// the header may carry an x5c chain or an OIDF trust_chain. Larger requests
+// are refused, never truncated.
+const MaxRequestJWTBytes = 256 << 10 // 256KB

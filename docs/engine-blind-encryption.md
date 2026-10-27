@@ -33,8 +33,7 @@ substitution. For mdoc, OID4VP Annex B.2.6.2 makes it detectable, because the
 verifier key's thumbprint is bound into the session transcript, but only after
 the engine has already seen the plaintext. The model is therefore
 honest-but-curious: the engine is trusted to relay the right keys but not to
-read what it relays (OID4VCI section 13.4 covers this setup). It is not a
-defence against an actively malicious engine.
+read what it relays (OID4VCI section 13.4 covers this setup). The honest-but-curious wording is not a defence against an actively malicious engine for remote mode; the embedded engine (gomobile, native Kotlin/Swift only, in design) is the planned answer to an active relay on native, while web stays honest-but-curious.
 
 ## What the engine still needs
 
@@ -96,7 +95,7 @@ defence against an actively malicious engine.
 
 - `sign_presentation` carries `verified_request`
   (`client_id`, `client_id_scheme`, `response_mode`, `response_uri`, `signed`,
-  `signature_verification`, `client_metadata`, capped at 64 KB by the engine). The client takes the JARM
+  `signature_verification`, `client_metadata`; only `client_metadata` is capped, at `MaxClientMetadataBytes` (64 KB), and the raw request object the engine forwards in `trust_evaluation_request` is capped separately at `MaxRequestJWTBytes` (256 KB)). The client takes the JARM
   `aud` from `verified_request.client_id`. Only the engine POSTs, and only to
   `verified_request.response_uri`.
 - `sign_request` also carries, for `direct_post.jwt` only:

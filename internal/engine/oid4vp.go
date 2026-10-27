@@ -493,6 +493,9 @@ func (h *OID4VPHandler) parseRequestFromURL(u *url.URL) (*AuthorizationRequest, 
 }
 
 func (h *OID4VPHandler) parseRequestJWT(jwtStr string) (*AuthorizationRequest, error) {
+	if len(jwtStr) > MaxRequestJWTBytes {
+		return nil, fmt.Errorf("request JWT exceeds %d bytes", MaxRequestJWTBytes)
+	}
 	// Parse JWT without verification (verification happens during trust evaluation)
 	parts := strings.Split(jwtStr, ".")
 	if len(parts) != 3 {

@@ -289,3 +289,11 @@ func TestClientMetadata_InlineSizeBound(t *testing.T) {
 	require.NoError(t, err)
 	assert.JSONEq(t, zkpClientMetadata, string(authReq.ClientMetadataRaw))
 }
+
+func TestParseRequestJWT_RefusesOversizeRequestObject(t *testing.T) {
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}}
+	_, err := h.parseRequestJWT("e30." + strings.Repeat("A", MaxRequestJWTBytes) + ".sig")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds")
+	assert.NotContains(t, err.Error(), "AAAA", "the value is never echoed")
+}
