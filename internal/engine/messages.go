@@ -131,6 +131,12 @@ const (
 	// (org.siros.secret_seed, org.siros.holder_commitments, org.siros.psc).
 	// Refused, not supported: nothing is stored. auxiliary_data replaces them.
 	ErrCodeLegacySecretMember ErrorCode = "LEGACY_SECRET_MEMBER"
+	// ErrCodeAuxiliaryDataUnsupported: the credential configuration needs
+	// auxiliary data this wallet cannot handle (a to_wallet entry with an alg
+	// or encoding Auxiliary Data v0.1 does not define, or a required to_issuer
+	// entry the wallet cannot send). Refused before any authorization or
+	// request.
+	ErrCodeAuxiliaryDataUnsupported ErrorCode = "AUXILIARY_DATA_UNSUPPORTED"
 	// ErrCodeAuxiliaryDataConflict: the issuer rejected the credential request
 	// with the OpenID4VCI Credential Auxiliary Data error code
 	// auxiliary_data_conflict (an entry conflicts with a value it holds for
@@ -200,6 +206,8 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "The wallet's key proof carries auxiliary data that cannot be sent to the issuer"
 	case ErrCodeAuxiliaryDataConflict:
 		return "The issuer holds a conflicting value for you; it must be resolved with the issuer"
+	case ErrCodeAuxiliaryDataUnsupported:
+		return "The issuer needs auxiliary data that this wallet does not support"
 	case ErrCodeLegacySecretMember:
 		return "The issuer uses a secret delivery format that this wallet no longer supports"
 	default:
@@ -591,6 +599,14 @@ type SignRequestParams struct {
 	// (OpenID4VCI Credential Auxiliary Data v0.1, section 6). The engine never
 	// computes or sees a commitment value.
 	AuxiliaryDataToIssuer []json.RawMessage `json:"auxiliary_data_to_issuer,omitempty"`
+	// AuxiliaryDataToWallet (generate_proof only): the issuer's advertised
+	// to_wallet entries, verbatim. The client uses them to check the entries of
+	// the response it decrypts (each entry listed MUST be present, and
+	// SHA-256(opening) MUST equal the commitment the claim at path represents,
+	// Auxiliary Data v0.1 section 7.2) and refuses the issuance otherwise. The
+	// engine has already refused an entry whose alg or encoding is undefined
+	// there; the client MUST NOT assume it ran.
+	AuxiliaryDataToWallet []json.RawMessage `json:"auxiliary_data_to_wallet,omitempty"`
 	// CredentialType and CredentialIssuer (generate_proof only; set whenever
 	// AuxiliaryDataToIssuer is non-empty): the wallet derives its per-issuer
 	// value for (CredentialType, CredentialIssuer).

@@ -109,13 +109,32 @@ func (h *OID4VCIHandler) failSecretDelivery(err error) error {
 	return err
 }
 
-// refuseLegacySecretMember refuses to use a credential configuration that
-// advertises a superseded secret-bearing member, before any authorization.
-func (h *OID4VCIHandler) refuseLegacySecretMember(config *CredentialConfig) error {
-	if config != nil && hasLegacySecretMember(config.CredentialMetadata) {
-		return h.failLegacySecretMember(errLegacySecretMember)
+// configRefusal says, without sending anything, why a credential configuration
+// must not be used: a superseded member (errLegacySecretMember), a malformed
+// advertisement, or auxiliary data the wallet cannot handle
+// (errAuxiliaryDataUnsupported).
+func configRefusal(config *CredentialConfig) error {
+	if config == nil {
+		return nil
 	}
-	return nil
+	if hasLegacySecretMember(config.CredentialMetadata) {
+		return errLegacySecretMember
+	}
+	d, err := secretDeliveryOf(config)
+	if err != nil {
+		return err
+	}
+	return d.usable(config)
+}
+
+// failConfigRefusal fails the flow for an error of configRefusal.
+func (h *OID4VCIHandler) failConfigRefusal(err error) error {
+	if errors.Is(err, errAuxiliaryDataUnsupported) {
+		h.Logger.Warn("refusing a credential configuration", zap.Error(err))
+		_ = h.Error(StepRequestingCredential, ErrCodeAuxiliaryDataUnsupported, ErrCodeAuxiliaryDataUnsupported.UserFacingMessage())
+		return err
+	}
+	return h.failSecretDelivery(err)
 }
 
 const (
@@ -126,9 +145,27 @@ const (
 	// auxTypeHashCommitment is the one Auxiliary Data Type the engine knows.
 	// Its response entries carry a Secret Value (opening).
 	auxTypeHashCommitment = "hash_commitment"
-	maxAuxEntries         = 16
-	maxAuxPathLen         = 16
 )
+
+// What the wallet can do with a hash_commitment entry, as Auxiliary Data v0.1
+// section 4.1 defines it: the hash function `alg` (sha-256) and how the claim
+// at `path` represents the commitment, `encoding` (absent, base64url, base64 or
+// hex). An entry with any other value is one the wallet does not recognise.
+// The spec sets no limit on the number of entries or the length of a path, and
+// the engine sets none.
+var (
+	auxSupportedAlgs      = []string{"sha-256"}
+	auxSupportedEncodings = []string{"base64url", "base64", "hex"}
+)
+
+func contains(set []string, v string) bool {
+	for _, x := range set {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
 
 // secretDelivery is what the engine takes from one credential configuration's
 // advertisement of secret delivery.
@@ -136,12 +173,51 @@ type secretDelivery struct {
 	// requireEncryption: the issuer delivers secret values to the wallet, so
 	// the response MUST be encrypted (Auxiliary Data v0.1 section 7.1).
 	requireEncryption bool
-	// toIssuer are the advertised auxiliary_data_supported.to_issuer entries,
-	// verbatim, for the wallet to place in its key proofs.
+	// toIssuer are the advertised auxiliary_data_supported.to_issuer entries
+	// the wallet can send (or ignores: an unrecognised type), verbatim, for
+	// the wallet to place in its key proofs. A hash_commitment entry the wallet
+	// cannot send (unsupported alg or encoding) is not in it.
 	toIssuer []json.RawMessage
 	// toIssuerRecognised: at least one to_issuer entry is of a type the engine
 	// knows (hash_commitment), so the wallet needs the credential type.
 	toIssuerRecognised bool
+	// toWallet are the advertised to_wallet entries, verbatim, so the client
+	// can check what it receives and refuse a response that lacks an entry
+	// (v0.1 section 7.2).
+	toWallet []json.RawMessage
+	// unusable is why the wallet must not request the Credential, if it must
+	// not: a to_wallet hash_commitment entry with an alg or encoding it does
+	// not recognise, or a required to_issuer entry it cannot send (v0.1
+	// sections 4.1 and 5). The reason never carries the content.
+	unusable string
+	// requiredToIssuer: a to_issuer entry is required, so a key proof that can
+	// carry auxiliary_data is needed.
+	requiredToIssuer bool
+}
+
+// errAuxiliaryDataUnsupported is why a configuration cannot be used; the flow
+// fails with AUXILIARY_DATA_UNSUPPORTED before any authorization or request.
+var errAuxiliaryDataUnsupported = errors.New("the credential configuration needs auxiliary data this wallet cannot handle")
+
+// usable reports whether the wallet may request the Credential: it recognises
+// every to_wallet hash_commitment entry and every required to_issuer entry,
+// and has a key proof type to carry a required to_issuer entry.
+func (d secretDelivery) usable(config *CredentialConfig) error {
+	if d.unusable != "" {
+		return fmt.Errorf("%w: %s", errAuxiliaryDataUnsupported, d.unusable)
+	}
+	if d.requiredToIssuer && !carriesAuxiliaryData(config) {
+		return fmt.Errorf("%w: a required to_issuer entry needs a jwt or attestation key proof", errAuxiliaryDataUnsupported)
+	}
+	return nil
+}
+
+// carriesAuxiliaryData: the configuration declares a key proof type in which
+// the wallet can place auxiliary_data and the engine can inspect it.
+func carriesAuxiliaryData(config *CredentialConfig) bool {
+	_, jwt := config.ProofTypesSupported["jwt"]
+	_, att := config.ProofTypesSupported["attestation"]
+	return jwt || att
 }
 
 // errMalformedAdvertisement never carries the offending content.
@@ -167,6 +243,9 @@ func secretDeliveryOf(config *CredentialConfig) (secretDelivery, error) {
 		d.requireEncryption = d.requireEncryption || aux.toWalletSecret
 		d.toIssuer = aux.toIssuer
 		d.toIssuerRecognised = aux.toIssuerRecognised
+		d.toWallet = aux.toWallet
+		d.unusable = aux.unusable
+		d.requiredToIssuer = aux.requiredToIssuer
 	}
 	return d, nil
 }
@@ -238,8 +317,11 @@ func (c *CredentialConfig) UnmarshalJSON(data []byte) error {
 
 type auxAdvertisement struct {
 	toWalletSecret     bool
+	toWallet           []json.RawMessage
 	toIssuer           []json.RawMessage
 	toIssuerRecognised bool
+	unusable           string
+	requiredToIssuer   bool
 }
 
 // auxSupportedWire is auxiliary_data_supported (Auxiliary Data v0.1 section 5).
@@ -253,6 +335,7 @@ type auxSupportedWire struct {
 type auxEntryWire struct {
 	Type     string          `json:"type"`
 	Alg      string          `json:"alg"`
+	Encoding json.RawMessage `json:"encoding"`
 	Path     json.RawMessage `json:"path"`
 	Required json.RawMessage `json:"required"`
 }
@@ -275,19 +358,40 @@ func parseAuxiliaryDataSupported(raw json.RawMessage) (*auxAdvertisement, error)
 	}
 	out := &auxAdvertisement{}
 	if top.ToWallet != nil {
-		entries, _, err := parseAuxEntries(top.ToWallet, "to_wallet")
+		entries, rawEntries, err := parseAuxEntries(top.ToWallet, "to_wallet")
 		if err != nil {
 			return nil, err
 		}
 		out.toWalletSecret = hasHashCommitment(entries)
+		out.toWallet = rawEntries
+		// Every to_wallet entry of a type the wallet knows must be one it can
+		// check: it MUST NOT request the Credential otherwise (section 4.1).
+		for _, e := range entries {
+			if e.typ == auxTypeHashCommitment && !e.sendable {
+				out.unusable = "a to_wallet entry has an alg or encoding this wallet does not recognise"
+			}
+		}
 	}
 	if top.ToIssuer != nil {
 		entries, rawEntries, err := parseAuxEntries(top.ToIssuer, "to_issuer")
 		if err != nil {
 			return nil, err
 		}
-		out.toIssuer = rawEntries
 		out.toIssuerRecognised = hasHashCommitment(entries)
+		for i, e := range entries {
+			switch {
+			case e.typ == auxTypeHashCommitment && !e.sendable:
+				// MUST NOT be sent; required, it also MUST NOT be requested.
+				if e.required {
+					out.unusable = "a required to_issuer entry has an alg or encoding this wallet does not recognise"
+				}
+				continue
+			case e.typ != auxTypeHashCommitment && e.required:
+				out.unusable = "a required to_issuer entry is of a type this wallet does not recognise"
+			}
+			out.requiredToIssuer = out.requiredToIssuer || e.required
+			out.toIssuer = append(out.toIssuer, rawEntries[i])
+		}
 	}
 	return out, nil
 }
@@ -303,7 +407,11 @@ func hasHashCommitment(entries []auxEntry) bool {
 }
 
 type auxEntry struct {
-	typ string
+	typ      string
+	required bool
+	// sendable: a hash_commitment entry whose alg and encoding the wallet
+	// recognises.
+	sendable bool
 }
 
 // errAuxEntry is a malformed entry; the text says why and never carries content.
@@ -316,8 +424,8 @@ func parseAuxEntries(raw json.RawMessage, list string) ([]auxEntry, []json.RawMe
 		return nil, nil, fmt.Errorf("%w: %s %s", errMalformedAdvertisement, list, why)
 	}
 	var rawEntries []json.RawMessage
-	if json.Unmarshal(raw, &rawEntries) != nil || len(rawEntries) == 0 || len(rawEntries) > maxAuxEntries {
-		return bad("is not a non-empty array of bounded size")
+	if json.Unmarshal(raw, &rawEntries) != nil || len(rawEntries) == 0 {
+		return bad("is not a non-empty array")
 	}
 	seen := make(map[string]struct{}, len(rawEntries))
 	entries := make([]auxEntry, 0, len(rawEntries))
@@ -357,7 +465,20 @@ func parseAuxEntry(re json.RawMessage, list string) (auxEntry, string, error) {
 	if err != nil {
 		return auxEntry{}, "", err
 	}
-	return auxEntry{typ: w.Type}, pathKey, nil
+	e := auxEntry{typ: w.Type, required: string(w.Required) == "true"}
+	if w.Type == auxTypeHashCommitment {
+		e.sendable = contains(auxSupportedAlgs, w.Alg) && encodingSupported(w.Encoding)
+	}
+	return e, pathKey, nil
+}
+
+// encodingSupported: encoding is absent, or a string the spec defines.
+func encodingSupported(raw json.RawMessage) bool {
+	if raw == nil {
+		return true
+	}
+	var enc string
+	return json.Unmarshal(raw, &enc) == nil && contains(auxSupportedEncodings, enc)
 }
 
 // checkAuxRequired: only to_issuer entries may carry required, and it is a boolean.
@@ -408,7 +529,7 @@ func auxEntryPathKey(w auxEntryWire) (string, error) {
 // compacted JSON for duplicate detection.
 func claimsPathKey(raw json.RawMessage) (string, bool) {
 	var p []json.RawMessage
-	if json.Unmarshal(raw, &p) != nil || len(p) == 0 || len(p) > maxAuxPathLen {
+	if json.Unmarshal(raw, &p) != nil || len(p) == 0 {
 		return "", false
 	}
 	// Decode every element so the key is independent of how the issuer spelled

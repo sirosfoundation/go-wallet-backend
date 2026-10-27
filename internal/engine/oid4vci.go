@@ -1125,6 +1125,9 @@ func (h *OID4VCIHandler) issueCredential(ctx context.Context, metadata *IssuerMe
 	// Credential response encryption is decided from the issuer metadata
 	// before any proof is requested: the client generates the key in its
 	// generate_proof answer. The engine never holds a response key.
+	if err := configRefusal(selectedConfig); err != nil {
+		return h.failConfigRefusal(err)
+	}
 	respOffer, err := h.negotiateResponseEncryption(metadata, selectedConfig)
 	if err != nil {
 		return err
@@ -1781,18 +1784,19 @@ func (h *OID4VCIHandler) fetchIACACertificates(ctx context.Context, iacasURL str
 func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata) (string, *CredentialConfig, error) {
 	// Build available credentials list
 	available := make([]AvailableCredential, 0, len(offer.CredentialConfigurationIDs))
-	var legacyErr error
+	var refusal error
 	for _, configID := range offer.CredentialConfigurationIDs {
 		config, ok := metadata.CredentialConfigurationsSupported[configID]
 		if !ok {
 			continue
 		}
-		// A configuration advertising a superseded secret-bearing member is
-		// not offered, and using it is refused (LEGACY_SECRET_MEMBER): the
-		// engine would otherwise ask for no response encryption and let the
-		// secret travel in clear.
-		if hasLegacySecretMember(config.CredentialMetadata) {
-			legacyErr = h.refuseLegacySecretMember(&config)
+		// A configuration the wallet must not use is not offered, and using it
+		// is refused before any authorization: a superseded secret-bearing
+		// member (LEGACY_SECRET_MEMBER: the engine would otherwise ask for no
+		// response encryption and let the secret travel in clear), or
+		// auxiliary data it cannot handle (AUXILIARY_DATA_UNSUPPORTED).
+		if err := configRefusal(&config); err != nil {
+			refusal = err
 			continue
 		}
 		var display *CredentialDisplay
@@ -1807,8 +1811,8 @@ func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *Cr
 		})
 	}
 
-	if len(available) == 0 && legacyErr != nil {
-		return "", nil, legacyErr
+	if len(available) == 0 && refusal != nil {
+		return "", nil, h.failConfigRefusal(refusal)
 	}
 
 	// If only one credential, auto-select
@@ -1843,8 +1847,8 @@ func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *Cr
 		_ = h.Error(StepAwaitingSelection, ErrCodeInvalidMessage, "Invalid credential configuration")
 		return "", nil, errors.New("invalid credential configuration")
 	}
-	if err := h.refuseLegacySecretMember(&config); err != nil {
-		return "", nil, err
+	if err := configRefusal(&config); err != nil {
+		return "", nil, h.failConfigRefusal(err)
 	}
 
 	return selection.CredentialConfigurationID, &config, nil
@@ -2505,6 +2509,7 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 	if err != nil {
 		return nil, nil, err
 	}
+	params.AuxiliaryDataToWallet = delivery.toWallet
 	if len(delivery.toIssuer) > 0 {
 		credType := config.VCT
 		if credType == "" {

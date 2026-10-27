@@ -104,7 +104,6 @@ func TestAuxiliaryDataSupported_Malformed(t *testing.T) {
 		"duplicate unknown path":  `{"to_wallet":[{"type":"https://x.example/t","path":["a"]},{"type":"https://x.example/t","path":[ "\u0061" ]}]}`,
 		"required in to_wallet":   `{"to_wallet":[` + hc(`,"required":true`) + `]}`,
 		"duplicate type and path": `{"to_wallet":[` + hc("") + `,` + hc("") + `]}`,
-		"too many entries":        `{"to_wallet":[` + strings.TrimSuffix(strings.Repeat(hc("")+",", 17), ",") + `]}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			d, err := secretDeliveryOf(auxCfg(adv))
@@ -717,4 +716,110 @@ func TestAuxiliaryDataConflict_ReadFailureFailsClosed(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, n)
+}
+
+// Before the credential request the wallet refuses what it cannot handle
+// (Auxiliary Data v0.1 sections 4.1 and 5): a to_wallet hash_commitment entry
+// whose alg or encoding the spec does not define, and a required to_issuer
+// entry it cannot send. The refusal is at selection, before any authorization.
+func TestAuxiliaryData_UnusableConfigurationRefusedBeforeAnyRequest(t *testing.T) {
+	hc := func(extra string) string {
+		return `{"type":"hash_commitment","alg":"sha-256","path":["a","b"]` + extra + `}`
+	}
+	for name, tc := range map[string]struct {
+		adv    string
+		noJWT  bool
+		refuse bool
+	}{
+		"to_wallet alg undefined":            {adv: `{"to_wallet":[{"type":"hash_commitment","alg":"sha-512","path":["a"]}]}`, refuse: true},
+		"to_wallet alg wrong case":           {adv: `{"to_wallet":[{"type":"hash_commitment","alg":"SHA-256","path":["a"]}]}`, refuse: true},
+		"to_wallet encoding undefined":       {adv: `{"to_wallet":[` + hc(`,"encoding":"base32"`) + `]}`, refuse: true},
+		"to_wallet encoding not a string":    {adv: `{"to_wallet":[` + hc(`,"encoding":1`) + `]}`, refuse: true},
+		"to_wallet one bad entry of two":     {adv: `{"to_wallet":[` + hc("") + `,{"type":"hash_commitment","alg":"md5","path":["a","c"]}]}`, refuse: true},
+		"required to_issuer unknown type":    {adv: `{"to_issuer":[{"type":"https://x.example/t","required":true}]}`, refuse: true},
+		"required to_issuer alg undefined":   {adv: `{"to_issuer":[{"type":"hash_commitment","alg":"sha-1","path":["a"],"required":true}]}`, refuse: true},
+		"required to_issuer encoding":        {adv: `{"to_issuer":[` + hc(`,"encoding":"rot13","required":true`) + `]}`, refuse: true},
+		"required to_issuer without a proof": {adv: `{"to_issuer":[` + hc(`,"required":true`) + `]}`, noJWT: true, refuse: true},
+		"to_wallet sha-256, no encoding":     {adv: `{"to_wallet":[` + hc("") + `]}`},
+		"to_wallet base64url":                {adv: `{"to_wallet":[` + hc(`,"encoding":"base64url"`) + `]}`},
+		"to_wallet base64":                   {adv: `{"to_wallet":[` + hc(`,"encoding":"base64"`) + `]}`},
+		"to_wallet hex":                      {adv: `{"to_wallet":[` + hc(`,"encoding":"hex"`) + `]}`},
+		"to_wallet unknown type ignored":     {adv: `{"to_wallet":[{"type":"https://x.example/t","alg":"x"}]}`},
+		"optional to_issuer bad alg ignored": {adv: `{"to_issuer":[{"type":"hash_commitment","alg":"sha-1","path":["a"]}]}`},
+		"optional to_issuer unknown ignored": {adv: `{"to_issuer":[{"type":"https://x.example/t"}]}`},
+		"required to_issuer, jwt proof":      {adv: `{"to_issuer":[` + hc(`,"required":true`) + `]}`},
+		"optional to_issuer without a proof": {adv: `{"to_issuer":[` + hc("") + `]}`, noJWT: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg := auxCfg(tc.adv)
+			if tc.noJWT {
+				cfg.ProofTypesSupported = nil
+			}
+			var md IssuerMetadata
+			md.CredentialConfigurationsSupported = CredentialConfigurations{"cfg": *cfg}
+			offer := &CredentialOffer{CredentialConfigurationIDs: []string{"cfg"}}
+			h, ch, cleanup := captureHandler(t)
+			defer cleanup()
+			_, _, err := h.awaitCredentialSelection(context.Background(), offer, &md)
+			if !tc.refuse {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorIs(t, err, errAuxiliaryDataUnsupported)
+			assert.Equal(t, ErrCodeAuxiliaryDataUnsupported, flowErrorCode(t, nextMsg(t, ch)))
+
+			// Defence in depth: a configuration that gets past selection
+			// reaches neither the issuer nor the client.
+			st := newIssuerStub(t, `{"credential":"c"}`)
+			fc := &fakeClient{t: t}
+			h2, _, cleanup2 := newBlindHandler(t, fc, st.srv.Client())
+			defer cleanup2()
+			err = h2.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", cfg, nil, "")
+			require.ErrorIs(t, err, errAuxiliaryDataUnsupported)
+			assert.Empty(t, st.requests)
+			assert.Empty(t, fc.actions())
+		})
+	}
+}
+
+// One usable configuration is selected over a refused one; the refusal is not
+// reported to the client when something else can be used.
+func TestAuxiliaryData_RefusedConfigurationNotOfferedBesideUsableOne(t *testing.T) {
+	bad := auxCfg(`{"to_wallet":[{"type":"hash_commitment","alg":"sha-512","path":["a"]}]}`)
+	good := auxCfg(auxAdvFull)
+	md := IssuerMetadata{CredentialConfigurationsSupported: CredentialConfigurations{"bad": *bad, "good": *good}}
+	offer := &CredentialOffer{CredentialConfigurationIDs: []string{"bad", "good"}}
+	h, ch, cleanup := captureHandler(t)
+	defer cleanup()
+	id, _, err := h.awaitCredentialSelection(context.Background(), offer, &md)
+	require.NoError(t, err)
+	assert.Equal(t, "good", id)
+	select {
+	case m := <-ch:
+		t.Fatalf("unexpected %s", m["type"])
+	default:
+	}
+}
+
+// The client is told which entries the issuer will send (to_wallet) and which
+// the wallet may send (to_issuer, minus what it cannot send), so it can check
+// the response and refuse.
+func TestGenerateProof_CarriesToWalletAndSendableToIssuer(t *testing.T) {
+	st := newIssuerStub(t, seedResponse)
+	fc := &fakeClient{t: t}
+	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
+	defer cleanup()
+	const dropped = `{"type":"hash_commitment","alg":"sha-1","path":["a","old"]}`
+	const toWallet = `{"type":"hash_commitment","alg":"sha-256","encoding":"hex","path":["a","ssc"]}`
+	adv := `{"to_wallet":[` + toWallet + `],"to_issuer":[` + auxToIssuerPSC + `,` + dropped + `]}`
+	cfg := auxCfg(adv)
+	require.NoError(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", cfg, nil, ""))
+	p := generateProofParams(t, fc)
+	var w, i []json.RawMessage
+	require.NoError(t, json.Unmarshal(p["auxiliary_data_to_wallet"], &w))
+	require.NoError(t, json.Unmarshal(p["auxiliary_data_to_issuer"], &i))
+	require.Len(t, w, 1)
+	assert.JSONEq(t, toWallet, string(w[0]))
+	require.Len(t, i, 1, "an entry the wallet cannot send is not passed on")
+	assert.JSONEq(t, auxToIssuerPSC, string(i[0]))
 }

@@ -730,7 +730,7 @@ credential_configurations_supported[cfg].auxiliary_data_supported
 ```
 
 - It must be an object with at least one of `to_wallet` and `to_issuer`, each a
-  non-empty array (at most 16) of entry objects with a string `type`, at most
+  non-empty array of entry objects with a string `type`, at most
   one entry per `type` and `path`. `required` (a boolean) is allowed in
   `to_issuer` entries only. A `hash_commitment` entry needs a string `alg` and a
   `path` (a non-empty claims path of strings, nulls and non-negative integers)
@@ -747,10 +747,23 @@ credential_configurations_supported[cfg].auxiliary_data_supported
   objects as the issuer published them). The wallet places
   `{type, alg, path, commitment}` in the signed part of every key proof it
   returns, the same value in all proofs of the request, and MUST send each entry
-  with `required: true`. The engine never computes or sees a commitment. Whether
-  a `required` entry was sent is the issuer's to enforce: a configuration with a
-  `required` entry and no proof type is not refused by the engine, the request
-  goes out without the entry and the issuer refuses it.
+  with `required: true`. The engine never computes or sees a commitment. A
+  `hash_commitment` entry the wallet cannot send (an `alg` other than `sha-256`,
+  or an `encoding` other than `base64url`, `base64` or `hex`; section 4.1) is not
+  passed on. Whether the entries sent are acceptable is the issuer's to enforce.
+- `to_wallet` entries go to the client in the param `auxiliary_data_to_wallet`
+  (verbatim), so that it can check the response it decrypts and refuse the
+  issuance when an entry is missing or an opening does not match (section 7.2).
+- Before any authorization or request the engine refuses a configuration (flow
+  error `AUXILIARY_DATA_UNSUPPORTED`, step `requesting_credential`, fixed message)
+  when a `to_wallet` `hash_commitment` entry has an `alg` or `encoding` the
+  specification does not define, when a `required` `to_issuer` entry is of a type
+  the wallet does not recognise or has such an `alg` or `encoding`, or when a
+  `required` `to_issuer` entry is advertised and the configuration declares
+  neither a `jwt` nor an `attestation` proof type to carry it (sections 4.1 and
+  5). A configuration refused this way is not offered for selection beside a
+  usable one. Entries of an unrecognised type that are not `required` are
+  ignored.
 - Whenever `auxiliary_data_to_issuer` is non-empty the request also carries
   `credential_issuer` (the exact `credential_issuer` string of the issuer
   metadata) and, when the configuration has one, `credential_type` (its `vct`,
@@ -1174,6 +1187,7 @@ Server → Client:
 | `TOKEN_ERROR` | Token endpoint returned error |
 | `CREDENTIAL_ERROR` | Credential endpoint returned error |
 | `AUXILIARY_DATA_PROOF_INVALID` | A key proof carries an `opening`, or cannot be inspected for one while the issuer advertised `to_issuer` entries; nothing was sent to the issuer |
+| `AUXILIARY_DATA_UNSUPPORTED` | The configuration needs auxiliary data the wallet cannot handle (undefined `alg`/`encoding` in `to_wallet`, or a `required` `to_issuer` entry it cannot send); refused before any authorization or request. Fixed message |
 | `AUXILIARY_DATA_CONFLICT` | Issuer rejected the credential request with `auxiliary_data_conflict`; `error.details.error` carries that code |
 | `LEGACY_SECRET_MEMBER` | The issuer advertised, or a plain response carried, a superseded secret-bearing member (`org.siros.secret_seed`, `org.siros.holder_commitments`, `org.siros.psc`); refused, nothing stored. Fixed message |
 | `SIGN_TIMEOUT` | Client did not respond to sign request |
