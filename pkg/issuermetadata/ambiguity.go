@@ -36,6 +36,26 @@ var documentSecurityMembers = []string{"credential_response_encryption", "creden
 // read whole.
 var configurationSecurityMembers = []string{"auxiliary_data_supported", "credential_metadata", "proof_types_supported"}
 
+// checkEnvelope checks the raw outer document of a JSON response before any
+// of its members is used: its own member names (signed_metadata, jwks,
+// jwks_uri, ...) and the whole of an inline jwks, which selects the key the
+// signed_metadata JWT is verified with. An error fails the fetch.
+func checkEnvelope(body []byte) error {
+	if err := strictjson.Walk(body, 1, strictjson.All); err != nil {
+		return fmt.Errorf("issuer metadata has an ambiguous member name: %w", err)
+	}
+	var doc map[string]json.RawMessage
+	if json.Unmarshal(body, &doc) != nil {
+		return nil
+	}
+	if jwks, ok := doc["jwks"]; ok {
+		if err := strictjson.Check(jwks, -1); err != nil {
+			return fmt.Errorf("issuer metadata jwks is ambiguous: %w", err)
+		}
+	}
+	return nil
+}
+
 // dropAmbiguousConfigurations checks data, the JSON document claims was decoded
 // from, and removes from claims every credential configuration whose
 // security-relevant members are ambiguous. It returns the removed ids, sorted.
@@ -66,7 +86,7 @@ func dropAmbiguousConfigurations(data []byte, claims map[string]interface{}) ([]
 // per-configuration scope (an error fails the fetch) and returns the raw
 // credential_configurations_supported, nil when absent.
 func checkDocumentLevel(data []byte) (map[string]json.RawMessage, json.RawMessage, error) {
-	if err := strictjson.Walk(data, 1, strictjson.FoldCase); err != nil {
+	if err := strictjson.Walk(data, 1, strictjson.All); err != nil {
 		return nil, nil, fmt.Errorf("issuer metadata has an ambiguous member name: %w", err)
 	}
 	var doc map[string]json.RawMessage

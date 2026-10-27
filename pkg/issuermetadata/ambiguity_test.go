@@ -160,6 +160,15 @@ func TestResolve_AmbiguousAdvertisements(t *testing.T) {
 		"case-variant credential_request_encryption member": {
 			doc:   document(`"credential_request_encryption":{"encryption_required":true,"Encryption_Required":false}`, cfgs(`"o":{}`)),
 			fails: true},
+		"alias-only credential_configurations_supported": {
+			doc:   `{"credential_issuer":"ISS","sub":"ISS","iat":1,"Credential_Configurations_Supported":{"x":{}}}`,
+			fails: true},
+		"alias-only credential_response_encryption": {
+			doc:   document(`"Credential_Response_Encryption":{"encryption_required":true}`, cfgs(`"o":{}`)),
+			fails: true},
+		"alias-only proof_types_supported": {
+			doc:     document("", cfgs(`"bad":{"Proof_Types_Supported":{"jwt":{},"jwt":null}}`)),
+			removed: []string{"bad"}},
 		"repeated credential_configurations_supported": {
 			doc:   `{"credential_issuer":"ISS","sub":"ISS","iat":1,"credential_configurations_supported":{},"credential_configurations_supported":{}}`,
 			fails: true},
@@ -205,3 +214,33 @@ func TestResolve_AmbiguousAdvertisements(t *testing.T) {
 }
 
 func jsonMarshal(v interface{}) ([]byte, error) { return json.Marshal(v) }
+
+// The outer document of a JSON response is checked before its signed_metadata
+// or jwks is used: a repeated envelope member would otherwise pick the last.
+func TestResolve_AmbiguousEnvelopeFailsTheFetch(t *testing.T) {
+	priv, pub := newTestKey(t)
+	jwks := mustJSON(t, inlineJWKS(t, pub))
+	for name, outer := range map[string]string{
+		"repeated signed_metadata": `"signed_metadata":"x.y.z","signed_metadata":"TOKEN"`,
+		"repeated jwks":            `"jwks":{"keys":[]},"jwks":` + jwks + `,"signed_metadata":"TOKEN"`,
+		"alias jwks_uri":           `"jwks_uri":"https://a.example","Jwks_Uri":"https://b.example","signed_metadata":"TOKEN"`,
+		"repeated member in jwks":  `"jwks":{"keys":[],"keys":[]},"signed_metadata":"TOKEN"`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			var srv *httptest.Server
+			srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				token := signRaw(t, priv, nil, "JWT", []byte(strings.ReplaceAll(document("", `{}`), "ISS", srv.URL)))
+				body := `{"credential_issuer":"` + srv.URL + `","jwks":` + jwks + `,` + strings.ReplaceAll(outer, "TOKEN", token) + `}`
+				if strings.HasPrefix(outer, `"jwks"`) {
+					body = `{"credential_issuer":"` + srv.URL + `",` + strings.ReplaceAll(outer, "TOKEN", token) + `}`
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(body))
+			}))
+			defer srv.Close()
+			if _, err := newTestResolver(t).ResolveWithInfo(context.Background(), srv.URL); err == nil {
+				t.Fatal("expected the fetch to fail closed")
+			}
+		})
+	}
+}

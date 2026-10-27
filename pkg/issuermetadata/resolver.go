@@ -550,6 +550,9 @@ func (r *Resolver) handleJSONResponse(ctx context.Context, issuerURL string, bod
 		return nil, fmt.Errorf("response is not valid JSON")
 	}
 
+	if err := checkEnvelope(body); err != nil {
+		return nil, err
+	}
 	var raw map[string]interface{}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("parsing JSON: %w", err)
