@@ -3,6 +3,7 @@ package config
 import (
 	"context"
 	"fmt"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -2968,6 +2969,23 @@ func TestDeletionTombstoneRetention(t *testing.T) {
 	bad.Security.DeletionTombstone.RetentionMarginDays = -1
 	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "retention_margin_days") {
 		t.Errorf("negative retention margin must be refused, got %v", err)
+	}
+	bad = defaultConfig()
+	bad.Security.DeletionTombstone.RetentionMarginDays = MaxDeletionTombstoneRetentionMarginDays + 1
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "retention_margin_days") {
+		t.Errorf("overflowing retention margin must be refused, got %v", err)
+	}
+	bad = defaultConfig()
+	bad.Security.DeletionTombstone.CleanupIntervalSeconds = int(math.MaxInt64 / int64(time.Second))
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "cleanup_interval_seconds") {
+		t.Errorf("overflowing cleanup interval must be refused, got %v", err)
+	}
+	// Even unvalidated, the retention saturates instead of wrapping into the past.
+	sat := defaultConfig()
+	sat.Security.DeletionTombstone.RetentionMarginDays = math.MaxInt
+	sat.JWT.RefreshDays = math.MaxInt
+	if got := sat.DeletionTombstoneRetention(); got <= 0 {
+		t.Errorf("retention wrapped: %v", got)
 	}
 	d := defaultConfig()
 	if d.Security.DeletionTombstone.CleanupIntervalSeconds != 3600 || d.Security.DeletionTombstone.RetentionMarginDays != 30 {
