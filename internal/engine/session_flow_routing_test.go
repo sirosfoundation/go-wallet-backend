@@ -399,3 +399,18 @@ func TestRouting_ReadLoopDeliversInterleavedMessagesToTheirOwners(t *testing.T) 
 	assert.Equal(t, "a", (<-waitA).FlowID)
 	assert.Equal(t, "b", (<-waitB).FlowID)
 }
+
+// A late reply (timed-out sign_client_auth probe, attestation request) for a
+// flow that is still registered is dropped silently: UNKNOWN_FLOW is terminal
+// and the flow is alive.
+func TestRouting_LateReplyForLiveFlowIsDroppedSilently(t *testing.T) {
+	s, client := newRoutingSession(t)
+	s.flowsMu.Lock()
+	s.flows["live"] = &Flow{ID: "live"}
+	s.flowsMu.Unlock()
+
+	s.dispatchSignResponse(&SignResponseMessage{Message: Message{Type: TypeSignResponse, FlowID: "live", MessageID: "gone"}})
+	s.dispatchMatchResponse(&MatchResponseMessage{Message: Message{Type: TypeMatchResponse, FlowID: "live", MessageID: "gone"}})
+	assertNoFurtherReply(t, client)
+	assert.Zero(t, outstandingCount(s))
+}

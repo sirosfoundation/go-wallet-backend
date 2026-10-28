@@ -760,6 +760,8 @@ func (s *Session) dispatchSignResponse(msg *SignResponseMessage) {
 	}
 	_, flowExists := s.flows[msg.FlowID]
 	s.flowsMu.RUnlock()
+	// A late reply to a request that already timed out or was cancelled must not
+	// tell the client its still-live flow is gone (UNKNOWN_FLOW is terminal).
 	if !owned && !flowExists {
 		s.replyUnknownFlow(msg.FlowID, msg.Type)
 	}
@@ -777,8 +779,11 @@ func (s *Session) dispatchMatchResponse(msg *MatchResponseMessage) {
 		default:
 		}
 	}
+	_, flowExists := s.flows[msg.FlowID]
 	s.flowsMu.RUnlock()
-	if !owned {
+	// A late reply to a request that already timed out or was cancelled must not
+	// tell the client its still-live flow is gone (UNKNOWN_FLOW is terminal).
+	if !owned && !flowExists {
 		s.replyUnknownFlow(msg.FlowID, msg.Type)
 	}
 }
