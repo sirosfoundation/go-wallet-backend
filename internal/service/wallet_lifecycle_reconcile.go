@@ -68,7 +68,7 @@ func (s *WalletLifecycleService) reconcile(ctx context.Context, userID domain.Us
 	if err != nil || latest == nil {
 		return outcome, nil, err
 	}
-	leftover, err := s.leftoverData(ctx, userID, latest.TenantID)
+	leftover, err := s.leftoverData(ctx, userID)
 	if err != nil {
 		return "", nil, err
 	}
@@ -88,7 +88,7 @@ func (s *WalletLifecycleService) reconcile(ctx context.Context, userID domain.Us
 	if err != nil || again == nil {
 		return outcome, leftover, err
 	}
-	left, err := s.leftoverData(ctx, userID, again.TenantID)
+	left, err := s.leftoverData(ctx, userID)
 	if err != nil {
 		return "", leftover, err
 	}
@@ -139,7 +139,7 @@ func latestForGrace(revoked []*domain.WalletInstance) *domain.WalletInstance {
 // leftoverData lists the categories of wallet data the user still has in any
 // tenant. Sessions and challenges are not probed; the cascade drops them
 // whenever it runs.
-func (s *WalletLifecycleService) leftoverData(ctx context.Context, userID domain.UserID, tenantID domain.TenantID) ([]string, error) {
+func (s *WalletLifecycleService) leftoverData(ctx context.Context, userID domain.UserID) ([]string, error) {
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
@@ -155,25 +155,18 @@ func (s *WalletLifecycleService) leftoverData(ctx context.Context, userID domain
 		found = append(found, leftoverKeyMaterial)
 	}
 	holders := holderKeySet(userID, user.DID)
-	tenants, err := s.userTenants(ctx, userID, tenantID, holders)
+	// Existence only: TenantsByHolders is a distinct-tenant query, so the probe
+	// never loads or decodes credential and presentation bodies while holding
+	// the user's lifecycle lock.
+	credTenants, err := s.store.Credentials().TenantsByHolders(ctx, holders)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("list credentials: %w", err)
 	}
-	var hasCreds, hasPres bool
-	for _, tid := range tenants {
-		for _, holder := range holders {
-			creds, err := s.store.Credentials().GetAllByHolder(ctx, tid, holder)
-			if err != nil && !errors.Is(err, storage.ErrNotFound) {
-				return nil, fmt.Errorf("list credentials: %w", err)
-			}
-			pres, err := s.store.Presentations().GetAllByHolder(ctx, tid, holder)
-			if err != nil && !errors.Is(err, storage.ErrNotFound) {
-				return nil, fmt.Errorf("list presentations: %w", err)
-			}
-			hasCreds = hasCreds || len(creds) > 0
-			hasPres = hasPres || len(pres) > 0
-		}
+	presTenants, err := s.store.Presentations().TenantsByHolders(ctx, holders)
+	if err != nil {
+		return nil, fmt.Errorf("list presentations: %w", err)
 	}
+	hasCreds, hasPres := len(credTenants) > 0, len(presTenants) > 0
 	if hasCreds {
 		found = append(found, leftoverCredentials)
 	}

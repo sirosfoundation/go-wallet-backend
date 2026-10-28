@@ -1013,3 +1013,63 @@ func TestErasureReconciler_SlowUserDoesNotBlockLaterUsers(t *testing.T) {
 	assert.Zero(t, st.Failed)
 	assert.Equal(t, domain.UserID{}, r.cursor, "an interrupted user is not moved past")
 }
+
+// noBodyProbeStore fails the test if the probe loads credential or
+// presentation bodies: existence is answered by TenantsByHolders alone, so a
+// dry run holding the lifecycle lock never decodes a wallet's payloads.
+type noBodyProbeStore struct {
+	storage.Store
+	t *testing.T
+}
+
+func (s noBodyProbeStore) Credentials() storage.CredentialStore {
+	return noBodyCreds{s.Store.Credentials(), s.t}
+}
+
+func (s noBodyProbeStore) Presentations() storage.PresentationStore {
+	return noBodyPres{s.Store.Presentations(), s.t}
+}
+
+type noBodyCreds struct {
+	storage.CredentialStore
+	t *testing.T
+}
+
+func (c noBodyCreds) GetAllByHolder(context.Context, domain.TenantID, string) ([]*domain.VerifiableCredential, error) {
+	c.t.Error("probe loaded credential bodies")
+	return nil, nil
+}
+
+type noBodyPres struct {
+	storage.PresentationStore
+	t *testing.T
+}
+
+func (p noBodyPres) GetAllByHolder(context.Context, domain.TenantID, string) ([]*domain.VerifiablePresentation, error) {
+	p.t.Error("probe loaded presentation bodies")
+	return nil, nil
+}
+
+func TestReconcileUserDryRun_ProbeDoesNotLoadRecordBodies(t *testing.T) {
+	ctx := context.Background()
+	mem := memory.NewStore()
+	userID := domain.NewUserID()
+	holder := domain.HolderDID(userID.String())
+	require.NoError(t, mem.Users().Create(ctx, &domain.User{UUID: userID}))
+	require.NoError(t, mem.WalletInstances().Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-nb", TenantID: domain.DefaultTenantID, UserID: &userID, Status: domain.InstanceStatusActive,
+	}))
+	require.NoError(t, mem.Credentials().Create(ctx, &domain.VerifiableCredential{
+		TenantID: domain.DefaultTenantID, HolderDID: holder, CredentialIdentifier: "c", Credential: "jwt", Format: domain.CredentialFormat("jwt_vc"),
+	}))
+	require.NoError(t, mem.Presentations().Create(ctx, &domain.VerifiablePresentation{
+		TenantID: domain.DefaultTenantID, HolderDID: holder, PresentationIdentifier: "p", Presentation: "jwt",
+	}))
+	revokeSilently(t, mem, userID)
+
+	svc := NewWalletLifecycleService(noBodyProbeStore{mem, t}, zap.NewNop(), nil)
+	out, left, err := svc.ReconcileUserDryRun(ctx, userID, inTheFuture())
+	require.NoError(t, err)
+	require.Equal(t, ReconcileWouldErase, out)
+	assert.ElementsMatch(t, []string{leftoverCredentials, leftoverPresentations}, left)
+}
