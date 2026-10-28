@@ -7,6 +7,7 @@ package authzen
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"sync"
@@ -321,6 +322,12 @@ func (e *Evaluator) fromAuthZENResponse(resp *gotrust.EvaluationResponse) *trust
 		// Extract trust metadata
 		if resp.Context.TrustMetadata != nil {
 			result.TrustMetadata = resp.Context.TrustMetadata
+		}
+	}
+
+	if resp.Context != nil {
+		if raw, err := json.Marshal(resp.Context); err == nil && string(raw) != "{}" {
+			result.Context = raw
 		}
 	}
 
