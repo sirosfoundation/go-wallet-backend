@@ -84,38 +84,58 @@ func DiscoverIssuer(ctx context.Context, issuerURL string, httpClient *http.Clie
 }
 
 // fetchIssuerMetadata fetches OpenID4VCI issuer metadata from well-known endpoint.
-// Uses RFC 8615 well-known URI construction as required by OID4VCI draft 16+:
-// https://{host}/.well-known/openid-credential-issuer{path}
+// Candidate URLs come from oidc.CredentialIssuerMetadataURLs (1.0 literal form
+// first, 1.1 draft form on HTTP 404 only; RFC 8615 defines only the
+// /.well-known/ namespace).
 func fetchIssuerMetadata(ctx context.Context, issuerURL string, client *http.Client) (*IssuerMetadata, error) {
-	wellKnownURL, err := oidc.WellKnownURL(issuerURL, "openid-credential-issuer")
+	candidates, err := oidc.CredentialIssuerMetadataURLs(issuerURL)
 	if err != nil {
 		return nil, err
 	}
+	for i, u := range candidates {
+		md, status, err := fetchIssuerMetadataFrom(ctx, u, client)
+		if status == http.StatusNotFound && i < len(candidates)-1 {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		// OpenID4VCI 12.2.4: credential_issuer MUST be identical to the
+		// identifier (simple string comparison, no normalisation); whichever
+		// candidate URL served the document, a mismatch is refused.
+		if md.CredentialIssuer != issuerURL {
+			return nil, fmt.Errorf("metadata 'credential_issuer' claim %q does not match issuer URL %q", md.CredentialIssuer, issuerURL)
+		}
+		return md, nil
+	}
+	return nil, fmt.Errorf("no metadata URL candidates")
+}
 
+func fetchIssuerMetadataFrom(ctx context.Context, wellKnownURL string, client *http.Client) (*IssuerMetadata, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wellKnownURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+		return nil, 0, fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "SIROS-Wallet/1.0")
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("HTTP request: %w", err)
+		return nil, 0, fmt.Errorf("HTTP request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
+		return nil, resp.StatusCode, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	var metadata IssuerMetadata
 	if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
-		return nil, fmt.Errorf("decoding response: %w", err)
+		return nil, resp.StatusCode, fmt.Errorf("decoding response: %w", err)
 	}
 
-	return &metadata, nil
+	return &metadata, resp.StatusCode, nil
 }
 
 // fetchIACACertificates fetches IACA certificates from mdoc_iacas_uri
