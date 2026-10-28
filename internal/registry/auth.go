@@ -86,10 +86,17 @@ func AuthMiddlewares(cfg AuthConfig) []gin.HandlerFunc {
 			}
 			// Per-jti revocation for every token type (go-tokenauth v0.4.0
 			// only applies its own checker to asymmetric tokens).
-			if cfg.Blacklist != nil && res.JTI != "" && cfg.Blacklist.IsBlacklisted(c.Request.Context(), res.JTI) {
-				c.JSON(401, gin.H{"error": "Token has been revoked"})
-				c.Abort()
-				return
+			if cfg.Blacklist != nil && res.JTI != "" {
+				revoked, err := cfg.Blacklist.IsBlacklisted(c.Request.Context(), res.JTI)
+				if err != nil {
+					middleware.RefuseRevocationUnavailable(c, logger, err)
+					return
+				}
+				if revoked {
+					c.JSON(401, gin.H{"error": "Token has been revoked"})
+					c.Abort()
+					return
+				}
 			}
 			markAuthenticated(c, res)
 			c.Next()
@@ -102,7 +109,20 @@ func AuthMiddlewares(cfg AuthConfig) []gin.HandlerFunc {
 func acceptedInOptionalMode(c *gin.Context, cfg AuthConfig, res *claims.Result, logger *zap.Logger) bool {
 	ctx := c.Request.Context()
 	if cfg.Blacklist != nil {
-		if (res.JTI != "" && cfg.Blacklist.IsBlacklisted(ctx, res.JTI)) || cfg.Blacklist.IsUserRevoked(ctx, res.UserID) {
+		jtiRevoked := false
+		var err error
+		if res.JTI != "" {
+			if jtiRevoked, err = cfg.Blacklist.IsBlacklisted(ctx, res.JTI); err != nil {
+				logger.Error("registry revocation check failed, continuing unauthenticated", zap.Error(err))
+				return false
+			}
+		}
+		userRevoked, err := cfg.Blacklist.IsUserRevoked(ctx, res.UserID)
+		if err != nil {
+			logger.Error("registry revocation check failed, continuing unauthenticated", zap.Error(err))
+			return false
+		}
+		if jtiRevoked || userRevoked {
 			logger.Debug("registry token revoked, continuing unauthenticated")
 			return false
 		}

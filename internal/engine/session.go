@@ -46,13 +46,23 @@ var (
 // validateToken relies on the shared Validator's own per-jti Revocation checker; this field
 // adds only the user-level check that checker's interface can't express.
 type TokenBlacklistChecker interface {
-	IsBlacklisted(ctx context.Context, jti string) bool
-	IsUserRevoked(ctx context.Context, userID string) bool
+	// IsBlacklisted and IsUserRevoked return an error when the revocation
+	// store cannot answer; the handshake is then refused.
+	IsBlacklisted(ctx context.Context, jti string) (bool, error)
+	IsUserRevoked(ctx context.Context, userID string) (bool, error)
 }
 
 // MaxPendingFlowsPerSession limits concurrent flows to prevent DoS.
 // A session cannot start a new flow if it already has this many pending flows.
 const MaxPendingFlowsPerSession = 3
+
+// revocationCheckTimeout bounds a revocation lookup made outside a request
+// context (session registration).
+var revocationCheckTimeout = 5 * time.Second
+
+// errRevocationUnavailable refuses a handshake whose revocation status could
+// not be determined.
+var errRevocationUnavailable = errors.New("token revocation check unavailable")
 
 const (
 	// defaultWSPingInterval/defaultWSPongTimeout are the fallback keepalive
@@ -981,13 +991,26 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	logger.Info("Flow completed")
 }
 
-// userRevokedAnywhere reports whether userID is revoked according to the
-// engine's own always-on signal or the optional token blacklist.
-func (m *Manager) userRevokedAnywhere(userID string) bool {
-	if m.isUserRevoked(userID) {
+// checkSharedRevocation consults the shared revocation store before
+// registerSession takes sessionsMu. It closes the session and returns false
+// when the user is revoked or the store cannot answer (fail closed).
+func (m *Manager) checkSharedRevocation(session *Session) bool {
+	if session.UserID == "" || m.blacklist == nil {
 		return true
 	}
-	return m.blacklist != nil && m.blacklist.IsUserRevoked(context.Background(), userID)
+	ctx, cancel := context.WithTimeout(context.Background(), revocationCheckTimeout)
+	revoked, err := m.blacklist.IsUserRevoked(ctx, session.UserID)
+	cancel()
+	if err != nil {
+		m.logger.Error("Session refused: revocation check failed", zap.Error(err))
+		session.closeWithReason("revocation check unavailable")
+		return false
+	}
+	if revoked {
+		session.closeWithReason("account deleted")
+		return false
+	}
+	return true
 }
 
 // registerSession adds session to the manager's live-session bookkeeping
@@ -1023,10 +1046,19 @@ func (m *Manager) userRevokedAnywhere(userID string) bool {
 // always caught here (RevokeUser sets revokedUsers before it scans for
 // and closes existing sessions, so there's no ordering to get wrong);
 // registering before it is caught by that same scan.
+//
+// The shared store is consulted before taking sessionsMu: a lookup that
+// reaches a remote store must not stall every other session. The engine's own
+// revokedUsers, which is what orders against RevokeUser, is still checked
+// under the lock.
 func (m *Manager) registerSession(session *Session) bool {
+	if !m.checkSharedRevocation(session) {
+		return false
+	}
+
 	m.sessionsMu.Lock()
 
-	if session.UserID != "" && m.userRevokedAnywhere(session.UserID) {
+	if session.UserID != "" && m.isUserRevoked(session.UserID) {
 		m.sessionsMu.Unlock()
 		session.closeWithReason("account deleted")
 		return false
@@ -1117,7 +1149,17 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 	}
 	// Per-jti revocation happens inside Validate; user-level revocation does not (the checker only
 	// sees a jti), so check the optional TokenBlacklist and the engine's own revokedUsers (#403).
-	if (m.blacklist != nil && m.blacklist.IsUserRevoked(ctx, result.UserID)) || m.isUserRevoked(result.UserID) {
+	if m.blacklist != nil {
+		revoked, err := m.blacklist.IsUserRevoked(ctx, result.UserID)
+		if err != nil {
+			m.logger.Error("Handshake refused: revocation check failed", zap.Error(err))
+			return "", "", "", errRevocationUnavailable
+		}
+		if revoked {
+			return "", "", "", errors.New("token has been revoked")
+		}
+	}
+	if m.isUserRevoked(result.UserID) {
 		return "", "", "", errors.New("token has been revoked")
 	}
 	// SID-AUTH-06: a token issued before the user's cut-off cannot open a session.
@@ -1631,6 +1673,18 @@ var ErrMatchTimeout = errors.New("credential matching timed out")
 // This is the privacy-preserving credential matching protocol where the client
 // matches credentials locally against the DCQL query.
 func (s *Session) RequestMatch(ctx context.Context, flowID string, dcql json.RawMessage) (*MatchResponseMessage, error) {
+	return s.RequestMatchWithClientMetadata(ctx, flowID, dcql, nil)
+}
+
+// RequestMatchWithClientMetadata is RequestMatch that also hands the client the
+// validated request inputs (nil omits them), including the verifier's
+// client_metadata object verbatim, which is also kept at its original
+// top-level member for older clients.
+func (s *Session) RequestMatchWithClientMetadata(ctx context.Context, flowID string, dcql json.RawMessage, request *VerifiedRequestInputs) (*MatchResponseMessage, error) {
+	var clientMetadata json.RawMessage
+	if request != nil {
+		clientMetadata = request.ClientMetadata
+	}
 	messageID := uuid.New().String()
 
 	msg := MatchRequestMessage{
@@ -1640,7 +1694,9 @@ func (s *Session) RequestMatch(ctx context.Context, flowID string, dcql json.Raw
 			MessageID: messageID,
 			Timestamp: Now(),
 		},
-		DCQLQuery: dcql,
+		DCQLQuery:       dcql,
+		ClientMetadata:  clientMetadata,
+		VerifiedRequest: request,
 	}
 
 	defer s.trackRequest(messageID)()

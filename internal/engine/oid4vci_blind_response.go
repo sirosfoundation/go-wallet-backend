@@ -162,7 +162,7 @@ func resolveClientEncryptionKey(offer *responseEncryption, raw json.RawMessage) 
 // (RFC 7516 §7.1): five base64url segments, of which only the encrypted key
 // may be empty. It does not parse or decrypt anything.
 func isCompactJWE(s string) bool {
-	parts := strings.Split(s, ".")
+	parts := strings.SplitN(s, ".", 6)
 	if len(parts) != 5 {
 		return false
 	}

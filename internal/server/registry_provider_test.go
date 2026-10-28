@@ -52,6 +52,11 @@ func newRegAS(t *testing.T) *regAS {
 
 func (a *regAS) token(t *testing.T, aud []string) string {
 	t.Helper()
+	return a.tokenWithJTI(t, aud, "")
+}
+
+func (a *regAS) tokenWithJTI(t *testing.T, aud []string, jti string) string {
+	t.Helper()
 	signer, err := gojose.NewSigner(gojose.SigningKey{Algorithm: gojose.ES256, Key: a.key},
 		(&gojose.SignerOptions{}).WithType("JWT").WithHeader("kid", "k1"))
 	require.NoError(t, err)
@@ -60,7 +65,7 @@ func (a *regAS) token(t *testing.T, aud []string) string {
 		TenantID string `json:"tenant_id"`
 		TAC      string `json:"tac"`
 	}{
-		Claims: josejwt.Claims{Issuer: "wallet-backend", Subject: "u", Audience: aud,
+		Claims: josejwt.Claims{Issuer: "wallet-backend", Subject: "u", Audience: aud, ID: jti,
 			Expiry: josejwt.NewNumericDate(time.Now().Add(time.Hour))},
 		TenantID: "acme", TAC: "r",
 	}).Serialize()
