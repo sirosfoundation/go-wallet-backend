@@ -987,6 +987,20 @@ func TestSignResult_UnknownClientErrorCodeNeverInErrorString(t *testing.T) {
 	_, err = signResult(&SignResponseMessage{Error: "x", ErrorCode: ErrCodeUnsupportedTransactionData})
 	require.ErrorAs(t, err, &se)
 	assert.Equal(t, ErrCodeUnsupportedTransactionData, se.Code)
+
+	// error_code alone (text omitted) is a failure too, allowlisted or not.
+	_, err = signResult(&SignResponseMessage{ErrorCode: ErrCodeUnsupportedTransactionData})
+	require.ErrorAs(t, err, &se)
+	assert.Equal(t, ErrCodeUnsupportedTransactionData, se.Code)
+	_, err = signResult(&SignResponseMessage{ErrorCode: "evil\ninjected"})
+	require.ErrorAs(t, err, &se)
+	assert.Empty(t, se.Code)
+	assert.NotContains(t, err.Error(), "injected")
+
+	// No error and no code: a success.
+	resp, err := signResult(&SignResponseMessage{VPToken: "t"})
+	require.NoError(t, err)
+	assert.Equal(t, "t", resp.VPToken)
 }
 
 // End to end: a trusted verifier's transaction_data request reaches a client that
@@ -995,6 +1009,52 @@ func TestSignResult_UnknownClientErrorCodeNeverInErrorString(t *testing.T) {
 // invalid_transaction_data and give the client the distinct code, not leave the
 // verifier waiting behind a bare SIGN_ERROR.
 func TestExecute_ClientRefusesTransactionDataAtSign_VerifierIsTold(t *testing.T) {
+	r, err := executeWithSignReply(t, "unsupported transaction type", ErrCodeUnsupportedTransactionData)
+	assertVerifierToldInvalidTransactionData(t, r, err)
+}
+
+// The client's text is optional: a refusal that carries only error_code is the
+// same refusal.
+func TestExecute_ClientRefusesTransactionDataAtSign_ErrorCodeOnly(t *testing.T) {
+	r, err := executeWithSignReply(t, "", ErrCodeUnsupportedTransactionData)
+	assertVerifierToldInvalidTransactionData(t, r, err)
+}
+
+// An error_code-only reply with a code the engine does not act on still ends the
+// flow as a client failure; the code reaches neither the verifier nor the error.
+func TestExecute_ClientSignFailureWithUnlistedCodeOnly_GenericFailure(t *testing.T) {
+	r, err := executeWithSignReply(t, "", "evil-injected-code")
+	var signErr *SignError
+	require.ErrorAs(t, err, &signErr)
+	assert.Empty(t, signErr.Code)
+	assert.NotContains(t, err.Error(), "injected")
+	select {
+	case form := <-r.verifierHits:
+		assert.NotEqual(t, "invalid_transaction_data", form.Get("error"))
+		assert.NotContains(t, form.Encode(), "injected")
+	case <-time.After(300 * time.Millisecond):
+	}
+	assert.NotContains(t, r.clientError(t).Error.Message, "injected")
+}
+
+func assertVerifierToldInvalidTransactionData(t *testing.T, r *executeRecorder, err error) {
+	t.Helper()
+	var signErr *SignError
+	require.ErrorAs(t, err, &signErr)
+	assert.Equal(t, ErrCodeUnsupportedTransactionData, signErr.Code)
+
+	select {
+	case form := <-r.verifierHits:
+		assert.Equal(t, "invalid_transaction_data", form.Get("error"))
+		assert.Equal(t, "st-1", form.Get("state"))
+	case <-time.After(2 * time.Second):
+		t.Fatal("the verifier was not told the client refused the transaction data")
+	}
+	assert.Equal(t, ErrCodeUnsupportedTransactionData, r.clientError(t).Error.Code)
+}
+
+func executeWithSignReply(t *testing.T, errText string, code ErrorCode) (*executeRecorder, error) {
+	t.Helper()
 	const (
 		did      = "did:web:verifier.example"
 		clientID = ClientIDSchemeDecentralizedIdentifier + ":" + did
@@ -1035,24 +1095,13 @@ func TestExecute_ClientRefusesTransactionDataAtSign_VerifierIsTold(t *testing.T)
 		req := <-r.signRequests
 		session.signCh <- &SignResponseMessage{
 			Message:   Message{Type: TypeSignResponse, FlowID: req.FlowID, MessageID: req.MessageID},
-			Error:     "unsupported transaction type",
-			ErrorCode: ErrCodeUnsupportedTransactionData,
+			Error:     errText,
+			ErrorCode: code,
 		}
 	}()
 
 	err = r.run(t, &FlowStartMessage{Protocol: ProtocolOID4VP, RequestURI: "openid4vp://?" + q.Encode(), Features: []string{FeatureTransactionDataV1}})
-	var signErr *SignError
-	require.ErrorAs(t, err, &signErr)
-	assert.Equal(t, ErrCodeUnsupportedTransactionData, signErr.Code)
-
-	select {
-	case form := <-r.verifierHits:
-		assert.Equal(t, "invalid_transaction_data", form.Get("error"))
-		assert.Equal(t, "st-1", form.Get("state"))
-	case <-time.After(2 * time.Second):
-		t.Fatal("the verifier was not told the client refused the transaction data")
-	}
-	assert.Equal(t, ErrCodeUnsupportedTransactionData, r.clientError(t).Error.Code)
+	return r, err
 }
 
 // A reply delivered straight to the waiting request (the per-request channel,

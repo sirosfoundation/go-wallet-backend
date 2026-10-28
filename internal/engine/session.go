@@ -1606,9 +1606,11 @@ func allowedSignErrorCode(c ErrorCode) ErrorCode {
 	return ""
 }
 
-// signResult turns a client-reported sign failure into an error.
+// signResult turns a client-reported sign failure into an error. Either field
+// marks a failure: the free-text error, or an error_code on its own, since the
+// client's text is optional. Whatever the code, only an allowlisted one is kept.
 func signResult(resp *SignResponseMessage) (*SignResponseMessage, error) {
-	if resp.Error != "" {
+	if resp.Error != "" || resp.ErrorCode != "" {
 		return nil, &SignError{Code: allowedSignErrorCode(resp.ErrorCode)}
 	}
 	return resp, nil
