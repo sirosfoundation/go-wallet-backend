@@ -2964,6 +2964,27 @@ func TestServedDocumentMissingEndpointsDoesNotGuess(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "no authorization_endpoint")
 	})
+	// Same-connection completion: authorization_endpoint present, token_endpoint
+	// nowhere. Refused before authorization starts; the exchange never guesses.
+	t.Run("token_endpoint missing, authorization_endpoint present", func(t *testing.T) {
+		var srv *httptest.Server
+		srv, paths := newASServer(t, nil)
+		srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			*paths = append(*paths, r.URL.Path)
+			_, _ = w.Write([]byte(`{"issuer":"` + srv.URL + `","authorization_endpoint":"` + srv.URL + `/authorize"}`))
+		})
+		h, cleanup := testOID4VCIHandler(t, srv.Client())
+		defer cleanup()
+		_, err := h.handleAuthorizationCode(context.Background(), &CredentialOffer{}, &IssuerMetadata{CredentialIssuer: srv.URL}, &CredentialConfig{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no token_endpoint")
+		assert.NotContains(t, *paths, "/token")
+
+		// Defence in depth: the exchange itself refuses to guess after a served document.
+		_, err = h.doTokenExchange(context.Background(), &IssuerMetadata{CredentialIssuer: srv.URL}, "x", func(url.Values) {})
+		require.Error(t, err)
+		assert.NotContains(t, *paths, "/token")
+	})
 }
 
 // ===== resumeWithAuthCode tests =====

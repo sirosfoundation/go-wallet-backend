@@ -51,6 +51,7 @@ type OID4VCIHandler struct {
 	dpopNonce            string                 // server-provided DPoP nonce (RFC 9449 §8)
 	attestationChallenge string                 // server-provided Client Attestation PoP challenge (attestation-based client auth)
 	challengeEndpoint    string                 // AS challenge endpoint for fetching attestation challenges
+	asDocumentServed     bool                   // a matching AS document was served (token_endpoint guess is then forbidden)
 	asMetadataFetched    bool                   // AS metadata fetch attempted (see fetchOAuthMetadata)
 	redirectURI          string
 	// encryptedNotificationRegistered is set once the notification context of
@@ -1943,6 +1944,12 @@ func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMe
 	}
 
 	tokenEndpoint := metadata.TokenEndpoint
+	if tokenEndpoint == "" && h.asDocumentServed {
+		// Defence in depth for every path that reaches here after discovery:
+		// never guess when a matching document was served without token_endpoint.
+		return nil, h.failASDiscovery(StepExchangingToken, ErrCodeTokenError,
+			errors.New("authorization server metadata has no token_endpoint"))
+	}
 	if tokenEndpoint == "" {
 		// No token_endpoint discovered (no AS document at all, or none in it):
 		// construct from issuer
@@ -2150,6 +2157,7 @@ func (h *OID4VCIHandler) fetchOAuthMetadata(ctx context.Context, metadata *Issue
 	if err := json.Unmarshal(body, &oauthMeta); err != nil {
 		return nil, fmt.Errorf("authorization server metadata discovery failed: %w", oidc.ErrASMetadataInvalid)
 	}
+	h.asDocumentServed = true
 	// Remember the challenge endpoint for attestation-PoP challenge retrieval.
 	if oauthMeta.ChallengeEndpoint != "" {
 		h.challengeEndpoint = oauthMeta.ChallengeEndpoint
@@ -2174,6 +2182,12 @@ func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *Cre
 		// require_pushed_authorization_requests) must not be dropped.
 		return nil, h.failASDiscovery(StepAuthorizationReq, ErrCodeAuthorizationFail,
 			errors.New("authorization server metadata has no authorization_endpoint"))
+	}
+	if oauthMeta != nil && oauthMeta.TokenEndpoint == "" && metadata.TokenEndpoint == "" {
+		// The code would later be sent to a guessed <issuer>/token: refuse before
+		// starting authorization, as discoverTokenEndpoint does for the other grants.
+		return nil, h.failASDiscovery(StepAuthorizationReq, ErrCodeAuthorizationFail,
+			errors.New("authorization server metadata has no token_endpoint"))
 	}
 	if oauthMeta == nil {
 		// Fallback: discovery found no document at all (every candidate 404);
