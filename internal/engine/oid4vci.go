@@ -632,6 +632,23 @@ func (h *OID4VCIHandler) prepareAttestationChallenge(ctx context.Context) {
 	h.attestationChallenge = challenge
 }
 
+// spendAttestationChallenge retires the pending challenge once the AS has
+// accepted a request carrying it. In legacy mode the WIA+PoP is requested once
+// and replayed, so a PoP bound to the now-spent challenge must not be replayed
+// on the next request (e.g. the token request after PAR): drop it so the next
+// resolveLegacyClientAuth re-requests one with a fresh challenge. A pre-supplied
+// attestation (legacyAttestationRequested false) is left alone.
+func (h *OID4VCIHandler) spendAttestationChallenge() {
+	if h.attestationChallenge == "" {
+		return
+	}
+	h.attestationChallenge = ""
+	if h.clientAuthMode == clientAuthLegacy && h.legacyAttestationRequested {
+		h.attestationProvider = nil
+		h.legacyAttestationRequested = false
+	}
+}
+
 // fetchAttestationChallenge POSTs the AS challenge endpoint to obtain a fresh
 // Client Attestation PoP challenge. A DPoP-Nonce response header, if present,
 // is captured for subsequent DPoP proofs.
@@ -1953,7 +1970,7 @@ func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMe
 			_ = h.Error(StepExchangingToken, ErrCodeTokenError, ErrCodeTokenError.UserFacingMessage())
 			return nil, parseOAuthError(resp.StatusCode, body)
 		}
-		h.attestationChallenge = "" // spent: the AS accepted it
+		h.spendAttestationChallenge() // the AS accepted it
 
 		var token TokenResponse
 		if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
@@ -2372,7 +2389,7 @@ func (h *OID4VCIHandler) sendPushedAuthorizationRequest(ctx context.Context, par
 		}
 		return "", fmt.Errorf("PAR endpoint returned status %d", resp.StatusCode)
 	}
-	h.attestationChallenge = "" // spent: the AS accepted it
+	h.spendAttestationChallenge() // the AS accepted it
 
 	var parResp PARResponse
 	if err := json.NewDecoder(resp.Body).Decode(&parResp); err != nil {

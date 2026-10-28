@@ -348,6 +348,9 @@ func testOID4VCIHandler(t *testing.T, httpClient *http.Client) (*OID4VCIHandler,
 		// Likewise treat the one-shot request_attestation as already done
 		// (declined), as Execute would have before reaching the token step.
 		legacyAttestationRequested: true,
+		// Unrelated tests mock only the endpoint under test; skip the AS
+		// metadata discovery doTokenExchange does for attestation challenges.
+		asMetadataFetched: true,
 	}
 	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
 	return h, cleanup

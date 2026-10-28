@@ -798,3 +798,38 @@ func TestChallengeRetry_NonceRetryDoesNotExhaustBudget(t *testing.T) {
 	assert.Equal(t, "C2", reqs[3].Params.AttestationChallenge)
 	assert.Equal(t, "N1", reqs[3].Params.DPoPNonce)
 }
+
+// In legacy mode the WIA+PoP is requested once and replayed. A PAR that the AS
+// accepted spent the challenge bound into that PoP, so the token request must
+// not replay it: the attestation is re-requested with a fresh challenge.
+func TestPrefetchChallenge_Legacy_PARSpendsChallengeTokenGetsFreshAttestation(t *testing.T) {
+	as := newChallengeAS(t)
+	client := &clientAuthClient{respond: func(req SignRequestMessage) SignResponseMessage {
+		if req.Action == SignActionRequestAttestation {
+			return SignResponseMessage{ClientAttestation: "wia.jwt", ClientAttestationPoP: "legacy-pop"}
+		}
+		return SignResponseMessage{}
+	}}
+	h, _, cleanup := newClientAuthHandler(t, as.Client(), client)
+	defer cleanup()
+	h.challengeEndpoint = as.URL + "/challenge"
+
+	parAuth, err := h.resolveClientAuth(context.Background(), clientAuthNeeds{attestation: true})
+	require.NoError(t, err)
+	_, err = h.sendPushedAuthorizationRequest(context.Background(), as.URL+"/par", url.Values{}, parAuth)
+	require.NoError(t, err)
+
+	metadata := &IssuerMetadata{CredentialIssuer: as.URL, TokenEndpoint: as.URL + "/token"}
+	_, err = h.exchangeAuthCode(context.Background(), metadata, "code", "https://wallet.example.com/cb", "")
+	require.NoError(t, err)
+
+	var attest []SignRequestMessage
+	for _, r := range client.seen() {
+		if r.Action == SignActionRequestAttestation {
+			attest = append(attest, r)
+		}
+	}
+	require.Len(t, attest, 2, "token request must not replay the PoP whose challenge PAR spent")
+	assert.Equal(t, "chal-1", attest[0].Params.AttestationChallenge)
+	assert.Equal(t, "chal-2", attest[1].Params.AttestationChallenge)
+}
