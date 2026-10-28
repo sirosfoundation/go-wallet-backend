@@ -1079,6 +1079,9 @@ func TestReconcileUserDryRun_ProbeDoesNotLoadRecordBodies(t *testing.T) {
 type slowListStore struct {
 	storage.Store
 	maxPage int
+	// succeedLate: the oversized page is returned successfully, but only once
+	// the run's deadline has passed (a slow fetch that eats the whole budget).
+	succeedLate bool
 }
 
 func (s *slowListStore) WalletInstances() storage.WalletInstanceStore {
@@ -1093,7 +1096,9 @@ type slowListInstances struct {
 func (g *slowListInstances) ListUsersWithRevokedInstances(ctx context.Context, after domain.UserID, limit int) ([]domain.UserID, error) {
 	if limit > g.s.maxPage {
 		<-ctx.Done()
-		return nil, ctx.Err()
+		if !g.s.succeedLate {
+			return nil, ctx.Err()
+		}
 	}
 	return g.WalletInstanceStore.ListUsersWithRevokedInstances(ctx, after, limit)
 }
@@ -1112,4 +1117,20 @@ func TestErasureReconciler_SlowPageShrinksSoTheCursorMoves(t *testing.T) {
 		cancel()
 	}
 	assert.Equal(t, len(ids), countErased(t, base, ids), "the reconciler made progress despite the slow oversized page")
+}
+
+// A page fetched successfully but only after the run's budget is spent leaves no
+// time to examine anyone; the same page would do the same every run, so the page
+// shrinks on that outcome too.
+func TestErasureReconciler_SuccessfulButSlowPageShrinksToo(t *testing.T) {
+	base := memory.NewStore()
+	ids := seedRevokedUsers(t, base, 6)
+	r := reconcilerFor(&slowListStore{Store: base, maxPage: 2, succeedLate: true}, 8)
+
+	for run := 0; run < 12 && countErased(t, base, ids) < len(ids); run++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		_, _ = r.RunOnce(ctx)
+		cancel()
+	}
+	assert.Equal(t, len(ids), countErased(t, base, ids))
 }

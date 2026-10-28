@@ -67,7 +67,7 @@ type ErasureReconciler struct {
 	runMu  sync.Mutex
 	cursor domain.UserID
 	// window is the page size actually requested (0: batch). A page the store
-	// cannot return within the run deadline halves it, so the cursor can move
+	// cannot return, or leave time to examine one user, within the run deadline halves it, so the cursor can move
 	// on a slow store instead of retrying the same oversized page forever; a
 	// page that succeeds doubles it back towards batch.
 	window int
@@ -252,6 +252,12 @@ func (r *ErasureReconciler) RunOnce(ctx context.Context) (ReconcileStats, error)
 		}
 		stats.add(outcome)
 		r.cursor = id
+	}
+	if stats.Scanned == 0 && len(ids) > 0 && page > 1 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		// The page arrived but the run's budget was gone before a single user
+		// was examined (a slow page plus a slow first probe): the same page
+		// would do the same next run, so ask for less.
+		r.window = page / 2
 	}
 	if len(ids) < page && ctx.Err() == nil {
 		r.cursor = domain.UserID{} // end of the list: start over next run
