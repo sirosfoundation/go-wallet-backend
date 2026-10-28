@@ -479,18 +479,38 @@ func TestResolve_Cached(t *testing.T) {
 	}
 }
 
-func TestResolve_TrailingSlashStripped(t *testing.T) {
+func TestResolve_PreservesIssuerPath(t *testing.T) {
+	const wellKnownPath = "/.well-known/openid-credential-issuer"
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL}) //nolint:errcheck
+		json.NewEncoder(w).Encode(map[string]string{ //nolint:errcheck
+			"credential_issuer": server.URL + strings.TrimPrefix(r.URL.EscapedPath(), wellKnownPath),
+			"request_path":      r.URL.EscapedPath(),
+		})
 	}))
 	defer server.Close()
 
 	r := newTestResolver(t)
-	// URL with trailing slash should work the same
-	if _, err := r.Resolve(context.Background(), server.URL+"/"); err != nil {
-		t.Fatalf("Resolve() with trailing slash error: %v", err)
+	for _, path := range []string{"", "/", "/test/a/issuer", "/test/a/issuer/", "/test/a/issuer//", "/path%2Fissuer/"} {
+		t.Run("path="+path, func(t *testing.T) {
+			issuerURL := server.URL + path
+			for _, cached := range []bool{false, true} {
+				got, err := r.ResolveWithInfo(context.Background(), issuerURL)
+				if err != nil {
+					t.Fatalf("ResolveWithInfo() error: %v", err)
+				}
+				if got.Cached != cached {
+					t.Errorf("Cached = %v, want %v", got.Cached, cached)
+				}
+				if got.Metadata["credential_issuer"] != issuerURL {
+					t.Errorf("credential_issuer = %v, want %s", got.Metadata["credential_issuer"], issuerURL)
+				}
+				if want := wellKnownPath + path; got.Metadata["request_path"] != want {
+					t.Errorf("request path = %v, want %s", got.Metadata["request_path"], want)
+				}
+			}
+		})
 	}
 }
 

@@ -305,7 +305,7 @@ type ResolveResult struct {
 // using a TTL-cached result when available.
 //
 // The issuerURL must use HTTPS (unless AllowHTTP is set in Config).
-// Any trailing slash in the issuer URL path is stripped per OID4VCI §12.2.1.
+// Any trailing slash in the issuer URL path is preserved per OID4VCI §12.2.2.
 // The endpoint queried follows RFC 8615:
 // https://{host}/.well-known/openid-credential-issuer{path}.
 //
@@ -337,14 +337,6 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 
 	if err := r.validateURL(issuerURL); err != nil {
 		return nil, err
-	}
-
-	// Normalize trailing slash for consistent cache keys, but only when the
-	// path is empty or just "/". Issuers with meaningful paths (e.g.
-	// https://host/issuer/) retain their trailing slash per RFC 8615.
-	parsed, _ := url.Parse(issuerURL) // already validated above
-	if parsed.Path == "" || parsed.Path == "/" {
-		issuerURL = strings.TrimRight(issuerURL, "/")
 	}
 
 	if entry := r.getCachedEntry(issuerURL); entry != nil {
