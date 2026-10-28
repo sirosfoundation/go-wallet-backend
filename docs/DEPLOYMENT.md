@@ -500,7 +500,7 @@ that keep reconnecting are being dropped.
 | `superseded` | A newer connection for the same user replaced this one ("last connection wins") | `superseded_by_session_id` |
 | `account_deleted`, `token_revoked`, `revocation_check_failed` | Closed by the server because the user or token was revoked, or the revocation store could not answer | |
 | `write_error` | A ping or handshake write failed | |
-| `server_shutdown` | The engine is shutting down | |
+| `server_shutdown` | `engine.Manager.Close` closed the session. The server binary does not currently call it on SIGTERM, so this is not expected in production | |
 | `read_error` | Any other read failure | `error_class` (Go type only, no message) |
 | `server_close` | Any other server-initiated close | |
 

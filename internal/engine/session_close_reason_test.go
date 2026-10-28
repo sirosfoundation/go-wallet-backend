@@ -188,12 +188,15 @@ func TestCloseReason_Superseded_LogsBothSessions(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return logs.FilterMessage("Session established").Len() == 2
 	}, time.Second, 10*time.Millisecond)
-	var established []map[string]interface{}
+	established := map[string]map[string]interface{}{}
 	for _, e := range logs.FilterMessage("Session established").All() {
-		established = append(established, e.ContextMap())
+		c := e.ContextMap()
+		established[c["session_id"].(string)] = c
 	}
-	assert.Equal(t, "", established[0]["superseded_session_id"])
-	assert.Equal(t, oldID, established[1]["superseded_session_id"])
+	require.Contains(t, established, oldID)
+	require.Contains(t, established, newID)
+	assert.Equal(t, "", established[oldID]["superseded_session_id"])
+	assert.Equal(t, oldID, established[newID]["superseded_session_id"])
 
 	// No secrets anywhere in the logs.
 	for _, e := range logs.All() {
@@ -201,4 +204,14 @@ func TestCloseReason_Superseded_LogsBothSessions(t *testing.T) {
 		assert.NotContains(t, s, token1)
 		assert.NotContains(t, s, "app_token")
 	}
+}
+
+func TestMarkClosing_DoesNotOverrideRecordedReadError(t *testing.T) {
+	s := &Session{closeInfo: newCloseBookkeeping(nil)}
+	s.noteReadError(&websocket.CloseError{Code: 4001})
+	assert.False(t, s.markClosing(closeReasonSuperseded, "x"))
+	assert.True(t, (&Session{closeInfo: newCloseBookkeeping(nil)}).markClosing(closeReasonSuperseded, "x"))
+	reason, code := classifyClose(s.closeInfo.pending, s.closeInfo.readErr)
+	assert.Equal(t, closeReasonPeerClose, reason)
+	assert.Equal(t, 4001, code)
 }

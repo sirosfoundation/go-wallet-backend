@@ -620,7 +620,11 @@ func (s *Session) pingLoop() {
 				if errors.As(err, &ne) && ne.Timeout() && err.Error() == gorillaWriteLockTimeoutMsg {
 					continue
 				}
-				s.markClosing(closeReasonWriteError, "")
+				// ErrCloseSent: the peer's close frame was already answered, so
+				// this is not a write failure (the read loop reports peer_close).
+				if !errors.Is(err, websocket.ErrCloseSent) {
+					s.markClosing(closeReasonWriteError, "")
+				}
 				_ = s.conn.Close()
 				return
 			}

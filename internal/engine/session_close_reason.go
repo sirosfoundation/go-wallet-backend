@@ -72,7 +72,9 @@ func (s *Session) markClosing(reason, supersededBy string) bool {
 	}
 	s.closeInfo.mu.Lock()
 	defer s.closeInfo.mu.Unlock()
-	if s.closeInfo.pending != "" {
+	// Once the read loop has ended with an error (or the close was reported)
+	// that error is the cause; a later server-side mark must not override it.
+	if s.closeInfo.pending != "" || s.closeInfo.readErr != nil || s.closeInfo.logged {
 		return false
 	}
 	s.closeInfo.pending = reason
