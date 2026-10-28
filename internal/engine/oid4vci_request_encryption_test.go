@@ -200,7 +200,7 @@ func TestPollDeferredCredential_EncryptedWhenRequired(t *testing.T) {
 		CredentialIssuer:            srv.URL,
 		CredentialRequestEncryption: &CredentialRequestEncryptionConfig{JWKS: jwks, EncValuesSupported: []string{"A256GCM"}, EncryptionRequired: true},
 	}
-	_, err := h.pollDeferredCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "tx1", 0, nil, nil)
+	_, err := h.pollDeferredCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "tx1", 0, nil)
 	require.NoError(t, err)
 	assert.Equal(t, "application/jwt", ct)
 	assert.Equal(t, "tx1", body["transaction_id"])

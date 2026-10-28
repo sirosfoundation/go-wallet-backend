@@ -760,15 +760,11 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	if !metadataIsSigned || trustResp.Decision {
 		h.inlineLogos(ctx, result.Metadata)
 	}
-	// A valid auxiliary_data_supported stays; a malformed one, or a superseded
-	// secret-bearing member, makes the configuration "not offered". This runs
+	// A valid auxiliary_data_supported stays; a malformed one makes the
+	// configuration "not offered". This runs
 	// after key extraction and the trust decision above, so dropping the
 	// original signed_metadata JWT here cannot change that decision.
 	sanitizeAuxiliaryDataAdvertisement(result.Metadata)
-	if len(result.AmbiguousConfigurations) > 0 {
-		// The resolver removed them; the retained JWT still carries them.
-		delete(result.Metadata, "signed_metadata")
-	}
 
 	// Step 6: Evaluate whether this provider is entitled to issue what it is
 	// offering. Distinct from the PDP decision above, which answers whether the
@@ -1110,9 +1106,7 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 // request response encryption and to place its commitments. A credential
 // configuration whose advertisement is malformed (a value where a name or
 // entry is expected, an auxiliary_data member or an opening in the metadata,
-// a bad entry), or that advertises a superseded secret-bearing member
-// (org.siros.secret_seed and the like, refused: LEGACY_SECRET_MEMBER), is
-// treated as not offered: the whole configuration is removed.
+// a bad entry) is treated as not offered: the whole configuration is removed.
 //
 // When a configuration is removed, the original signed_metadata JWT (kept by
 // the resolver for legacy signed metadata) is also dropped from the served

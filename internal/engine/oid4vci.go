@@ -327,11 +327,8 @@ func (c *CredentialConfigurations) UnmarshalJSON(data []byte) error {
 			continue
 		}
 		// A malformed secret delivery advertisement (auxiliary_data_supported)
-		// means the configuration is not offered. A configuration advertising
-		// a superseded member is kept so that its selection is refused with
-		// LEGACY_SECRET_MEMBER (see refuseLegacySecretMember) rather than
-		// reading as an unknown configuration.
-		if _, err := secretDeliveryOf(&cfg); err != nil && !errors.Is(err, errLegacySecretMember) {
+		// means the configuration is not offered.
+		if _, err := secretDeliveryOf(&cfg); err != nil {
 			continue
 		}
 		parsed[id] = cfg
@@ -375,8 +372,8 @@ type CredentialResponse struct {
 	Interval        int           `json:"interval,omitempty"`
 	NotificationID  string        `json:"notification_id,omitempty"`
 	// CredentialMetadata is the raw response-level credential_metadata of a
-	// PLAIN response. It may carry a secret (auxiliary_data, or a superseded
-	// member that is refused): never log it; only displayMetadata(...) of it
+	// PLAIN response. It may carry a secret (auxiliary_data, which is
+	// refused): never log it; only displayMetadata(...) of it
 	// may leave the engine.
 	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
 
@@ -1249,7 +1246,7 @@ func (h *OID4VCIHandler) issueCredential(ctx context.Context, metadata *IssuerMe
 		})
 
 		// Poll for deferred credential
-		deferredResp, err := h.pollDeferredCredential(ctx, metadata, token, credential.TransactionID, credential.Interval, credential.ResponseEncryption, selectedConfig)
+		deferredResp, err := h.pollDeferredCredential(ctx, metadata, token, credential.TransactionID, credential.Interval, credential.ResponseEncryption)
 		if err != nil {
 			h.Logger.Debug("deferred polling failed", zap.Error(err))
 			if !errors.Is(err, errFlowReported) {
@@ -1272,8 +1269,7 @@ func (h *OID4VCIHandler) issueCredential(ctx context.Context, metadata *IssuerMe
 // holds the credentials and the response-level credential_metadata.
 func (h *OID4VCIHandler) finishIssuance(ctx context.Context, resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo, metadata *IssuerMetadata, token *TokenResponse) error {
 	// A plain response never carries a Secret Value (Auxiliary Data v0.1,
-	// section 7.1), and never a superseded secret-bearing member: refuse it,
-	// without quoting any content, and store nothing.
+	// section 7.1): refuse it, without quoting any content, and store nothing.
 	if !resp.Encrypted {
 		if err := h.refusePlainSecretMembers(resp.CredentialMetadata); err != nil {
 			return err
@@ -1468,11 +1464,6 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*met
 		return nil, fmt.Errorf("failed to parse metadata: %w", err)
 	}
 	h.logIgnoredCredentialConfigurations(result.Metadata, metadata.CredentialConfigurationsSupported)
-	if len(result.AmbiguousConfigurations) > 0 {
-		// Ids only: the configurations are not offered, their content is not logged.
-		h.Logger.Warn("ignoring credential configurations with ambiguous members",
-			zap.Strings("credential_configuration_ids", result.AmbiguousConfigurations))
-	}
 
 	// Look up registered issuer record from backend storage when a lookup is wired.
 	// Errors are non-fatal: the issuer may simply not be registered in this tenant.
@@ -1860,9 +1851,7 @@ func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *Cr
 			continue
 		}
 		// A configuration the wallet must not use is not offered, and using it
-		// is refused before any authorization: a superseded secret-bearing
-		// member (LEGACY_SECRET_MEMBER: the engine would otherwise ask for no
-		// response encryption and let the secret travel in clear), or
+		// is refused before any authorization: a malformed advertisement, or
 		// auxiliary data it cannot handle (AUXILIARY_DATA_UNSUPPORTED).
 		if err := configRefusal(&config); err != nil {
 			refusal = err
@@ -2999,31 +2988,24 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			_ = resp.Body.Close()
 			if readErr != nil || len(body) > MaxErrorBodyBytes {
 				// Unreadable or too large to classify: it could be an
-				// auxiliary_data_conflict whose text echoes a commitment. Fail
-				// closed, log nothing of it.
+				// auxiliary_data_conflict, which is final. Fail closed.
 				h.Logger.Debug("credential endpoint error body unreadable or too large", zap.Int("status", resp.StatusCode))
 				_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 				return nil, fmt.Errorf("credential endpoint returned status %d with an oversized error body", resp.StatusCode)
 			}
-			quiet := config != nil && len(config.AuxiliaryDataSupported) > 0
-			// Recognise the conflict, and refuse an ambiguous body, BEFORE
-			// anything is logged or any retry is considered: the body may echo
-			// a commitment. A conflict is final and never retried.
+			// A conflict is final and never retried: recognise it before any
+			// retry is considered.
 			if conflictErr := h.auxiliaryDataConflictError(resp.StatusCode, body); conflictErr != nil {
 				return nil, conflictErr
 			}
-			// The body is unambiguous from here (an ambiguous one was refused
-			// above), so this strict decode reads the same document that the
-			// conflict check classified. Nonce detection uses only this read.
 			var errResp errorBodyWire
-			parsedErr := decodeStrict(body, &errResp) == nil
+			parsedErr := json.Unmarshal(body, &errResp) == nil
 			var nonceResp errorNonceWire
-			if decodeStrict(body, &nonceResp) != nil {
+			if json.Unmarshal(body, &nonceResp) != nil {
 				nonceResp = errorNonceWire{} // a non-string c_nonce is no nonce
 			}
 			// Only the error code is logged, never the body or error_description:
-			// they are issuer-controlled free text, may echo a commitment, and
-			// legacy ones carry a nonce.
+			// they are issuer-controlled free text and legacy ones carry a nonce.
 			h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode), zap.String("error", safeErrorCode(errResp.Error)))
 
 			// An invalid_nonce error (no c_nonce in the body per OpenID4VCI 1.0
@@ -3039,17 +3021,8 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 				}
 			}
 
-			// A request that carried auxiliary data may be answered with text
-			// that echoes a commitment (an invalid_proof description, say):
-			// then neither the body nor the description is returned, only the
-			// status and the error code.
-			errOf := parseOAuthError
-			if quiet {
-				errOf = oauthErrorCodeOnly
-			}
-
 			_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
-			return nil, errOf(resp.StatusCode, body)
+			return nil, parseOAuthError(resp.StatusCode, body)
 		}
 
 		body, err := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes+1))
@@ -3095,7 +3068,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		}
 
 		var credResp CredentialResponse
-		if err := decodeCredentialResponse(body, &credResp); err != nil {
+		if err := json.Unmarshal(body, &credResp); err != nil {
 			// Terminal and generic: nothing of the body is logged or returned.
 			_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 			return nil, errors.New("failed to parse credential response")
@@ -3129,16 +3102,12 @@ var (
 // deferred request asks for the same (OID4VCI 1.0 §9.1), and an encrypted
 // answer goes to the client exactly like the first response, with
 // deferred=true.
-func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, transactionID string, interval int, respEnc *responseEncryption, config *CredentialConfig) (*CredentialResponse, error) {
+func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, transactionID string, interval int, respEnc *responseEncryption) (*CredentialResponse, error) {
 	p := &deferredPoll{
-		h:        h,
-		metadata: metadata,
-		token:    token,
-		respEnc:  respEnc,
-		// A request that carried auxiliary data may be answered with text that
-		// echoes a commitment: then neither the body nor the description is
-		// logged or returned, only the status and the OAuth error code.
-		quiet:         config != nil && len(config.AuxiliaryDataSupported) > 0,
+		h:             h,
+		metadata:      metadata,
+		token:         token,
+		respEnc:       respEnc,
 		transactionID: transactionID,
 		// Determine deferred endpoint (OpenID4VCI spec: {credential_issuer}/deferred_credential or from metadata)
 		endpoint: strings.TrimSuffix(metadata.CredentialIssuer, "/") + "/deferred_credential",
@@ -3171,7 +3140,6 @@ type deferredPoll struct {
 	metadata      *IssuerMetadata
 	token         *TokenResponse
 	respEnc       *responseEncryption
-	quiet         bool
 	endpoint      string
 	transactionID string
 	wait          time.Duration
@@ -3253,8 +3221,7 @@ func (p *deferredPoll) once(ctx context.Context, attempt, maxAttempts int) (cred
 	_ = resp.Body.Close()
 	if readErr != nil || len(body) > MaxHTTPResponseBodyBytes {
 		// Unreadable or cut short: it cannot be classified (it may be a
-		// conflict that echoes a commitment) and must not be logged or acted
-		// on. Terminal and generic.
+		// conflict, which is final) and is not acted on. Terminal and generic.
 		return nil, true, errors.New("deferred response is unreadable or too large")
 	}
 
@@ -3315,7 +3282,7 @@ func (p *deferredPoll) plainAnswer(status int, body []byte, attempt int) (*Crede
 	case http.StatusOK:
 		// Credential is ready
 		var credResp CredentialResponse
-		if err := decodeCredentialResponse(body, &credResp); err != nil {
+		if err := json.Unmarshal(body, &credResp); err != nil {
 			return nil, true, errors.New("failed to parse deferred credential response")
 		}
 		h.Logger.Info("Deferred credential received", zap.String("transaction_id", p.transactionID))
@@ -3328,11 +3295,10 @@ func (p *deferredPoll) plainAnswer(status int, body []byte, attempt int) (*Crede
 			Interval           int             `json:"interval,omitempty"`
 			CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
 		}
-		// The one strict decoding step: a body that cannot be read
-		// unambiguously, or at all, ends the issuance rather than being
-		// skipped (it may hide a forbidden member).
+		// A body that cannot be read ends the issuance rather than being
+		// skipped (it may carry a forbidden member).
 		if len(bytes.TrimSpace(body)) > 0 {
-			if err := decodeStrict(body, &pendingResp); err != nil {
+			if err := json.Unmarshal(body, &pendingResp); err != nil {
 				return nil, true, errors.New("failed to parse deferred pending response")
 			}
 			if err := h.refusePlainSecretMembers(pendingResp.CredentialMetadata); err != nil {
@@ -3352,24 +3318,16 @@ func (p *deferredPoll) plainAnswer(status int, body []byte, attempt int) (*Crede
 		if err := h.auxiliaryDataConflictError(status, body); err != nil {
 			return nil, true, err
 		}
-		if p.quiet {
-			return nil, true, fmt.Errorf("deferred credential request failed with status %d: %w", status, oauthErrorCodeOnly(status, body))
-		}
 		return nil, true, fmt.Errorf("deferred credential request failed with status %d: %s", status, string(body))
 
 	default:
-		// An ambiguous body is terminal before the status is retried or its
-		// body logged, whatever the status.
+		// A conflict is final, whatever the status.
 		if err := h.auxiliaryDataConflictError(status, body); err != nil {
 			return nil, true, err
 		}
-		if p.quiet {
-			h.Logger.Warn("Unexpected deferred response status", zap.Int("status", status))
-		} else {
-			h.Logger.Warn("Unexpected deferred response status",
-				zap.Int("status", status),
-				zap.String("body", string(body)))
-		}
+		h.Logger.Warn("Unexpected deferred response status",
+			zap.Int("status", status),
+			zap.String("body", string(body)))
 		return nil, false, nil // Retry on unexpected responses
 	}
 }
@@ -3463,21 +3421,9 @@ type errorNonceWire struct {
 // the issuer's code under details.error, and returns the error to fail the flow
 // with; nil when the response is not a conflict. No other issuer text is
 // relayed.
-//
-// The body is read once, strictly (see decodeStrict). One that repeats a member
-// or spells one in another case is read differently by different decoders, so
-// it cannot be classified: it might be a conflict whose text echoes a
-// commitment. Such a body is terminal and generic, and nothing of it is
-// retried on, logged or returned.
 func (h *OID4VCIHandler) auxiliaryDataConflictError(status int, body []byte) error {
 	var e errorBodyWire
-	err := decodeStrict(body, &e)
-	if errors.Is(err, errAmbiguousJSON) {
-		// Whatever the status: a retry path (c_nonce, DPoP nonce) must not act
-		// on a body that two decoders read differently.
-		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
-		return fmt.Errorf("credential endpoint returned an ambiguous error response: %w", errFlowReported)
-	}
+	err := json.Unmarshal(body, &e)
 	if status != http.StatusBadRequest || err != nil || e.Error != auxiliaryDataConflictCode {
 		return nil
 	}
@@ -3488,8 +3434,7 @@ func (h *OID4VCIHandler) auxiliaryDataConflictError(status int, body []byte) err
 }
 
 // relayAuxiliaryDataConflict reads (and closes) the body of a 400 response and
-// relays it if it is an auxiliary_data_conflict, or refuses it when it is
-// ambiguous. Other responses are left for the caller with their body restored.
+// relays it if it is an auxiliary_data_conflict. Other responses are left for the caller with their body restored.
 func (h *OID4VCIHandler) relayAuxiliaryDataConflict(resp *http.Response) error {
 	body, readErr := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes+1))
 	if readErr != nil || len(body) > MaxErrorBodyBytes {

@@ -2094,7 +2094,7 @@ func TestResolve_URLSubject_LogoInlining(t *testing.T) {
 					"leaky": map[string]interface{}{
 						"format": "vc+sd-jwt",
 						"credential_metadata": map[string]interface{}{
-							"org.siros.secret_seed": map[string]interface{}{"ns": "00112233445566778899aabbccddeeff"},
+							"org.siros.secret_seed": map[string]interface{}{"namespaces": []interface{}{"x"}},
 						},
 					},
 				},
@@ -2162,15 +2162,12 @@ func TestResolve_URLSubject_LogoInlining(t *testing.T) {
 	}
 
 	// A valid advertisement is public and is served; a configuration with a
-	// superseded secret-bearing member is "not offered".
+	// superseded member name is an ordinary unknown member: served unchanged.
 	if pid["auxiliary_data_supported"] == nil {
 		t.Error("valid auxiliary_data_supported must be served to the wallet")
 	}
-	if _, present := ccs["leaky"]; present {
-		t.Error("configuration with a superseded secret member must not be offered")
-	}
-	if strings.Contains(w.Body.String(), "00112233445566778899aabbccddeeff") {
-		t.Error("seed value must never reach the wallet")
+	if _, present := ccs["leaky"]; !present {
+		t.Error("a superseded member name is an unknown member: the configuration is still offered")
 	}
 }
 
@@ -2299,9 +2296,10 @@ func TestResolve_URLSubject_SignedMetadata_VerificationFailed_Error(t *testing.T
 	}
 }
 
-func TestResolve_URLSubject_SignedMetadata_MalformedSeedConfigAndJWTNotServed(t *testing.T) {
+func TestResolve_URLSubject_SignedMetadata_MalformedAdvertisementAndJWTNotServed(t *testing.T) {
 	// A legacy signed document keeps the original JWT in signed_metadata; its
-	// payload still carries a rejected configuration (with a seed value). When
+	// payload still carries a rejected configuration (a malformed
+	// auxiliary_data_supported, with a marker value). When
 	// sanitisation removes the configuration the JWT must not be served either.
 	const seedHex = "00112233445566778899aabbccddeeff"
 	pdpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2310,7 +2308,7 @@ func TestResolve_URLSubject_SignedMetadata_MalformedSeedConfigAndJWTNotServed(t 
 	}))
 	defer pdpServer.Close()
 
-	cc := `{"leaky":{"format":"vc+sd-jwt","credential_metadata":{"org.siros.secret_seed":{"ns":"` + seedHex + `"}}}}`
+	cc := `{"leaky":{"format":"vc+sd-jwt","auxiliary_data_supported":{"to_wallet":[],"marker":"` + seedHex + `"}}}`
 	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"credential_issuer":"https://signed.example.com","credential_configurations_supported":` + cc + `}`))
 	// No embedded key in the header: key material falls through to inline jwks.
 	jwt := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"ES256"}`)) + "." + payload + ".sig"
@@ -2347,48 +2345,6 @@ func TestResolve_URLSubject_SignedMetadata_MalformedSeedConfigAndJWTNotServed(t 
 	for _, bad := range []string{seedHex, payload, "leaky", "signed_metadata"} {
 		if strings.Contains(out, bad) {
 			t.Errorf("response must not contain %q", bad)
-		}
-	}
-}
-
-// When the resolver removed a configuration for ambiguity, the retained
-// signed_metadata JWT (whose payload still carries it) is not served.
-func TestResolve_URLSubject_AmbiguousConfigurationDropsSignedMetadata(t *testing.T) {
-	pdpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(gotrust.EvaluationResponse{Decision: true})
-	}))
-	defer pdpServer.Close()
-	for removed, wantJWT := range map[bool]bool{true: false, false: true} {
-		var ids []string
-		if removed {
-			ids = []string{"gone"}
-		}
-		resolver := &mockMetadataResolver{result: &issuermetadata.ResolveResult{
-			Signed:                  true,
-			AmbiguousConfigurations: ids,
-			Metadata: map[string]interface{}{
-				"credential_issuer":                   "https://signed.example.com",
-				"jwks":                                map[string]interface{}{"keys": []interface{}{map[string]interface{}{"kty": "EC"}}},
-				"signed_metadata":                     "e30.e30.c2ln",
-				"credential_configurations_supported": map[string]interface{}{"kept": map[string]interface{}{"format": "vc+sd-jwt"}},
-			},
-		}}
-		cfg := &config.AuthZENProxyConfig{Enabled: true, PDPURL: pdpServer.URL, Timeout: 30, AllowResolution: true}
-		handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, http.DefaultClient, zap.NewNop())
-		router := gin.New()
-		router.Use(func(c *gin.Context) { c.Set("tenant_id", "test-tenant"); c.Next() })
-		router.POST("/v1/resolve", handler.Resolve)
-		body, _ := json.Marshal(map[string]string{"subject_id": "https://signed.example.com", "subject_type": "url"})
-		w := httptest.NewRecorder()
-		req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
-		req.Header.Set("Content-Type", "application/json")
-		router.ServeHTTP(w, req)
-		if w.Code != http.StatusOK {
-			t.Fatalf("status %d: %s", w.Code, w.Body.String())
-		}
-		if got := strings.Contains(w.Body.String(), "signed_metadata"); got != wantJWT {
-			t.Errorf("removed=%v: signed_metadata served=%v, want %v", removed, got, wantJWT)
 		}
 	}
 }

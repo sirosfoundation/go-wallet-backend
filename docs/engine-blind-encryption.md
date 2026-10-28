@@ -88,8 +88,7 @@ read what it relays (OID4VCI section 13.4 covers this setup). The honest-but-cur
    any.
 9. Seed delivery is gone. The superseded shapes (`org.siros.secret_seed`,
    `org.siros.holder_commitments`, `org.siros.psc`, `secret_members`) are
-   refused (`LEGACY_SECRET_MEMBER`) by the engine and by the wallet clients, on
-   immediate, deferred and plain completions. The replacement is Credential
+   ordinary unknown members, ignored by the engine. The replacement is Credential
    Auxiliary Data (`auxiliary_data`). Whatever the wallet validates and stores from the decrypted
    response stays wallet-side: the only client-supplied answers in the
    encrypted-response relay stay `credential_count` (1 to 256) or

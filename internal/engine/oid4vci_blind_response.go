@@ -216,7 +216,7 @@ func (h *OID4VCIHandler) relayEncryptedResponse(ctx context.Context, jwe string,
 // displayMetadataMembers are the members of a plain response's response-level
 // credential_metadata (OpenID4VCI 1.1) the engine relays: the display-only
 // ones. Everything else, in particular auxiliary_data, is dropped (a plain
-// response that carries it or a superseded member is refused before this).
+// response that carries it is refused before this).
 var displayMetadataMembers = []string{"display", "claims"}
 
 // displayMetadata returns the allow-listed display members of a PLAIN

@@ -17,16 +17,17 @@ func TestSanitizeAuxiliaryDataAdvertisement(t *testing.T) {
 		"scalar":{"auxiliary_data_supported":"deadbeef"},
 		"in_metadata":{"credential_metadata":{"auxiliary_data":[{"type":"hash_commitment","opening":"deadbeef"}]}},
 		"legacy_seed":{"credential_metadata":{"org.siros.secret_seed":{"namespaces":["x"]}}},
-		"legacy_seed_hex":{"credential_metadata":{"org.siros.secret_seed":{"ns":"deadbeef"}}},
-		"legacy_commitments":{"credential_metadata":{"org.siros.holder_commitments":{"commitments":["psc"]}}},
-		"legacy_psc":{"credential_metadata":{"org.siros.psc":"deadbeef"}},
+				"legacy_commitments":{"credential_metadata":{"org.siros.holder_commitments":{"commitments":["psc"]}}},
+		"legacy_psc":{"credential_metadata":{"org.siros.psc":"x"}},
 		"plain":{"credential_metadata":{"display":[]}},"c":{"display":[]},"d":"junk"}}`), &md))
 	sanitizeAuxiliaryDataAdvertisement(md)
 	ccs := md["credential_configurations_supported"].(map[string]interface{})
-	for _, id := range []string{"valid", "plain", "c"} {
+	// The superseded SIROS member names are ordinary unknown members: ignored,
+	// so the configurations that carry them are still offered.
+	for _, id := range []string{"valid", "plain", "c", "legacy_seed", "legacy_commitments", "legacy_psc"} {
 		assert.Contains(t, ccs, id)
 	}
-	for _, id := range []string{"opening", "empty", "scalar", "in_metadata", "legacy_seed", "legacy_seed_hex", "legacy_commitments", "legacy_psc"} {
+	for _, id := range []string{"opening", "empty", "scalar", "in_metadata"} {
 		assert.NotContains(t, ccs, id)
 	}
 	out, _ := json.Marshal(md)

@@ -574,10 +574,8 @@ response-level `credential_metadata` (omitted when it has neither); every other
 member (extensions) is dropped by the engine and never relayed or logged. A plain
 response whose `credential_metadata` carries `auxiliary_data` (a Secret Value
 never travels unencrypted, Auxiliary Data v0.1 section 7.1) is refused with
-`CREDENTIAL_ERROR` and no `flow_complete`, advertised or not; one that carries a
-superseded member (`org.siros.secret_seed`, `org.siros.holder_commitments`,
-`org.siros.psc`, `holder_commitments`, `secret_members`) is refused with
-`LEGACY_SECRET_MEMBER`. Errors and logs contain no values. Clients ignore extension members
+`CREDENTIAL_ERROR` and no `flow_complete`, advertised or not. Errors and logs
+contain no values. Other members the engine does not know are ignored. Clients ignore extension members
 arriving in `flow_complete`. An encrypted response never yields `credential_metadata`
 on `flow_complete`.
 
@@ -690,29 +688,16 @@ dropped from the served document too (editing the payload would break the
 signature). A valid advertisement is public data and is served to the wallet
 unchanged; the wallet needs it to request encryption.
 
-#### Superseded secret-bearing members (`LEGACY_SECRET_MEMBER`)
+#### Superseded secret-bearing members
 
 `auxiliary_data` is the one secret-bearing `credential_metadata` member, and
 `AUXILIARY_DATA_CONFLICT` the one conflict. The earlier SIROS shapes
 (`org.siros.secret_seed`, `org.siros.holder_commitments`, `org.siros.psc`, the
 `holder_commitments` sign param, `PSC_CONFLICT`, and the `issuance.secret_members`
-setting) are removed. They are refused, not ignored, for at least one release,
-because ignoring an advertisement would make the engine request no response
-encryption and let a secret travel in clear:
-
-- Offer time: a credential configuration whose issuer-metadata
-  `credential_metadata` has `org.siros.secret_seed`, `org.siros.holder_commitments`,
-  `org.siros.psc`, `holder_commitments` or `secret_members` (any letter case) is
-  not offered (the resolve endpoint removes it), and selecting or using it fails
-  the flow with `LEGACY_SECRET_MEMBER` before any authorization or request.
-- Response time: a plain credential response (immediate or deferred) whose
-  `credential_metadata` carries one of them fails the flow with
-  `LEGACY_SECRET_MEMBER`, step `requesting_credential`; nothing is relayed or
-  completed. An encrypted response is not visible to the engine; the client
-  refuses it the same way (`LEGACY_SECRET_MEMBER`).
-
-The error carries a fixed message. No text of the issuer or the client reaches
-a log or a response.
+setting) are removed. Their names are ordinary unknown members now: the engine
+ignores them in issuer metadata and in responses. An issuer that still needs
+response encryption for such a delivery refuses a request that has no
+`credential_response_encryption` itself.
 
 #### Credential Auxiliary Data
 
@@ -735,8 +720,10 @@ credential_configurations_supported[cfg].auxiliary_data_supported
   one entry per `type` and `path`. `required` (a boolean) is allowed in
   `to_issuer` entries only. A `hash_commitment` entry needs a string `alg` and a
   `path` (a non-empty claims path of strings, nulls and non-negative integers)
-  and must not carry `opening` or `commitment`. Entries of any other `type` are
-  kept and otherwise ignored. Anything else makes the configuration not offered,
+  and must not carry `opening` or `commitment`. An entry of any other `type` is
+  kept and ignored (section 3): of it only the `type` is checked, and `required`
+  when the entry is in `to_issuer`; its own parameters (a `commitment` or an
+  `opening` among them) are its own. Anything else makes the configuration not offered,
   exactly like any malformed advertisement (dropped at decode, removed in the
   resolve endpoint).
 - When `to_wallet` has an entry of type `hash_commitment` (a type with a Secret
@@ -784,38 +771,20 @@ credential_configurations_supported[cfg].auxiliary_data_supported
 JWT, an `auxiliary_data` claim that is not an array). A violation
   fails the flow with `AUXILIARY_DATA_PROOF_INVALID`, step `requesting_credential`,
   and no request reaches the issuer. The engine never logs or returns a
-  commitment or opening value. For a credential configuration that advertises
-  `auxiliary_data_supported`, an error response from the credential endpoint is
-  neither logged nor returned beyond its OAuth error code, because the issuer's
-  text may echo a commitment.
+  commitment or opening value. A commitment is not a secret (only an `opening`
+  is, section 4.1), so an issuer's error text is handled as for any other
+  request; the engine logs only the status and the OAuth error code of a
+  credential endpoint error, never its body.
 
-JSON that an issuer or the client hands the engine for secret delivery (an
-advertisement, a credential endpoint error body, a key proof payload) is read in
-one strict decoding step before it is decoded into typed values. It is refused
-when an object repeats a member name, has two names that differ only in letter
-case, spells a member this section names (`type`, `alg`, `path`, `opening`,
-`commitment`, `error`, ...) in another letter case, or has data after the value;
-the refusal says why and never quotes the document. A proof or error body
-refused this way is never forwarded, relayed or retried, whether or not
-`to_issuer` entries were advertised. The engine does not scan the retained `signed_metadata` JWT
-(issuer metadata is public); the resolver checks the raw metadata bytes instead
-(next paragraph). The same step reads a credential offer: a repeated or
-case-variant member (two `grants`, two issuers) refuses the offer.
-
-**Issuer metadata, all issuers (behaviour change).** The metadata resolver
-(`pkg/issuermetadata`) decodes an issuer's metadata into maps, which keep only the
-last of a repeated member. It therefore checks the raw bytes first, on every path
-(plain JSON, the `signed_metadata` JWT payload, and an `application/jwt`
-response), with the same decoder (`pkg/strictjson`):
-
-| Where the ambiguity is (repeated name, or two names differing only in letter case) | Result |
-|---|---|
-| a member of one credential configuration: its own member names, or anywhere inside `auxiliary_data_supported`, `credential_metadata` or `proof_types_supported` | that configuration is not offered (removed from the metadata, listed in `ResolveResult.AmbiguousConfigurations`; the served document drops the retained `signed_metadata` JWT, as for any removed configuration; the engine logs only the ids) |
-| the document's own member names, anywhere inside `credential_response_encryption` or `credential_request_encryption`, or a repeated `credential_configurations_supported` or configuration id | the fetch fails closed (no configuration can be dropped for it) |
-| any other member (`display`, `claims`, ...) | not judged; the configuration stays offered |
-
-A valid document is unchanged. This applies to every issuer, not only to those
-that use auxiliary data.
+Only a credential offer is read in one strict decoding step (`pkg/strictjson`):
+a third party writes it and both the client and the engine read it, so a repeated
+or case-variant member (two `grants`, two issuers) refuses the offer. Every
+other document (issuer metadata, credential and deferred responses, error
+bodies, key proof payloads) has one author, who already holds what a differing
+reading would protect, and is decoded normally: a repeated member is read as
+`encoding/json` reads it. The checks that matter do not depend on it: a plain
+response that carries `auxiliary_data` is refused, a conflict is never retried,
+and no proof with an `opening` is forwarded.
 
 If the credential endpoint answers HTTP 400 with the OAuth error code
 `auxiliary_data_conflict` (an entry conflicts with a value the issuer holds for
@@ -1413,7 +1382,6 @@ Server → Client:
 | `AUXILIARY_DATA_PROOF_INVALID` | A key proof carries an `opening`, or cannot be inspected for one while the issuer advertised `to_issuer` entries; nothing was sent to the issuer |
 | `AUXILIARY_DATA_UNSUPPORTED` | The configuration needs auxiliary data the wallet cannot handle (undefined `alg`/`encoding` in `to_wallet`, or a `required` `to_issuer` entry it cannot send); refused before any authorization or request. Fixed message |
 | `AUXILIARY_DATA_CONFLICT` | Issuer rejected the credential request with `auxiliary_data_conflict`; `error.details.error` carries that code |
-| `LEGACY_SECRET_MEMBER` | The issuer advertised, or a plain response carried, a superseded secret-bearing member (`org.siros.secret_seed`, `org.siros.holder_commitments`, `org.siros.psc`); refused, nothing stored. Fixed message |
 | `SIGN_TIMEOUT` | Client did not respond to sign request |
 | `SIGN_ERROR` | Client signature was invalid |
 | `PRESENTATION_ERROR` | VP creation or submission failed |

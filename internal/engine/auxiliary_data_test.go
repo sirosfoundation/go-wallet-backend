@@ -94,14 +94,10 @@ func TestAuxiliaryDataSupported_Malformed(t *testing.T) {
 		"OPENING in metadata":     `{"to_wallet":[` + hc(`,"OPENING":"SECRETOPENING"`) + `]}`,
 		"Commitment in metadata":  `{"to_issuer":[` + hc(`,"Commitment":"x"`) + `]}`,
 		"To_Wallet alias":         `{"to_issuer":[` + hc("") + `],"To_Wallet":[` + hc(`,"opening":"SECRETOPENING"`) + `]}`,
-		"TO_ISSUER alias":         `{"to_wallet":[` + hc("") + `],"TO_ISSUER":[` + hc("") + `]}`,
-		"nested opening":          `{"to_wallet":[{"type":"x","extra":{"opening":"SECRETOPENING"},"extra":null}]}`,
 		"Type shadow":             `{"to_issuer":[{"type":"https://x.example/t","Type":"hash_commitment","Opening":"SECRETOPENING"}]}`,
-		"opening in unknown type": `{"to_wallet":[{"type":"hash_commitment","type":"x","path":["a"],"opening":"SECRETOPENING"}]}`,
 		"required not bool":       `{"to_issuer":[` + hc(`,"required":"yes"`) + `]}`,
 		"required null":           `{"to_issuer":[` + hc(`,"required":null`) + `]}`,
 		"duplicate escaped path":  `{"to_wallet":[` + hc("") + `,{"type":"hash_commitment","alg":"sha-256","path":["\u0061","b"]}]}`,
-		"duplicate unknown path":  `{"to_wallet":[{"type":"https://x.example/t","path":["a"]},{"type":"https://x.example/t","path":[ "\u0061" ]}]}`,
 		"required in to_wallet":   `{"to_wallet":[` + hc(`,"required":true`) + `]}`,
 		"duplicate type and path": `{"to_wallet":[` + hc("") + `,` + hc("") + `]}`,
 	} {
@@ -134,7 +130,6 @@ func TestAuxiliaryDataInIssuerMetadataIsMalformed(t *testing.T) {
 	cfg := &CredentialConfig{CredentialMetadata: json.RawMessage(`{"auxiliary_data":[{"type":"hash_commitment","opening":"SECRETOPENING"}]}`)}
 	_, err := secretDeliveryOf(cfg)
 	require.Error(t, err)
-	assert.NotErrorIs(t, err, errLegacySecretMember)
 	assert.NotContains(t, err.Error(), "SECRETOPENING")
 }
 
@@ -279,37 +274,33 @@ func TestAuxiliaryDataConflict_RelayedUnchangedNoRetry(t *testing.T) {
 }
 
 // The classification of a credential endpoint error body: exactly the code is
-// a conflict; a body that cannot be read unambiguously is terminal and generic;
-// everything else is an ordinary credential error.
+// a conflict; everything else is an ordinary credential error. The body is
+// decoded normally: a document with a repeated member is read as encoding/json
+// reads it (the last one wins), as any other body is.
 func TestAuxiliaryDataConflict_Classification(t *testing.T) {
 	const (
-		conflict  = "conflict"
-		ordinary  = "ordinary"
-		ambiguous = "ambiguous"
+		conflict = "conflict"
+		ordinary = "ordinary"
 	)
 	for name, tc := range map[string]struct {
 		status int
 		body   string
 		want   string
 	}{
-		"exact code":           {400, `{"error":"auxiliary_data_conflict"}`, conflict},
-		"with description":     {400, `{"error":"auxiliary_data_conflict","error_description":"C"}`, conflict},
-		"other status":         {401, `{"error":"auxiliary_data_conflict"}`, ordinary},
-		"invalid_proof":        {400, `{"error":"invalid_proof","error_description":"auxiliary_data_conflict"}`, ordinary},
-		"different case":       {400, `{"error":"Auxiliary_Data_Conflict"}`, ordinary},
-		"in description":       {400, `{"error":"invalid_request","error_description":"auxiliary_data_conflict"}`, ordinary},
-		"not json":             {400, `auxiliary_data_conflict`, ordinary},
-		"error not string":     {400, `{"error":["auxiliary_data_conflict"]}`, ordinary},
-		"encryption params":    {400, `{"error":"invalid_encryption_parameters"}`, ordinary},
-		"repeated, null":       {400, `{"error":"auxiliary_data_conflict","error":null}`, ambiguous},
-		"repeated, benign":     {400, `{"error":"invalid_request","error":"x"}`, ambiguous},
-		"case-variant twin":    {400, `{"error":"auxiliary_data_conflict","ERROR":"invalid_proof"}`, ambiguous},
-		"case-variant first":   {400, `{"ERROR":"invalid_proof","error":"auxiliary_data_conflict"}`, ambiguous},
-		"only a variant":       {400, `{"ERROR":"auxiliary_data_conflict"}`, ambiguous},
-		"trailing value":       {400, `{"error":"invalid_request"} {"error":"auxiliary_data_conflict"}`, ambiguous},
-		"huge number":          {400, `{"x":1e400,"error":"auxiliary_data_conflict"}`, conflict},
-		"repeated member, 500": {500, `{"error":"x","error":"y","c_nonce":"n"}`, ambiguous},
-		"repeated member, 401": {401, `{"error":"auxiliary_data_conflict","ERROR":"x"}`, ambiguous},
+		"exact code":                {400, `{"error":"auxiliary_data_conflict"}`, conflict},
+		"with description":          {400, `{"error":"auxiliary_data_conflict","error_description":"C"}`, conflict},
+		"other status":              {401, `{"error":"auxiliary_data_conflict"}`, ordinary},
+		"invalid_proof":             {400, `{"error":"invalid_proof","error_description":"auxiliary_data_conflict"}`, ordinary},
+		"different case":            {400, `{"error":"Auxiliary_Data_Conflict"}`, ordinary},
+		"in description":            {400, `{"error":"invalid_request","error_description":"auxiliary_data_conflict"}`, ordinary},
+		"not json":                  {400, `auxiliary_data_conflict`, ordinary},
+		"error not string":          {400, `{"error":["auxiliary_data_conflict"]}`, ordinary},
+		"encryption params":         {400, `{"error":"invalid_encryption_parameters"}`, ordinary},
+		"repeated, conflict last":   {400, `{"error":"invalid_request","error":"auxiliary_data_conflict"}`, conflict},
+		"repeated, conflict first":  {400, `{"error":"auxiliary_data_conflict","error":"x"}`, ordinary},
+		"huge number":               {400, `{"x":1e400,"error":"auxiliary_data_conflict"}`, conflict},
+		"repeated member, 500":      {500, `{"error":"x","error":"y","c_nonce":"n"}`, ordinary},
+		"repeated member, 401, c.f": {401, `{"error":"auxiliary_data_conflict","ERROR":"x"}`, ordinary},
 	} {
 		t.Run(name, func(t *testing.T) {
 			h, ch, cleanup := captureHandler(t)
@@ -321,9 +312,6 @@ func TestAuxiliaryDataConflict_Classification(t *testing.T) {
 			case conflict:
 				require.Error(t, err)
 				assert.Equal(t, ErrCodeAuxiliaryDataConflict, flowErrorCode(t, nextMsg(t, ch)))
-			case ambiguous:
-				require.Error(t, err)
-				assert.Equal(t, ErrCodeCredentialError, flowErrorCode(t, nextMsg(t, ch)))
 			}
 		})
 	}
@@ -348,36 +336,6 @@ type closeTracker struct {
 }
 
 func (c *closeTracker) Close() error { c.closed = true; return nil }
-
-// encoding/json matches field names case-insensitively and folds U+017F to
-// "s": a look-alike key must not shadow the real advertisement for any reader.
-func TestAdvertisement_CaseFoldedLookAlikeKeysAreMalformed(t *testing.T) {
-	const real = `"auxiliary_data_supported":{"to_wallet":[` + auxToWalletSSC + `]}`
-	for name, doc := range map[string]string{
-		"long s after":         `{"format":"mso_mdoc",` + real + `,"auxiliary_data_ſupported":{"to_issuer":[{"type":"x"}]}}`,
-		"long s before":        `{"format":"mso_mdoc","auxiliary_data_ſupported":{"to_issuer":[{"type":"x"}]},` + real + `}`,
-		"upper case":           `{"format":"mso_mdoc",` + real + `,"AUXILIARY_DATA_SUPPORTED":{"to_issuer":[{"type":"x"}]}}`,
-		"metadata look-alike":  `{"format":"mso_mdoc","credential_metadata":{"display":[]},"Credential_Metadata":{"auxiliary_data":[{"opening":"SECRETOPENING"}]}}`,
-		"metadata kelvin sign": `{"format":"mso_mdoc","credential_Key":1,"CREDENTIAL_METADATA":{}}`,
-	} {
-		t.Run(name, func(t *testing.T) {
-			assert.True(t, AdvertisementMalformed(json.RawMessage(doc)))
-			var ccs CredentialConfigurations
-			require.NoError(t, json.Unmarshal([]byte(`{"c":`+doc+`}`), &ccs))
-			assert.NotContains(t, ccs, "c", "the configuration is not offered")
-			var cfg CredentialConfig
-			require.Error(t, json.Unmarshal([]byte(doc), &cfg))
-		})
-	}
-
-	// The exact key is what is read, and other members are untouched.
-	var cfg CredentialConfig
-	require.NoError(t, json.Unmarshal([]byte(`{"format":"mso_mdoc","vct":"v",`+real+`}`), &cfg))
-	assert.Equal(t, "v", cfg.VCT)
-	d, err := secretDeliveryOf(&cfg)
-	require.NoError(t, err)
-	assert.True(t, d.requireEncryption)
-}
 
 // auxProofJWT is an (unsigned) compact JWT whose body carries the given
 // auxiliary_data claim (nil = no claim). The engine reads the body only.
@@ -475,15 +433,9 @@ func TestCheckProofsForwardNoOpening(t *testing.T) {
 		"duplicate opening, null last":   `{"auxiliary_data":[{"type":"hash_commitment","opening":"SECRET","opening":null}]}`,
 		"AUXILIARY_DATA alias":           `{"AUXILIARY_DATA":` + secretEntry + `}`,
 		"alias next to benign canonical": `{"auxiliary_data":` + benign + `,"AUXILIARY_DATA":` + secretEntry + `}`,
-		"secret first, benign alias":     `{"auxiliary_data":` + secretEntry + `,"Auxiliary_Data":` + benign + `}`,
-		"secret first, benign twin":      `{"auxiliary_data":` + secretEntry + `,"auxiliary_data":` + benign + `}`,
 		"canonical twice":                `{"auxiliary_data":` + benign + `,"auxiliary_data":` + secretEntry + `}`,
 		"opening in an unknown type":     `{"auxiliary_data":[{"type":"hash_commitment","type":"x","opening":"SECRET"}]}`,
-		"shadowed nested subtree":        `{"auxiliary_data":[{"type":"x","extra":{"opening":"SECRET"},"extra":null}]}`,
-		"shadowed deeper subtree":        `{"auxiliary_data":[{"type":"x","a":{"b":[{"c":{"OPENING":"SECRET"}}],"b":1}}]}`,
 		"nested opening":                 `{"auxiliary_data":[{"type":"x","v":{"Opening":"SECRET"}}]}`,
-		"trailing object with opening":   `{"nonce":"n"}{"auxiliary_data":` + secretEntry + `}`,
-		"trailing value after claim":     `{"auxiliary_data":` + benign + `} 1`,
 		"opening beside a huge number":   `{"ignored":1e400,"auxiliary_data":` + secretEntry + `}`,
 	} {
 		withOpening["raw/jwt/"+name] = []ProofObject{{ProofType: "jwt", JWT: rawProofJWT(payload)}}
@@ -619,14 +571,14 @@ func TestOversizedErrorBodyFailsClosed(t *testing.T) {
 	}
 }
 
-// An issuer error that is not a conflict (an invalid_proof whose description
-// echoes a commitment) is neither logged nor returned beyond its error code
-// when the credential carries auxiliary data; the nonce retry still works.
-func TestCredentialErrorTextNotLoggedWithAuxiliaryData(t *testing.T) {
+// Issuer error text is not withheld because the request carried auxiliary
+// data: a commitment is not a secret (only an opening is, Auxiliary Data v0.1
+// section 4.1), so the error keeps its description. The log still holds only
+// the status and the error code.
+func TestCredentialErrorText_IsReturnedWithAuxiliaryData(t *testing.T) {
 	const echo = "COMMITMENT-ECHO-Zm9vYmFy"
 	for name, body := range map[string]string{
 		"invalid_proof":   `{"error":"invalid_proof","error_description":"the commitment ` + echo + ` is wrong"}`,
-		"with c_nonce":    `{"error":"invalid_proof","c_nonce":"n2","error_description":"the commitment ` + echo + ` is wrong"}`,
 		"odd error value": `{"error":"not a code ` + echo + `"}`,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -636,49 +588,13 @@ func TestCredentialErrorTextNotLoggedWithAuxiliaryData(t *testing.T) {
 			defer cleanup()
 			err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", auxCfg(auxAdvFull), nil, "")
 			require.Error(t, err)
-			assert.NotContains(t, err.Error(), echo)
-			assert.NotContains(t, logDump(logs), echo)
+			assert.Contains(t, err.Error(), echo)
+			assert.NotContains(t, logDump(logs), echo, "the body is never logged")
 			fc.settle()
 			for _, m := range fc.outboundMessages() {
-				assert.NotContains(t, string(m["error"]), echo)
+				assert.NotContains(t, string(m["error"]), echo, "the flow error is generic")
 			}
 		})
-	}
-}
-
-// The same policy holds for deferred polling: an error or an unexpected answer
-// that echoes a commitment is neither returned nor logged when the credential
-// carries auxiliary data, and is still returned for one that does not.
-func TestDeferredPollingErrorTextNotLoggedWithAuxiliaryData(t *testing.T) {
-	const echo = "COMMITMENT-ECHO-Zm9vYmFy"
-	for name, status := range map[string]int{"400": 400, "unexpected 500": 500} {
-		for _, withAux := range []bool{true, false} {
-			t.Run(fmt.Sprintf("%s/aux=%v", name, withAux), func(t *testing.T) {
-				fastDeferredPolling(t)
-				st := newIssuerStub(t, `{"credential":"c"}`)
-				st.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					w.WriteHeader(status)
-					_, _ = w.Write([]byte(`{"error":"invalid_transaction_id","error_description":"the commitment ` + echo + ` is wrong"}`))
-				})
-				fc := &fakeClient{t: t}
-				h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
-				defer cleanup()
-				cfg := &CredentialConfig{Format: "x"}
-				if withAux {
-					cfg = auxCfg(auxAdvFull)
-				}
-				ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
-				defer cancel()
-				_, err := h.pollDeferredCredential(ctx, st.metadata(nil), tokenBearer(), "tx", 0, nil, cfg)
-				require.Error(t, err)
-				if withAux {
-					assert.NotContains(t, err.Error(), echo)
-					assert.NotContains(t, logDump(logs), echo)
-				} else if status == 400 {
-					assert.Contains(t, err.Error(), echo, "without auxiliary data the existing behaviour is unchanged")
-				}
-			})
-		}
 	}
 }
 
@@ -846,7 +762,6 @@ func TestGenerateProof_DroppedEntryNeedsNoCredentialType(t *testing.T) {
 func TestPendingPlainResponse_ForbiddenMemberRefused(t *testing.T) {
 	for name, member := range map[string]string{
 		"auxiliary_data": `"auxiliary_data":[{"type":"hash_commitment","opening":"` + secretSeedA + `"}]`,
-		"legacy":         `"org.siros.secret_seed":{"ns":"` + secretSeedA + `"}`,
 	} {
 		pending := `{"transaction_id":"t1","interval":1,"credential_metadata":{` + member + `}}`
 		t.Run("credential response/"+name, func(t *testing.T) {
@@ -885,27 +800,23 @@ func TestGenerateProof_OptionalEntryWithoutProofTypeNeedsNoCredentialType(t *tes
 	assert.NotContains(t, generateProofParams(t, fc), "auxiliary_data_to_issuer")
 }
 
-// The response JSON is read strictly: a repeated credential_metadata cannot
-// shadow a forbidden member, and a pending body that cannot be read ends the
-// issuance instead of being skipped. Exactly one terminal flow_error is sent,
-// the one naming the reason.
-func TestPlainResponse_AmbiguousOrUnreadableEndsIssuance(t *testing.T) {
+// A plain response that carries auxiliary_data ends the issuance, immediately
+// or deferred, and a pending body that cannot be read ends it instead of being
+// skipped. Exactly one terminal flow_error is sent, the one naming the reason.
+func TestPlainResponse_AuxiliaryDataOrUnreadableEndsIssuance(t *testing.T) {
 	old1, old2 := deferredPollDefaultInterval, deferredPollIntervalUnit
 	deferredPollDefaultInterval, deferredPollIntervalUnit = time.Millisecond, time.Millisecond
 	defer func() { deferredPollDefaultInterval, deferredPollIntervalUnit = old1, old2 }()
 	secret := `"auxiliary_data":[{"type":"hash_commitment","opening":"` + secretSeedA + `"}]`
-	legacy := `"org.siros.secret_seed":{"ns":"` + secretSeedA + `"}`
 	for name, tc := range map[string]struct {
 		first, deferred string
 		deferredStatus  int
 		code            ErrorCode
 	}{
-		"immediate, shadowed by a repeated member": {`{"credential":"c","credential_metadata":{` + secret + `},"credential_metadata":null}`, "", 0, ErrCodeCredentialError},
-		"deferred 200, shadowed":                   {`{"transaction_id":"t"}`, `{"credential":"c","credential_metadata":{` + secret + `},"credential_metadata":null}`, 200, ErrCodeCredentialError},
-		"deferred 202, shadowed":                   {`{"transaction_id":"t"}`, `{"credential_metadata":{` + secret + `},"credential_metadata":null}`, 202, ErrCodeCredentialError},
-		"deferred 202, unreadable interval":        {`{"transaction_id":"t"}`, `{"interval":"bad","credential_metadata":{` + legacy + `}}`, 202, ErrCodeCredentialError},
-		"deferred 202, legacy member":              {`{"transaction_id":"t"}`, `{"credential_metadata":{` + legacy + `}}`, 202, ErrCodeLegacySecretMember},
-		"deferred 202, auxiliary_data":             {`{"transaction_id":"t"}`, `{"credential_metadata":{` + secret + `}}`, 202, ErrCodeCredentialError},
+		"immediate, auxiliary_data":         {`{"credential":"c","credential_metadata":{` + secret + `}}`, "", 0, ErrCodeCredentialError},
+		"deferred 200, auxiliary_data":      {`{"transaction_id":"t"}`, `{"credential":"c","credential_metadata":{` + secret + `}}`, 200, ErrCodeCredentialError},
+		"deferred 202, unreadable interval": {`{"transaction_id":"t"}`, `{"interval":"bad","credential_metadata":{` + secret + `}}`, 202, ErrCodeCredentialError},
+		"deferred 202, auxiliary_data":      {`{"transaction_id":"t"}`, `{"credential_metadata":{` + secret + `}}`, 202, ErrCodeCredentialError},
 	} {
 		t.Run(name, func(t *testing.T) {
 			st := newIssuerStub(t, tc.first)
@@ -990,20 +901,21 @@ func TestAuxiliaryDataConflict_DeferredIsTerminalAndReportedOnce(t *testing.T) {
 	}
 }
 
-// An unexpected deferred status with an ambiguous body ends the issuance
-// before it is retried or its body logged.
-func TestDeferredUnexpectedStatus_AmbiguousBodyIsTerminal(t *testing.T) {
+// An unexpected deferred status is retried, whatever the body: a body that
+// repeats a member is read normally, and is not a conflict.
+func TestDeferredUnexpectedStatus_IsRetried(t *testing.T) {
 	h, _, cleanup := captureHandler(t)
 	defer cleanup()
 	p := &deferredPoll{h: h}
-	_, done, err := p.plainAnswer(http.StatusInternalServerError, []byte(`{"error":"x","error":"SECRET-ISSUER-TEXT"}`), 0)
+	for _, body := range []string{`{"error":"x","error":"y"}`, `{"error":"x"}`} {
+		_, done, err := p.plainAnswer(http.StatusInternalServerError, []byte(body), 0)
+		require.NoError(t, err)
+		assert.False(t, done)
+	}
+	// A conflict is final, with any status that carries it as a 400.
+	_, done, err := p.plainAnswer(http.StatusBadRequest, []byte(`{"error":"invalid_request","error":"auxiliary_data_conflict"}`), 0)
 	require.Error(t, err)
 	assert.True(t, done)
-	assert.NotContains(t, err.Error(), "SECRET-ISSUER-TEXT")
-	// An unambiguous one is still retried.
-	_, done, err = p.plainAnswer(http.StatusInternalServerError, []byte(`{"error":"x"}`), 0)
-	require.NoError(t, err)
-	assert.False(t, done)
 }
 
 // A deferred answer that cannot be read whole ends the issuance: its body is
@@ -1068,4 +980,81 @@ func TestCheckProofsForwardNoOpening_HugeNumberIsNotAnError(t *testing.T) {
 	}
 	ps[0].JWT = rawProofJWT(`{"auxiliary_data":[{"type":"https://example.org/custom","alg":1e400,"opening":"S"}]}`)
 	require.Error(t, checkProofsForwardNoOpening(ps, true))
+}
+
+func flowErrorCode(t *testing.T, m map[string]json.RawMessage) ErrorCode {
+	t.Helper()
+	require.JSONEq(t, `"flow_error"`, string(m["type"]))
+	var e FlowError
+	require.NoError(t, json.Unmarshal(m["error"], &e))
+	assert.NotContains(t, e.Message, secretSeedA)
+	return e.Code
+}
+
+// Documents with one author are decoded normally: a credential response that
+// repeats a member is read as encoding/json reads it (the last wins), and the
+// issuance proceeds. A plain response that does carry auxiliary_data is still
+// refused (TestPlainResponse_AuxiliaryDataOrUnreadableEndsIssuance).
+func TestCredentialResponse_RepeatedMemberIsReadNormally(t *testing.T) {
+	st := newIssuerStub(t, `{"credential":"c","credential_metadata":{"auxiliary_data":[{"type":"hash_commitment","opening":"`+secretSeedA+`"}]},"credential_metadata":{"display":[]}}`)
+	fc := &fakeClient{t: t}
+	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
+	defer cleanup()
+	require.NoError(t, h.issueCredential(context.Background(), st.metadata(nil), tokenBearer(), "cfg", auxCfg(""), nil, ""))
+}
+
+// An error body that repeats a member is classified as encoding/json reads it,
+// and the invalid_nonce retry decides the same way.
+func TestErrorBody_RepeatedMemberIsReadNormally(t *testing.T) {
+	ni, _, _, err := runNonceRetry(t, true, `{"error":"invalid_proof","error":"invalid_nonce"}`, "")
+	require.NoError(t, err)
+	assert.Equal(t, 2, ni.credCalls)
+}
+
+// Auxiliary Data v0.1 section 3: a recipient MUST ignore entries of an
+// unrecognised type. Of such an entry only the type is checked, and required
+// when the entry is in to_issuer. Its own parameters, a "commitment" or an
+// "opening" among them, are its own and say nothing about the wallet.
+func TestUnrecognisedEntries_AreIgnored(t *testing.T) {
+	const own = `"commitment":"x","opening":"y","nested":{"opening":{"commitment":1}},"path":"not-a-claims-path"`
+	for name, adv := range map[string]string{
+		"to_wallet own parameters":         `{"to_wallet":[{"type":"https://x.example/t",` + own + `}]}`,
+		"to_issuer own parameters":         `{"to_issuer":[{"type":"https://x.example/t",` + own + `}]}`,
+		"to_wallet required is ignored":    `{"to_wallet":[{"type":"https://x.example/t","required":true}]}`,
+		"to_wallet required not a boolean": `{"to_wallet":[{"type":"https://x.example/t","required":"yes"}]}`,
+		"same type twice":                  `{"to_wallet":[{"type":"https://x.example/t","path":["a"]},{"type":"https://x.example/t","path":["a"]}]}`,
+		"recognised entry next to them":    `{"to_wallet":[` + auxToWalletSSC + `,{"type":"https://x.example/t",` + own + `}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			d, err := secretDeliveryOf(auxCfg(adv))
+			require.NoError(t, err)
+			assert.Empty(t, d.unusable)
+			assert.False(t, AdvertisementMalformed(json.RawMessage(`{"format":"x","auxiliary_data_supported":`+adv+`}`)))
+			var ccs CredentialConfigurations
+			require.NoError(t, json.Unmarshal([]byte(`{"c":{"format":"mso_mdoc","auxiliary_data_supported":`+adv+`}}`), &ccs))
+			assert.Contains(t, ccs, "c", "the configuration is not dropped")
+			require.NoError(t, d.usable(auxCfg(adv)))
+		})
+	}
+
+	// A required unrecognised entry in to_issuer cannot be sent: the
+	// configuration is unusable (section 5), though not malformed.
+	adv := `{"to_issuer":[{"type":"https://x.example/t","required":true,` + own + `}]}`
+	d, err := secretDeliveryOf(auxCfg(adv))
+	require.NoError(t, err)
+	assert.NotEmpty(t, d.unusable)
+	require.ErrorIs(t, d.usable(auxCfg(adv)), errAuxiliaryDataUnsupported)
+
+	// A type must still be there.
+	_, err = secretDeliveryOf(auxCfg(`{"to_wallet":[{"commitment":"x"}]}`))
+	require.Error(t, err)
+}
+
+// An advertisement that repeats a member is read as encoding/json reads it.
+func TestAdvertisement_RepeatedMemberIsReadNormally(t *testing.T) {
+	_, err := secretDeliveryOf(auxCfg(`{"to_wallet":[` + auxToWalletSSC + `],"to_wallet":[{"type":"https://x.example/t"}]}`))
+	require.NoError(t, err)
+	var ccs CredentialConfigurations
+	require.NoError(t, json.Unmarshal([]byte(`{"c":{"format":"x","format":"y","auxiliary_data_supported":{"to_wallet":[`+auxToWalletSSC+`]}}}`), &ccs))
+	assert.Contains(t, ccs, "c")
 }

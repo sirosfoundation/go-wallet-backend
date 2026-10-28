@@ -220,7 +220,6 @@ type cachedEntry struct {
 	validated         bool
 	signed            bool
 	signerKeyMaterial *SignerKeyMaterial
-	ambiguous         []string
 }
 
 // maxResponseBodyBytes is the maximum HTTP response body size (10 MB).
@@ -304,12 +303,6 @@ type ResolveResult struct {
 	Validated         bool
 	Signed            bool               // true when response was application/jwt or contained signed_metadata
 	SignerKeyMaterial *SignerKeyMaterial // non-nil for application/jwt responses with x5c header
-	// AmbiguousConfigurations are the ids of credential configurations removed
-	// from Metadata because a security-relevant member of theirs repeats a
-	// name or spells it in another letter case (see dropAmbiguousConfigurations).
-	// A retained signed_metadata JWT still carries them: callers that serve the
-	// document drop it when this is non-empty.
-	AmbiguousConfigurations []string
 }
 
 // Resolve returns the authoritative issuer metadata for the given issuer URL,
@@ -342,7 +335,6 @@ type fetchResult struct {
 	validated         bool
 	signed            bool
 	signerKeyMaterial *SignerKeyMaterial
-	ambiguous         []string
 }
 
 // ResolveWithInfo is like Resolve but additionally reports whether the result
@@ -360,7 +352,7 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 	// comparison, no normalisation), so they never share an entry.
 
 	if entry := r.getCachedEntry(issuerURL); entry != nil {
-		return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial, AmbiguousConfigurations: entry.ambiguous}, nil
+		return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial}, nil
 	}
 
 	// Use singleflight to coalesce concurrent requests for the same issuer.
@@ -371,7 +363,7 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 	val, err, _ := r.group.Do(issuerURL, func() (interface{}, error) {
 		// Re-check cache inside singleflight — another caller may have populated it.
 		if entry := r.getCachedEntry(issuerURL); entry != nil {
-			return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial, AmbiguousConfigurations: entry.ambiguous}, nil
+			return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial}, nil
 		}
 
 		// Candidate metadata URLs, derived from the identifier as received
@@ -402,7 +394,7 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 		}
 
 		r.setCache(issuerURL, result)
-		return &ResolveResult{Metadata: deepCopyMap(result.metadata), Cached: false, Validated: result.validated, Signed: result.signed, SignerKeyMaterial: result.signerKeyMaterial, AmbiguousConfigurations: result.ambiguous}, nil
+		return &ResolveResult{Metadata: deepCopyMap(result.metadata), Cached: false, Validated: result.validated, Signed: result.signed, SignerKeyMaterial: result.signerKeyMaterial}, nil
 	})
 	if err != nil {
 		return nil, err
@@ -549,11 +541,10 @@ func (r *Resolver) handleJWTResponse(ctx context.Context, issuerURL, jwtString s
 	}
 
 	// Resolve signing key from JOSE header and verify signature
-	parsed, err := r.verifyJWSFromHeader(ctx, issuerURL, jws)
+	claims, err := r.verifyJWSFromHeader(ctx, issuerURL, jws)
 	if err != nil {
 		return nil, err
 	}
-	claims := parsed.claims
 
 	// Validate required payload claims per §12.2.3
 	if err := validateJWTClaims(claims, issuerURL); err != nil {
@@ -576,7 +567,7 @@ func (r *Resolver) handleJWTResponse(ctx context.Context, issuerURL, jwtString s
 	// Validated is true only when a TrustEvaluator is configured and approved
 	// the signer. Without a TrustEvaluator, the signature is verified but no
 	// trust decision is made.
-	return &fetchResult{metadata: claims, validated: r.cfg.TrustEvaluator != nil, signed: true, signerKeyMaterial: km, ambiguous: parsed.ambiguous}, nil
+	return &fetchResult{metadata: claims, validated: r.cfg.TrustEvaluator != nil, signed: true, signerKeyMaterial: km}, nil
 }
 
 // handleJSONResponse processes an application/json response.
@@ -586,9 +577,6 @@ func (r *Resolver) handleJSONResponse(ctx context.Context, issuerURL string, bod
 		return nil, fmt.Errorf("response is not valid JSON")
 	}
 
-	if err := checkEnvelope(body); err != nil {
-		return nil, err
-	}
 	var raw map[string]interface{}
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, fmt.Errorf("parsing JSON: %w", err)
@@ -598,18 +586,18 @@ func (r *Resolver) handleJSONResponse(ctx context.Context, issuerURL string, bod
 	// JWT payload claims as the authoritative metadata.
 	if smVal, ok := raw["signed_metadata"]; ok {
 		if smStr, ok := smVal.(string); ok && smStr != "" {
-			parsed, err := r.validateSignedMetadata(ctx, issuerURL, raw, smStr)
+			claims, err := r.validateSignedMetadata(ctx, issuerURL, raw, smStr)
 			if err != nil {
 				return nil, err
 			}
 			// The verified claims must bind to the identifier exactly, whichever
 			// candidate URL served the document (sub and/or credential_issuer;
 			// at least one must be present, any present one must match).
-			if err := validateSignedMetadataIdentity(parsed.claims, issuerURL); err != nil {
+			if err := validateSignedMetadataIdentity(claims, issuerURL); err != nil {
 				return nil, err
 			}
 			// Validated only when a TrustEvaluator is configured and approved.
-			return &fetchResult{metadata: parsed.claims, validated: r.cfg.TrustEvaluator != nil, signed: true, ambiguous: parsed.ambiguous}, nil
+			return &fetchResult{metadata: claims, validated: r.cfg.TrustEvaluator != nil, signed: true}, nil
 		}
 	}
 
@@ -623,32 +611,7 @@ func (r *Resolver) handleJSONResponse(ctx context.Context, issuerURL string, bod
 		return nil, err
 	}
 
-	ambiguous, err := dropAmbiguousConfigurations(body, raw)
-	if err != nil {
-		return nil, err
-	}
-	return &fetchResult{metadata: raw, validated: false, signed: false, ambiguous: ambiguous}, nil
-}
-
-// parsedClaims are the claims of a verified metadata JWT payload, with the
-// configurations removed for ambiguity.
-type parsedClaims struct {
-	claims    map[string]interface{}
-	ambiguous []string
-}
-
-// parseClaims decodes a verified JWT payload into claims and removes the
-// configurations whose security-relevant members are ambiguous.
-func parseClaims(payload []byte) (*parsedClaims, error) {
-	var claims map[string]interface{}
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return nil, fmt.Errorf("parsing JWT payload claims: %w", err)
-	}
-	ambiguous, err := dropAmbiguousConfigurations(payload, claims)
-	if err != nil {
-		return nil, err
-	}
-	return &parsedClaims{claims: claims, ambiguous: ambiguous}, nil
+	return &fetchResult{metadata: raw, validated: false, signed: false}, nil
 }
 
 // validateCredentialIssuerClaim checks that the metadata's credential_issuer
@@ -700,7 +663,7 @@ func validateSignedMetadataIdentity(claims map[string]interface{}, issuerURL str
 // When using JWKS, if the JWT header contains a kid, keys matching that kid
 // are tried first. If none match the kid or no kid is present, all JWKS keys
 // are tried in order.
-func (r *Resolver) validateSignedMetadata(ctx context.Context, issuerURL string, raw map[string]interface{}, signedMetadata string) (*parsedClaims, error) {
+func (r *Resolver) validateSignedMetadata(ctx context.Context, issuerURL string, raw map[string]interface{}, signedMetadata string) (map[string]interface{}, error) {
 	jws, err := jose.ParseSigned(signedMetadata, supportedSignatureAlgorithms)
 	if err != nil {
 		return nil, fmt.Errorf("parsing signed_metadata JWT: %w", err)
@@ -714,12 +677,12 @@ func (r *Resolver) validateSignedMetadata(ctx context.Context, issuerURL string,
 			return nil, fmt.Errorf("resolving JWKS for signed_metadata verification: %w", jwksErr)
 		}
 		// No JWKS in metadata body — fall back to x5c from JWT header.
-		parsed, headerErr := r.verifyJWSFromHeader(ctx, issuerURL, jws)
+		claims, headerErr := r.verifyJWSFromHeader(ctx, issuerURL, jws)
 		if headerErr != nil {
 			return nil, fmt.Errorf("signed_metadata verification failed: no JWKS in metadata and header key extraction failed: %w", headerErr)
 		}
-		parsed.claims["signed_metadata"] = signedMetadata
-		return parsed, nil
+		claims["signed_metadata"] = signedMetadata
+		return claims, nil
 	}
 
 	// Determine the candidate keys to try for verification.
@@ -750,18 +713,19 @@ func (r *Resolver) validateSignedMetadata(ctx context.Context, issuerURL string,
 		return nil, fmt.Errorf("signer trust evaluation failed: %w", err)
 	}
 
-	parsed, err := parseClaims(payload)
-	if err != nil {
-		return nil, err
+	var claims map[string]interface{}
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil, fmt.Errorf("parsing JWT payload claims: %w", err)
 	}
-	parsed.claims["signed_metadata"] = signedMetadata
-	return parsed, nil
+
+	claims["signed_metadata"] = signedMetadata
+	return claims, nil
 }
 
 // verifyJWSFromHeader resolves the signing key from the JWS JOSE header
 // (x5c or embedded key) and verifies the signature.
 // Returns the verified payload claims.
-func (r *Resolver) verifyJWSFromHeader(ctx context.Context, issuerURL string, jws *jose.JSONWebSignature) (*parsedClaims, error) {
+func (r *Resolver) verifyJWSFromHeader(ctx context.Context, issuerURL string, jws *jose.JSONWebSignature) (map[string]interface{}, error) {
 	headers := jws.Signatures[0].Protected
 
 	// Try x5c header: extract certs from the raw JWS header.
@@ -778,7 +742,11 @@ func (r *Resolver) verifyJWSFromHeader(ctx context.Context, issuerURL string, jw
 			return nil, fmt.Errorf("x5c signer trust evaluation failed: %w", err)
 		}
 
-		return parseClaims(payload)
+		var claims map[string]interface{}
+		if err := json.Unmarshal(payload, &claims); err != nil {
+			return nil, fmt.Errorf("parsing JWT payload claims: %w", err)
+		}
+		return claims, nil
 	}
 
 	// If x5c was present but malformed, surface the real error.
@@ -1086,7 +1054,6 @@ func (r *Resolver) setCache(issuerURL string, result *fetchResult) {
 		validated:         result.validated,
 		signed:            result.signed,
 		signerKeyMaterial: result.signerKeyMaterial,
-		ambiguous:         result.ambiguous,
 	}
 }
 

@@ -168,28 +168,32 @@ func TestSafeErrorCode(t *testing.T) {
 	assert.Equal(t, "unrecognized", safeErrorCode(string(make([]byte, 65))))
 }
 
-// An invalid_nonce body that repeats a member (here "error") is read
-// differently by different decoders: it is terminal before any retry decision,
-// whatever either reading says.
-func TestIssueCredential_AmbiguousInvalidNonceBodyIsTerminal(t *testing.T) {
-	for name, body := range map[string]string{
-		"duplicate error member":  `{"error":"invalid_nonce","error":"invalid_proof"}`,
-		"duplicate, nonce last":   `{"error":"invalid_proof","error":"invalid_nonce"}`,
-		"case-folded duplicate":   `{"error":"invalid_nonce","ERROR":"x"}`,
-		"duplicate c_nonce":       `{"error":"invalid_nonce","c_nonce":"dup-n1","c_nonce":"dup-n2"}`,
-		"c_nonce in another case": `{"error":"invalid_nonce","c_nonce":"dup-n1","C_Nonce":"dup-n2"}`,
-		"lone C_Nonce spelling":   `{"error":"invalid_nonce","C_Nonce":"dup-n1"}`,
+// A body that repeats a member, or spells one in another letter case, is read
+// as encoding/json reads it (the last wins, names match without case): the
+// retry decision follows that single reading and no reading is refused.
+func TestIssueCredential_RepeatedOrFoldedMemberIsReadNormally(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body         string
+		withEndpoint bool
+		retried      bool
+	}{
+		"invalid_nonce first, invalid_proof last": {`{"error":"invalid_nonce","error":"invalid_proof"}`, true, false},
+		"invalid_proof first, invalid_nonce last": {`{"error":"invalid_proof","error":"invalid_nonce"}`, true, true},
+		"repeated c_nonce, last used":             {`{"error":"invalid_nonce","c_nonce":"rep-n1","c_nonce":"rep-n2"}`, false, true},
+		"folded C_Nonce":                          {`{"error":"invalid_proof","C_Nonce":"rep-n1"}`, false, true},
+		"folded ERROR":                            {`{"ERROR":"invalid_nonce"}`, true, true},
 	} {
 		t.Run(name, func(t *testing.T) {
-			for _, withEndpoint := range []bool{true, false} {
-				ni, fc, logs, err := runNonceRetry(t, withEndpoint, body, "")
+			ni, fc, logs, err := runNonceRetry(t, tc.withEndpoint, tc.body, "")
+			assert.NotContains(t, logs, "rep-n")
+			if !tc.retried {
 				require.Error(t, err)
-				assert.Equal(t, 1, ni.credCalls, "an ambiguous error body is never retried on")
-				assert.Len(t, proofNonces(t, fc), 1)
-				assert.NotContains(t, logs, "dup-n")
-				fc.settle()
-				assert.Equal(t, 1, countFlowErrors(fc), "reported once")
+				assert.Equal(t, 1, ni.credCalls)
+				return
 			}
+			require.NoError(t, err)
+			assert.Equal(t, 2, ni.credCalls)
+			assert.Len(t, proofNonces(t, fc), 2, "new nonce => new proofs")
 		})
 	}
 }

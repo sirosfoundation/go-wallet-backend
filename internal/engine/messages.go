@@ -126,11 +126,6 @@ const (
 	ErrCodeUnsupportedTransactionData ErrorCode = "UNSUPPORTED_TRANSACTION_DATA"
 	ErrCodeInternalError              ErrorCode = "INTERNAL_ERROR"
 	ErrCodeTooManyRequests            ErrorCode = "TOO_MANY_REQUESTS"
-	// ErrCodeLegacySecretMember: an issuer advertised, or a plain credential
-	// response carried, a superseded secret-bearing credential_metadata member
-	// (org.siros.secret_seed, org.siros.holder_commitments, org.siros.psc).
-	// Refused, not supported: nothing is stored. auxiliary_data replaces them.
-	ErrCodeLegacySecretMember ErrorCode = "LEGACY_SECRET_MEMBER"
 	// ErrCodeAuxiliaryDataUnsupported: the credential configuration needs
 	// auxiliary data this wallet cannot handle (a to_wallet entry with an alg
 	// or encoding Auxiliary Data v0.1 does not define, or a required to_issuer
@@ -208,8 +203,6 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "The issuer holds a conflicting value for you; it must be resolved with the issuer"
 	case ErrCodeAuxiliaryDataUnsupported:
 		return "The issuer needs auxiliary data that this wallet does not support"
-	case ErrCodeLegacySecretMember:
-		return "The issuer uses a secret delivery format that this wallet no longer supports"
 	default:
 		return "An error occurred"
 	}
@@ -484,7 +477,7 @@ type FlowCompleteMessage struct {
 	// response-level credential_metadata, applying to every credential in
 	// Credentials. Every other member, in particular auxiliary_data, is dropped
 	// by the engine and never relayed or logged (a plain response that carries
-	// auxiliary_data or a superseded secret-bearing member is refused). Never present when CredentialResponseEncrypted is true.
+	// auxiliary_data is refused). Never present when CredentialResponseEncrypted is true.
 	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
 }
 

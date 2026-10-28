@@ -19,54 +19,12 @@ import (
 // engine decides from the advertisement alone whether the response must be
 // encrypted.
 //
-// The superseded SIROS members (see legacySecretMembers) are not supported.
-// They are refused, not ignored: ignoring an advertisement of one would make
-// the engine ask for no response encryption and let a seed travel in clear.
-
-// legacySecretMembers are the superseded secret-bearing credential_metadata
-// members, refused for at least one release (LEGACY_SECRET_MEMBER). The names
-// are the ones the Swift and Kotlin SDKs refuse.
-var legacySecretMembers = []string{
-	"org.siros.secret_seed",
-	"org.siros.holder_commitments",
-	"org.siros.psc",
-	"holder_commitments",
-	"secret_members",
-}
-
-// isLegacySecretMember reports whether name is a superseded member, in any
-// letter case (fail closed).
-func isLegacySecretMember(name string) bool {
-	for _, n := range legacySecretMembers {
-		if strings.EqualFold(name, n) {
-			return true
-		}
-	}
-	return false
-}
+// Members of credential_metadata the engine does not know, the superseded SIROS
+// ones included, are ordinary unknown members and are ignored.
 
 // errFlowReported marks an error whose terminal flow_error has already been
 // sent, so a caller does not send a second one.
 var errFlowReported = errors.New("flow error already reported")
-
-// errLegacySecretMember never carries the offending content. The flow fails
-// with LEGACY_SECRET_MEMBER.
-var errLegacySecretMember = errors.New("a superseded secret-bearing credential_metadata member is not supported")
-
-// hasLegacySecretMember reports whether a credential_metadata object has a
-// superseded member. A value that is not a JSON object has none.
-func hasLegacySecretMember(md json.RawMessage) bool {
-	var m map[string]json.RawMessage
-	if json.Unmarshal(md, &m) != nil {
-		return false
-	}
-	for k := range m {
-		if isLegacySecretMember(k) {
-			return true
-		}
-	}
-	return false
-}
 
 // hasAuxiliaryDataMember reports whether a response-level credential_metadata
 // object has the auxiliary_data member.
@@ -81,11 +39,8 @@ func hasAuxiliaryDataMember(md json.RawMessage) bool {
 
 // refusePlainSecretMembers fails the flow when a PLAIN credential response
 // carries auxiliary_data (a Secret Value must never travel unencrypted, v0.1
-// section 7.1) or a superseded member. Nothing of the content is logged.
+// section 7.1). Nothing of the content is logged.
 func (h *OID4VCIHandler) refusePlainSecretMembers(md json.RawMessage) error {
-	if hasLegacySecretMember(md) {
-		return h.failLegacySecretMember(errors.New("credential response carries a superseded secret-bearing member"))
-	}
 	if hasAuxiliaryDataMember(md) {
 		err := fmt.Errorf("%w: auxiliary_data arrived in a plain response", errFlowReported)
 		h.Logger.Warn("rejecting credential response", zap.Error(err))
@@ -95,34 +50,19 @@ func (h *OID4VCIHandler) refusePlainSecretMembers(md json.RawMessage) error {
 	return nil
 }
 
-// failLegacySecretMember fails the flow with LEGACY_SECRET_MEMBER. The error
-// text and the log line carry no content from the issuer or the client.
-func (h *OID4VCIHandler) failLegacySecretMember(err error) error {
-	h.Logger.Warn("refusing a superseded secret-bearing member", zap.Error(err))
-	_ = h.Error(StepRequestingCredential, ErrCodeLegacySecretMember, ErrCodeLegacySecretMember.UserFacingMessage())
-	return fmt.Errorf("%w: %w", errLegacySecretMember, errFlowReported)
-}
-
 // failSecretDelivery maps an error of secretDeliveryOf to the flow error.
 func (h *OID4VCIHandler) failSecretDelivery(err error) error {
-	if errors.Is(err, errLegacySecretMember) {
-		return h.failLegacySecretMember(err)
-	}
 	h.Logger.Warn("rejecting issuer metadata", zap.Error(err))
 	_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer advertised malformed secret delivery metadata")
 	return err
 }
 
 // configRefusal says, without sending anything, why a credential configuration
-// must not be used: a superseded member (errLegacySecretMember), a malformed
-// advertisement, or auxiliary data the wallet cannot handle
+// must not be used: a malformed advertisement, or auxiliary data the wallet cannot handle
 // (errAuxiliaryDataUnsupported).
 func configRefusal(config *CredentialConfig) error {
 	if config == nil {
 		return nil
-	}
-	if hasLegacySecretMember(config.CredentialMetadata) {
-		return errLegacySecretMember
 	}
 	d, err := secretDeliveryOf(config)
 	if err != nil {
@@ -228,8 +168,8 @@ func carriesAuxiliaryData(config *CredentialConfig) bool {
 var errMalformedAdvertisement = errors.New("issuer metadata secret delivery advertisement is malformed")
 
 // secretDeliveryOf evaluates the advertisement of a credential configuration:
-// auxiliary_data_supported, and a refusal of any superseded member in its
-// credential_metadata (errLegacySecretMember). Anything malformed is an error
+// auxiliary_data_supported, and a refusal of an auxiliary_data member in its
+// credential_metadata. Anything malformed is an error
 // (fail closed); an absent advertisement is the zero value.
 func secretDeliveryOf(config *CredentialConfig) (secretDelivery, error) {
 	var d secretDelivery
@@ -254,9 +194,9 @@ func secretDeliveryOf(config *CredentialConfig) (secretDelivery, error) {
 	return d, nil
 }
 
-// checkIssuerCredentialMetadata refuses a superseded member in issuer metadata
-// (errLegacySecretMember) and an auxiliary_data member (it MUST NOT appear in
-// Credential Issuer Metadata, v0.1 section 7: errMalformedAdvertisement). A
+// checkIssuerCredentialMetadata refuses an auxiliary_data member in issuer
+// metadata (it MUST NOT appear in Credential Issuer Metadata, v0.1 section 7:
+// errMalformedAdvertisement). A
 // document that is not an object is not judged here.
 func checkIssuerCredentialMetadata(credentialMetadata json.RawMessage) error {
 	if len(credentialMetadata) == 0 {
@@ -265,14 +205,6 @@ func checkIssuerCredentialMetadata(credentialMetadata json.RawMessage) error {
 	var md map[string]json.RawMessage
 	if json.Unmarshal(credentialMetadata, &md) != nil {
 		return nil
-	}
-	for k := range md {
-		if isLegacySecretMember(k) {
-			return errLegacySecretMember
-		}
-	}
-	if err := checkUnambiguous(credentialMetadata, -1); err != nil {
-		return fmt.Errorf("%w: credential_metadata is ambiguous", errMalformedAdvertisement)
 	}
 	if _, has := md[auxiliaryDataMember]; has {
 		return fmt.Errorf("%w: %s in credential_metadata", errMalformedAdvertisement, auxiliaryDataMember)
@@ -292,31 +224,11 @@ func AdvertisementMalformed(configuration json.RawMessage) bool {
 	if json.Unmarshal(configuration, &m) != nil || m == nil {
 		return false // not a JSON object: not judged here
 	}
-	if checkUnambiguous(configuration, 1) != nil {
-		return true
-	}
 	_, err := secretDeliveryOf(&CredentialConfig{
 		CredentialMetadata:     m["credential_metadata"],
 		AuxiliaryDataSupported: m["auxiliary_data_supported"],
 	})
 	return err != nil
-}
-
-// UnmarshalJSON decodes a credential configuration. The names of its own
-// top-level members must be unambiguous (see decodeStrict): the two members
-// the advertisement lives in are otherwise read by a case-insensitive field
-// match that another reader may not make.
-func (c *CredentialConfig) UnmarshalJSON(data []byte) error {
-	type plain CredentialConfig // no methods: avoids recursion
-	var p plain
-	if err := json.Unmarshal(data, &p); err != nil {
-		return err
-	}
-	if err := checkUnambiguous(data, 1); err != nil {
-		return fmt.Errorf("%w: ambiguous member names", errMalformedAdvertisement)
-	}
-	*c = CredentialConfig(p)
-	return nil
 }
 
 type auxAdvertisement struct {
@@ -349,13 +261,14 @@ type auxEntryWire struct {
 // entry is an object with a string type, at most one entry per type and path;
 // to_issuer entries may carry a boolean required. A hash_commitment entry needs
 // a string alg and a claims path, and never an opening or commitment (values,
-// not metadata). Entries of an unrecognised type are kept (a recipient ignores
-// them) but must still be objects with a type. The returned toIssuer entries
-// are verbatim.
+// not metadata). A recipient ignores an entry of an unrecognised type (section
+// 3): of it only the type is checked, and required when it is in to_issuer (a
+// required entry the wallet cannot send makes the configuration unusable). The
+// returned toIssuer entries are verbatim.
 func parseAuxiliaryDataSupported(raw json.RawMessage) (*auxAdvertisement, error) {
 	var top auxSupportedWire
-	if err := decodeStrict(raw, &top); err != nil || string(raw) == "null" {
-		return nil, fmt.Errorf("%w: auxiliary_data_supported is not an unambiguous object", errMalformedAdvertisement)
+	if err := json.Unmarshal(raw, &top); err != nil || string(raw) == "null" {
+		return nil, fmt.Errorf("%w: auxiliary_data_supported is not an object", errMalformedAdvertisement)
 	}
 	if top.ToWallet == nil && top.ToIssuer == nil {
 		return nil, fmt.Errorf("%w: auxiliary_data_supported has neither to_wallet nor to_issuer", errMalformedAdvertisement)
@@ -440,17 +353,18 @@ func parseAuxEntries(raw json.RawMessage, list string) ([]auxEntry, []json.RawMe
 		if err != nil {
 			return bad(err.Error())
 		}
-		dup := e.typ + "\x00" + pathKey
-		if _, d := seen[dup]; d {
-			return bad("has two entries of the same type and path")
+		if e.typ == auxTypeHashCommitment {
+			if _, d := seen[pathKey]; d {
+				return bad("has two entries of the same type and path")
+			}
+			seen[pathKey] = struct{}{}
 		}
-		seen[dup] = struct{}{}
 		entries = append(entries, e)
 	}
 	return entries, rawEntries, nil
 }
 
-// parseAuxEntry validates one entry (already unambiguous, see decodeStrict) and
+// parseAuxEntry validates one entry and
 // returns it with its duplicate-detection path key. The error text is the
 // reason, without content.
 func parseAuxEntry(re json.RawMessage, list string) (auxEntry, string, error) {
@@ -458,8 +372,13 @@ func parseAuxEntry(re json.RawMessage, list string) (auxEntry, string, error) {
 	if json.Unmarshal(re, &w) != nil || string(re) == "null" || re[0] != '{' || w.Type == "" {
 		return auxEntry{}, "", errAuxEntry("has an entry that is not an object with a string type")
 	}
-	// Values, never metadata: no opening or commitment member at any depth,
-	// whatever the entry's type.
+	if w.Type != auxTypeHashCommitment {
+		// An entry of an unrecognised type is ignored (section 3): its own
+		// parameters, a "commitment" or "opening" among them, are its own.
+		// Only required is read, and only in to_issuer.
+		return auxEntry{typ: w.Type, required: unrecognisedRequired(w, list)}, "", nil
+	}
+	// Values, never metadata: no opening or commitment member at any depth.
 	var generic any
 	if json.Unmarshal(re, &generic) != nil || containsMember(generic, "opening") || containsMember(generic, "commitment") {
 		return auxEntry{}, "", errAuxEntry("has an entry carrying an opening or a commitment")
@@ -472,9 +391,7 @@ func parseAuxEntry(re json.RawMessage, list string) (auxEntry, string, error) {
 		return auxEntry{}, "", err
 	}
 	e := auxEntry{typ: w.Type, required: string(w.Required) == "true"}
-	if w.Type == auxTypeHashCommitment {
-		e.sendable = contains(auxSupportedAlgs, algOf(w)) && encodingSupported(w.Encoding)
-	}
+	e.sendable = contains(auxSupportedAlgs, algOf(w)) && encodingSupported(w.Encoding)
 	return e, pathKey, nil
 }
 
@@ -495,6 +412,13 @@ func encodingSupported(raw json.RawMessage) bool {
 	}
 	var enc string
 	return json.Unmarshal(raw, &enc) == nil && contains(auxSupportedEncodings, enc)
+}
+
+// unrecognisedRequired reports whether an entry of an unrecognised type in
+// to_issuer is required. Anywhere else, and for a value that is not the boolean
+// true, the entry is ignored.
+func unrecognisedRequired(w auxEntryWire, list string) bool {
+	return list == "to_issuer" && string(w.Required) == "true"
 }
 
 // checkAuxRequired: only to_issuer entries may carry required, and it is a boolean.
@@ -524,20 +448,7 @@ func auxEntryPathKey(w auxEntryWire) (string, error) {
 		}
 		return p, nil
 	}
-	if w.Path == nil {
-		return "", nil
-	}
-	// Unrecognised type: only duplicate detection, on the decoded
-	// value so escapes and whitespace cannot hide a duplicate.
-	var v interface{}
-	if json.Unmarshal(w.Path, &v) != nil {
-		return "", errAuxEntry("has an entry with an invalid path")
-	}
-	norm, err := json.Marshal(v)
-	if err != nil {
-		return "", errAuxEntry("has an entry with an invalid path")
-	}
-	return string(norm), nil
+	return "", nil
 }
 
 // claimsPathKey validates a claims path pointer (OpenID4VCI Appendix C): a
@@ -598,8 +509,7 @@ func auxProofErr(why string) error { return fmt.Errorf("%w: %s", errAuxiliaryDat
 // than jwt or attestation, an unreadable JWT, an auxiliary_data claim that is
 // not an array of objects) is refused rather than forwarded unexamined. With
 // nothing advertised an unreadable proof is left to the issuer's own proof
-// verification, while a readable one is still checked, and an ambiguous one
-// (see decodeStrict) is never forwarded.
+// verification, while a readable one is still checked.
 func checkProofsForwardNoOpening(proofs []ProofObject, inspect bool) error {
 	for _, proof := range proofs {
 		var token string
@@ -616,7 +526,7 @@ func checkProofsForwardNoOpening(proofs []ProofObject, inspect bool) error {
 		}
 		claim, has, err := proofAuxiliaryDataClaim(token)
 		if err != nil {
-			if inspect || errors.Is(err, errAmbiguousJSON) {
+			if inspect {
 				return err
 			}
 			continue
@@ -649,8 +559,7 @@ type proofClaimsWire struct {
 }
 
 // proofAuxiliaryDataClaim returns the auxiliary_data claim of a compact JWT's
-// payload, and whether it is present. An ambiguous payload (see decodeStrict)
-// is an error wrapping errAmbiguousJSON and errAuxiliaryDataProof.
+// payload, and whether it is present.
 func proofAuxiliaryDataClaim(token string) (json.RawMessage, bool, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 {
@@ -661,10 +570,7 @@ func proofAuxiliaryDataClaim(token string) (json.RawMessage, bool, error) {
 		return nil, false, auxProofErr("proof payload is not base64url")
 	}
 	var claims proofClaimsWire
-	if err := decodeStrict(payload, &claims); err != nil || string(bytes.TrimSpace(payload)) == "null" {
-		if errors.Is(err, errAmbiguousJSON) {
-			return nil, false, fmt.Errorf("%w: %w", errAuxiliaryDataProof, errAmbiguousJSON)
-		}
+	if err := json.Unmarshal(payload, &claims); err != nil || string(bytes.TrimSpace(payload)) == "null" {
 		return nil, false, auxProofErr("proof payload is not a JSON object")
 	}
 	return claims.AuxiliaryData, claims.AuxiliaryData != nil, nil
