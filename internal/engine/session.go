@@ -22,6 +22,7 @@ import (
 	"github.com/sirosfoundation/go-tokenauth/claims"
 	tokenvalidator "github.com/sirosfoundation/go-tokenauth/validator"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	ws "github.com/sirosfoundation/go-wallet-backend/internal/websocket"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -218,6 +219,30 @@ func newFlow(id string, protocol Protocol, session *Session) *Flow {
 	}
 }
 
+// userKey identifies the one live session a user may hold per tenant.
+// Users can belong to several tenants, so keying by UserID alone would let
+// a connection in one tenant tear down the same user's session in another.
+type userKey struct {
+	TenantID string
+	UserID   string
+}
+
+// normalizeTenant maps a missing tenant claim to the default tenant. It is
+// the single normalisation shared by WebSocket session creation, the
+// (tenant, user) index and the persisted store, so the same tokenless-tenant
+// user always resolves to the same tenant.
+func normalizeTenant(t string) string {
+	if t == "" {
+		return domain.DefaultTenantID.String()
+	}
+	return t
+}
+
+// userKey returns the session's (tenant, user) index key.
+func (s *Session) userKey() userKey {
+	return userKey{TenantID: normalizeTenant(s.TenantID), UserID: s.UserID}
+}
+
 // Manager manages WebSocket sessions and flows
 type Manager struct {
 	cfg      *config.Config
@@ -225,8 +250,8 @@ type Manager struct {
 	upgrader websocket.Upgrader
 
 	sessionsMu sync.RWMutex
-	sessions   map[string]*Session // sessionID -> session (active connections only)
-	userIndex  map[string]*Session // userID -> session (last connection wins)
+	sessions   map[string]*Session  // sessionID -> session (active connections only)
+	userIndex  map[userKey]*Session // (tenant, user) -> session (last connection wins)
 
 	flowHandlers map[Protocol]FlowHandlerFactory
 	handlersMu   sync.RWMutex
@@ -288,7 +313,7 @@ func NewManager(cfg *config.Config, logger *zap.Logger) *Manager {
 			CheckOrigin:     ws.CheckOriginFromConfig(cfg),
 		},
 		sessions:        make(map[string]*Session),
-		userIndex:       make(map[string]*Session),
+		userIndex:       make(map[userKey]*Session),
 		revokedUsers:    make(map[string]struct{}),
 		flowHandlers:    make(map[Protocol]FlowHandlerFactory),
 		trustService:    NewTrustService(cfg, logger),
@@ -1059,23 +1084,25 @@ func (m *Manager) registerSession(session *Session) bool {
 	}
 	defer m.sessionsMu.Unlock()
 
-	// Close existing session for this user (skip for anonymous sessions)
+	// Close the existing session for this (tenant, user) pair (skip for
+	// anonymous sessions). The same user's sessions in other tenants are
+	// independent and left alone.
 	if session.UserID != "" {
-		if existing, ok := m.userIndex[session.UserID]; ok {
+		if existing, ok := m.userIndex[session.userKey()]; ok {
 			m.logSuperseding(existing, session)
 			existing.markClosing(closeReasonSuperseded, session.ID)
 			_ = existing.conn.Close()
 			delete(m.sessions, existing.ID)
 			// Also remove from persistent store
 			if m.sessionStore != nil {
-				_ = m.sessionStore.DeleteByUser(context.Background(), session.UserID)
+				_ = m.sessionStore.Delete(context.Background(), existing.TenantID, existing.UserID, existing.ID)
 			}
 		}
 	}
 
 	m.sessions[session.ID] = session
 	if session.UserID != "" {
-		m.userIndex[session.UserID] = session
+		m.userIndex[session.userKey()] = session
 	}
 
 	// Persist to store
@@ -1083,7 +1110,7 @@ func (m *Manager) registerSession(session *Session) bool {
 		sessionData := &SessionData{
 			ID:        session.ID,
 			UserID:    session.UserID,
-			TenantID:  session.TenantID,
+			TenantID:  normalizeTenant(session.TenantID),
 			CreatedAt: time.Now(),
 			ExpiresAt: time.Now().Add(24 * time.Hour), // TODO: configurable
 		}
@@ -1100,14 +1127,14 @@ func (m *Manager) unregisterSession(session *Session) {
 
 	delete(m.sessions, session.ID)
 	if session.UserID != "" {
-		if current, ok := m.userIndex[session.UserID]; ok && current == session {
-			delete(m.userIndex, session.UserID)
+		if current, ok := m.userIndex[session.userKey()]; ok && current == session {
+			delete(m.userIndex, session.userKey())
 		}
 	}
 
 	// Remove from persistent store
 	if m.sessionStore != nil {
-		_ = m.sessionStore.Delete(context.Background(), session.ID)
+		_ = m.sessionStore.Delete(context.Background(), session.TenantID, session.UserID, session.ID)
 	}
 
 	// "session" (session.logger's bound field) is the user's short ID, not
@@ -1157,8 +1184,9 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 	if m.isUserRevoked(result.UserID) {
 		return "", "", "", errors.New("token has been revoked")
 	}
-	// UserID may be empty for anonymous tokens — that is acceptable.
-	return result.UserID, result.TenantID, result.TAC, nil
+	// UserID may be empty for anonymous tokens — that is acceptable. A token
+	// without a tenant_id claim belongs to the default tenant (see normalizeTenant).
+	return result.UserID, normalizeTenant(result.TenantID), result.TAC, nil
 }
 
 func (m *Manager) getCapabilities() []string {
@@ -1196,11 +1224,12 @@ func (m *Manager) GetSession(sessionID string) (*Session, error) {
 	return session, nil
 }
 
-// GetSessionByUser returns a session by user ID
-func (m *Manager) GetSessionByUser(userID string) (*Session, error) {
+// GetSessionByUser returns the current session of userID within tenantID.
+// A user may hold one session per tenant.
+func (m *Manager) GetSessionByUser(tenantID, userID string) (*Session, error) {
 	m.sessionsMu.RLock()
 	defer m.sessionsMu.RUnlock()
-	session, ok := m.userIndex[userID]
+	session, ok := m.userIndex[userKey{TenantID: normalizeTenant(tenantID), UserID: userID}]
 	if !ok {
 		return nil, ErrSessionNotFound
 	}
@@ -1212,7 +1241,7 @@ func (m *Manager) ListSessions(ctx context.Context, tenantID string) ([]*Session
 	if m.sessionStore == nil {
 		return nil, nil
 	}
-	return m.sessionStore.List(ctx, tenantID)
+	return m.sessionStore.List(ctx, normalizeTenant(tenantID))
 }
 
 // CleanupSessions removes expired sessions from the persistent store
@@ -1292,7 +1321,9 @@ func (m *Manager) isUserRevoked(userID string) bool {
 // a close frame with reason where the connection can still accept one) and
 // returns how many were closed. A user can hold more than one concurrent
 // session (multiple devices), so this closes all of them, not just the one
-// in userIndex ("last connection wins" - see registerSession). Matching is
+// in userIndex ("last connection wins" per tenant - see registerSession),
+// and across every tenant the user belongs to, since a user-wide
+// revocation is not tenant-scoped. Matching is
 // strictly by exact Session.UserID equality (and userID must be non-empty),
 // so this can never close an anonymous session or a different user's
 // session.
@@ -1355,7 +1386,7 @@ func (m *Manager) Close() {
 		_ = session.conn.Close()
 	}
 	m.sessions = make(map[string]*Session)
-	m.userIndex = make(map[string]*Session)
+	m.userIndex = make(map[userKey]*Session)
 
 	// Close session store
 	if m.sessionStore != nil {

@@ -745,7 +745,7 @@ func TestManager_CloseUserSessions_ClosesLiveConnection(t *testing.T) {
 	require.Eventually(t, func() bool {
 		m.sessionsMu.RLock()
 		defer m.sessionsMu.RUnlock()
-		_, stillIndexed := m.userIndex[deletedUser]
+		stillIndexed := hasUserIndexed(m, deletedUser)
 		return len(m.sessions) == 0 && !stillIndexed
 	}, time.Second, 10*time.Millisecond, "session bookkeeping was not cleaned up after close")
 }
@@ -853,7 +853,7 @@ func TestManager_CloseUserSessions_NeverTouchesOtherUsers(t *testing.T) {
 	require.NoError(t, survivorWS.SetReadDeadline(time.Time{}))
 
 	m.sessionsMu.RLock()
-	_, stillPresent := m.userIndex["innocent-bystander"]
+	stillPresent := hasUserIndexed(m, "innocent-bystander")
 	m.sessionsMu.RUnlock()
 	assert.True(t, stillPresent, "the innocent bystander must still be registered")
 }
@@ -935,7 +935,7 @@ func TestManager_RegisterSession_RejectsAlreadyRevokedUser(t *testing.T) {
 
 	m.sessionsMu.RLock()
 	_, present := m.sessions[session.ID]
-	_, indexed := m.userIndex[session.UserID]
+	_, indexed := m.userIndex[session.userKey()]
 	m.sessionsMu.RUnlock()
 	assert.False(t, present, "a rejected session must not be added to m.sessions")
 	assert.False(t, indexed, "a rejected session must not be added to m.userIndex")
@@ -1280,6 +1280,207 @@ func TestSession_RequestSign_ConcurrentWaitersGetOwnReplies(t *testing.T) {
 			t.Fatalf("waiter %s never got its reply", name)
 		}
 	}
+}
+
+// hasUserIndexed reports whether userID has an entry in m.userIndex under any
+// tenant. The caller must hold m.sessionsMu.
+func hasUserIndexed(m *Manager, userID string) bool {
+	for k := range m.userIndex {
+		if k.UserID == userID {
+			return true
+		}
+	}
+	return false
+}
+
+// newMultiTenantTestSession returns a session bound to a real (loopback)
+// WebSocket connection, so registerSession's supersede path closes a live
+// connection exactly as in production.
+func newMultiTenantTestSession(t *testing.T, id, tenantID, userID string) *Session {
+	t.Helper()
+	srvConnCh := make(chan *websocket.Conn, 1)
+	_, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) { srvConnCh <- srvConn })
+	t.Cleanup(cleanup)
+	return &Session{
+		ID: id, TenantID: tenantID, UserID: userID, conn: <-srvConnCh,
+		flows: make(map[string]*Flow), logger: zap.NewNop(),
+	}
+}
+
+// sessionConnClosed reports whether the session's server-side connection has
+// been closed (a control write on a closed connection fails).
+func sessionConnClosed(s *Session) bool {
+	return s.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(time.Second)) != nil
+}
+
+// isCurrentSessionForTest reports whether s is still the registered session for its
+// (tenant, user).
+func (m *Manager) isCurrentSessionForTest(s *Session) bool {
+	m.sessionsMu.RLock()
+	defer m.sessionsMu.RUnlock()
+	if m.sessions[s.ID] != s {
+		return false
+	}
+	return s.UserID == "" || m.userIndex[s.userKey()] == s
+}
+
+// A user in tenants A and B keeps one session in each; a second session in
+// the same tenant supersedes only that tenant's first.
+func TestManager_RegisterSession_OneSessionPerTenantUser(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
+	m := NewManager(cfg, zap.NewNop())
+	defer m.Close()
+
+	a1 := newMultiTenantTestSession(t, "a1", "tenant-a", "user-1")
+	b1 := newMultiTenantTestSession(t, "b1", "tenant-b", "user-1")
+	require.True(t, m.registerSession(a1))
+	require.True(t, m.registerSession(b1))
+
+	assert.False(t, sessionConnClosed(a1), "a session in tenant B must not supersede tenant A's")
+	assert.True(t, m.isCurrentSessionForTest(a1))
+	assert.True(t, m.isCurrentSessionForTest(b1))
+	gotA, err := m.GetSessionByUser("tenant-a", "user-1")
+	require.NoError(t, err)
+	assert.Same(t, a1, gotA)
+	gotB, err := m.GetSessionByUser("tenant-b", "user-1")
+	require.NoError(t, err)
+	assert.Same(t, b1, gotB)
+
+	a2 := newMultiTenantTestSession(t, "a2", "tenant-a", "user-1")
+	require.True(t, m.registerSession(a2))
+	assert.True(t, sessionConnClosed(a1))
+	assert.False(t, m.isCurrentSessionForTest(a1))
+	assert.True(t, m.isCurrentSessionForTest(a2))
+	assert.True(t, m.isCurrentSessionForTest(b1), "tenant B session must survive tenant A supersede")
+	assert.False(t, sessionConnClosed(b1))
+
+	// Unregistering the superseded session must not drop its successor's index.
+	m.unregisterSession(a1)
+	assert.True(t, m.isCurrentSessionForTest(a2))
+
+	// Anonymous sessions are never indexed or superseded.
+	an1 := newMultiTenantTestSession(t, "an1", "tenant-a", "")
+	an2 := newMultiTenantTestSession(t, "an2", "tenant-a", "")
+	require.True(t, m.registerSession(an1))
+	require.True(t, m.registerSession(an2))
+	assert.True(t, m.isCurrentSessionForTest(an1))
+	assert.True(t, m.isCurrentSessionForTest(an2))
+	assert.False(t, sessionConnClosed(an1))
+}
+
+// Persisted session bookkeeping is also per (tenant, user).
+func TestManager_RegisterSession_StoreKeepsBothTenants(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
+	m := NewManager(cfg, zap.NewNop())
+	store := NewMemorySessionStore(zap.NewNop())
+	m.SetSessionStore(store)
+	defer m.Close()
+	ctx := context.Background()
+
+	require.True(t, m.registerSession(newMultiTenantTestSession(t, "a1", "tenant-a", "user-1")))
+	require.True(t, m.registerSession(newMultiTenantTestSession(t, "b1", "tenant-b", "user-1")))
+	_, err := store.GetByUser(ctx, "tenant-a", "user-1")
+	require.NoError(t, err)
+	_, err = store.GetByUser(ctx, "tenant-b", "user-1")
+	require.NoError(t, err)
+
+	require.True(t, m.registerSession(newMultiTenantTestSession(t, "a2", "tenant-a", "user-1")))
+	_, err = store.Get(ctx, "a1")
+	assert.ErrorIs(t, err, ErrSessionNotFound)
+	_, err = store.Get(ctx, "b1")
+	require.NoError(t, err)
+	got, err := store.GetByUser(ctx, "tenant-a", "user-1")
+	require.NoError(t, err)
+	assert.Equal(t, "a2", got.ID)
+}
+
+// User-wide revocation closes the user's sessions in every tenant.
+func TestManager_CloseUserSessions_ClosesSessionsInAllTenants(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
+	m := NewManager(cfg, zap.NewNop())
+	defer m.Close()
+
+	a := newMultiTenantTestSession(t, "a", "tenant-a", "user-1")
+	b := newMultiTenantTestSession(t, "b", "tenant-b", "user-1")
+	other := newMultiTenantTestSession(t, "other", "tenant-a", "user-2")
+	require.True(t, m.registerSession(a))
+	require.True(t, m.registerSession(b))
+	require.True(t, m.registerSession(other))
+
+	assert.Equal(t, 2, m.CloseUserSessions("user-1", "account deleted"))
+	assert.True(t, sessionConnClosed(a))
+	assert.True(t, sessionConnClosed(b))
+	assert.False(t, sessionConnClosed(other))
+}
+
+func TestMemorySessionStore_DeleteByUser_AllTenants(t *testing.T) {
+	store := NewMemorySessionStore(zap.NewNop())
+	ctx := context.Background()
+	exp := time.Now().Add(time.Hour)
+	for _, s := range []*SessionData{
+		{ID: "a", UserID: "u", TenantID: "ta", ExpiresAt: exp},
+		{ID: "b", UserID: "u", TenantID: "tb", ExpiresAt: exp},
+		{ID: "c", UserID: "other", TenantID: "ta", ExpiresAt: exp},
+	} {
+		require.NoError(t, store.Put(ctx, s))
+	}
+	require.NoError(t, store.Delete(ctx, "ta", "u", "a"))
+	_, err := store.GetByUser(ctx, "tb", "u")
+	require.NoError(t, err, "deleting tenant A's session must not drop tenant B's index")
+
+	require.NoError(t, store.DeleteByUser(ctx, "u"))
+	_, err = store.Get(ctx, "b")
+	assert.ErrorIs(t, err, ErrSessionNotFound)
+	_, err = store.Get(ctx, "c")
+	assert.NoError(t, err)
+}
+
+// A token without a tenant_id claim belongs to the default tenant (as the
+// HTTP middleware already treats it), so a WebSocket session for it is
+// indexed and persisted under "default" rather than under an empty tenant.
+func TestManager_validateToken_MissingTenantNormalisedToDefault(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
+	m := NewManager(cfg, zap.NewNop())
+	v, key, issuer := setupEngineTokenValidatorTest(t)
+	m.SetTokenValidator(v)
+
+	token := signEngineToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims: gojosejwt.Claims{Audience: gojosejwt.Audience{"wallet-registry"}},
+		TAC:    "r",
+		ACR:    "urn:siros:acr:passkey",
+	})
+	_, tenantID, _, err := m.validateToken(context.Background(), token)
+	require.NoError(t, err)
+	assert.Equal(t, "default", tenantID)
+}
+
+func TestManager_RegisterSession_EmptyTenantIndexedAsDefault(t *testing.T) {
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
+	m := NewManager(cfg, zap.NewNop())
+	store := NewMemorySessionStore(zap.NewNop())
+	m.SetSessionStore(store)
+	defer m.Close()
+	ctx := context.Background()
+
+	empty := newMultiTenantTestSession(t, "empty", "", "user-nt")
+	require.True(t, m.registerSession(empty))
+	got, err := m.GetSessionByUser("default", "user-nt")
+	require.NoError(t, err, "an empty-tenant session must be found under the default tenant")
+	assert.Same(t, empty, got)
+	_, err = m.GetSessionByUser("", "user-nt")
+	assert.NoError(t, err, "an empty tenant resolves to default on lookup too")
+	_, err = store.GetByUser(ctx, "default", "user-nt")
+	assert.NoError(t, err, "the persisted session must be under the default tenant")
+	listed, err := m.ListSessions(ctx, "")
+	require.NoError(t, err)
+	assert.Len(t, listed, 1)
+
+	// A session explicitly in the default tenant supersedes the empty-tenant one.
+	explicit := newMultiTenantTestSession(t, "explicit", "default", "user-nt")
+	require.True(t, m.registerSession(explicit))
+	assert.True(t, sessionConnClosed(empty))
+	assert.False(t, m.isCurrentSessionForTest(empty))
+	assert.True(t, m.isCurrentSessionForTest(explicit))
 }
 
 // TestHandleNewConnection_EmptyTACRefusedOnFlowStart drives the real WebSocket
