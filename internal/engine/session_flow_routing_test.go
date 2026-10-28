@@ -317,7 +317,7 @@ func TestRouting_DuplicateReplyIsDropped(t *testing.T) {
 
 	s.dispatchSignResponse(first)
 	s.dispatchSignResponse(&SignResponseMessage{Message: Message{MessageID: "m"}, TransactionID: "second"})
-	assert.Equal(t, ErrCodeUnknownFlow, readFlowError(t, client).Error.Code)
+	assertNoFurtherReply(t, client) // the request has an owner: no UNKNOWN_FLOW
 
 	require.Len(t, reply, 1, "the duplicate must not be queued")
 	assert.Equal(t, "first", (<-reply).TransactionID)

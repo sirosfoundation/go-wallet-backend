@@ -731,19 +731,20 @@ func (s *Session) dispatchAction(msg *FlowActionMessage) {
 // request it answers. A response without a flow_id is correlated by
 // message_id alone; one that names a flow must name the request's flow.
 func (s *Session) dispatchSignResponse(msg *SignResponseMessage) {
-	delivered := false
+	owned := false
 	s.flowsMu.RLock()
 	if p := s.outstandingRequests[msg.MessageID]; p != nil && p.sign != nil &&
 		(msg.FlowID == "" || msg.FlowID == p.flowID) {
-		// Cap 1: a duplicate reply finds it full and is dropped.
+		owned = true
+		// Cap 1: a duplicate reply finds it full and is dropped silently; the
+		// request has an owner, so UNKNOWN_FLOW (terminal) would be untrue.
 		select {
 		case p.sign <- msg:
-			delivered = true
 		default:
 		}
 	}
 	s.flowsMu.RUnlock()
-	if !delivered {
+	if !owned {
 		s.replyUnknownFlow(msg.FlowID, msg.Type)
 	}
 }
@@ -751,17 +752,17 @@ func (s *Session) dispatchSignResponse(msg *SignResponseMessage) {
 // dispatchMatchResponse is dispatchSignResponse for match_response, which must
 // always name the request's flow.
 func (s *Session) dispatchMatchResponse(msg *MatchResponseMessage) {
-	delivered := false
+	owned := false
 	s.flowsMu.RLock()
 	if p := s.outstandingRequests[msg.MessageID]; p != nil && p.match != nil && msg.FlowID == p.flowID {
+		owned = true
 		select {
 		case p.match <- msg:
-			delivered = true
 		default:
 		}
 	}
 	s.flowsMu.RUnlock()
-	if !delivered {
+	if !owned {
 		s.replyUnknownFlow(msg.FlowID, msg.Type)
 	}
 }
