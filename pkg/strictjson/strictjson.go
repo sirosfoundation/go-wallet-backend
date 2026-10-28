@@ -30,7 +30,7 @@ var ErrAmbiguous = errors.New("ambiguous JSON")
 var ProtocolMembers = []string{
 	"type", "alg", "encoding", "path", "required", "opening", "commitment",
 	"to_wallet", "to_issuer", "auxiliary_data", "auxiliary_data_supported",
-	"credential_metadata", "error",
+	"credential_metadata", "error", "c_nonce",
 	// Read by the issuer metadata resolver and the engine.
 	"credential_configurations_supported", "credential_response_encryption",
 	"credential_request_encryption", "proof_types_supported",

@@ -178,6 +178,7 @@ func TestIssueCredential_AmbiguousInvalidNonceBodyIsTerminal(t *testing.T) {
 		"case-folded duplicate":   `{"error":"invalid_nonce","ERROR":"x"}`,
 		"duplicate c_nonce":       `{"error":"invalid_nonce","c_nonce":"dup-n1","c_nonce":"dup-n2"}`,
 		"c_nonce in another case": `{"error":"invalid_nonce","c_nonce":"dup-n1","C_Nonce":"dup-n2"}`,
+		"lone C_Nonce spelling":   `{"error":"invalid_nonce","C_Nonce":"dup-n1"}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			for _, withEndpoint := range []bool{true, false} {
