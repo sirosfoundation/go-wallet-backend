@@ -590,3 +590,20 @@ func TestIssuerMetadataCache_Disabled(t *testing.T) {
 		t.Error("disabled cache must always miss")
 	}
 }
+
+func TestNewHandlers_MetadataCacheDisabledWiring(t *testing.T) {
+	for _, disabled := range []bool{false, true} {
+		cfg := &config.Config{}
+		cfg.HTTPClient.MetadataCacheDisabled = disabled
+
+		h := NewHandlers(&service.Services{}, cfg, zap.NewNop(), []string{"test"})
+		if h.metadataCache.disabled != disabled {
+			t.Errorf("NewHandlers disabled = %v, want %v", h.metadataCache.disabled, disabled)
+		}
+
+		hs := NewHandlersWithStore(&service.Services{}, nil, cfg, zap.NewNop(), []string{"test"})
+		if hs.metadataCache.disabled != disabled {
+			t.Errorf("NewHandlersWithStore disabled = %v, want %v", hs.metadataCache.disabled, disabled)
+		}
+	}
+}
