@@ -373,3 +373,22 @@ func TestMemorySessionStore_PutKeepsAnonymousSessions(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, listed, 2)
 }
+
+// Deleting an older existing session must keep the newer session's index entry.
+// Anonymous sessions both survive Put and share the (tenant, "") key, so the
+// existing-record branch of Delete is exercised.
+func TestMemorySessionStore_DeleteExistingOlderKeepsNewerIndex(t *testing.T) {
+	store := NewMemorySessionStore(zap.NewNop())
+	ctx := context.Background()
+	exp := time.Now().Add(time.Hour)
+	require.NoError(t, store.Put(ctx, &SessionData{ID: "a1", TenantID: "t", ExpiresAt: exp}))
+	require.NoError(t, store.Put(ctx, &SessionData{ID: "a2", TenantID: "t", ExpiresAt: exp}))
+
+	require.NoError(t, store.Delete(ctx, "t", "", "a1"))
+
+	_, err := store.Get(ctx, "a1")
+	assert.ErrorIs(t, err, ErrSessionNotFound)
+	got, err := store.GetByUser(ctx, "t", "")
+	require.NoError(t, err)
+	assert.Equal(t, "a2", got.ID, "the newer session's index entry must survive")
+}
