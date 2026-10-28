@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"math/rand/v2"
 	"sync"
 	"time"
@@ -65,6 +66,11 @@ type ErasureReconciler struct {
 	// run cut short never moves it past a user it did not examine.
 	runMu  sync.Mutex
 	cursor domain.UserID
+	// window is the page size actually requested (0: batch). A page the store
+	// cannot return within the run deadline halves it, so the cursor can move
+	// on a slow store instead of retrying the same oversized page forever; a
+	// page that succeeds doubles it back towards batch.
+	window int
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -166,6 +172,14 @@ func (r *ErasureReconciler) reconcile(ctx context.Context) {
 	}
 }
 
+// pageSize is the page requested from the store (see window).
+func (r *ErasureReconciler) pageSize() int {
+	if r.window > 0 && r.window < r.batch {
+		return r.window
+	}
+	return r.batch
+}
+
 func (r *ErasureReconciler) perUserTimeout() time.Duration {
 	if r.userTimeout > 0 {
 		return r.userTimeout
@@ -183,14 +197,24 @@ func (r *ErasureReconciler) RunOnce(ctx context.Context) (ReconcileStats, error)
 	defer r.runMu.Unlock()
 
 	var stats ReconcileStats
-	ids, err := r.store.WalletInstances().ListUsersWithRevokedInstances(ctx, r.cursor, r.batch)
+	page := r.pageSize()
+	list := func() ([]domain.UserID, error) {
+		ids, err := r.store.WalletInstances().ListUsersWithRevokedInstances(ctx, r.cursor, page)
+		if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) && page > 1 {
+			r.window = page / 2 // too slow for this run: ask for less next time
+		} else if err == nil && page < r.batch {
+			r.window = min(page*2, r.batch)
+		}
+		return ids, err
+	}
+	ids, err := list()
 	if err != nil {
 		return stats, err
 	}
 	if len(ids) == 0 && r.cursor != (domain.UserID{}) {
 		// The previous run ended exactly at the end of the list: wrap now.
 		r.cursor = domain.UserID{}
-		if ids, err = r.store.WalletInstances().ListUsersWithRevokedInstances(ctx, r.cursor, r.batch); err != nil {
+		if ids, err = list(); err != nil {
 			return stats, err
 		}
 	}
@@ -229,7 +253,7 @@ func (r *ErasureReconciler) RunOnce(ctx context.Context) (ReconcileStats, error)
 		stats.add(outcome)
 		r.cursor = id
 	}
-	if len(ids) < r.batch && ctx.Err() == nil {
+	if len(ids) < page && ctx.Err() == nil {
 		r.cursor = domain.UserID{} // end of the list: start over next run
 	}
 	return stats, nil

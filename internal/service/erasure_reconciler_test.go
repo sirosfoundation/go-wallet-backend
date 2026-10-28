@@ -1073,3 +1073,43 @@ func TestReconcileUserDryRun_ProbeDoesNotLoadRecordBodies(t *testing.T) {
 	require.Equal(t, ReconcileWouldErase, out)
 	assert.ElementsMatch(t, []string{leftoverCredentials, leftoverPresentations}, left)
 }
+
+// slowListStore cannot return a page larger than maxPage inside a run: it waits
+// for the run's deadline, as a store doing one lookup per owner would.
+type slowListStore struct {
+	storage.Store
+	maxPage int
+}
+
+func (s *slowListStore) WalletInstances() storage.WalletInstanceStore {
+	return &slowListInstances{s.Store.WalletInstances(), s}
+}
+
+type slowListInstances struct {
+	storage.WalletInstanceStore
+	s *slowListStore
+}
+
+func (g *slowListInstances) ListUsersWithRevokedInstances(ctx context.Context, after domain.UserID, limit int) ([]domain.UserID, error) {
+	if limit > g.s.maxPage {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return g.WalletInstanceStore.ListUsersWithRevokedInstances(ctx, after, limit)
+}
+
+// A page the store cannot return within the run deadline must not be retried
+// at the same size forever: the requested page shrinks until the cursor moves,
+// then grows back.
+func TestErasureReconciler_SlowPageShrinksSoTheCursorMoves(t *testing.T) {
+	base := memory.NewStore()
+	ids := seedRevokedUsers(t, base, 6)
+	r := reconcilerFor(&slowListStore{Store: base, maxPage: 2}, 8)
+
+	for run := 0; run < 12 && countErased(t, base, ids) < len(ids); run++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+		_, _ = r.RunOnce(ctx)
+		cancel()
+	}
+	assert.Equal(t, len(ids), countErased(t, base, ids), "the reconciler made progress despite the slow oversized page")
+}
