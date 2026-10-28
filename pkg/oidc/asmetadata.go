@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strings"
 )
 
 // Errors returned by FetchAuthorizationServerMetadata. Their messages are
@@ -23,7 +25,29 @@ var (
 	// ErrASMetadataInvalid means the response was not a JSON object, or was
 	// larger than the size limit.
 	ErrASMetadataInvalid = errors.New("authorization server metadata invalid")
+	// ErrASIdentifierInvalid means the identifier cannot name an authorization
+	// server (RFC 8414 section 2: an https URL without query or fragment; plain
+	// http is left to the client's own scheme policy, see below).
+	ErrASIdentifierInvalid = errors.New("authorization server identifier invalid")
 )
+
+// maxASRedirects bounds the redirect chain of one candidate request.
+const maxASRedirects = 5
+
+// ValidateAuthorizationServerIdentifier rejects identifiers that must never be
+// fetched: anything but an http(s) URL with a host, and any identifier with
+// userinfo, a query or a fragment. Whether plain http is acceptable is the
+// client's decision (config HTTPClientConfig.AllowsPlaintext refuses it, on
+// every redirect hop too, unless the operator allowed it).
+func ValidateAuthorizationServerIdentifier(identifier string) error {
+	u, err := url.Parse(identifier)
+	if err != nil || u.Host == "" || u.Hostname() == "" ||
+		(u.Scheme != "https" && u.Scheme != "http") ||
+		u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || strings.Contains(identifier, "#") {
+		return ErrASIdentifierInvalid
+	}
+	return nil
+}
 
 // ASMetadataStatusError reports a non-200, non-404 response from a candidate
 // URL. No further candidate is tried after it.
@@ -47,10 +71,27 @@ func (e *ASMetadataStatusError) Error() string {
 // 4.3); otherwise the document MUST NOT be used and ErrASIssuerMismatch is
 // returned without trying further candidates.
 func FetchAuthorizationServerMetadata(ctx context.Context, client *http.Client, identifier string, maxBytes int64) ([]byte, error) {
+	if err := ValidateAuthorizationServerIdentifier(identifier); err != nil {
+		return nil, err
+	}
 	urls, err := AuthorizationServerMetadataURLs(identifier)
 	if err != nil {
 		return nil, err
 	}
+	// Per-request copy (the transport, with its SSRF dial guard, is shared):
+	// every redirect hop must stay http(s), carry no userinfo, and the chain is
+	// short. The dial guard of client applies to each hop as well.
+	guarded := *client
+	guarded.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if (req.URL.Scheme != "https" && req.URL.Scheme != "http") || req.URL.Host == "" || req.URL.User != nil {
+			return errors.New("refusing redirect to a disallowed URL")
+		}
+		if len(via) >= maxASRedirects {
+			return errors.New("too many redirects")
+		}
+		return nil
+	}
+	client = &guarded
 	for _, u := range urls {
 		body, status, err := fetchASCandidate(ctx, client, u, maxBytes)
 		if err != nil {

@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
@@ -2906,6 +2907,26 @@ func TestDoTokenExchange_GuessOnlyWhenNoDocument(t *testing.T) {
 				assert.NotContains(t, *paths, "/token")
 			}
 		})
+	}
+}
+
+// The SSRF-guarded client refuses loopback/private AS identifiers on every
+// candidate: no request reaches the server and discovery is an error, not "no
+// document" (so no endpoint guessing).
+func TestFetchOAuthMetadata_GuardedClientRefusesPrivate(t *testing.T) {
+	srv, paths := newASServer(t, nil)
+	h := asTestHandler(config.HTTPClientConfig{}.NewHTTPClient(0))
+	meta, err := h.fetchOAuthMetadata(context.Background(), &IssuerMetadata{CredentialIssuer: srv.URL})
+	require.Error(t, err)
+	assert.Nil(t, meta)
+	assert.Empty(t, *paths)
+}
+
+func TestFetchOAuthMetadata_InvalidIdentifierRefused(t *testing.T) {
+	for _, id := range []string{"ftp://as.example.com", "https://u:p@as.example.com", "https://as.example.com/t#f", "https://as.example.com/t?q=1"} {
+		meta, err := asTestHandler(&http.Client{Transport: &errRoundTripper{}}).fetchOAuthMetadata(context.Background(), &IssuerMetadata{CredentialIssuer: id})
+		require.Error(t, err, id)
+		assert.Nil(t, meta)
 	}
 }
 

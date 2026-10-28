@@ -847,6 +847,8 @@ func (h *AuthZENProxyHandler) resolveAuthorizationServerMetadata(c *gin.Context,
 				zap.String("tenant_id", tenantID),
 			)
 			c.JSON(http.StatusBadGateway, gin.H{"error": "authorization server metadata issuer mismatch"})
+		case errors.Is(err, oidc.ErrASIdentifierInvalid):
+			c.JSON(http.StatusBadGateway, gin.H{"error": "invalid authorization server URL"})
 		case errors.Is(err, oidc.ErrASMetadataNotFound):
 			h.logger.Debug("authorization server metadata not found", zap.String("issuer_url", issuerURL))
 			c.JSON(http.StatusBadGateway, gin.H{"error": "authorization server returned HTTP 404"})

@@ -79,3 +79,85 @@ func TestFetchAuthorizationServerMetadata(t *testing.T) {
 		})
 	}
 }
+
+func TestValidateAuthorizationServerIdentifier(t *testing.T) {
+	for _, tt := range []struct {
+		in string
+		ok bool
+	}{
+		{"https://as.example.com", true},
+		{"https://as.example.com/tenant/1/", true},
+		{"https://as.example.com:8443/t", true},
+		{"http://localhost:8080", true}, // plain http is the client's policy
+		{"", false},
+		{"as.example.com", false},
+		{"ftp://as.example.com", false},
+		{"file:///etc/passwd", false},
+		{"javascript:alert(1)", false},
+		{"https://", false},
+		{"https:///path", false},
+		{"https://user:pw@as.example.com", false},
+		{"https://user@as.example.com", false},
+		{"https://as.example.com/t?x=1", false},
+		{"https://as.example.com/t?", false},
+		{"https://as.example.com/t#frag", false},
+		{"https://as.example.com/t#", false},
+		{"://bad", false},
+	} {
+		err := ValidateAuthorizationServerIdentifier(tt.in)
+		if (err == nil) != tt.ok {
+			t.Errorf("%q: err %v, want ok=%v", tt.in, err, tt.ok)
+		}
+	}
+}
+
+// Rejected identifiers must not cause any request.
+func TestFetchAuthorizationServerMetadata_InvalidIdentifierNoRequest(t *testing.T) {
+	hits := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits++ }))
+	defer srv.Close()
+	for _, id := range []string{"ftp://x", srv.URL + "?a=b", srv.URL + "#f", "http://u:p@" + strings.TrimPrefix(srv.URL, "http://")} {
+		if _, err := FetchAuthorizationServerMetadata(context.Background(), srv.Client(), id, 1024); !errors.Is(err, ErrASIdentifierInvalid) {
+			t.Errorf("%q: err %v", id, err)
+		}
+	}
+	if hits != 0 {
+		t.Errorf("%d requests made", hits)
+	}
+}
+
+// A redirect to a non-http(s) URL or one with userinfo is refused, and the
+// target is not requested.
+func TestFetchAuthorizationServerMetadata_RedirectGuard(t *testing.T) {
+	for _, loc := range []string{"ftp://as.example.com/x", "http://u:p@127.0.0.1:1/x", "file:///etc/passwd"} {
+		t.Run(loc, func(t *testing.T) {
+			hits := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits++
+				http.Redirect(w, r, loc, http.StatusFound)
+			}))
+			defer srv.Close()
+			if _, err := FetchAuthorizationServerMetadata(context.Background(), srv.Client(), srv.URL, 1024); err == nil {
+				t.Fatal("redirect followed")
+			}
+			if hits != 1 {
+				t.Errorf("%d requests, want 1", hits)
+			}
+		})
+	}
+	t.Run("redirect loop is bounded", func(t *testing.T) {
+		hits := 0
+		var srv *httptest.Server
+		srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			hits++
+			http.Redirect(w, r, srv.URL+"/again", http.StatusFound)
+		}))
+		defer srv.Close()
+		if _, err := FetchAuthorizationServerMetadata(context.Background(), srv.Client(), srv.URL, 1024); err == nil {
+			t.Fatal("expected error")
+		}
+		if hits > maxASRedirects+1 {
+			t.Errorf("%d requests", hits)
+		}
+	})
+}

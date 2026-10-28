@@ -2114,7 +2114,7 @@ func (h *OID4VCIHandler) fetchOAuthMetadata(ctx context.Context, metadata *Issue
 		// Do not wrap the transport error: it can carry the issuer-controlled URL.
 		var statusErr *oidc.ASMetadataStatusError
 		switch {
-		case errors.As(err, &statusErr), errors.Is(err, oidc.ErrASIssuerMismatch), errors.Is(err, oidc.ErrASMetadataInvalid):
+		case errors.As(err, &statusErr), errors.Is(err, oidc.ErrASIssuerMismatch), errors.Is(err, oidc.ErrASMetadataInvalid), errors.Is(err, oidc.ErrASIdentifierInvalid):
 			return nil, fmt.Errorf("authorization server metadata discovery failed: %w", err)
 		default:
 			return nil, errors.New("authorization server metadata discovery failed: request error")
