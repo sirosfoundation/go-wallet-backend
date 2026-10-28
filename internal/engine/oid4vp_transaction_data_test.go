@@ -552,10 +552,12 @@ func newExecuteRecorder(t *testing.T, cfg *config.Config, trustSvc *TrustService
 	})
 	t.Cleanup(cleanup)
 
+	// The flow is registered with the session: actions are routed to the
+	// registered flow's own channel.
 	r.handler = &OID4VPHandler{}
 	r.handler.BaseHandler = BaseHandler{
 		Logger: zap.NewNop(), Config: cfg, TrustSvc: trustSvc,
-		Flow: &Flow{ID: "flow-1", Session: testSession(conn), Data: map[string]interface{}{}},
+		Flow: registerTestFlow(testSession(conn), "flow-1"),
 	}
 	r.handler.httpClient = verifier.Client()
 	return r
@@ -758,7 +760,7 @@ func signRequestFor(t *testing.T, authReq *AuthorizationRequest) SignRequestMess
 			resp = &SignResponseMessage{Message: Message{MessageID: m.MessageID},
 				ResponseJWE: seg(hdr) + "." + ek + "." + seg([]byte("i")) + "." + seg([]byte("c")) + "." + seg([]byte("t"))}
 		}
-		session.signCh <- resp
+		session.dispatchSignResponse(resp)
 		require.NoError(t, <-done)
 		return m
 	case <-time.After(2 * time.Second):
@@ -954,11 +956,11 @@ func TestSession_RequestSign_ClientErrorBecomesSignError(t *testing.T) {
 				if clientConn.ReadJSON(&req) != nil {
 					return
 				}
-				session.signCh <- &SignResponseMessage{
+				session.dispatchSignResponse(&SignResponseMessage{
 					Message:   Message{Type: TypeSignResponse, MessageID: req.MessageID},
 					Error:     "secret client text",
 					ErrorCode: tc.code,
-				}
+				})
 			}()
 			_, err := session.RequestSign(context.Background(), "f", SignActionSignPresentation, SignRequestParams{})
 			var se *SignError
@@ -1093,37 +1095,56 @@ func executeWithSignReply(t *testing.T, errText string, code ErrorCode) (*execut
 	})
 	go func() {
 		req := <-r.signRequests
-		session.signCh <- &SignResponseMessage{
+		session.dispatchSignResponse(&SignResponseMessage{
 			Message:   Message{Type: TypeSignResponse, FlowID: req.FlowID, MessageID: req.MessageID},
 			Error:     errText,
 			ErrorCode: code,
-		}
+		})
 	}()
 
 	err = r.run(t, &FlowStartMessage{Protocol: ProtocolOID4VP, RequestURI: "openid4vp://?" + q.Encode(), Features: []string{FeatureTransactionDataV1}})
 	return r, err
 }
 
-// A reply delivered straight to the waiting request (the per-request channel,
-// as another request's waiter does) carries the client's refusal the same way.
-func TestSession_RequestSign_ReplyViaOwnChannelBecomesSignError(t *testing.T) {
-	srvConnCh := make(chan *websocket.Conn, 1)
-	clientConn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) { srvConnCh <- srvConn })
-	defer cleanup()
-	session := testSession(<-srvConnCh)
+// An error_code-only reply (no error text) routed by the read loop's per-request
+// dispatch (dispatchSignResponse, with and without the flow_id echoed) still
+// reaches RequestSign's signResult as a client-reported failure, and neither a
+// duplicate nor an unlisted code turns it into a success.
+func TestSession_RequestSign_ErrorCodeOnlyReplyThroughDispatchBecomesSignError(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		echoFlow bool
+		code     ErrorCode
+		wantCode ErrorCode
+	}{
+		{"allowlisted without flow_id", false, ErrCodeUnsupportedTransactionData, ErrCodeUnsupportedTransactionData},
+		{"allowlisted with flow_id", true, ErrCodeUnsupportedTransactionData, ErrCodeUnsupportedTransactionData},
+		{"unlisted code alone is a generic failure", true, "evil\ninjected", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srvConnCh := make(chan *websocket.Conn, 1)
+			clientConn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) { srvConnCh <- srvConn })
+			defer cleanup()
+			session := testSession(<-srvConnCh)
+			registerTestFlow(session, "f")
 
-	go func() {
-		var req SignRequestMessage
-		if clientConn.ReadJSON(&req) != nil {
-			return
-		}
-		session.signWaitersMu.Lock()
-		mine := session.signWaiters[req.MessageID]
-		session.signWaitersMu.Unlock()
-		mine <- &SignResponseMessage{Message: Message{MessageID: req.MessageID}, Error: "x", ErrorCode: ErrCodeUnsupportedTransactionData}
-	}()
-	_, err := session.RequestSign(context.Background(), "f", SignActionSignPresentation, SignRequestParams{})
-	var se *SignError
-	require.ErrorAs(t, err, &se)
-	assert.Equal(t, ErrCodeUnsupportedTransactionData, se.Code)
+			go func() {
+				var req SignRequestMessage
+				if clientConn.ReadJSON(&req) != nil {
+					return
+				}
+				resp := &SignResponseMessage{Message: Message{Type: TypeSignResponse, MessageID: req.MessageID}, ErrorCode: tc.code}
+				if tc.echoFlow {
+					resp.FlowID = req.FlowID
+				}
+				session.dispatchSignResponse(resp)
+				session.dispatchSignResponse(resp) // duplicate: dropped, not queued
+			}()
+			resp, err := session.RequestSign(context.Background(), "f", SignActionSignPresentation, SignRequestParams{})
+			require.Nil(t, resp)
+			var se *SignError
+			require.ErrorAs(t, err, &se)
+			assert.Equal(t, tc.wantCode, se.Code)
+		})
+	}
 }

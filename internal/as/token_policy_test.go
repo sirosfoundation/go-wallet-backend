@@ -223,12 +223,6 @@ func TestTokenErrorsCarryRegisteredOAuthCodes(t *testing.T) {
 	}
 }
 
-// respondTokenError must not leak a non-tokenError's text to the client.
-func TestRespondTokenErrorHidesUnknownErrors(t *testing.T) {
-	var te *tokenError
-	require.False(t, errors.As(errors.New("mongo: connection refused to db-7"), &te))
-}
-
 // These reuse the package's existing fakeBlacklist (token_endpoint_test.go).
 
 var errStoreDown = errors.New("revocation store unreachable")

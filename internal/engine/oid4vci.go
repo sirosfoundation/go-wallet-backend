@@ -887,6 +887,25 @@ type OAuthError struct {
 
 // parseOAuthError attempts to parse a structured OAuth error from a response body.
 // Returns the parsed error or a generic error with the status code.
+// safeErrorCode returns an OAuth error code for logging: only a short token of
+// [A-Za-z0-9_.-] qualifies, anything else is reported as "unrecognized".
+func safeErrorCode(code string) string {
+	if code == "" {
+		return ""
+	}
+	if len(code) > 64 {
+		return "unrecognized"
+	}
+	for _, r := range code {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '.', r == '-':
+		default:
+			return "unrecognized"
+		}
+	}
+	return code
+}
+
 func parseOAuthError(statusCode int, body []byte) error {
 	var oauthErr OAuthError
 	if err := json.Unmarshal(body, &oauthErr); err == nil && oauthErr.Error != "" {
@@ -1159,27 +1178,20 @@ func (h *OID4VCIHandler) issueCredential(ctx context.Context, metadata *IssuerMe
 		credential, credErr = h.requestCredential(ctx, metadata, token, selectedConfigID, selectedConfig, proofs, respEnc)
 		if credErr != nil {
 			var cNonceErr *CNonceRequiredError
-			if retries == 0 && errors.As(credErr, &cNonceErr) {
-				// Issuer signaled a nonce mismatch — get a fresh nonce and retry.
-				// Prefer Nonce Endpoint; fall back to the c_nonce from the error response.
-				if metadata.NonceEndpoint != "" {
-					if n, fetchErr := h.fetchNonce(ctx, metadata.NonceEndpoint); fetchErr == nil {
-						nonce = n
-					} else {
-						h.Logger.Debug("nonce endpoint retry failed, using error response c_nonce", zap.Error(fetchErr))
-						nonce = cNonceErr.NewNonce
-					}
-				} else {
-					nonce = cNonceErr.NewNonce
-				}
-				h.Logger.Debug("c_nonce refreshed, re-requesting proofs")
-				continue
-			}
-			// On the second attempt or for non-c_nonce errors, surface the error.
-			// For CNonceRequiredError on the final retry, send the flow error here
-			// and unwrap the underlying credential error so the caller receives a
-			// meaningful issuer error message (e.g. "invalid_nonce: ...").
 			if errors.As(credErr, &cNonceErr) {
+				// Issuer signaled a nonce mismatch. Retry ONCE with a fresh nonce
+				// (new nonce => new key proofs via generate_proof); never loop.
+				if retries == 0 {
+					if fresh, ok := h.freshNonceForRetry(ctx, metadata, cNonceErr); ok {
+						nonce = fresh
+						h.Logger.Debug("nonce refreshed, re-requesting proofs")
+						continue
+					}
+					h.Logger.Debug("issuer reported an invalid nonce but no fresh nonce is obtainable")
+				}
+				// No retry possible (second attempt, or no fresh nonce): send the
+				// flow error here and unwrap the underlying credential error so
+				// the caller receives the issuer's message (e.g. "invalid_nonce").
 				_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 				return cNonceErr.Err
 			}
@@ -2065,14 +2077,13 @@ func (h *OID4VCIHandler) fetchOAuthMetadata(ctx context.Context, metadata *Issue
 		authServer = metadata.CredentialIssuer
 	}
 
-	// RFC 8414 §2: the issuer identifier MUST NOT include a trailing '/'
-	authServer = strings.TrimRight(authServer, "/")
-
-	// RFC 8615 well-known URI construction for OAuth AS metadata
-	oauthMetadataURL, err := oidc.WellKnownURL(authServer, "oauth-authorization-server")
+	// Well-known URL construction for OAuth AS metadata: RFC 8414 section 3.1
+	// removes the terminating "/" (the builder does it; no separate trim).
+	oauthMetadataURLs, err := oidc.AuthorizationServerMetadataURLs(authServer)
 	if err != nil {
 		return nil
 	}
+	oauthMetadataURL := oauthMetadataURLs[0]
 	req, err := http.NewRequestWithContext(ctx, "GET", oauthMetadataURL, nil)
 	if err != nil {
 		return nil
@@ -2456,16 +2467,39 @@ func (h *OID4VCIHandler) resumeWithAuthCode(ctx context.Context, msg *FlowStartM
 }
 
 // CNonceRequiredError is returned by requestCredential when the credential
-// endpoint responds with an error that includes a refreshed c_nonce. The
-// engine should re-request all proofs from the frontend using the new nonce
-// and retry the credential request.
+// endpoint reports an invalid nonce: error "invalid_nonce" (OpenID4VCI 1.0
+// section 8.3.1.2, whose error response carries no c_nonce) or, for older
+// issuers, any error body that includes a refreshed c_nonce. The engine
+// should re-request all proofs from the frontend using a fresh nonce and
+// retry the credential request once.
 type CNonceRequiredError struct {
+	// NewNonce is the c_nonce from the error body; empty for a spec-conformant
+	// invalid_nonce response (the fresh nonce then comes from the Nonce Endpoint).
 	NewNonce string
 	Err      error
 }
 
 func (e *CNonceRequiredError) Error() string { return e.Err.Error() }
 func (e *CNonceRequiredError) Unwrap() error { return e.Err }
+
+// freshNonceForRetry returns the nonce to use for the single retry after an
+// invalid-nonce error. The Nonce Endpoint (section 7) is preferred; the
+// c_nonce from the error body is used only when the endpoint is not
+// advertised or fails (older/draft issuers). ok is false when neither
+// yields a nonce, in which case the error is terminal.
+func (h *OID4VCIHandler) freshNonceForRetry(ctx context.Context, metadata *IssuerMetadata, e *CNonceRequiredError) (string, bool) {
+	if metadata.NonceEndpoint != "" {
+		n, err := h.fetchNonce(ctx, metadata.NonceEndpoint)
+		if err == nil {
+			return n, true
+		}
+		h.Logger.Debug("nonce endpoint retry failed", zap.Error(err))
+	}
+	if e.NewNonce != "" {
+		return e.NewNonce, true
+	}
+	return "", false
+}
 
 func (h *OID4VCIHandler) needsProof(config *CredentialConfig) bool {
 	return len(config.ProofTypesSupported) > 0
@@ -2817,7 +2851,14 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 			_ = resp.Body.Close()
-			h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+			var errResp struct {
+				Error  string `json:"error"`
+				CNonce string `json:"c_nonce"`
+			}
+			parsedErr := json.Unmarshal(body, &errResp) == nil
+			// Only the error code is logged, never the body or error_description:
+			// they are issuer-controlled free text and legacy ones carry a nonce.
+			h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode), zap.String("error", safeErrorCode(errResp.Error)))
 
 			// A holder commitment conflict is a final, user-actionable outcome:
 			// relay it as its own flow error code (never retried).
@@ -2825,13 +2866,12 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 				return nil, conflictErr
 			}
 
-			// Check whether the error response contains a refreshed c_nonce so the
-			// caller can re-request proofs and retry. Do NOT send a flow error here —
-			// that is the caller's responsibility when no retry is possible.
-			var errResp struct {
-				CNonce string `json:"c_nonce"`
-			}
-			if json.Unmarshal(body, &errResp) == nil && errResp.CNonce != "" {
+			// An invalid_nonce error (no c_nonce in the body per OpenID4VCI 1.0
+			// section 8.3.1.2) or any error carrying a refreshed c_nonce (older
+			// issuers) lets the caller re-request proofs and retry once. Do NOT
+			// send a flow error here: that is the caller's responsibility when
+			// no retry is possible.
+			if parsedErr && (errResp.Error == "invalid_nonce" || errResp.CNonce != "") {
 				return nil, &CNonceRequiredError{
 					NewNonce: errResp.CNonce,
 					Err:      parseOAuthError(resp.StatusCode, body),
