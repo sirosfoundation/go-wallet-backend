@@ -2,6 +2,7 @@ package as
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -33,12 +34,23 @@ func refuseRevocationUnavailable(c *gin.Context, logger *zap.Logger, err error) 
 	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "revocation check unavailable"})
 }
 
-// sessionOwnerRevoked reports whether the session's user has been revoked
-// (account deletion revokes the user before the sessions are purged, so an
-// interrupted or unacknowledged deletion can leave a live session whose owner
-// is already revoked). When it returns true a response has been written and
-// the caller must stop: 401 for a revoked owner, 503 when the revocation
-// store cannot say. Without a wired blacklist there is nothing to check.
+// respondRevocation answers a failed revocation check and is the only caller
+// that has to tell the two kinds of failure apart: a refusal, which is a
+// *tokenError, or a store that could not answer, which is anything else.
+func respondRevocation(c *gin.Context, deps *tokenDeps, err error) {
+	var te *tokenError
+	if errors.As(err, &te) {
+		respondTokenError(c, te)
+		return
+	}
+	refuseRevocationUnavailable(c, deps.logger, err)
+}
+
+// sessionOwnerRevoked returns the refusal when the session's user has been
+// revoked, or nil when a token may still be issued. Account deletion revokes
+// the user before the sessions are purged, so an interrupted or
+// unacknowledged deletion can leave a live session whose owner is already
+// revoked.
 //
 // deletionOnly names the one token a revoked owner may still obtain: exactly
 // the deletion permission, which is all DELETE /user/session needs and the
@@ -46,20 +58,18 @@ func refuseRevocationUnavailable(c *gin.Context, logger *zap.Logger, err error) 
 // interrupted deletion be completed after the previous access token expired,
 // while every other token (including any anonymous one, whose missing "sub"
 // would bypass the user revocation) stays refused.
-func sessionOwnerRevoked(c *gin.Context, deps *tokenDeps, session *Session, deletionOnly bool, tac TAC) bool {
-	revoked, err := deps.blacklist.IsUserRevoked(c.Request.Context(), session.UserID)
+func sessionOwnerRevoked(ctx context.Context, bl TokenBlacklistChecker, session *Session, deletionOnly bool, tac TAC) error {
+	revoked, err := bl.IsUserRevoked(ctx, session.UserID)
 	if err != nil {
-		refuseRevocationUnavailable(c, deps.logger, err)
-		return true
+		return err
 	}
 	if !revoked {
-		return false
+		return nil
 	}
 	if deletionOnly && tac == TAC(string(TACDelete)) {
-		return false
+		return nil
 	}
-	respondTokenError(c, errInvalidSession)
-	return true
+	return errInvalidSession
 }
 
 // tokenDeps groups the shared dependencies for token issuance handlers.
@@ -188,7 +198,8 @@ func handleSessionTokenRequest(
 
 	// After the policy, because the deletion-only exemption needs the
 	// resolved TAC.
-	if sessionOwnerRevoked(c, deps, session, true, tac) {
+	if err := sessionOwnerRevoked(c.Request.Context(), deps.blacklist, session, true, tac); err != nil {
+		respondRevocation(c, deps, err)
 		return
 	}
 
@@ -225,7 +236,8 @@ func handleAnonymousTokenRequest(
 	}
 	// Before the policy, and with no TAC: a revoked owner gets no anonymous
 	// token at all, since a missing "sub" would bypass the user revocation.
-	if sessionOwnerRevoked(c, deps, session, false, "") {
+	if err := sessionOwnerRevoked(c.Request.Context(), deps.blacklist, session, false, ""); err != nil {
+		respondRevocation(c, deps, err)
 		return
 	}
 
@@ -265,7 +277,8 @@ func handleDelegationTokenRequest(
 		return
 	}
 
-	if parentTokenRevoked(c, deps, parentClaims) {
+	if err := parentTokenRevoked(c.Request.Context(), deps.blacklist, parentClaims); err != nil {
+		respondRevocation(c, deps, err)
 		return
 	}
 
@@ -278,9 +291,8 @@ func handleDelegationTokenRequest(
 	issueToken(c, deps, parentClaims.Subject, req.Audience, tenantID, tac, parentClaims.ACR)
 }
 
-// parentTokenRevoked reports whether the delegating token may no longer be
-// exchanged. When it returns true a response has been written and the caller
-// must stop: 401 for a revocation, 503 when the store cannot say.
+// parentTokenRevoked returns the refusal when the delegating token may no
+// longer be exchanged, or nil when it may.
 //
 // A revoked parent must not be usable to mint a fresh, differently-jti'd
 // token - otherwise logout/account deletion (#382/#383) would not actually
@@ -289,29 +301,24 @@ func handleDelegationTokenRequest(
 // deletion - see service.TokenBlacklist.RevokeUser) are checked: checking jti
 // alone missed a different, not-yet-blacklisted delegation-capable token for
 // the same deleted user still being exchangeable here (#391 review).
-func parentTokenRevoked(c *gin.Context, deps *tokenDeps, parent *AccessTokenClaims) bool {
-	ctx := c.Request.Context()
+func parentTokenRevoked(ctx context.Context, bl TokenBlacklistChecker, parent *AccessTokenClaims) error {
 	if parent.ID != "" {
-		jtiRevoked, err := deps.blacklist.IsBlacklisted(ctx, parent.ID)
+		jtiRevoked, err := bl.IsBlacklisted(ctx, parent.ID)
 		if err != nil {
-			refuseRevocationUnavailable(c, deps.logger, err)
-			return true
+			return err
 		}
 		if jtiRevoked {
-			respondTokenError(c, errParentRevoked)
-			return true
+			return errParentRevoked
 		}
 	}
-	userRevoked, err := deps.blacklist.IsUserRevoked(ctx, parent.Subject)
+	userRevoked, err := bl.IsUserRevoked(ctx, parent.Subject)
 	if err != nil {
-		refuseRevocationUnavailable(c, deps.logger, err)
-		return true
+		return err
 	}
 	if userRevoked {
-		respondTokenError(c, errParentUserGone)
-		return true
+		return errParentUserGone
 	}
-	return false
+	return nil
 }
 
 // issueToken is the common path for both session and delegation flows.

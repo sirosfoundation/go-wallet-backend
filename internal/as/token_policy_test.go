@@ -1,6 +1,7 @@
 package as
 
 import (
+	"context"
 	"errors"
 	"testing"
 
@@ -226,4 +227,134 @@ func TestTokenErrorsCarryRegisteredOAuthCodes(t *testing.T) {
 func TestRespondTokenErrorHidesUnknownErrors(t *testing.T) {
 	var te *tokenError
 	require.False(t, errors.As(errors.New("mongo: connection refused to db-7"), &te))
+}
+
+// These reuse the package's existing fakeBlacklist (token_endpoint_test.go).
+
+var errStoreDown = errors.New("revocation store unreachable")
+
+func TestSessionOwnerRevoked(t *testing.T) {
+	session := &Session{UserID: "user-1"}
+	for _, tc := range []struct {
+		name         string
+		bl           *fakeBlacklist
+		deletionOnly bool
+		tac          TAC
+		wantErr      error
+	}{
+		{
+			name: "a live owner may have a token",
+			bl:   &fakeBlacklist{},
+		},
+		{
+			name:    "a revoked owner may not",
+			bl:      &fakeBlacklist{revokedUsers: map[string]bool{"user-1": true}},
+			wantErr: errInvalidSession,
+		},
+		{
+			name:         "except exactly the deletion permission",
+			bl:           &fakeBlacklist{revokedUsers: map[string]bool{"user-1": true}},
+			deletionOnly: true,
+			tac:          TAC(string(TACDelete)),
+		},
+		{
+			// The exemption is for DELETE /user/session alone, not for any
+			// token that merely includes "d".
+			name:         "not a wider TAC that happens to include d",
+			bl:           &fakeBlacklist{revokedUsers: map[string]bool{"user-1": true}},
+			deletionOnly: true,
+			tac:          TAC("rd"),
+			wantErr:      errInvalidSession,
+		},
+		{
+			name:         "and not on a path that does not allow it",
+			bl:           &fakeBlacklist{revokedUsers: map[string]bool{"user-1": true}},
+			deletionOnly: false,
+			tac:          TAC(string(TACDelete)),
+			wantErr:      errInvalidSession,
+		},
+		{
+			name:    "a store that cannot answer is not an allow",
+			bl:      &fakeBlacklist{userErr: errStoreDown},
+			wantErr: errStoreDown,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := sessionOwnerRevoked(context.Background(), tc.bl, session, tc.deletionOnly, tc.tac)
+			if tc.wantErr == nil {
+				assert.NoError(t, err)
+				return
+			}
+			assert.ErrorIs(t, err, tc.wantErr)
+		})
+	}
+}
+
+func TestParentTokenRevoked(t *testing.T) {
+	parent := func(jti string) *AccessTokenClaims {
+		return &AccessTokenClaims{Claims: jwt.Claims{ID: jti, Subject: "user-1"}}
+	}
+	for _, tc := range []struct {
+		name    string
+		parent  *AccessTokenClaims
+		bl      *fakeBlacklist
+		wantErr error
+	}{
+		{
+			name:   "a live parent may be exchanged",
+			parent: parent("jti-1"),
+			bl:     &fakeBlacklist{},
+		},
+		{
+			name:    "a revoked jti may not",
+			parent:  parent("jti-1"),
+			bl:      &fakeBlacklist{revoked: map[string]bool{"jti-1": true}},
+			wantErr: errParentRevoked,
+		},
+		{
+			// #391: a different, never-blacklisted token of a deleted user
+			// was still exchangeable when only the jti was checked.
+			name:    "a revoked user may not, even with a clean jti",
+			parent:  parent("jti-1"),
+			bl:      &fakeBlacklist{revokedUsers: map[string]bool{"user-1": true}},
+			wantErr: errParentUserGone,
+		},
+		{
+			name:    "an unreadable jti check is not an allow",
+			parent:  parent("jti-1"),
+			bl:      &fakeBlacklist{jtiErr: errStoreDown},
+			wantErr: errStoreDown,
+		},
+		{
+			name:    "an unreadable user check is not an allow either",
+			parent:  parent("jti-1"),
+			bl:      &fakeBlacklist{userErr: errStoreDown},
+			wantErr: errStoreDown,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := parentTokenRevoked(context.Background(), tc.bl, tc.parent)
+			if tc.wantErr == nil {
+				assert.NoError(t, err)
+				return
+			}
+			assert.ErrorIs(t, err, tc.wantErr)
+		})
+	}
+}
+
+// A parent with no jti skips that check, but must still be checked by user:
+// the skip is the one implicit path in parentTokenRevoked, so pin it.
+func TestParentTokenRevoked_NoJTISkipsThatCheckOnly(t *testing.T) {
+	// jtiErr would surface if the jti check ran at all, so reaching the
+	// user refusal proves the empty jti was skipped and nothing else was.
+	bl := &fakeBlacklist{
+		jtiErr:       errStoreDown,
+		revokedUsers: map[string]bool{"user-1": true},
+	}
+	err := parentTokenRevoked(context.Background(), bl, &AccessTokenClaims{
+		Claims: jwt.Claims{Subject: "user-1"},
+	})
+	assert.ErrorIs(t, err, errParentUserGone, "the user check still runs")
+	assert.NotErrorIs(t, err, errStoreDown, "an empty jti must not be looked up")
 }
