@@ -180,3 +180,14 @@ type noopBlacklist struct{}
 func (noopBlacklist) IsBlacklisted(context.Context, string) (bool, error) { return false, nil }
 func (noopBlacklist) IsUserRevoked(context.Context, string) (bool, error) { return false, nil }
 func (noopBlacklist) Add(context.Context, string, time.Time) error        { return nil }
+
+// blacklistOrNoop keeps a wired blacklist non-nil, so no caller has to branch
+// on it. It is the one place the unconfigured default is decided: should that
+// become "fail closed" rather than "not revoked", it changes here instead of
+// at every call site.
+func blacklistOrNoop(b TokenBlacklistChecker) TokenBlacklistChecker {
+	if b == nil {
+		return noopBlacklist{}
+	}
+	return b
+}

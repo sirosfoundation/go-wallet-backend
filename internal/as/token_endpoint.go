@@ -117,17 +117,12 @@ type TokenEndpointConfig struct {
 func TokenEndpointHandler(cfg TokenEndpointConfig) gin.HandlerFunc {
 	opts := CookieOptions{Insecure: cfg.InsecureCookies}
 	store := cfg.Store
-	blacklist := cfg.Blacklist
-	if blacklist == nil {
-		// Kept non-nil so no handler has to branch on it; see noopBlacklist.
-		blacklist = noopBlacklist{}
-	}
 	deps := &tokenDeps{
 		issuer:    cfg.Issuer,
 		policy:    cfg.Policy,
 		ttlFunc:   cfg.TTLFunc,
 		audiences: cfg.Audiences,
-		blacklist: blacklist,
+		blacklist: blacklistOrNoop(cfg.Blacklist),
 		logger:    cfg.Logger,
 	}
 	return func(c *gin.Context) {
