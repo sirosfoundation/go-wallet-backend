@@ -116,7 +116,7 @@ func runProofs(t *testing.T, cfg *CredentialConfig, jwt string) (SignRequestPara
 		}
 		var m SignResponseMessage
 		if json.Unmarshal(data, &m) == nil {
-			session.signCh <- &m
+			session.dispatchSignResponse(&m)
 		}
 	}()
 	h := &OID4VCIHandler{}

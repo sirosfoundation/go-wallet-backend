@@ -772,8 +772,8 @@ Server → Client:
 
 Any client message that references a `flow_id` the session does not know -
 `flow_action` (including `decline`), and `sign_response` / `match_response`
-that carry a `flow_id` and do not answer a request the session still has
-outstanding - is answered with exactly one `flow_error`, never
+that carry a `flow_id` naming no flow on this session and do not answer a
+request the session still has outstanding - is answered with exactly one `flow_error`, never
 silently dropped:
 
 ```
@@ -797,7 +797,9 @@ Properties: the lookup is scoped to the current session, so a flow owned by
 another session or user produces the identical reply as a flow that never
 existed (no probing). Replies are rate-limited per session (burst 10, then
 about 2/s); beyond that, messages for unknown flows are dropped without a
-reply. A `sign_response` answering an outstanding `sign_request` is always delivered,
+reply. A late `sign_response` / `match_response` (its request already timed out or was
+cancelled) naming a flow that is still live is dropped silently: UNKNOWN_FLOW
+is terminal and the flow is not dead. A `sign_response` answering an outstanding `sign_request` is always delivered,
 even if the requesting flow has completed (client-held DPoP signing after
 issuance relies on this). A `sign_response` without a `flow_id` is correlated
 by `message_id` only. A `match_response` MUST carry both the `flow_id` and the

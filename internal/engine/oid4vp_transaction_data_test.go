@@ -753,7 +753,7 @@ func signRequestFor(t *testing.T, authReq *AuthorizationRequest) SignRequestMess
 			resp = &SignResponseMessage{Message: Message{MessageID: m.MessageID},
 				ResponseJWE: seg(hdr) + "." + ek + "." + seg([]byte("i")) + "." + seg([]byte("c")) + "." + seg([]byte("t"))}
 		}
-		session.signCh <- resp
+		session.dispatchSignResponse(resp)
 		require.NoError(t, <-done)
 		return m
 	case <-time.After(2 * time.Second):

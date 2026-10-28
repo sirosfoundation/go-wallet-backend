@@ -277,7 +277,7 @@ func (f *blindFixture) answer(t *testing.T, reply func(params map[string]any) *S
 				resp.Type = TypeSignResponse
 				resp.FlowID = f.h.Flow.ID
 				resp.MessageID, _ = msg["message_id"].(string)
-				f.session.signCh <- resp
+				f.session.dispatchSignResponse(resp)
 				return
 			case <-deadline:
 				return
