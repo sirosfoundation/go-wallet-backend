@@ -1869,8 +1869,17 @@ func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *Cr
 		})
 	}
 
-	if len(available) == 0 && refusal != nil {
-		return "", nil, h.failConfigRefusal(refusal)
+	if len(available) == 0 {
+		if refusal != nil {
+			return "", nil, h.failConfigRefusal(refusal)
+		}
+		// Nothing the wallet can use is left (a configuration with a malformed
+		// advertisement is dropped when the metadata is decoded): waiting for a
+		// selection could never succeed.
+		err := errors.New("the offer names no credential configuration this wallet can use")
+		h.Logger.Warn("no usable credential configuration in the offer")
+		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "No usable credential configuration in the offer")
+		return "", nil, fmt.Errorf("%w: %w", err, errFlowReported)
 	}
 
 	// If only one credential, auto-select

@@ -1064,3 +1064,21 @@ func TestAdvertisement_RepeatedMemberIsReadNormally(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(`{"c":{"format":"x","format":"y","auxiliary_data_supported":{"to_wallet":[`+auxToWalletSSC+`]}}}`), &ccs))
 	assert.Contains(t, ccs, "c")
 }
+
+// An offer whose only configuration was dropped for a malformed advertisement
+// (it is removed when the metadata is decoded) ends at once with a terminal
+// flow error; the engine does not wait for a selection that cannot come.
+func TestAwaitCredentialSelection_NothingUsableFailsAtOnce(t *testing.T) {
+	var md IssuerMetadata
+	require.NoError(t, json.Unmarshal([]byte(`{"credential_configurations_supported":{"bad":{"format":"mso_mdoc","auxiliary_data_supported":{"to_wallet":[]}}}}`), &md))
+	require.NotContains(t, md.CredentialConfigurationsSupported, "bad")
+	offer := &CredentialOffer{CredentialConfigurationIDs: []string{"bad"}}
+	h, ch, cleanup := captureHandler(t)
+	defer cleanup()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _, err := h.awaitCredentialSelection(ctx, offer, &md)
+	require.Error(t, err)
+	require.NoError(t, ctx.Err(), "no wait for a selection")
+	assert.Equal(t, ErrCodeCredentialError, flowErrorCode(t, nextMsg(t, ch)))
+}
