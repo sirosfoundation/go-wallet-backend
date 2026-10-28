@@ -273,6 +273,7 @@ Environment prefix: `WALLET_SECURITY`
 | `security.challenge_cleanup.interval_seconds` | `WALLET_SECURITY_CHALLENGE_CLEANUP_INTERVAL_SECONDS` | integer | IntervalSeconds is how often to run cleanup (in seconds) Default: 300 (5 minutes) |
 | `security.token_blacklist.enabled` | `WALLET_SECURITY_TOKEN_BLACKLIST_ENABLED` | boolean | Enabled controls whether token blacklist checking is active |
 | `security.token_blacklist.cleanup_interval_seconds` | `WALLET_SECURITY_TOKEN_BLACKLIST_CLEANUP_INTERVAL_SECONDS` | integer | CleanupIntervalSeconds is how often to clean up expired blacklist entries Default: 3600 (1 hour) |
+| `security.token_blacklist.backend` | `WALLET_SECURITY_TOKEN_BLACKLIST_BACKEND` | string | Backend selects where revoked access-token jtis and revoked users are kept: "memory" (per process; lost on restart, not seen by other replicas) or "storage" (the MongoDB storage backend; shared by all replicas and survives restarts). Empty means "storage" when storage.type is mongodb and "memory" otherwise. |
 | `security.webauthn.attestation_conveyance` | `WALLET_SECURITY_WEBAUTHN_ATTESTATION_CONVEYANCE` | string | AttestationConveyance controls how the RP requests attestation from authenticators. Valid values: "none", "indirect", "direct", "enterprise" Default: "none" (recommended for most deployments - avoids certificate validation issues) Use "direct" only if you need to verify authenticator makes/models. |
 
 ## http_client

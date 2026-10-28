@@ -56,6 +56,7 @@ type AuthProvider struct {
 var newServices = service.NewServices
 
 func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logger, roles []string) *AuthProvider {
+	warnProcessLocalState(cfg, logger, true)
 	services := newServices(store, cfg, logger)
 	services.Start()
 	handlers := api.NewHandlers(services, cfg, logger, roles)
@@ -458,9 +459,14 @@ func (v StandaloneValidator) Close() error { v.Stop(); return nil }
 // provider (--mode=engine). The JWKS comes from as.external_url; without it every connection would be
 // rejected, so it returns an error and startup fails.
 //
-// A standalone engine has no revocation source (shared blacklist tracked in #407 and #415): a token
-// stays valid until it expires, even after logout or user revocation. A warning is logged.
-func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (*StandaloneValidator, error) {
+// blacklist is the shared revocation store (see NewSharedBlacklist) when the
+// configuration selects it: the validator then checks every token's jti against
+// it, so a logged-out token (anonymous ones included) cannot open a connection.
+// User-level revocation is checked by the engine itself (see
+// EngineProvider.SetTokenBlacklist). With a nil blacklist a standalone engine
+// has no revocation source: a token stays valid until it expires, even after
+// logout or user revocation. A warning is logged.
+func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger, blacklist *service.TokenBlacklist) (*StandaloneValidator, error) {
 	if cfg.AS.ExternalURL == "" {
 		return nil, fmt.Errorf("standalone engine needs as.external_url to fetch the AS JWKS; refusing to start with no way to authenticate connections (legacy HMAC tokens no longer exist)")
 	}
@@ -472,14 +478,20 @@ func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (
 	if err != nil {
 		return nil, err
 	}
-	v := tokenvalidator.New(tokenvalidator.Config{
+	vcfg := tokenvalidator.Config{
 		JWKSURL:   jwksURL,
 		Issuer:    issuer,
 		Audiences: cfg.SessionAudiences(),
-	})
+	}
+	if blacklist != nil {
+		vcfg.Revocation = blacklistRevocationChecker{blacklist: blacklist, logger: logger}
+	}
+	v := tokenvalidator.New(vcfg)
 	v.Start(context.Background())
-	logger.Warn("Standalone engine has no token revocation source: AS session tokens stay valid at this engine until they expire, even after logout or user revocation. Mitigate with short access token TTLs, or co-host the engine with the backend (shared blacklist).",
-		zap.String("jwks_source", "as.external_url"))
+	if blacklist == nil {
+		logger.Warn("Standalone engine has no token revocation source: AS session tokens stay valid at this engine until they expire, even after logout or user revocation. Mitigate with short access token TTLs, use the shared MongoDB revocation store, or co-host the engine with the backend.",
+			zap.String("jwks_source", "as.external_url"))
+	}
 	logger.Info("Standalone engine token validator started")
 	return &StandaloneValidator{Validator: v}, nil
 }
@@ -531,11 +543,24 @@ func (p *EngineProvider) CheckReady(ctx context.Context) error {
 // (IsRevoked vs IsBlacklisted), so Logout/DeleteUser revocation applies to AS-issued tokens.
 type blacklistRevocationChecker struct {
 	blacklist *service.TokenBlacklist
+	logger    *zap.Logger // optional
 }
 
-// IsRevoked implements revocation.Checker.
+// IsRevoked implements revocation.Checker. The interface has no error
+// return, so a store failure is reported as "revoked": the Validator then
+// rejects the token (401) rather than accepting it unchecked.
 func (c blacklistRevocationChecker) IsRevoked(ctx context.Context, jti string) bool {
-	return c.blacklist.IsBlacklisted(ctx, jti)
+	revoked, err := c.blacklist.IsBlacklisted(ctx, jti)
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Error("Revocation check failed; rejecting token", zap.Error(err))
+		}
+		return true
+	}
+	// A logout call may present a token whose jti is already revoked, to
+	// complete a logout that was interrupted (see middleware.IsLogout). Only
+	// a definite "revoked" answer is relaxed; a store error still rejects.
+	return revoked && !middleware.IsLogoutCompletion(ctx)
 }
 
 // =============================================================================
@@ -682,7 +707,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 			Issuer:    issuer,
 			Audiences: cfg.AS.Audiences,
 			// Same blacklist as the rest of the process: the Validator has its own validation path that would not consult it.
-			Revocation: blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist},
+			Revocation: blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist, logger: logger},
 		})
 		tv.Start(context.Background())
 		logger.Info("Authorization Server module initialized",
@@ -796,7 +821,17 @@ func (p *BackendProvider) CheckReady(ctx context.Context) error {
 	// Use a short timeout for readiness checks
 	checkCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
-	return p.store.Ping(checkCtx)
+	if err := p.store.Ping(checkCtx); err != nil {
+		return err
+	}
+	// A revocation store that failed to initialize refuses every
+	// authenticated request until restart; do not report ready meanwhile.
+	if p.auth != nil && p.auth.services != nil {
+		if err := p.auth.services.TokenBlacklist.Ready(); err != nil {
+			return fmt.Errorf("token revocation store unavailable: %w", err)
+		}
+	}
+	return nil
 }
 
 // Store returns the underlying storage backend
@@ -1181,6 +1216,7 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 		return nil, fmt.Errorf("create backend: %w", err)
 	}
 
+	warnProcessLocalState(cfg, logger, false)
 	services := newServices(store, cfg, logger)
 	// HasSigningKey (not IsSupported): a cert-less signing key is a valid
 	// standalone deployment when only "ietf"-mode WIA is needed. Key
@@ -1220,7 +1256,7 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 		Audiences: cfg.SessionAudiences(),
 		// Same wiring as NewBackendProvider; this provider's own TokenBlacklist is used as-is (it is never
 		// co-hosted with BackendProvider).
-		Revocation: blacklistRevocationChecker{blacklist: services.TokenBlacklist},
+		Revocation: blacklistRevocationChecker{blacklist: services.TokenBlacklist, logger: logger},
 	})
 	tv.Start(context.Background())
 
@@ -1237,6 +1273,20 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 
 func (p *WalletProviderProvider) Transport() Transport { return TransportWalletProvider }
 func (p *WalletProviderProvider) Name() string         { return "wallet-provider" }
+
+// CheckReady implements health.ReadinessChecker for WalletProviderProvider.
+// A revocation store that failed to initialize refuses every authenticated
+// request until restart, so the isolated wallet-provider must not report
+// ready meanwhile.
+func (p *WalletProviderProvider) CheckReady(_ context.Context) error {
+	if p.services == nil {
+		return nil
+	}
+	if err := p.services.TokenBlacklist.Ready(); err != nil {
+		return fmt.Errorf("token revocation store unavailable: %w", err)
+	}
+	return nil
+}
 
 // authMiddleware returns the auth middleware for the wallet-provider routes. This provider never runs
 // co-hosted with BackendProvider, so its own Services.TokenBlacklist is used as-is.
