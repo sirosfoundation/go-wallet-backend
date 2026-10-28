@@ -458,49 +458,6 @@ func (e erroringSessionCleaner) DeleteByUser(_ context.Context, _ string) error 
 	return e.err
 }
 
-// erroringTokenRevoker always fails, to exercise DeleteUser's best-effort
-// error handling around the token revoker. The production *TokenBlacklist
-// implementation's own RevokeUser never actually returns a non-nil error
-// today (see TokenRevoker's doc comment), so this fake is the only way to
-// reach that branch at all.
-type erroringTokenRevoker struct{ err error }
-
-func (e erroringTokenRevoker) RevokeUser(_ context.Context, _ string) error {
-	return e.err
-}
-
-// TestUserService_DeleteUser_ContinuesWhenTokenRevokerErrors proves that a
-// failing TokenRevoker (best effort, logged) never aborts DeleteUser. A failing
-// SessionCleaner is different: see
-// TestUserService_DeleteUser_FailsClosedWhenSessionCleanerErrors.
-func TestUserService_DeleteUser_ContinuesWhenTokenRevokerErrors(t *testing.T) {
-	ctx := t.Context()
-	store := memory.NewStore()
-	cfg := testConfig()
-	logger := testLogger()
-	svc := NewUserService(store, cfg, logger)
-	svc.SetTokenBlacklist(erroringTokenRevoker{err: errors.New("revoke boom")})
-
-	username := "revoker-error-user"
-	req := &domain.RegisterRequest{
-		Username:    &username,
-		DisplayName: "Revoker Error User",
-		WalletType:  domain.WalletTypeDB,
-	}
-	user, err := svc.Register(ctx, req)
-	if err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
-
-	if err := svc.DeleteUser(ctx, user.UUID, user.DID); err != nil {
-		t.Fatalf("DeleteUser() should not fail when the token revoker errors, got: %v", err)
-	}
-
-	if _, err := store.Users().GetByID(ctx, user.UUID); err == nil {
-		t.Error("user should still have been deleted despite the token revoker error")
-	}
-}
-
 // A session that cannot be dropped keeps the user record, so the deletion can be
 // repeated (SID-AUTH-06).
 func TestUserService_DeleteUser_FailsClosedWhenSessionCleanerErrors(t *testing.T) {
@@ -510,15 +467,10 @@ func TestUserService_DeleteUser_FailsClosedWhenSessionCleanerErrors(t *testing.T
 	svc.SetSessionCleaner(erroringSessionCleaner{err: errors.New("session cleanup boom")})
 
 	username := "cleaner-error-user"
-	user, err := svc.Register(ctx, &domain.RegisterRequest{
-		Username:    &username,
-		DisplayName: "Cleaner Error User",
-		WalletType:  domain.WalletTypeDB,
-	})
+	user, err := svc.Register(ctx, &domain.RegisterRequest{Username: &username, DisplayName: "u", WalletType: domain.WalletTypeDB})
 	if err != nil {
 		t.Fatalf("Register() error = %v", err)
 	}
-
 	if err := svc.DeleteUser(ctx, user.UUID, user.DID); err == nil {
 		t.Fatal("DeleteUser() must report the session cleanup failure")
 	}
@@ -526,6 +478,55 @@ func TestUserService_DeleteUser_FailsClosedWhenSessionCleanerErrors(t *testing.T
 		t.Errorf("the user record must be kept so the deletion can be retried, got %v", err)
 	}
 }
+
+// TestUserService_DeleteUser_RevocationFailureFailsClosed proves a failed
+// token revocation aborts the deletion: the user stays, so the request can
+// be retried, rather than leaving a deleted user's tokens valid.
+func TestUserService_DeleteUser_RevocationFailureFailsClosed(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	svc := NewUserService(store, testConfig(), testLogger())
+	revoker := &flakyTokenRevoker{err: errors.New("revoke boom")}
+	svc.SetTokenBlacklist(revoker)
+
+	username := "revoke-fails-user"
+	user, err := svc.Register(ctx, &domain.RegisterRequest{Username: &username, DisplayName: "u", WalletType: domain.WalletTypeDB})
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	if err := store.UserTenants().AddMembership(ctx, &domain.UserTenantMembership{UserID: user.UUID, TenantID: domain.DefaultTenantID, Role: "user"}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.UserTenants().GetUserTenants(ctx, user.UUID)
+	if err != nil || len(before) == 0 {
+		t.Fatalf("precondition: the user has a tenant membership (%v, %v)", before, err)
+	}
+
+	err = svc.DeleteUser(ctx, user.UUID, user.DID)
+	if !errors.Is(err, ErrTokenRevocationFailed) {
+		t.Fatalf("DeleteUser() = %v, want ErrTokenRevocationFailed", err)
+	}
+	if _, err := store.Users().GetByID(ctx, user.UUID); err != nil {
+		t.Fatalf("the user must not be deleted when revocation failed: %v", err)
+	}
+	after, err := store.UserTenants().GetUserTenants(ctx, user.UUID)
+	if err != nil || len(after) != len(before) {
+		t.Fatalf("tenant memberships must be untouched when revocation failed: %v, %v", after, err)
+	}
+
+	revoker.err = nil
+	if err := svc.DeleteUser(ctx, user.UUID, user.DID); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if _, err := store.Users().GetByID(ctx, user.UUID); err == nil {
+		t.Error("retry: user should be deleted")
+	}
+}
+
+type flakyTokenRevoker struct{ err error }
+
+func (f *flakyTokenRevoker) RevokeUser(context.Context, string) error { return f.err }
 
 // TestUserService_DeleteUser_RevokesTokens proves #383: deleting a user
 // revokes every previously-issued token for that user (via
@@ -556,7 +557,7 @@ func TestUserService_DeleteUser_RevokesTokens(t *testing.T) {
 	// A token issued before deletion (e.g. from a different, still-logged-in
 	// device) must be rejected afterward, even though it was never
 	// individually blacklisted by jti.
-	if blacklist.IsUserRevoked(ctx, user.UUID.String()) {
+	if userRevoked(t, blacklist, ctx, user.UUID.String()) {
 		t.Fatal("user should not be revoked before deletion")
 	}
 
@@ -564,12 +565,12 @@ func TestUserService_DeleteUser_RevokesTokens(t *testing.T) {
 		t.Fatalf("DeleteUser() error = %v", err)
 	}
 
-	if !blacklist.IsUserRevoked(ctx, user.UUID.String()) {
+	if !userRevoked(t, blacklist, ctx, user.UUID.String()) {
 		t.Error("expected a pre-deletion token to be revoked after DeleteUser")
 	}
 
 	// A different, unrelated user must be unaffected.
-	if blacklist.IsUserRevoked(ctx, "some-other-user") {
+	if userRevoked(t, blacklist, ctx, "some-other-user") {
 		t.Error("DeleteUser must not revoke tokens for unrelated users")
 	}
 }

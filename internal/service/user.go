@@ -73,6 +73,10 @@ type UserLocker interface {
 	LockUser(userID domain.UserID) func()
 }
 
+// ErrTokenRevocationFailed is returned by DeleteUser when the user's tokens
+// could not be revoked; the user is not deleted.
+var ErrTokenRevocationFailed = errors.New("failed to revoke tokens")
+
 // UserService handles user-related operations
 type UserService struct {
 	store          storage.Store
@@ -506,10 +510,17 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	lockedOut := false
 	if s.tokenBlacklist != nil {
 		if err := s.tokenBlacklist.RevokeUser(ctx, userID.String()); err != nil {
-			s.logger.Warn("Failed to revoke tokens for deleted user", zap.Error(err))
-		} else {
-			lockedOut = true
+			// Fail closed: deleting the user without the revocation would
+			// leave their tokens valid. The record is kept and the
+			// revocation is idempotent, so a repeat completes the deletion
+			// even if the failed write was in fact stored (the auth
+			// middlewares let a revoked user reach DELETE /user/session for
+			// that reason). Nothing below this point has run yet.
+			s.logger.Error("Account deletion incomplete: tokens could not be revoked",
+				zap.Error(err), zap.String("user_id", userID.String()))
+			return fmt.Errorf("%w: %w", ErrTokenRevocationFailed, err)
 		}
+		lockedOut = true
 	}
 
 	for _, r := range s.userRevokers {

@@ -45,6 +45,21 @@ type TokenBlacklist struct {
 	wg       sync.WaitGroup
 }
 
+// Ready returns the error that left the configured revocation store
+// unusable (for example a failed TTL-index setup), or nil. While it is
+// non-nil every authenticated request is refused, so readiness must report it
+// rather than only pinging the database: the process cannot recover without a
+// restart even once MongoDB is reachable again.
+func (b *TokenBlacklist) Ready() error {
+	if b == nil {
+		return nil
+	}
+	if u, ok := b.store.(interface{ Unavailable() error }); ok {
+		return u.Unavailable()
+	}
+	return nil
+}
+
 // NewTokenBlacklist creates a new token blacklist
 func NewTokenBlacklist(cfg config.TokenBlacklistConfig, logger *zap.Logger) *TokenBlacklist {
 	return NewTokenBlacklistWithStore(cfg, logger, nil)
@@ -159,24 +174,19 @@ func (b *TokenBlacklist) Add(ctx context.Context, jti string, expiry time.Time) 
 	return nil
 }
 
-// IsBlacklisted checks if a token JTI is on the blacklist
-func (b *TokenBlacklist) IsBlacklisted(ctx context.Context, jti string) bool {
+// IsBlacklisted checks if a token JTI is on the blacklist. A non-nil error
+// means the store could not answer; callers must refuse the request.
+func (b *TokenBlacklist) IsBlacklisted(ctx context.Context, jti string) (bool, error) {
 	if !b.config.Enabled {
-		return false
+		return false, nil
 	}
 
 	if jti == "" {
 		// Tokens without JTI can't be blacklisted
-		return false
+		return false, nil
 	}
 
-	revoked, err := b.store.Has(ctx, jti)
-	if err != nil {
-		// The bool signature cannot carry the error; refuse rather than accept.
-		b.logger.Error("Revocation store unavailable; treating token as revoked", zap.Error(err))
-		return true
-	}
-	return revoked
+	return b.store.Has(ctx, jti)
 }
 
 // RevokeUser permanently marks userID as revoked: every token for it,
@@ -206,22 +216,18 @@ func (b *TokenBlacklist) RevokeUser(ctx context.Context, userID string) error {
 // IsUserRevoked reports whether userID has been permanently revoked (via
 // RevokeUser) - i.e. whether any token for that user, however it validated,
 // should be rejected even though its own jti was never individually
-// blacklisted.
-func (b *TokenBlacklist) IsUserRevoked(ctx context.Context, userID string) bool {
+// blacklisted. A non-nil error means the store could not answer; callers must
+// refuse the request.
+func (b *TokenBlacklist) IsUserRevoked(ctx context.Context, userID string) (bool, error) {
 	if !b.config.Enabled {
-		return false
+		return false, nil
 	}
 
 	if userID == "" {
-		return false
+		return false, nil
 	}
 
-	revoked, err := b.store.IsUserRevoked(ctx, userID)
-	if err != nil {
-		b.logger.Error("Revocation store unavailable; treating user as revoked", zap.Error(err))
-		return true
-	}
-	return revoked
+	return b.store.IsUserRevoked(ctx, userID)
 }
 
 // Remove removes a token from the blacklist (if needed for admin override).

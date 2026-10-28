@@ -389,6 +389,9 @@ func (c *Config) ValidateRegistryStandalone() error {
 }
 
 func (c *Config) validateRegistryStandaloneServer() error {
+	if err := c.validateTokenBlacklistBackend(); err != nil {
+		return err
+	}
 	port := c.Server.RegistryPort
 	if port == 0 {
 		port = 8097
@@ -413,4 +416,24 @@ func (c *Config) validateRegistryStandaloneServer() error {
 		}
 	}
 	return c.Server.validateTrustedProxies()
+}
+
+// loadRegistrySecrets loads only the secret files the registry role can use:
+// the MongoDB password, and only while the shared revocation store is in use.
+// Secret paths of backend-only features (admin token, wallet-provider PKCS#11
+// and attestation keys) are not read, so a registry-only process does not
+// need them mounted.
+func (c *Config) loadRegistrySecrets() error {
+	if c.UsesSharedRevocationStore() {
+		return c.loadMongoPassword()
+	}
+	return nil
+}
+
+// UsesSharedRevocationStore reports whether token revocations are kept in the
+// MongoDB storage backend (see TokenBlacklistConfig.Backend).
+func (c *Config) UsesSharedRevocationStore() bool {
+	bl := c.Security.TokenBlacklist
+	return bl.Enabled && (bl.Backend == TokenBlacklistBackendStorage ||
+		(bl.Backend == "" && c.Storage.Type == "mongodb"))
 }

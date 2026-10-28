@@ -141,7 +141,14 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	}
 
 	userSvc := NewUserService(store, cfg, logger)
-	tokenBlacklist := NewTokenBlacklist(cfg.Security.TokenBlacklist, logger)
+	revocationStore, err := NewRevocationStore(context.Background(), cfg.Security.TokenBlacklist, store, logger)
+	if err != nil {
+		// Never fall back to memory on a configured shared store: every
+		// revocation operation fails (and so refuses) until restart.
+		logger.Error("Token revocation store unavailable; authenticated requests will be refused", zap.Error(err))
+		revocationStore = unavailableRevocationStore{err: err}
+	}
+	tokenBlacklist := NewTokenBlacklistWithStore(cfg.Security.TokenBlacklist, logger, revocationStore)
 	// Wire the blacklist into UserService so DeleteUser can revoke all of a
 	// deleted user's previously-issued tokens (#383), mirroring the
 	// SetSessionCleaner pattern below - but wired here, rather than by an
