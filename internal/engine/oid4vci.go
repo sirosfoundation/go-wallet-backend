@@ -51,6 +51,7 @@ type OID4VCIHandler struct {
 	dpopNonce            string                 // server-provided DPoP nonce (RFC 9449 §8)
 	attestationChallenge string                 // server-provided Client Attestation PoP challenge (attestation-based client auth)
 	challengeEndpoint    string                 // AS challenge endpoint for fetching attestation challenges
+	asMetadataFetched    bool                   // AS metadata fetch attempted (see fetchOAuthMetadata)
 	redirectURI          string
 	// encryptedNotificationRegistered is set once the notification context of
 	// an encrypted response has been registered for this issuance, so a later
@@ -613,6 +614,21 @@ func (h *OID4VCIHandler) resolveAttestationChallenge(ctx context.Context, resp *
 	return true
 }
 
+// prepareAttestationChallenge fetches a challenge from the AS challenge
+// endpoint before a new PoP is signed, so the request is not first rejected
+// with use_attestation_challenge. Failure is not fatal.
+func (h *OID4VCIHandler) prepareAttestationChallenge(ctx context.Context) {
+	if h.attestationChallenge != "" || h.challengeEndpoint == "" {
+		return
+	}
+	challenge, err := h.fetchAttestationChallenge(ctx, h.challengeEndpoint)
+	if err != nil {
+		h.Logger.Debug("failed to prefetch attestation challenge; proceeding without", zap.Error(err))
+		return
+	}
+	h.attestationChallenge = challenge
+}
+
 // fetchAttestationChallenge POSTs the AS challenge endpoint to obtain a fresh
 // Client Attestation PoP challenge. A DPoP-Nonce response header, if present,
 // is captured for subsequent DPoP proofs.
@@ -837,6 +853,7 @@ func (h *OID4VCIHandler) requestClientAttestation(ctx context.Context) {
 		PoP: resp.ClientAttestationPoP,
 		ID:  h.clientID,
 	}
+	h.attestationChallenge = "" // single-use: now bound into the PoP
 	h.Logger.Info("using OAuth-Client-Attestation authentication (engine-requested, client-signed PoP)",
 		zap.String("auth_server_issuer", h.authServerIssuer),
 		zap.String("client_id", h.clientID))
@@ -1893,6 +1910,10 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 // from different grants remain distinguishable in logs without duplicating the
 // whole loop.
 func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMetadata, logContext string, setGrantParams func(data url.Values)) (*TokenResponse, error) {
+	if !h.asMetadataFetched {
+		h.fetchOAuthMetadata(ctx, metadata)
+	}
+
 	tokenEndpoint := metadata.TokenEndpoint
 	if tokenEndpoint == "" {
 		// Try to construct from issuer
@@ -2015,6 +2036,7 @@ func (h *OID4VCIHandler) exchangeRefreshToken(ctx context.Context, metadata *Iss
 // fetchOAuthMetadata fetches OAuth Authorization Server metadata from the well-known endpoint.
 // Returns nil (not an error) if the metadata cannot be fetched, allowing callers to use fallbacks.
 func (h *OID4VCIHandler) fetchOAuthMetadata(ctx context.Context, metadata *IssuerMetadata) *oauthServerMetadata {
+	h.asMetadataFetched = true
 	authServer := metadata.authorizationServer()
 	if authServer == "" {
 		authServer = metadata.CredentialIssuer

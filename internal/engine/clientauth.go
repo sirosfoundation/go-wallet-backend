@@ -224,6 +224,7 @@ func (h *OID4VCIHandler) requestClientAuth(ctx context.Context, needs clientAuth
 	}
 	params := SignRequestParams{KeyID: h.dpopKeyID}
 	if needs.attestation {
+		h.prepareAttestationChallenge(ctx)
 		params.Audience = h.authServerIssuer                 // PoP aud = the AS the request is sent to
 		params.Issuer = h.clientID                           // WIA sub / PoP iss = this flow's effective client_id
 		params.AttestationChallenge = h.attestationChallenge // server challenge for the PoP, when one was demanded
@@ -255,6 +256,7 @@ func (h *OID4VCIHandler) headersFromClientAuthResponse(resp *SignResponseMessage
 		if resp.ClientAttestation != "" && resp.ClientAttestationPoP != "" {
 			out.wia = resp.ClientAttestation
 			out.pop = resp.ClientAttestationPoP
+			h.attestationChallenge = "" // single-use: now bound into the PoP
 		} else {
 			h.Logger.Debug("client returned no attestation for sign_client_auth; proceeding without",
 				zap.String("client_id", h.clientID))
@@ -271,6 +273,7 @@ func (h *OID4VCIHandler) resolveLegacyClientAuth(ctx context.Context, needs clie
 	if needs.attestation {
 		if h.attestationProvider == nil && !h.legacyAttestationRequested {
 			h.legacyAttestationRequested = true
+			h.prepareAttestationChallenge(ctx)
 			h.requestClientAttestation(ctx)
 		}
 		if tsa, ok := h.attestationProvider.(*TransportSuppliedAttestation); ok && tsa.Available() {

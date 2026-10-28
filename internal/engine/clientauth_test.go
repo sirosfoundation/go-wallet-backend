@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -243,7 +244,7 @@ func TestResolveClientAuth_ClientHeld_AttestationChallengeRetry(t *testing.T) {
 	require.Len(t, reqs, 2)
 	assert.Empty(t, reqs[0].Params.AttestationChallenge, "first PoP carries no challenge yet")
 	assert.Equal(t, "chal-abc", reqs[1].Params.AttestationChallenge, "retry must carry the server challenge")
-	assert.Equal(t, "chal-abc", h.attestationChallenge)
+	assert.Empty(t, h.attestationChallenge, "a challenge is bound into one PoP only")
 }
 
 func TestResolveClientAuth_ClientHeld_ResourceRequestCarriesATHOnly(t *testing.T) {
@@ -445,6 +446,166 @@ func TestSendFlowComplete_RelaysDPoPKeyID(t *testing.T) {
 	assert.Equal(t, "instance-key-1", received["dpop_key_id"])
 	_, hasJWK := received["dpop_jwk"]
 	assert.False(t, hasJWK, "client-held mode relays no private key")
+}
+
+// challengeAS is an AS whose metadata advertises a challenge endpoint handing
+// out chal-1, chal-2, ..., and whose token endpoint records request headers.
+type challengeAS struct {
+	*httptest.Server
+	mu             sync.Mutex
+	metadataHits   int
+	challengeHits  int
+	challengeFails bool
+	tokenHeaders   []http.Header
+}
+
+func newChallengeAS(t *testing.T) *challengeAS {
+	t.Helper()
+	as := &challengeAS{}
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
+		as.mu.Lock()
+		as.metadataHits++
+		as.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"issuer":"` + as.URL + `","token_endpoint":"` + as.URL + `/token","challenge_endpoint":"` + as.URL + `/challenge"}`))
+	})
+
+	mux.HandleFunc("/challenge", func(w http.ResponseWriter, r *http.Request) {
+		as.mu.Lock()
+		as.challengeHits++
+		n := as.challengeHits
+		fail := as.challengeFails
+		as.mu.Unlock()
+		if fail {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("OAuth-Client-Attestation-Challenge", "chal-"+strconv.Itoa(n))
+	})
+
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		as.mu.Lock()
+		as.tokenHeaders = append(as.tokenHeaders, r.Header.Clone())
+		as.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"at","token_type":"DPoP"}`))
+	})
+
+	as.Server = httptest.NewServer(mux)
+
+	t.Cleanup(as.Close)
+
+	return as
+}
+
+func (as *challengeAS) counts() (metadata, challenge, token int) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	return as.metadataHits, as.challengeHits, len(as.tokenHeaders)
+}
+
+func TestPrefetchChallenge_ClientHeld_FirstTokenRequestCarriesChallenge(t *testing.T) {
+	as := newChallengeAS(t)
+	client := supportingClient()
+	h, _, cleanup := newClientAuthHandler(t, as.Client(), client)
+	defer cleanup()
+
+	// token_endpoint already known from issuer metadata: AS metadata must
+	// still be read to discover challenge_endpoint.
+	metadata := &IssuerMetadata{CredentialIssuer: as.URL, TokenEndpoint: as.URL + "/token"}
+	_, err := h.exchangePreAuthCode(context.Background(), metadata, "code", "")
+	require.NoError(t, err)
+
+	metadataHits, challengeHits, tokenHits := as.counts()
+	assert.Equal(t, 1, metadataHits)
+	assert.Equal(t, 1, challengeHits)
+	assert.Equal(t, 1, tokenHits, "no use_attestation_challenge round-trip")
+
+	reqs := client.seen()
+	require.Len(t, reqs, 1)
+	assert.Equal(t, "chal-1", reqs[0].Params.AttestationChallenge)
+	assert.Empty(t, h.attestationChallenge, "a challenge is bound into one PoP only")
+}
+
+func TestPrefetchChallenge_ClientHeld_FreshChallengePerPoP(t *testing.T) {
+	as := newChallengeAS(t)
+	client := supportingClient()
+	h, _, cleanup := newClientAuthHandler(t, as.Client(), client)
+	defer cleanup()
+	h.challengeEndpoint = as.URL + "/challenge"
+
+	// PAR then token request.
+	_, err := h.resolveClientAuth(context.Background(), clientAuthNeeds{attestation: true})
+	require.NoError(t, err)
+	_, err = h.resolveClientAuth(context.Background(), clientAuthNeeds{attestation: true, dpop: true, htm: "POST", htu: as.URL + "/token"})
+	require.NoError(t, err)
+
+	reqs := client.seen()
+	require.Len(t, reqs, 2)
+	assert.Equal(t, "chal-1", reqs[0].Params.AttestationChallenge)
+	assert.Equal(t, "chal-2", reqs[1].Params.AttestationChallenge)
+}
+
+func TestPrefetchChallenge_Legacy_RequestAttestationCarriesChallenge(t *testing.T) {
+	as := newChallengeAS(t)
+	client := &clientAuthClient{respond: func(req SignRequestMessage) SignResponseMessage {
+		if req.Action == SignActionRequestAttestation {
+			return SignResponseMessage{ClientAttestation: "wia.jwt", ClientAttestationPoP: "legacy-pop"}
+		}
+		return SignResponseMessage{}
+	}}
+	h, _, cleanup := newClientAuthHandler(t, as.Client(), client)
+	defer cleanup()
+
+	metadata := &IssuerMetadata{CredentialIssuer: as.URL, TokenEndpoint: as.URL + "/token"}
+	_, err := h.exchangePreAuthCode(context.Background(), metadata, "code", "")
+	require.NoError(t, err)
+
+	reqs := client.seen()
+	require.Len(t, reqs, 2)
+	assert.Equal(t, SignActionRequestAttestation, reqs[1].Action)
+	assert.Equal(t, "chal-1", reqs[1].Params.AttestationChallenge, "unused probe challenge carries over")
+	_, challengeHits, _ := as.counts()
+	assert.Equal(t, 1, challengeHits)
+}
+
+func TestPrefetchChallenge_SkippedForPreSuppliedAttestation(t *testing.T) {
+	as := newChallengeAS(t)
+	client := supportingClient()
+	h, _, cleanup := newClientAuthHandler(t, as.Client(), client)
+	defer cleanup()
+	// What Execute does for FlowStartMessage{ClientAttestation, ClientAttestationPoP}.
+	h.attestationProvider = &TransportSuppliedAttestation{WIA: "wia.jwt", PoP: "upfront-pop", ID: h.clientID}
+	require.NoError(t, h.useLegacyClientAuth())
+
+	metadata := &IssuerMetadata{CredentialIssuer: as.URL, TokenEndpoint: as.URL + "/token"}
+	_, err := h.exchangePreAuthCode(context.Background(), metadata, "code", "")
+	require.NoError(t, err)
+
+	_, challengeHits, _ := as.counts()
+	assert.Zero(t, challengeHits, "a pre-signed PoP cannot carry a new challenge")
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	assert.Equal(t, "upfront-pop", as.tokenHeaders[0].Get("OAuth-Client-Attestation-PoP"))
+}
+
+func TestPrefetchChallenge_EndpointFailureIsNotFatal(t *testing.T) {
+	as := newChallengeAS(t)
+	as.challengeFails = true
+	client := supportingClient()
+	h, _, cleanup := newClientAuthHandler(t, as.Client(), client)
+	defer cleanup()
+
+	metadata := &IssuerMetadata{CredentialIssuer: as.URL, TokenEndpoint: as.URL + "/token"}
+	_, err := h.exchangePreAuthCode(context.Background(), metadata, "code", "")
+	require.NoError(t, err)
+
+	reqs := client.seen()
+	require.Len(t, reqs, 1)
+	assert.Empty(t, reqs[0].Params.AttestationChallenge)
 }
 
 func TestAccessTokenHash(t *testing.T) {
