@@ -669,10 +669,11 @@ response in clear. Every key lives in the client.
    negotiated one) always fails the issuance closed. The engine forwards only the
    key, with `use: "enc"` and the negotiated `alg`.
 3. **Request.** The engine puts the JWK in the Credential Request's
-   `credential_response_encryption` (`{alg, enc, jwk}`). Request encryption to the
-   issuer's key (`credential_request_encryption`, OID4VCI 1.0 §10) is unchanged and
-   stays engine-side: the request holds only proofs, the configuration id and a
-   public JWK.
+   `credential_response_encryption` (`{enc, jwk}`); the negotiated `alg` is
+   included in the JWK. Request encryption to the issuer's key
+   (`credential_request_encryption`, OID4VCI 1.0 §10) is unchanged and stays
+   engine-side: the request holds only proofs, the configuration id and a public
+   JWK.
 4. **Relay.** The issuer answers with a compact JWE (`application/jwt` or
    `application/jose`). The engine checks only that it has the shape of a compact
    JWE (five base64url segments), then sends it unread:
