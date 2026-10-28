@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"encoding/json"
 	"sync"
 	"time"
 
@@ -21,6 +22,13 @@ type TrustCacheRecord struct {
 	TrustStatus    domain.TrustStatus
 	TrustFramework string
 	Trusted        bool
+	// Reason is the PDP's explanation for the verdict, replayed on cache hits.
+	Reason string
+	// Context is the already-narrowed wallet-facing context
+	// ({"verifier_ids":[...]} only, see narrowVerifierContext) replayed on
+	// cache hits. Admin-only PDP context (reason, trust_metadata) is never
+	// stored. nil means there were no verifier_ids.
+	Context json.RawMessage
 }
 
 // TrustCache is a tenant-aware, in-memory TTL cache for verifier trust
