@@ -304,30 +304,49 @@ func handleDelegationTokenRequest(
 }
 
 // parentTokenRevoked returns the refusal when the delegating token may no
-// longer be exchanged, or nil when it may.
+// longer be exchanged, or nil when it may. A revoked parent must not be
+// usable to mint a fresh, differently-jti'd token, or logout and account
+// deletion (#382/#383) would not actually stop re-delegation.
 //
-// A revoked parent must not be usable to mint a fresh, differently-jti'd
-// token - otherwise logout/account deletion (#382/#383) would not actually
-// stop re-delegation. Both the parent's own jti (individually blacklisted,
-// e.g. by AS logout - see LogoutHandler) and its subject in bulk (account
-// deletion - see service.TokenBlacklist.RevokeUser) are checked: checking jti
-// alone missed a different, not-yet-blacklisted delegation-capable token for
-// the same deleted user still being exchangeable here (#391 review).
+// The two checks below are independent and both are needed; see each.
 func parentTokenRevoked(ctx context.Context, bl TokenBlacklistChecker, parent *AccessTokenClaims) error {
-	if parent.ID != "" {
-		jtiRevoked, err := bl.IsBlacklisted(ctx, parent.ID)
-		if err != nil {
-			return err
-		}
-		if jtiRevoked {
-			return errParentRevoked
-		}
+	if err := parentJTIRevoked(ctx, bl, parent.ID); err != nil {
+		return err
 	}
-	userRevoked, err := bl.IsUserRevoked(ctx, parent.Subject)
+	return parentUserRevoked(ctx, bl, parent.Subject)
+}
+
+// parentJTIRevoked refuses a delegating token whose own jti was individually
+// blacklisted, e.g. by AS logout (see LogoutHandler).
+//
+// A parent with no jti has nothing to look up and is passed to the user
+// check, which is the only thing that can still refuse it.
+func parentJTIRevoked(ctx context.Context, bl TokenBlacklistChecker, jti string) error {
+	if jti == "" {
+		return nil
+	}
+	revoked, err := bl.IsBlacklisted(ctx, jti)
 	if err != nil {
 		return err
 	}
-	if userRevoked {
+	if revoked {
+		return errParentRevoked
+	}
+	return nil
+}
+
+// parentUserRevoked refuses a delegating token whose subject was revoked in
+// bulk (account deletion - see service.TokenBlacklist.RevokeUser).
+//
+// It is not covered by the jti check: a different, not-yet-blacklisted
+// delegation-capable token belonging to the same deleted user was still
+// exchangeable here when only the jti was checked (#391 review).
+func parentUserRevoked(ctx context.Context, bl TokenBlacklistChecker, subject string) error {
+	revoked, err := bl.IsUserRevoked(ctx, subject)
+	if err != nil {
+		return err
+	}
+	if revoked {
 		return errParentUserGone
 	}
 	return nil
