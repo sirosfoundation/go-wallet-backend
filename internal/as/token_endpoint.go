@@ -36,12 +36,49 @@ func refuseRevocationUnavailable(c *gin.Context, logger *zap.Logger, err error) 
 	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "revocation check unavailable"})
 }
 
-// sessionOwnerRevoked reports whether the session's user has been revoked
-// (account deletion revokes the user before the sessions are purged, so an
-// interrupted or unacknowledged deletion can leave a live session whose owner
-// is already revoked). When it returns true a response has been written and
-// the caller must stop: 401 for a revoked owner, 503 when the revocation
-// store cannot say. Without a wired blacklist there is nothing to check.
+// respondTokenError writes a policy refusal. Together with
+// refuseRevocationUnavailable it is the whole of this endpoint's knowledge of
+// the error wire format; the policy itself (token_policy.go) has none and
+// imports no web framework.
+func respondTokenError(c *gin.Context, err error) {
+	var te *tokenError
+	if !errors.As(err, &te) {
+		te = &tokenError{http.StatusInternalServerError, "server_error", "token issuance failed"}
+	}
+	c.JSON(te.Status, gin.H{"error": te.Message})
+}
+
+// respondCutoff answers a failed lifecycle cut-off check: a refusal is
+// rendered as is, a store failure is logged and answered 500 "internal error".
+func respondCutoff(c *gin.Context, deps *tokenDeps, err error) {
+	var cc *cutoffCheckError
+	if errors.As(err, &cc) {
+		if deps.logger != nil {
+			deps.logger.Error("token cut-off check failed", zap.Error(cc.err))
+		}
+		respondTokenError(c, errCutoffUnavailable)
+		return
+	}
+	respondTokenError(c, err)
+}
+
+// respondRevocation answers a failed revocation check and is the only caller
+// that has to tell the two kinds of failure apart: a refusal, which is a
+// *tokenError, or a store that could not answer, which is anything else.
+func respondRevocation(c *gin.Context, deps *tokenDeps, err error) {
+	var te *tokenError
+	if errors.As(err, &te) {
+		respondTokenError(c, te)
+		return
+	}
+	refuseRevocationUnavailable(c, deps.logger, err)
+}
+
+// sessionOwnerRevoked returns the refusal when the session's user has been
+// revoked, or nil when a token may still be issued. Account deletion revokes
+// the user before the sessions are purged, so an interrupted or
+// unacknowledged deletion can leave a live session whose owner is already
+// revoked.
 //
 // deletionOnly names the one token a revoked owner may still obtain: exactly
 // the deletion permission, which is all DELETE /user/session needs and the
@@ -49,23 +86,18 @@ func refuseRevocationUnavailable(c *gin.Context, logger *zap.Logger, err error) 
 // interrupted deletion be completed after the previous access token expired,
 // while every other token (including any anonymous one, whose missing "sub"
 // would bypass the user revocation) stays refused.
-func sessionOwnerRevoked(c *gin.Context, deps *tokenDeps, session *Session, deletionOnly bool, tac TAC) bool {
-	if deps.blacklist == nil {
-		return false
-	}
-	revoked, err := deps.blacklist.IsUserRevoked(c.Request.Context(), session.UserID)
+func sessionOwnerRevoked(ctx context.Context, bl TokenBlacklistChecker, session *Session, deletionOnly bool, tac TAC) error {
+	revoked, err := bl.IsUserRevoked(ctx, session.UserID)
 	if err != nil {
-		refuseRevocationUnavailable(c, deps.logger, err)
-		return true
+		return err
 	}
 	if !revoked {
-		return false
+		return nil
 	}
 	if deletionOnly && tac == TAC(string(TACDelete)) {
-		return false
+		return nil
 	}
-	c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
-	return true
+	return errInvalidSession
 }
 
 // tokenDeps groups the shared dependencies for token issuance handlers.
@@ -132,7 +164,7 @@ func TokenEndpointHandler(cfg TokenEndpointConfig) gin.HandlerFunc {
 		policy:    cfg.Policy,
 		ttlFunc:   cfg.TTLFunc,
 		audiences: cfg.Audiences,
-		blacklist: cfg.Blacklist,
+		blacklist: blacklistOrNoop(cfg.Blacklist),
 		logger:    cfg.Logger,
 		gate:      cfg.Gate,
 	}
@@ -187,51 +219,26 @@ func handleSessionTokenRequest(
 ) {
 	session, err := store.Get(c.Request.Context(), sessionID)
 	if err != nil || session == nil || !session.IsValid() {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
+		respondTokenError(c, errInvalidSession)
 		return
 	}
-	if !sessionPassesCutoff(c, deps, session) {
-		return
-	}
-
-	tenantID := req.TenantID
-	if tenantID == "" {
-		tenantID = session.TenantID
-	}
-
-	// Enforce tenant scoping: session-based tokens cannot target a different tenant
-	// unless the session itself is cross-tenant (TenantID == "*").
-	if session.TenantID != "*" && tenantID != session.TenantID {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "cannot issue token for a different tenant",
-		})
+	if err := sessionPredatesCutoff(c.Request.Context(), deps.gate, session); err != nil {
+		respondCutoff(c, deps, err)
 		return
 	}
 
-	tac := TAC(req.TAC)
-	if tac == "" {
-		tac = session.MaxTAC
-	}
-
-	// An empty MaxTAC means the session grants no permissions.
-	if session.MaxTAC == "" {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "session has no granted permissions",
-		})
+	tenantID, tac, err := authorizeSessionToken(session, req)
+	if err != nil {
+		respondTokenError(c, err)
 		return
 	}
 
-	// Validate requested TAC is a subset of session MaxTAC.
-	if !tac.IsSubsetOf(session.MaxTAC) {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "requested permissions exceed session maximum",
-		})
-		return
-	}
-
-	// Both gates apply: the lifecycle cut-off above and the shared revocation
-	// store here (a revoked owner may still obtain a deletion-only token).
-	if sessionOwnerRevoked(c, deps, session, true, tac) {
+	// After the policy, because the deletion-only exemption needs the
+	// resolved TAC. Both gates apply: the lifecycle cut-off above and the
+	// shared revocation store here (a revoked owner may still obtain a
+	// deletion-only token, which does not lift the cut-off).
+	if err := sessionOwnerRevoked(c.Request.Context(), deps.blacklist, session, true, tac); err != nil {
+		respondRevocation(c, deps, err)
 		return
 	}
 
@@ -263,94 +270,27 @@ func handleAnonymousTokenRequest(
 ) {
 	session, err := store.Get(c.Request.Context(), sessionID)
 	if err != nil || session == nil || !session.IsValid() {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
+		respondTokenError(c, errInvalidSession)
 		return
 	}
-	if !sessionPassesCutoff(c, deps, session) {
+	if err := sessionPredatesCutoff(c.Request.Context(), deps.gate, session); err != nil {
+		respondCutoff(c, deps, err)
 		return
 	}
-	if sessionOwnerRevoked(c, deps, session, false, "") {
-		return
-	}
-
-	// ACR proves this session came from a real authentication event. Every
-	// login flow sets it, so this should be unreachable in practice, but
-	// fail closed rather than mint a token with no authentication context
-	// behind it at all if a session somehow lacks one.
-	if session.ACR == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "session has no authentication context"})
+	// Before the policy, and with no TAC: a revoked owner gets no anonymous
+	// token at all, since a missing "sub" would bypass the user revocation.
+	if err := sessionOwnerRevoked(c.Request.Context(), deps.blacklist, session, false, ""); err != nil {
+		respondRevocation(c, deps, err)
 		return
 	}
 
-	tenantID := req.TenantID
-	if tenantID == "" {
-		tenantID = session.TenantID
-	}
-
-	// Enforce tenant scoping: identical to handleSessionTokenRequest - a
-	// session-backed token (identity-free or not) cannot target a different
-	// tenant unless the session itself is cross-tenant (TenantID == "*").
-	if session.TenantID != "*" && tenantID != session.TenantID {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "cannot issue token for a different tenant",
-		})
-		return
-	}
-
-	tac := TAC(req.TAC)
-	if tac == "" {
-		tac = TAC("r") // anonymous tokens default to read-only
-	}
-
-	// Anonymous tokens are capped to read-only regardless of what the
-	// session's own MaxTAC allows.
-	if !tac.IsSubsetOf(TAC("rl")) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "anonymous tokens are read-only"})
-		return
-	}
-
-	// An empty MaxTAC means the session grants no permissions at all.
-	if session.MaxTAC == "" {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "session has no granted permissions",
-		})
-		return
-	}
-
-	// Validate requested TAC is a subset of session MaxTAC (in addition to
-	// the read-only cap above - a session with only "w" granted, for
-	// instance, still can't be used to mint even a read-only token).
-	if !tac.IsSubsetOf(session.MaxTAC) {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "requested permissions exceed session maximum",
-		})
+	tenantID, tac, err := authorizeAnonymousToken(session, req)
+	if err != nil {
+		respondTokenError(c, err)
 		return
 	}
 
 	issueToken(c, deps, sessionSubject(session), "", req.Audience, tenantID, tac, session.ACR)
-}
-
-// sessionPassesCutoff refuses a session that predates the user's SID-AUTH-06
-// cut-off, so a session that outlived a revocation (the cascade can fail to
-// drop it) cannot mint a fresh token. It writes the response and returns false
-// on refusal.
-func sessionPassesCutoff(c *gin.Context, deps *tokenDeps, session *Session) bool {
-	err := deps.gate.Check(c.Request.Context(), session.UserID, session.authInstant())
-	switch {
-	case err == nil:
-		return true
-	case errors.Is(err, tokengate.ErrRevoked):
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "session predates a wallet lifecycle change"})
-	default:
-		deps.logger.Error("token cut-off check failed", zap.Error(err))
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-	}
-	return false
-}
-
-// sessionSubject identifies a session for the cut-off re-check.
-func sessionSubject(session *Session) cutoffSubject {
-	return cutoffSubject{userID: session.UserID, issuedAt: session.authInstant()}
 }
 
 // handleDelegationTokenRequest issues a downscoped token from a Bearer token
@@ -362,7 +302,7 @@ func handleDelegationTokenRequest(
 ) {
 	bearerToken := extractBearerToken(c)
 	if bearerToken == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+		respondTokenError(c, errNoDelegateAuth)
 		return
 	}
 
@@ -376,116 +316,83 @@ func handleDelegationTokenRequest(
 	// behavior for every other caller.
 	parentClaims, err := deps.issuer.ParseAndVerify(bearerToken, deps.audiences)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid delegating token"})
+		respondTokenError(c, errInvalidParent)
 		return
 	}
 
-	// A revoked parent token must not be usable to mint a fresh, differently
-	// -jti'd token - otherwise logout/account deletion (#382/#383) would not
-	// actually stop re-delegation. Checks both the parent's own jti
-	// (individually blacklisted, e.g. by AS logout - see LogoutHandler) and
-	// its subject in bulk (account deletion - see
-	// service.TokenBlacklist.RevokeUser): checking jti alone missed a
-	// different, not-yet-blacklisted delegation-capable token for the same
-	// deleted user still being exchangeable here (#391 review). Only fails
-	// closed when a blacklist is actually wired (deps.blacklist != nil);
-	// ASModule always wires one from NewBackendProvider, so this is only
-	// ever nil in tests that don't care.
-	if deps.blacklist != nil {
-		ctx := c.Request.Context()
-		jtiRevoked := false
-		var err error
-		if parentClaims.ID != "" {
-			if jtiRevoked, err = deps.blacklist.IsBlacklisted(ctx, parentClaims.ID); err != nil {
-				refuseRevocationUnavailable(c, deps.logger, err)
-				return
-			}
-		}
-		if jtiRevoked {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token has been revoked"})
-			return
-		}
-		userRevoked, err := deps.blacklist.IsUserRevoked(ctx, parentClaims.Subject)
-		if err != nil {
-			refuseRevocationUnavailable(c, deps.logger, err)
-			return
-		}
-		if userRevoked {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token's user has been revoked"})
-			return
-		}
-	}
-
-	// SID-AUTH-06: a delegating token issued before the revocation must not mint
-	// a fresh one; the parent is judged (see cutoffSubject), as a child would carry
-	// a fresh iat.
-	parent := cutoffSubject{userID: parentClaims.Subject, issuedAt: tokengate.IssuedAt(bearerToken)}
-	if err := deps.gate.Check(c.Request.Context(), parent.userID, parent.issuedAt); err != nil {
-		if errors.Is(err, tokengate.ErrRevoked) {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token has been revoked"})
-		} else {
-			deps.logger.Error("token cut-off check failed", zap.Error(err))
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-		}
+	if err := parentTokenRevoked(c.Request.Context(), deps.blacklist, parentClaims); err != nil {
+		respondRevocation(c, deps, err)
 		return
 	}
 
-	// Delegating token must have the 'k' permission.
-	if !parentClaims.TAC.Has(TACDelegate) {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "delegating token lacks delegate (k) permission",
-		})
+	// SID-AUTH-06: a delegating token issued before the revocation must not
+	// mint a fresh one; the parent is judged, as a child would carry a fresh iat.
+	parent := parentSubject(parentClaims, bearerToken)
+	if err := parentPredatesCutoff(c.Request.Context(), deps.gate, parent); err != nil {
+		respondCutoff(c, deps, err)
 		return
 	}
 
-	// Derive tenant — delegation must match or narrow.
-	tenantID := req.TenantID
-	if tenantID == "" {
-		tenantID = parentClaims.TenantID
-	}
-	// Delegated token must have the same tenant_id, unless the parent has
-	// cross-tenant scope ("*"), in which case it may be narrowed to a specific tenant.
-	if parentClaims.TenantID != "*" && tenantID != parentClaims.TenantID {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "delegation cannot change tenant",
-		})
-		return
-	}
-
-	// Derive TAC — must be a subset of parent, and 'k' is stripped by default
-	// unless explicitly requested (re-delegation).
-	tac := TAC(req.TAC)
-	if tac == "" {
-		// Default: same as parent minus 'k'.
-		tac = parentClaims.TAC.Without(TACDelegate)
-	}
-
-	// Validate downscoping: delegated TAC must be subset of parent TAC.
-	// This is the complete security boundary for delegation - a delegated
-	// token can never exceed what its own parent already had, regardless
-	// of what SPOCP evaluation below would otherwise allow - see
-	// rules/delegation.rules for why SPOCP itself doesn't independently
-	// restrict this.
-	if !tac.IsSubsetOf(parentClaims.TAC) {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "delegated permissions exceed parent token",
-		})
+	tenantID, tac, err := authorizeDelegationToken(parentClaims, req)
+	if err != nil {
+		respondTokenError(c, err)
 		return
 	}
 
 	issueToken(c, deps, parent, parentClaims.Subject, req.Audience, tenantID, tac, parentClaims.ACR)
 }
 
-// issueToken is the common path for both session and delegation flows.
-// cutoffSubject is the issuing instant of the token or session that asked, so
-// issueToken can re-check the SID-AUTH-06 cut-off after minting: the new
-// token's own iat is always fresh, so only the credential behind it can be
-// judged. Minting after a lifecycle change requires a new login.
-type cutoffSubject struct {
-	userID   string
-	issuedAt time.Time
+// parentTokenRevoked returns the refusal when the delegating token may no
+// longer be exchanged, or nil when it may. A revoked parent must not be
+// usable to mint a fresh, differently-jti'd token, or logout and account
+// deletion (#382/#383) would not actually stop re-delegation.
+//
+// The two checks below are independent and both are needed; see each.
+func parentTokenRevoked(ctx context.Context, bl TokenBlacklistChecker, parent *AccessTokenClaims) error {
+	if err := parentJTIRevoked(ctx, bl, parent.ID); err != nil {
+		return err
+	}
+	return parentUserRevoked(ctx, bl, parent.Subject)
 }
 
+// parentJTIRevoked refuses a delegating token whose own jti was individually
+// blacklisted, e.g. by AS logout (see LogoutHandler).
+//
+// A parent with no jti has nothing to look up and is passed to the user
+// check, which is the only thing that can still refuse it.
+func parentJTIRevoked(ctx context.Context, bl TokenBlacklistChecker, jti string) error {
+	if jti == "" {
+		return nil
+	}
+	revoked, err := bl.IsBlacklisted(ctx, jti)
+	if err != nil {
+		return err
+	}
+	if revoked {
+		return errParentRevoked
+	}
+	return nil
+}
+
+// parentUserRevoked refuses a delegating token whose subject was revoked in
+// bulk (account deletion - see service.TokenBlacklist.RevokeUser).
+//
+// It is not covered by the jti check: a different, not-yet-blacklisted
+// delegation-capable token belonging to the same deleted user was still
+// exchangeable here when only the jti was checked (#391 review).
+func parentUserRevoked(ctx context.Context, bl TokenBlacklistChecker, subject string) error {
+	revoked, err := bl.IsUserRevoked(ctx, subject)
+	if err != nil {
+		return err
+	}
+	if revoked {
+		return errParentUserGone
+	}
+	return nil
+}
+
+// issueToken is the common path for the session, anonymous and delegation flows.
+// subject is the credential behind the request, re-checked against the cut-off.
 func issueToken(
 	c *gin.Context,
 	deps *tokenDeps,
@@ -532,15 +439,10 @@ func issueToken(
 		return
 	}
 
-	// SID-AUTH-06: a revocation landing since the check above must not be handed
-	// a token with a fresh iat.
-	if err := deps.gate.Check(c.Request.Context(), subject.userID, subject.issuedAt); err != nil {
-		if errors.Is(err, tokengate.ErrRevoked) {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "authorization revoked while the token was being issued"})
-		} else {
-			deps.logger.Error("token cut-off re-check failed", zap.Error(err))
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-		}
+	// SID-AUTH-06: a revocation landing since the check above must not be
+	// handed a token with a fresh iat.
+	if err := issuedAfterCutoff(c.Request.Context(), deps.gate, subject); err != nil {
+		respondCutoff(c, deps, err)
 		return
 	}
 
