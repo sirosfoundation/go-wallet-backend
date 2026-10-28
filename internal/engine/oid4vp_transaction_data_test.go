@@ -740,7 +740,20 @@ func signRequestFor(t *testing.T, authReq *AuthorizationRequest) SignRequestMess
 
 	select {
 	case m := <-got:
-		session.signCh <- &SignResponseMessage{Message: Message{MessageID: m.MessageID}, VPToken: "vp"}
+		resp := &SignResponseMessage{Message: Message{MessageID: m.MessageID}, VPToken: "vp"}
+		if re := m.Params.ResponseEncryption; re != nil {
+			// direct_post.jwt: the client answers with the finished JWE.
+			hdr, _ := json.Marshal(map[string]string{"alg": re.Alg, "enc": re.Enc})
+			seg := base64.RawURLEncoding.EncodeToString
+			// An encrypted key exists only for key-wrapping algorithms.
+			ek := ""
+			if re.Alg != "ECDH-ES" {
+				ek = seg([]byte("k"))
+			}
+			resp = &SignResponseMessage{Message: Message{MessageID: m.MessageID},
+				ResponseJWE: seg(hdr) + "." + ek + "." + seg([]byte("i")) + "." + seg([]byte("c")) + "." + seg([]byte("t"))}
+		}
+		session.signCh <- resp
 		require.NoError(t, <-done)
 		return m
 	case <-time.After(2 * time.Second):
@@ -801,6 +814,11 @@ func TestRequestVPSignature_SendsTheEffectiveResponseMode(t *testing.T) {
 			authReq := &AuthorizationRequest{
 				Nonce: "n", ClientID: "verifier.example.com", ResponseMode: tc.requested,
 				TransactionDataRaw: rawArray(t, v.Raw), DCQLQuery: payDCQL,
+			}
+			if tc.requested == ResponseModeDirectPostJWT {
+				// The client builds the encrypted response itself, so the
+				// engine needs the verifier's encryption key to ask for it.
+				authReq.ClientMetadata = &ClientMetadata{JWKS: json.RawMessage(`{"keys":[{"kty":"EC","crv":"P-256","use":"enc","x":"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU","y":"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"}]}`)}
 			}
 			require.NoError(t, validateTransactionData(authReq, tdClient))
 			assert.Equal(t, tc.sent, signRequestFor(t, authReq).Params.ResponseMode)

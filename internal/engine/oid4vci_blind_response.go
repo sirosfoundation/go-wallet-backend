@@ -55,7 +55,7 @@ func (e *responseEncryption) params() *CredentialResponseEncryptionParams {
 // requestMember is the credential_response_encryption member of a Credential
 // (or Deferred Credential) Request.
 func (e *responseEncryption) requestMember() map[string]interface{} {
-	return map[string]interface{}{"alg": e.Alg, "enc": e.Enc, "jwk": e.JWK}
+	return map[string]interface{}{"enc": e.Enc, "jwk": e.JWK}
 }
 
 // negotiateResponseEncryption decides, from the issuer metadata alone, whether
@@ -162,7 +162,7 @@ func resolveClientEncryptionKey(offer *responseEncryption, raw json.RawMessage) 
 // (RFC 7516 §7.1): five base64url segments, of which only the encrypted key
 // may be empty. It does not parse or decrypt anything.
 func isCompactJWE(s string) bool {
-	parts := strings.Split(s, ".")
+	parts := strings.SplitN(s, ".", 6)
 	if len(parts) != 5 {
 		return false
 	}

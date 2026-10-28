@@ -613,19 +613,15 @@ no credential value and no `credential_metadata`:
 (and no `notification_id`); the client pairs entry `i` with the `i`-th
 credential it decrypted itself (see "Credential response encryption" below), and
 a count mismatch is an error on the client. The response-level
-`credential_metadata` (OpenID4VCI 1.1, openid/OpenID4VCI#721), which may carry
-`org.siros.secret_seed`, is never relayed by the engine: the client already holds
-it from its own decryption. An issuer that does not encrypt its response is
+`credential_metadata` (OpenID4VCI 1.1, openid/OpenID4VCI#721), is never relayed by
+the engine: the client already holds it from its own decryption. An issuer that does not encrypt its response is
 visible to the engine, which relays its credentials as before (no
 `credential_response_encrypted`, `credential` present). For such a plain
 response `flow_complete` also carries a top-level `credential_metadata`
 containing ONLY the display-only members `display` and `claims` of the
 response-level `credential_metadata` (omitted when it has neither); every other
-member (extensions) is dropped by the engine and never relayed or logged. A plain
-response whose `credential_metadata` carries `org.siros.secret_seed` is refused
-with `CREDENTIAL_ERROR` and no `flow_complete`, advertised or not (privatedata-spec
-5A.4); errors and logs contain no values. Clients ignore extension members
-arriving in `flow_complete`. An encrypted response never yields `credential_metadata`
+member (extensions) is dropped by the engine and never relayed or logged. Clients
+ignore extension members arriving in `flow_complete`. An encrypted response never yields `credential_metadata`
 on `flow_complete`.
 
 #### Credential response encryption (engine-blind)
@@ -647,12 +643,13 @@ response in clear. Every key lives in the client.
        "credential_response_encryption": { "alg": "ECDH-ES", "enc": "A256GCM", "required": true } } }
    ```
 
-   `required` is `true` when the issuer marks encryption as required or the
-   configuration advertises `org.siros.secret_seed`
-   (`credential_configurations_supported[cfg].credential_metadata["org.siros.secret_seed"]
-   = {"namespaces": [...]}`, privatedata-spec 5A.4). A seed advertisement with no
-   usable issuer encryption (none offered, or no mutually supported pair) fails
-   the issuance with `CREDENTIAL_ERROR` before any request is sent. A configuration
+   `required` is `true` when the issuer marks encryption as required. On this
+   branch the engine ALSO still sets it when the configuration advertises the
+   superseded `org.siros.secret_seed`, and then fails the issuance with
+   `CREDENTIAL_ERROR` before any request is sent if there is no usable issuer
+   encryption (and refuses a plain response carrying a seed). That handling is
+   removed by https://github.com/sirosfoundation/go-wallet-backend/pull/480; the
+   wallet clients now refuse the seed shapes. A configuration
    without `proof_types_supported` still gets this request when encryption is
    wanted: it is then for the key alone and the client returns no proofs.
 2. **Key.** The client generates a FRESH ephemeral P-256 key per `generate_proof`
@@ -672,10 +669,11 @@ response in clear. Every key lives in the client.
    negotiated one) always fails the issuance closed. The engine forwards only the
    key, with `use: "enc"` and the negotiated `alg`.
 3. **Request.** The engine puts the JWK in the Credential Request's
-   `credential_response_encryption` (`{alg, enc, jwk}`). Request encryption to the
-   issuer's key (`credential_request_encryption`, OID4VCI 1.0 §10) is unchanged and
-   stays engine-side: the request holds only proofs, the configuration id and a
-   public JWK.
+   `credential_response_encryption` (`{enc, jwk}`); the negotiated `alg` is
+   included in the JWK. Request encryption to the issuer's key
+   (`credential_request_encryption`, OID4VCI 1.0 §10) is unchanged and stays
+   engine-side: the request holds only proofs, the configuration id and a public
+   JWK.
 4. **Relay.** The issuer answers with a compact JWE (`application/jwt` or
    `application/jose`). The engine checks only that it has the shape of a compact
    JWE (five base64url segments), then sends it unread:
@@ -688,10 +686,13 @@ response in clear. Every key lives in the client.
    `deferred` is always present. A body that is not a compact JWE (empty,
    JSON, ...) is refused with no relay.
 5. **Answer.** The client decrypts with the flow's key, STORES the credentials and
-   the response-level `credential_metadata` locally, validates the seed
-   (privatedata-spec 5A: namespaces, hex, size/depth caps, "a seed needs an
-   encrypted response and a non-empty `notification_id`", strip-before-merge,
-   `SHA256(seed) == ssc`) and answers with control fields ONLY:
+   the response-level `credential_metadata` locally, validates what it needs
+   from it (the superseded seed shapes `org.siros.secret_seed`,
+   `org.siros.holder_commitments`, `org.siros.psc` and `secret_members` are
+   refused; Credential Auxiliary Data, `auxiliary_data`, is the replacement,
+   implemented in the engine by
+   https://github.com/sirosfoundation/go-wallet-backend/pull/480) and answers
+   with control fields ONLY:
 
    ```
    { "type": "sign_response", "credential_count": 2 }                 // credentials issued
@@ -709,8 +710,7 @@ response in clear. Every key lives in the client.
    encryption or the request asks for an encrypted response. Each encrypted answer
    goes through step 4 with `"deferred": true`; an answer that again reports a
    `transaction_id` keeps the polling going. (Before this change the engine did
-   not decrypt deferred answers at all.) A plain deferred answer to a
-   seed-advertising configuration is refused unread.
+   not decrypt deferred answers at all.)
 7. **Notification.** The client supplies `notification_id` (from the decrypted
    body) in `credential_notification`. For an encrypted response the engine
    registers its notification context with an empty id, which matches any id the
@@ -718,24 +718,18 @@ response in clear. Every key lives in the client.
    issuer's own endpoint through the engine, which adds the issuer access token).
    The context is registered before the first JWE is relayed, so a
    `credential_failure` still reaches the issuer when the client rejects what it
-   decrypted (for example a seed that fails its checks).
+   decrypted (for example auxiliary data that fails its checks).
 
-What the engine still sees: the proof JWTs (holder public key; the `psc`
-commitment is hiding by design), DPoP traffic, the issuer metadata, timing and
+What the engine still sees: the proof JWTs (holder public key), DPoP traffic, the issuer metadata, timing and
 sizes, and `credential_count`/`transaction_id`/`interval`. It never sees a
-credential, a seed or the response plaintext when the issuer encrypts. The same
+credential, auxiliary data or the response plaintext when the issuer encrypts. The same
 messages are carried by the WMP sign sub-flow (go-wallet-backend#163) once its translation copies the new fields.
 
-A malformed seed advertisement (hex or other values instead of a name list,
-wrong counts, duplicate or over-long names) means the configuration is not
-offered (privatedata-spec 5A.3): the engine drops it when decoding issuer
-metadata (logging only the configuration id) and the resolve endpoint removes the
-whole configuration from the metadata it serves. For legacy signed metadata the
-resolver also keeps the original `signed_metadata` JWT, whose payload still
-carries the rejected configuration; when a configuration is removed that JWT is
-dropped from the served document too (editing the payload would break the
-signature). A valid advertisement is public names-only data and is served to the
-wallet unchanged; the wallet needs it to request encryption.
+Engine-side handling of the superseded `org.siros.secret_seed` and
+`org.siros.holder_commitments` advertisements (dropping malformed ones when
+decoding issuer metadata, sanitising them in the resolve endpoint) predates this
+change and is replaced by Credential Auxiliary Data in
+https://github.com/sirosfoundation/go-wallet-backend/pull/480.
 
 Deferred issuance:
 
@@ -963,6 +957,153 @@ Client → Server:
 **Note**: The `match_request`/`match_response` pattern uses `message_id` for
 correlation (same as `sign_request`/`sign_response`), with a 30-second timeout.
 
+#### Verifier trust result (`verifier_trust_evaluated`)
+
+When the engine evaluates verifier trust itself (a verifier PDP is configured)
+it sends a `flow_progress` whose payload has `verifier_trust_evaluated: true`,
+for a fresh evaluation and identically when the verdict is served from the
+engine's trust cache:
+
+```
+{
+  "type": "flow_progress",
+  "flow_id": "<uuid>",
+  "step": "trust_evaluated",
+  "payload": {
+    "verifier_trust_evaluated": true,
+    "verifier": "x509_san_dns:verifier.example.com",
+    "trusted": true,
+    "framework": "authzen",
+    "reason": "trust evaluation successful",
+    "context": {
+      "verifier_ids": [
+        { "verifier_id_type": "semantic",     "verifier_id": "semantic_id:VATSE-556000000101", "basis": "x5c-chain" },
+        { "verifier_id_type": "x509_san_dns", "verifier_id": "verifier.example.com",           "basis": "client-id-binding" }
+      ]
+    }
+  }
+}
+```
+
+`context` contains only `verifier_ids` from the PDP response; every other
+member of the PDP context (such as `reason` and `trust_metadata`, which are
+admin-visible) is never forwarded, and unknown members of each entry are
+dropped. Each entry is `{verifier_id_type, verifier_id, basis?}`. `context` is
+omitted when there are no `verifier_ids`. `verifier_ids` is
+present only when the PDP policy enables it and the identifier was verified;
+`verifier_id_type` is an opaque string, `verifier_id` is in the canonical form
+the PDP defines for that type (`semantic_id:<value>`, the lower-case A-label
+DNS name for `x509_san_dns`, the SAN URI byte for byte for `x509_san_uri`, the
+full DID, or the OpenID Federation entity id), and `basis` says how it was
+verified. A wallet that needs a stable verifier identifier (for example as
+input to a pseudonym function) reads it from here. Clients MUST ignore members
+they do not understand. The progress is informational: an untrusted verdict is
+still followed by a flow error.
+
+#### Verifier `client_metadata` (optional)
+
+The `credential_selection` progress message, the `match_request` message and
+the `sign_request` params of a `sign_presentation` action may carry an optional
+`client_metadata` member: the verifier's `client_metadata` JSON object, passed
+verbatim from the validated request object (inline, or fetched from
+`client_metadata_uri`). It is omitted when the request had none. Clients MUST
+ignore members they do not understand.
+
+The engine bounds the object at 64 KB (`MaxClientMetadataBytes`) however it
+arrives, because it is relayed three times per flow. Larger inline metadata
+fails the request parse (`request_parse_error`); a larger
+`client_metadata_uri` response is treated like an unusable one: no metadata is
+used or relayed, and the flow continues without it. Nothing is truncated.
+
+The engine only models the members it uses itself, so this object is how a
+wallet sees the rest, notably `vp_formats_supported`. For a `zkp_req`
+presentation (typically `response_mode=direct_post.jwt`) that carries the
+`system_id_values` and `proof_system_values` the wallet chooses its circuit
+and proof system from:
+
+```
+{
+  "type": "match_request",
+  "flow_id": "<uuid>",
+  "message_id": "<uuid>",
+  "dcql_query": { "credentials": [ { "id": "zkp", "format": "zkp_req", "_req": [ ... ] } ] },
+  "client_metadata": {
+    "jwks": { "keys": [ ... ] },
+    "vp_formats_supported": {
+      "zkp_req": {
+        "system_id_values": ["longfellow-libzk-v1"],
+        "proof_system_values": ["vega"]
+      }
+    }
+  }
+}
+```
+
+For `direct_post.jwt`, `sign_request` params also carry `verifier_jwk_thumbprint`:
+the unpadded base64url SHA-256 JWK Thumbprint (RFC 7638) of the verifier's
+response-encryption key. If that key cannot be read the engine fails the flow
+with a `SIGN_ERROR` flow error instead of sending an empty value. It is kept
+for compatibility: a client computes the mdoc session-transcript thumbprint from
+`response_encryption.jwk` and must not rely on this value when the two disagree.
+
+#### Verified request inputs (`verified_request`)
+
+The `credential_selection` progress message, the `match_request` message and
+the `sign_request` params of a `sign_presentation` action carry the same
+optional `verified_request` object: the OpenID4VP request as the engine
+validated it. It is built once per flow and emitted identically at all three
+points, so a wallet applies one policy over the whole flow and over every
+transport (including a redirect flow, not only the DC API). It carries no
+trust verdict; the wallet MUST still require `verifier.trusted`. The members
+are additive, and clients MUST ignore members they do not understand.
+
+| Member | Meaning |
+|--------|---------|
+| `client_id` | The request's own `client_id`, after the client_id match and scheme-prefix checks. Not the admin-configured VP audience that `verifier.client_id` carries. |
+| `client_id_scheme` | `x509_san_dns`, `x509_san_uri`, `x509_hash`, `did`/`decentralized_identifier`, `verifier_attestation`, `redirect_uri`. |
+| `response_mode` | `direct_post`, `direct_post.jwt`, `query`, `fragment`. A wallet refuses a `zkp_req` presentation over a non-encrypted mode; the engine does not do that itself. |
+| `response_uri` | The validated `response_uri` (the `redirect_uri` when the request has no `response_uri`). |
+| `signed` | `true` only when `signature_verification` is `"verified"`. A client that does not know the field reads it as not signed. |
+| `signature_verification` | `"verified"`, `"deferred"` or `"none"`. |
+| `client_metadata` | The verifier's `client_metadata`, verbatim, as below. |
+
+`signature_verification` states what the engine itself established: that the
+request object's signature verified against a key the scheme binds to
+`client_id`.
+
+| Scheme | `verified` when | Otherwise |
+|--------|-----------------|-----------|
+| `x509_san_dns`, `x509_san_uri`, `x509_hash` | the JWT signature verified against the header `x5c` | the flow fails |
+| `did`, `decentralized_identifier` | the signature verified against a key resolved for the DID (verifier PDP configured) | `deferred` with no verifier PDP: resolution and verification are left to the frontend |
+| `verifier_attestation` | the signature verified against the attestation's `cnf` key and the PDP is configured to validate the attestation | `deferred` with no verifier PDP: nothing has checked the attestation that binds `cnf` to `client_id` |
+| `redirect_uri` | never | `none`: a valid embedded key proves possession only |
+
+`deferred` MUST NOT be treated as verified. For the x509 schemes the SAN or
+hash binding to `client_id` is the PDP's check, which is why `verifier.trusted`
+stays mandatory.
+
+```
+"verified_request": {
+  "client_id": "x509_san_dns:verifier.example.com",
+  "client_id_scheme": "x509_san_dns",
+  "response_mode": "direct_post.jwt",
+  "response_uri": "https://verifier.example.com/response",
+  "signed": true,
+  "signature_verification": "verified",
+  "client_metadata": { "vp_formats_supported": { ... } }
+}
+```
+
+`"client_id": "did:web:verifier.example.com"` with no PDP gives
+`"signed": false, "signature_verification": "deferred"`; a `redirect_uri`
+request gives `"signed": false, "signature_verification": "none"`.
+
+The OID4VP handler does not send `match_request`: it hands the DCQL query to the
+client inside `credential_selection`, where the client matches and asks for
+consent in one step. `match_request` stays for flows that match first, and
+carries the same `verified_request` when sent. The top-level `client_metadata`
+member of all three messages is unchanged.
+
 #### User Consent
 
 Server prompts for user consent with the matched credentials:
@@ -1049,6 +1190,63 @@ Client → Server:
   "vp_token": "eyJ..."
 }
 ```
+
+#### Encrypted response (`direct_post.jwt`)
+
+For `response_mode=direct_post.jwt` the engine does not see the `vp_token`: the
+`sign_request` params additionally carry the recipient the client encrypts to,
+and the client answers with a finished JWE (see
+[engine-blind-encryption.md](engine-blind-encryption.md)).
+
+```
+Server → Client:
+{
+  "type": "sign_request",
+  "flow_id": "<uuid>",
+  "message_id": "<uuid>",
+  "action": "sign_presentation",
+  "params": {
+    "audience": "x509_san_dns:verifier.example.com",
+    "nonce": "verifier-nonce-123",
+    "credentials_to_include": [ { "credential_id": "local-cred-id-1", "credential_query_id": "q" } ],
+    "verified_request": { "client_id": "x509_san_dns:verifier.example.com", "response_mode": "direct_post.jwt", "response_uri": "https://verifier.example.com/response", "signed": true, "signature_verification": "verified" },
+    "response_encryption": {
+      "jwk": { "kty": "EC", "crv": "P-256", "x": "...", "y": "...", "kid": "verifier-enc-1", "use": "enc" },
+      "alg": "ECDH-ES",
+      "enc": "A128GCM"
+    },
+    "state": "state-1"
+  }
+}
+```
+
+```
+Client → Server:
+{
+  "type": "sign_response",
+  "flow_id": "<uuid>",
+  "message_id": "<uuid>",
+  "response_jwe": "<compact JWE>"
+}
+```
+
+The client builds the `vp_token` (for DCQL an object keyed by credential query
+id), the JARM claims (`iss` `https://self-issued.me/v2`, `aud` from
+`verified_request.client_id`, `iat`, `exp` = `iat` + 300, `vp_token`, `state`
+when present) and the compact JWE (`alg`/`enc` as requested, `kid` in the
+protected header; clients SHOULD NOT set `cty`, the plaintext is plain JSON
+claims, and the engine does not check it). The engine POSTs `response=<jwe>` to the
+validated `response_uri` and relays the verifier's `redirect_uri`. It refuses an
+empty, oversized, non-compact or mismatching `response_jwe`, and a
+`sign_response` that also carries `vp_token`, with a `SIGN_ERROR` flow error (no
+`details.redirect_uri`); the verifier is not contacted, because an error for
+`direct_post.jwt` would itself have to be a JARM JWT, which the engine does not
+build, so the verifier session ends by timeout. It never encrypts for the client.
+The key and algorithms are resolved by the engine (`client_metadata.jwks`
+`use=enc`, else the request JWT's `x5c`; `alg` from `client_metadata`, else the
+JWK, else the key type; `enc` defaults to `A128GCM`); when none can be resolved
+no `sign_request` is sent. Plain `direct_post`, `query` and `fragment` are
+unchanged: the client returns `vp_token`.
 
 #### Response Submission
 
