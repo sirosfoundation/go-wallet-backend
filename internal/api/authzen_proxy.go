@@ -833,7 +833,7 @@ func (h *AuthZENProxyHandler) resolveAuthorizationServerMetadata(c *gin.Context,
 	// an additional request to /.well-known/openid-credential-issuer
 	// which can interfere with conformance suite state machines.
 	// The caller can pass the authorization server URL directly if different.
-	wellKnown, err := oidc.WellKnownURL(issuerURL, "oauth-authorization-server")
+	wellKnown, err := oidc.AuthorizationServerMetadataURL(issuerURL)
 	if err != nil {
 		h.logger.Error("could not construct authorization server well-known URL",
 			zap.String("issuer_url", issuerURL),

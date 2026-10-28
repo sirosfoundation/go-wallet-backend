@@ -2068,8 +2068,8 @@ func (h *OID4VCIHandler) fetchOAuthMetadata(ctx context.Context, metadata *Issue
 	// RFC 8414 §2: the issuer identifier MUST NOT include a trailing '/'
 	authServer = strings.TrimRight(authServer, "/")
 
-	// RFC 8615 well-known URI construction for OAuth AS metadata
-	oauthMetadataURL, err := oidc.WellKnownURL(authServer, "oauth-authorization-server")
+	// Well-known URL construction for OAuth AS metadata (RFC 8414 section 3.1)
+	oauthMetadataURL, err := oidc.AuthorizationServerMetadataURL(authServer)
 	if err != nil {
 		return nil
 	}

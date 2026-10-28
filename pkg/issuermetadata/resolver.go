@@ -305,10 +305,12 @@ type ResolveResult struct {
 // using a TTL-cached result when available.
 //
 // The issuerURL must use HTTPS (unless AllowHTTP is set in Config).
-// The identifier is used exactly as given (no normalisation); only the
-// well-known URL construction removes a terminating slash (section 12.2.2).
-// The endpoint queried follows RFC 8615:
-// https://{host}/.well-known/openid-credential-issuer{path}.
+// The identifier is used exactly as given (no normalisation) for the identity
+// check and the cache key.
+// The endpoints queried are formed per OpenID4VCI 1.0 section 12.2.2 (literal
+// path insertion) and, on HTTP 404 only, the 1.1 draft form with a terminating
+// slash removed; see oidc.CredentialIssuerMetadataURLs. RFC 8615 defines only
+// the /.well-known/ namespace.
 //
 // When the fetched document contains a signed_metadata field, its JWT
 // signature is verified against the issuer's JWKS (inline jwks or jwks_uri).
@@ -360,12 +362,29 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 			return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial}, nil
 		}
 
-		// RFC 8615 well-known URI construction (required since OID4VCI draft 16):
-		// https://{host}/.well-known/openid-credential-issuer{path}
-		metadataURL, _ := oidc.WellKnownURL(issuerURL, "openid-credential-issuer") // already validated above
+		// Candidate metadata URLs, derived from the identifier as received
+		// (see oidc.CredentialIssuerMetadataURLs): the OpenID4VCI 1.0 literal
+		// form first, then the 1.1 draft form (terminating slash removed).
+		// The second is tried ONLY when the first answers HTTP 404; 5xx,
+		// timeouts, network errors and every other status are returned as they
+		// are, so a failing issuer is not hit twice and real failures are not
+		// masked. Both use the same guarded client and the same size, timeout
+		// and content-type rules. Whichever URL serves the document, its
+		// credential_issuer / sub is compared exactly with issuerURL; a
+		// mismatch is never retried against the other form.
+		candidates, _ := oidc.CredentialIssuerMetadataURLs(issuerURL) // already validated above
 		fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer fetchCancel()
-		result, err := r.fetch(fetchCtx, issuerURL, metadataURL)
+		var result *fetchResult
+		var err error
+		for i, metadataURL := range candidates {
+			result, err = r.fetch(fetchCtx, issuerURL, metadataURL)
+			var se *statusError
+			if err != nil && errors.As(err, &se) && se.status == http.StatusNotFound && i < len(candidates)-1 {
+				continue
+			}
+			break
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -426,8 +445,14 @@ func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*f
 			break
 		}
 	}
-	return nil, fmt.Errorf("issuer returned HTTP %d", lastStatus)
+	return nil, &statusError{status: lastStatus}
 }
+
+// statusError reports a non-200 metadata response. The resolver falls back to
+// the next candidate URL only for 404.
+type statusError struct{ status int }
+
+func (e *statusError) Error() string { return fmt.Sprintf("issuer returned HTTP %d", e.status) }
 
 // fetchOnce performs a single metadata GET with the given Accept header. It
 // returns the parsed result only on HTTP 200; on any other status it returns

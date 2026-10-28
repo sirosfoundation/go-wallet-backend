@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -479,23 +480,195 @@ func TestResolve_Cached(t *testing.T) {
 	}
 }
 
-// Section 12.2.2: a terminating slash is removed from the identifier only when
-// building the well-known URL; the identifier (and credential_issuer) keep it.
-func TestResolve_TrailingSlashOnlyRemovedFromWellKnownURL(t *testing.T) {
-	var gotPath string
-	var server *httptest.Server
-	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL + "/tenant/"}) //nolint:errcheck
-	}))
-	defer server.Close()
+// candidateServer serves metadata per request path. status maps a path to an
+// HTTP status (default 200); docIssuer maps a path to the credential_issuer it
+// declares (default: the identifier given by want).
+type candidateServer struct {
+	*httptest.Server
+	paths  []string
+	status map[string]int
+	claim  map[string]string
+}
 
-	if _, err := newTestResolver(t).Resolve(context.Background(), server.URL+"/tenant/"); err != nil {
-		t.Fatalf("Resolve() error: %v", err)
+func newCandidateServer(t *testing.T) *candidateServer {
+	t.Helper()
+	cs := &candidateServer{status: map[string]int{}, claim: map[string]string{}}
+	cs.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cs.paths = append(cs.paths, r.URL.EscapedPath())
+		if st, ok := cs.status[r.URL.EscapedPath()]; ok && st != 200 {
+			w.WriteHeader(st)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": cs.claim[r.URL.EscapedPath()]}) //nolint:errcheck
+	}))
+	t.Cleanup(cs.Close)
+	return cs
+}
+
+const wk = "/.well-known/openid-credential-issuer"
+
+// Issue 505 (OIDF conformance suite): the identifier keeps its trailing slash
+// in the first request (OpenID4VCI 1.0 section 12.2.2 literal), a 200 is used
+// and there is no second request.
+func TestResolve_Conformance505_LiteralFormFirstNoFallback(t *testing.T) {
+	cs := newCandidateServer(t)
+	id := cs.URL + "/test/a/siros-wallet-vci-test-tecca-1/"
+	cs.claim[wk+"/test/a/siros-wallet-vci-test-tecca-1/"] = id
+	if _, err := newTestResolver(t).Resolve(context.Background(), id); err != nil {
+		t.Fatal(err)
 	}
-	if gotPath != "/.well-known/openid-credential-issuer/tenant" {
-		t.Fatalf("well-known path = %q", gotPath)
+	if !reflect.DeepEqual(cs.paths, []string{wk + "/test/a/siros-wallet-vci-test-tecca-1/"}) {
+		t.Fatalf("requests = %v", cs.paths)
+	}
+}
+
+// 404 on the literal form falls back to the 1.1 draft form; its document is
+// checked exactly like any other.
+func TestResolve_404FallsBackToStrippedForm(t *testing.T) {
+	cs := newCandidateServer(t)
+	id := cs.URL + "/tenant/"
+	cs.status[wk+"/tenant/"] = 404
+	cs.claim[wk+"/tenant"] = id
+	if _, err := newTestResolver(t).Resolve(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(cs.paths, []string{wk + "/tenant/", wk + "/tenant"}) {
+		t.Fatalf("requests = %v", cs.paths)
+	}
+}
+
+func TestResolve_404OnBothIsAnError(t *testing.T) {
+	cs := newCandidateServer(t)
+	id := cs.URL + "/tenant/"
+	cs.status[wk+"/tenant/"] = 404
+	cs.status[wk+"/tenant"] = 404
+	_, err := newTestResolver(t).Resolve(context.Background(), id)
+	if err == nil || !strings.Contains(err.Error(), "404") {
+		t.Fatalf("expected HTTP 404 error, got %v", err)
+	}
+	if len(cs.paths) != 2 {
+		t.Fatalf("requests = %v", cs.paths)
+	}
+}
+
+// Only 404 falls back: 5xx and other statuses are terminal after one request.
+func TestResolve_NoFallbackOnOtherStatuses(t *testing.T) {
+	for _, st := range []int{500, 502, 503, 401, 403, 410} {
+		cs := newCandidateServer(t)
+		id := cs.URL + "/tenant/"
+		cs.status[wk+"/tenant/"] = st
+		cs.claim[wk+"/tenant"] = id
+		if _, err := newTestResolver(t).Resolve(context.Background(), id); err == nil {
+			t.Fatalf("status %d: expected error", st)
+		}
+		if len(cs.paths) != 1 {
+			t.Fatalf("status %d: fallback must not happen, requests = %v", st, cs.paths)
+		}
+	}
+}
+
+// A document whose credential_issuer differs by the slash is refused, whichever
+// candidate URL served it, and no other form is tried to find a match.
+func TestResolve_CredentialIssuerMismatchRefusedForEitherURL(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		idSlash bool
+		claim   func(id string) string
+		serve   string // path served with 200; the literal form 404s when it is "stripped"
+	}{
+		{"literal form, id has slash, claim without", true, func(id string) string { return strings.TrimSuffix(id, "/") }, "literal"},
+		{"literal form, id without slash, claim with", false, func(id string) string { return id + "/" }, "literal"},
+		{"fallback form, claim differs from slashed id", true, func(id string) string { return id + "x" }, "stripped"},
+		{"fallback form, claim without slash vs slashed id", true, func(id string) string { return strings.TrimSuffix(id, "/") }, "stripped"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := newCandidateServer(t)
+			id := cs.URL + "/tenant"
+			if tc.idSlash {
+				id += "/"
+			}
+			lit := wk + "/tenant"
+			if tc.idSlash {
+				lit += "/"
+			}
+			if tc.serve == "stripped" {
+				cs.status[lit] = 404
+				cs.claim[wk+"/tenant"] = tc.claim(id)
+			} else {
+				cs.claim[lit] = tc.claim(id)
+			}
+			_, err := newTestResolver(t).Resolve(context.Background(), id)
+			if err == nil || !strings.Contains(err.Error(), "does not match") {
+				t.Fatalf("expected credential_issuer mismatch, got %v", err)
+			}
+			want := 1
+			if tc.serve == "stripped" {
+				want = 2
+			}
+			if len(cs.paths) != want {
+				t.Fatalf("a mismatch must not trigger another lookup: %v", cs.paths)
+			}
+		})
+	}
+}
+
+func TestResolve_CandidatePaths(t *testing.T) {
+	for _, tc := range []struct {
+		name, path string
+		want       []string
+	}{
+		{"no path", "", []string{wk}},
+		{"bare root slash", "/", []string{wk + "/", wk}},
+		{"path", "/tenant", []string{wk + "/tenant"}},
+		{"percent-encoded", "/a%2Fb/", []string{wk + "/a%2Fb/", wk + "/a%2Fb"}},
+		{"repeated slash", "/t//", []string{wk + "/t//", wk + "/t/"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := newCandidateServer(t)
+			for _, p := range tc.want {
+				cs.status[p] = 404
+			}
+			// Every candidate 404s: the requests made are exactly the candidates, in order.
+			_, _ = newTestResolver(t).Resolve(context.Background(), cs.URL+tc.path)
+			if !reflect.DeepEqual(cs.paths, tc.want) {
+				t.Fatalf("requests = %v, want %v", cs.paths, tc.want)
+			}
+		})
+	}
+}
+
+// One cache entry per identifier as received, regardless of which URL served
+// it; "x" and "x/" are different identifiers.
+func TestResolve_CacheIsolationPathSpellings(t *testing.T) {
+	cs := newCandidateServer(t)
+	a, b := cs.URL+"/x", cs.URL+"/x/"
+	cs.claim[wk+"/x"] = a
+	cs.status[wk+"/x/"] = 404 // b falls back to wk/x, whose claim is a: refused for b
+	res := newTestResolver(t)
+	if _, err := res.Resolve(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := res.Resolve(context.Background(), b); err == nil {
+		t.Fatal("b must not be served from a's cache entry or accept a's document")
+	}
+	r, err := res.ResolveWithInfo(context.Background(), a)
+	if err != nil || !r.Cached {
+		t.Fatalf("a should still be cached: %v", err)
+	}
+	// Fallback success is cached under the identifier as received.
+	cs2 := newCandidateServer(t)
+	id := cs2.URL + "/t/"
+	cs2.status[wk+"/t/"] = 404
+	cs2.claim[wk+"/t"] = id
+	res2 := newTestResolver(t)
+	for i := 0; i < 2; i++ {
+		if _, err := res2.Resolve(context.Background(), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(cs2.paths) != 2 {
+		t.Fatalf("second Resolve must be a cache hit: %v", cs2.paths)
 	}
 }
 
