@@ -144,7 +144,6 @@ func TestCloseReason_ServerPaths(t *testing.T) {
 func TestCloseReason_Superseded_LogsBothSessions(t *testing.T) {
 	m, logs, wsURL := newObservedManager(t, testCfg())
 	const user = "dup-user-1234567890"
-	token1 := engineSessionToken(t, m, user)
 
 	ws1 := dialAndHandshakeAsUser(t, m, wsURL, user)
 	defer func() { _ = ws1.Close() }()
@@ -201,7 +200,8 @@ func TestCloseReason_Superseded_LogsBothSessions(t *testing.T) {
 	// No secrets anywhere in the logs.
 	for _, e := range logs.All() {
 		s := fmt.Sprint(e.ContextMap(), e.Message)
-		assert.NotContains(t, s, token1)
+		// dialAndHandshakeAsUser mints its own bearer tokens; any JWT would start with eyJ.
+		assert.NotContains(t, s, "eyJ")
 		assert.NotContains(t, s, "app_token")
 	}
 }
