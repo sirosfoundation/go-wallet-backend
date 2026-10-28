@@ -1660,3 +1660,42 @@ func TestResolve_SignedMetadataIdentityExact_Fallback(t *testing.T) {
 		})
 	}
 }
+
+// Identifier spellings from the preserve-only draft: each is requested at the
+// literal path first and, with a matching credential_issuer, accepted as is.
+func TestResolve_LiteralPathSpellingsAccepted(t *testing.T) {
+	for _, path := range []string{"", "/", "/test/a/issuer", "/test/a/issuer/", "/test/a/issuer//", "/path%2Fissuer/"} {
+		t.Run("path="+path, func(t *testing.T) {
+			cs := newCandidateServer(t)
+			id := cs.URL + path
+			cs.claim[wk+path] = id
+			if _, err := newTestResolver(t).Resolve(context.Background(), id); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(cs.paths, []string{wk + path}) {
+				t.Fatalf("requests = %v", cs.paths)
+			}
+		})
+	}
+}
+
+// An application/jwt payload with an exact sub but another credential_issuer
+// (or a non-string one) is refused; so is a non-string sub in signed_metadata.
+func TestValidateClaims_NonStringAndMixedIdentity(t *testing.T) {
+	id := "https://i.example"
+	if err := validateJWTClaims(map[string]interface{}{"sub": id, "iat": 1, "credential_issuer": "https://other.example"}, id); err == nil {
+		t.Error("JWT with other credential_issuer must be refused")
+	}
+	if err := validateJWTClaims(map[string]interface{}{"sub": id, "iat": 1, "credential_issuer": 5}, id); err == nil {
+		t.Error("JWT with non-string credential_issuer must be refused")
+	}
+	if err := validateJWTClaims(map[string]interface{}{"sub": id, "iat": 1, "credential_issuer": id}, id); err != nil {
+		t.Errorf("matching claims must pass: %v", err)
+	}
+	if err := validateSignedMetadataIdentity(map[string]interface{}{"sub": 5, "credential_issuer": id}, id); err == nil {
+		t.Error("non-string sub must be refused")
+	}
+	if err := validateSignedMetadataIdentity(map[string]interface{}{"credential_issuer": []string{id}}, id); err == nil {
+		t.Error("non-string credential_issuer must be refused")
+	}
+}

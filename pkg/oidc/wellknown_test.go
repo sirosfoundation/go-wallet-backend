@@ -42,7 +42,7 @@ func TestCredentialIssuerMetadataURLs(t *testing.T) {
 }
 
 // RFC 8414 section 3.1: terminating slash removed, no fallback.
-func TestAuthorizationServerMetadataURL(t *testing.T) {
+func TestAuthorizationServerMetadataURLs(t *testing.T) {
 	const w = "/.well-known/oauth-authorization-server"
 	for _, tt := range []struct {
 		name, in, want string
@@ -57,9 +57,15 @@ func TestAuthorizationServerMetadataURL(t *testing.T) {
 		{"invalid", "://not-a-url", "", true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := AuthorizationServerMetadataURL(tt.in)
-			if (err != nil) != tt.wantErr || got != tt.want {
-				t.Errorf("got %q err %v, want %q", got, err, tt.want)
+			got, err := AuthorizationServerMetadataURLs(tt.in)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err %v", err)
+			}
+			if tt.wantErr {
+				return
+			}
+			if len(got) != 1 || got[0] != tt.want {
+				t.Errorf("got %q, want [%q]", got, tt.want)
 			}
 		})
 	}

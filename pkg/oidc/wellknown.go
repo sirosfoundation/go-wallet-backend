@@ -60,13 +60,18 @@ func CredentialIssuerMetadataURLs(identifier string) ([]string, error) {
 	return []string{literal, stripped}, nil
 }
 
-// AuthorizationServerMetadataURL returns the OAuth 2.0 Authorization Server
-// Metadata URL for an issuer identifier. RFC 8414 section 3.1 requires any
-// terminating "/" to be removed from the issuer before inserting
-// "/.well-known/oauth-authorization-server" between host and path. There is no
-// fallback form.
-func AuthorizationServerMetadataURL(issuer string) (string, error) {
-	return insertWellKnown(issuer, authorizationServerWellKnown, true)
+// AuthorizationServerMetadataURLs returns the ordered candidate URLs for the
+// OAuth 2.0 Authorization Server Metadata of an issuer identifier. RFC 8414
+// section 3.1 removes a terminating "/" (exactly one) from the issuer before
+// inserting "/.well-known/oauth-authorization-server" between host and path.
+// Today that is the only candidate; the slice shape lets AS discovery add
+// further forms (see issue 510) without changing callers.
+func AuthorizationServerMetadataURLs(issuer string) ([]string, error) {
+	u, err := insertWellKnown(issuer, authorizationServerWellKnown, true)
+	if err != nil {
+		return nil, err
+	}
+	return []string{u}, nil
 }
 
 func insertWellKnown(identifier, suffix string, stripTerminatingSlash bool) (string, error) {

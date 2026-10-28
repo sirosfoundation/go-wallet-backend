@@ -598,8 +598,9 @@ func (r *Resolver) handleJSONResponse(ctx context.Context, issuerURL string, bod
 	}
 
 	// Bind the plain-JSON metadata document to the URL it was requested from.
-	// Per OpenID4VCI §11.2.1, credential_issuer MUST match the Credential
-	// Issuer Identifier that was used to fetch this metadata. Without this
+	// Per OpenID4VCI 1.0 section 12.2.4 (the same rule is in the 1.1 draft's
+	// Credential Issuer Metadata section), credential_issuer MUST be identical
+	// to the Credential Issuer Identifier that was used to fetch this metadata. Without this
 	// check a metadata document served from (or injected at) an unrelated
 	// path/host could impersonate a different issuer identifier.
 	if err := validateCredentialIssuerClaim(raw, issuerURL); err != nil {
@@ -627,16 +628,21 @@ func validateCredentialIssuerClaim(claims map[string]interface{}, issuerURL stri
 // validateSignedMetadataIdentity checks the identity claims of the verified
 // signed_metadata payload against the identifier exactly (no normalisation).
 func validateSignedMetadataIdentity(claims map[string]interface{}, issuerURL string) error {
-	sub, hasSub := claims["sub"].(string)
-	ci, hasCI := claims["credential_issuer"].(string)
+	subV, hasSub := claims["sub"]
+	ciV, hasCI := claims["credential_issuer"]
 	if !hasSub && !hasCI {
 		return fmt.Errorf("signed_metadata payload has neither 'sub' nor 'credential_issuer' to bind it to the issuer")
 	}
-	if hasSub && sub != issuerURL {
-		return fmt.Errorf("signed_metadata 'sub' claim %q does not match issuer URL %q", sub, issuerURL)
+	// Presence, not type: a non-string value is a mismatch, never a skip.
+	if hasSub {
+		if sub, _ := subV.(string); sub != issuerURL {
+			return fmt.Errorf("signed_metadata 'sub' claim %v does not match issuer URL %q", subV, issuerURL)
+		}
 	}
-	if hasCI && ci != issuerURL {
-		return fmt.Errorf("signed_metadata 'credential_issuer' claim %q does not match issuer URL %q", ci, issuerURL)
+	if hasCI {
+		if ci, _ := ciV.(string); ci != issuerURL {
+			return fmt.Errorf("signed_metadata 'credential_issuer' claim %v does not match issuer URL %q", ciV, issuerURL)
+		}
 	}
 	return nil
 }
@@ -809,6 +815,14 @@ func validateJWTClaims(claims map[string]interface{}, issuerURL string) error {
 	}
 	if sub != issuerURL {
 		return fmt.Errorf("JWT 'sub' claim %q does not match issuer URL %q", sub, issuerURL)
+	}
+	// The payload carries the metadata itself: when credential_issuer is
+	// present (any type) it must be the identifier too, since callers use it
+	// as the proof audience.
+	if v, present := claims["credential_issuer"]; present {
+		if ci, _ := v.(string); ci != issuerURL {
+			return fmt.Errorf("JWT 'credential_issuer' claim %v does not match issuer URL %q", v, issuerURL)
+		}
 	}
 
 	// iat MUST be present
