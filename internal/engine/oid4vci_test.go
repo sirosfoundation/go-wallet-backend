@@ -2930,6 +2930,42 @@ func TestFetchOAuthMetadata_InvalidIdentifierRefused(t *testing.T) {
 	}
 }
 
+// A served, identity-checked document that lacks the endpoint we need is an
+// error, not "no document": no guessed endpoint, and PAR requirements in it
+// are not dropped.
+func TestServedDocumentMissingEndpointsDoesNotGuess(t *testing.T) {
+	t.Run("token_endpoint", func(t *testing.T) {
+		var srv *httptest.Server
+		var paths *[]string
+		srv, paths = newASServer(t, nil)
+		srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			*paths = append(*paths, r.URL.Path)
+			if r.URL.Path == asRFC8414Path {
+				_, _ = w.Write([]byte(`{"issuer":"` + srv.URL + `"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"access_token":"at","token_type":"Bearer"}`))
+		})
+		h, _, cleanup := newClientAuthHandler(t, srv.Client(), supportingClient())
+		defer cleanup()
+		_, err := h.exchangePreAuthCode(context.Background(), &IssuerMetadata{CredentialIssuer: srv.URL}, "code", "")
+		require.Error(t, err)
+		assert.NotContains(t, *paths, "/token")
+	})
+	t.Run("authorization_endpoint", func(t *testing.T) {
+		var srv *httptest.Server
+		srv, _ = newASServer(t, nil)
+		srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte(`{"issuer":"` + srv.URL + `","require_pushed_authorization_requests":true}`))
+		})
+		h, cleanup := testOID4VCIHandler(t, srv.Client())
+		defer cleanup()
+		_, err := h.handleAuthorizationCode(context.Background(), &CredentialOffer{}, &IssuerMetadata{CredentialIssuer: srv.URL}, &CredentialConfig{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "no authorization_endpoint")
+	})
+}
+
 // ===== resumeWithAuthCode tests =====
 
 func TestResumeWithAuthCode_Success(t *testing.T) {

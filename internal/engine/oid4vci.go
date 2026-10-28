@@ -1875,12 +1875,8 @@ func (h *OID4VCIHandler) handlePreAuthorized(ctx context.Context, metadata *Issu
 
 	// Fetch OAuth metadata to get token endpoint if not in issuer metadata
 	if metadata.TokenEndpoint == "" {
-		oauthMeta, err := h.fetchOAuthMetadata(ctx, metadata)
-		if err != nil {
-			return nil, err
-		}
-		if oauthMeta != nil && oauthMeta.TokenEndpoint != "" {
-			metadata.TokenEndpoint = oauthMeta.TokenEndpoint
+		if _, err := h.discoverTokenEndpoint(ctx, metadata); err != nil {
+			return nil, h.failASDiscovery(StepExchangingToken, ErrCodeTokenError, err)
 		}
 	}
 
@@ -1941,18 +1937,8 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 // whole loop.
 func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMetadata, logContext string, setGrantParams func(data url.Values)) (*TokenResponse, error) {
 	if !h.asMetadataFetched {
-		oauthMeta, err := h.fetchOAuthMetadata(ctx, metadata)
-		switch {
-		case err != nil && metadata.TokenEndpoint == "":
-			// Nothing to take the token endpoint from and a document that must
-			// not be (or could not be) used: fail rather than guess.
-			return nil, err
-		case err != nil:
-			// The token endpoint is already known; discovery here only serves
-			// the optional challenge endpoint, and a refused document is unused.
-			h.Logger.Debug("authorization server metadata discovery failed", zap.Error(err))
-		case oauthMeta != nil && metadata.TokenEndpoint == "":
-			metadata.TokenEndpoint = oauthMeta.TokenEndpoint
+		if _, err := h.discoverTokenEndpoint(ctx, metadata); err != nil {
+			return nil, h.failASDiscovery(StepExchangingToken, ErrCodeTokenError, err)
 		}
 	}
 
@@ -2080,6 +2066,45 @@ func (h *OID4VCIHandler) exchangeRefreshToken(ctx context.Context, metadata *Iss
 	})
 }
 
+// discoverTokenEndpoint runs AS discovery for a token request. It sets
+// metadata.TokenEndpoint from the document when issuer metadata supplied none.
+//
+//   - Token endpoint already known: discovery is best effort (it still feeds the
+//     optional challenge endpoint and PKCE hints); a failed or refused document
+//     is not used and not fatal.
+//   - Not known: a failure, or a served document without token_endpoint, is an
+//     error. Only when no document exists at all ((nil, nil)) may the caller
+//     guess <issuer>/token.
+func (h *OID4VCIHandler) discoverTokenEndpoint(ctx context.Context, metadata *IssuerMetadata) (*oauthServerMetadata, error) {
+	oauthMeta, err := h.fetchOAuthMetadata(ctx, metadata)
+	if metadata.TokenEndpoint != "" {
+		if err != nil {
+			h.Logger.Debug("authorization server metadata discovery failed", zap.Error(err))
+			return nil, nil
+		}
+		return oauthMeta, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if oauthMeta == nil {
+		return nil, nil
+	}
+	if oauthMeta.TokenEndpoint == "" {
+		return nil, errors.New("authorization server metadata has no token_endpoint")
+	}
+	metadata.TokenEndpoint = oauthMeta.TokenEndpoint
+	return oauthMeta, nil
+}
+
+// failASDiscovery tells the client the flow failed (sanitized, fixed text: the
+// underlying error is logged, never sent) and returns err.
+func (h *OID4VCIHandler) failASDiscovery(step FlowStep, code ErrorCode, err error) error {
+	h.Logger.Warn("authorization server metadata discovery failed", zap.Error(err))
+	_ = h.Error(step, code, code.UserFacingMessage())
+	return err
+}
+
 // maxASMetadataBytes bounds an authorization server metadata document.
 const maxASMetadataBytes = 1 << 20
 
@@ -2141,10 +2166,17 @@ func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *Cre
 
 	oauthMeta, err := h.fetchOAuthMetadata(ctx, metadata)
 	if err != nil {
-		return nil, err
+		return nil, h.failASDiscovery(StepAuthorizationReq, ErrCodeAuthorizationFail, err)
 	}
-	if oauthMeta == nil || oauthMeta.AuthorizationEndpoint == "" {
-		// Fallback (no document found at all, or no authorization_endpoint in it;
+	if oauthMeta != nil && oauthMeta.AuthorizationEndpoint == "" {
+		// A served, identity-checked document without authorization_endpoint is
+		// not a "no document" case: no guess, and its other members (such as
+		// require_pushed_authorization_requests) must not be dropped.
+		return nil, h.failASDiscovery(StepAuthorizationReq, ErrCodeAuthorizationFail,
+			errors.New("authorization server metadata has no authorization_endpoint"))
+	}
+	if oauthMeta == nil {
+		// Fallback: discovery found no document at all (every candidate 404);
 		// never reached after an issuer mismatch or a failed request): construct auth URL directly, no PAR
 		return h.startAuthorizationFlow(ctx, offer, metadata, selectedConfig, &oauthServerMetadata{
 			AuthorizationEndpoint: fallbackEndpoint,
@@ -2466,18 +2498,9 @@ func (h *OID4VCIHandler) resumeWithAuthCode(ctx context.Context, msg *FlowStartM
 	_ = h.ProgressMessage(StepAuthorizationReq, "Resuming flow with authorization code")
 
 	// Fetch OAuth metadata to get token endpoint and check PKCE requirements
-	oauthMeta, err := h.fetchOAuthMetadata(ctx, metadata)
+	oauthMeta, err := h.discoverTokenEndpoint(ctx, metadata)
 	if err != nil {
-		if metadata.TokenEndpoint == "" {
-			return nil, err
-		}
-		// Token endpoint already known: a refused or failed document is simply
-		// not used (PKCE is then assumed required below).
-		h.Logger.Debug("authorization server metadata discovery failed", zap.Error(err))
-		oauthMeta = nil
-	}
-	if oauthMeta != nil && oauthMeta.TokenEndpoint != "" && metadata.TokenEndpoint == "" {
-		metadata.TokenEndpoint = oauthMeta.TokenEndpoint
+		return nil, h.failASDiscovery(StepAuthorizationReq, ErrCodeAuthorizationFail, err)
 	}
 
 	// Validate code_verifier: PKCE defaults to enabled (OID4VCI spec), so if the

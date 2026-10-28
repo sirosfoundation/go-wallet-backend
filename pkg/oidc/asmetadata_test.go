@@ -39,6 +39,9 @@ func TestFetchAuthorizationServerMetadata(t *testing.T) {
 		{"410 no fallback", "", map[string]route{rfc: {410, issuerDoc(self)}, oidcPath: {200, issuerDoc(self)}}, nil, 410, []string{rfc}},
 		{"mismatch RFC form", "", map[string]route{rfc: {200, issuerDoc(func(string) string { return "https://evil.example" })}, oidcPath: {200, issuerDoc(self)}}, ErrASIssuerMismatch, 0, []string{rfc}},
 		{"mismatch OIDC form", "", map[string]route{oidcPath: {200, issuerDoc(func(b string) string { return b + "/" })}}, ErrASIssuerMismatch, 0, []string{rfc, oidcPath}},
+		{"uppercase Issuer only", "", map[string]route{rfc: {200, func(b string) string { return `{"Issuer":"` + b + `"}` }}}, ErrASIssuerMismatch, 0, []string{rfc}},
+		{"lowercase wrong, uppercase right", "", map[string]route{rfc: {200, func(b string) string { return `{"issuer":"https://other.example","Issuer":"` + b + `"}` }}}, ErrASIssuerMismatch, 0, []string{rfc}},
+		{"issuer not a string", "", map[string]route{rfc: {200, func(string) string { return `{"issuer":1}` }}}, ErrASIssuerMismatch, 0, []string{rfc}},
 		{"not JSON", "", map[string]route{rfc: {200, func(string) string { return "nope" }}}, ErrASMetadataInvalid, 0, []string{rfc}},
 		{"too large", "", map[string]route{rfc: {200, func(b string) string { return `{"issuer":"` + b + `","x":"` + strings.Repeat("a", 4096) + `"}` }}}, ErrASMetadataInvalid, 0, []string{rfc}},
 	} {

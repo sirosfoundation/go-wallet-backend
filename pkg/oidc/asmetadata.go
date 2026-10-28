@@ -103,13 +103,15 @@ func FetchAuthorizationServerMetadata(ctx context.Context, client *http.Client, 
 		if status != http.StatusOK {
 			return nil, &ASMetadataStatusError{Status: status}
 		}
-		var doc struct {
-			Issuer string `json:"issuer"`
-		}
-		if err := json.Unmarshal(body, &doc); err != nil {
+		// Struct decoding matches member names case-insensitively, so decode to
+		// a map and require the exact lowercase "issuer" member, a string equal
+		// to the identifier.
+		var members map[string]json.RawMessage
+		if err := json.Unmarshal(body, &members); err != nil {
 			return nil, ErrASMetadataInvalid
 		}
-		if doc.Issuer != identifier {
+		var iss string
+		if raw, ok := members["issuer"]; !ok || json.Unmarshal(raw, &iss) != nil || iss != identifier {
 			return nil, ErrASIssuerMismatch
 		}
 		return body, nil
