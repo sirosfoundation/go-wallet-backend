@@ -252,3 +252,18 @@ func TestIssueCredential_InvalidNonceRetry_ResendsAuxiliaryDataAndEncryptionOffe
 	}
 	assert.NotEqual(t, string(reqs[0]["nonce"]), string(reqs[1]["nonce"]))
 }
+
+// A c_nonce of the wrong type must not hide the error code: a conflict stays
+// terminal, and an invalid_nonce still retries (with the Nonce Endpoint's nonce).
+func TestIssueCredential_NonStringCNonce(t *testing.T) {
+	ni, fc, logs, err := runNonceRetry(t, true, `{"error":"auxiliary_data_conflict","c_nonce":123,"error_description":"SECRET-N"}`, "")
+	require.Error(t, err)
+	assert.Equal(t, 1, ni.credCalls, "a conflict is never retried")
+	assert.NotContains(t, logs, "SECRET-N")
+	fc.settle()
+	assert.Equal(t, 1, countFlowErrors(fc))
+
+	ni, _, _, err = runNonceRetry(t, true, `{"error":"invalid_nonce","c_nonce":123}`, "")
+	require.NoError(t, err)
+	assert.Equal(t, 2, ni.credCalls)
+}

@@ -2936,6 +2936,10 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			// conflict check classified. Nonce detection uses only this read.
 			var errResp errorBodyWire
 			parsedErr := decodeStrict(body, &errResp) == nil
+			var nonceResp errorNonceWire
+			if decodeStrict(body, &nonceResp) != nil {
+				nonceResp = errorNonceWire{} // a non-string c_nonce is no nonce
+			}
 			// Only the error code is logged, never the body or error_description:
 			// they are issuer-controlled free text, may echo a commitment, and
 			// legacy ones carry a nonce.
@@ -2947,9 +2951,9 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			// send a flow error here: that is the caller's responsibility when
 			// no retry is possible. The error carries the code only: a legacy
 			// description may hold the nonce.
-			if parsedErr && (errResp.Error == "invalid_nonce" || errResp.CNonce != "") {
+			if parsedErr && (errResp.Error == "invalid_nonce" || nonceResp.CNonce != "") {
 				return nil, &CNonceRequiredError{
-					NewNonce: errResp.CNonce,
+					NewNonce: nonceResp.CNonce,
 					Err:      oauthErrorCodeOnly(resp.StatusCode, body),
 				}
 			}
@@ -3363,7 +3367,13 @@ const auxiliaryDataConflictCode = "auxiliary_data_conflict"
 // errorBodyWire is the member of a credential endpoint error body the engine
 // classifies on.
 type errorBodyWire struct {
-	Error  string `json:"error"`
+	Error string `json:"error"`
+}
+
+// errorNonceWire is the refreshed nonce an older issuer puts in an error body.
+// It is decoded apart from errorBodyWire so that a c_nonce of the wrong type can
+// never keep the error code (an auxiliary_data_conflict, say) from being read.
+type errorNonceWire struct {
 	CNonce string `json:"c_nonce"`
 }
 
