@@ -508,6 +508,12 @@ Common fields: `session_id`, `session` (short user id), `tenant_id`,
 `remote_addr` (the raw socket peer: behind a proxy this is the proxy, not the
 client), `session_age`, `ping_interval`, `pong_timeout`.
 
+The default JSON logger uses zap's production sampling (the first 100 lines
+per second for a given level and message are kept, then every 100th), so a
+burst of more than 100 disconnects in one second can drop some `Session close
+reason` lines. The counter is never sampled and is the exact source for
+totals.
+
 When a connection supersedes another, the `Closing existing session` Info
 line carries `old_session_id`/`new_session_id`, both ages and both remote
 addresses, and the new connection's `Session established` line carries
