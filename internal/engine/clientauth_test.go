@@ -613,3 +613,152 @@ func TestAccessTokenHash(t *testing.T) {
 	// RFC 9449 §4.2: base64url(SHA-256(access_token)), unpadded.
 	assert.Equal(t, "fUHyO2r2Z3DZ53EsNrWBb0xWXoaNy59IiKCAqksmQEo", accessTokenHash("Kz~8mXK1EalYznwH-LC-1fBAo.4Ljp~zsPE_NeO.gxU"))
 }
+
+// scriptedTokenAS is an AS whose token endpoint answers from a script, one
+// step per request. withChallengeEndpoint controls whether its metadata
+// advertises a challenge_endpoint (handing out chal-1, chal-2, ...).
+type scriptedTokenAS struct {
+	*httptest.Server
+	mu            sync.Mutex
+	steps         []func(w http.ResponseWriter)
+	tokenHits     int
+	challengeHits int
+}
+
+func tokenStepUseChallenge(challenge string) func(w http.ResponseWriter) {
+	return func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("OAuth-Client-Attestation-Challenge", challenge)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"use_attestation_challenge"}`))
+	}
+}
+
+func tokenStepUseNonce(nonce string) func(w http.ResponseWriter) {
+	return func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("DPoP-Nonce", nonce)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"use_dpop_nonce"}`))
+	}
+}
+
+func tokenStepOK(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"access_token":"at","token_type":"DPoP"}`))
+}
+
+func newScriptedTokenAS(t *testing.T, withChallengeEndpoint bool, steps ...func(w http.ResponseWriter)) *scriptedTokenAS {
+	t.Helper()
+	as := &scriptedTokenAS{steps: steps}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		ce := ""
+		if withChallengeEndpoint {
+			ce = `,"challenge_endpoint":"` + as.URL + `/challenge"`
+		}
+		_, _ = w.Write([]byte(`{"issuer":"` + as.URL + `","token_endpoint":"` + as.URL + `/token"` + ce + `}`))
+	})
+	mux.HandleFunc("/challenge", func(w http.ResponseWriter, r *http.Request) {
+		as.mu.Lock()
+		as.challengeHits++
+		n := as.challengeHits
+		as.mu.Unlock()
+		w.Header().Set("OAuth-Client-Attestation-Challenge", "chal-"+strconv.Itoa(n))
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		as.mu.Lock()
+		i := as.tokenHits
+		as.tokenHits++
+		as.mu.Unlock()
+		if i >= len(as.steps) {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		as.steps[i](w)
+	})
+	as.Server = httptest.NewServer(mux)
+	t.Cleanup(as.Close)
+	return as
+}
+
+func exchangeScripted(t *testing.T, as *scriptedTokenAS, client *clientAuthClient) error {
+	t.Helper()
+	h, _, cleanup := newClientAuthHandler(t, as.Client(), client)
+	defer cleanup()
+	metadata := &IssuerMetadata{CredentialIssuer: as.URL, TokenEndpoint: as.URL + "/token"}
+	_, err := h.exchangePreAuthCode(context.Background(), metadata, "code", "")
+	return err
+}
+
+// A request rejected with use_dpop_nonce was not accepted, so the challenge it
+// carried may not have been consumed. Without a challenge endpoint the engine
+// cannot fetch another one, so the retry must resend the same challenge along
+// with the nonce rather than drop it.
+func TestChallengeRetry_NoEndpoint_NonceRetryKeepsChallenge(t *testing.T) {
+	as := newScriptedTokenAS(t, false,
+		tokenStepUseChallenge("C1"), tokenStepUseNonce("N1"), tokenStepOK)
+	client := supportingClient()
+	require.NoError(t, exchangeScripted(t, as, client))
+
+	reqs := client.seen()
+	require.Len(t, reqs, 3)
+	assert.Empty(t, reqs[0].Params.AttestationChallenge)
+	assert.Equal(t, "C1", reqs[1].Params.AttestationChallenge)
+	assert.Empty(t, reqs[1].Params.DPoPNonce)
+	assert.Equal(t, "C1", reqs[2].Params.AttestationChallenge, "nonce-only retry must keep the challenge")
+	assert.Equal(t, "N1", reqs[2].Params.DPoPNonce)
+}
+
+// With a challenge endpoint, a nonce retry gets a fresh challenge (the early
+// fetch consumed the first one into the rejected PoP).
+func TestChallengeRetry_Endpoint_NonceRetryCarriesFreshChallenge(t *testing.T) {
+	as := newScriptedTokenAS(t, true, tokenStepUseNonce("N1"), tokenStepOK)
+	client := supportingClient()
+	require.NoError(t, exchangeScripted(t, as, client))
+
+	reqs := client.seen()
+	require.Len(t, reqs, 2)
+	assert.Equal(t, "chal-1", reqs[0].Params.AttestationChallenge)
+	assert.Equal(t, "chal-2", reqs[1].Params.AttestationChallenge)
+	assert.Equal(t, "N1", reqs[1].Params.DPoPNonce)
+}
+
+// challenge -> nonce -> challenge again (the AS consumed the first one) ->
+// success needs four requests: nonce retries must not eat the budget the
+// challenge retries need.
+func TestChallengeRetry_NonceRetryDoesNotExhaustBudget(t *testing.T) {
+	as := newScriptedTokenAS(t, false,
+		tokenStepUseChallenge("C1"), tokenStepUseNonce("N1"), tokenStepUseChallenge("C2"), tokenStepOK)
+	client := supportingClient()
+	require.NoError(t, exchangeScripted(t, as, client))
+
+	reqs := client.seen()
+	require.Len(t, reqs, 4)
+	assert.Equal(t, "C2", reqs[3].Params.AttestationChallenge)
+	assert.Equal(t, "N1", reqs[3].Params.DPoPNonce)
+}
+
+// A challenge bound into an earlier PoP (PAR) must not be resurrected for an
+// unrelated token request's nonce retry.
+func TestChallengeRetry_NoEndpoint_NonceRetryDoesNotResurrectOldChallenge(t *testing.T) {
+	as := newScriptedTokenAS(t, false, tokenStepUseNonce("N1"), tokenStepOK)
+	client := supportingClient()
+	h, _, cleanup := newClientAuthHandler(t, as.Client(), client)
+	defer cleanup()
+	h.attestationChallenge = "par-chal"
+	_, err := h.resolveClientAuth(context.Background(), clientAuthNeeds{attestation: true}) // PAR consumes it
+	require.NoError(t, err)
+
+	metadata := &IssuerMetadata{CredentialIssuer: as.URL, TokenEndpoint: as.URL + "/token"}
+	_, err = h.exchangePreAuthCode(context.Background(), metadata, "code", "")
+	require.NoError(t, err)
+
+	reqs := client.seen()
+	require.Len(t, reqs, 3)
+	assert.Equal(t, "par-chal", reqs[0].Params.AttestationChallenge)
+	assert.Empty(t, reqs[1].Params.AttestationChallenge)
+	assert.Empty(t, reqs[2].Params.AttestationChallenge)
+}

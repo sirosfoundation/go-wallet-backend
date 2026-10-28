@@ -44,15 +44,16 @@ type CredentialIssuerLookup interface {
 // OID4VCIHandler handles OpenID4VCI credential issuance flows
 type OID4VCIHandler struct {
 	BaseHandler
-	httpClient           *http.Client
-	metadataResolver     MetadataResolver
-	issuerLookup         CredentialIssuerLookup // optional; nil-safe
-	dpopKey              *ecdsa.PrivateKey      // ephemeral DPoP key pair (RFC 9449)
-	dpopNonce            string                 // server-provided DPoP nonce (RFC 9449 §8)
-	attestationChallenge string                 // server-provided Client Attestation PoP challenge (attestation-based client auth)
-	challengeEndpoint    string                 // AS challenge endpoint for fetching attestation challenges
-	asMetadataFetched    bool                   // AS metadata fetch attempted (see fetchOAuthMetadata)
-	redirectURI          string
+	httpClient               *http.Client
+	metadataResolver         MetadataResolver
+	issuerLookup             CredentialIssuerLookup // optional; nil-safe
+	dpopKey                  *ecdsa.PrivateKey      // ephemeral DPoP key pair (RFC 9449)
+	dpopNonce                string                 // server-provided DPoP nonce (RFC 9449 §8)
+	attestationChallenge     string                 // server-provided Client Attestation PoP challenge (attestation-based client auth)
+	lastAttestationChallenge string                 // challenge most recently bound into a PoP (see restoreChallengeForNonceRetry)
+	challengeEndpoint        string                 // AS challenge endpoint for fetching attestation challenges
+	asMetadataFetched        bool                   // AS metadata fetch attempted (see fetchOAuthMetadata)
+	redirectURI              string
 	// encryptedNotificationRegistered is set once the notification context of
 	// an encrypted response has been registered for this issuance, so a later
 	// step (deferred polling, completion) cannot recreate a context the client
@@ -558,6 +559,9 @@ func isDPoPNonceError(resp *http.Response) bool {
 	return resp.Header.Get("DPoP-Nonce") != ""
 }
 
+// maxTokenAttempts bounds the token request retry loop (see doTokenExchange).
+const maxTokenAttempts = 4
+
 // errAttestationChallenge is returned internally once a use_attestation_challenge
 // rejection has been handled and a fresh challenge obtained, signalling the caller
 // to retry the request with the Client Attestation PoP carrying it.
@@ -629,6 +633,32 @@ func (h *OID4VCIHandler) prepareAttestationChallenge(ctx context.Context) {
 	h.attestationChallenge = challenge
 }
 
+// consumeAttestationChallenge marks the pending challenge as bound into a PoP
+// that is about to be (or has been) sent. A challenge is single-use, so it is
+// not offered to the next PoP; it is remembered only so a nonce-only retry can
+// resend it when no fresh one can be fetched.
+func (h *OID4VCIHandler) consumeAttestationChallenge() {
+	h.lastAttestationChallenge = h.attestationChallenge // may be empty: reflects the latest PoP only
+	h.attestationChallenge = ""
+}
+
+// restoreChallengeForNonceRetry is called when a request was rejected with
+// use_dpop_nonce. That rejection is not an acceptance, and the AS may have
+// rejected on the nonce before consuming the PoP challenge, so the retry must
+// not lose it. With a challenge endpoint the next PoP gets a fresh challenge
+// (prepareAttestationChallenge), which is valid whether or not the AS burnt
+// the previous one; without one, the engine cannot obtain another, so the
+// last challenge is resent. If the AS did consume it, it answers
+// use_attestation_challenge with a new one, handled by the existing retry.
+// Only the client-held mode re-signs a PoP per attempt; legacy replays a fixed
+// WIA+PoP and needs nothing here.
+func (h *OID4VCIHandler) restoreChallengeForNonceRetry() {
+	if h.clientAuthMode != clientAuthClientHeld || h.attestationChallenge != "" || h.challengeEndpoint != "" {
+		return
+	}
+	h.attestationChallenge = h.lastAttestationChallenge
+}
+
 // fetchAttestationChallenge POSTs the AS challenge endpoint to obtain a fresh
 // Client Attestation PoP challenge. A DPoP-Nonce response header, if present,
 // is captured for subsequent DPoP proofs.
@@ -664,7 +694,7 @@ func (h *OID4VCIHandler) fetchAttestationChallenge(ctx context.Context, endpoint
 	var challengeResp struct {
 		AttestationChallenge string `json:"attestation_challenge"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&challengeResp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, MaxErrorBodyBytes)).Decode(&challengeResp); err != nil {
 		return "", fmt.Errorf("parsing challenge response: %w", err)
 	}
 	if challengeResp.AttestationChallenge == "" {
@@ -853,7 +883,7 @@ func (h *OID4VCIHandler) requestClientAttestation(ctx context.Context) {
 		PoP: resp.ClientAttestationPoP,
 		ID:  h.clientID,
 	}
-	h.attestationChallenge = "" // single-use: now bound into the PoP
+	h.consumeAttestationChallenge() // single-use: now bound into the PoP
 	h.Logger.Info("using OAuth-Client-Attestation authentication (engine-requested, client-signed PoP)",
 		zap.String("auth_server_issuer", h.authServerIssuer),
 		zap.String("client_id", h.clientID))
@@ -1922,15 +1952,19 @@ func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMe
 
 	// Token exchange with DPoP nonce (RFC 9449 §8) and attestation challenge
 	// (attestation-based client auth) retries.
-	for attempt := 0; attempt < 3; attempt++ {
+	// The budget covers one nonce retry and one challenge retry in either
+	// order, plus a second challenge retry when the AS consumed the challenge
+	// of the nonce-rejected request, plus the final attempt.
+	for attempt := 0; attempt < maxTokenAttempts; attempt++ {
 		resp, err := h.sendTokenRequest(ctx, metadata, tokenEndpoint, setGrantParams)
 		if err != nil {
 			return nil, err
 		}
 
 		// Check for DPoP nonce requirement — retry with server-provided nonce
-		if attempt < 2 && isDPoPNonceError(resp) {
+		if attempt < maxTokenAttempts-1 && isDPoPNonceError(resp) {
 			h.updateDPoPNonce(resp)
+			h.restoreChallengeForNonceRetry()
 			_ = resp.Body.Close()
 			continue
 		}
@@ -1940,7 +1974,7 @@ func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMe
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 			_ = resp.Body.Close()
 			// Retry with the server-provided challenge in the attestation PoP.
-			if attempt < 2 && isAttestationChallengeError(resp.StatusCode, body) && h.resolveAttestationChallenge(ctx, resp, metadata) {
+			if attempt < maxTokenAttempts-1 && isAttestationChallengeError(resp.StatusCode, body) && h.resolveAttestationChallenge(ctx, resp, metadata) {
 				h.Logger.Debug(logContext + " endpoint requires attestation challenge, retrying with challenge")
 				continue
 			}

@@ -256,7 +256,7 @@ func (h *OID4VCIHandler) headersFromClientAuthResponse(resp *SignResponseMessage
 		if resp.ClientAttestation != "" && resp.ClientAttestationPoP != "" {
 			out.wia = resp.ClientAttestation
 			out.pop = resp.ClientAttestationPoP
-			h.attestationChallenge = "" // single-use: now bound into the PoP
+			h.consumeAttestationChallenge() // single-use: now bound into the PoP
 		} else {
 			h.Logger.Debug("client returned no attestation for sign_client_auth; proceeding without",
 				zap.String("client_id", h.clientID))
