@@ -84,3 +84,79 @@ func TestTokenEndpoint_SessionCookie_RevocationStoreAndLifecycleCutoffBothApply(
 		})
 	}
 }
+
+// The cut-off applies on the anonymous and delegation paths as well, as one
+// implementation with the session path (token_policy.go): a live (not
+// revoked) user whose session or delegating token predates the cut-off is
+// refused on each, and one issued after it is not.
+func TestTokenEndpoint_CutoffAppliesOnAnonymousAndDelegationPaths(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	issuer := newTestTokenIssuer(t)
+	ttl := func(string) time.Duration { return 2 * time.Minute }
+
+	users := memory.NewStore().Users()
+	uid := domain.NewUserID()
+	if err := users.Create(context.Background(), &domain.User{UUID: uid}); err != nil {
+		t.Fatal(err)
+	}
+	if err := users.InvalidateAuthBefore(context.Background(), uid, time.Now().Add(-5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	// A delegating token minted now is after the cut-off; to get one before it,
+	// move the cut-off to the future relative to the token (same second refuses).
+	parent, err := issuer.Issue(uid.String(), "wallet-backend", "tenant-1", TAC("rk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	do := func(t *testing.T, sessionAt time.Time, anonymous bool, bearer string) (int, string) {
+		t.Helper()
+		sessions := NewMemorySessionStore()
+		router := gin.New()
+		RegisterTokenEndpoint(router.Group("/auth"), TokenEndpointConfig{
+			Store: sessions, Issuer: issuer, Policy: AllowAllPolicy{}, TTLFunc: ttl,
+			Blacklist: &fakeBlacklist{}, InsecureCookies: true, Gate: tokengate.New(users), Logger: zap.NewNop(),
+		})
+		body := `{"aud":"wallet-backend","tac":"r"`
+		if anonymous {
+			body += `,"anonymous":true`
+		}
+		req := httptest.NewRequest(http.MethodPost, "/auth/token", strings.NewReader(body+"}"))
+		req.Header.Set("Content-Type", "application/json")
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		} else {
+			if err := sessions.Create(context.Background(), &Session{
+				JTI: "s", UserID: uid.String(), TenantID: "tenant-1", ACR: "urn:siros:acr:passkey",
+				MaxTAC: TAC("rwld"), CreatedAt: sessionAt, ExpiresAt: time.Now().Add(time.Hour),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "s"})
+		}
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w.Code, w.Body.String()
+	}
+
+	// The refusal must come from the early check (its own message), not only
+	// from the post-issue re-check, which would mask a missing early gate.
+	code, body := do(t, time.Now().Add(-time.Hour), true, "")
+	if code != http.StatusUnauthorized || !strings.Contains(body, "session predates a wallet lifecycle change") {
+		t.Errorf("anonymous, session before cut-off: got %d %s", code, body)
+	}
+	if code, body := do(t, time.Now(), true, ""); code != http.StatusOK {
+		t.Errorf("anonymous, session after cut-off: got %d %s, want 200", code, body)
+	}
+	if code, body := do(t, time.Time{}, false, parent); code != http.StatusOK {
+		t.Errorf("delegation, parent after cut-off: got %d %s, want 200", code, body)
+	}
+	// Move the cut-off to now: the parent (iat in the same second) predates it.
+	if err := users.InvalidateAuthBefore(context.Background(), uid, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	code, body = do(t, time.Time{}, false, parent)
+	if code != http.StatusUnauthorized || !strings.Contains(body, "delegating token has been revoked") {
+		t.Errorf("delegation, parent before cut-off: got %d %s", code, body)
+	}
+}

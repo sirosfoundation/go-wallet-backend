@@ -486,6 +486,42 @@ scrape_configs:
       - targets: ['wallet-backend:8080']
 ```
 
+### WebSocket close reasons
+
+Every engine WebSocket session that ends logs exactly one Info line,
+`Session close reason`, and increments the counter
+`siros_engine_ws_session_closed_total{reason}`. Use it to tell *why* clients
+that keep reconnecting are being dropped.
+
+| `reason` | Meaning | Extra fields |
+| --- | --- | --- |
+| `read_deadline` | No frame, ping or pong from the client within the read window (`ping_interval` + `pong_timeout`, default 3 s + 5 s) | `read_window`, `since_last_inbound` |
+| `peer_close` | The client sent a close frame or the TCP connection was closed | `close_code` (numeric only; the peer's close text is never logged) |
+| `superseded` | A newer connection for the same user replaced this one ("last connection wins") | `superseded_by_session_id` |
+| `account_deleted`, `token_revoked`, `revocation_check_failed` | Closed by the server because the user or token was revoked, or the revocation store could not answer | |
+| `write_error` | A ping or handshake write failed | |
+| `server_shutdown` | `engine.Manager.Close` closed the session. The server binary does not currently call it on SIGTERM, so this is not expected in production | |
+| `read_error` | Any other read failure | `error_class` (Go type only, no message) |
+| `server_close` | Any other server-initiated close | |
+
+Common fields: `session_id`, `session` (short user id), `tenant_id`,
+`remote_addr` (the raw socket peer: behind a proxy this is the proxy, not the
+client), `session_age`, `ping_interval`, `pong_timeout`.
+
+The default JSON logger uses zap's production sampling (the first 100 lines
+per second for a given level and message are kept, then every 100th), so a
+burst of more than 100 disconnects in one second can drop some `Session close
+reason` lines. The counter is never sampled and is the exact source for
+totals.
+
+When a connection supersedes another, the `Closing existing session` Info
+line carries `old_session_id`/`new_session_id`, both ages and both remote
+addresses, and the new connection's `Session established` line carries
+`superseded_session_id` (empty if it superseded nothing). A client that
+reconnects every few seconds with `read_deadline` closes points at keepalive
+(the client not answering pings, or a proxy swallowing them); a stream of
+`superseded` closes points at two sockets for one user fighting each other.
+
 ### Logs
 
 Logs are output to stdout in JSON format:
