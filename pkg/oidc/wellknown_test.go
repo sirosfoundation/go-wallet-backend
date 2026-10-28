@@ -1,74 +1,71 @@
 package oidc
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
-func TestWellKnownURL(t *testing.T) {
-	tests := []struct {
-		name    string
-		baseURL string
-		suffix  string
-		want    string
-		wantErr bool
+func TestCredentialIssuerMetadataURLs(t *testing.T) {
+	const w = "/.well-known/openid-credential-issuer"
+	for _, tt := range []struct {
+		name, in string
+		want     []string
+		wantErr  bool
 	}{
-		{
-			name:    "no path",
-			baseURL: "https://example.com",
-			suffix:  "openid-credential-issuer",
-			want:    "https://example.com/.well-known/openid-credential-issuer",
-		},
-		{
-			name:    "with path",
-			baseURL: "https://example.com/test/a/alias",
-			suffix:  "openid-credential-issuer",
-			want:    "https://example.com/.well-known/openid-credential-issuer/test/a/alias",
-		},
-		{
-			name:    "trailing slash preserved",
-			baseURL: "https://example.com/issuer/",
-			suffix:  "openid-credential-issuer",
-			want:    "https://example.com/.well-known/openid-credential-issuer/issuer/",
-		},
-		{
-			name:    "oauth authorization server",
-			baseURL: "https://as.example.com/tenant/1",
-			suffix:  "oauth-authorization-server",
-			want:    "https://as.example.com/.well-known/oauth-authorization-server/tenant/1",
-		},
-		{
-			name:    "openid-configuration",
-			baseURL: "https://idp.example.com",
-			suffix:  "openid-configuration",
-			want:    "https://idp.example.com/.well-known/openid-configuration",
-		},
-		{
-			name:    "percent-encoded path preserved",
-			baseURL: "https://example.com/path%2Fwith%2Fslashes/issuer",
-			suffix:  "openid-credential-issuer",
-			want:    "https://example.com/.well-known/openid-credential-issuer/path%2Fwith%2Fslashes/issuer",
-		},
-		{
-			name:    "with port",
-			baseURL: "https://localhost:8443/test/a/siros-wallet",
-			suffix:  "openid-credential-issuer",
-			want:    "https://localhost:8443/.well-known/openid-credential-issuer/test/a/siros-wallet",
-		},
-		{
-			name:    "invalid URL",
-			baseURL: "://not-a-url",
-			suffix:  "openid-credential-issuer",
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
+		{"1.1 example: path", "https://issuer.example.com/tenant", []string{"https://issuer.example.com" + w + "/tenant"}, false},
+		{"1.1 example: path with terminating slash", "https://issuer.example.com/tenant/",
+			[]string{"https://issuer.example.com" + w + "/tenant/", "https://issuer.example.com" + w + "/tenant"}, false},
+		{"1.1 example: host only", "https://tenant.issuer.example.com", []string{"https://tenant.issuer.example.com" + w}, false},
+		{"OIDF conformance (issue 505)", "https://www.certification.openid.net/test/a/siros-wallet-vci-test-tecca-1/",
+			[]string{"https://www.certification.openid.net" + w + "/test/a/siros-wallet-vci-test-tecca-1/", "https://www.certification.openid.net" + w + "/test/a/siros-wallet-vci-test-tecca-1"}, false},
+		{"bare root slash", "https://h.example/", []string{"https://h.example" + w + "/", "https://h.example" + w}, false},
+		{"nested path", "https://example.com/test/a/alias", []string{"https://example.com" + w + "/test/a/alias"}, false},
+		{"percent-encoded path preserved", "https://example.com/path%2Fwith%2Fslashes/issuer",
+			[]string{"https://example.com" + w + "/path%2Fwith%2Fslashes/issuer"}, false},
+		{"percent-encoded with terminating slash", "https://example.com/a%2Fb/",
+			[]string{"https://example.com" + w + "/a%2Fb/", "https://example.com" + w + "/a%2Fb"}, false},
+		{"repeated terminating slash: strips one", "https://example.com/t//",
+			[]string{"https://example.com" + w + "/t//", "https://example.com" + w + "/t/"}, false},
+		{"port", "https://localhost:8443/t", []string{"https://localhost:8443" + w + "/t"}, false},
+		{"invalid", "://not-a-url", nil, true},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := WellKnownURL(tt.baseURL, tt.suffix)
+			got, err := CredentialIssuerMetadataURLs(tt.in)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("WellKnownURL() error = %v, wantErr %v", err, tt.wantErr)
+				t.Fatalf("error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("got %v\nwant %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// RFC 8414 section 3.1: terminating slash removed, no fallback.
+func TestAuthorizationServerMetadataURLs(t *testing.T) {
+	const w = "/.well-known/oauth-authorization-server"
+	for _, tt := range []struct {
+		name, in, want string
+		wantErr        bool
+	}{
+		{"path", "https://as.example.com/tenant/1", "https://as.example.com" + w + "/tenant/1", false},
+		{"path with terminating slash", "https://as.example.com/tenant/", "https://as.example.com" + w + "/tenant", false},
+		{"host only", "https://as.example.com", "https://as.example.com" + w, false},
+		{"root slash", "https://as.example.com/", "https://as.example.com" + w, false},
+		{"percent-encoded", "https://as.example.com/a%2Fb", "https://as.example.com" + w + "/a%2Fb", false},
+		{"repeated slash strips one", "https://as.example.com/t//", "https://as.example.com" + w + "/t/", false},
+		{"invalid", "://not-a-url", "", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := AuthorizationServerMetadataURLs(tt.in)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err %v", err)
+			}
+			if tt.wantErr {
 				return
 			}
-			if got != tt.want {
-				t.Errorf("WellKnownURL()\n  got  = %s\n  want = %s", got, tt.want)
+			if len(got) != 1 || got[0] != tt.want {
+				t.Errorf("got %q, want [%q]", got, tt.want)
 			}
 		})
 	}

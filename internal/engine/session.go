@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -109,18 +110,11 @@ type Session struct {
 	flowsMu       sync.RWMutex
 	logger        *zap.Logger
 
-	// Channels for flow coordination
-	actionCh chan *FlowActionMessage
-	signCh   chan *SignResponseMessage
-	// signWaiters maps the message ID of each pending RequestSign to its own
-	// reply channel. Several RequestSign calls can be pending at once (a flow
-	// waiting on a decryption while a notification worker asks for a DPoP
-	// proof), and they all read signCh: a waiter that reads another waiter's
-	// reply hands it over instead of discarding it.
-	signWaitersMu sync.Mutex
-	signWaiters   map[string]chan *SignResponseMessage
-	matchCh       chan *MatchResponseMessage
-	closeCh       chan struct{}
+	// closeCh is closed when the session ends and releases every waiter.
+	// Client messages are routed by the read loop straight to their owner (a
+	// Flow's action channel, or the reply channel of an outstanding request),
+	// so there is no shared channel for concurrent flows to steal from.
+	closeCh chan struct{}
 
 	// notifications holds ephemeral, TTL-bounded OID4VCI §10 notification
 	// contexts keyed by flow ID. It lets the backend forward a client-reported
@@ -143,30 +137,51 @@ type Session struct {
 	// rejectIfUnknownFlow). Only touched from the read loop goroutine.
 	unknownFlowLimiter *rate.Limiter
 
-	// outstandingRequests holds the message_id of every sign/match request
-	// currently awaiting its response (guarded by flowsMu), so responses are
-	// still delivered after the requesting flow has completed.
-	outstandingRequests map[string]struct{}
+	// outstandingRequests maps the message_id of every sign/match request
+	// currently awaiting its response (guarded by flowsMu) to the request that
+	// owns it, so the read loop can hand a reply straight to its waiter, and
+	// so a response is still delivered after the requesting flow has completed.
+	outstandingRequests map[string]*pendingRequest
 
 	// closeInfo is diagnostic-only bookkeeping for the close-reason log
 	// (see session_close_reason.go).
 	closeInfo *closeBookkeeping
 }
 
-// trackRequest registers messageID as an outstanding request until the
-// returned func is called.
-func (s *Session) trackRequest(messageID string) (done func()) {
+// pendingRequest is an outstanding sign or match request: exactly one of
+// sign/match is set, and it is the buffered (cap 1) channel the read loop
+// delivers the reply to. flowID is the flow the request was addressed to.
+type pendingRequest struct {
+	flowID string
+	sign   chan *SignResponseMessage
+	match  chan *MatchResponseMessage
+}
+
+// trackRequest registers p under messageID until the returned func is called.
+// The func removes the entry, so a reply arriving after completion, timeout or
+// cancellation finds nothing and is answered and dropped, never parked.
+func (s *Session) trackRequest(messageID string, p *pendingRequest) (done func()) {
 	s.flowsMu.Lock()
 	if s.outstandingRequests == nil {
-		s.outstandingRequests = make(map[string]struct{})
+		s.outstandingRequests = make(map[string]*pendingRequest)
 	}
-	s.outstandingRequests[messageID] = struct{}{}
+	s.outstandingRequests[messageID] = p
 	s.flowsMu.Unlock()
 	return func() {
 		s.flowsMu.Lock()
 		delete(s.outstandingRequests, messageID)
 		s.flowsMu.Unlock()
 	}
+}
+
+func (s *Session) trackSign(messageID, flowID string) (<-chan *SignResponseMessage, func()) {
+	p := &pendingRequest{flowID: flowID, sign: make(chan *SignResponseMessage, 1)}
+	return p.sign, s.trackRequest(messageID, p)
+}
+
+func (s *Session) trackMatch(messageID, flowID string) (<-chan *MatchResponseMessage, func()) {
+	p := &pendingRequest{flowID: flowID, match: make(chan *MatchResponseMessage, 1)}
+	return p.match, s.trackRequest(messageID, p)
 }
 
 // Flow represents an active credential flow
@@ -185,6 +200,29 @@ type Flow struct {
 	// Flow-specific data
 	Data map[string]interface{}
 	mu   sync.RWMutex
+
+	// actions carries this flow's client actions, in arrival order, from the
+	// session's read loop to the flow's waiter. It is owned by the flow and
+	// released with it. Nil (a Flow not created by newFlow) means the flow
+	// cannot receive actions: they are refused, not queued.
+	actions chan *FlowActionMessage
+}
+
+// flowActionBuffer bounds the actions queued for one flow. A full buffer is
+// answered with TOO_MANY_REQUESTS rather than dropped silently.
+const flowActionBuffer = 50
+
+// newFlow creates a flow that can receive client actions.
+func newFlow(id string, protocol Protocol, session *Session) *Flow {
+	return &Flow{
+		ID:        id,
+		Protocol:  protocol,
+		Session:   session,
+		State:     FlowStep("started"),
+		StartTime: time.Now(),
+		Data:      make(map[string]interface{}),
+		actions:   make(chan *FlowActionMessage, flowActionBuffer),
+	}
 }
 
 // Cancel stops the flow's context, then its handler if built. Safe to repeat.
@@ -464,9 +502,6 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		conn:          conn,
 		flows:         make(map[string]*Flow),
 		logger:        m.logger.With(zap.String("session", logLabel)),
-		actionCh:      make(chan *FlowActionMessage, 50),
-		signCh:        make(chan *SignResponseMessage, 20),
-		matchCh:       make(chan *MatchResponseMessage, 20),
 		closeCh:       make(chan struct{}, 1), // Buffered to prevent deadlock
 		stopPing:      make(chan struct{}),
 		notifications: newNotificationContextStore(),
@@ -706,42 +741,112 @@ const (
 	unknownFlowErrorRate  = rate.Limit(2) // replies per second, sustained
 )
 
-// rejectIfUnknownFlow answers a client message that references flowID with a
-// flow_error (UNKNOWN_FLOW) when this session has no such flow, and reports
-// whether it did. It must only be called from the session's read loop.
+// Client messages are routed by the read loop, the only reader of the
+// socket, to the one owner that can consume them: an action to the action
+// channel of the Flow it names, a sign/match reply to the reply channel of the
+// outstanding request it answers (see trackRequest). Anything that has no
+// owner - an unknown flow, an unknown or already answered request, a reply
+// that disagrees with its request about the flow - is answered with a
+// flow_error (UNKNOWN_FLOW) and dropped; nothing is ever parked.
 //
-// The lookup is deliberately scoped to this session's own flow table: a flow
-// that belongs to another session or user is indistinguishable from one that
-// never existed (same code, same message, nothing about the other flow is
-// disclosed), so a client cannot probe for foreign flow IDs. A flow that was
-// in progress on a previous session of the same user is likewise unknown to
-// the new session - this error is how a reconnected client learns it is dead.
+// The lookup is deliberately scoped to this session's own tables: a flow that
+// belongs to another session or user is indistinguishable from one that never
+// existed (same code, same message, nothing about the other flow is
+// disclosed), so a client cannot probe for foreign flow IDs. A flow that was in
+// progress on a previous session of the same user is likewise unknown to the
+// new session - this error is how a reconnected client learns it is dead.
 //
-// A response (messageID != "") that answers a request this session still has
-// outstanding is never rejected, even if its flow has since completed: the
-// client-held DPoP signer deliberately addresses sign requests to a finished
-// flow (see clientHeldDPoPSigner) to forward credential notifications.
-func (s *Session) rejectIfUnknownFlow(flowID, messageID string, msgType MessageType) bool {
-	s.flowsMu.RLock()
-	_, ok := s.flows[flowID]
-	_, outstanding := s.outstandingRequests[messageID]
-	s.flowsMu.RUnlock()
-	if ok || (messageID != "" && outstanding) {
-		return false
-	}
+// A reply that answers a request this session still has outstanding is
+// delivered even if its flow has since completed: the client-held DPoP signer
+// deliberately addresses sign requests to a finished flow (see
+// clientHeldDPoPSigner) to forward credential notifications.
+
+// replyUnknownFlow answers a message that has no owner. It must only be called
+// from the session's read loop.
+func (s *Session) replyUnknownFlow(flowID string, msgType MessageType) {
 	// Debug, not Warn: the flow_id is client-controlled and this path is
 	// reachable by any authenticated client, so it must not flood the logs.
-	s.logger.Debug("Message for unknown flow",
+	s.logger.Debug("Message for unknown flow or request",
 		zap.String("type", string(msgType)),
 		zap.String("flow_id", truncateForLog(flowID, 64)))
 	if s.unknownFlowLimiter == nil {
 		s.unknownFlowLimiter = rate.NewLimiter(unknownFlowErrorRate, unknownFlowErrorBurst)
 	}
 	if !s.unknownFlowLimiter.Allow() {
-		return true // abusive volume: dropped, not answered
+		return // abusive volume: dropped, not answered
 	}
 	_ = s.SendFlowError(flowID, "", ErrCodeUnknownFlow, "Flow not found or already completed")
-	return true
+}
+
+// dispatchAction hands a flow_action to its flow's channel, in arrival order.
+func (s *Session) dispatchAction(msg *FlowActionMessage) {
+	routed, full := false, false
+	s.flowsMu.RLock()
+	if flow := s.flows[msg.FlowID]; flow != nil && flow.actions != nil {
+		select {
+		case flow.actions <- msg:
+			routed = true
+		default:
+			full = true
+		}
+	}
+	s.flowsMu.RUnlock()
+	switch {
+	case routed:
+	case full:
+		s.logger.Error("Action channel full, sending error to client",
+			zap.String("flow_id", msg.FlowID),
+			zap.String("action", msg.Action))
+		_ = s.SendFlowError(msg.FlowID, "", ErrCodeTooManyRequests, "Server overloaded, please retry")
+	default:
+		s.replyUnknownFlow(msg.FlowID, msg.Type)
+	}
+}
+
+// dispatchSignResponse hands a sign_response to the RequestSign that sent the
+// request it answers. A response without a flow_id is correlated by
+// message_id alone; one that names a flow must name the request's flow.
+func (s *Session) dispatchSignResponse(msg *SignResponseMessage) {
+	owned := false
+	s.flowsMu.RLock()
+	if p := s.outstandingRequests[msg.MessageID]; p != nil && p.sign != nil &&
+		(msg.FlowID == "" || msg.FlowID == p.flowID) {
+		owned = true
+		// Cap 1: a duplicate reply finds it full and is dropped silently; the
+		// request has an owner, so UNKNOWN_FLOW (terminal) would be untrue.
+		select {
+		case p.sign <- msg:
+		default:
+		}
+	}
+	_, flowExists := s.flows[msg.FlowID]
+	s.flowsMu.RUnlock()
+	// A late reply to a request that already timed out or was cancelled must not
+	// tell the client its still-live flow is gone (UNKNOWN_FLOW is terminal).
+	if !owned && !flowExists {
+		s.replyUnknownFlow(msg.FlowID, msg.Type)
+	}
+}
+
+// dispatchMatchResponse is dispatchSignResponse for match_response, which must
+// always name the request's flow.
+func (s *Session) dispatchMatchResponse(msg *MatchResponseMessage) {
+	owned := false
+	s.flowsMu.RLock()
+	if p := s.outstandingRequests[msg.MessageID]; p != nil && p.match != nil && msg.FlowID == p.flowID {
+		owned = true
+		select {
+		case p.match <- msg:
+		default:
+		}
+	}
+	_, flowExists := s.flows[msg.FlowID]
+	s.flowsMu.RUnlock()
+	// A late reply to a request that already timed out or was cancelled must not
+	// tell the client its still-live flow is gone (UNKNOWN_FLOW is terminal).
+	if !owned && !flowExists {
+		s.replyUnknownFlow(msg.FlowID, msg.Type)
+	}
 }
 
 func truncateForLog(s string, n int) string {
@@ -794,21 +899,9 @@ func (m *Manager) handleSession(session *Session) {
 				_ = session.SendFlowError(msg.FlowID, "", ErrCodeInvalidMessage, "Invalid flow_action format")
 				continue
 			}
-			// Check if flow exists before routing - prevents action loss for
-			// unknown flows. The client is always told (flow_error
-			// UNKNOWN_FLOW), never left waiting on a flow that is gone.
-			if session.rejectIfUnknownFlow(actionMsg.FlowID, "", msg.Type) {
-				continue
-			}
-			// Route to the flow - send error if channel full instead of dropping
-			select {
-			case session.actionCh <- &actionMsg:
-			default:
-				session.logger.Error("Action channel full, sending error to client",
-					zap.String("flow_id", actionMsg.FlowID),
-					zap.String("action", actionMsg.Action))
-				_ = session.SendFlowError(actionMsg.FlowID, "", ErrCodeTooManyRequests, "Server overloaded, please retry")
-			}
+			// The client is always told (flow_error UNKNOWN_FLOW or
+			// TOO_MANY_REQUESTS), never left waiting on a flow that is gone.
+			session.dispatchAction(&actionMsg)
 
 		case TypeSignResponse:
 			var signMsg SignResponseMessage
@@ -816,20 +909,7 @@ func (m *Manager) handleSession(session *Session) {
 				session.logger.Warn("Invalid sign_response", zap.Error(err))
 				continue
 			}
-			// Responses that name a flow that no longer exists are answered
-			// with UNKNOWN_FLOW. A response without a flow_id is correlated
-			// by message_id alone and routed as before.
-			if signMsg.FlowID != "" && session.rejectIfUnknownFlow(signMsg.FlowID, signMsg.MessageID, msg.Type) {
-				continue
-			}
-			// Route to waiting flow - send error if channel full instead of dropping
-			select {
-			case session.signCh <- &signMsg:
-			default:
-				session.logger.Error("Sign channel full, sending error to client",
-					zap.String("message_id", signMsg.MessageID))
-				_ = session.SendFlowError("", "", ErrCodeTooManyRequests, "Server overloaded, please retry")
-			}
+			session.dispatchSignResponse(&signMsg)
 
 		case TypeMatchResponse:
 			var matchMsg MatchResponseMessage
@@ -837,18 +917,7 @@ func (m *Manager) handleSession(session *Session) {
 				session.logger.Warn("Invalid match_response", zap.Error(err))
 				continue
 			}
-			if matchMsg.FlowID != "" && session.rejectIfUnknownFlow(matchMsg.FlowID, matchMsg.MessageID, msg.Type) {
-				continue
-			}
-			// Route to waiting flow - send error if channel full instead of dropping
-			select {
-			case session.matchCh <- &matchMsg:
-			default:
-				session.logger.Error("Match channel full, sending error to client",
-					zap.String("flow_id", matchMsg.FlowID),
-					zap.String("message_id", matchMsg.MessageID))
-				_ = session.SendFlowError(matchMsg.FlowID, StepMatchCredentials, ErrCodeTooManyRequests, "Server overloaded, please retry")
-			}
+			session.dispatchMatchResponse(&matchMsg)
 
 		case TypeCredentialNotification:
 			var notifMsg CredentialNotificationMessage
@@ -959,15 +1028,8 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	flowCtx, cancelFlow := context.WithTimeout(context.Background(), 5*time.Minute)
 
 	// Create flow while still holding lock
-	flow := &Flow{
-		ID:        flowID,
-		Protocol:  msg.Protocol,
-		Session:   session,
-		State:     FlowStep("started"),
-		StartTime: time.Now(),
-		cancel:    cancelFlow,
-		Data:      make(map[string]interface{}),
-	}
+	flow := newFlow(flowID, msg.Protocol, session)
+	flow.cancel = cancelFlow
 
 	// Register flow immediately to reserve slot
 	session.flows[flowID] = flow
@@ -1633,20 +1695,10 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 		Params: params,
 	}
 
-	// Register before sending, so a reply read by another waiter always finds us.
-	mine := make(chan *SignResponseMessage, 1)
-	s.signWaitersMu.Lock()
-	if s.signWaiters == nil {
-		s.signWaiters = make(map[string]chan *SignResponseMessage)
-	}
-	s.signWaiters[messageID] = mine
-	s.signWaitersMu.Unlock()
-	defer func() {
-		s.signWaitersMu.Lock()
-		delete(s.signWaiters, messageID)
-		s.signWaitersMu.Unlock()
-	}()
-	defer s.trackRequest(messageID)()
+	// Register before sending: the read loop delivers the reply straight to
+	// this call's own channel, whatever else is pending on the session.
+	reply, done := s.trackSign(messageID, flowID)
+	defer done()
 	if err := s.Send(&msg); err != nil {
 		return nil, err
 	}
@@ -1654,32 +1706,51 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 	// Wait for response
 	timer := time.NewTimer(3 * time.Minute)
 	defer timer.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-timer.C:
-			return nil, ErrSignTimeout
-		case <-s.closeCh:
-			return nil, errors.New("session closed")
-		case resp := <-mine:
-			return resp, nil
-		case resp := <-s.signCh:
-			if resp.MessageID == messageID {
-				return resp, nil
-			}
-			// Another pending request's reply: hand it to its owner.
-			s.signWaitersMu.Lock()
-			other := s.signWaiters[resp.MessageID]
-			s.signWaitersMu.Unlock()
-			if other != nil {
-				select {
-				case other <- resp:
-				default: // a duplicate reply for the same ID: drop it
-				}
-			}
-		}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, ErrSignTimeout
+	case <-s.closeCh:
+		return nil, errors.New("session closed")
+	case resp := <-reply:
+		return signResult(resp)
 	}
+}
+
+// SignError is a sign failure reported by the client, with the client's
+// classification of it. The client's own error text is client-controlled and
+// might echo request or response content (a JWE plaintext, a seed), so it is
+// deliberately not kept: only the allowlisted Code survives.
+type SignError struct {
+	Code ErrorCode
+}
+
+func (e *SignError) Error() string {
+	if e.Code != "" {
+		return "client failed the sign request (" + string(e.Code) + ")"
+	}
+	return "client failed the sign request"
+}
+
+// allowedSignErrorCode keeps only the client-supplied codes the engine acts on.
+// Anything else is client-controlled text that could end up in logs (Error()
+// prints the code), so it is dropped.
+func allowedSignErrorCode(c ErrorCode) ErrorCode {
+	if c == ErrCodeUnsupportedTransactionData {
+		return c
+	}
+	return ""
+}
+
+// signResult turns a client-reported sign failure into an error. Either field
+// marks a failure: the free-text error, or an error_code on its own, since the
+// client's text is optional. Whatever the code, only an allowlisted one is kept.
+func signResult(resp *SignResponseMessage) (*SignResponseMessage, error) {
+	if resp.Error != "" || resp.ErrorCode != "" {
+		return nil, &SignError{Code: allowedSignErrorCode(resp.ErrorCode)}
+	}
+	return resp, nil
 }
 
 // MatchTimeout is the timeout for credential matching requests.
@@ -1719,7 +1790,8 @@ func (s *Session) RequestMatchWithClientMetadata(ctx context.Context, flowID str
 		VerifiedRequest: request,
 	}
 
-	defer s.trackRequest(messageID)()
+	reply, done := s.trackMatch(messageID, flowID)
+	defer done()
 	if err := s.Send(&msg); err != nil {
 		return nil, err
 	}
@@ -1727,26 +1799,18 @@ func (s *Session) RequestMatchWithClientMetadata(ctx context.Context, flowID str
 	// Wait for response with proper timer cleanup
 	timer := time.NewTimer(MatchTimeout)
 	defer timer.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-timer.C:
-			return nil, ErrMatchTimeout
-		case <-s.closeCh:
-			return nil, errors.New("session closed")
-		case resp := <-s.matchCh:
-			// Verify both flow_id and message_id for proper correlation
-			if resp.FlowID == flowID && resp.MessageID == messageID {
-				// Check for error in response
-				if resp.Error != "" {
-					return nil, errors.New(resp.Error)
-				}
-				return resp, nil
-			}
-			// Wrong flow_id or message_id, keep waiting
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, ErrMatchTimeout
+	case <-s.closeCh:
+		return nil, errors.New("session closed")
+	case resp := <-reply:
+		if resp.Error != "" {
+			return nil, errors.New(resp.Error)
 		}
+		return resp, nil
 	}
 }
 
@@ -1762,8 +1826,25 @@ func (s *Session) WaitForAction(ctx context.Context, flowID string, expectedActi
 	return s.WaitForActionWithTimeout(ctx, flowID, UserInteractionTimeout, expectedActions...)
 }
 
-// WaitForActionWithTimeout waits for a flow action with a custom timeout
+// flowActions returns the action channel of flowID, or nil if there is none.
+func (s *Session) flowActions(flowID string) chan *FlowActionMessage {
+	s.flowsMu.RLock()
+	defer s.flowsMu.RUnlock()
+	if flow := s.flows[flowID]; flow != nil {
+		return flow.actions
+	}
+	return nil
+}
+
+// WaitForActionWithTimeout waits for a flow action with a custom timeout. It
+// reads only flowID's own channel, so it can neither consume another flow's
+// actions nor lose its own to another waiter. An action that is not one of
+// expectedActions is skipped.
 func (s *Session) WaitForActionWithTimeout(ctx context.Context, flowID string, timeout time.Duration, expectedActions ...string) (*FlowActionMessage, error) {
+	actions := s.flowActions(flowID)
+	if actions == nil {
+		return nil, ErrFlowNotFound // fail closed: nothing could ever arrive
+	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 
@@ -1775,24 +1856,10 @@ func (s *Session) WaitForActionWithTimeout(ctx context.Context, flowID string, t
 			return nil, ErrFlowTimeout
 		case <-s.closeCh:
 			return nil, errors.New("session closed")
-		case action := <-s.actionCh:
-			if action.FlowID != flowID {
-				continue // Wrong flow
+		case action := <-actions:
+			if len(expectedActions) == 0 || slices.Contains(expectedActions, action.Action) {
+				return action, nil
 			}
-			// Check if action is expected
-			if len(expectedActions) > 0 {
-				found := false
-				for _, expected := range expectedActions {
-					if action.Action == expected {
-						found = true
-						break
-					}
-				}
-				if !found {
-					continue // Unexpected action
-				}
-			}
-			return action, nil
 		}
 	}
 }
