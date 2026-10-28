@@ -643,7 +643,7 @@ func (h *OID4VCIHandler) spendAttestationChallenge() {
 		return
 	}
 	h.attestationChallenge = ""
-	if h.clientAuthMode == clientAuthLegacy && h.legacyAttestationRequested {
+	if h.clientAuthMode == clientAuthLegacy && h.legacyAttestationRequested && h.attestationProvider != nil {
 		h.attestationProvider = nil
 		h.legacyAttestationRequested = false
 	}
