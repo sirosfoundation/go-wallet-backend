@@ -72,7 +72,7 @@ func encryptingIssuer(t *testing.T, priv *ecdsa.PrivateKey, got *map[string]any,
 		var wk jose.JSONWebKey
 		require.NoError(t, json.Unmarshal(jb, &wk))
 		enc, err := jose.NewEncrypter(jose.ContentEncryption(encObj["enc"].(string)),
-			jose.Recipient{Algorithm: jose.KeyAlgorithm(encObj["alg"].(string)), Key: &wk}, nil)
+			jose.Recipient{Algorithm: jose.KeyAlgorithm(wk.Algorithm), Key: &wk}, nil)
 		require.NoError(t, err)
 		out, _ := enc.Encrypt([]byte(`{"credential":"c","credential_metadata":` + seedMetadata + `}`))
 		s, _ := out.CompactSerialize()
@@ -109,6 +109,9 @@ func TestRequestCredential_EncryptedRequestRoundTrip(t *testing.T) {
 	assert.NotEmpty(t, kid)
 	assert.Equal(t, "cfg", got["credential_configuration_id"])
 	assert.Contains(t, got, "credential_response_encryption")
+	respEnc := got["credential_response_encryption"].(map[string]any)
+	assert.NotContains(t, respEnc, "alg")
+	assert.Equal(t, "ECDH-ES+A256KW", respEnc["jwk"].(map[string]any)["alg"])
 	// The client key, not an engine key, is what the issuer encrypted to.
 	require.Len(t, fc.decrypted, 1)
 	assert.JSONEq(t, `true`, string(completion(t, fc)["credential_response_encrypted"]))

@@ -348,6 +348,9 @@ func testOID4VCIHandler(t *testing.T, httpClient *http.Client) (*OID4VCIHandler,
 		// Likewise treat the one-shot request_attestation as already done
 		// (declined), as Execute would have before reaching the token step.
 		legacyAttestationRequested: true,
+		// Unrelated tests mock only the endpoint under test; skip the AS
+		// metadata discovery doTokenExchange does for attestation challenges.
+		asMetadataFetched: true,
 	}
 	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
 	return h, cleanup
@@ -2774,6 +2777,7 @@ func TestResumeWithAuthCode_FetchesTokenEndpointFromOAuthMetadata(t *testing.T) 
 
 	h, cleanup := testOID4VCIHandler(t, server.Client())
 	defer cleanup()
+	h.asMetadataFetched = false
 
 	metadata := &IssuerMetadata{
 		CredentialIssuer: server.URL,
@@ -2794,8 +2798,9 @@ func TestResumeWithAuthCode_FetchesTokenEndpointFromOAuthMetadata(t *testing.T) 
 func TestResumeWithAuthCode_MissingCodeVerifier(t *testing.T) {
 	// When OAuth metadata is unreachable, PKCE defaults to required.
 	// An empty code_verifier should produce a clear error.
-	h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+	h, cleanup := testOID4VCIHandler(t, &http.Client{Transport: &errRoundTripper{}})
 	defer cleanup()
+	h.asMetadataFetched = false
 
 	metadata := &IssuerMetadata{
 		CredentialIssuer: "https://issuer.example.com",
@@ -2836,6 +2841,7 @@ func TestResumeWithAuthCode_PKCENotRequired(t *testing.T) {
 
 	h, cleanup := testOID4VCIHandler(t, server.Client())
 	defer cleanup()
+	h.asMetadataFetched = false
 
 	metadata := &IssuerMetadata{
 		CredentialIssuer: server.URL,

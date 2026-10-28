@@ -144,6 +144,10 @@ type Session struct {
 	// currently awaiting its response (guarded by flowsMu), so responses are
 	// still delivered after the requesting flow has completed.
 	outstandingRequests map[string]struct{}
+
+	// closeInfo is diagnostic-only bookkeeping for the close-reason log
+	// (see session_close_reason.go).
+	closeInfo *closeBookkeeping
 }
 
 // trackRequest registers messageID as an outstanding request until the
@@ -420,6 +424,7 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 		notifications: newNotificationContextStore(),
 		pingInterval:  pingInterval,
 		pongTimeout:   pongTimeout,
+		closeInfo:     newCloseBookkeeping(conn),
 	}
 
 	// Register session. A rejection here means the user was revoked in the
@@ -428,6 +433,7 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	// case, so there is nothing left to unregister.
 	if !m.registerSession(session) {
 		session.logger.Warn("Handshake rejected: user revoked between token validation and session registration")
+		session.logClosed(closeReasonServerClose)
 		return
 	}
 	defer m.unregisterSession(session)
@@ -447,13 +453,15 @@ func (m *Manager) handleNewConnection(conn *websocket.Conn) {
 	}
 	if err := session.Send(&completeMsg); err != nil {
 		m.logger.Error("Failed to send handshake complete", zap.Error(err))
+		session.logClosed(closeReasonWriteError)
 		return
 	}
 
 	session.logger.Info("Session established",
 		zap.String("session_id", session.ID),
 		zap.Strings("capabilities", capabilities),
-		zap.Duration("ping_interval", pingInterval))
+		zap.Duration("ping_interval", pingInterval),
+		zap.String("superseded_session_id", session.supersededID()))
 
 	// Start ping keepalive goroutine
 	go session.pingLoop()
@@ -500,8 +508,9 @@ func configureKeepalive(conn *websocket.Conn, window time.Duration) {
 // at most once per window/8, so it can lag the last byte by that much.
 type activityConn struct {
 	net.Conn
-	window  atomic.Int64 // nanoseconds; 0 = not armed
-	lastSet atomic.Int64 // unix nanos of the last refresh
+	window   atomic.Int64 // nanoseconds; 0 = not armed
+	lastSet  atomic.Int64 // unix nanos of the last refresh
+	lastRead atomic.Int64 // unix nanos of the last read that yielded bytes (diagnostics only)
 }
 
 func (c *activityConn) arm(window time.Duration) {
@@ -512,6 +521,7 @@ func (c *activityConn) arm(window time.Duration) {
 func (c *activityConn) Read(p []byte) (int, error) {
 	n, err := c.Conn.Read(p)
 	if n > 0 {
+		c.lastRead.Store(time.Now().UnixNano())
 		if w := c.window.Load(); w > 0 {
 			now := time.Now()
 			if now.UnixNano()-c.lastSet.Load() >= w/8 {
@@ -610,6 +620,11 @@ func (s *Session) pingLoop() {
 				if errors.As(err, &ne) && ne.Timeout() && err.Error() == gorillaWriteLockTimeoutMsg {
 					continue
 				}
+				// ErrCloseSent: the peer's close frame was already answered, so
+				// this is not a write failure (the read loop reports peer_close).
+				if !errors.Is(err, websocket.ErrCloseSent) {
+					s.markClosing(closeReasonWriteError, "")
+				}
 				_ = s.conn.Close()
 				return
 			}
@@ -677,6 +692,7 @@ func truncateForLog(s string, n int) string {
 
 func (m *Manager) handleSession(session *Session) {
 	defer func() {
+		session.logClosed(closeReasonReadError)
 		close(session.stopPing) // stop the ping goroutine
 		close(session.closeCh)
 		// Cancel all active flows
@@ -692,6 +708,7 @@ func (m *Manager) handleSession(session *Session) {
 	for {
 		_, message, err := readMessageRefreshingDeadline(session.conn, session.pingInterval+session.pongTimeout)
 		if err != nil {
+			session.noteReadError(err)
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 				session.logger.Error("Read error", zap.Error(err))
 			}
@@ -983,7 +1000,8 @@ func (m *Manager) registerSession(session *Session) bool {
 	// Close existing session for this user (skip for anonymous sessions)
 	if session.UserID != "" {
 		if existing, ok := m.userIndex[session.UserID]; ok {
-			m.logger.Debug("Closing existing session", zap.String("user_id", session.UserID))
+			m.logSuperseding(existing, session)
+			existing.markClosing(closeReasonSuperseded, session.ID)
 			_ = existing.conn.Close()
 			delete(m.sessions, existing.ID)
 			// Also remove from persistent store
@@ -1256,6 +1274,7 @@ func (m *Manager) CloseUserSessions(userID string, reason string) int {
 // indefinitely on an in-flight s.Send. WriteControl's own deadline bounds
 // this call regardless of whether it succeeds, and Close is unconditional.
 func (s *Session) closeWithReason(reason string) {
+	s.markClosing(closeReasonFromText(reason), "")
 	_ = s.conn.WriteControl(
 		websocket.CloseMessage,
 		websocket.FormatCloseMessage(websocket.ClosePolicyViolation, reason),
@@ -1270,6 +1289,7 @@ func (m *Manager) Close() {
 	defer m.sessionsMu.Unlock()
 
 	for _, session := range m.sessions {
+		session.markClosing(closeReasonServerShutdown, "")
 		_ = session.conn.Close()
 	}
 	m.sessions = make(map[string]*Session)
