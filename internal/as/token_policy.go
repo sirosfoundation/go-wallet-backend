@@ -2,11 +2,8 @@ package as
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"time"
-
-	"github.com/gin-gonic/gin"
 )
 
 // Token issuance policy, separated from the HTTP handlers.
@@ -65,16 +62,6 @@ var (
 	errDelegationTenant  = &tokenError{http.StatusForbidden, oauthErrInvalidRequest, "delegation cannot change tenant"}
 	errTACExceedsParent  = &tokenError{http.StatusForbidden, oauthErrInvalidScope, "delegated permissions exceed parent token"}
 )
-
-// respondTokenError writes a policy refusal. It is the only place in the
-// token endpoint that knows the error wire format.
-func respondTokenError(c *gin.Context, err error) {
-	var te *tokenError
-	if !errors.As(err, &te) {
-		te = &tokenError{http.StatusInternalServerError, "server_error", "token issuance failed"}
-	}
-	c.JSON(te.Status, gin.H{"error": te.Message})
-}
 
 // Anonymous tokens are narrowly scoped by design: identity-free, and capped
 // regardless of what the session's own MaxTAC allows.

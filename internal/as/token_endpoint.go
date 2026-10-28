@@ -34,6 +34,18 @@ func refuseRevocationUnavailable(c *gin.Context, logger *zap.Logger, err error) 
 	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "revocation check unavailable"})
 }
 
+// respondTokenError writes a policy refusal. Together with
+// refuseRevocationUnavailable it is the whole of this endpoint's knowledge of
+// the error wire format; the policy itself (token_policy.go) has none and
+// imports no web framework.
+func respondTokenError(c *gin.Context, err error) {
+	var te *tokenError
+	if !errors.As(err, &te) {
+		te = &tokenError{http.StatusInternalServerError, "server_error", "token issuance failed"}
+	}
+	c.JSON(te.Status, gin.H{"error": te.Message})
+}
+
 // respondRevocation answers a failed revocation check and is the only caller
 // that has to tell the two kinds of failure apart: a refusal, which is a
 // *tokenError, or a store that could not answer, which is anything else.
