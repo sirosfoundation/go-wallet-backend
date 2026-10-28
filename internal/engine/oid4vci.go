@@ -887,6 +887,25 @@ type OAuthError struct {
 
 // parseOAuthError attempts to parse a structured OAuth error from a response body.
 // Returns the parsed error or a generic error with the status code.
+// safeErrorCode returns an OAuth error code for logging: only a short token of
+// [A-Za-z0-9_.-] qualifies, anything else is reported as "unrecognized".
+func safeErrorCode(code string) string {
+	if code == "" {
+		return ""
+	}
+	if len(code) > 64 {
+		return "unrecognized"
+	}
+	for _, r := range code {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '.', r == '-':
+		default:
+			return "unrecognized"
+		}
+	}
+	return code
+}
+
 func parseOAuthError(statusCode int, body []byte) error {
 	var oauthErr OAuthError
 	if err := json.Unmarshal(body, &oauthErr); err == nil && oauthErr.Error != "" {
@@ -2836,8 +2855,14 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 			_ = resp.Body.Close()
-			// The body is not logged verbatim: legacy issuers put a c_nonce in it.
-			h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode), zap.String("error", parseOAuthError(resp.StatusCode, body).Error()))
+			var errResp struct {
+				Error  string `json:"error"`
+				CNonce string `json:"c_nonce"`
+			}
+			parsedErr := json.Unmarshal(body, &errResp) == nil
+			// Only the error code is logged, never the body or error_description:
+			// they are issuer-controlled free text and legacy ones carry a nonce.
+			h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode), zap.String("error", safeErrorCode(errResp.Error)))
 
 			// A holder commitment conflict is a final, user-actionable outcome:
 			// relay it as its own flow error code (never retried).
@@ -2850,11 +2875,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			// issuers) lets the caller re-request proofs and retry once. Do NOT
 			// send a flow error here: that is the caller's responsibility when
 			// no retry is possible.
-			var errResp struct {
-				Error  string `json:"error"`
-				CNonce string `json:"c_nonce"`
-			}
-			if json.Unmarshal(body, &errResp) == nil && (errResp.Error == "invalid_nonce" || errResp.CNonce != "") {
+			if parsedErr && (errResp.Error == "invalid_nonce" || errResp.CNonce != "") {
 				return nil, &CNonceRequiredError{
 					NewNonce: errResp.CNonce,
 					Err:      parseOAuthError(resp.StatusCode, body),

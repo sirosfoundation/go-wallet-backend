@@ -150,3 +150,20 @@ func TestIssueCredential_InvalidNonceNoEndpointNoCNonce_IsTerminal(t *testing.T)
 	assert.Equal(t, 1, ni.credCalls)
 	assert.Len(t, proofNonces(t, fc), 1)
 }
+
+// Issuer free text (error_description) can repeat the nonce: it is never logged.
+func TestIssueCredential_ErrorDescriptionNonceNotLogged(t *testing.T) {
+	_, _, logs, err := runNonceRetry(t, false,
+		`{"error":"invalid_nonce","error_description":"nonce secret-n2 has expired","c_nonce":"secret-n2"}`,
+		`{"error":"invalid_nonce","error_description":"nonce secret-n3 expired","c_nonce":"secret-n3"}`)
+	require.Error(t, err)
+	assert.NotContains(t, logs, "secret-n")
+	assert.Contains(t, logs, "invalid_nonce")
+}
+
+func TestSafeErrorCode(t *testing.T) {
+	assert.Equal(t, "invalid_nonce", safeErrorCode("invalid_nonce"))
+	assert.Equal(t, "", safeErrorCode(""))
+	assert.Equal(t, "unrecognized", safeErrorCode("nonce abc expired"))
+	assert.Equal(t, "unrecognized", safeErrorCode(string(make([]byte, 65))))
+}
