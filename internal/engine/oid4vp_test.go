@@ -376,7 +376,7 @@ func TestParseRequest(t *testing.T) {
 	})
 	defer cleanup()
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Logger: zap.NewNop()}, httpClient: srv.Client()}
 
@@ -1564,7 +1564,7 @@ func TestOID4VPFlow_X509SANURI_NeverFetchesClientMetadataBeforeVerification(t *t
 			})
 			defer cleanup()
 			session := testSession(conn)
-			flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+			flow := registerTestFlow(session, "test-flow")
 
 			h := &OID4VPHandler{
 				BaseHandler: BaseHandler{Flow: flow, Config: testConfig(), Logger: zap.NewNop()},
@@ -1644,7 +1644,7 @@ func TestOID4VPFlow_X509SANDNSAndHash_NeverFetchesClientMetadataBeforeVerificati
 				})
 				defer cleanup()
 				session := testSession(conn)
-				flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+				flow := registerTestFlow(session, "test-flow")
 
 				h := &OID4VPHandler{
 					BaseHandler: BaseHandler{Flow: flow, Config: testConfig(), Logger: zap.NewNop()},
@@ -2345,7 +2345,7 @@ func TestEvaluateVerifierTrust_DecentralizedIdentifier(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow:     flow,
@@ -2403,15 +2403,15 @@ func TestEvaluateVerifierTrust_NoPDPConfigured_FallsBackToFrontend(t *testing.T)
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	result, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "eidas"})
 	require.NoError(t, err)
-	session.actionCh <- &FlowActionMessage{
+	session.dispatchAction(&FlowActionMessage{
 		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
 		Action:  ActionTrustResult,
 		Payload: result,
-	}
+	})
 
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow:   flow,
@@ -2447,7 +2447,7 @@ func TestEvaluateVerifierTrust_DecentralizedIdentifierRequiresSignedRequest(t *t
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Config: testConfig(), Logger: zap.NewNop()}}
 
 	// An unsigned request under the new spelling is refused in the active path
@@ -2508,7 +2508,7 @@ func TestEvaluateVerifierTrust_PDPError_FailsClosed_NoFrontendFallback(t *testin
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc,
 	}}
@@ -2550,7 +2550,7 @@ func TestEvaluateVerifierTrust_PDPPath_DeniedWithoutError(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -2594,7 +2594,7 @@ func TestEvaluateVerifierTrust_PDPPath_CacheHit_Trusted_SkipsSecondPDPCall(t *te
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -2641,7 +2641,7 @@ func TestEvaluateVerifierTrust_PDPPath_CacheHit_Untrusted_SkipsSecondPDPCall(t *
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -2691,15 +2691,15 @@ func TestEvaluateVerifierTrust_ClientAssertedVerdict_NeverCached(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	result, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "client-asserted", Name: "Attacker-Controlled Name"})
 	require.NoError(t, err)
-	session.actionCh <- &FlowActionMessage{
+	session.dispatchAction(&FlowActionMessage{
 		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
 		Action:  ActionTrustResult,
 		Payload: result,
-	}
+	})
 
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustCache: trustCache,
@@ -2752,7 +2752,7 @@ func TestEvaluateVerifierTrust_CacheNeverBypassesSignatureVerification(t *testin
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -2819,7 +2819,7 @@ func TestEvaluateVerifierTrust_CacheDoesNotLeakAcrossDifferentClaimedVerifier(t 
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -2880,7 +2880,7 @@ func TestEvaluateVerifierTrust_CacheKeyIncludesCertificateFingerprint(t *testing
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -2938,7 +2938,7 @@ func TestEvaluateVerifierTrust_PDPPath_ForwardsTrustChainContext(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc,
 	}}
@@ -3046,7 +3046,7 @@ func TestEvaluateVerifierTrust_X509Hash_PDPPath(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3161,7 +3161,7 @@ func TestEvaluateVerifierTrust_VerifierAttestation_PDPPath(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3211,7 +3211,7 @@ func TestEvaluateVerifierTrust_RedirectURIScheme_PDPPath_UsesCanonicalURLCacheKe
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3297,7 +3297,7 @@ func TestEvaluateVerifierTrust_DIDCacheKeyIncludesMatchedKeyFingerprint(t *testi
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3369,7 +3369,7 @@ func TestEvaluateVerifierTrust_AttestationCacheKeyIncludesRawJWTHash(t *testing.
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3427,7 +3427,7 @@ func TestEvaluateVerifierTrust_CacheKeyIncludesPDPContext(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3494,7 +3494,7 @@ func TestEvaluateVerifierTrust_FallbackCacheKeyIncludesClientID(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3536,11 +3536,11 @@ func feedAction(t *testing.T, s *Session, flowID, action string, payload any) {
 	t.Helper()
 	raw, err := json.Marshal(payload)
 	require.NoError(t, err)
-	s.actionCh <- &FlowActionMessage{
+	s.dispatchAction(&FlowActionMessage{
 		Message: Message{Type: TypeFlowAction, FlowID: flowID},
 		Action:  action,
 		Payload: raw,
-	}
+	})
 }
 
 // newSelectionTestHandler returns a handler whose session writes to a real
@@ -3562,8 +3562,8 @@ func newSelectionTestHandler(t *testing.T) (*OID4VPHandler, *Session, chan map[s
 		}
 	})
 	session := testSession(conn)
-	flow := &Flow{ID: "flow-1", Protocol: ProtocolOID4VP, Session: session, Data: map[string]interface{}{}}
-	session.flows[flow.ID] = flow
+	flow := registerTestFlow(session, "flow-1")
+	flow.Protocol = ProtocolOID4VP
 	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Logger: zap.NewNop()}}
 	h.httpClient = &http.Client{Timeout: 5 * time.Second}
 	return h, session, received, cleanup
@@ -3711,7 +3711,7 @@ func TestRequestCredentialSelection_NonEmptyMatchKeepsWaitingForConsent(t *testi
 }
 
 func TestWaitForSelectionAction_RepeatedMatchesDoNotExtendTheDeadline(t *testing.T) {
-	h, session, _, cleanup := newSelectionTestHandler(t)
+	h, _, _, cleanup := newSelectionTestHandler(t)
 	defer cleanup()
 
 	// A client that keeps sending the informational credentials_matched action
@@ -3728,7 +3728,7 @@ func TestWaitForSelectionAction_RepeatedMatchesDoNotExtendTheDeadline(t *testing
 			select {
 			case <-stop:
 				return
-			case session.actionCh <- &FlowActionMessage{
+			case h.Flow.actions <- &FlowActionMessage{
 				Message: Message{Type: TypeFlowAction, FlowID: h.Flow.ID},
 				Action:  ActionCredentialsMatched,
 				Payload: raw,
@@ -3885,15 +3885,15 @@ func TestEvaluateVerifierTrust_DIDScheme_NoPDPConfigured_SetsResolutionFlags(t *
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	result, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "did-frontend-resolved"})
 	require.NoError(t, err)
-	session.actionCh <- &FlowActionMessage{
+	session.dispatchAction(&FlowActionMessage{
 		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
 		Action:  ActionTrustResult,
 		Payload: result,
-	}
+	})
 
 	cfg := testConfig() // no Trust.PDPURL / Verifier.PDPURL set at all
 	trustCache := NewTrustCache(time.Hour)
@@ -3945,7 +3945,7 @@ func TestEvaluateVerifierTrust_X509SANURI_RequiresSignedRequest(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Config: testConfig(), Logger: zap.NewNop()}}
 	authReq := &AuthorizationRequest{
 		ClientID:       "https://verifier.example.com/id",
@@ -3979,7 +3979,7 @@ func TestEvaluateVerifierTrust_X509SANURI_InvalidSignature_NeverReachesPDP(t *te
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc}}
 	authReq := &AuthorizationRequest{
 		ClientID:       "https://verifier.example.com/id",
@@ -4021,7 +4021,7 @@ func TestEvaluateVerifierTrust_X509SANURI_MatchingSAN_TrustedAndCached(t *testin
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache}}
 	authReq := &AuthorizationRequest{
 		ClientID:       sanURI,
@@ -4086,7 +4086,7 @@ func TestEvaluateVerifierTrust_X509SANURI_MismatchedSAN_Untrusted(t *testing.T) 
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc}}
 	authReq := &AuthorizationRequest{
 		ClientID:       sanURI,
@@ -4136,7 +4136,7 @@ func TestEvaluateVerifierTrust_DisplayName_IgnoresClientSuppliedName(t *testing.
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache}}
 	authReq := &AuthorizationRequest{
 		ClientID:       "verifier.example.com",
@@ -4211,15 +4211,15 @@ func TestEvaluateVerifierTrust_NoPDPFrontendFallback_DisplayName_IgnoresFrontend
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	result, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "client-asserted", Name: frontendAssertedName})
 	require.NoError(t, err)
-	session.actionCh <- &FlowActionMessage{
+	session.dispatchAction(&FlowActionMessage{
 		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
 		Action:  ActionTrustResult,
 		Payload: result,
-	}
+	})
 
 	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Config: cfg, Logger: zap.NewNop()}}
 	authReq := &AuthorizationRequest{

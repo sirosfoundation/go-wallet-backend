@@ -10,10 +10,12 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1192,5 +1194,71 @@ func TestTokenEndpoint_SessionCookie_RevokedOwnerMayObtainDeletionOnlyToken(t *t
 		if w := post(tac); w.Code != http.StatusUnauthorized {
 			t.Errorf("tac %q: expected 401 for a revoked owner, got %d: %s", tac, w.Code, w.Body.String())
 		}
+	}
+}
+
+// respondTokenError is the endpoint's whole knowledge of the error wire format, so it is
+// checked through a real gin context: a refusal renders its own status and message, and
+// anything else renders a generic 500 whose body cannot carry the underlying text. An unknown
+// error here is an engine fault (a store error reaching the wrong path), and its message may
+// name internal hosts or echo request content.
+func TestRespondTokenError(t *testing.T) {
+	const leaky = "mongo: connection refused to db-7.internal:27017"
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantError  string
+	}{
+		{
+			name:       "a refusal keeps its own status and message",
+			err:        errTACExceedsSession,
+			wantStatus: http.StatusForbidden,
+			wantError:  "requested permissions exceed session maximum",
+		},
+		{
+			name:       "an unauthorized refusal keeps its own status",
+			err:        errInvalidSession,
+			wantStatus: http.StatusUnauthorized,
+			wantError:  "invalid or expired session",
+		},
+		{
+			name:       "anything else is a generic 500",
+			err:        errors.New(leaky),
+			wantStatus: http.StatusInternalServerError,
+			wantError:  "token issuance failed",
+		},
+		{
+			name:       "including one wrapping an internal error",
+			err:        fmt.Errorf("issue token: %w", errors.New(leaky)),
+			wantStatus: http.StatusInternalServerError,
+			wantError:  "token issuance failed",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+
+			respondTokenError(c, tc.err)
+
+			if w.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d", w.Code, tc.wantStatus)
+			}
+			var body map[string]string
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("body %q: %v", w.Body.String(), err)
+			}
+			if body["error"] != tc.wantError {
+				t.Errorf("error = %q, want %q", body["error"], tc.wantError)
+			}
+			if len(body) != 1 {
+				t.Errorf("body has %d members, want only \"error\": %v", len(body), body)
+			}
+			for _, secret := range []string{"mongo", "internal:27017"} {
+				if strings.Contains(w.Body.String(), secret) {
+					t.Errorf("body %q leaks %q from the underlying error", w.Body.String(), secret)
+				}
+			}
+		})
 	}
 }

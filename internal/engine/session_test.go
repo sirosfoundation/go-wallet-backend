@@ -1069,9 +1069,6 @@ func TestManager_RegisterSession_RejectsAlreadyRevokedUser(t *testing.T) {
 		conn:     srvConn,
 		flows:    make(map[string]*Flow),
 		logger:   zap.NewNop(),
-		actionCh: make(chan *FlowActionMessage, 1),
-		signCh:   make(chan *SignResponseMessage, 1),
-		matchCh:  make(chan *MatchResponseMessage, 1),
 		closeCh:  make(chan struct{}, 1),
 		stopPing: make(chan struct{}),
 	}
@@ -1120,9 +1117,6 @@ func TestManager_RegisterSession_RejectsRevokedUser_WithoutBlacklistFeature(t *t
 		conn:     srvConn,
 		flows:    make(map[string]*Flow),
 		logger:   zap.NewNop(),
-		actionCh: make(chan *FlowActionMessage, 1),
-		signCh:   make(chan *SignResponseMessage, 1),
-		matchCh:  make(chan *MatchResponseMessage, 1),
 		closeCh:  make(chan struct{}, 1),
 		stopPing: make(chan struct{}),
 	}
@@ -1402,9 +1396,6 @@ func TestManager_RegisterSession_RevocationStoreErrorRefuses(t *testing.T) {
 		conn:     <-srvConnCh,
 		flows:    make(map[string]*Flow),
 		logger:   zap.NewNop(),
-		actionCh: make(chan *FlowActionMessage, 1),
-		signCh:   make(chan *SignResponseMessage, 1),
-		matchCh:  make(chan *MatchResponseMessage, 1),
 		closeCh:  make(chan struct{}, 1),
 		stopPing: make(chan struct{}),
 	}
@@ -1445,8 +1436,7 @@ func TestManager_RegisterSession_StuckStoreFailsClosedWithoutHoldingLock(t *test
 	defer cleanup()
 	session := &Session{
 		ID: "stuck", UserID: "u", conn: <-srvConnCh, flows: make(map[string]*Flow),
-		logger: zap.NewNop(), actionCh: make(chan *FlowActionMessage, 1),
-		signCh: make(chan *SignResponseMessage, 1), matchCh: make(chan *MatchResponseMessage, 1),
+		logger:  zap.NewNop(),
 		closeCh: make(chan struct{}, 1), stopPing: make(chan struct{}),
 	}
 
@@ -1491,7 +1481,6 @@ func TestSession_RequestSign_ConcurrentWaitersGetOwnReplies(t *testing.T) {
 		conn:     srvConn,
 		flows:    make(map[string]*Flow),
 		logger:   zap.NewNop(),
-		signCh:   make(chan *SignResponseMessage, 20),
 		closeCh:  make(chan struct{}, 1),
 		stopPing: make(chan struct{}),
 	}
@@ -1518,10 +1507,10 @@ func TestSession_RequestSign_ConcurrentWaitersGetOwnReplies(t *testing.T) {
 		reqs = append(reqs, req)
 	}
 	for i := len(reqs) - 1; i >= 0; i-- {
-		session.signCh <- &SignResponseMessage{
+		session.dispatchSignResponse(&SignResponseMessage{
 			Message:       Message{Type: TypeSignResponse, MessageID: reqs[i].MessageID},
 			TransactionID: reqs[i].Params.JWE, // tag the reply with its owner
-		}
+		})
 	}
 	for name, ch := range results {
 		select {

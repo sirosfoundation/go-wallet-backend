@@ -38,7 +38,7 @@ func unknownFlowHarnessOn(t *testing.T, m *Manager, flows ...string) (*websocket
 		defer c.Close()
 		s := testSession(c)
 		for _, id := range flows {
-			s.flows[id] = &Flow{ID: id, Session: s}
+			registerTestFlow(s, id)
 		}
 		sessCh <- s
 		m.handleSession(s)
@@ -114,7 +114,7 @@ func TestUnknownFlow_OtherSessionsFlowIsIndistinguishable(t *testing.T) {
 	require.NoError(t, cl2.WriteMessage(websocket.TextMessage,
 		[]byte(`{"type":"flow_action","flow_id":"theirs","action":"decline"}`)))
 	select {
-	case a := <-s2.actionCh:
+	case a := <-s2.flows["theirs"].actions:
 		assert.Equal(t, "theirs", a.FlowID)
 	case <-time.After(2 * time.Second):
 		t.Fatal("live flow on its own session was not routed")
@@ -123,18 +123,22 @@ func TestUnknownFlow_OtherSessionsFlowIsIndistinguishable(t *testing.T) {
 
 func TestUnknownFlow_LiveFlowSignAndMatchResponsesAreDelivered(t *testing.T) {
 	cl, s := unknownFlowHarness(t, "live")
+	signCh, doneSign := s.trackSign("s1", "live")
+	defer doneSign()
+	matchCh, doneMatch := s.trackMatch("m1", "live")
+	defer doneMatch()
 	require.NoError(t, cl.WriteMessage(websocket.TextMessage,
 		[]byte(`{"type":"sign_response","flow_id":"live","message_id":"s1"}`)))
 	require.NoError(t, cl.WriteMessage(websocket.TextMessage,
 		[]byte(`{"type":"match_response","flow_id":"live","message_id":"m1","matches":[]}`)))
 	select {
-	case r := <-s.signCh:
+	case r := <-signCh:
 		assert.Equal(t, "s1", r.MessageID)
 	case <-time.After(2 * time.Second):
 		t.Fatal("sign_response for a live flow was not routed")
 	}
 	select {
-	case r := <-s.matchCh:
+	case r := <-matchCh:
 		assert.Equal(t, "m1", r.MessageID)
 	case <-time.After(2 * time.Second):
 		t.Fatal("match_response for a live flow was not routed")
@@ -182,7 +186,7 @@ func TestUnknownFlow_KnownFlowUnaffected(t *testing.T) {
 	require.NoError(t, cl.WriteMessage(websocket.TextMessage,
 		[]byte(`{"type":"flow_action","flow_id":"live","action":"decline"}`)))
 	select {
-	case a := <-s.actionCh:
+	case a := <-s.flows["live"].actions:
 		assert.Equal(t, "live", a.FlowID)
 		assert.Equal(t, ActionDecline, a.Action)
 	case <-time.After(2 * time.Second):
@@ -191,9 +195,11 @@ func TestUnknownFlow_KnownFlowUnaffected(t *testing.T) {
 	assertNoFurtherReply(t, cl)
 
 	// sign/match responses without a flow_id keep their message_id-only routing.
+	signCh, doneSign := s.trackSign("m1", "live")
+	defer doneSign()
 	require.NoError(t, cl.WriteMessage(websocket.TextMessage, []byte(`{"type":"sign_response","message_id":"m1"}`)))
 	select {
-	case r := <-s.signCh:
+	case r := <-signCh:
 		assert.Equal(t, "m1", r.MessageID)
 	case <-time.After(2 * time.Second):
 		t.Fatal("sign_response without flow_id was not routed")

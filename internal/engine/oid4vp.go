@@ -2097,11 +2097,18 @@ func (h *OID4VPHandler) refuseVerifierOnEncryptionError(ctx context.Context, aut
 // failSign reports a failed VP signature to the wallet as SIGN_ERROR. When the
 // failure was the direct_post.jwt contract, the verifier is refused first and
 // the redirect_uri it answered with (if any) travels in details, as it does for
-// every other refusal.
+// every other refusal. A client may also refuse a transaction type only it can
+// judge; the verifier is then told invalid_transaction_data rather than left
+// waiting.
 func (h *OID4VPHandler) failSign(ctx context.Context, authReq *AuthorizationRequest, err error) {
 	if redirectURI := h.refuseVerifierOnEncryptionError(ctx, authReq, err); redirectURI != "" {
 		_ = h.ErrorWithDetails(StepSubmittingResponse, ErrCodeSignError, ErrCodeSignError.UserFacingMessage(),
 			map[string]interface{}{"redirect_uri": redirectURI})
+		return
+	}
+	var signErr *SignError
+	if len(authReq.TransactionData) > 0 && errors.As(err, &signErr) && signErr.Code == ErrCodeUnsupportedTransactionData {
+		h.failTransactionData(ctx, authReq, &transactionDataError{code: ErrCodeUnsupportedTransactionData, err: err})
 		return
 	}
 	_ = h.Error(StepSubmittingResponse, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
