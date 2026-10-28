@@ -409,7 +409,7 @@ authenticating the User. Providers do it through `PUT
 /admin/tenants/{tenantId}/users/{userId}/instances/revoke-all`.
 
 The irreversible operation a user does own is removing the account, `DELETE
-/user/session`: it drops every session, erases the wallet data, stored
+/user/session` (confirmed with a passkey assertion, see below): it drops every session, erases the wallet data, stored
 credentials and presentations, deletes the user's wallet instances so the same
 device can enrol again, and removes the user record with its passkeys.
 
@@ -452,9 +452,142 @@ tombstone remembers the user's tenants and canonical holder DID (cleared once
 the final sweep succeeds), so a repeat of the deletion that finds no user record
 still sweeps the DID-keyed credentials and presentations in every tenant.
 
+##### POST /user/session/delete-begin
+
+Start deleting the account. The caller must confirm it with a fresh passkey
+assertion, so a stolen bearer token alone cannot erase an account. Needs `w` in
+the token's TAC (it stores a short-lived challenge); any passkey session
+qualifies, including one restricted to `rwl`.
+
+**Response:** `200`
+```json
+{
+  "challengeId": "a1b2c3...",
+  "publicKey": {
+    "rpId": "wallet.example.org",
+    "challenge": { "$b64u": "..." },
+    "allowCredentials": [ { "type": "public-key", "id": { "$b64u": "..." }, "transports": ["internal"] } ],
+    "userVerification": "required"
+  }
+}
+```
+`allowCredentials` lists only the caller's own passkeys; any one of them may
+sign. The challenge is bound to the caller and to this action, expires after
+120 seconds and is single use: the first `DELETE` that presents it consumes
+it, whatever the outcome, except that a `confirm` other than `DELETE` is
+refused before the challenge is touched. `400 NO_PASSKEY` when the account has no
+passkey (an OIDC-only account cannot confirm this way yet); `401` when
+unauthenticated; `404` when the user no longer exists.
+
+##### DELETE /user/session
+
+Delete the account: the operation described above, authorised by the assertion.
+
+**Request:**
+```json
+{
+  "challengeId": "a1b2c3...",
+  "credential": { "id": "...", "rawId": "...", "type": "public-key", "response": { "authenticatorData": "...", "clientDataJSON": "...", "signature": "...", "userHandle": "..." } },
+  "confirm": "DELETE"
+}
+```
+`credential` is the `PublicKeyCredential` the authenticator returned for the
+options of `delete-begin`, serialised like the login `credential`. `confirm`
+must be the exact text `DELETE`.
+
+The server checks the typed confirmation, consumes the challenge for the
+caller, and verifies the assertion against the caller's own passkeys. A
+credential of another user is refused, as is a challenge that was minted for
+another user or another action (for example a login challenge). No session or
+token is minted. It then runs the deletion unchanged, so `200 {"result":
+"DELETED"}`, `202` (`DELETION_CLEANUP_PENDING`, `DELETION_OPERATOR_REQUIRED`),
+`409 DELETION_INCOMPLETE`, `401` and `404` mean what they do above. A retry
+after `409` needs a fresh `delete-begin` and assertion.
+
+| Status | `error` | Meaning |
+|--------|---------|---------|
+| 401 | `STEP_UP_REQUIRED` | no body, and `user.delete.require_step_up` is on |
+| 401 | `STEP_UP_FAILED` | challenge unknown, already used, minted for someone or something else, or the assertion did not verify; the body was malformed |
+| 400 | `STEP_UP_FAILED` | the body is over 1 MiB or could not be read |
+| 410 | `STEP_UP_EXPIRED` | the challenge is older than 120 seconds, and less than 10 minutes old (an older one is deleted and reads as `STEP_UP_FAILED`) |
+| 400 | `CONFIRMATION_REQUIRED` | `confirm` is not `DELETE`; the assertion is not consumed, so the request can be sent again |
+
+A request with a body is authorised by its assertion alone: it does not need
+`d` in the token's TAC. The bodyless request still needs `d`. Passkey sessions
+hold `d` under the current defaults (`as.default_max_tac` is `rwlid`, and
+`/auth/token` issues the session's maximum when no TAC is requested), so a
+default passkey token can still delete an account without an assertion while
+`user.delete.require_step_up` is false. Restricting `as.default_max_tac` to
+`rwl` makes the assertion the only way for passkey sessions.
+
+**Rollout.** For one release the bodyless `DELETE /user/session` still works,
+so the backend can ship before the clients. Set
+`user.delete.require_step_up: true` (`WALLET_USER_DELETE_REQUIRE_STEP_UP`) to
+refuse it with `401 STEP_UP_REQUIRED` once the clients send the assertion; the
+default will flip to true in a later release.
+
+**What is erased and what is kept.** Erased: the user record (private data,
+passkeys, external identities), the credentials and presentations in every
+tenant, the wallet instances, and all sessions and tokens. Kept: a deletion
+tombstone for its retention period (it refuses the user's old tokens) and the
+audit log. `202` means an operator completes the last cleanup. Issuers and
+relying parties keep their own records; they are not notified.
+
+**Audit.** With `audit.enabled`, `audit.account_events` selects the SET events
+`requested` (the assertion verified; `step_up: false` for a bodyless request),
+`succeeded` and `cleanup_pending`. The subject is a hash of the user id; no
+credential content is recorded. None is emitted by default.
+
 ### Credential Management
 
 All credential endpoints require authentication.
+
+#### Adding a passkey to an existing account
+
+`POST /user/session/webauthn/register-begin` and
+`POST /user/session/webauthn/register-finish` (token TAC `i`) add a passkey to
+the caller's account. An account that already has a passkey needs one of them to
+authorise the addition, so a bearer token alone cannot enrol a passkey of its
+own. Two WebAuthn ceremonies take place, both answered in the one `finish`
+request; the authorising assertion is made first or second, in either order.
+
+**`register-begin` response:** as before (`challengeId`, `createOptions`,
+`username`), plus, when the account has a passkey:
+```json
+{
+  "authorization": {
+    "publicKey": {
+      "rpId": "wallet.example.org",
+      "challenge": { "$b64u": "..." },
+      "allowCredentials": [ { "type": "public-key", "id": { "$b64u": "..." } } ],
+      "userVerification": "required"
+    }
+  }
+}
+```
+`authorization` has the shape of the `delete-begin` options and is bound to the
+same `challengeId`: its challenge is fresh, single use and dies with the
+registration challenge (5 minutes). It is absent only for an account with no
+passkey yet.
+
+**Known limit.** An account with no passkey (for example one that signs in
+only through OIDC) has nothing to authorise with, so the first passkey is added
+on the bearer token alone. A holder of a stolen token can therefore enrol the
+first passkey of such an account and use it to confirm a deletion.
+
+**`register-finish` request:** as before (`challengeId`, `credential`,
+`nickname`, `privateData`), plus `authorization`: the `PublicKeyCredential`
+assertion an existing passkey returned for the `authorization.publicKey`
+options, serialised like the login `credential`. Required unless
+`register-begin` returned no `authorization`.
+
+| Status | `error` | Meaning |
+|--------|---------|---------|
+| 401 | `ENROLLMENT_AUTHORIZATION_REQUIRED` | the account has a passkey and `authorization` is missing |
+| 401 | `ENROLLMENT_AUTHORIZATION_FAILED` | the assertion is not from one of the caller's passkeys, is over another challenge, or does not verify |
+
+The check comes before the registration is verified, and a refused attempt
+consumes the challenge: start again with `register-begin`.
 
 #### GET /storage/vc
 

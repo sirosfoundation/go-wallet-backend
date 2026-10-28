@@ -95,3 +95,15 @@ func TestWebauthnChallenge_Actions(t *testing.T) {
 		})
 	}
 }
+
+func TestWebauthnChallenge_IsExpired_ValidUntil(t *testing.T) {
+	now := time.Now()
+	c := WebauthnChallenge{ValidUntil: now.Add(-time.Second), ExpiresAt: now.Add(time.Hour)}
+	if !c.IsExpired() {
+		t.Error("a challenge past ValidUntil is expired even though it is still stored")
+	}
+	c.ValidUntil = now.Add(time.Minute)
+	if c.IsExpired() {
+		t.Error("a challenge before ValidUntil is valid")
+	}
+}

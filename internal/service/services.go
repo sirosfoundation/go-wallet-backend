@@ -155,6 +155,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	// external caller like cmd/server/main.go does for SetSessionCleaner,
 	// since both objects are already owned by this constructor.
 	userSvc.SetTokenBlacklist(tokenBlacklist)
+	userSvc.SetAudit(audit.NewFromConfig(cfg, logger), cfg.Audit)
 	lifecycle := NewWalletLifecycleService(store, logger, audit.NewFromConfig(cfg, logger))
 	userSvc.SetUserLocker(lifecycle)
 	if wiaSvc != nil {
