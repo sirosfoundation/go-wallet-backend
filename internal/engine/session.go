@@ -758,8 +758,9 @@ func (s *Session) dispatchSignResponse(msg *SignResponseMessage) {
 		default:
 		}
 	}
+	_, flowExists := s.flows[msg.FlowID]
 	s.flowsMu.RUnlock()
-	if !owned {
+	if !owned && !flowExists {
 		s.replyUnknownFlow(msg.FlowID, msg.Type)
 	}
 }
