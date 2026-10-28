@@ -19,9 +19,50 @@ import (
 // TokenBlacklistChecker's read methods plus service.TokenBlacklist's own
 // Add; *service.TokenBlacklist satisfies this.
 type TokenBlacklistChecker interface {
-	IsBlacklisted(ctx context.Context, jti string) bool
-	IsUserRevoked(ctx context.Context, userID string) bool
+	IsBlacklisted(ctx context.Context, jti string) (bool, error)
+	IsUserRevoked(ctx context.Context, userID string) (bool, error)
 	Add(ctx context.Context, jti string, expiry time.Time) error
+}
+
+// refuseRevocationUnavailable answers 503 when the revocation store cannot say
+// whether a token is revoked. Only the error is logged, never token content.
+func refuseRevocationUnavailable(c *gin.Context, logger *zap.Logger, err error) {
+	if logger != nil {
+		logger.Error("token request refused: revocation check failed", zap.Error(err))
+	}
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "revocation check unavailable"})
+}
+
+// sessionOwnerRevoked reports whether the session's user has been revoked
+// (account deletion revokes the user before the sessions are purged, so an
+// interrupted or unacknowledged deletion can leave a live session whose owner
+// is already revoked). When it returns true a response has been written and
+// the caller must stop: 401 for a revoked owner, 503 when the revocation
+// store cannot say. Without a wired blacklist there is nothing to check.
+//
+// deletionOnly names the one token a revoked owner may still obtain: exactly
+// the deletion permission, which is all DELETE /user/session needs and the
+// only call the resource middleware lets a revoked user reach. It lets an
+// interrupted deletion be completed after the previous access token expired,
+// while every other token (including any anonymous one, whose missing "sub"
+// would bypass the user revocation) stays refused.
+func sessionOwnerRevoked(c *gin.Context, deps *tokenDeps, session *Session, deletionOnly bool, tac TAC) bool {
+	if deps.blacklist == nil {
+		return false
+	}
+	revoked, err := deps.blacklist.IsUserRevoked(c.Request.Context(), session.UserID)
+	if err != nil {
+		refuseRevocationUnavailable(c, deps.logger, err)
+		return true
+	}
+	if !revoked {
+		return false
+	}
+	if deletionOnly && tac == TAC(string(TACDelete)) {
+		return false
+	}
+	c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
+	return true
 }
 
 // tokenDeps groups the shared dependencies for token issuance handlers.
@@ -29,10 +70,10 @@ type tokenDeps struct {
 	issuer *TokenIssuer
 	policy PolicyEngine
 	// ttlFunc, audiences and blacklist are used differently across the two
-	// token-issuance paths: ttlFunc for both; audiences and blacklist only
-	// by handleDelegationTokenRequest, which is the only path that verifies
-	// an already-issued Bearer token rather than trusting a server-side
-	// session record.
+	// token-issuance paths: ttlFunc for both; audiences only by
+	// handleDelegationTokenRequest, which verifies an already-issued Bearer
+	// token. blacklist is used by every path: delegation checks the parent
+	// token, the session paths check the session owner (sessionOwnerRevoked).
 	ttlFunc   func(string) time.Duration
 	audiences []string
 	blacklist TokenBlacklistChecker
@@ -56,10 +97,11 @@ type TokenEndpointConfig struct {
 	Issuer  *TokenIssuer
 	Policy  PolicyEngine
 	TTLFunc func(string) time.Duration
-	// Audiences and Blacklist are used only by the delegation-exchange path
-	// (handleDelegationTokenRequest), which is the only one that verifies an
-	// already-issued Bearer token rather than trusting a server-side session
-	// record - see #381/#382.
+	// Audiences is used only by the delegation-exchange path
+	// (handleDelegationTokenRequest), which verifies an already-issued Bearer
+	// token - see #381/#382. Blacklist is consulted by every path: delegation
+	// checks the parent token; the session-cookie paths check that the
+	// session's owner has not been revoked (account deletion).
 	Audiences       []string
 	Blacklist       TokenBlacklistChecker
 	InsecureCookies bool
@@ -176,6 +218,10 @@ func handleSessionTokenRequest(
 		return
 	}
 
+	if sessionOwnerRevoked(c, deps, session, true, tac) {
+		return
+	}
+
 	issueToken(c, deps, session.UserID, req.Audience, tenantID, tac, session.ACR)
 }
 
@@ -205,6 +251,9 @@ func handleAnonymousTokenRequest(
 	session, err := store.Get(c.Request.Context(), sessionID)
 	if err != nil || session == nil || !session.IsValid() {
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
+		return
+	}
+	if sessionOwnerRevoked(c, deps, session, false, "") {
 		return
 	}
 
@@ -305,11 +354,24 @@ func handleDelegationTokenRequest(
 	// ever nil in tests that don't care.
 	if deps.blacklist != nil {
 		ctx := c.Request.Context()
-		if parentClaims.ID != "" && deps.blacklist.IsBlacklisted(ctx, parentClaims.ID) {
+		jtiRevoked := false
+		var err error
+		if parentClaims.ID != "" {
+			if jtiRevoked, err = deps.blacklist.IsBlacklisted(ctx, parentClaims.ID); err != nil {
+				refuseRevocationUnavailable(c, deps.logger, err)
+				return
+			}
+		}
+		if jtiRevoked {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token has been revoked"})
 			return
 		}
-		if deps.blacklist.IsUserRevoked(ctx, parentClaims.Subject) {
+		userRevoked, err := deps.blacklist.IsUserRevoked(ctx, parentClaims.Subject)
+		if err != nil {
+			refuseRevocationUnavailable(c, deps.logger, err)
+			return
+		}
+		if userRevoked {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token's user has been revoked"})
 			return
 		}
