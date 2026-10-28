@@ -3,9 +3,10 @@ module github.com/sirosfoundation/go-wallet-backend
 go 1.27.3
 
 require (
+	github.com/alicebob/miniredis/v2 v2.39.0
 	github.com/descope/virtualwebauthn v1.0.3
 	github.com/fxamacker/cbor/v2 v2.9.6
-	github.com/getkin/kin-openapi v0.151.0
+	github.com/getkin/kin-openapi v0.152.0
 	github.com/gin-contrib/cors v1.7.9
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-jose/go-jose/v4 v4.1.6
@@ -21,12 +22,14 @@ require (
 	github.com/sirosfoundation/go-siros-set v0.1.0
 	github.com/sirosfoundation/go-spocp v0.1.0
 	github.com/sirosfoundation/go-tokenauth v0.5.0
-	github.com/sirosfoundation/go-trust v0.25.0
+	github.com/sirosfoundation/go-trust v0.26.0
 	github.com/sirosfoundation/go-ts11client v0.0.0-20260820233304-8809951d6f67
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.1
+	github.com/veraison/go-cose v1.3.0
 	go.mongodb.org/mongo-driver v1.17.10
 	go.uber.org/zap v1.28.0
+	golang.org/x/net v0.60.0
 	golang.org/x/sync v0.24.0
 	golang.org/x/time v0.16.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -86,13 +89,13 @@ require (
 	github.com/xdg-go/scram v1.2.0 // indirect
 	github.com/xdg-go/stringprep v1.0.4 // indirect
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
+	github.com/yuin/gopher-lua v1.1.1 // indirect
 	go.mongodb.org/mongo-driver/v2 v2.9.1 // indirect
 	go.uber.org/atomic v1.12.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/arch v0.31.0 // indirect
 	golang.org/x/crypto v0.57.0 // indirect
-	golang.org/x/net v0.60.0 // indirect
 	golang.org/x/sys v0.48.0 // indirect
 	golang.org/x/text v0.42.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect

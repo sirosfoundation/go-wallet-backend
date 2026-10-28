@@ -44,7 +44,7 @@ func NewHandlers(services *service.Services, cfg *config.Config, logger *zap.Log
 		cfg:           cfg,
 		logger:        logger.Named("handlers"),
 		roles:         roles,
-		metadataCache: newIssuerMetadataCache(),
+		metadataCache: newIssuerMetadataCache(cfg.HTTPClient.MetadataCacheDisabled),
 		httpClient:    cfg.HTTPClient.NewHTTPClient(0),
 		imageEmbedder: newIssuerMetadataImageEmbedder(cfg, logger),
 	}
@@ -58,7 +58,7 @@ func NewHandlersWithStore(services *service.Services, store storage.Store, cfg *
 		cfg:           cfg,
 		logger:        logger.Named("handlers"),
 		roles:         roles,
-		metadataCache: newIssuerMetadataCache(),
+		metadataCache: newIssuerMetadataCache(cfg.HTTPClient.MetadataCacheDisabled),
 		httpClient:    cfg.HTTPClient.NewHTTPClient(0),
 		imageEmbedder: newIssuerMetadataImageEmbedder(cfg, logger),
 	}
@@ -405,6 +405,9 @@ type SecurityPropertiesRequest struct {
 	KeyStorage         []string    `json:"key_storage"`
 	UserAuthentication []string    `json:"user_authentication"`
 	Certification      interface{} `json:"certification,omitempty"`
+	// Plugin names the WSCD plugin holding the keys. A client claim, only
+	// ever evidence for the assurance policy.
+	Plugin string `json:"plugin,omitempty"`
 }
 
 func (s *SecurityPropertiesRequest) toService() *service.SecurityProperties {
@@ -415,6 +418,7 @@ func (s *SecurityPropertiesRequest) toService() *service.SecurityProperties {
 		KeyStorage:         s.KeyStorage,
 		UserAuthentication: s.UserAuthentication,
 		Certification:      s.Certification,
+		Plugin:             s.Plugin,
 	}
 }
 
@@ -479,8 +483,17 @@ func (h *Handlers) GenerateKeyAttestation(c *gin.Context) {
 		return
 	}
 
+	// Bind the request to the authenticated caller so a wallet_instance_id
+	// belonging to another tenant or user cannot lend its platform evidence.
+	tenantID, _ := h.getTenantID(c)
+	callerUser, _ := contextUserID(c)
+	kaCtx := service.WithKeyAttestationCaller(c.Request.Context(), service.KeyAttestationCaller{
+		TenantID: tenantID,
+		UserID:   callerUser,
+	})
+
 	keyAttestation, err := h.services.WalletProvider.GenerateKeyAttestation(
-		c.Request.Context(),
+		kaCtx,
 		req.JWKS,
 		req.OpenID4VCI.Nonce,
 		req.SecurityProperties.toService(),
@@ -605,6 +618,19 @@ func maxConfiguredASTokenTTL(cfg *config.Config) time.Duration {
 }
 
 // Logout blacklists the jti of the access token TokenAuthMiddleware already validated.
+//
+// A failed revocation write fails the handler closed with a 500: the token is
+// still usable, so a clean logout must not be reported.
+//
+// Revocations are monotonic: nothing is ever withdrawn here. A jti entry is
+// shared by every request that presents the token, so removing it after a
+// failure could undo a logout another request completed; and an error from
+// the shared write does not prove it was rejected (MongoDB can apply the
+// update and then fail to acknowledge it), so "write failed, therefore not
+// revoked" cannot be assumed either. What makes a failure recoverable is that
+// logout is idempotent and reachable with an already revoked token
+// (middleware.IsLogout): the client retries and the jti write is repeated
+// harmlessly.
 func (h *Handlers) Logout(c *gin.Context) {
 	v, exists := c.Get("tokenauth_result")
 	if !exists {
@@ -616,12 +642,13 @@ func (h *Handlers) Logout(c *gin.Context) {
 		if result.JTI != "" && h.services.TokenBlacklist != nil {
 			expiry := time.Now().Add(maxConfiguredASTokenTTL(h.cfg) + time.Minute)
 			if err := h.services.TokenBlacklist.Add(c.Request.Context(), result.JTI, expiry); err != nil {
-				h.logger.Warn("Failed to blacklist token", zap.Error(err))
-			} else {
-				h.logger.Info("User logged out, token blacklisted",
-					zap.String("jti", result.JTI),
-				)
+				h.logger.Error("Logout: failed to revoke session token", zap.Error(err))
+				c.JSON(500, gin.H{"error": "Failed to revoke session"})
+				return
 			}
+			h.logger.Info("User logged out, token blacklisted",
+				zap.String("jti", result.JTI),
+			)
 		}
 	}
 
@@ -648,6 +675,11 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		holderDID,
 	); err != nil {
 		h.logger.Error("Failed to delete user", zap.Error(err))
+		if errors.Is(err, service.ErrTokenRevocationFailed) {
+			// Nothing was deleted yet that a retry cannot redo.
+			c.JSON(500, gin.H{"error": "Failed to revoke tokens"})
+			return
+		}
 		c.JSON(400, gin.H{"error": err.Error()})
 		return
 	}

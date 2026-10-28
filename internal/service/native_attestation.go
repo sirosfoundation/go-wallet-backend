@@ -1,13 +1,16 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,12 +20,18 @@ import (
 	"github.com/go-jose/go-jose/v4"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
 var (
 	ErrNativeAttestationDisabled = errors.New("native attestation verification is not enabled")
 	ErrNativeAttestationInvalid  = errors.New("native attestation verification failed")
+	// ErrNativeAttestationUnavailable means a valid-looking attestation could
+	// not be judged or recorded because storage failed. It is not a client
+	// error: the request is refused and may be retried.
+	ErrNativeAttestationUnavailable = errors.New("native attestation cannot be verified right now")
 )
 
 // NativeAttestationType identifies the platform attestation type.
@@ -39,7 +48,10 @@ type NativeAttestationRequest struct {
 	Type NativeAttestationType `json:"type"`
 	// Token is the platform-specific attestation token/assertion
 	Token string `json:"token"`
-	// KeyID is the key identifier for logging/correlation (not cryptographically validated)
+	// KeyID is the key identifier. For App Attest it is required and is
+	// validated against the attested public key (it must be the base64 of
+	// SHA-256 over the credCert public key); for Play Integrity it is only
+	// logged, never used as an identity.
 	KeyID string `json:"key_id"`
 	// Challenge is the nonce/challenge that was attested
 	Challenge string `json:"challenge"`
@@ -61,6 +73,13 @@ type NativeAttestationResult struct {
 type NativeAttestationService struct {
 	cfg    *config.Config
 	logger *zap.Logger
+
+	// appAttestKeys durably stores verified App Attest keys; nil disables
+	// storing (attestations are still verified in full).
+	appAttestKeys storage.AppAttestKeyStore
+	// appRoots is the trust root pool for the attestation chain; nil means
+	// the pinned Apple App Attestation Root CA. Tests inject a test CA.
+	appRoots *x509.CertPool
 }
 
 // NewNativeAttestationService creates a new native attestation verifier.
@@ -71,20 +90,37 @@ func NewNativeAttestationService(cfg *config.Config, logger *zap.Logger) *Native
 	}
 }
 
+// SetAppAttestKeys installs the store verified App Attest keys are kept in.
+func (s *NativeAttestationService) SetAppAttestKeys(k storage.AppAttestKeyStore) { s.appAttestKeys = k }
+
 // IsEnabled returns true if native attestation verification is configured.
 func (s *NativeAttestationService) IsEnabled() bool {
 	return s.cfg.WalletProvider.Attestation.NativeAttestation.Enabled
 }
 
 // Verify validates a native attestation request.
+//
+// It verifies only: an App Attest key is not stored, because there is no
+// caller context to bind it to. The WIA path uses VerifyBound.
 func (s *NativeAttestationService) Verify(ctx context.Context, req *NativeAttestationRequest) (*NativeAttestationResult, error) {
+	return s.verify(ctx, nil, req)
+}
+
+// VerifyBound validates a native attestation request on behalf of an
+// authenticated caller. A verified App Attest key is stored bound to that
+// caller (tenant, user, wallet instance), so later requests can use assertions.
+func (s *NativeAttestationService) VerifyBound(ctx context.Context, bind NativeAttestationBinding, req *NativeAttestationRequest) (*NativeAttestationResult, error) {
+	return s.verify(ctx, &bind, req)
+}
+
+func (s *NativeAttestationService) verify(ctx context.Context, bind *NativeAttestationBinding, req *NativeAttestationRequest) (*NativeAttestationResult, error) {
 	if !s.IsEnabled() {
 		return nil, ErrNativeAttestationDisabled
 	}
 
 	switch req.Type {
 	case NativeAttestationAppleAppAttest:
-		return s.verifyAppleAppAttest(ctx, req)
+		return s.verifyAppleAppAttest(ctx, bind, req)
 	case NativeAttestationGooglePlayInteg:
 		return s.verifyGooglePlayIntegrity(ctx, req)
 	default:
@@ -105,16 +141,98 @@ type appleAppAttestAttestStatement struct {
 	Receipt []byte   `cbor:"receipt"`
 }
 
+// App Attest authenticator data layout (attestation object):
+//
+//	rpIdHash (32) || flags (1) || signCount (4) ||
+//	aaguid (16) || credentialIdLength (2, big endian) || credentialId || credentialPublicKey (COSE)
+const (
+	appAttestAuthDataHeaderLen  = 37
+	appAttestAttestedDataOffset = appAttestAuthDataHeaderLen + 16 + 2 // 55
+	appAttestKeyIDLen           = sha256.Size
+	// maxAppAttestObjectLen bounds the attestation object accepted. Real
+	// objects are a few KiB; the cap keeps a hostile client from making the
+	// server decode megabytes of CBOR.
+	maxAppAttestObjectLen = 64 * 1024
+)
+
+// AAGUIDs Apple puts in attestation objects: the environment is part of the
+// signed authenticator data, not something the client reports.
+var (
+	appAttestAAGUIDProduction  = [16]byte{'a', 'p', 'p', 'a', 't', 't', 'e', 's', 't'}
+	appAttestAAGUIDDevelopment = [16]byte{'a', 'p', 'p', 'a', 't', 't', 'e', 's', 't', 'd', 'e', 'v', 'e', 'l', 'o', 'p'}
+)
+
+// appAttestEnvironment resolves the configured environment. Empty means
+// production (the historical default); anything unrecognised is refused
+// rather than guessed.
+func appAttestEnvironment(configured string) (domain.AppAttestEnvironment, [16]byte, error) {
+	switch configured {
+	case "", "production":
+		return domain.AppAttestProduction, appAttestAAGUIDProduction, nil
+	case "development":
+		return domain.AppAttestDevelopment, appAttestAAGUIDDevelopment, nil
+	}
+	return "", [16]byte{}, fmt.Errorf("unsupported apple_app_attest_environment %q", configured)
+}
+
+// decodeAppAttestKeyID decodes the key identifier a client sends. Apple's
+// keyId is the base64 of 32 bytes; standard and URL alphabets, padded or not,
+// are accepted. Anything that does not decode to exactly 32 bytes is refused.
+func decodeAppAttestKeyID(s string) ([]byte, error) {
+	for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+		if b, err := enc.DecodeString(s); err == nil {
+			if len(b) != appAttestKeyIDLen {
+				return nil, fmt.Errorf("key_id is %d bytes, want %d", len(b), appAttestKeyIDLen)
+			}
+			return b, nil
+		}
+	}
+	return nil, errors.New("key_id is not base64")
+}
+
+// canonicalAppAttestKeyID is the stored form of a key id.
+func canonicalAppAttestKeyID(raw []byte) string { return base64.StdEncoding.EncodeToString(raw) }
+
+// NativeAttestationBinding is the context an App Attest key is attested in:
+// the authenticated caller of the WIA request. The attested key is stored
+// bound to it.
+type NativeAttestationBinding struct {
+	TenantID         domain.TenantID
+	UserID           *domain.UserID
+	WalletInstanceID string
+}
+
 // verifyAppleAppAttest validates an Apple App Attest attestation object.
 // See: https://developer.apple.com/documentation/devicecheck/validating_apps_that_connect_to_your_server
-func (s *NativeAttestationService) verifyAppleAppAttest(_ context.Context, req *NativeAttestationRequest) (*NativeAttestationResult, error) {
+//
+// It performs the checks Apple specifies, in order: certificate chain to the
+// pinned App Attest root, nonce, keyId against the credCert public key, rpIdHash, counter
+// zero, AAGUID for the configured environment and credentialId against keyId.
+// The public key is then stored (when a store is configured and the caller is
+// bound) so later requests prove key possession with assertions instead of
+// attesting again.
+func (s *NativeAttestationService) verifyAppleAppAttest(ctx context.Context, bind *NativeAttestationBinding, req *NativeAttestationRequest) (*NativeAttestationResult, error) {
 	nativeCfg := s.cfg.WalletProvider.Attestation.NativeAttestation
 
 	if nativeCfg.AppleAppID == "" {
 		return nil, fmt.Errorf("%w: apple_app_id not configured", ErrNativeAttestationInvalid)
 	}
+	env, wantAAGUID, err := appAttestEnvironment(nativeCfg.AppleAppAttestEnvironment)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrNativeAttestationInvalid, err)
+	}
+
+	// The key id is required and validated below against the attested key;
+	// it is never trusted as sent.
+	wantKeyID, err := decodeAppAttestKeyID(req.KeyID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrNativeAttestationInvalid, err)
+	}
 
 	// Decode the attestation object
+	if base64.StdEncoding.DecodedLen(len(req.Token)) > maxAppAttestObjectLen {
+		return nil, fmt.Errorf("%w: attestation too large", ErrNativeAttestationInvalid)
+	}
 	attestBytes, err := base64.StdEncoding.DecodeString(req.Token)
 	if err != nil {
 		return nil, fmt.Errorf("%w: decode token: %v", ErrNativeAttestationInvalid, err)
@@ -156,18 +274,25 @@ func (s *NativeAttestationService) verifyAppleAppAttest(_ context.Context, req *
 	}
 
 	// Verify chain against Apple App Attest root CA
-	roots := AppleAppAttestRootCAs()
+	roots := s.appRoots
+	if roots == nil {
+		roots = AppleAppAttestRootCAs()
+	}
+	chainVerified := true
 	_, err = leafCert.Verify(x509.VerifyOptions{
 		Roots:         roots,
 		Intermediates: intermediates,
 	})
 	if err != nil {
-		if nativeCfg.AppleAppAttestEnvironment == "development" {
+		if env == domain.AppAttestDevelopment {
 			// Development-only bypass for test harnesses without a genuine Apple
 			// attestation chain. Logged at Error (not Warn) and counted in a
 			// dedicated metric so an accidental "development" setting in a
 			// production deployment is loud, not silent. The nonce check below
 			// is NOT bypassed even in development — see that check for why.
+			// A key accepted this way is stored as chain-unverified and never
+			// yields a verified key home.
+			chainVerified = false
 			nativeAttestationDevChainBypass.Inc()
 			s.logger.Error("App Attest x5c chain verification failed — proceeding because apple_app_attest_environment=development; this must never be set in production", zap.Error(err))
 		} else {
@@ -179,12 +304,12 @@ func (s *NativeAttestationService) verifyAppleAppAttest(_ context.Context, req *
 	// authData structure: rpIdHash (32) || flags (1) || signCount (4) || attestedCredData (...)
 	// The nonce is SHA256(authData || SHA256(clientDataJSON))
 	// For App Attest, clientDataHash = SHA256(challenge)
-	if len(attestObj.AuthData) < 37 {
+	if len(attestObj.AuthData) < appAttestAttestedDataOffset {
 		return nil, fmt.Errorf("%w: authData too short", ErrNativeAttestationInvalid)
 	}
 
 	clientDataHash := sha256.Sum256([]byte(req.Challenge))
-	composite := append(attestObj.AuthData, clientDataHash[:]...)
+	composite := append(append([]byte{}, attestObj.AuthData...), clientDataHash[:]...)
 	nonce := sha256.Sum256(composite)
 
 	// The nonce should be embedded in the leaf certificate's extension (OID 1.2.840.113635.100.8.2)
@@ -212,40 +337,128 @@ func (s *NativeAttestationService) verifyAppleAppAttest(_ context.Context, req *
 		return nil, fmt.Errorf("%w: nonce mismatch in leaf certificate", ErrNativeAttestationInvalid)
 	}
 
-	// Step 5: Verify rpIdHash matches configured App ID
+	// Step 5: keyId. SHA-256 of the credCert public key (X9.62 uncompressed
+	// point) must equal the key id the client sent: this is what ties the
+	// client-supplied identifier to the key that was actually attested.
+	certPub, ok := leafCert.PublicKey.(*ecdsa.PublicKey)
+	if !ok || certPub.Curve != elliptic.P256() {
+		return nil, fmt.Errorf("%w: credCert public key is not P-256", ErrNativeAttestationInvalid)
+	}
+	ecdhPub, err := certPub.ECDH()
+	if err != nil {
+		return nil, fmt.Errorf("%w: credCert public key: %v", ErrNativeAttestationInvalid, err)
+	}
+	pubPoint := ecdhPub.Bytes() // X9.62 uncompressed
+	derivedKeyID := sha256.Sum256(pubPoint)
+	if subtle.ConstantTimeCompare(derivedKeyID[:], wantKeyID) != 1 {
+		return nil, fmt.Errorf("%w: key_id does not match the attested public key", ErrNativeAttestationInvalid)
+	}
+
+	// Step 6: rpIdHash matches configured App ID
 	// rpIdHash is the first 32 bytes of authData = SHA256(appID)
 	expectedRpIdHash := sha256.Sum256([]byte(nativeCfg.AppleAppID))
-	rpIdHash := attestObj.AuthData[:32]
-	if subtle.ConstantTimeCompare(rpIdHash, expectedRpIdHash[:]) != 1 {
+	if subtle.ConstantTimeCompare(attestObj.AuthData[:32], expectedRpIdHash[:]) != 1 {
 		return nil, fmt.Errorf("%w: rpIdHash mismatch (wrong app ID)", ErrNativeAttestationInvalid)
 	}
 
-	// Step 6: Verify attested credential data flag is present in authData.
-	// Note: full public key extraction/binding is not implemented yet —
-	// this only checks the flags bit to confirm the attestation statement
-	// includes credential data per the App Attest format.
-	// Flags byte (index 32) bit 6 indicates attested credential data is present
-	flags := attestObj.AuthData[32]
-	if flags&0x40 == 0 {
+	// Step 7: attested credential data flag (flags byte, bit 6) must be set,
+	// and the counter in a fresh attestation is exactly zero.
+	if attestObj.AuthData[32]&0x40 == 0 {
 		return nil, fmt.Errorf("%w: no attested credential data in authData", ErrNativeAttestationInvalid)
+	}
+	if counter := binary.BigEndian.Uint32(attestObj.AuthData[33:37]); counter != 0 {
+		return nil, fmt.Errorf("%w: attestation counter is %d, want 0", ErrNativeAttestationInvalid, counter)
+	}
+
+	// Step 8: AAGUID names the environment; it must be the configured one
+	// (a development attestation is never accepted by a production backend).
+	if subtle.ConstantTimeCompare(attestObj.AuthData[37:53], wantAAGUID[:]) != 1 {
+		return nil, fmt.Errorf("%w: AAGUID does not match environment %q", ErrNativeAttestationInvalid, env)
+	}
+
+	// Step 9: credentialId equals the key id.
+	credIDLen := int(binary.BigEndian.Uint16(attestObj.AuthData[53:55]))
+	if credIDLen != appAttestKeyIDLen || len(attestObj.AuthData) < appAttestAttestedDataOffset+credIDLen {
+		return nil, fmt.Errorf("%w: credentialId has unexpected length", ErrNativeAttestationInvalid)
+	}
+	credID := attestObj.AuthData[appAttestAttestedDataOffset : appAttestAttestedDataOffset+credIDLen]
+	if subtle.ConstantTimeCompare(credID, wantKeyID) != 1 {
+		return nil, fmt.Errorf("%w: credentialId does not match key_id", ErrNativeAttestationInvalid)
+	}
+
+	keyID := canonicalAppAttestKeyID(wantKeyID)
+	if bind != nil {
+		if err := s.persistAppAttestKey(ctx, bind, &domain.AppAttestKeyRecord{
+			KeyID:         keyID,
+			PublicKey:     pubPoint,
+			Environment:   env,
+			AppID:         nativeCfg.AppleAppID,
+			ChainVerified: chainVerified,
+			TenantID:      bind.TenantID,
+			UserID:        bind.UserID,
+			Status:        domain.AppAttestKeyActive,
+
+			WalletInstanceID: bind.WalletInstanceID,
+		}); err != nil {
+			return nil, err
+		}
 	}
 
 	s.logger.Info("Apple App Attest verification successful",
-		zap.String("key_id", req.KeyID),
+		zap.String("key_id", keyID),
 		zap.String("app_id", nativeCfg.AppleAppID),
+		zap.String("environment", string(env)),
+		zap.Bool("chain_verified", chainVerified),
 	)
 
 	attSource := "platform_attested"
-	if nativeCfg.AppleAppAttestEnvironment == "development" {
+	appID := nativeCfg.AppleAppID
+	if env == domain.AppAttestDevelopment {
 		attSource = "development_attested"
+		// Development mode accepts a self-signed chain, so nothing
+		// authenticated the application: never report an app id as verified.
+		appID = ""
 	}
 
 	return &NativeAttestationResult{
 		Verified:          true,
 		Platform:          NativeAttestationAppleAppAttest,
-		AppID:             nativeCfg.AppleAppID,
+		AppID:             appID,
 		AttestationSource: attSource,
 	}, nil
+}
+
+// persistAppAttestKey stores a freshly verified attested key. A key that is
+// already stored is left exactly as it is (its counter is never reset, which
+// would reopen assertion replay); it is accepted only when it is the same key
+// in the same tenant/user context and still active.
+func (s *NativeAttestationService) persistAppAttestKey(ctx context.Context, bind *NativeAttestationBinding, rec *domain.AppAttestKeyRecord) error {
+	if s.appAttestKeys == nil {
+		return nil
+	}
+	if bind.TenantID == "" {
+		return fmt.Errorf("%w: tenant required to store an attested key", ErrNativeAttestationInvalid)
+	}
+	err := s.appAttestKeys.Create(ctx, rec)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, storage.ErrAlreadyExists) {
+		return fmt.Errorf("%w: store attested key: %v", ErrNativeAttestationUnavailable, err)
+	}
+	existing, err := s.appAttestKeys.Get(ctx, rec.KeyID)
+	if err != nil {
+		return fmt.Errorf("%w: load attested key: %v", ErrNativeAttestationUnavailable, err)
+	}
+	switch {
+	case !existing.IsActive():
+		return fmt.Errorf("%w: attested key is not active", ErrNativeAttestationInvalid)
+	case !existing.BelongsTo(bind.TenantID, bind.UserID):
+		return fmt.Errorf("%w: attested key belongs to another context", ErrNativeAttestationInvalid)
+	case !bytes.Equal(existing.PublicKey, rec.PublicKey), existing.Environment != rec.Environment:
+		return fmt.Errorf("%w: stored attested key differs from the attestation", ErrNativeAttestationInvalid)
+	}
+	return nil
 }
 
 // verifyGooglePlayIntegrity validates a Google Play Integrity token.
@@ -325,7 +538,6 @@ func (s *NativeAttestationService) verifyGooglePlayIntegrity(_ context.Context, 
 	}
 
 	s.logger.Info("Play Integrity verification successful",
-		zap.String("key_id", req.KeyID),
 		zap.String("package", nativeCfg.GooglePackageName),
 		zap.String("app_verdict", verdict.AppIntegrity.AppRecognitionVerdict),
 		zap.Strings("device_verdict", verdict.DeviceIntegrity.DeviceRecognitionVerdict),

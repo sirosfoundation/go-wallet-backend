@@ -9,6 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
@@ -398,6 +401,57 @@ func TestUserStore_Modify_NotFound(t *testing.T) {
 	if !errors.Is(err, storage.ErrNotFound) {
 		t.Errorf("Modify() error = %v, want ErrNotFound", err)
 	}
+}
+
+// A Modify callback may attach caller-owned memory to the user (for example
+// UpdatePrivateData keeps the slice it is given). Mutating that memory after
+// Modify returns must not change what the store holds.
+func TestUserStore_Modify_DoesNotAliasCallerMemory(t *testing.T) {
+	ctx := t.Context()
+	users := NewStore().Users()
+
+	user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:alias"}
+	require.NoError(t, users.Create(ctx, user))
+
+	data := []byte("private")
+	nick := "nick"
+	stored, err := users.Modify(ctx, user.UUID, func(u *domain.User) error {
+		u.UpdatePrivateData(data)
+		u.WebauthnCredentials = append(u.WebauthnCredentials, domain.WebauthnCredential{ID: "c", Nickname: &nick})
+		return nil
+	})
+	require.NoError(t, err)
+
+	data[0] = 'X'
+	nick = "changed"
+
+	got, err := users.GetByID(ctx, user.UUID)
+	require.NoError(t, err)
+	assert.Equal(t, "private", string(got.PrivateData))
+	assert.Equal(t, domain.ComputePrivateDataETag([]byte("private")), got.PrivateDataETag)
+	assert.Equal(t, "nick", *got.WebauthnCredentials[0].Nickname)
+
+	// The returned snapshot is private to the caller too.
+	stored.PrivateData[0] = 'Y'
+	got, _ = users.GetByID(ctx, user.UUID)
+	assert.Equal(t, "private", string(got.PrivateData))
+}
+
+// UpdateCredentialAuthenticator is a user write: it must bump the version so
+// version-conditional writers (Modify on Mongo) can detect it.
+func TestUserStore_UpdateCredentialAuthenticator_BumpsVersion(t *testing.T) {
+	ctx := t.Context()
+	users := NewStore().Users()
+
+	user := &domain.User{UUID: domain.NewUserID(), WebauthnCredentials: []domain.WebauthnCredential{{ID: "c1"}}}
+	require.NoError(t, users.Create(ctx, user))
+	before, _ := users.GetByID(ctx, user.UUID)
+
+	_, err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "c1", 5, true)
+	require.NoError(t, err)
+
+	after, _ := users.GetByID(ctx, user.UUID)
+	assert.Greater(t, after.Version, before.Version)
 }
 
 func TestUserStore_GetByID_ReturnsCopy(t *testing.T) {

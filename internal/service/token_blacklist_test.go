@@ -19,7 +19,7 @@ func TestTokenBlacklist_AddAndIsBlacklisted(t *testing.T) {
 	ctx := context.Background()
 	b := newTestBlacklist(t)
 
-	if b.IsBlacklisted(ctx, "jti-1") {
+	if blacklisted(t, b, ctx, "jti-1") {
 		t.Error("expected jti-1 not to be blacklisted before Add")
 	}
 
@@ -27,7 +27,7 @@ func TestTokenBlacklist_AddAndIsBlacklisted(t *testing.T) {
 		t.Fatalf("Add: %v", err)
 	}
 
-	if !b.IsBlacklisted(ctx, "jti-1") {
+	if !blacklisted(t, b, ctx, "jti-1") {
 		t.Error("expected jti-1 to be blacklisted after Add")
 	}
 	if b.Count() != 1 {
@@ -38,7 +38,7 @@ func TestTokenBlacklist_AddAndIsBlacklisted(t *testing.T) {
 	if err := b.Add(ctx, "", time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("Add empty jti: %v", err)
 	}
-	if b.IsBlacklisted(ctx, "") {
+	if blacklisted(t, b, ctx, "") {
 		t.Error("empty jti should never be blacklisted")
 	}
 }
@@ -53,7 +53,7 @@ func TestTokenBlacklist_IsBlacklisted_ExpiredEntryNotBlacklisted(t *testing.T) {
 	if err := b.Add(ctx, "jti-expired", time.Now().Add(-time.Hour)); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	if b.IsBlacklisted(ctx, "jti-expired") {
+	if blacklisted(t, b, ctx, "jti-expired") {
 		t.Error("expected an entry past its own expiry not to be blacklisted")
 	}
 }
@@ -68,7 +68,7 @@ func TestTokenBlacklist_Remove(t *testing.T) {
 	if err := b.Remove(ctx, "jti-1"); err != nil {
 		t.Fatalf("Remove: %v", err)
 	}
-	if b.IsBlacklisted(ctx, "jti-1") {
+	if blacklisted(t, b, ctx, "jti-1") {
 		t.Error("expected jti-1 not to be blacklisted after Remove")
 	}
 }
@@ -80,13 +80,13 @@ func TestTokenBlacklist_Disabled_NoOps(t *testing.T) {
 	if err := b.Add(ctx, "jti-1", time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	if b.IsBlacklisted(ctx, "jti-1") {
+	if blacklisted(t, b, ctx, "jti-1") {
 		t.Error("expected IsBlacklisted to always return false when disabled")
 	}
 	if err := b.RevokeUser(ctx, "user-1"); err != nil {
 		t.Fatalf("RevokeUser: %v", err)
 	}
-	if b.IsUserRevoked(ctx, "user-1") {
+	if userRevoked(t, b, ctx, "user-1") {
 		t.Error("expected IsUserRevoked to always return false when disabled")
 	}
 }
@@ -118,13 +118,13 @@ func TestTokenBlacklist_Cleanup_RemovesExpiredJTIsButNotUserRevocations(t *testi
 	if b.Count() != 1 {
 		t.Errorf("Count() after cleanup = %d, want 1 (only jti-live should remain)", b.Count())
 	}
-	if b.IsBlacklisted(ctx, "jti-expired") {
+	if blacklisted(t, b, ctx, "jti-expired") {
 		t.Error("expected jti-expired to be removed by cleanup")
 	}
-	if !b.IsBlacklisted(ctx, "jti-live") {
+	if !blacklisted(t, b, ctx, "jti-live") {
 		t.Error("expected jti-live to survive cleanup")
 	}
-	if !b.IsUserRevoked(ctx, "user-revoked-long-ago") {
+	if !userRevoked(t, b, ctx, "user-revoked-long-ago") {
 		t.Error("expected a user revocation to survive cleanup regardless of age")
 	}
 }
@@ -137,8 +137,7 @@ func TestTokenBlacklist_StartStop_Enabled(t *testing.T) {
 
 func TestTokenBlacklist_StartStop_Disabled(t *testing.T) {
 	// Start() on a disabled blacklist still launches the cleanup goroutine
-	// (see Start's doc comment - ConsumeOnce needs it regardless of
-	// config.Enabled) and logs accordingly; Stop() must be safe to call
+	// (see Start's doc comment) and logs accordingly; Stop() must be safe to call
 	// afterward either way.
 	b := NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: false}, zap.NewNop())
 	b.Start()

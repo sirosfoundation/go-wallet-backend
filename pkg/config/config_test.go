@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1365,8 +1367,36 @@ func TestCORSConfig_SetDefaults_KeepsPrivateDataHeadersWhenOverridden(t *testing
 func TestCORSConfig_SetDefaults_WildcardAllowedHeaders(t *testing.T) {
 	cfg := CORSConfig{AllowedHeaders: []string{"*"}}
 	cfg.SetDefaults()
-	if len(cfg.AllowedHeaders) != 1 {
-		t.Errorf("wildcard AllowedHeaders should be left as-is, got %v", cfg.AllowedHeaders)
+	for _, h := range RequiredCORSAllowedHeaders {
+		found := false
+		for _, g := range cfg.AllowedHeaders {
+			if strings.EqualFold(g, h) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("wildcard AllowedHeaders must still list %q explicitly, got %v", h, cfg.AllowedHeaders)
+		}
+	}
+	exp := CORSConfig{ExposedHeaders: []string{"*"}}
+	exp.SetDefaults()
+	if !reflect.DeepEqual(exp.ExposedHeaders, []string{"*", "X-Private-Data-ETag"}) {
+		t.Errorf("wildcard ExposedHeaders must still list X-Private-Data-ETag explicitly, got %v", exp.ExposedHeaders)
+	}
+}
+
+func TestCORSConfig_DefaultExposedHeadersIncludeRetryAfter(t *testing.T) {
+	cfg := CORSConfig{}
+	cfg.SetDefaults()
+	want := []string{"X-Private-Data-ETag", "Retry-After"}
+	if !reflect.DeepEqual(cfg.ExposedHeaders, want) {
+		t.Fatalf("default ExposedHeaders = %v, want %v", cfg.ExposedHeaders, want)
+	}
+
+	explicit := CORSConfig{ExposedHeaders: []string{"X-Only"}}
+	explicit.SetDefaults()
+	if !reflect.DeepEqual(explicit.ExposedHeaders, []string{"X-Only", "X-Private-Data-ETag"}) {
+		t.Fatalf("explicit list must be kept plus required headers, got %v", explicit.ExposedHeaders)
 	}
 }
 
@@ -2304,6 +2334,19 @@ func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
 		{"rfc1918", "10.0.0.5", "private/loopback"},
 		{"rfc1918 172.16", "172.16.4.2", "private/loopback"},
 		{"link-local", "169.254.10.1", "private/loopback"},
+		{"cgnat", "100.64.0.1", "private/loopback"},
+		{"cgnat upper", "100.127.255.254", "private/loopback"},
+		{"alibaba metadata", "100.100.100.200", "cloud metadata"},
+		{"oracle metadata", "192.0.0.192", "cloud metadata"},
+		{"benchmarking", "198.19.1.1", "private/loopback"},
+		{"nat64 loopback", "64:ff9b::7f00:1", "private/loopback"},
+		{"nat64 rfc1918", "64:ff9b::a00:5", "private/loopback"},
+		{"nat64 link-local", "64:ff9b::a9fe:a00", "private/loopback"},
+		{"nat64 metadata", "64:ff9b::a9fe:a9fe", "cloud metadata"},
+		{"nat64 cgnat metadata", "64:ff9b::6464:64c8", "cloud metadata"},
+		{"nat64 unspecified", "64:ff9b::", "unspecified"},
+		{"nat64 local-use", "64:ff9b:1::1", "private/loopback"},
+		{"v4-mapped metadata", "::ffff:169.254.169.254", "cloud metadata"},
 		{"cloud metadata", "169.254.169.254", "cloud metadata"},
 		{"cloud metadata ipv6", "fd00::1", "cloud metadata"},
 		{"unspecified", "0.0.0.0", "unspecified"},
@@ -2326,6 +2369,19 @@ func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
 				t.Fatalf("connected to %v after refusing", dialed)
 			}
 		})
+	}
+}
+
+// A well-known NAT64 address that embeds a public IPv4 address is a normal
+// destination on a DNS64 network and must not be refused.
+func TestGuardedDial_AllowsNAT64WithPublicEmbeddedAddress(t *testing.T) {
+	var dialed []string
+	dial := guardedDial(staticLookup("64:ff9b::5db8:d822"), recordingDial(&dialed), nil)
+	if _, err := dial(context.Background(), "tcp", "v4only.example.com:443"); err != nil {
+		t.Fatalf("dial refused: %v", err)
+	}
+	if len(dialed) != 1 {
+		t.Fatalf("dialed %v, want one connection", dialed)
 	}
 }
 
@@ -2801,6 +2857,20 @@ func TestLoad_MetadataTypeEnvOverride(t *testing.T) {
 	}
 }
 
+func TestLoad_MetadataCacheDisabled(t *testing.T) {
+	if defaultConfig().HTTPClient.MetadataCacheDisabled {
+		t.Error("http_client.metadata_cache_disabled must default to false")
+	}
+	t.Setenv("WALLET_HTTP_CLIENT_METADATA_CACHE_DISABLED", "true")
+	cfg := defaultConfig()
+	if err := envconfig.Process("WALLET", cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.HTTPClient.MetadataCacheDisabled {
+		t.Error("env override not applied")
+	}
+}
+
 func TestConfig_Validate_DCQLConsentCheck(t *testing.T) {
 	for _, m := range []DCQLConsentCheckMode{"", DCQLConsentCheckOff, DCQLConsentCheckWarn, DCQLConsentCheckEnforce} {
 		if err := m.validate(); err != nil {
@@ -2891,6 +2961,9 @@ func TestGuardedDial_TrustedHostMayBePrivate(t *testing.T) {
 		{"unlisted host, private ip", "other.internal", "10.1.2.3", true},
 		{"trusted host, metadata ip", "idp.internal", "169.254.169.254", true},
 		{"trusted host, unspecified ip", "idp.internal", "0.0.0.0", true},
+		{"trusted host, cgnat ip", "idp.internal", "100.64.0.9", false},
+		{"trusted host, alibaba metadata ip", "idp.internal", "100.100.100.200", true},
+		{"trusted host, oracle metadata ip", "idp.internal", "192.0.0.192", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -3205,6 +3278,164 @@ func TestApplyASSecurityDefaults_Parity(t *testing.T) {
 	}
 }
 
+func TestConfig_Validate_TokenBlacklistBackend(t *testing.T) {
+	tests := []struct {
+		name    string
+		backend string
+		storage string
+		wantErr string
+	}{
+		{"default with memory storage", "", "memory", ""},
+		{"default with mongodb", "", "mongodb", ""},
+		{"memory with mongodb", "memory", "mongodb", ""},
+		{"storage with mongodb", "storage", "mongodb", ""},
+		{"storage needs mongodb", "storage", "memory", "requires storage.type=mongodb"},
+		{"unknown value", "redis", "mongodb", "invalid security.token_blacklist.backend"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validBaseConfig()
+			cfg.Storage.Type = tt.storage
+			cfg.Storage.MongoDB.URI = "mongodb://localhost"
+			cfg.Security.TokenBlacklist.Backend = tt.backend
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() = %v, want error containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestDefaultConfig_StatusCheck(t *testing.T) {
+	sc := defaultConfig().StatusCheck
+	if !sc.Enabled || !sc.StatusListSignerFallback {
+		t.Errorf("enabled/fallback must default to true: %+v", sc)
+	}
+	if sc.MaxListsPerRequest != 20 {
+		t.Errorf("max_lists_per_request default = %d, want 20", sc.MaxListsPerRequest)
+	}
+	if sc.RequestTimeoutSeconds != DefaultStatusRequestTimeoutSeconds || sc.RequestTimeoutSeconds >= 15 {
+		t.Errorf("request_timeout_seconds default = %d, must be well under the 15 s write timeout", sc.RequestTimeoutSeconds)
+	}
+	if sc.MaxListBytes != 2<<20 {
+		t.Errorf("max_list_bytes default = %d, want 2 MiB", sc.MaxListBytes)
+	}
+	if sc.StatusListMinEntries != 0 {
+		t.Error("status_list_min_entries must default to 0 (the draft sets no minimum)")
+	}
+	if !sc.RateLimit.Enabled || sc.RateLimit.MaxAttempts <= 0 {
+		t.Errorf("rate limit must default on: %+v", sc.RateLimit)
+	}
+}
+
+func TestConfig_Validate_StatusCheck(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*StatusCheckConfig)
+		want   string // "" = valid
+	}{
+		{"zero value", func(*StatusCheckConfig) {}, ""},
+		{"negative min entries", func(c *StatusCheckConfig) { c.StatusListMinEntries = -1 }, "status_list_min_entries"},
+		{"min entries", func(c *StatusCheckConfig) { c.StatusListMinEntries = 131072 }, ""},
+		{"negative loads", func(c *StatusCheckConfig) { c.StatusListMaxConcurrentLoads = -1 }, "status_list_max_concurrent_loads"},
+		{"loads", func(c *StatusCheckConfig) { c.StatusListMaxConcurrentLoads = 4 }, ""},
+		{"negative cap", func(c *StatusCheckConfig) { c.MaxListsPerRequest = -1 }, "max_lists_per_request"},
+		{"negative timeout", func(c *StatusCheckConfig) { c.RequestTimeoutSeconds = -1 }, "request_timeout_seconds"},
+		{"timeout over write timeout", func(c *StatusCheckConfig) { c.RequestTimeoutSeconds = MaxStatusRequestTimeoutSeconds + 1 }, "request_timeout_seconds"},
+		{"max timeout", func(c *StatusCheckConfig) { c.RequestTimeoutSeconds = MaxStatusRequestTimeoutSeconds }, ""},
+		{"negative size", func(c *StatusCheckConfig) { c.MaxListBytes = -1 }, "max_list_bytes"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validBaseConfig()
+			tc.mutate(&cfg.StatusCheck)
+			err := cfg.Validate()
+			switch {
+			case tc.want == "" && err != nil:
+				t.Fatalf("unexpected error: %v", err)
+			case tc.want != "" && (err == nil || !strings.Contains(err.Error(), "status_check."+tc.want)):
+				t.Fatalf("err = %v, want one naming status_check.%s", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_StatusCheckSection checks that yaml and env values override the defaults.
+func TestLoad_StatusCheckSection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	yaml := `
+server:
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+status_check:
+  enabled: false
+  status_list_signer_fallback: false
+  status_list_min_entries: 7
+  status_list_max_concurrent_loads: 3
+  max_lists_per_request: 5
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WALLET_STATUS_CHECK_REQUEST_TIMEOUT_SECONDS", "6")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := cfg.StatusCheck
+	if sc.Enabled || sc.StatusListSignerFallback || sc.StatusListMinEntries != 7 || sc.StatusListMaxConcurrentLoads != 3 ||
+		sc.MaxListsPerRequest != 5 || sc.RequestTimeoutSeconds != 6 {
+		t.Fatalf("status_check = %+v", sc)
+	}
+	// Defaults survive a partial section.
+	if sc.MaxListBytes != DefaultStatusMaxListBytes || !sc.RateLimit.Enabled {
+		t.Fatalf("defaults lost: %+v", sc)
+	}
+}
+
+// An operator-configured proxy on a private address must be dialable while
+// destinations stay guarded.
+func TestNewHTTPClient_PrivateProxyIsDialable(t *testing.T) {
+	var gotURL string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURL = r.URL.String()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer proxy.Close() // listens on 127.0.0.1
+
+	cfg := HTTPClientConfig{ProxyURL: proxy.URL, AllowHTTP: true}
+	resp, err := cfg.NewHTTPClient(5 * time.Second).Get("http://93.184.216.34/list")
+	if err != nil {
+		t.Fatalf("request through the private proxy failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if gotURL != "http://93.184.216.34/list" {
+		t.Fatalf("proxy saw %q", gotURL)
+	}
+
+	// The destination itself is still checked, even through the proxy.
+	if resp, err := cfg.NewHTTPClient(5 * time.Second).Get("http://10.1.2.3/list"); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("private destination reached through the proxy")
+	}
+
+	// And the proxy's address does not open up the rest of the network.
+	other := httptest.NewServer(http.NotFoundHandler())
+	defer other.Close()
+	noProxy := HTTPClientConfig{AllowHTTP: true}
+	if resp, err := noProxy.NewHTTPClient(5 * time.Second).Get(other.URL); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("loopback destination reached directly")
+	}
+}
+
 // The ignored sunset_date must still load and be reported by DeprecatedSettings.
 func TestLoad_DeprecatedSunsetDateStillLoads(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
@@ -3297,5 +3528,128 @@ func TestConfig_Validate_AS_RequiresExternalURL(t *testing.T) {
 	off.AS.Enabled = false
 	if err := off.Validate(); err != nil {
 		t.Fatalf("AS disabled must not need external_url: %v", err)
+	}
+}
+
+func TestAndroidKeyAttestationConfig_YAMLAndEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+wallet_provider:
+  attestation:
+    android_key_attestation:
+      trust_anchors_path: /etc/siros/android-roots.pem
+      allowed_app_digests: ["aa", "bb"]
+      allowed_packages: [org.siros.wallet]
+      status_list_url: https://example.test/status
+      status_list_default_ttl_seconds: 120
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_TRUST_ANCHORS_PEM", "PEMDATA")
+	t.Setenv("WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_ALLOWED_APP_DIGESTS", "cc,dd")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := cfg.WalletProvider.Attestation.AndroidKeyAttestation
+	if a.TrustAnchorsPath != "/etc/siros/android-roots.pem" || a.TrustAnchorsPEM != "PEMDATA" ||
+		len(a.AllowedAppDigests) != 2 || a.AllowedAppDigests[0] != "cc" || // the environment overrides the file
+		len(a.AllowedPackages) != 1 || a.StatusListURL != "https://example.test/status" || a.StatusListDefaultTTLSeconds != 120 {
+		t.Fatalf("android_key_attestation = %+v", a)
+	}
+}
+
+func TestAndroidKeyAttestationConfig_EnforcementKeysAndDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	base := `
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+`
+	if err := os.WriteFile(path, []byte(base), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := cfg.WalletProvider.Attestation.AndroidKeyAttestation
+	if a.Rejecting() || a.Enforcement != "" || !a.VerifiedBootRequired() || !a.LockedBootloaderRequired() || a.MinPatchLevel != 0 {
+		t.Fatalf("defaults = %+v (ignore mode; boot requirements default on; no patch level)", a)
+	}
+
+	y := base + `
+wallet_provider:
+  attestation:
+    android_key_attestation:
+      enforcement: reject
+      trust_anchors_pem: PEM
+      allowed_app_digests: [aa]
+      require_verified_boot: false
+      min_patch_level: 202601
+`
+	if err := os.WriteFile(path, []byte(y), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const p = "WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_"
+	t.Setenv(p+"REQUIRE_LOCKED_BOOTLOADER", "false")
+	t.Setenv(p+"MIN_PATCH_LEVEL", "202603")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a = cfg.WalletProvider.Attestation.AndroidKeyAttestation
+	if !a.Rejecting() || a.VerifiedBootRequired() || a.LockedBootloaderRequired() || a.MinPatchLevel != 202603 {
+		t.Fatalf("yaml+env = %+v", a)
+	}
+
+	t.Setenv(p+"ENFORCEMENT", "ignore")
+	t.Setenv(p+"REQUIRE_VERIFIED_BOOT", "true")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a = cfg.WalletProvider.Attestation.AndroidKeyAttestation
+	if a.Rejecting() || !a.VerifiedBootRequired() {
+		t.Fatalf("env override = %+v", a)
+	}
+}
+
+func TestAndroidKeyAttestationConfig_ValidateEnforcement(t *testing.T) {
+	ok := AndroidKeyAttestationConfig{Enforcement: "reject", TrustAnchorsPEM: "x", AllowedAppDigests: []string{"aa"}, MinPatchLevel: 202601}
+	if err := ok.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for name, mut := range map[string]func(*AndroidKeyAttestationConfig){
+		"unknown mode":       func(c *AndroidKeyAttestationConfig) { c.Enforcement = "enforce" },
+		"reject, no anchors": func(c *AndroidKeyAttestationConfig) { c.TrustAnchorsPEM = " " },
+		"reject, no digests": func(c *AndroidKeyAttestationConfig) { c.AllowedAppDigests = nil },
+		"bad month":          func(c *AndroidKeyAttestationConfig) { c.MinPatchLevel = 202613 },
+		"not yyyymm":         func(c *AndroidKeyAttestationConfig) { c.MinPatchLevel = 2026 },
+	} {
+		c := ok
+		mut(&c)
+		if c.Validate() == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	// Anchors from a file count; ignore mode never needs either.
+	c := ok
+	c.TrustAnchorsPEM, c.TrustAnchorsPath = "", "/etc/roots.pem"
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := (AndroidKeyAttestationConfig{Enforcement: "ignore"}).Validate(); err != nil {
+		t.Fatal(err)
+	}
+	// The whole-config Validate applies it.
+	full := validBaseConfig()
+	full.WalletProvider.Attestation.AndroidKeyAttestation = AndroidKeyAttestationConfig{Enforcement: "reject"}
+	if full.Validate() == nil {
+		t.Fatal("Config.Validate accepted reject with nothing pinned")
 	}
 }

@@ -304,6 +304,9 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 	}
 
 	// Forward the request to the PDP
+	if !validateEvaluationRequest(c, &req) {
+		return
+	}
 	resp, err := client.Evaluate(ctx, &req)
 	if err != nil {
 		h.logger.Error("PDP evaluation failed",
@@ -311,7 +314,7 @@ func (h *AuthZENProxyHandler) Evaluate(c *gin.Context) {
 			zap.String("pdp_url", pdpURL),
 			zap.Error(err),
 		)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "trust evaluation service unavailable"})
+		h.writePDPError(c, ctx, err, "trust evaluation service unavailable")
 		return
 	}
 
@@ -726,6 +729,9 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 		trustReq.Resource.Type = "resolution"
 	}
 
+	if !validateEvaluationRequest(c, trustReq) {
+		return
+	}
 	trustResp, err := client.Evaluate(ctx, trustReq)
 	if err != nil {
 		h.logger.Error("PDP trust evaluation failed",
@@ -733,7 +739,7 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 			zap.String("pdp_url", pdpURL),
 			zap.Error(err),
 		)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "trust evaluation service unavailable"})
+		h.writePDPError(c, ctx, err, "trust evaluation service unavailable")
 		return
 	}
 
@@ -759,6 +765,7 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	// after key extraction and the trust decision above, so dropping the
 	// original signed_metadata JWT here cannot change that decision.
 	sanitizeSecretSeedAdvertisement(result.Metadata)
+	sanitizeHolderCommitmentsAdvertisement(result.Metadata)
 
 	// Step 6: Evaluate whether this provider is entitled to issue what it is
 	// offering. Distinct from the PDP decision above, which answers whether the
@@ -826,46 +833,40 @@ func (h *AuthZENProxyHandler) resolveAuthorizationServerMetadata(c *gin.Context,
 	// an additional request to /.well-known/openid-credential-issuer
 	// which can interfere with conformance suite state machines.
 	// The caller can pass the authorization server URL directly if different.
-	wellKnown, err := oidc.WellKnownURL(issuerURL, "oauth-authorization-server")
+	// Ordered candidates (RFC 8414 insertion, then OIDC Discovery append),
+	// 404-only fallback, exact issuer identity check: see
+	// oidc.FetchAuthorizationServerMetadata. The SSRF-protected httpClient is
+	// used for every candidate.
+	body, err := oidc.FetchAuthorizationServerMetadata(ctx, h.httpClient, issuerURL, 1<<20)
 	if err != nil {
-		h.logger.Error("could not construct authorization server well-known URL",
-			zap.String("issuer_url", issuerURL),
-			zap.Error(err),
-		)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "invalid authorization server URL"})
-		return
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wellKnown, nil)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-		return
-	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := h.httpClient.Do(req)
-	if err != nil {
-		h.logger.Debug("failed to fetch authorization server metadata",
-			zap.String("url", wellKnown),
-			zap.Error(err),
-		)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "authorization server metadata fetch failed"})
-		return
-	}
-	defer resp.Body.Close() //nolint:errcheck
-
-	if resp.StatusCode != http.StatusOK {
-		h.logger.Debug("authorization server metadata returned non-200",
-			zap.String("url", wellKnown),
-			zap.Int("status", resp.StatusCode),
-		)
-		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("authorization server returned HTTP %d", resp.StatusCode)})
-		return
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read authorization server response"})
+		var statusErr *oidc.ASMetadataStatusError
+		switch {
+		case errors.Is(err, oidc.ErrASIssuerMismatch):
+			// Do not log or return the document's issuer (attacker-controlled).
+			h.logger.Warn("authorization server metadata issuer mismatch",
+				zap.String("tenant_id", tenantID),
+			)
+			c.JSON(http.StatusBadGateway, gin.H{"error": "authorization server metadata issuer mismatch"})
+		case errors.Is(err, oidc.ErrASIdentifierInvalid):
+			c.JSON(http.StatusBadGateway, gin.H{"error": "invalid authorization server URL"})
+		case errors.Is(err, oidc.ErrASMetadataNotFound):
+			h.logger.Debug("authorization server metadata not found", zap.String("issuer_url", issuerURL))
+			c.JSON(http.StatusBadGateway, gin.H{"error": "authorization server returned HTTP 404"})
+		case errors.As(err, &statusErr):
+			h.logger.Debug("authorization server metadata returned non-200",
+				zap.String("issuer_url", issuerURL),
+				zap.Int("status", statusErr.Status),
+			)
+			c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("authorization server returned HTTP %d", statusErr.Status)})
+		case errors.Is(err, oidc.ErrASMetadataInvalid):
+			c.JSON(http.StatusBadGateway, gin.H{"error": "invalid authorization server metadata JSON"})
+		default:
+			h.logger.Debug("failed to fetch authorization server metadata",
+				zap.String("issuer_url", issuerURL),
+				zap.Error(err),
+			)
+			c.JSON(http.StatusBadGateway, gin.H{"error": "authorization server metadata fetch failed"})
+		}
 		return
 	}
 
@@ -912,13 +913,128 @@ func (h *AuthZENProxyHandler) proxyToPDP(c *gin.Context, ctx context.Context, te
 		return
 	}
 
+	if !validateEvaluationRequest(c, evalReq) {
+		return
+	}
 	resp, err := client.Evaluate(ctx, evalReq)
 	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "resolution service unavailable"})
+		h.logger.Error("PDP resolution failed",
+			zap.String("tenant_id", tenantID),
+			zap.String("pdp_url", pdpURL),
+			zap.Error(err),
+		)
+		h.writePDPError(c, ctx, err, "resolution service unavailable")
 		return
 	}
 
 	c.JSON(http.StatusOK, resp)
+}
+
+// maxPDPErrorBodyBytes bounds how much of a PDP error body is echoed to callers.
+const maxPDPErrorBodyBytes = 2048
+
+// writePDPError maps a failed PDP call to an HTTP response.
+//
+// Error contract:
+//   - PDP answered 422 -> 422; any other PDP 4xx that signals a bad request
+//     (400, 405, 409, 413, 415, ...) -> 400. The PDP's error body is passed
+//     through under "details" (parsed JSON if it is JSON, else a truncated
+//     string; bounded to maxPDPErrorBodyBytes) so callers can tell a rejected
+//     request from an unreachable backend and must NOT fall back to weaker checks.
+//   - PDP 401/403/404/408/429 describe the proxy-to-PDP relationship (credentials,
+//     routing, throttling), not the caller's request -> 502.
+//   - PDP 5xx and transport errors -> 502; deadline exceeded -> 504.
+func (h *AuthZENProxyHandler) writePDPError(c *gin.Context, ctx context.Context, err error, unavailableMsg string) {
+	var evalErr *authzenclient.EvaluationError
+	if errors.As(err, &evalErr) {
+		switch sc := evalErr.StatusCode; {
+		case sc == http.StatusUnprocessableEntity:
+			c.JSON(sc, pdpErrorBody("trust evaluation request rejected by PDP", evalErr.Body))
+			return
+		case sc >= 400 && sc < 500 &&
+			sc != http.StatusUnauthorized && sc != http.StatusForbidden &&
+			sc != http.StatusNotFound && sc != http.StatusRequestTimeout &&
+			sc != http.StatusTooManyRequests:
+			c.JSON(http.StatusBadRequest, pdpErrorBody("trust evaluation request rejected by PDP", evalErr.Body))
+			return
+		}
+	} else if errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "trust evaluation service timed out"})
+		return
+	}
+	c.JSON(http.StatusBadGateway, gin.H{"error": unavailableMsg})
+}
+
+// pdpErrorBody builds a structured error response embedding the PDP's own
+// error body. The serialized response is guaranteed to be at most
+// maxPDPErrorBodyBytes: a JSON object body is embedded as-is when it fits;
+// otherwise (non-JSON, or too large once serialized) a truncated string is
+// embedded, shrunk until the serialized response fits.
+func pdpErrorBody(msg, pdpBody string) gin.H {
+	pdpBody = strings.TrimSpace(pdpBody)
+	if pdpBody == "" {
+		return gin.H{"error": msg}
+	}
+	var parsed map[string]interface{}
+	if json.Unmarshal([]byte(pdpBody), &parsed) == nil {
+		out := gin.H{"error": msg, "details": parsed}
+		if e, ok := parsed["error"].(string); ok && e != "" && len(e) <= 256 {
+			out["error"] = e
+		}
+		if serializedLen(out) <= maxPDPErrorBodyBytes {
+			return out
+		}
+	}
+	return truncatedPDPErrorBody(msg, pdpBody)
+}
+
+// truncatedPDPErrorBody embeds the longest prefix of pdpBody whose serialized
+// response still fits in maxPDPErrorBodyBytes, falling back to the bare error
+// envelope when not even an empty prefix fits.
+//
+// A byte-offset cut can split a UTF-8 rune, so each candidate is passed through
+// strings.ToValidUTF8, which drops the partial trailing rune. The search is
+// sound because the serialized length is monotonically non-decreasing in the
+// cut offset n: the cleaned string for n is always a prefix of the cleaned
+// string for n+1 (a partial rune is dropped, then completed), and JSON
+// escaping is applied independently per rune, so a longer prefix never
+// serializes shorter.
+func truncatedPDPErrorBody(msg, pdpBody string) gin.H {
+	lo, hi := 0, len(pdpBody)
+	var best gin.H
+	for lo <= hi {
+		mid := lo + (hi-lo)/2
+		out := gin.H{"error": msg, "details": strings.ToValidUTF8(pdpBody[:mid], "")}
+		if serializedLen(out) <= maxPDPErrorBodyBytes {
+			best, lo = out, mid+1
+		} else {
+			hi = mid - 1
+		}
+	}
+	if best != nil {
+		return best
+	}
+	return gin.H{"error": msg}
+}
+
+func serializedLen(v interface{}) int {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return maxPDPErrorBodyBytes + 1
+	}
+	return len(b)
+}
+
+// validateEvaluationRequest performs the same local validation the AuthZEN
+// client does before sending, so that an invalid request (e.g. mismatched
+// subject/resource IDs) is reported as 400 rather than being folded into a
+// 502 "unavailable" by the PDP error path. Returns false after responding.
+func validateEvaluationRequest(c *gin.Context, req *gotrust.EvaluationRequest) bool {
+	if err := req.Validate(); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid evaluation request: " + err.Error()})
+		return false
+	}
+	return true
 }
 
 // extractKeyMaterial extracts cryptographic key material from issuer metadata.
@@ -1000,6 +1116,17 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 // and the trust decision taken before this runs; the effect is only that the
 // wallet cannot re-verify the (by now modified) document itself.
 func sanitizeSecretSeedAdvertisement(metadata map[string]interface{}) {
+	sanitizeAdvertisement(metadata, "org.siros.secret_seed", func(raw []byte) bool {
+		present, valid := engine.SecretSeedAdvertisement(raw)
+		return present && !valid
+	})
+}
+
+// sanitizeAdvertisement removes every credential configuration whose
+// credential_metadata[member] is judged malformed by malformed (which receives
+// the whole credential_metadata object, JSON encoded), and drops
+// signed_metadata when it removed one.
+func sanitizeAdvertisement(metadata map[string]interface{}, member string, malformed func(raw []byte) bool) {
 	ccs, ok := metadata["credential_configurations_supported"].(map[string]interface{})
 	if !ok {
 		return
@@ -1013,20 +1140,27 @@ func sanitizeSecretSeedAdvertisement(metadata map[string]interface{}) {
 		if !ok {
 			continue
 		}
-		if _, has := cm["org.siros.secret_seed"]; !has {
+		if _, has := cm[member]; !has {
 			continue
 		}
 		raw, err := json.Marshal(cm)
-		if err != nil {
-			delete(ccs, id)
-			delete(metadata, "signed_metadata")
-			continue
-		}
-		if present, valid := engine.SecretSeedAdvertisement(raw); present && !valid {
+		if err != nil || malformed(raw) {
 			delete(ccs, id)
 			delete(metadata, "signed_metadata")
 		}
 	}
+}
+
+// sanitizeHolderCommitmentsAdvertisement removes, in place, every credential
+// configuration whose org.siros.holder_commitments member is malformed (not
+// {"commitments": [1..4 short names]}, or carrying hex-looking values), so no
+// such value reaches the wallet; signed_metadata is dropped when that happens,
+// for the same reason as in sanitizeSecretSeedAdvertisement.
+func sanitizeHolderCommitmentsAdvertisement(metadata map[string]interface{}) {
+	sanitizeAdvertisement(metadata, "org.siros.holder_commitments", func(raw []byte) bool {
+		present, _, valid := engine.HolderCommitmentsAdvertisement(raw)
+		return present && !valid
+	})
 }
 
 // inlineLogos walks the metadata tree and replaces logo URIs with data: URIs.

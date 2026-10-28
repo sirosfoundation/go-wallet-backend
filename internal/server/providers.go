@@ -26,6 +26,9 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 )
 
+// audienceWalletBackend is the token audience of this backend's own API.
+const audienceWalletBackend = "wallet-backend"
+
 // =============================================================================
 // Auth Provider - handles authentication routes only
 // =============================================================================
@@ -40,6 +43,9 @@ type AuthProvider struct {
 	roles          []string
 	tokenValidator *tokenvalidator.Validator
 	wiaRateLimiter *middleware.AuthRateLimiter
+	// statusRateLimiter limits the status list API per caller (user, else tenant);
+	// it holds counters only.
+	statusRateLimiter *middleware.AuthRateLimiter
 	// gateRateLimiter feeds the AS module's passkey OIDC gates (per-IP and per-tenant buckets).
 	gateRateLimiter *middleware.OIDCGateRateLimiter
 }
@@ -50,6 +56,7 @@ type AuthProvider struct {
 var newServices = service.NewServices
 
 func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logger, roles []string) *AuthProvider {
+	warnProcessLocalState(cfg, logger, true)
 	services := newServices(store, cfg, logger)
 	services.Start()
 	handlers := api.NewHandlers(services, cfg, logger, roles)
@@ -62,6 +69,8 @@ func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logg
 		roles:           roles,
 		wiaRateLimiter:  middleware.NewAuthRateLimiter(cfg.WalletProvider.WIA.RateLimit, logger.Named("wia")),
 		gateRateLimiter: middleware.NewOIDCGateRateLimiter(cfg.Security.OIDCGateRateLimit, logger),
+
+		statusRateLimiter: middleware.NewAuthRateLimiter(cfg.StatusCheck.RateLimit, logger.Named("status")),
 	}
 }
 
@@ -122,6 +131,21 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		public.POST("/helper/auth-check", p.handlers.AuthCheck)
 	}
 
+	// Verified status list API. Not in the protected group, whose
+	// NoCacheMiddleware would override this response's own Cache-Control.
+	// Always registered: when disabled the handler answers 503 STATUS_NOT_SUPPORTED.
+	statusGroup := router.Group("/status/v1")
+	statusGroup.Use(p.authMiddleware())
+	statusGroup.Use(middleware.RequireAudience(audienceWalletBackend))
+	statusGroup.POST("/lists",
+		requireCallerIdentity(),
+		middleware.AuthRateLimitMiddlewareWithResponse(p.statusRateLimiter, wiaCallerIdentifier, gin.H{
+			"error":   "RATE_LIMIT_EXCEEDED",
+			"message": "Too many status list requests, please retry later",
+		}),
+		middleware.MustHaveTAC("r"),
+		p.handlers.StatusLists)
+
 	// Protected auth routes (session management)
 	protected := router.Group("/")
 	protected.Use(
@@ -131,7 +155,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 	// These are general user-facing routes, not the narrow-purpose calls
 	// (trust evaluation, engine transport) an identity-free anonymous token
 	// is scoped to - reject a wallet-registry-only token here.
-	protected.Use(middleware.RequireAudience("wallet-backend"))
+	protected.Use(middleware.RequireAudience(audienceWalletBackend))
 	{
 		// User session routes (authenticated)
 		session := protected.Group("/user/session")
@@ -191,6 +215,9 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		walletProvider := protected.Group("/wallet-provider")
 		{
 			walletProvider.POST("/key-attestation/generate", middleware.MustHaveTAC("w"), p.handlers.GenerateKeyAttestation)
+			// Dry-run of the assurance decisions; verifies a FIDO2 attestation, so
+			// it is rate-limited like the WIA routes.
+			walletProvider.POST("/assurance-preview", middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier), middleware.MustHaveTAC("w"), p.handlers.AssurancePreview)
 			if p.cfg.WalletProvider.WIA.Enabled && p.services.WIA != nil {
 				wiaLimit := middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier)
 				walletProvider.POST("/wia/challenge", wiaLimit, middleware.MustHaveTAC("w"), p.handlers.WIAChallenge)
@@ -215,6 +242,22 @@ func wiaCallerIdentifier(c *gin.Context) string {
 		return tenantID
 	}
 	return ""
+}
+
+// requireCallerIdentity refuses a request whose token carries no user or DID.
+// An identity-free anonymous token passes authentication and audience checks
+// but must not reach endpoints that are for identified callers only.
+func requireCallerIdentity() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.GetString("user_id") == "" && c.GetString("did") == "" {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"error":   "FORBIDDEN",
+				"message": "A caller identity is required",
+			})
+			return
+		}
+		c.Next()
+	}
 }
 
 // authMiddleware returns the go-tokenauth middleware validating AS-issued
@@ -286,7 +329,7 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 	// Credential storage is a general user-facing route, not one of the
 	// narrow purposes (trust evaluation, engine transport) an anonymous
 	// token is scoped to - reject a wallet-registry-only token here.
-	protected.Use(middleware.RequireAudience("wallet-backend"))
+	protected.Use(middleware.RequireAudience(audienceWalletBackend))
 	{
 		// Credential storage (gated)
 		if p.cfg.Features.CredentialStorageEnabled {
@@ -361,9 +404,10 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 	metadataResolver := sharedResolver
 	if metadataResolver == nil {
 		r, err := issuermetadata.New(issuermetadata.Config{
-			HTTPClient:   cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
-			AllowHTTP:    cfg.HTTPClient.AllowsPlaintext(),
-			MetadataType: issuermetadata.MetadataType(cfg.HTTPClient.MetadataType), // validated by Config.Validate and New
+			HTTPClient:    cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
+			AllowHTTP:     cfg.HTTPClient.AllowsPlaintext(),
+			MetadataType:  issuermetadata.MetadataType(cfg.HTTPClient.MetadataType), // validated by Config.Validate and New
+			CacheDisabled: cfg.HTTPClient.MetadataCacheDisabled,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("creating issuer metadata resolver: %w", err)
@@ -416,9 +460,14 @@ func (v StandaloneValidator) Close() error { v.Stop(); return nil }
 // provider (--mode=engine). The JWKS comes from as.external_url; without it every connection would be
 // rejected, so it returns an error and startup fails.
 //
-// A standalone engine has no revocation source (shared blacklist tracked in #407 and #415): a token
-// stays valid until it expires, even after logout or user revocation. A warning is logged.
-func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (*StandaloneValidator, error) {
+// blacklist is the shared revocation store (see NewSharedBlacklist) when the
+// configuration selects it: the validator then checks every token's jti against
+// it, so a logged-out token (anonymous ones included) cannot open a connection.
+// User-level revocation is checked by the engine itself (see
+// EngineProvider.SetTokenBlacklist). With a nil blacklist a standalone engine
+// has no revocation source: a token stays valid until it expires, even after
+// logout or user revocation. A warning is logged.
+func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger, blacklist *service.TokenBlacklist) (*StandaloneValidator, error) {
 	if cfg.AS.ExternalURL == "" {
 		return nil, fmt.Errorf("standalone engine needs as.external_url to fetch the AS JWKS; refusing to start with no way to authenticate connections (legacy HMAC tokens no longer exist)")
 	}
@@ -430,14 +479,20 @@ func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (
 	if err != nil {
 		return nil, err
 	}
-	v := tokenvalidator.New(tokenvalidator.Config{
+	vcfg := tokenvalidator.Config{
 		JWKSURL:   jwksURL,
 		Issuer:    issuer,
 		Audiences: cfg.SessionAudiences(),
-	})
+	}
+	if blacklist != nil {
+		vcfg.Revocation = blacklistRevocationChecker{blacklist: blacklist, logger: logger}
+	}
+	v := tokenvalidator.New(vcfg)
 	v.Start(context.Background())
-	logger.Warn("Standalone engine has no token revocation source: AS session tokens stay valid at this engine until they expire, even after logout or user revocation. Mitigate with short access token TTLs, or co-host the engine with the backend (shared blacklist).",
-		zap.String("jwks_source", "as.external_url"))
+	if blacklist == nil {
+		logger.Warn("Standalone engine has no token revocation source: AS session tokens stay valid at this engine until they expire, even after logout or user revocation. Mitigate with short access token TTLs, use the shared MongoDB revocation store, or co-host the engine with the backend.",
+			zap.String("jwks_source", "as.external_url"))
+	}
 	logger.Info("Standalone engine token validator started")
 	return &StandaloneValidator{Validator: v}, nil
 }
@@ -489,11 +544,24 @@ func (p *EngineProvider) CheckReady(ctx context.Context) error {
 // (IsRevoked vs IsBlacklisted), so Logout/DeleteUser revocation applies to AS-issued tokens.
 type blacklistRevocationChecker struct {
 	blacklist *service.TokenBlacklist
+	logger    *zap.Logger // optional
 }
 
-// IsRevoked implements revocation.Checker.
+// IsRevoked implements revocation.Checker. The interface has no error
+// return, so a store failure is reported as "revoked": the Validator then
+// rejects the token (401) rather than accepting it unchecked.
 func (c blacklistRevocationChecker) IsRevoked(ctx context.Context, jti string) bool {
-	return c.blacklist.IsBlacklisted(ctx, jti)
+	revoked, err := c.blacklist.IsBlacklisted(ctx, jti)
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Error("Revocation check failed; rejecting token", zap.Error(err))
+		}
+		return true
+	}
+	// A logout call may present a token whose jti is already revoked, to
+	// complete a logout that was interrupted (see middleware.IsLogout). Only
+	// a definite "revoked" answer is relaxed; a store error still rejects.
+	return revoked && !middleware.IsLogoutCompletion(ctx)
 }
 
 // =============================================================================
@@ -580,9 +648,10 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 	var metadataResolver *issuermetadata.Resolver
 	if cfg.AuthZENProxy.Enabled && cfg.AuthZENProxy.AllowResolution {
 		r, err := issuermetadata.New(issuermetadata.Config{
-			HTTPClient:   cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
-			AllowHTTP:    cfg.HTTPClient.AllowsPlaintext(),
-			MetadataType: issuermetadata.MetadataType(cfg.HTTPClient.MetadataType), // validated by Config.Validate and New
+			HTTPClient:    cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
+			AllowHTTP:     cfg.HTTPClient.AllowsPlaintext(),
+			MetadataType:  issuermetadata.MetadataType(cfg.HTTPClient.MetadataType), // validated by Config.Validate and New
+			CacheDisabled: cfg.HTTPClient.MetadataCacheDisabled,
 		})
 		if err != nil {
 			if closeErr := store.Close(); closeErr != nil {
@@ -653,7 +722,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 			Issuer:    issuer,
 			Audiences: cfg.AS.Audiences,
 			// Same blacklist as the rest of the process: the Validator has its own validation path that would not consult it.
-			Revocation: blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist},
+			Revocation: blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist, logger: logger},
 		})
 		tv.Start(context.Background())
 		logger.Info("Authorization Server module initialized",
@@ -724,7 +793,7 @@ func (p *BackendProvider) RegisterRoutes(router *gin.Engine) {
 		// Trust-evaluation calls are identity-free by design (see
 		// handleAnonymousTokenRequest) and only need a wallet-registry or
 		// wallet-backend audience - never require a broader one.
-		protected.Use(middleware.RequireAudience("wallet-registry", "wallet-backend"))
+		protected.Use(middleware.RequireAudience("wallet-registry", audienceWalletBackend))
 		v1 := protected.Group("/v1")
 		{
 			v1.POST("/evaluate", middleware.MustHaveTAC("r"), p.authzenHandler.Evaluate)
@@ -767,7 +836,17 @@ func (p *BackendProvider) CheckReady(ctx context.Context) error {
 	// Use a short timeout for readiness checks
 	checkCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
-	return p.store.Ping(checkCtx)
+	if err := p.store.Ping(checkCtx); err != nil {
+		return err
+	}
+	// A revocation store that failed to initialize refuses every
+	// authenticated request until restart; do not report ready meanwhile.
+	if p.auth != nil && p.auth.services != nil {
+		if err := p.auth.services.TokenBlacklist.Ready(); err != nil {
+			return fmt.Errorf("token revocation store unavailable: %w", err)
+		}
+	}
+	return nil
 }
 
 // Store returns the underlying storage backend
@@ -1153,6 +1232,7 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 		return nil, fmt.Errorf("create backend: %w", err)
 	}
 
+	warnProcessLocalState(cfg, logger, false)
 	services := newServices(store, cfg, logger)
 	// HasSigningKey (not IsSupported): a cert-less signing key is a valid
 	// standalone deployment when only "ietf"-mode WIA is needed. Key
@@ -1192,7 +1272,7 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 		Audiences: cfg.SessionAudiences(),
 		// Same wiring as NewBackendProvider; this provider's own TokenBlacklist is used as-is (it is never
 		// co-hosted with BackendProvider).
-		Revocation: blacklistRevocationChecker{blacklist: services.TokenBlacklist},
+		Revocation: blacklistRevocationChecker{blacklist: services.TokenBlacklist, logger: logger},
 	})
 	tv.Start(context.Background())
 
@@ -1210,6 +1290,20 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 func (p *WalletProviderProvider) Transport() Transport { return TransportWalletProvider }
 func (p *WalletProviderProvider) Name() string         { return "wallet-provider" }
 
+// CheckReady implements health.ReadinessChecker for WalletProviderProvider.
+// A revocation store that failed to initialize refuses every authenticated
+// request until restart, so the isolated wallet-provider must not report
+// ready meanwhile.
+func (p *WalletProviderProvider) CheckReady(_ context.Context) error {
+	if p.services == nil {
+		return nil
+	}
+	if err := p.services.TokenBlacklist.Ready(); err != nil {
+		return fmt.Errorf("token revocation store unavailable: %w", err)
+	}
+	return nil
+}
+
 // authMiddleware returns the auth middleware for the wallet-provider routes. This provider never runs
 // co-hosted with BackendProvider, so its own Services.TokenBlacklist is used as-is.
 func (p *WalletProviderProvider) authMiddleware() gin.HandlerFunc {
@@ -1223,9 +1317,10 @@ func (p *WalletProviderProvider) RegisterRoutes(router *gin.Engine) {
 	// Key attestation / WIA are general user-facing routes, not one of the
 	// narrow purposes an anonymous token is scoped to - reject a
 	// wallet-registry-only token here.
-	wp.Use(middleware.RequireAudience("wallet-backend"))
+	wp.Use(middleware.RequireAudience(audienceWalletBackend))
 	{
 		wp.POST("/key-attestation/generate", middleware.MustHaveTAC("w"), p.handlers.GenerateKeyAttestation)
+		wp.POST("/assurance-preview", middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier), middleware.MustHaveTAC("w"), p.handlers.AssurancePreview)
 		if p.cfg.WalletProvider.WIA.Enabled && p.services.WIA != nil {
 			wiaLimit := middleware.AuthRateLimitMiddlewareWithIdentifier(p.wiaRateLimiter, wiaCallerIdentifier)
 			wp.POST("/wia/challenge", wiaLimit, middleware.MustHaveTAC("w"), p.handlers.WIAChallenge)

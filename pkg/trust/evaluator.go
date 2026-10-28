@@ -11,6 +11,7 @@ package trust
 import (
 	"context"
 	"crypto/x509"
+	"encoding/json"
 
 	"github.com/sirosfoundation/go-trust/pkg/trustapi"
 )
@@ -130,6 +131,12 @@ type EvaluationResponse struct {
 	TrustMetadata interface{}
 	// Chain contains the validated certificate chain, if applicable.
 	Chain []*x509.Certificate
+	// Context is the PDP's response context object, verbatim as JSON (reason,
+	// trust_metadata, verifier_ids, ...). Nil when the PDP returned none.
+	Context json.RawMessage
+	// Failed means no decision could be had (PDP unreachable, error response,
+	// unbuildable request); Decision is false but is not a denial.
+	Failed bool
 }
 
 // ToTrustDecision converts EvaluationResponse to trustapi.TrustDecision.
@@ -316,6 +323,8 @@ func (m *EvaluatorManager) Evaluate(ctx context.Context, req *EvaluationRequest)
 	return &EvaluationResponse{
 		Decision: false,
 		Reason:   "no evaluator available for resource type: " + string(keyType),
+		// No evaluator could be asked.
+		Failed: true,
 	}, nil
 }
 

@@ -74,10 +74,19 @@ type Config struct {
 	// Default: 5 minutes.
 	CacheTTL time.Duration
 
+	// CacheDisabled turns off caching entirely: every Resolve fetches the
+	// metadata from the issuer. CacheTTL is ignored.
+	CacheDisabled bool
+
 	// HTTPClient is the HTTP client used for outbound requests.
 	// The caller is responsible for configuring timeouts, TLS settings,
-	// and SSRF protections (e.g. blocking private IP ranges).
-	// If nil, http.DefaultClient is used.
+	// and SSRF protections (e.g. blocking private IP ranges); production
+	// callers build it with config.HTTPClientConfig.NewHTTPClient.
+	// Required: issuer URLs are caller-controlled, so there is deliberately no
+	// default client. New returns ErrHTTPClientRequired when it is nil rather
+	// than fall back to http.DefaultClient, which reaches private, loopback and
+	// cloud-metadata addresses. (This package cannot build the guarded client
+	// itself: pkg/config imports it, so importing pkg/config here is a cycle.)
 	HTTPClient *http.Client
 
 	// AllowHTTP permits non-TLS issuer URLs.
@@ -241,8 +250,12 @@ type Resolver struct {
 	group singleflight.Group
 }
 
+// ErrHTTPClientRequired is returned by New when Config.HTTPClient is nil.
+var ErrHTTPClientRequired = errors.New("issuermetadata: Config.HTTPClient is required (build one with config.HTTPClientConfig.NewHTTPClient)")
+
 // New creates a Resolver with the given configuration.
-// Sensible defaults are applied for zero-value fields.
+// Sensible defaults are applied for zero-value fields, except HTTPClient, which
+// is required.
 func New(cfg Config) (*Resolver, error) {
 	if cfg.CacheTTL == 0 {
 		cfg.CacheTTL = 5 * time.Minute
@@ -263,7 +276,7 @@ func New(cfg Config) (*Resolver, error) {
 
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		return nil, ErrHTTPClientRequired
 	}
 
 	return &Resolver{
@@ -296,9 +309,12 @@ type ResolveResult struct {
 // using a TTL-cached result when available.
 //
 // The issuerURL must use HTTPS (unless AllowHTTP is set in Config).
-// Any trailing slash in the issuer URL path is stripped per OID4VCI §12.2.1.
-// The endpoint queried follows RFC 8615:
-// https://{host}/.well-known/openid-credential-issuer{path}.
+// The identifier is used exactly as given (no normalisation) for the identity
+// check and the cache key.
+// The endpoints queried are formed per OpenID4VCI 1.0 section 12.2.2 (literal
+// path insertion) and, on HTTP 404 only, the 1.1 draft form with a terminating
+// slash removed; see oidc.CredentialIssuerMetadataURLs. RFC 8615 defines only
+// the /.well-known/ namespace.
 //
 // When the fetched document contains a signed_metadata field, its JWT
 // signature is verified against the issuer's JWKS (inline jwks or jwks_uri).
@@ -330,13 +346,10 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 		return nil, err
 	}
 
-	// Normalize trailing slash for consistent cache keys, but only when the
-	// path is empty or just "/". Issuers with meaningful paths (e.g.
-	// https://host/issuer/) retain their trailing slash per RFC 8615.
-	parsed, _ := url.Parse(issuerURL) // already validated above
-	if parsed.Path == "" || parsed.Path == "/" {
-		issuerURL = strings.TrimRight(issuerURL, "/")
-	}
+	// issuerURL is used exactly as received, including as the cache and
+	// singleflight key: "https://i.example" and "https://i.example/" are
+	// different identifiers (OpenID4VCI 1.0 section 12.2.4, simple string
+	// comparison, no normalisation), so they never share an entry.
 
 	if entry := r.getCachedEntry(issuerURL); entry != nil {
 		return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial}, nil
@@ -353,12 +366,29 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 			return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial}, nil
 		}
 
-		// RFC 8615 well-known URI construction (required since OID4VCI draft 16):
-		// https://{host}/.well-known/openid-credential-issuer{path}
-		metadataURL, _ := oidc.WellKnownURL(issuerURL, "openid-credential-issuer") // already validated above
+		// Candidate metadata URLs, derived from the identifier as received
+		// (see oidc.CredentialIssuerMetadataURLs): the OpenID4VCI 1.0 literal
+		// form first, then the 1.1 draft form (terminating slash removed).
+		// The second is tried ONLY when the first answers HTTP 404; 5xx,
+		// timeouts, network errors and every other status are returned as they
+		// are, so a failing issuer is not hit twice and real failures are not
+		// masked. Both use the same guarded client and the same size, timeout
+		// and content-type rules. Whichever URL serves the document, its
+		// credential_issuer / sub is compared exactly with issuerURL; a
+		// mismatch is never retried against the other form.
+		candidates, _ := oidc.CredentialIssuerMetadataURLs(issuerURL) // already validated above
 		fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer fetchCancel()
-		result, err := r.fetch(fetchCtx, issuerURL, metadataURL)
+		var result *fetchResult
+		var err error
+		for i, metadataURL := range candidates {
+			result, err = r.fetch(fetchCtx, issuerURL, metadataURL)
+			var se *statusError
+			if err != nil && errors.As(err, &se) && se.status == http.StatusNotFound && i < len(candidates)-1 {
+				continue
+			}
+			break
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -419,8 +449,14 @@ func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*f
 			break
 		}
 	}
-	return nil, fmt.Errorf("issuer returned HTTP %d", lastStatus)
+	return nil, &statusError{status: lastStatus}
 }
+
+// statusError reports a non-200 metadata response. The resolver falls back to
+// the next candidate URL only for 404.
+type statusError struct{ status int }
+
+func (e *statusError) Error() string { return fmt.Sprintf("issuer returned HTTP %d", e.status) }
 
 // fetchOnce performs a single metadata GET with the given Accept header. It
 // returns the parsed result only on HTTP 200; on any other status it returns
@@ -554,14 +590,21 @@ func (r *Resolver) handleJSONResponse(ctx context.Context, issuerURL string, bod
 			if err != nil {
 				return nil, err
 			}
+			// The verified claims must bind to the identifier exactly, whichever
+			// candidate URL served the document (sub and/or credential_issuer;
+			// at least one must be present, any present one must match).
+			if err := validateSignedMetadataIdentity(claims, issuerURL); err != nil {
+				return nil, err
+			}
 			// Validated only when a TrustEvaluator is configured and approved.
 			return &fetchResult{metadata: claims, validated: r.cfg.TrustEvaluator != nil, signed: true}, nil
 		}
 	}
 
 	// Bind the plain-JSON metadata document to the URL it was requested from.
-	// Per OpenID4VCI §11.2.1, credential_issuer MUST match the Credential
-	// Issuer Identifier that was used to fetch this metadata. Without this
+	// Per OpenID4VCI 1.0 section 12.2.4 (the same rule is in the 1.1 draft's
+	// Credential Issuer Metadata section), credential_issuer MUST be identical
+	// to the Credential Issuer Identifier that was used to fetch this metadata. Without this
 	// check a metadata document served from (or injected at) an unrelated
 	// path/host could impersonate a different issuer identifier.
 	if err := validateCredentialIssuerClaim(raw, issuerURL); err != nil {
@@ -582,6 +625,28 @@ func validateCredentialIssuerClaim(claims map[string]interface{}, issuerURL stri
 	}
 	if credentialIssuer != issuerURL {
 		return fmt.Errorf("metadata 'credential_issuer' claim %q does not match issuer URL %q", credentialIssuer, issuerURL)
+	}
+	return nil
+}
+
+// validateSignedMetadataIdentity checks the identity claims of the verified
+// signed_metadata payload against the identifier exactly (no normalisation).
+func validateSignedMetadataIdentity(claims map[string]interface{}, issuerURL string) error {
+	subV, hasSub := claims["sub"]
+	ciV, hasCI := claims["credential_issuer"]
+	if !hasSub && !hasCI {
+		return fmt.Errorf("signed_metadata payload has neither 'sub' nor 'credential_issuer' to bind it to the issuer")
+	}
+	// Presence, not type: a non-string value is a mismatch, never a skip.
+	if hasSub {
+		if sub, _ := subV.(string); sub != issuerURL {
+			return fmt.Errorf("signed_metadata 'sub' claim %v does not match issuer URL %q", subV, issuerURL)
+		}
+	}
+	if hasCI {
+		if ci, _ := ciV.(string); ci != issuerURL {
+			return fmt.Errorf("signed_metadata 'credential_issuer' claim %v does not match issuer URL %q", ciV, issuerURL)
+		}
 	}
 	return nil
 }
@@ -752,10 +817,16 @@ func validateJWTClaims(claims map[string]interface{}, issuerURL string) error {
 	if sub == "" {
 		return fmt.Errorf("JWT payload missing required 'sub' claim")
 	}
-	normalizedSub := strings.TrimSuffix(sub, "/")
-	normalizedIssuer := strings.TrimSuffix(issuerURL, "/")
-	if normalizedSub != normalizedIssuer {
+	if sub != issuerURL {
 		return fmt.Errorf("JWT 'sub' claim %q does not match issuer URL %q", sub, issuerURL)
+	}
+	// The payload carries the metadata itself: when credential_issuer is
+	// present (any type) it must be the identifier too, since callers use it
+	// as the proof audience.
+	if v, present := claims["credential_issuer"]; present {
+		if ci, _ := v.(string); ci != issuerURL {
+			return fmt.Errorf("JWT 'credential_issuer' claim %v does not match issuer URL %q", v, issuerURL)
+		}
 	}
 
 	// iat MUST be present
@@ -935,6 +1006,9 @@ func (r *Resolver) fetchJWKSFromURI(ctx context.Context, uri string) (jose.JSONW
 }
 
 func (r *Resolver) getCachedEntry(issuerURL string) *cachedEntry {
+	if r.cfg.CacheDisabled {
+		return nil
+	}
 	r.mu.RLock()
 	entry, ok := r.cache[issuerURL]
 	if !ok {
@@ -969,6 +1043,9 @@ func deepCopyMap(m map[string]interface{}) map[string]interface{} {
 }
 
 func (r *Resolver) setCache(issuerURL string, result *fetchResult) {
+	if r.cfg.CacheDisabled {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.cache[issuerURL] = &cachedEntry{

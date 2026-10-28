@@ -16,6 +16,7 @@ import (
 
 	"github.com/sirosfoundation/go-siros-set/set"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
@@ -30,6 +31,12 @@ var (
 	ErrWIAPopInvalid           = errors.New("WIA-PoP validation failed")
 	ErrWIAChallengeCapacityMax = errors.New("challenge capacity exceeded")
 	ErrWIAInstanceDeactivated  = errors.New("wallet instance is suspended or revoked")
+	// ErrWIARefusedByPolicy is returned when the assurance policy is enabled
+	// and no assure-wia-issue rule permits the evidence of this request.
+	ErrWIARefusedByPolicy = errors.New("WIA refused by assurance policy")
+	// ErrWIANativeAttestationUnavailable means the native attestation could not
+	// be judged or recorded because storage failed; refused, retryable (503).
+	ErrWIANativeAttestationUnavailable = errors.New("native attestation cannot be verified right now")
 )
 
 // WIAChallenge is a single-use nonce for WIA generation.
@@ -163,8 +170,28 @@ type WIAService struct {
 	instances    storage.WalletInstanceStore
 	audit        *audit.Emitter
 
+	// keyAttestations holds per-key evidence verified by the backend. The WIA
+	// path reads it for the PoP (instance) key only; nil means no evidence is
+	// ever found and the instance records wscd_type unknown.
+	keyAttestations storage.KeyAttestationStore
+
+	// appAttestKeys holds attested App Attest keys (see SetAppAttestKeys).
+	appAttestKeys storage.AppAttestKeyStore
+
+	// keyVerifiers verifies the optional key_attestation request field, by
+	// type. Registered while wiring the service (RegisterInstanceKeyVerifier).
+	keyVerifiers map[KeyAttestationType]InstanceKeyEvidenceVerifier
+
+	// keyChecker re-checks stored instance-key evidence each time it backs a
+	// WIA (revocation, expiry). Verifiers that can re-check register here too.
+	keyChecker *instanceKeyChecker
+
 	// Challenge store for single-use nonces (memory or MongoDB).
 	challenges WIAChallengeStore
+
+	// assessor is the assurance policy; used only when
+	// wallet_provider.attestation.assurance.enabled is true.
+	assessor *assurance.Assessor
 
 	// stopCh signals the cleanup goroutine to exit.
 	stopCh    chan struct{}
@@ -194,6 +221,31 @@ func NewWIAService(cfg *config.Config, logger *zap.Logger, jwtSigner *signing.Cr
 	}
 
 	return svc
+}
+
+// SetAssessor installs the assurance policy used when
+// wallet_provider.attestation.assurance.enabled is true.
+func (s *WIAService) SetAssessor(a *assurance.Assessor) { s.assessor = a }
+
+// SetKeyAttestations installs the store of verified per-key evidence that
+// the instance key is looked up in (see instanceKeyEvidence).
+func (s *WIAService) SetKeyAttestations(k storage.KeyAttestationStore) { s.keyAttestations = k }
+
+// SetAppAttestKeys installs the store of attested Apple App Attest keys: the
+// native attestation verifier stores verified keys in it.
+func (s *WIAService) SetAppAttestKeys(k storage.AppAttestKeyStore) {
+	s.appAttestKeys = k
+	if s.nativeAttSvc != nil {
+		s.nativeAttSvc.SetAppAttestKeys(k)
+	}
+}
+
+// SetInstanceKeyChecker installs the shared re-check of stored instance-key
+// evidence (see instance_key_recheck.go).
+func (s *WIAService) SetInstanceKeyChecker(c *instanceKeyChecker) { s.keyChecker = c }
+
+func (s *WIAService) assuranceEnabled() bool {
+	return s.cfg.WalletProvider.Attestation.Assurance.Enabled
 }
 
 // IsSupported returns true if WIA generation is available. Unlike
@@ -267,6 +319,26 @@ func (s *WIAService) consumeChallenge(ctx context.Context, challenge string) err
 	return nil
 }
 
+// restoreChallenge puts a consumed challenge back for a retry after a
+// retryable server-side failure. It runs detached from the request's
+// cancellation (a client that gave up must not strand its once-per-key
+// enrollment) and is a SINGLE best-effort Put on purpose: retrying a Put whose
+// acknowledgement was lost could recreate a nonce a concurrent request has
+// already consumed, which would let one PoP and attestation issue twice. If it
+// cannot be stored the caller needs a new challenge (and, for App Attest, a
+// new key).
+func (s *WIAService) restoreChallenge(ctx context.Context, tenantID domain.TenantID, challenge string) {
+	ttl := time.Duration(s.cfg.WalletProvider.WIA.ChallengeTTLSeconds) * time.Second
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	if ok, err := s.challenges.Put(ctx, tenantID, challenge, time.Now().Add(ttl)); err != nil || !ok {
+		s.logger.Warn("could not restore the WIA challenge after a retryable failure", zap.Error(err))
+	}
+}
+
 // WIARequest contains the parameters for WIA generation.
 type WIARequest struct {
 	// Pop is the WIA-PoP JWT (typ: oauth-client-attestation-pop+jwt)
@@ -277,6 +349,9 @@ type WIARequest struct {
 	ClientID string `json:"client_id,omitempty"`
 	// NativeAttestation is optional platform attestation evidence
 	NativeAttestation *NativeAttestationRequest `json:"native_attestation,omitempty"`
+	// KeyAttestation is optional evidence about the instance (PoP) key
+	// itself; see instance_key_evidence.go. Absent: the home stays unknown.
+	KeyAttestation *KeyAttestation `json:"key_attestation,omitempty"`
 }
 
 // WIAPopClaims are the expected claims in a WIA-PoP JWT.
@@ -297,6 +372,13 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	start := time.Now()
 	defer func() { wiaGenerationDuration.Observe(time.Since(start).Seconds()) }()
 
+	// Step 0: an unknown key_attestation type is a client error that must not
+	// burn the single-use challenge.
+	keyVerifier, err := s.keyVerifierFor(req.KeyAttestation)
+	if err != nil {
+		return "", err
+	}
+
 	// Step 1: Consume challenge (single-use, atomic).
 	// Must happen before PoP validation to prevent concurrent crypto amplification
 	// attacks on the same challenge (TOCTOU). The trade-off is that a malformed PoP
@@ -308,6 +390,11 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 
 	// Step 2: Parse and validate WIA-PoP
 	cnfJWK, err := s.validatePop(req.Pop, req.Challenge)
+	if err != nil {
+		s.emitAuditFailure("pop_invalid", err)
+		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
+	}
+	popKey, err := jwk.ParseECPublicKey(cnfJWK)
 	if err != nil {
 		s.emitAuditFailure("pop_invalid", err)
 		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
@@ -339,27 +426,285 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	}
 
 	// Step 3: Determine attestation source
-	attestationSource := "backend_attested" // Tier 3 baseline
+	att := wiaAttestation{Source: "backend_attested"} // Tier 3 baseline
 	if req.NativeAttestation != nil && s.nativeAttSvc != nil {
 		// Bind native attestation challenge to the WIA challenge nonce
 		if req.NativeAttestation.Challenge != req.Challenge {
 			return "", fmt.Errorf("%w: native attestation challenge does not match WIA challenge", ErrWIAPopInvalid)
 		}
-		result, err := s.nativeAttSvc.Verify(ctx, req.NativeAttestation)
+		result, err := s.nativeAttSvc.VerifyBound(ctx, NativeAttestationBinding{TenantID: tenantID, UserID: userID, WalletInstanceID: jkt}, req.NativeAttestation)
 		if err != nil {
 			// When native attestation is submitted but fails, reject the request.
 			// If the client doesn't want native attestation, it should omit the field.
 			nativeAttestationErrors.Inc()
+			if errors.Is(err, ErrNativeAttestationUnavailable) {
+				// Apple issues an attestation object once per key and its nonce
+				// binds THIS challenge, so a retry with a fresh challenge could not
+				// reuse it. The request was otherwise valid (challenge, PoP and
+				// attestation verified), only storage failed: put the same
+				// challenge back so the caller can retry the identical request.
+				// Replay-safe: storing the key is bound to this caller, and the
+				// challenge is single-use again on the retry.
+				s.restoreChallenge(ctx, tenantID, req.Challenge)
+				return "", fmt.Errorf("%w: %v", ErrWIANativeAttestationUnavailable, err)
+			}
 			return "", fmt.Errorf("%w: native attestation failed: %v", ErrWIAPopInvalid, err)
 		}
 		if result.Verified {
-			attestationSource = result.AttestationSource
+			att.Source = result.AttestationSource
+			att.AppID = result.AppID
 			nativeAttestationSuccess.Inc()
 		}
 	}
 
+	// Step 3.4: evidence about the instance key itself (the PoP key), from the
+	// store of per-key evidence the backend verified. Never from anything the
+	// client reports about its keystore.
+	// Step 3.3: evidence the client submitted about that key is verified and
+	// stored first, so the lookup below sees it. Invalid evidence refuses the
+	// WIA; evidence that names no home changes nothing.
+	var submitted *domain.KeyAttestationRecord
+	if keyVerifier != nil {
+		submitted, err = s.verifyKeyAttestation(ctx, keyVerifier, req.KeyAttestation, tenantID, userIDString(userID), jkt, popKey, req.Challenge)
+		if err != nil {
+			s.emitAuditFailure("key_attestation_rejected", err)
+			return "", err
+		}
+	}
+	att.KeyEvidence, err = s.instanceKeyEvidence(ctx, tenantID, userIDString(userID), jkt)
+	if err != nil {
+		// The stored evidence cannot be re-checked right now: refuse rather
+		// than issue with a home nobody could confirm.
+		s.emitAuditFailure("key_attestation_unavailable", err)
+		return "", err
+	}
+	if att.KeyEvidence == nil && s.storedEvidenceOutOfScope(ctx, tenantID, userIDString(userID), jkt) {
+		// Nothing in scope to read back: no store, or the stored record for
+		// this key belongs to another tenant or user (the store keeps the
+		// stronger one and never replaces it). What was just verified for THIS
+		// caller still counts for this request; the durable record is untouched.
+		// A record that is in scope but revoked, expired or no longer
+		// qualifying stays "none": it was replaced above if a fresh valid
+		// submission superseded it.
+		att.KeyEvidence = submitted
+	}
+
+	// Step 3.5: the assurance policy decides whether a WIA is issued at all,
+	// which S profile it carries and which certification information applies.
+	// Disabled (default): always issue, exactly as before.
+	if s.assuranceEnabled() {
+		if err := s.applyAssurance(ctx, jkt, &att); err != nil {
+			s.emitAuditFailure("assurance_refused", err)
+			return "", err
+		}
+	}
+
 	// Step 4: Generate WIA JWT
-	return s.signWIA(cnfJWK, jkt, tenantID, userID, attestationSource, req.ClientID)
+	return s.signWIA(cnfJWK, jkt, tenantID, userID, att, req.ClientID)
+}
+
+// wiaAttestation is what one WIA request established and decided.
+type wiaAttestation struct {
+	// Source is the attestation source the backend verified in THIS request:
+	// platform_attested, development_attested or backend_attested. It is
+	// what is stored on the wallet instance and what rules see as the
+	// platform source.
+	Source string
+	// AppID is the verified application id, "" when none.
+	AppID string
+
+	// Claim is the attestation_source claim value. Empty means Source (the
+	// policy-disabled behaviour); with the policy enabled it is the emitted
+	// value of the chosen S profile.
+	Claim string
+	// CertInfo, when non-nil, replaces the configured
+	// wallet_solution_certification_information.
+	CertInfo map[string]interface{}
+	// Decision is the policy outcome, nil with the policy disabled.
+	Decision *assurance.WIAOutcome
+
+	// KeyEvidence is the VERIFIED per-key evidence record for the instance
+	// key (the thumbprint of the PoP key), nil when the backend holds none.
+	// It is what the fido2 evidence slot and the recorded wscd_type derive
+	// from; the client-reported plugin is never consulted.
+	KeyEvidence *domain.KeyAttestationRecord
+}
+
+// instanceKeyEvidence returns the verified key-evidence record stored for the
+// instance key with thumbprint jkt, or nil. The lookup is by the PoP key's own
+// RFC 7638 thumbprint, so evidence only applies when the key that was attested
+// is the key that signs the PoP.
+//
+// ARKG caveat: for a key derived with ARKG the public key the authenticator
+// attested is the base (seed) key, while the PoP key is a derived key with a
+// different thumbprint. The thumbprints then differ, nothing matches and the
+// result stays "no evidence" (wscd_type unknown). That is intended: the
+// evidence says nothing about the derived key unless a later stage binds them.
+//
+// A store error is treated as no evidence (fail closed to unknown), never as
+// permission. A stored record is re-checked before it is used (revocation,
+// expiry, see instance_key_recheck.go): a record that fails is no evidence; a
+// re-check that cannot be done returns an error wrapping
+// ErrWIAKeyAttestationUnavailable.
+func (s *WIAService) instanceKeyEvidence(ctx context.Context, tenantID domain.TenantID, userID, jkt string) (*domain.KeyAttestationRecord, error) {
+	if s.keyAttestations == nil {
+		return nil, nil
+	}
+	rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, jkt)
+	if err != nil {
+		if !errors.Is(err, storage.ErrNotFound) {
+			s.logger.Warn("instance key evidence lookup failed; treating as none", zap.Error(err))
+		}
+		return nil, nil
+	}
+	if !instanceEvidenceInScope(rec, tenantID, userID) {
+		s.logger.Warn("instance key evidence was verified for another tenant or user; ignoring it")
+		return nil, nil
+	}
+	return s.keyChecker.usable(ctx, s.keyAttestations, rec)
+}
+
+// storedEvidenceOutOfScope reports that there is no durable record this caller
+// may read back for jkt: no store is configured, or the stored record was
+// verified for another tenant or user. A record for this caller (usable or not)
+// or an unreadable store is not out of scope.
+func (s *WIAService) storedEvidenceOutOfScope(ctx context.Context, tenantID domain.TenantID, userID, jkt string) bool {
+	if s.keyAttestations == nil {
+		return true
+	}
+	rec, err := s.keyAttestations.GetByKeyThumbprint(ctx, jkt)
+	if err != nil {
+		return false
+	}
+	return !instanceEvidenceInScope(rec, tenantID, userID)
+}
+
+func userIDString(u *domain.UserID) string {
+	if u == nil {
+		return ""
+	}
+	return u.String()
+}
+
+// instanceKeyEvidenceBuilder turns a verified per-key evidence record of one
+// Kind into the verified instance_key evidence slot. New evidence families
+// (android_key, app_attest_assertion) register a builder in
+// instanceKeyBuilders; nothing else in the WIA path changes.
+type instanceKeyEvidenceBuilder interface {
+	// Kind is the record kind this builder understands.
+	Kind() domain.KeyEvidenceKind
+	// Build renders a normalized, verified record of that kind.
+	Build(rec *domain.KeyAttestationRecord) *assurance.InstanceKeyVerified
+}
+
+// instanceKeyBuilders is keyed by record Kind. A record whose kind has no
+// builder yields no slot: unknown evidence is never rendered as verified.
+var instanceKeyBuilders = map[domain.KeyEvidenceKind]instanceKeyEvidenceBuilder{
+	domain.KeyEvidenceFIDO2:              fido2InstanceKeyBuilder{},
+	domain.KeyEvidenceAppAttestAssertion: appAttestAssertionBuilder{},
+}
+
+// fido2InstanceKeyBuilder renders a verified FIDO2 attestation: the key was
+// attested by an authenticator (binding attested). A FIDO2 record carries no
+// security level or boot state, which render none (never invented).
+type fido2InstanceKeyBuilder struct{}
+
+func (fido2InstanceKeyBuilder) Kind() domain.KeyEvidenceKind { return domain.KeyEvidenceFIDO2 }
+
+func (fido2InstanceKeyBuilder) Build(rec *domain.KeyAttestationRecord) *assurance.InstanceKeyVerified {
+	return &assurance.InstanceKeyVerified{
+		Kind:    string(rec.Kind),
+		Home:    string(rec.Home),
+		Level:   rec.SecurityLevel,
+		Boot:    rec.VerifiedBootState,
+		Binding: assurance.BindingAttested,
+	}
+}
+
+// instanceKeyVerifiedFromRecord renders the verified instance_key slot from
+// the instance key's evidence record, nil (slot none) when there is no record
+// or no builder for its kind. Only this function fills the slot; it is fed
+// from storage, never from the request.
+func instanceKeyVerifiedFromRecord(rec *domain.KeyAttestationRecord) *assurance.InstanceKeyVerified {
+	if rec == nil {
+		return nil
+	}
+	n := *rec
+	n.Normalize()
+	b, ok := instanceKeyBuilders[n.Kind]
+	if !ok {
+		return nil
+	}
+	return b.Build(&n)
+}
+
+// fido2VerifiedFromRecord renders a verified FIDO2 record as the evidence
+// fido2 slot. Records of other kinds (android_key, app_attest_assertion, ...)
+// are not FIDO2 evidence and yield nil. Presence means the attestation chain
+// was accepted by the FIDO MDS3 registry.
+func fido2VerifiedFromRecord(rec *domain.KeyAttestationRecord) *assurance.Fido2Verified {
+	if rec == nil {
+		return nil
+	}
+	n := *rec
+	n.Normalize()
+	if n.Kind != domain.KeyEvidenceFIDO2 {
+		return nil
+	}
+	out := &assurance.Fido2Verified{AAGUID: n.AAGUID}
+	if n.UV {
+		out.UV = assurance.UVPresent
+	}
+	return out
+}
+
+// wiaFacts builds the evidence of a WIA decision. The platform slot is the
+// native attestation source verified in this request (not stored instance
+// state); the FIDO2 slot is the verified FIDO2 record stored for the instance
+// key (none when there is none: a WIA request itself carries no FIDO2
+// evidence); there are no client claims. This is KEY evidence about the
+// instance key: no shipped rule derives a credential key's KA level from it.
+func wiaFacts(att wiaAttestation) assurance.Facts {
+	return assurance.Facts{
+		Platform:    &assurance.PlatformVerified{Source: att.Source, AppID: att.AppID},
+		Fido2:       fido2VerifiedFromRecord(att.KeyEvidence),
+		InstanceKey: instanceKeyVerifiedFromRecord(att.KeyEvidence),
+	}
+}
+
+// applyAssurance runs the policy for one WIA request and records the result
+// in att. It returns ErrWIARefusedByPolicy when no rule permits issuance.
+func (s *WIAService) applyAssurance(ctx context.Context, jkt string, att *wiaAttestation) error {
+	if s.assessor == nil {
+		return ErrAssuranceUnavailable
+	}
+	out := s.assessor.AssessWIA(ctx, wiaFacts(*att))
+	for _, err := range out.Errors {
+		s.logger.Warn("assurance decider error treated as deny", zap.Error(err))
+	}
+	s.logger.Info("wia assurance decision",
+		zap.String("jkt", jkt[:min(8, len(jkt))]+"..."),
+		zap.String("policy_hash", out.PolicyVersion),
+		zap.Int("schema_version", out.SchemaVersion),
+		zap.Strings("rule_ids", out.RuleIDs()),
+		zap.Bool("issue", out.Issue),
+		zap.Strings("issue_rules", out.IssueRuleIDs),
+		zap.String("verified_source", att.Source),
+		zap.String("instance_key_kind", instanceKeyAudit(att.KeyEvidence, func(i *assurance.InstanceKeyVerified) string { return i.Kind })),
+		zap.String("instance_key_home", instanceKeyAudit(att.KeyEvidence, func(i *assurance.InstanceKeyVerified) string { return i.Home })),
+		zap.String("profile", out.Profile.Level),
+		zap.String("profile_value", out.Profile.Value),
+		zap.Strings("profile_rules", out.Profile.RuleIDs),
+		zap.String("certification_entry", out.CertName),
+		zap.Strings("certification_rules", out.CertRuleIDs),
+	)
+	att.Decision = out
+	if !out.Issue {
+		return ErrWIARefusedByPolicy
+	}
+	att.Claim = out.Profile.Value
+	att.CertInfo = out.CertInfo
+	return nil
 }
 
 // validatePop validates the WIA-PoP JWT and extracts the cnf key.
@@ -455,29 +800,46 @@ func (s *WIAService) validatePop(popJWT string, expectedNonce string) (map[strin
 	return jwkMap, nil
 }
 
+// effectiveWIALifetime is the lifetime signWIA gives a WIA: the configured
+// attestation.lifetime_seconds, defaulting to (and capped by)
+// wia.max_expiry_seconds, which itself defaults to 24h. unset reports that
+// lifetime_seconds was not configured. Platform-evidence freshness for Key
+// Attestation uses the same value, so evidence never outlives its WIA.
+func effectiveWIALifetime(cfg *config.Config) (lifetime time.Duration, unset bool) {
+	lifetime = time.Duration(cfg.WalletProvider.Attestation.LifetimeSeconds) * time.Second
+	maxExpiry := time.Duration(cfg.WalletProvider.WIA.MaxExpirySeconds) * time.Second
+	if maxExpiry <= 0 {
+		maxExpiry = 24 * time.Hour // sensible default to prevent zero/negative expiry
+	}
+	if lifetime <= 0 {
+		lifetime, unset = maxExpiry, true
+	}
+	if lifetime > maxExpiry {
+		lifetime = maxExpiry
+	}
+	return lifetime, unset
+}
+
 // signWIA creates the WIA JWT (typ: oauth-client-attestation+jwt).
 // jkt is the JWK Thumbprint of cnfJWK, precomputed by the caller (GenerateWIA)
 // so it can also be used for the instance-status guard before signing.
-func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, attestationSource string, clientID string) (string, error) {
+func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, att wiaAttestation, clientID string) (string, error) {
 	now := time.Now()
+	attestationSource := att.Source
+	claimSource := att.Claim
+	if claimSource == "" {
+		claimSource = att.Source
+	}
 
 	// WIA lifetime, capped by WIA max expiry. Deliberately short (default
 	// 300s / 5 min, see AttestationConfig) — this wallet provider has no
 	// client_status/revocation-chaining mechanism (see below); a short
 	// lifetime is the actual mechanism bounding exposure from a
 	// compromised/revoked wallet instance.
-	lifetime := time.Duration(s.cfg.WalletProvider.Attestation.LifetimeSeconds) * time.Second
-	maxExpiry := time.Duration(s.cfg.WalletProvider.WIA.MaxExpirySeconds) * time.Second
-	if maxExpiry <= 0 {
-		maxExpiry = 24 * time.Hour // sensible default to prevent zero/negative expiry
-	}
-	if lifetime <= 0 {
-		lifetime = maxExpiry
+	lifetime, lifetimeUnset := effectiveWIALifetime(s.cfg)
+	if lifetimeUnset {
 		s.logger.Warn("attestation.lifetime_seconds not set, defaulting to max_expiry_seconds",
 			zap.Duration("lifetime", lifetime))
-	}
-	if lifetime > maxExpiry {
-		lifetime = maxExpiry
 	}
 
 	// sub: draft-ietf-oauth-attestation-based-client-auth-10 requires "the sub
@@ -499,24 +861,33 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 		"iat": now.Unix(),
 		"exp": now.Add(lifetime).Unix(),
 		// attestation_source: a SIROS extension claim — neither EC TS03 nor
-		// ETSI TS 119 472-3 define a WIA claim for this. Its values are
-		// chosen to mirror the S1/S3 "WIA dimension" tiers from WE BUILD
-		// wp4-architecture PR #229 ("cs-04: Add Annex C — Tiered WUA for
-		// cross-platform Wallet Solutions", open as of 2026-08, branch
+		// ETSI TS 119 472-3 define a WIA claim for this. It mirrors the
+		// S-tier "WIA dimension" of WE BUILD wp4-architecture PR #229
+		// ("cs-04: Add Annex C — Tiered WUA for cross-platform Wallet
+		// Solutions", open as of 2026-08, branch
 		// cs-04/annex-c-tiered-attestation) — NOT "WP4 CS-05" (Business
 		// Wallet, unrelated); Annex C is a proposed addition to CS-04.
 		// Annex C's own note is explicit that TS-03/CS-04 don't define this
 		// claim: any such signal "may [be conveyed] via the certification
 		// information or via an extension claim, but this is outside the
 		// scope of TS-03 and CS-04" — this claim is that extension.
-		//   "backend_attested"         — Annex C tier S3: backend-only attestation
-		//   "ios_app_attest"           — Annex C tier S1: full client attestation (Apple App Attest)
-		//   "android_play_integrity"   — Annex C tier S1: full client attestation (Google Play Integrity)
-		// Annex C's tier S2 (partial client attestation, e.g. a browser
-		// extension/companion) has no corresponding value yet.
+		// Values emitted by the backend without the assurance policy (the
+		// strings the attestation verifier produces):
+		//   "backend_attested"      — Annex C S3: backend-only attestation
+		//   "platform_attested"     — Annex C S1: full client attestation,
+		//                             a verified Apple App Attest or Google
+		//                             Play Integrity check
+		//   "development_attested"  — an App Attest chain that only chained
+		//                             to a development environment; NOT S1
+		// Annex C's S2 (partial client attestation, e.g. a browser
+		// extension/companion) has no evidence source and no value yet.
+		// With wallet_provider.attestation.assurance enabled the value is
+		// the emitted string of the S profile the policy chose
+		// (assure-wia); the verified source stays in the audit log and on
+		// the wallet instance.
 		// Third-party wallet providers may omit this claim; issuers must handle
 		// both present and absent cases (absent = unknown tier).
-		"attestation_source": attestationSource,
+		"attestation_source": claimSource,
 	}
 
 	if s.cfg.WalletProvider.WIA.WalletName != "" {
@@ -529,8 +900,13 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 		claims["wallet_link"] = s.cfg.WalletProvider.WIA.WalletLink
 	}
 
-	// Wallet solution certification information (Annex C §C.3.2)
-	if len(s.cfg.WalletProvider.WIA.CertificationInfo) > 0 {
+	// Wallet solution certification information (Annex C §C.3.2). The
+	// assurance policy may select a catalogue entry; otherwise the static
+	// configuration is used.
+	switch {
+	case len(att.CertInfo) > 0:
+		claims["wallet_solution_certification_information"] = att.CertInfo
+	case len(s.cfg.WalletProvider.WIA.CertificationInfo) > 0:
 		claims["wallet_solution_certification_information"] = s.cfg.WalletProvider.WIA.CertificationInfo
 	}
 
@@ -592,7 +968,7 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 		return "", err
 	}
 
-	wiaGeneratedTotal.WithLabelValues(attestationSource).Inc()
+	wiaGeneratedTotal.WithLabelValues(claimSource).Inc()
 	s.logger.Info("WIA generated", zap.String("jkt", jkt[:8]+"..."))
 
 	// Record wallet instance (upsert: creates on first attestation, updates on subsequent).
@@ -603,12 +979,18 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 	if s.instances != nil {
 		now := time.Now().UTC()
 		instance := &domain.WalletInstance{
-			ID:                jkt,
-			TenantID:          tenantID,
-			UserID:            userID,
-			Status:            domain.InstanceStatusActive,
-			WSCDType:          wscdTypeFromAttestation(attestationSource),
+			ID:       jkt,
+			TenantID: tenantID,
+			UserID:   userID,
+			Status:   domain.InstanceStatusActive,
+			// The WIA PoP key is the wallet's instance key in its own keystore
+			// (software store or any WSCD plugin), not the App Attest / Play
+			// Integrity key. Its home is only known from verified per-key
+			// evidence for that very key; without it the type is unknown (never
+			// derived from the platform attestation or a client-reported plugin).
+			WSCDType:          instanceWSCDType(att.KeyEvidence),
 			AttestationSource: attestationSource,
+			VerifiedAppID:     att.AppID,
 			LastAttestedAt:    now,
 			CreatedAt:         now,
 			UpdatedAt:         now,
@@ -620,9 +1002,16 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 
 	// Emit audit event
 	if s.audit != nil {
-		s.audit.EmitWithSubject(set.EventWIAIssued, jkt, map[string]any{
-			"attestation_source": attestationSource,
-		})
+		payload := map[string]any{"attestation_source": claimSource}
+		if att.Decision != nil {
+			// With the policy enabled attestation_source is the chosen
+			// profile's value, so the verified source goes alongside it.
+			payload["verified_attestation_source"] = attestationSource
+			payload["assurance_profile"] = att.Decision.Profile.Level
+			payload["assurance_policy_hash"] = att.Decision.PolicyVersion
+			payload["assurance_rule_ids"] = att.Decision.RuleIDs()
+		}
+		s.audit.EmitWithSubject(set.EventWIAIssued, jkt, payload)
 	}
 
 	return tokenString, nil
@@ -686,15 +1075,45 @@ func (s *WIAService) emitAuditFailure(reason string, err error) {
 	}
 }
 
-// wscdTypeFromAttestation maps attestation source to WSCD type.
-func wscdTypeFromAttestation(source string) domain.WSCDType {
-	switch source {
-	case "ios_app_attest":
-		return domain.WSCDTypeNativeIOS
-	case "android_play_integrity":
+// wscdTypeFromKeyHome maps the verified home of a key to the WSCD type an
+// instance records. It must only be called with the Home of a VERIFIED
+// key-evidence record (storage returns only verified records); with nothing
+// verified the type is domain.WSCDTypeUnknown, never a guess from the
+// client-reported plugin or from the platform attestation.
+//
+// KeyHomeSecureEnclaveAsserted deliberately maps to unknown: an App Attest
+// assertion proves that an attested app endorsed the key, not that the key
+// resides in the Secure Enclave, so it must not be recorded as native_ios.
+func wscdTypeFromKeyHome(home domain.KeyHome) domain.WSCDType {
+	switch home {
+	case domain.KeyHomeStrongBox, domain.KeyHomeTEE:
 		return domain.WSCDTypeNativeAndroid
-	default:
-		// Backend-attested instances from web frontend use Web Crypto.
-		return domain.WSCDTypeWebCrypto
+	case domain.KeyHomeFIDO2Hardware:
+		return domain.WSCDTypeFIDO2Hardware
+	case domain.KeyHomeHSM:
+		return domain.WSCDTypeRemote
 	}
+	return domain.WSCDTypeUnknown
+}
+
+// instanceWSCDType is the wscd_type to record for an instance key given its
+// verified evidence record (nil: nothing verified, so unknown).
+func instanceWSCDType(rec *domain.KeyAttestationRecord) domain.WSCDType {
+	if rec == nil {
+		return domain.WSCDTypeUnknown
+	}
+	n := *rec
+	n.Normalize()
+	return wscdTypeFromKeyHome(n.Home)
+}
+
+// instanceKeyAudit extracts one field of the instance_key evidence for the
+// audit line, "none" when the slot is absent.
+func instanceKeyAudit(rec *domain.KeyAttestationRecord, field func(*assurance.InstanceKeyVerified) string) string {
+	if ik := instanceKeyVerifiedFromRecord(rec); ik != nil {
+		if v := field(ik); v != "" {
+			return v
+		}
+	}
+	return assurance.None
 }

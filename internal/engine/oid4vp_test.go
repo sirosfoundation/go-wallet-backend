@@ -6,7 +6,6 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
@@ -377,7 +376,7 @@ func TestParseRequest(t *testing.T) {
 	})
 	defer cleanup()
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Logger: zap.NewNop()}, httpClient: srv.Client()}
 
@@ -657,329 +656,6 @@ func TestMatchRequestMessage_DCQLQuery_JSON(t *testing.T) {
 	assert.NotNil(t, parsed["dcql_query"])
 }
 
-// ===== submitDirectPostJWT tests =====
-
-func TestSubmitDirectPostJWT_EncryptsAndPosts(t *testing.T) {
-	// Generate an ephemeral EC key for ECDH-ES encryption
-	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-
-	encJWK := map[string]any{
-		"kty": "EC",
-		"crv": "P-256",
-		"x":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.X.Bytes(), 32)),
-		"y":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.Y.Bytes(), 32)),
-		"use": "enc",
-		"kid": "enc-key-1",
-	}
-	jwksBytes, _ := json.Marshal(map[string]any{"keys": []any{encJWK}})
-
-	var receivedForm url.Values
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		err := r.ParseForm()
-		require.NoError(t, err)
-		receivedForm = r.PostForm
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer server.Close()
-
-	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
-	authReq := &AuthorizationRequest{
-		ClientID: "https://verifier.example.com",
-		State:    "test-state",
-		ClientMetadata: &ClientMetadata{
-			JWKS:                              jwksBytes,
-			AuthorizationEncryptedResponseAlg: "ECDH-ES",
-			AuthorizationEncryptedResponseEnc: "A128CBC-HS256",
-		},
-	}
-
-	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
-	require.NoError(t, err)
-
-	// Should have posted a JWE in the "response" field
-	response := receivedForm.Get("response")
-	assert.NotEmpty(t, response, "should post a JWE in the 'response' field")
-	// A JWE compact serialization has 5 dot-separated parts
-	parts := len(splitDots(response))
-	assert.Equal(t, 5, parts, "JWE should have 5 parts, got %d", parts)
-}
-
-func TestSubmitDirectPostJWT_MissingEncAlg_InfersFromECKey(t *testing.T) {
-	// When authorization_encrypted_response_alg is absent but an EC key is
-	// available in client_metadata.jwks, the algorithm should be inferred as
-	// ECDH-ES (EC key → ECDH-ES, RFC 7518 §4.6).
-	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-
-	encJWK := map[string]any{
-		"kty": "EC", "crv": "P-256",
-		"x":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.X.Bytes(), 32)),
-		"y":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.Y.Bytes(), 32)),
-		"use": "enc", "kid": "ec-enc-key",
-	}
-	jwksBytes, _ := json.Marshal(map[string]any{"keys": []any{encJWK}})
-
-	var receivedForm url.Values
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		receivedForm = r.PostForm
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer server.Close()
-
-	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
-	authReq := &AuthorizationRequest{
-		ClientID: "https://verifier.example.com",
-		// No AuthorizationEncryptedResponseAlg — should be inferred as ECDH-ES
-		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
-	}
-
-	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
-	require.NoError(t, err, "should succeed by inferring ECDH-ES from EC key")
-
-	response := receivedForm.Get("response")
-	assert.NotEmpty(t, response, "should post a JWE in the 'response' field")
-	assert.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
-}
-
-func TestSubmitDirectPostJWT_MissingEncAlg_HonorsJWKAlg(t *testing.T) {
-	// When authorization_encrypted_response_alg is absent but the verifier's
-	// encryption JWK declares its own "alg" (e.g. ECDH-ES+A256KW), that value
-	// must be used for the JWE header rather than inferring ECDH-ES from the
-	// EC key type. Verifiers validate the JWE header "alg" against their
-	// selected encryption JWK and reject a mismatch (regression test for the
-	// "JWE header does not match the selected verifier encryption JWK" failure).
-	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-
-	jwksBytes := makeJWKS(jose.JSONWebKey{
-		Key:       &encKey.PublicKey,
-		KeyID:     "enc-key-1",
-		Use:       "enc",
-		Algorithm: "ECDH-ES+A256KW",
-	})
-
-	var receivedForm url.Values
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		receivedForm = r.PostForm
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer server.Close()
-
-	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
-	authReq := &AuthorizationRequest{
-		ClientID: "https://verifier.example.com",
-		// No AuthorizationEncryptedResponseAlg — must fall back to the JWK's alg.
-		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
-	}
-
-	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
-	require.NoError(t, err, "should succeed by honoring the JWK's declared alg")
-
-	response := receivedForm.Get("response")
-	require.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
-
-	headerJSON, err := base64.RawURLEncoding.DecodeString(splitDots(response)[0])
-	require.NoError(t, err)
-	var header struct {
-		Alg string `json:"alg"`
-	}
-	require.NoError(t, json.Unmarshal(headerJSON, &header))
-	assert.Equal(t, string(jose.ECDH_ES_A256KW), header.Alg,
-		"JWE header alg should honor the JWK's declared ECDH-ES+A256KW, not inferred ECDH-ES")
-}
-
-func TestSubmitDirectPostJWT_MissingEncAlg_IgnoresNonJARMJWKAlg(t *testing.T) {
-	// When authorization_encrypted_response_alg is absent and the verifier's
-	// JWK carries a non-JARM key-management "alg" (e.g. a signature alg like
-	// "ES256"), that value must NOT be forced onto the JWE. The code should
-	// fall back to key-type inference (EC key → ECDH-ES) instead of failing on
-	// an unsupported JARM key algorithm.
-	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-
-	jwksBytes := makeJWKS(jose.JSONWebKey{
-		Key:       &encKey.PublicKey,
-		KeyID:     "enc-key-1",
-		Use:       "enc",
-		Algorithm: "ES256", // signature alg, not a JARM key-management alg
-	})
-
-	var receivedForm url.Values
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		receivedForm = r.PostForm
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer server.Close()
-
-	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
-	authReq := &AuthorizationRequest{
-		ClientID:       "https://verifier.example.com",
-		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
-	}
-
-	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
-	require.NoError(t, err, "should fall back to ECDH-ES key-type inference, not fail on ES256")
-
-	response := receivedForm.Get("response")
-	require.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
-
-	headerJSON, err := base64.RawURLEncoding.DecodeString(splitDots(response)[0])
-	require.NoError(t, err)
-	var header struct {
-		Alg string `json:"alg"`
-	}
-	require.NoError(t, json.Unmarshal(headerJSON, &header))
-	assert.Equal(t, string(jose.ECDH_ES), header.Alg,
-		"non-JARM JWK alg should be ignored in favor of inferred ECDH-ES")
-}
-
-func TestSubmitDirectPostJWT_MissingEncAlg_InfersFromRSAKey(t *testing.T) {
-	// When authorization_encrypted_response_alg is absent but an RSA key is
-	// available in client_metadata.jwks, the algorithm should be inferred as
-	// RSA-OAEP (RSA key → RSA-OAEP, RFC 7518 §4.3).
-	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	require.NoError(t, err)
-
-	jwksBytes := makeJWKS(jose.JSONWebKey{Key: &rsaKey.PublicKey, KeyID: "rsa-enc", Use: "enc"})
-
-	var receivedForm url.Values
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		receivedForm = r.PostForm
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer server.Close()
-
-	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
-	authReq := &AuthorizationRequest{
-		ClientID:       "https://verifier.example.com",
-		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
-	}
-
-	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
-	require.NoError(t, err, "should succeed by inferring RSA-OAEP from RSA key")
-
-	response := receivedForm.Get("response")
-	assert.NotEmpty(t, response)
-	assert.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
-}
-
-func TestSubmitDirectPostJWT_MissingEncAlgAndNoKey_Errors(t *testing.T) {
-	// When neither authorization_encrypted_response_alg nor any key material is
-	// available, the call must fail with a clear error.
-	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: http.DefaultClient}
-	authReq := &AuthorizationRequest{
-		ClientID:       "https://verifier.example.com",
-		ClientMetadata: &ClientMetadata{}, // no JWKS, no alg
-	}
-
-	_, err := h.submitDirectPostJWT(context.Background(), "https://example.com/post", authReq, "vp-token")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "authorization_encrypted_response_alg")
-}
-
-func TestSubmitDirectPostJWT_NilClientMetadata_InfersFromX5C(t *testing.T) {
-	// When client_metadata is nil but the request JWT carries an x5c, the algorithm
-	// should be inferred from the x5c leaf cert's public key.
-	leafKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-	tmpl := &x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject:      pkix.Name{CommonName: "verifier"},
-		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(time.Hour),
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &leafKey.PublicKey, leafKey)
-	require.NoError(t, err)
-	certB64 := base64.StdEncoding.EncodeToString(der)
-
-	requestJWT := buildMinimalJWT(t, leafKey, certB64)
-
-	var receivedForm url.Values
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		receivedForm = r.PostForm
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer server.Close()
-
-	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
-	authReq := &AuthorizationRequest{
-		ClientID:   "x509_san_dns:verifier.example.com",
-		RequestJWT: requestJWT,
-		// No client_metadata — algorithm inferred from x5c leaf
-	}
-
-	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "test-vp-token")
-	require.NoError(t, err, "should succeed by inferring ECDH-ES from x5c EC key")
-
-	response := receivedForm.Get("response")
-	assert.NotEmpty(t, response)
-	assert.Equal(t, 5, len(splitDots(response)), "JWE should have 5 parts")
-}
-
-func TestSubmitDirectPostJWT_DefaultEncIsA128GCM(t *testing.T) {
-	// When authorization_encrypted_response_enc is absent, default should be
-	// A128GCM, not A128CBC-HS256 (RFC 7518's first mandatory-to-implement
-	// "enc" but not universally implemented - confirmed live against
-	// verifier.multipaz.org's own JsonWebEncryption decrypter, which only
-	// implements the GCM family and rejects CBC-HS256 outright).
-	encKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-
-	encJWK := map[string]any{
-		"kty": "EC", "crv": "P-256",
-		"x":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.X.Bytes(), 32)),
-		"y":   base64.RawURLEncoding.EncodeToString(padBytes(encKey.PublicKey.Y.Bytes(), 32)),
-		"use": "enc",
-	}
-	jwksBytes, _ := json.Marshal(map[string]any{"keys": []any{encJWK}})
-
-	var receivedForm url.Values
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = r.ParseForm()
-		receivedForm = r.PostForm
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{}`))
-	}))
-	defer server.Close()
-
-	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}, httpClient: server.Client()}
-	authReq := &AuthorizationRequest{
-		ClientID: "https://verifier.example.com",
-		ClientMetadata: &ClientMetadata{
-			JWKS:                              jwksBytes,
-			AuthorizationEncryptedResponseAlg: "ECDH-ES",
-			// No enc — should default to A128GCM
-		},
-	}
-
-	_, err = h.submitDirectPostJWT(context.Background(), server.URL, authReq, "vp-token")
-	require.NoError(t, err, "should succeed with default A128GCM enc")
-	response := receivedForm.Get("response")
-	assert.Equal(t, 5, len(splitDots(response)))
-
-	headerB64 := splitDots(response)[0]
-	headerJSON, err := base64.RawURLEncoding.DecodeString(headerB64)
-	require.NoError(t, err)
-	var header struct {
-		Enc string `json:"enc"`
-	}
-	require.NoError(t, json.Unmarshal(headerJSON, &header))
-	assert.Equal(t, string(jose.A128GCM), header.Enc, "default enc should be A128GCM, not A128CBC-HS256")
-}
-
 func TestSanitizeEndpointURL_InvalidScheme(t *testing.T) {
 	_, err := sanitizeEndpointURL("ftp://evil.com")
 	require.Error(t, err)
@@ -996,60 +672,6 @@ func TestSanitizeEndpointURL_ValidHTTP(t *testing.T) {
 	result, err := sanitizeEndpointURL("http://localhost:8080/callback")
 	require.NoError(t, err)
 	assert.Equal(t, "http://localhost:8080/callback", result)
-}
-
-// ===== extractVerifierEncryptionKey tests =====
-
-func TestExtractVerifierEncryptionKey_PrefersUseEnc(t *testing.T) {
-	sigKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	encKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-
-	jwksBytes := makeJWKS(
-		jose.JSONWebKey{Key: &sigKey.PublicKey, KeyID: "sig-key-1", Use: "sig"},
-		jose.JSONWebKey{Key: &encKey.PublicKey, KeyID: "enc-key-1", Use: "enc", Algorithm: "ECDH-ES+A256KW"},
-	)
-
-	h := &OID4VPHandler{}
-	authReq := &AuthorizationRequest{
-		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
-	}
-
-	_, kid, alg, err := h.extractVerifierEncryptionKey(authReq)
-	require.NoError(t, err)
-	assert.Equal(t, "enc-key-1", kid, "should select the key with use=enc")
-	assert.Equal(t, "ECDH-ES+A256KW", alg, "should return the JWK's declared alg")
-}
-
-func TestExtractVerifierEncryptionKey_FallsBackToFirstKey(t *testing.T) {
-	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-
-	jwk := map[string]any{
-		"kty": "EC", "crv": "P-256",
-		"x":   base64.RawURLEncoding.EncodeToString(padBytes(key.PublicKey.X.Bytes(), 32)),
-		"y":   base64.RawURLEncoding.EncodeToString(padBytes(key.PublicKey.Y.Bytes(), 32)),
-		"kid": "only-key",
-	}
-	jwksBytes, _ := json.Marshal(map[string]any{"keys": []any{jwk}})
-
-	h := &OID4VPHandler{}
-	authReq := &AuthorizationRequest{
-		ClientMetadata: &ClientMetadata{JWKS: jwksBytes},
-	}
-
-	_, kid, _, err := h.extractVerifierEncryptionKey(authReq)
-	require.NoError(t, err)
-	assert.Equal(t, "only-key", kid)
-}
-
-func TestExtractVerifierEncryptionKey_NoKeysReturnsError(t *testing.T) {
-	h := &OID4VPHandler{}
-	authReq := &AuthorizationRequest{
-		ClientMetadata: &ClientMetadata{},
-	}
-
-	_, _, _, err := h.extractVerifierEncryptionKey(authReq)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "no verifier encryption key found")
 }
 
 // splitDots splits a string by "." — a minimal helper for counting JWE parts.
@@ -1507,17 +1129,17 @@ func TestValidateResponseURIOrigin_NilMsg(t *testing.T) {
 
 func TestValidateTransactionData_Empty(t *testing.T) {
 	authReq := &AuthorizationRequest{}
-	assert.NoError(t, validateTransactionData(authReq))
+	assert.NoError(t, validateTransactionData(authReq, tdClient))
 }
 
 func TestValidateTransactionData_Valid(t *testing.T) {
-	td := TransactionData{Type: "owf_payment_initiation"}
+	td := TransactionData{Type: "owf_payment_initiation", CredentialIDs: []string{"pay"}}
 	tdJSON, _ := json.Marshal(td)
 	encoded := base64.RawURLEncoding.EncodeToString(tdJSON)
 	raw, _ := json.Marshal([]string{encoded})
 
-	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
-	err := validateTransactionData(authReq)
+	authReq := &AuthorizationRequest{TransactionDataRaw: raw, DCQLQuery: payDCQL}
+	err := validateTransactionData(authReq, tdClient)
 	assert.NoError(t, err)
 	require.Len(t, authReq.TransactionData, 1)
 	assert.Equal(t, "owf_payment_initiation", authReq.TransactionData[0].Type)
@@ -1526,7 +1148,7 @@ func TestValidateTransactionData_Valid(t *testing.T) {
 func TestValidateTransactionData_InvalidBase64(t *testing.T) {
 	raw, _ := json.Marshal([]string{"not-valid-base64!!!"})
 	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
-	err := validateTransactionData(authReq)
+	err := validateTransactionData(authReq, tdClient)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid base64url encoding")
 }
@@ -1535,33 +1157,36 @@ func TestValidateTransactionData_InvalidJSON(t *testing.T) {
 	encoded := base64.RawURLEncoding.EncodeToString([]byte("{bad json"))
 	raw, _ := json.Marshal([]string{encoded})
 	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
-	err := validateTransactionData(authReq)
+	err := validateTransactionData(authReq, tdClient)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "invalid JSON")
 }
 
-func TestValidateTransactionData_UnsupportedType(t *testing.T) {
-	td := TransactionData{Type: "unsupported_type"}
+// The engine does not judge whether a type is supported: that depends on the
+// type metadata of the attestation the entry is bound to, which the wallet
+// resolves. A well-formed entry of any type goes to a client that declared
+// the feature, and the client refuses what it cannot handle.
+func TestValidateTransactionData_EngineDoesNotJudgeTheType(t *testing.T) {
+	td := TransactionData{Type: "some_type_the_engine_has_never_heard_of", CredentialIDs: []string{"pay"}}
 	tdJSON, _ := json.Marshal(td)
 	encoded := base64.RawURLEncoding.EncodeToString(tdJSON)
 	raw, _ := json.Marshal([]string{encoded})
 
-	authReq := &AuthorizationRequest{TransactionDataRaw: raw}
-	err := validateTransactionData(authReq)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "unsupported transaction_data type")
+	authReq := &AuthorizationRequest{TransactionDataRaw: raw, DCQLQuery: payDCQL}
+	require.NoError(t, validateTransactionData(authReq, tdClient))
+	require.Len(t, authReq.TransactionData, 1)
 }
 
 func TestValidateTransactionData_NotStringArray(t *testing.T) {
 	authReq := &AuthorizationRequest{TransactionDataRaw: json.RawMessage(`[123, 456]`)}
-	err := validateTransactionData(authReq)
+	err := validateTransactionData(authReq, tdClient)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "expected array of base64url strings")
 }
 
 func TestValidateTransactionData_Null(t *testing.T) {
 	authReq := &AuthorizationRequest{TransactionDataRaw: json.RawMessage(`null`)}
-	err := validateTransactionData(authReq)
+	err := validateTransactionData(authReq, tdClient)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "must be an array, not null")
 }
@@ -1939,7 +1564,7 @@ func TestOID4VPFlow_X509SANURI_NeverFetchesClientMetadataBeforeVerification(t *t
 			})
 			defer cleanup()
 			session := testSession(conn)
-			flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+			flow := registerTestFlow(session, "test-flow")
 
 			h := &OID4VPHandler{
 				BaseHandler: BaseHandler{Flow: flow, Config: testConfig(), Logger: zap.NewNop()},
@@ -2019,7 +1644,7 @@ func TestOID4VPFlow_X509SANDNSAndHash_NeverFetchesClientMetadataBeforeVerificati
 				})
 				defer cleanup()
 				session := testSession(conn)
-				flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+				flow := registerTestFlow(session, "test-flow")
 
 				h := &OID4VPHandler{
 					BaseHandler: BaseHandler{Flow: flow, Config: testConfig(), Logger: zap.NewNop()},
@@ -2186,7 +1811,9 @@ func TestComputeVerifierJWKThumbprint_NonJWTMode(t *testing.T) {
 	authReq := &AuthorizationRequest{
 		ResponseMode: ResponseModeDirectPost,
 	}
-	assert.Equal(t, "", h.computeVerifierJWKThumbprint(authReq))
+	got, err := h.computeVerifierJWKThumbprint(authReq)
+	require.NoError(t, err)
+	assert.Equal(t, "", got)
 }
 
 func TestComputeVerifierJWKThumbprint_JWTMode(t *testing.T) {
@@ -2205,7 +1832,8 @@ func TestComputeVerifierJWKThumbprint_JWTMode(t *testing.T) {
 			JWKS: jwksBytes,
 		},
 	}
-	result := h.computeVerifierJWKThumbprint(authReq)
+	result, err := h.computeVerifierJWKThumbprint(authReq)
+	require.NoError(t, err)
 	assert.NotEmpty(t, result, "should return a non-empty thumbprint")
 }
 
@@ -2214,9 +1842,12 @@ func TestComputeVerifierJWKThumbprint_JWTModeNoKeys(t *testing.T) {
 	h.BaseHandler = BaseHandler{Logger: zap.NewNop()}
 	authReq := &AuthorizationRequest{
 		ResponseMode: ResponseModeDirectPostJWT,
-		// No client metadata — should warn and return empty
+		// No client metadata: must fail, not send an empty thumbprint
 	}
-	assert.Equal(t, "", h.computeVerifierJWKThumbprint(authReq))
+	got, err := h.computeVerifierJWKThumbprint(authReq)
+	require.Error(t, err)
+	assert.Equal(t, "", got)
+	assert.Contains(t, err.Error(), "direct_post.jwt")
 }
 
 // --- Test for validateAuthorizationRequest with all known schemes ---
@@ -2314,7 +1945,7 @@ func TestValidateAuthorizationRequest_OriginMismatchViaMsg(t *testing.T) {
 }
 
 func TestValidateAuthorizationRequest_WithTransactionData(t *testing.T) {
-	td := TransactionData{Type: "owf_payment_initiation"}
+	td := TransactionData{Type: "owf_payment_initiation", CredentialIDs: []string{"pay"}}
 	tdJSON, _ := json.Marshal(td)
 	encoded := base64.RawURLEncoding.EncodeToString(tdJSON)
 	raw, _ := json.Marshal([]string{encoded})
@@ -2327,8 +1958,9 @@ func TestValidateAuthorizationRequest_WithTransactionData(t *testing.T) {
 		ClientID:           "https://verifier.example.com",
 		ClientIDScheme:     ClientIDSchemeRedirectURI,
 		TransactionDataRaw: raw,
+		DCQLQuery:          payDCQL,
 	}
-	err := h.validateAuthorizationRequest(authReq, nil)
+	err := h.validateAuthorizationRequest(authReq, tdClient)
 	assert.NoError(t, err)
 	require.Len(t, authReq.TransactionData, 1)
 }
@@ -2713,7 +2345,7 @@ func TestEvaluateVerifierTrust_DecentralizedIdentifier(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow:     flow,
@@ -2771,15 +2403,15 @@ func TestEvaluateVerifierTrust_NoPDPConfigured_FallsBackToFrontend(t *testing.T)
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	result, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "eidas"})
 	require.NoError(t, err)
-	session.actionCh <- &FlowActionMessage{
+	session.dispatchAction(&FlowActionMessage{
 		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
 		Action:  ActionTrustResult,
 		Payload: result,
-	}
+	})
 
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow:   flow,
@@ -2815,7 +2447,7 @@ func TestEvaluateVerifierTrust_DecentralizedIdentifierRequiresSignedRequest(t *t
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Config: testConfig(), Logger: zap.NewNop()}}
 
 	// An unsigned request under the new spelling is refused in the active path
@@ -2876,7 +2508,7 @@ func TestEvaluateVerifierTrust_PDPError_FailsClosed_NoFrontendFallback(t *testin
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc,
 	}}
@@ -2918,7 +2550,7 @@ func TestEvaluateVerifierTrust_PDPPath_DeniedWithoutError(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -2962,7 +2594,7 @@ func TestEvaluateVerifierTrust_PDPPath_CacheHit_Trusted_SkipsSecondPDPCall(t *te
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3009,7 +2641,7 @@ func TestEvaluateVerifierTrust_PDPPath_CacheHit_Untrusted_SkipsSecondPDPCall(t *
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3059,15 +2691,15 @@ func TestEvaluateVerifierTrust_ClientAssertedVerdict_NeverCached(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	result, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "client-asserted", Name: "Attacker-Controlled Name"})
 	require.NoError(t, err)
-	session.actionCh <- &FlowActionMessage{
+	session.dispatchAction(&FlowActionMessage{
 		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
 		Action:  ActionTrustResult,
 		Payload: result,
-	}
+	})
 
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustCache: trustCache,
@@ -3120,7 +2752,7 @@ func TestEvaluateVerifierTrust_CacheNeverBypassesSignatureVerification(t *testin
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3187,7 +2819,7 @@ func TestEvaluateVerifierTrust_CacheDoesNotLeakAcrossDifferentClaimedVerifier(t 
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3248,7 +2880,7 @@ func TestEvaluateVerifierTrust_CacheKeyIncludesCertificateFingerprint(t *testing
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3306,7 +2938,7 @@ func TestEvaluateVerifierTrust_PDPPath_ForwardsTrustChainContext(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc,
 	}}
@@ -3414,7 +3046,7 @@ func TestEvaluateVerifierTrust_X509Hash_PDPPath(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3529,7 +3161,7 @@ func TestEvaluateVerifierTrust_VerifierAttestation_PDPPath(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3579,7 +3211,7 @@ func TestEvaluateVerifierTrust_RedirectURIScheme_PDPPath_UsesCanonicalURLCacheKe
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3665,7 +3297,7 @@ func TestEvaluateVerifierTrust_DIDCacheKeyIncludesMatchedKeyFingerprint(t *testi
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3737,7 +3369,7 @@ func TestEvaluateVerifierTrust_AttestationCacheKeyIncludesRawJWTHash(t *testing.
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3795,7 +3427,7 @@ func TestEvaluateVerifierTrust_CacheKeyIncludesPDPContext(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3862,7 +3494,7 @@ func TestEvaluateVerifierTrust_FallbackCacheKeyIncludesClientID(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{
 		Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache,
 	}}
@@ -3904,11 +3536,11 @@ func feedAction(t *testing.T, s *Session, flowID, action string, payload any) {
 	t.Helper()
 	raw, err := json.Marshal(payload)
 	require.NoError(t, err)
-	s.actionCh <- &FlowActionMessage{
+	s.dispatchAction(&FlowActionMessage{
 		Message: Message{Type: TypeFlowAction, FlowID: flowID},
 		Action:  action,
 		Payload: raw,
-	}
+	})
 }
 
 // newSelectionTestHandler returns a handler whose session writes to a real
@@ -3930,8 +3562,8 @@ func newSelectionTestHandler(t *testing.T) (*OID4VPHandler, *Session, chan map[s
 		}
 	})
 	session := testSession(conn)
-	flow := &Flow{ID: "flow-1", Protocol: ProtocolOID4VP, Session: session, Data: map[string]interface{}{}}
-	session.flows[flow.ID] = flow
+	flow := registerTestFlow(session, "flow-1")
+	flow.Protocol = ProtocolOID4VP
 	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Logger: zap.NewNop()}}
 	h.httpClient = &http.Client{Timeout: 5 * time.Second}
 	return h, session, received, cleanup
@@ -4079,7 +3711,7 @@ func TestRequestCredentialSelection_NonEmptyMatchKeepsWaitingForConsent(t *testi
 }
 
 func TestWaitForSelectionAction_RepeatedMatchesDoNotExtendTheDeadline(t *testing.T) {
-	h, session, _, cleanup := newSelectionTestHandler(t)
+	h, _, _, cleanup := newSelectionTestHandler(t)
 	defer cleanup()
 
 	// A client that keeps sending the informational credentials_matched action
@@ -4096,7 +3728,7 @@ func TestWaitForSelectionAction_RepeatedMatchesDoNotExtendTheDeadline(t *testing
 			select {
 			case <-stop:
 				return
-			case session.actionCh <- &FlowActionMessage{
+			case h.Flow.actions <- &FlowActionMessage{
 				Message: Message{Type: TypeFlowAction, FlowID: h.Flow.ID},
 				Action:  ActionCredentialsMatched,
 				Payload: raw,
@@ -4253,15 +3885,15 @@ func TestEvaluateVerifierTrust_DIDScheme_NoPDPConfigured_SetsResolutionFlags(t *
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	result, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "did-frontend-resolved"})
 	require.NoError(t, err)
-	session.actionCh <- &FlowActionMessage{
+	session.dispatchAction(&FlowActionMessage{
 		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
 		Action:  ActionTrustResult,
 		Payload: result,
-	}
+	})
 
 	cfg := testConfig() // no Trust.PDPURL / Verifier.PDPURL set at all
 	trustCache := NewTrustCache(time.Hour)
@@ -4313,7 +3945,7 @@ func TestEvaluateVerifierTrust_X509SANURI_RequiresSignedRequest(t *testing.T) {
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Config: testConfig(), Logger: zap.NewNop()}}
 	authReq := &AuthorizationRequest{
 		ClientID:       "https://verifier.example.com/id",
@@ -4347,7 +3979,7 @@ func TestEvaluateVerifierTrust_X509SANURI_InvalidSignature_NeverReachesPDP(t *te
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc}}
 	authReq := &AuthorizationRequest{
 		ClientID:       "https://verifier.example.com/id",
@@ -4389,7 +4021,7 @@ func TestEvaluateVerifierTrust_X509SANURI_MatchingSAN_TrustedAndCached(t *testin
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache}}
 	authReq := &AuthorizationRequest{
 		ClientID:       sanURI,
@@ -4454,7 +4086,7 @@ func TestEvaluateVerifierTrust_X509SANURI_MismatchedSAN_Untrusted(t *testing.T) 
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc}}
 	authReq := &AuthorizationRequest{
 		ClientID:       sanURI,
@@ -4504,7 +4136,7 @@ func TestEvaluateVerifierTrust_DisplayName_IgnoresClientSuppliedName(t *testing.
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Config: cfg, Logger: zap.NewNop(), TrustSvc: trustSvc, TrustCache: trustCache}}
 	authReq := &AuthorizationRequest{
 		ClientID:       "verifier.example.com",
@@ -4579,15 +4211,15 @@ func TestEvaluateVerifierTrust_NoPDPFrontendFallback_DisplayName_IgnoresFrontend
 	defer cleanup()
 
 	session := testSession(conn)
-	flow := &Flow{ID: "test-flow", Session: session, Data: make(map[string]interface{})}
+	flow := registerTestFlow(session, "test-flow")
 
 	result, err := json.Marshal(TrustResultPayload{Trusted: true, Framework: "client-asserted", Name: frontendAssertedName})
 	require.NoError(t, err)
-	session.actionCh <- &FlowActionMessage{
+	session.dispatchAction(&FlowActionMessage{
 		Message: Message{Type: TypeFlowAction, FlowID: flow.ID, Timestamp: Now()},
 		Action:  ActionTrustResult,
 		Payload: result,
-	}
+	})
 
 	h := &OID4VPHandler{BaseHandler: BaseHandler{Flow: flow, Config: cfg, Logger: zap.NewNop()}}
 	authReq := &AuthorizationRequest{

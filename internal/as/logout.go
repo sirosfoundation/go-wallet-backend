@@ -1,6 +1,8 @@
 package as
 
 import (
+	"context"
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -29,10 +31,11 @@ func LogoutHandler(store SessionStore, issuer *TokenIssuer, blacklist TokenBlack
 		// subject-binding check below.
 		session, sessErr := store.Get(c.Request.Context(), sessionID)
 
-		// A missing session (nil, nil) is already logged out. Any storage failure
-		// must not be reported as success: keep the cookie so the client can retry.
+		// A missing session (nil, nil, or ErrSessionNotFound from Revoke) is
+		// already logged out. Any other storage failure must not be reported
+		// as success: keep the cookie so the client can retry.
 		revokeErr := store.Revoke(c.Request.Context(), sessionID)
-		if sessErr != nil || (revokeErr != nil && session != nil) {
+		if sessErr != nil || (revokeErr != nil && !errors.Is(revokeErr, ErrSessionNotFound)) {
 			logger.Error("logout: session lookup or revocation failed",
 				zap.String("session_id", sessionID),
 				zap.NamedError("lookup_error", sessErr),
@@ -42,9 +45,15 @@ func LogoutHandler(store SessionStore, issuer *TokenIssuer, blacklist TokenBlack
 			return
 		}
 
+		// A failed jti write is reported, not swallowed: the bearer token may
+		// still be usable, so the cookie is kept - it is the client's only
+		// credential for the retry. (The session itself is already revoked.)
 		if blacklist != nil && session != nil {
 			if bearerToken := extractBearerToken(c); bearerToken != "" {
-				blacklistOwnBearerToken(c, bearerToken, session.UserID, issuer, blacklist, logger)
+				if err := blacklistOwnBearerToken(c.Request.Context(), bearerToken, session.UserID, issuer, blacklist, logger); err != nil {
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to revoke token"})
+					return
+				}
 			}
 		}
 
@@ -54,29 +63,33 @@ func LogoutHandler(store SessionStore, issuer *TokenIssuer, blacklist TokenBlack
 }
 
 // blacklistOwnBearerToken blacklists bearerToken's jti only if its subject matches sessionUserID;
-// a mismatch is logged and ignored, never an error.
-func blacklistOwnBearerToken(c *gin.Context, bearerToken, sessionUserID string, issuer *TokenIssuer, blacklist TokenBlacklistChecker, logger *zap.Logger) {
+// a mismatch is logged and ignored, never an error. A failing blacklist write is returned so the
+// caller can fail closed. The jti entry is never withdrawn: an Add error means "outcome unknown"
+// and the token is being revoked anyway.
+func blacklistOwnBearerToken(ctx context.Context, bearerToken, sessionUserID string, issuer *TokenIssuer, blacklist TokenBlacklistChecker, logger *zap.Logger) error {
 	if issuer == nil {
-		return
+		return nil
 	}
 	// No audience restriction: only sub/jti/exp are needed.
 	claims, err := issuer.ParseAndVerify(bearerToken, nil)
 	if err != nil {
-		return
+		return nil
 	}
 	if claims.Subject != sessionUserID {
 		logger.Warn("logout: presented bearer token belongs to a different user than the session - not blacklisting",
 			zap.String("session_user_id", sessionUserID),
 		)
-		return
+		return nil
 	}
 	if claims.ID == "" {
-		return
+		return nil
 	}
-	if err := blacklist.Add(c.Request.Context(), claims.ID, claims.Expiry.Time()); err != nil {
-		logger.Warn("failed to blacklist token on logout",
+	if err := blacklist.Add(ctx, claims.ID, claims.Expiry.Time()); err != nil {
+		logger.Error("failed to blacklist token on logout",
 			zap.String("jti", claims.ID),
 			zap.Error(err),
 		)
+		return err
 	}
+	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
 	"github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
@@ -26,10 +27,30 @@ type Services struct {
 	Helper           *HelperService
 	WalletProvider   *WalletProviderService
 	WIA              *WIAService
+	Status           *StatusService // verified Token Status List API; nil when status_check.enabled is false
 	FIDO2Attestation *FIDO2AttestationService
 	TokenBlacklist   *TokenBlacklist
 	ChallengeCleanup *ChallengeCleanupWorker
 	AAGUIDValidator  *AAGUIDValidator
+}
+
+// registerAppAttestAssertionVerifier registers the App Attest assertion
+// verifier. App Attest assertions as instance-key evidence need the stored
+// attested keys, so they exist only where native attestation does.
+func registerAppAttestAssertionVerifier(cfg *config.Config, store storage.Store, wiaSvc *WIAService, keyChecker *instanceKeyChecker, logger *zap.Logger) {
+	nat := cfg.WalletProvider.Attestation.NativeAttestation
+	if !nat.Enabled || nat.AppleAppID == "" || store.AppAttestKeys() == nil {
+		return
+	}
+	v, err := NewAppAttestAssertionVerifier(store.AppAttestKeys(), nat.AppleAppID, nat.AppleAppAttestEnvironment, logger)
+	if err != nil {
+		logger.Warn("app_attest_assertion key attestation is not available", zap.Error(err))
+		return
+	}
+	wiaSvc.RegisterInstanceKeyVerifier(v)
+	// Stored assertion evidence is re-checked against its App Attest key on
+	// every use (revocation, configuration).
+	keyChecker.register(v)
 }
 
 // NewServices creates a new Services instance
@@ -51,6 +72,27 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	}
 
 	wpSvc := NewWalletProviderService(cfg, logger, store.WalletInstances(), store.KeyAttestations())
+	fido2Svc := NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), engine.NewTrustService(cfg, logger), logger)
+	// The assurance preview runs the same FIDO2 verifier in dry-run.
+	wpSvc.SetFIDO2Verifier(fido2Svc)
+	// One re-check of stored instance-key evidence (revocation, expiry) is
+	// shared by the WIA path and the assurance preview.
+	androidVerifier := newAndroidKeyVerifierForServer(cfg, logger)
+	keyChecker := newInstanceKeyChecker(logger)
+	keyChecker.register(androidVerifier)
+	wpSvc.SetInstanceKeyChecker(keyChecker)
+	var assessor *assurance.Assessor
+	if cfg.WalletProvider.Attestation.Assurance.Enabled {
+		// cmd/server refuses to start on a bad policy (assurance.CheckConfig);
+		// if one still fails to load here, Key Attestation fails closed
+		// (ErrAssuranceUnavailable) rather than using another procedure.
+		if a, err := assurance.NewFromConfig(cfg.WalletProvider.Attestation.Assurance, logger); err != nil {
+			logger.Error("assurance policy failed to load; key attestation and WIA will fail closed", zap.Error(err))
+		} else {
+			assessor = a
+			wpSvc.SetAssessor(assessor)
+		}
+	}
 
 	// WIA shares the same signing key as the wallet provider. Uses
 	// HasSigningKey (not IsSupported) because "ietf"-mode WIA only needs a
@@ -76,6 +118,13 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		// audited whenever cfg.Audit is enabled, consistent with admin-API auditing.
 		wiaAuditor := audit.NewFromConfig(cfg, logger)
 		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain, store.WalletInstances(), wiaAuditor, challengeStore)
+		wiaSvc.SetAssessor(assessor)
+		wiaSvc.SetKeyAttestations(store.KeyAttestations())
+		wiaSvc.SetAppAttestKeys(store.AppAttestKeys())
+		registerAppAttestAssertionVerifier(cfg, store, wiaSvc, keyChecker, logger)
+		// Instance-key evidence verifiers, one line per key_attestation type.
+		wiaSvc.RegisterInstanceKeyVerifier(androidVerifier)
+		wiaSvc.SetInstanceKeyChecker(keyChecker)
 		// A signing key alone is enough to construct WIAService, but "etsi"
 		// mode additionally requires a certificate chain (see IsSupported).
 		// Leaving wiaSvc non-nil here would register the WIA routes, but
@@ -89,13 +138,22 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	}
 
 	userSvc := NewUserService(store, cfg, logger)
-	tokenBlacklist := NewTokenBlacklist(cfg.Security.TokenBlacklist, logger)
+	revocationStore, err := NewRevocationStore(context.Background(), cfg.Security.TokenBlacklist, store, logger)
+	if err != nil {
+		// Never fall back to memory on a configured shared store: every
+		// revocation operation fails (and so refuses) until restart.
+		logger.Error("Token revocation store unavailable; authenticated requests will be refused", zap.Error(err))
+		revocationStore = unavailableRevocationStore{err: err}
+	}
+	tokenBlacklist := NewTokenBlacklistWithStore(cfg.Security.TokenBlacklist, logger, revocationStore)
 	// Wire the blacklist into UserService so DeleteUser can revoke all of a
 	// deleted user's previously-issued tokens (#383), mirroring the
 	// SetSessionCleaner pattern below - but wired here, rather than by an
 	// external caller like cmd/server/main.go does for SetSessionCleaner,
 	// since both objects are already owned by this constructor.
 	userSvc.SetTokenBlacklist(tokenBlacklist)
+	trustSvc := engine.NewTrustService(cfg, logger)
+
 	return &Services{
 		User:             userSvc,
 		Tenant:           NewTenantService(store, logger),
@@ -109,7 +167,8 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		Helper:           NewHelperService(logger, cfg.HTTPClient),
 		WalletProvider:   wpSvc,
 		WIA:              wiaSvc,
-		FIDO2Attestation: NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), engine.NewTrustService(cfg, logger), logger),
+		Status:           NewStatusService(cfg, trustSvc, logger.Named("status")),
+		FIDO2Attestation: fido2Svc,
 		TokenBlacklist:   tokenBlacklist,
 		ChallengeCleanup: NewChallengeCleanupWorker(cfg.Security.ChallengeCleanup, store, logger),
 		AAGUIDValidator:  aaguidValidator,

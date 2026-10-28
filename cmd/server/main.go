@@ -13,6 +13,7 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
 	"github.com/sirosfoundation/go-wallet-backend/internal/server"
@@ -104,6 +105,17 @@ func main() {
 	if registryCfg != nil {
 		for _, w := range registryCfg.Warnings() {
 			logger.Warn(w)
+		}
+	}
+
+	// Fail closed at startup on a bad assurance policy (missing/invalid rules
+	// file, lint errors) instead of discovering it on the first KA request.
+	if backendCfg != nil {
+		if err := assurance.CheckConfig(backendCfg.WalletProvider.Attestation.Assurance); err != nil {
+			logger.Fatal("Invalid assurance policy", zap.Error(err))
+		}
+		if err := service.CheckAndroidKeyAttestationConfig(backendCfg.WalletProvider.Attestation.AndroidKeyAttestation); err != nil {
+			logger.Fatal("Invalid android key attestation configuration", zap.Error(err))
 		}
 	}
 
@@ -238,6 +250,25 @@ func main() {
 		resources = append(resources, backendProvider)
 	}
 
+	// Engine and registry processes without the backend role have no storage
+	// of their own: give them the shared revocation store so they reject what
+	// the backend replicas revoked.
+	var sharedBlacklist *server.SharedBlacklist
+	if backendProvider == nil && (roles.Has(modes.RoleEngine) || roles.Has(modes.RoleRegistry)) {
+		revCfg := backendCfg
+		if revCfg == nil {
+			revCfg = registryCfg
+		}
+		var err error
+		sharedBlacklist, err = server.NewSharedBlacklist(context.Background(), revCfg, logger)
+		if err != nil {
+			logger.Fatal("Failed to set up the shared token revocation store", zap.Error(err))
+		}
+		if sharedBlacklist != nil {
+			resources = append(resources, sharedBlacklist)
+		}
+	}
+
 	var registryProvider *server.RegistryProvider
 	if roles.Has(modes.RoleRegistry) {
 		provider, err := server.NewRegistryProvider(registryCfg, logger)
@@ -251,6 +282,8 @@ func main() {
 		if backendProvider != nil {
 			provider.SetTenantLookup(backendProvider.Store().Tenants())
 			provider.SetTokenBlacklist(backendProvider.Services().TokenBlacklist)
+		} else if sharedBlacklist != nil {
+			provider.SetTokenBlacklist(sharedBlacklist)
 		}
 		registryProvider = provider
 		mgr.AddProvider(provider)
@@ -293,7 +326,11 @@ func main() {
 		}
 		// Standalone engine: a JWKS-backed validator is the only way to authenticate handshakes.
 		if backendProvider == nil {
-			sv, err := server.NewStandaloneEngineTokenValidator(backendCfg, logger)
+			var rev *service.TokenBlacklist
+			if sharedBlacklist != nil {
+				rev = sharedBlacklist.TokenBlacklist
+			}
+			sv, err := server.NewStandaloneEngineTokenValidator(backendCfg, logger, rev)
 			if err != nil {
 				logger.Fatal("Failed to create standalone engine token validator", zap.Error(err))
 			}
@@ -308,6 +345,8 @@ func main() {
 		// EngineProvider.SetTokenBlacklist.
 		if backendProvider != nil {
 			provider.SetTokenBlacklist(backendProvider.Services().TokenBlacklist)
+		} else if sharedBlacklist != nil {
+			provider.SetTokenBlacklist(sharedBlacklist)
 		}
 		mgr.AddProvider(provider)
 		engineProvider = provider

@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"strings"
@@ -36,6 +37,7 @@ type Config struct {
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
 	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
 	Presentation   PresentationConfig   `yaml:"presentation" envconfig:"PRESENTATION"`
+	StatusCheck    StatusCheckConfig    `yaml:"status_check" envconfig:"STATUS_CHECK"`
 
 	// Registry configures the VCTM registry role (--mode=registry). It
 	// replaces the retired standalone registry configuration file
@@ -418,6 +420,76 @@ type PresentationConfig struct {
 	DCQLConsentCheck DCQLConsentCheckMode `yaml:"dcql_consent_check" envconfig:"DCQL_CONSENT_CHECK"`
 }
 
+// Limits of the verified status list API (StatusCheckConfig).
+const (
+	// DefaultStatusMaxListsPerRequest is the default cap on lists per request.
+	DefaultStatusMaxListsPerRequest = 20
+	// DefaultStatusRequestTimeoutSeconds is the default per-request deadline.
+	DefaultStatusRequestTimeoutSeconds = 8
+	// MaxStatusRequestTimeoutSeconds is the largest accepted per-request
+	// deadline (the HTTP WriteTimeout is 15 s).
+	MaxStatusRequestTimeoutSeconds = 12
+	// DefaultStatusMaxListBytes is the default cap on one compressed `lst` (2 MiB).
+	DefaultStatusMaxListBytes = 2 << 20
+)
+
+// StatusCheckConfig configures the verified Token Status List API
+// (POST /status/v1/lists) and its verifier; see
+// docs/adr/013-status-checking-outside-the-engine.md.
+type StatusCheckConfig struct {
+	// Enabled turns the API on; when false the route answers 503
+	// STATUS_NOT_SUPPORTED. Default: true. Status list URIs are chosen by the
+	// caller, so lists are fetched like any other untrusted URL, under the
+	// http_client policy: HTTPS only and no private, loopback, link-local or
+	// cloud-metadata addresses unless http_client.allow_http or
+	// http_client.allow_private_ips (or insecure_skip_verify) is set, e.g. for
+	// a local test issuer. Fetched lists are always signature-verified and
+	// their signer trust-evaluated. Env: WALLET_STATUS_CHECK_ENABLED
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// StatusListSignerFallback: when go-trust errors on the `status-list-signer`
+	// evaluation and this is true (default), ask once more as
+	// `credential-issuer`; when false the list is undetermined
+	// (trust_unavailable). A genuine negative never falls back.
+	// Env: WALLET_STATUS_CHECK_STATUS_LIST_SIGNER_FALLBACK
+	StatusListSignerFallback bool `yaml:"status_list_signer_fallback" envconfig:"STATUS_LIST_SIGNER_FALLBACK"`
+
+	// StatusListMinEntries rejects a list with fewer entries once inflated
+	// (bytes*8/bits) as undetermined (list_too_small). Default 0: no minimum,
+	// as the draft sets none; set e.g. 131072 only if every status issuer you
+	// rely on publishes at least that. Must not be negative.
+	// Env: WALLET_STATUS_CHECK_STATUS_LIST_MIN_ENTRIES
+	StatusListMinEntries int `yaml:"status_list_min_entries" envconfig:"STATUS_LIST_MIN_ENTRIES"`
+
+	// StatusListMaxConcurrentLoads bounds concurrent list fetch-and-inflate
+	// loads across all requests; each can hold up to 36 MiB, which the cache
+	// limit does not cover. A request waiting for a slot gives up at its
+	// deadline (budget_exhausted). 0 (default) means 8. Must not be negative.
+	// Env: WALLET_STATUS_CHECK_STATUS_LIST_MAX_CONCURRENT_LOADS
+	StatusListMaxConcurrentLoads int `yaml:"status_list_max_concurrent_loads" envconfig:"STATUS_LIST_MAX_CONCURRENT_LOADS"`
+
+	// MaxListsPerRequest caps the lists per request (over it: 400
+	// TOO_MANY_URIS). Clients should ask for 1-3 to limit what the server
+	// learns. 0 (default) means 20.
+	// Env: WALLET_STATUS_CHECK_MAX_LISTS_PER_REQUEST
+	MaxListsPerRequest int `yaml:"max_lists_per_request" envconfig:"MAX_LISTS_PER_REQUEST"`
+
+	// RequestTimeoutSeconds is the deadline of one request, covering all its
+	// lists; unfinished lists are undetermined (budget_exhausted). Must stay
+	// under the 15 s HTTP write timeout. 0 (default) means 8; at most 12.
+	// Env: WALLET_STATUS_CHECK_REQUEST_TIMEOUT_SECONDS
+	RequestTimeoutSeconds int `yaml:"request_timeout_seconds" envconfig:"REQUEST_TIMEOUT_SECONDS"`
+
+	// MaxListBytes caps one returned compressed `lst`; a larger list is
+	// undetermined (too_large). 0 (default) means 2097152 (2 MiB). Must not be
+	// negative.
+	// Env: WALLET_STATUS_CHECK_MAX_LIST_BYTES
+	MaxListBytes int `yaml:"max_list_bytes" envconfig:"MAX_LIST_BYTES"`
+
+	// RateLimit caps API requests per authenticated caller (user, else tenant) per window.
+	RateLimit AuthRateLimitConfig `yaml:"rate_limit" envconfig:"RATE_LIMIT"`
+}
+
 // HTTPClientConfig contains HTTP client configuration for outbound requests
 type HTTPClientConfig struct {
 	// ProxyURL is the URL of the HTTP proxy for egress requests (e.g., http://proxy:8080)
@@ -434,7 +506,8 @@ type HTTPClientConfig struct {
 	AllowPrivateIPs bool `yaml:"allow_private_ips" envconfig:"ALLOW_PRIVATE_IPS"`
 	// AllowHTTP permits non-TLS (plain HTTP) for every fetch that goes through
 	// the client this configuration builds - request objects, issuer and
-	// verifier metadata, JWKS, logos, registry and proxy calls - not only for
+	// verifier metadata, JWKS, logos, registry and proxy calls and Token Status
+	// List fetches (status_check) - not only for
 	// metadata resolution, which was its scope while the resolver was the sole
 	// consumer. Code that builds its own client rather than taking this one is
 	// not governed by it; see NewHTTPClient for which paths those are.
@@ -468,6 +541,14 @@ type HTTPClientConfig struct {
 	// AuthZEN proxy URL resolution) and the engine role build. The registry
 	// role builds no resolver and ignores the field.
 	MetadataType string `yaml:"metadata_type" envconfig:"METADATA_TYPE"`
+
+	// MetadataCacheDisabled turns off caching of OpenID4VCI issuer metadata,
+	// so every resolution fetches it afresh. This covers the issuer-metadata
+	// resolvers (engine and AuthZEN proxy) and the backend's
+	// GET /issuer/:id/metadata endpoint cache. Useful for testing scenarios
+	// where the same issuer URL is reused with different metadata.
+	// Env: WALLET_HTTP_CLIENT_METADATA_CACHE_DISABLED
+	MetadataCacheDisabled bool `yaml:"metadata_cache_disabled" envconfig:"METADATA_CACHE_DISABLED"`
 
 	// TrustedIdPHosts lists hostnames of operator-configured OIDC identity
 	// providers that may resolve to private/loopback/link-local addresses.
@@ -558,10 +639,12 @@ func (c HTTPClientConfig) newHTTPClient(timeoutOverride time.Duration, trustedHo
 		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true} //nolint:gosec
 	}
 
+	var proxyAddr string
 	if c.ProxyURL != "" {
 		proxyURL, err := url.Parse(c.ProxyURL)
 		if err == nil {
 			transport.Proxy = http.ProxyURL(proxyURL)
+			proxyAddr = proxyDialAddr(proxyURL)
 		}
 	}
 
@@ -572,7 +655,18 @@ func (c HTTPClientConfig) newHTTPClient(timeoutOverride time.Duration, trustedHo
 			Timeout:   10 * time.Second,
 			KeepAlive: 30 * time.Second,
 		}
-		transport.DialContext = guardedDial(defaultLookupIP, baseDialer.DialContext, trustedHosts)
+		guarded := guardedDial(defaultLookupIP, baseDialer.DialContext, trustedHosts)
+		transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// The operator-configured proxy is authorised by configuration and
+			// may sit on a private network; every other address is a
+			// destination a counterparty chose and stays guarded. Destinations
+			// reached through the proxy are checked by ssrfGuard below, since
+			// this dialer only sees the proxy.
+			if proxyAddr != "" && strings.EqualFold(addr, proxyAddr) {
+				return baseDialer.DialContext(ctx, network, addr)
+			}
+			return guarded(ctx, network, addr)
+		}
 		roundTripper = ssrfGuard{
 			base:      transport,
 			proxy:     transport.Proxy,
@@ -586,6 +680,23 @@ func (c HTTPClientConfig) newHTTPClient(timeoutOverride time.Duration, trustedHo
 		Timeout:   timeout,
 		Transport: roundTripper,
 	}
+}
+
+// proxyDialAddr is the host:port net/http dials for proxyURL, with the
+// scheme's default port filled in.
+func proxyDialAddr(u *url.URL) string {
+	port := u.Port()
+	if port == "" {
+		switch u.Scheme {
+		case "https":
+			port = "443"
+		case "socks5", "socks5h":
+			port = "1080"
+		default:
+			port = "80"
+		}
+	}
+	return net.JoinHostPort(u.Hostname(), port)
 }
 
 // GuardedDialContext returns a dial function applying the same address policy
@@ -796,12 +907,18 @@ func checkAddressesFor(host string, ips []net.IP, trusted map[string]struct{}) e
 		return fmt.Errorf("no addresses found for %s", host)
 	}
 	for _, ip := range ips {
-		// Block cloud metadata endpoints (169.254.169.254, fd00::1)
-		// before the generic private/link-local check for a clearer message.
-		if ip.Equal(net.ParseIP("169.254.169.254")) || ip.Equal(net.ParseIP("fd00::1")) {
+		// A well-known NAT64 address is only a wrapper: the gateway connects
+		// to the embedded IPv4 address, so that is the destination to judge.
+		// Rejecting the whole prefix would also refuse every public IPv4-only
+		// host on a DNS64 network.
+		if embedded, ok := nat64Embedded(ip); ok {
+			ip = embedded
+		}
+		// Block cloud metadata endpoints before the generic private/link-local check for a clearer message.
+		if isMetadataAddr(ip) {
 			return fmt.Errorf("connection to cloud metadata endpoint %s (%s) is not allowed", host, ip)
 		}
-		if !isTrusted && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()) {
+		if !isTrusted && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || inInternalRange(ip)) {
 			return fmt.Errorf("connection to %s (%s) is not allowed: private/loopback address", host, ip)
 		}
 		// 0.0.0.0 / :: name no real destination, but connect() on Linux (and
@@ -813,6 +930,90 @@ func checkAddressesFor(host string, ips []net.IP, trusted map[string]struct{}) e
 		}
 	}
 	return nil
+}
+
+// v4 and v6 build addresses from numeric components, so the policy tables
+// below read as data rather than as address literals.
+func v4(a, b, c, d byte) netip.Addr { return netip.AddrFrom4([4]byte{a, b, c, d}) }
+
+func v6(groups ...uint16) netip.Addr {
+	var raw [16]byte
+	for i, g := range groups {
+		raw[2*i], raw[2*i+1] = byte(g>>8), byte(g)
+	}
+	return netip.AddrFrom16(raw)
+}
+
+// metadataAddrs are the cloud instance-metadata endpoints, named separately
+// from the generic ranges so the refusal says which rule was hit: the
+// link-local endpoint used by AWS, GCP, Azure and others; the IPv6 unique-local
+// endpoint used by AWS; Alibaba Cloud's endpoint in shared address space; and
+// Oracle Cloud's endpoint in the IETF protocol-assignment block.
+var metadataAddrs = []netip.Addr{
+	v4(169, 254, 169, 254),
+	v6(0xfd00, 0, 0, 0, 0, 0, 0, 1),
+	v4(100, 100, 100, 200),
+	v4(192, 0, 0, 192),
+}
+
+func isMetadataAddr(ip net.IP) bool {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, m := range metadataAddrs {
+		if addr == m {
+			return true
+		}
+	}
+	return false
+}
+
+// internalRanges are non-global blocks that net.IP's predicates do not cover
+// but that reach a deployment's own network:
+//   - shared address space (RFC 6598, CGNAT), also used by overlay VPNs and
+//     Alibaba's metadata service
+//   - IETF protocol assignments (RFC 6890), which hold Oracle's metadata service
+//   - benchmarking space (RFC 2544)
+//   - the NAT64 local-use prefix (RFC 8215), which is operator-internal by
+//     definition and whose embedded address layout depends on the prefix
+//     length, so it is refused outright rather than decoded. The well-known
+//     prefix 64:ff9b::/96 (RFC 6052) is not listed: nat64Embedded unwraps it
+//     and the embedded IPv4 address is judged instead.
+var internalRanges = []netip.Prefix{
+	netip.PrefixFrom(v4(100, 64, 0, 0), 10),
+	netip.PrefixFrom(v4(192, 0, 0, 0), 24),
+	netip.PrefixFrom(v4(198, 18, 0, 0), 15),
+	netip.PrefixFrom(v6(0x64, 0xff9b, 1), 48),
+}
+
+var nat64WellKnown = netip.PrefixFrom(v6(0x64, 0xff9b), 96)
+
+// nat64Embedded returns the IPv4 address carried by an address in the NAT64
+// well-known prefix 64:ff9b::/96 (RFC 6052), where it occupies the last four
+// bytes.
+func nat64Embedded(ip net.IP) (net.IP, bool) {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok || addr.Is4() || addr.Is4In6() || !nat64WellKnown.Contains(addr) {
+		return nil, false
+	}
+	b := addr.As16()
+	return net.IPv4(b[12], b[13], b[14], b[15]), true
+}
+
+func inInternalRange(ip net.IP) bool {
+	addr, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return false
+	}
+	addr = addr.Unmap()
+	for _, p := range internalRanges {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
 }
 
 // ssrfGuard is the half of the protection that has to sit above the transport
@@ -1038,6 +1239,9 @@ type CORSConfig struct {
 	AllowedHeaders []string `yaml:"allowed_headers" envconfig:"ALLOWED_HEADERS"`
 
 	// ExposedHeaders is a list of headers that browsers are allowed to access.
+	// Default: X-Private-Data-ETag and Retry-After (sent with every 429). An
+	// explicit list replaces the defaults, so it must keep Retry-After for
+	// cross-origin clients to read it.
 	ExposedHeaders []string `yaml:"exposed_headers" envconfig:"EXPOSED_HEADERS"`
 
 	// AllowCredentials indicates whether the request can include credentials.
@@ -1078,12 +1282,15 @@ var RequiredCORSAllowedHeaders = []string{"If-None-Match", "X-Private-Data-If-Ma
 var RequiredCORSExposedHeaders = []string{"X-Private-Data-ETag"}
 
 // appendMissingHeaders appends each required header not already present
-// (case-insensitive, as HTTP header names are).
+// (case-insensitive, as HTTP header names are). A "*" entry does not count as
+// presence: under credentialed CORS a "*" in Access-Control-Allow-Headers or
+// Access-Control-Expose-Headers is a literal header name, not a wildcard, so
+// the required names must be listed explicitly.
 func appendMissingHeaders(headers []string, required []string) []string {
 	for _, r := range required {
 		found := false
 		for _, h := range headers {
-			if strings.EqualFold(strings.TrimSpace(h), r) || strings.TrimSpace(h) == "*" {
+			if strings.EqualFold(strings.TrimSpace(h), r) {
 				found = true
 				break
 			}
@@ -1112,7 +1319,7 @@ func (c *CORSConfig) SetDefaults() {
 		}
 	}
 	if len(c.ExposedHeaders) == 0 {
-		c.ExposedHeaders = []string{"X-Private-Data-ETag"}
+		c.ExposedHeaders = []string{"X-Private-Data-ETag", "Retry-After"}
 	}
 	c.AllowedHeaders = appendMissingHeaders(c.AllowedHeaders, RequiredCORSAllowedHeaders)
 	c.ExposedHeaders = appendMissingHeaders(c.ExposedHeaders, RequiredCORSExposedHeaders)
@@ -1313,9 +1520,19 @@ type AttestationConfig struct {
 	// FIDO2AttestationService.
 	FIDO2Attestation FIDO2AttestationConfig `yaml:"fido2_attestation" envconfig:"FIDO2_ATTESTATION"`
 
+	// AndroidKeyAttestation controls verification of Android Key Attestation
+	// chains submitted as evidence about the WIA instance key
+	// (key_attestation type android_key). Nothing is trusted by default.
+	AndroidKeyAttestation AndroidKeyAttestationConfig `yaml:"android_key_attestation" envconfig:"ANDROID_KEY_ATTESTATION"`
+
 	// StatusList controls the Token Status List references embedded in the
 	// WIA (`client_status`) and KA (`key_storage_status`).
 	StatusList StatusListConfig `yaml:"status_list" envconfig:"STATUS_LIST"`
+
+	// Assurance is the backend-owned assurance policy deciding the KA's
+	// key_storage / user_authentication / certification values. Off by
+	// default; see AssuranceConfig.
+	Assurance AssuranceConfig `yaml:"assurance" envconfig:"ASSURANCE"`
 }
 
 // StatusListRefMinMaintenanceSeconds is the floor CS-04 §7.2.2 (TS-03
@@ -1377,6 +1594,127 @@ type FIDO2AttestationConfig struct {
 	// endpoint accepts and verifies attestation objects. Off by default —
 	// like NativeAttestation, this is an explicit opt-in trust decision.
 	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+}
+
+// AndroidKeyAttestationConfig controls verification of Android Key
+// Attestation chains (key_attestation type android_key). The verifier ships
+// NO trust anchors and trusts no application: with no trust anchors, or no
+// allowed app digests, it records no evidence at all (fail closed), and a
+// wallet then simply has its instance key home "unknown".
+//
+// Get Google's hardware attestation roots from
+// https://android.googleapis.com/attestation/root (a JSON array of PEM
+// certificates: the RSA root and the ECDSA P-384 "Key Attestation CA1" root)
+// and pin them here. Operators review and rotate the list; the backend never
+// fetches trust anchors itself.
+type AndroidKeyAttestationConfig struct {
+	// TrustAnchorsPath is a file of PEM CERTIFICATE blocks: the pinned roots
+	// an attestation chain must end in. Unset and empty TrustAnchorsPEM mean
+	// no anchors, so nothing verifies.
+	TrustAnchorsPath string `yaml:"trust_anchors_path" envconfig:"TRUST_ANCHORS_PATH"`
+
+	// TrustAnchorsPEM is the same list given inline (for example from a
+	// mounted secret exposed as an environment variable). It is added to the
+	// anchors read from TrustAnchorsPath.
+	TrustAnchorsPEM string `yaml:"trust_anchors_pem" envconfig:"TRUST_ANCHORS_PEM"`
+
+	// AllowedAppDigests are the SHA-256 digests (hex, optionally colon
+	// separated) of the signing certificates of the wallet apps whose keys
+	// are accepted. Every digest the chain reports for the app must be on
+	// the list. Empty: no app is accepted.
+	AllowedAppDigests []string `yaml:"allowed_app_digests" envconfig:"ALLOWED_APP_DIGESTS"`
+
+	// AllowedPackages optionally narrows the accepted Android package names.
+	// Empty: any package whose signing digests are allowed.
+	AllowedPackages []string `yaml:"allowed_packages" envconfig:"ALLOWED_PACKAGES"`
+
+	// StatusListURL is Google's attestation revocation list. Default
+	// https://android.googleapis.com/attestation/status.
+	StatusListURL string `yaml:"status_list_url" envconfig:"STATUS_LIST_URL"`
+
+	// StatusListDefaultTTLSeconds is how long a fetched list is trusted when
+	// the response carries no Cache-Control max-age. Default 3600. The list
+	// is never used past its freshness: when it has expired and cannot be
+	// fetched, evidence is refused (fail closed).
+	StatusListDefaultTTLSeconds int `yaml:"status_list_default_ttl_seconds" envconfig:"STATUS_LIST_DEFAULT_TTL_SECONDS"`
+
+	// Enforcement says what happens to evidence that is well formed but does
+	// not qualify (no trust anchors or app digests configured, a chain that
+	// does not end in a pinned anchor, a software security level, a key not
+	// generated in the keystore, no SIGN purpose, an app that is not allowed,
+	// and the boot-state requirements below):
+	//
+	//	ignore (default)  the WIA issues and the instance key home stays
+	//	                  unknown; a metric and a log line record the reason.
+	//	reject            the request fails with 400 KEY_ATTESTATION_NOT_QUALIFYING
+	//	                  and a machine-readable reason; nothing is recorded.
+	//
+	// Evidence that is invalid (malformed, wrong key or challenge, revoked) is
+	// always refused whatever this says.
+	Enforcement string `yaml:"enforcement" envconfig:"ENFORCEMENT"`
+
+	// RequireVerifiedBoot, in reject mode, requires the attested verified
+	// boot state to be "verified". Unset means true; set false to switch it
+	// off. Ignored in ignore mode (the state is recorded either way).
+	RequireVerifiedBoot *bool `yaml:"require_verified_boot" envconfig:"REQUIRE_VERIFIED_BOOT"`
+
+	// RequireLockedBootloader, in reject mode, requires the attested
+	// bootloader to be locked. Unset means true; set false to switch it off.
+	RequireLockedBootloader *bool `yaml:"require_locked_bootloader" envconfig:"REQUIRE_LOCKED_BOOTLOADER"`
+
+	// MinPatchLevel, in reject mode, is the oldest accepted OS patch level as
+	// YYYYMM (for example 202601). 0 (default) means no requirement.
+	MinPatchLevel int `yaml:"min_patch_level" envconfig:"MIN_PATCH_LEVEL"`
+}
+
+// Android key attestation enforcement modes.
+const (
+	AndroidEnforcementIgnore = "ignore"
+	AndroidEnforcementReject = "reject"
+)
+
+// Rejecting reports whether non-qualifying evidence is refused.
+func (c AndroidKeyAttestationConfig) Rejecting() bool {
+	return c.Enforcement == AndroidEnforcementReject
+}
+
+// VerifiedBootRequired reports whether reject mode requires a verified boot
+// state (default true).
+func (c AndroidKeyAttestationConfig) VerifiedBootRequired() bool {
+	return c.RequireVerifiedBoot == nil || *c.RequireVerifiedBoot
+}
+
+// LockedBootloaderRequired reports whether reject mode requires a locked
+// bootloader (default true).
+func (c AndroidKeyAttestationConfig) LockedBootloaderRequired() bool {
+	return c.RequireLockedBootloader == nil || *c.RequireLockedBootloader
+}
+
+// Validate checks the enforcement settings. Reject mode with no trust anchors
+// or no allowed app digests could never accept anything and is refused, as is
+// an unknown mode or a malformed patch level. (The anchors themselves are
+// parsed by the service at startup.)
+func (c AndroidKeyAttestationConfig) Validate() error {
+	const p = "wallet_provider.attestation.android_key_attestation"
+	switch c.Enforcement {
+	case "", AndroidEnforcementIgnore:
+	case AndroidEnforcementReject:
+		if c.TrustAnchorsPath == "" && strings.TrimSpace(c.TrustAnchorsPEM) == "" {
+			return fmt.Errorf("%s.enforcement=reject needs trust anchors (trust_anchors_path or trust_anchors_pem)", p)
+		}
+		if len(c.AllowedAppDigests) == 0 {
+			return fmt.Errorf("%s.enforcement=reject needs allowed_app_digests", p)
+		}
+	default:
+		return fmt.Errorf("%s.enforcement %q must be %q or %q", p, c.Enforcement, AndroidEnforcementIgnore, AndroidEnforcementReject)
+	}
+	if c.MinPatchLevel != 0 {
+		y, m := c.MinPatchLevel/100, c.MinPatchLevel%100
+		if y < 2000 || y > 9999 || m < 1 || m > 12 {
+			return fmt.Errorf("%s.min_patch_level %d must be YYYYMM (for example 202601) or 0", p, c.MinPatchLevel)
+		}
+	}
+	return nil
 }
 
 // NativeAttestationConfig controls platform-specific attestation verification.
@@ -1932,7 +2270,20 @@ type TokenBlacklistConfig struct {
 	// CleanupIntervalSeconds is how often to clean up expired blacklist entries
 	// Default: 3600 (1 hour)
 	CleanupIntervalSeconds int `yaml:"cleanup_interval_seconds" envconfig:"CLEANUP_INTERVAL_SECONDS"`
+
+	// Backend selects where revoked access-token jtis and revoked users are
+	// kept: "memory" (per process; lost on restart, not seen by other
+	// replicas) or "storage" (the MongoDB storage backend; shared by all
+	// replicas and survives restarts). Empty means "storage" when
+	// storage.type is mongodb and "memory" otherwise.
+	Backend string `yaml:"backend" envconfig:"BACKEND"`
 }
+
+// Token blacklist backends.
+const (
+	TokenBlacklistBackendMemory  = "memory"
+	TokenBlacklistBackendStorage = "storage"
+)
 
 // SetDefaults sets default values for token blacklist
 func (c *TokenBlacklistConfig) SetDefaults() {
@@ -1970,9 +2321,10 @@ func Load(configFile string) (*Config, error) {
 // caller after any deprecated-alias overlay (see ValidateRegistry and
 // ValidateRegistryStandalone).
 func LoadRegistryOnly(configFile string) (*Config, error) {
-	// No secret files are read: the registry validates AS tokens through the JWKS (a deprecated
-	// registry.yaml jwt secret is ignored).
-	return load(configFile, func(*Config) error { return nil }, (*Config).validateRegistryStandaloneServer)
+	// Only the MongoDB password is read, and only when the shared revocation
+	// store is in use: the registry validates AS tokens through the JWKS (a
+	// deprecated registry.yaml jwt secret is ignored).
+	return load(configFile, (*Config).loadRegistrySecrets, (*Config).validateRegistryStandaloneServer)
 }
 
 func load(configFile string, loadSecrets, validate func(*Config) error) (*Config, error) {
@@ -2173,16 +2525,43 @@ func (c *Config) loadSecretsFromFiles() error {
 		}
 	}
 
-	// Load MongoDB password from file and inject into URI
-	if c.Storage.MongoDB.PasswordPath != "" {
-		password, err := readSecretFile(c.Storage.MongoDB.PasswordPath)
-		if err != nil {
-			return fmt.Errorf("storage.mongodb.password_path: %w", err)
-		}
-		// Replace %PASSWORD% placeholder in URI (no-op if not present)
-		c.Storage.MongoDB.URI = strings.Replace(c.Storage.MongoDB.URI, "%PASSWORD%", password, 1)
-	}
+	return c.loadMongoPassword()
+}
 
+// validateTokenBlacklistBackend rejects an unknown revocation backend and the
+// storage backend without MongoDB storage. A typo must not silently turn
+// shared revocations off.
+func (c *Config) validateTokenBlacklistBackend() error {
+	switch c.Security.TokenBlacklist.Backend {
+	case "":
+		// The default follows storage.type, so a typo there would silently
+		// select the per-process blacklist; a registry-only process does not
+		// run the full storage validation.
+		if c.Security.TokenBlacklist.Enabled && c.Storage.Type != "mongodb" && c.Storage.Type != "memory" && c.Storage.Type != "" {
+			return fmt.Errorf("invalid storage.type: %q (must be memory or mongodb); it selects the default token revocation backend", c.Storage.Type)
+		}
+	case TokenBlacklistBackendMemory:
+	case TokenBlacklistBackendStorage:
+		if c.Storage.Type != "mongodb" {
+			return fmt.Errorf("security.token_blacklist.backend=storage requires storage.type=mongodb")
+		}
+	default:
+		return fmt.Errorf("invalid security.token_blacklist.backend: %q (must be memory or storage)", c.Security.TokenBlacklist.Backend)
+	}
+	return nil
+}
+
+// loadMongoPassword reads the MongoDB password file and injects it into the
+// URI's %PASSWORD% placeholder (a no-op if the URI has none).
+func (c *Config) loadMongoPassword() error {
+	if c.Storage.MongoDB.PasswordPath == "" {
+		return nil
+	}
+	password, err := readSecretFile(c.Storage.MongoDB.PasswordPath)
+	if err != nil {
+		return fmt.Errorf("storage.mongodb.password_path: %w", err)
+	}
+	c.Storage.MongoDB.URI = strings.Replace(c.Storage.MongoDB.URI, "%PASSWORD%", password, 1)
 	return nil
 }
 
@@ -2302,6 +2681,19 @@ func defaultConfig() *Config {
 			Timeout:         30,
 		},
 		Presentation: PresentationConfig{DCQLConsentCheck: DCQLConsentCheckWarn},
+		StatusCheck: StatusCheckConfig{
+			Enabled:                  true,
+			StatusListSignerFallback: true,
+			MaxListsPerRequest:       DefaultStatusMaxListsPerRequest,
+			RequestTimeoutSeconds:    DefaultStatusRequestTimeoutSeconds,
+			MaxListBytes:             DefaultStatusMaxListBytes,
+			RateLimit: AuthRateLimitConfig{
+				Enabled:        true,
+				MaxAttempts:    60,
+				WindowSeconds:  60,
+				LockoutSeconds: 60,
+			},
+		},
 		AS: ASConfig{
 			DefaultTokenTTL: 2 * time.Minute,
 		},
@@ -2325,6 +2717,15 @@ func defaultConfig() *Config {
 				// instance. See AttestationConfig's type-level comment.
 				LifetimeSeconds: 300,
 				KAExpirySeconds: 15,
+				Assurance: AssuranceConfig{
+					// Off by default: behaviour is exactly the pre-policy clamp.
+					// Lowering by client claims is on by default once enabled.
+					KeyStorageScheme:                DefaultLevelSchemeID,
+					UserAuthenticationScheme:        DefaultLevelSchemeID,
+					LowerByClaimsKeyStorage:         true,
+					LowerByClaimsUserAuthentication: true,
+					WIAProfileScheme:                DefaultWIAProfileSchemeID,
+				},
 				StatusList: StatusListConfig{
 					// On by default: CS-04 §7.1.2/§7.1.3 require
 					// client_status/key_storage_status on every WUA, and a
@@ -2438,6 +2839,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("sqlite storage is not yet implemented - please use 'memory' or 'mongodb'")
 	default:
 		return fmt.Errorf("invalid storage type: %s (must be memory or mongodb)", c.Storage.Type)
+	}
+
+	if err := c.validateTokenBlacklistBackend(); err != nil {
+		return err
 	}
 
 	if c.Storage.Type == "mongodb" && c.Storage.MongoDB.URI == "" {
@@ -2639,11 +3044,22 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	if err := c.WalletProvider.Attestation.Assurance.Validate(); err != nil {
+		return err
+	}
+
+	if err := c.WalletProvider.Attestation.AndroidKeyAttestation.Validate(); err != nil {
+		return err
+	}
+
 	if _, err := issuermetadata.ParseMetadataType(c.HTTPClient.MetadataType); err != nil {
 		return fmt.Errorf("http_client.metadata_type: %w", err)
 	}
 
 	if err := c.Presentation.DCQLConsentCheck.validate(); err != nil {
+		return err
+	}
+	if err := c.StatusCheck.validate(); err != nil {
 		return err
 	}
 
@@ -2812,6 +3228,26 @@ func containsString(list []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// validate rejects status_check values that would misbehave at runtime.
+func (c StatusCheckConfig) validate() error {
+	if c.StatusListMinEntries < 0 {
+		return fmt.Errorf("invalid status_check.status_list_min_entries %d: must not be negative", c.StatusListMinEntries)
+	}
+	if c.StatusListMaxConcurrentLoads < 0 {
+		return fmt.Errorf("invalid status_check.status_list_max_concurrent_loads %d: must not be negative", c.StatusListMaxConcurrentLoads)
+	}
+	if c.MaxListsPerRequest < 0 {
+		return fmt.Errorf("invalid status_check.max_lists_per_request %d: must not be negative", c.MaxListsPerRequest)
+	}
+	if c.RequestTimeoutSeconds < 0 || c.RequestTimeoutSeconds > MaxStatusRequestTimeoutSeconds {
+		return fmt.Errorf("invalid status_check.request_timeout_seconds %d: must be between 0 and %d (the HTTP write timeout is 15 s)", c.RequestTimeoutSeconds, MaxStatusRequestTimeoutSeconds)
+	}
+	if c.MaxListBytes < 0 {
+		return fmt.Errorf("invalid status_check.max_list_bytes %d: must not be negative", c.MaxListBytes)
+	}
+	return nil
 }
 
 // cloneDefaultTransport returns a private copy of http.DefaultTransport so

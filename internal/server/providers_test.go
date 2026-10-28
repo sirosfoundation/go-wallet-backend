@@ -105,9 +105,14 @@ func (b *memoryBackend) Invites() storage.InviteStore             { return b.sto
 func (b *memoryBackend) WalletInstances() storage.WalletInstanceStore {
 	return b.store.WalletInstances()
 }
+
 func (b *memoryBackend) KeyAttestations() storage.KeyAttestationStore {
 	return b.store.KeyAttestations()
 }
+func (b *memoryBackend) AppAttestKeys() storage.AppAttestKeyStore {
+	return b.store.AppAttestKeys()
+}
+
 func (b *memoryBackend) Ping(ctx context.Context) error { return b.store.Ping(ctx) }
 func (b *memoryBackend) Close() error                   { return b.store.Close() }
 
@@ -365,6 +370,7 @@ func (m *mockBackend) Verifiers() storage.VerifierStore             { return nil
 func (m *mockBackend) Invites() storage.InviteStore                 { return nil }
 func (m *mockBackend) WalletInstances() storage.WalletInstanceStore { return nil }
 func (m *mockBackend) KeyAttestations() storage.KeyAttestationStore { return nil }
+func (m *mockBackend) AppAttestKeys() storage.AppAttestKeyStore     { return nil }
 
 // Verify mockBackend implements backend.Backend
 var _ backend.Backend = (*mockBackend)(nil)
@@ -1369,7 +1375,7 @@ func TestNewBackendProvider_ASEnabled_WiresBlacklistAndRevocation(t *testing.T) 
 	if err := provider.auth.services.TokenBlacklist.Add(ctx, "jti-shared-with-as", time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
-	if !provider.asModule.Blacklist.IsBlacklisted(ctx, "jti-shared-with-as") {
+	if revoked, err := provider.asModule.Blacklist.IsBlacklisted(ctx, "jti-shared-with-as"); err != nil || !revoked {
 		t.Error("expected AS module's Blacklist to share AuthProvider's TokenBlacklist instance")
 	}
 }
@@ -1425,12 +1431,12 @@ func TestEngineProvider_SetTokenBlacklist(t *testing.T) {
 // implementation, just to prove SetTokenBlacklist accepts a real implementer.
 type fakeEngineBlacklistForProviderTest struct{}
 
-func (fakeEngineBlacklistForProviderTest) IsBlacklisted(ctx context.Context, jti string) bool {
-	return false
+func (fakeEngineBlacklistForProviderTest) IsBlacklisted(ctx context.Context, jti string) (bool, error) {
+	return false, nil
 }
 
-func (fakeEngineBlacklistForProviderTest) IsUserRevoked(ctx context.Context, userID string) bool {
-	return false
+func (fakeEngineBlacklistForProviderTest) IsUserRevoked(ctx context.Context, userID string) (bool, error) {
+	return false, nil
 }
 
 // TestNewBackendProvider_WiresASModuleWhenEnabled is a regression test for a
@@ -1644,5 +1650,190 @@ func TestRequireSessionAuthMechanism(t *testing.T) {
 	}
 	if err := requireSessionAuthMechanism(&config.Config{AS: config.ASConfig{Enabled: true}}, "backend"); err != nil {
 		t.Errorf("AS enabled must be accepted: %v", err)
+	}
+}
+
+var errFailingStore = errors.New("store down")
+
+// failingRevocationStore is a service.RevocationStore whose every call fails.
+type failingRevocationStore struct{}
+
+func (failingRevocationStore) Add(context.Context, string, time.Time) error { return errFailingStore }
+func (failingRevocationStore) Has(context.Context, string) (bool, error) {
+	return false, errFailingStore
+}
+func (failingRevocationStore) RevokeUser(context.Context, string) error { return errFailingStore }
+func (failingRevocationStore) IsUserRevoked(context.Context, string) (bool, error) {
+	return false, errFailingStore
+}
+
+// go-tokenauth's Checker has no error return, so a store failure must read
+// as revoked: the Validator then rejects the token.
+func TestBlacklistRevocationChecker_StoreErrorReadsAsRevoked(t *testing.T) {
+	bl := service.NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop(), failingRevocationStore{})
+	checker := blacklistRevocationChecker{blacklist: bl, logger: zap.NewNop()}
+	if !checker.IsRevoked(context.Background(), "jti-1") {
+		t.Error("a store failure must not read as 'not revoked'")
+	}
+	// Without a logger the adapter must still refuse.
+	if !(blacklistRevocationChecker{blacklist: bl}).IsRevoked(context.Background(), "jti-1") {
+		t.Error("a store failure must not read as 'not revoked' (no logger)")
+	}
+}
+
+// A revocation store that failed to initialize refuses every authenticated
+// request until restart, so readiness must not report healthy meanwhile even
+// though the database itself answers its ping.
+func TestBackendProvider_CheckReady_RevocationStoreUnavailable(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := &config.Config{}
+	cfg.Security.TokenBlacklist = config.TokenBlacklistConfig{Enabled: true, Backend: "storage"}
+	store := &mockBackend{healthy: true}
+
+	// mockBackend is not MongoDB, so the "storage" revocation backend cannot
+	// be built and NewServices installs the failing stand-in.
+	provider := &BackendProvider{
+		store:  store,
+		logger: logger,
+		auth:   &AuthProvider{services: service.NewServices(store, cfg, logger)},
+	}
+	err := provider.CheckReady(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "revocation store unavailable") {
+		t.Fatalf("expected revocation store unavailable error, got %v", err)
+	}
+}
+
+// The validator's revocation checker admits an already revoked jti only for
+// the logout call (to complete an interrupted logout); a store failure still
+// rejects there.
+func TestBlacklistRevocationChecker_LogoutCompletionAdmitsRevokedJTIOnly(t *testing.T) {
+	bl := service.NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop())
+	if err := bl.Add(context.Background(), "jti-r", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	checker := blacklistRevocationChecker{blacklist: bl}
+
+	ctx := context.Background()
+	lctx := middleware.WithLogoutCompletion(ctx)
+	if !checker.IsRevoked(ctx, "jti-r") {
+		t.Error("a revoked jti must be rejected outside logout")
+	}
+	if checker.IsRevoked(lctx, "jti-r") {
+		t.Error("a revoked jti must be admitted for the logout call")
+	}
+	failing := service.NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop(), failingRevocationStore{})
+	if !(blacklistRevocationChecker{blacklist: failing}).IsRevoked(lctx, "jti-r") {
+		t.Error("a store failure must still reject the logout call")
+	}
+}
+
+// The isolated wallet-provider authenticates through the same revocation
+// store, so a store that failed to initialize must make it not ready.
+func TestWalletProviderProvider_CheckReady_RevocationStoreUnavailable(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := &config.Config{}
+	cfg.Security.TokenBlacklist = config.TokenBlacklistConfig{Enabled: true, Backend: "storage"}
+	store := &mockBackend{healthy: true}
+
+	p := &WalletProviderProvider{store: store, logger: logger, services: service.NewServices(store, cfg, logger)}
+	err := p.CheckReady(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "revocation store unavailable") {
+		t.Fatalf("expected revocation store unavailable error, got %v", err)
+	}
+
+	cfg.Security.TokenBlacklist.Backend = "memory"
+	p.services = service.NewServices(store, cfg, logger)
+	if err := p.CheckReady(context.Background()); err != nil {
+		t.Fatalf("memory backend must be ready, got %v", err)
+	}
+}
+
+// Manager.AddProvider only registers a readiness check for providers that
+// implement ReadinessCheckProvider.
+var _ ReadinessCheckProvider = (*WalletProviderProvider)(nil)
+
+// =============================================================================
+// /wallet-provider/assurance-preview wiring: registered in both providers with
+// the same authentication, audience and TAC "w" as key-attestation/generate.
+// =============================================================================
+
+func newTestWalletProviderProviderWithValidator(t *testing.T, v *tokenvalidator.Validator) *WalletProviderProvider {
+	t.Helper()
+	store := newTestMemoryBackend(t)
+	logger := zap.NewNop()
+	cfg := minimalTestConfig()
+	services := service.NewServices(store, cfg, logger)
+	return &WalletProviderProvider{
+		cfg:            cfg,
+		logger:         logger,
+		store:          store,
+		handlers:       api.NewHandlers(services, cfg, logger, []string{"wallet-provider"}),
+		services:       services,
+		wiaRateLimiter: middleware.NewAuthRateLimiter(cfg.WalletProvider.WIA.RateLimit, logger),
+		tokenValidator: v,
+	}
+}
+
+func TestAssurancePreviewRoute_RegisteredAndGuardedInBothProviders(t *testing.T) {
+	v, key, issuer := setupServerTokenValidatorTest(t)
+
+	registers := map[string]func(*gin.Engine){
+		"auth provider": func(r *gin.Engine) {
+			p := newTestBackendProviderWithValidator(t, v)
+			p.auth.RegisterRoutes(r)
+		},
+		"wallet-provider provider": func(r *gin.Engine) {
+			newTestWalletProviderProviderWithValidator(t, v).RegisterRoutes(r)
+		},
+	}
+	token := func(aud, tac string) string {
+		return signServerToken(t, key, issuer, claims.AccessTokenClaims{
+			Claims:   jwt.Claims{Subject: "user-1", Audience: jwt.Audience{aud}},
+			TenantID: string(domain.DefaultTenantID),
+			TAC:      claims.TAC(tac),
+			ACR:      "urn:siros:acr:passkey",
+		})
+	}
+	call := func(r *gin.Engine, bearer string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/wallet-provider/assurance-preview", strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	for name, register := range registers {
+		t.Run(name, func(t *testing.T) {
+			router := gin.New()
+			register(router)
+			if !hasRoute(router.Routes(), http.MethodPost, "/wallet-provider/assurance-preview") {
+				t.Fatal("route not registered")
+			}
+			if w := call(router, ""); w.Code != http.StatusUnauthorized {
+				t.Errorf("no token: %d, want 401", w.Code)
+			}
+			if w := call(router, token("wallet-backend", "r")); w.Code != http.StatusForbidden {
+				t.Errorf("tac r: %d, want 403 (MustHaveTAC w)", w.Code)
+			}
+			if w := call(router, token("wallet-registry", "rw")); w.Code != http.StatusForbidden {
+				t.Errorf("wallet-registry audience: %d, want 403", w.Code)
+			}
+			w := call(router, token("wallet-backend", "w"))
+			if w.Code != http.StatusOK {
+				t.Fatalf("tac w: %d: %s", w.Code, w.Body.String())
+			}
+			var body map[string]interface{}
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			for _, k := range []string{"key_storage", "user_authentication", "certification", "wia_profile", "wia_issue", "policy_version", "schema_version"} {
+				if _, ok := body[k]; !ok {
+					t.Errorf("response has no %q: %v", k, body)
+				}
+			}
+		})
 	}
 }

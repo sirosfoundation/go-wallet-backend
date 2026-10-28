@@ -308,6 +308,52 @@ func TestUserStore_Modify_LegacyDocumentWithoutVersion(t *testing.T) {
 	assert.Equal(t, domain.ComputePrivateDataETag([]byte("new")), got.PrivateDataETag)
 }
 
+// TestUserStore_Modify_InterleavedWithCredentialAuthenticatorUpdate proves
+// that a login's sign-count / clone-warning write bumps the document version:
+// a Modify that read the user before the login must retry on fresh data
+// instead of restoring the pre-login counter and clearing the clone warning.
+func TestUserStore_Modify_InterleavedWithCredentialAuthenticatorUpdate(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy_without_version=%v", legacy), func(t *testing.T) {
+			store := skipIfNoMongo(t)
+			ctx := context.Background()
+
+			user := &domain.User{
+				UUID: domain.NewUserID(),
+				WebauthnCredentials: []domain.WebauthnCredential{
+					{ID: "cred-1", Authenticator: domain.Authenticator{SignCount: 1}},
+				},
+			}
+			require.NoError(t, store.Users().Create(ctx, user))
+			if legacy {
+				_, err := store.users.collection.UpdateOne(ctx, bson.M{"_id.id": user.UUID.String()},
+					bson.M{"$unset": bson.M{"version": ""}})
+				require.NoError(t, err)
+			}
+
+			calls := 0
+			_, err := store.Users().Modify(ctx, user.UUID, func(u *domain.User) error {
+				calls++
+				if calls == 1 {
+					// A login lands after Modify read the user but before its write.
+					_, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 10, true)
+					require.NoError(t, err)
+				}
+				u.UpdatePrivateData([]byte("data"))
+				return nil
+			})
+			require.NoError(t, err)
+			assert.Equal(t, 2, calls, "Modify must detect the concurrent login and retry")
+
+			got, err := store.Users().GetByID(ctx, user.UUID)
+			require.NoError(t, err)
+			assert.Equal(t, uint32(10), got.WebauthnCredentials[0].Authenticator.SignCount, "login sign count must not be rolled back")
+			assert.True(t, got.WebauthnCredentials[0].Authenticator.CloneWarning, "clone warning must not be cleared")
+			assert.Equal(t, []byte("data"), got.PrivateData)
+		})
+	}
+}
+
 func TestUserStore_Modify_NotFound(t *testing.T) {
 	store := skipIfNoMongo(t)
 	_, err := store.Users().Modify(context.Background(), domain.NewUserID(), func(*domain.User) error { return nil })

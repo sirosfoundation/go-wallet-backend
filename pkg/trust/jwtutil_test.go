@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -127,6 +128,27 @@ func TestVerifyJWTWithEmbeddedKey(t *testing.T) {
 		}
 		if result.Type != "jwk" {
 			t.Errorf("VerifyJWTWithEmbeddedKey().Type = %q, want %q", result.Type, "jwk")
+		}
+	})
+
+	t.Run("jwk that is also a key set is refused", func(t *testing.T) {
+		trusted, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		mixed := map[string]any{
+			"kty": jwk["kty"], "crv": jwk["crv"], "x": jwk["x"], "y": jwk["y"],
+			"keys": []any{map[string]any{
+				"kty": "EC", "crv": "P-256",
+				"x": base64.RawURLEncoding.EncodeToString(trusted.PublicKey.X.Bytes()),
+				"y": base64.RawURLEncoding.EncodeToString(trusted.PublicKey.Y.Bytes()),
+			}},
+		}
+		token := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{"sub": "test"})
+		token.Header["jwk"] = mixed
+		tokenStr, err := token.SignedString(privateKey)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if km, err := VerifyJWTWithEmbeddedKey(tokenStr); err == nil {
+			t.Fatalf("accepted a jwk carrying a keys array: %+v", km)
 		}
 	})
 
@@ -710,4 +732,72 @@ func TestExtractVerifierAttestation(t *testing.T) {
 			t.Error("expected error for invalid request JWT")
 		}
 	})
+}
+
+// A JWK carrying a "keys" member is a key set in disguise: the top-level key
+// would verify the signature while downstream normalisation prefers "keys".
+func TestVerifyJWTWithEmbeddedKey_RejectsKeysMember(t *testing.T) {
+	signer, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	victim, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pub := func(k *ecdsa.PrivateKey) map[string]any {
+		return map[string]any{
+			"kty": "EC", "crv": "P-256",
+			"x": base64.RawURLEncoding.EncodeToString(k.PublicKey.X.FillBytes(make([]byte, 32))),
+			"y": base64.RawURLEncoding.EncodeToString(k.PublicKey.Y.FillBytes(make([]byte, 32))),
+		}
+	}
+	sign := func(jwk map[string]any) string {
+		token := jwt.NewWithClaims(jwt.SigningMethodES256, jwt.MapClaims{"sub": "t"})
+		token.Header["jwk"] = jwk
+		s, err := token.SignedString(signer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+
+	mixed := pub(signer)
+	mixed["keys"] = []any{pub(victim)}
+	if _, err := VerifyJWTWithEmbeddedKey(sign(mixed)); err == nil {
+		t.Error("a JWK with a keys member must be rejected")
+	}
+	if _, err := VerifyJWTWithEmbeddedKey(sign(pub(signer))); err != nil {
+		t.Errorf("a plain single JWK must still verify: %v", err)
+	}
+}
+
+func TestDecodeX5CCert(t *testing.T) {
+	raw := []byte{0xfb, 0xff, 0xfe, 0x01} // std: +//+AQ==, url: -__-AQ
+	std := base64.StdEncoding.EncodeToString(raw)
+	url := base64.RawURLEncoding.EncodeToString(raw)
+	if std == url {
+		t.Fatal("fixture must differ between alphabets")
+	}
+	for name, in := range map[string]string{"standard": std, "unpadded base64url": url} {
+		got, err := DecodeX5CCert(in)
+		if err != nil || string(got) != string(raw) {
+			t.Fatalf("%s: got %x, %v", name, got, err)
+		}
+	}
+
+	// "AB-+" is invalid in both alphabets, at different offsets (2 and 3).
+	const bad = "AB-+"
+	_, err := DecodeX5CCert(bad)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	_, stdErr := base64.StdEncoding.DecodeString(bad)
+	_, urlErr := base64.RawURLEncoding.DecodeString(bad)
+	if stdErr == urlErr {
+		t.Fatal("fixture must fail differently in the two alphabets")
+	}
+	if !errors.Is(err, stdErr) || !errors.Is(err, urlErr) {
+		t.Fatalf("error %q must carry both decode failures", err)
+	}
 }

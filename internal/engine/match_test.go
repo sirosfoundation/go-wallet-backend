@@ -42,9 +42,6 @@ func testSession(conn *websocket.Conn) *Session {
 		conn:     conn,
 		flows:    make(map[string]*Flow),
 		logger:   zap.NewNop(),
-		actionCh: make(chan *FlowActionMessage, 50),
-		signCh:   make(chan *SignResponseMessage, 20),
-		matchCh:  make(chan *MatchResponseMessage, 20),
 		closeCh:  make(chan struct{}, 1),
 		stopPing: make(chan struct{}),
 		// Deliberately much faster than production's real (already-fast)
@@ -53,6 +50,16 @@ func testSession(conn *websocket.Conn) *Session {
 		pingInterval: 50 * time.Millisecond,
 		pongTimeout:  500 * time.Millisecond,
 	}
+}
+
+// registerTestFlow adds a live flow (one that can receive client actions) to
+// the session's flow table, as handleFlowStart does.
+func registerTestFlow(s *Session, id string) *Flow {
+	flow := newFlow(id, "", s)
+	s.flowsMu.Lock()
+	s.flows[id] = flow
+	s.flowsMu.Unlock()
+	return flow
 }
 
 // --- RequestMatch tests ---
@@ -89,7 +96,7 @@ func TestSession_RequestMatch_Success(t *testing.T) {
 	session := testSession(conn)
 
 	// Simulate the server-side delivery by reading from the ws client
-	// and pushing into matchCh (mimicking handleSession's routing)
+	// and pushing to the waiting request (mimicking handleSession's routing)
 	go func() {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
@@ -99,7 +106,7 @@ func TestSession_RequestMatch_Success(t *testing.T) {
 		if err := json.Unmarshal(data, &matchMsg); err != nil {
 			return
 		}
-		session.matchCh <- &matchMsg
+		session.dispatchMatchResponse(&matchMsg)
 	}()
 
 	ctx := context.Background()
@@ -174,7 +181,7 @@ func TestSession_RequestMatch_ErrorInResponse(t *testing.T) {
 		if err := json.Unmarshal(data, &matchMsg); err != nil {
 			return
 		}
-		session.matchCh <- &matchMsg
+		session.dispatchMatchResponse(&matchMsg)
 	}()
 
 	ctx := context.Background()
@@ -220,7 +227,7 @@ func TestSession_RequestMatch_NoMatchReason(t *testing.T) {
 		if err := json.Unmarshal(data, &matchMsg); err != nil {
 			return
 		}
-		session.matchCh <- &matchMsg
+		session.dispatchMatchResponse(&matchMsg)
 	}()
 
 	ctx := context.Background()
@@ -293,7 +300,7 @@ func TestSession_RequestMatch_WrongFlowID_Ignored(t *testing.T) {
 
 	session := testSession(conn)
 
-	// Route both messages from the ws client into matchCh
+	// Route both messages from the ws client to the waiting request
 	go func() {
 		for i := 0; i < 2; i++ {
 			_, data, err := conn.ReadMessage()
@@ -304,7 +311,7 @@ func TestSession_RequestMatch_WrongFlowID_Ignored(t *testing.T) {
 			if err := json.Unmarshal(data, &matchMsg); err != nil {
 				return
 			}
-			session.matchCh <- &matchMsg
+			session.dispatchMatchResponse(&matchMsg)
 		}
 	}()
 
@@ -314,69 +321,6 @@ func TestSession_RequestMatch_WrongFlowID_Ignored(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, resp)
 	assert.Equal(t, "correct-cred", resp.Matches[0].CredentialID)
-}
-
-// --- handleSession match_response routing test ---
-
-func TestMatchResponseChannelRouting(t *testing.T) {
-	// Test that a MatchResponseMessage pushed into matchCh is received
-	session := &Session{
-		matchCh: make(chan *MatchResponseMessage, 20),
-		closeCh: make(chan struct{}, 1),
-		logger:  zap.NewNop(),
-	}
-
-	msg := &MatchResponseMessage{
-		Message: Message{
-			Type:      TypeMatchResponse,
-			FlowID:    "flow-1",
-			MessageID: "msg-1",
-		},
-		Matches: []CredentialMatch{
-			{CredentialQueryID: "id-1", CredentialID: "cred-1"},
-		},
-	}
-
-	// Simulate handleSession's TypeMatchResponse branch
-	select {
-	case session.matchCh <- msg:
-	default:
-		t.Fatal("matchCh should accept message")
-	}
-
-	// Verify it comes out the other side
-	select {
-	case received := <-session.matchCh:
-		assert.Equal(t, "flow-1", received.FlowID)
-		assert.Equal(t, "msg-1", received.MessageID)
-		assert.Len(t, received.Matches, 1)
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for match response")
-	}
-}
-
-func TestMatchResponseChannelFull(t *testing.T) {
-	// When matchCh is full, the message should be dropped (select default branch)
-	session := &Session{
-		matchCh: make(chan *MatchResponseMessage), // unbuffered = immediately full
-		closeCh: make(chan struct{}, 1),
-		logger:  zap.NewNop(),
-	}
-
-	msg := &MatchResponseMessage{
-		Message: Message{
-			Type:   TypeMatchResponse,
-			FlowID: "flow-full",
-		},
-	}
-
-	// This should not block — hits the default case
-	select {
-	case session.matchCh <- msg:
-		t.Fatal("should not have sent to unbuffered channel without receiver")
-	default:
-		// Expected: channel full, message dropped
-	}
 }
 
 // --- BaseHandler.RequestMatch delegation test ---
@@ -424,7 +368,7 @@ func TestBaseHandler_RequestMatch(t *testing.T) {
 		if err := json.Unmarshal(data, &matchMsg); err != nil {
 			return
 		}
-		session.matchCh <- &matchMsg
+		session.dispatchMatchResponse(&matchMsg)
 	}()
 
 	ctx := context.Background()

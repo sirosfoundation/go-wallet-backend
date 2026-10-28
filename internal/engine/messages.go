@@ -118,8 +118,18 @@ const (
 	// was never asked, so reporting this to the wallet as "declined" would be
 	// wrong. The verifier is told neither apart - see submitErrorResponse.
 	ErrCodeNoMatchingCredentials ErrorCode = "NO_MATCHING_CREDENTIALS"
-	ErrCodeInternalError         ErrorCode = "INTERNAL_ERROR"
-	ErrCodeTooManyRequests       ErrorCode = "TOO_MANY_REQUESTS"
+	// ErrCodeUnsupportedTransactionData is returned when a request carries
+	// OID4VP transaction_data this wallet cannot process: the client did not
+	// declare FeatureTransactionDataV1, or the type is not supported. The
+	// wallet refuses rather than present without the transaction hashes or
+	// without showing the user what they are authorizing.
+	ErrCodeUnsupportedTransactionData ErrorCode = "UNSUPPORTED_TRANSACTION_DATA"
+	ErrCodeInternalError              ErrorCode = "INTERNAL_ERROR"
+	ErrCodeTooManyRequests            ErrorCode = "TOO_MANY_REQUESTS"
+	// ErrCodePSCConflict: the issuer already holds a different holder
+	// commitment (psc) for this subject. The message is the issuer's own text
+	// and tells the user what to do (operator-approved reset).
+	ErrCodePSCConflict ErrorCode = "PSC_CONFLICT"
 )
 
 // UserFacingMessage returns a generic user-facing message for an error code.
@@ -168,10 +178,14 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "Presentation failed"
 	case ErrCodeNoMatchingCredentials:
 		return "You do not have any credentials that match this request"
+	case ErrCodeUnsupportedTransactionData:
+		return "This wallet cannot process the transaction in this request. Please update the wallet and try again"
 	case ErrCodeInternalError:
 		return "Internal server error"
 	case ErrCodeTooManyRequests:
 		return "Too many requests"
+	case ErrCodePSCConflict:
+		return "The issuer holds a different holder commitment for you"
 	default:
 		return "An error occurred"
 	}
@@ -193,6 +207,13 @@ const (
 	// means it does not, and the engine falls back to its own DPoP key plus
 	// a single SignActionRequestAttestation.
 	SignActionSignClientAuth SignAction = "sign_client_auth"
+	// SignActionDecryptCredentialResponse relays the issuer's encrypted
+	// Credential (or Deferred Credential) Response to the client, which alone
+	// holds the response-encryption key. The client decrypts and keeps the
+	// credentials and the response-level credential_metadata; it answers with
+	// control fields only (transaction_id, interval, credential_count), so the
+	// engine never sees a credential, a seed or the JWE plaintext.
+	SignActionDecryptCredentialResponse SignAction = "decrypt_credential_response"
 )
 
 // Message is the base message envelope for all WebSocket messages
@@ -278,6 +299,17 @@ type FlowStartMessage struct {
 	// client that never sends this behaves exactly as before.
 	AuthorizationDetails []AuthorizationDetail `json:"authorization_details,omitempty"`
 
+	// Features lists the optional protocol features this client implements,
+	// declared per flow. The engine only sends a client work it can do
+	// correctly: a client that omits a feature is treated as not supporting it,
+	// so an older frontend or SDK keeps working exactly as before and is
+	// refused (with an explicit error) rather than silently mishandling a
+	// request that needs the feature. Unknown entries are ignored, so a newer
+	// client can declare features an older engine does not know.
+	//
+	// Today's only feature is FeatureTransactionDataV1.
+	Features []string `json:"features,omitempty"`
+
 	// Resumption fields (same-tab redirect flow)
 	AuthCode     string `json:"auth_code,omitempty"`     // Authorization code from OAuth redirect
 	CodeVerifier string `json:"code_verifier,omitempty"` // PKCE code verifier (saved by client before redirect)
@@ -316,24 +348,27 @@ type FlowStartMessage struct {
 	DPoPKeyID string `json:"dpop_key_id,omitempty"`
 }
 
-// CredentialMetadataRelay is a validated response-level credential_metadata
-// and whether the issuer response carrying it was JWE-encrypted.
-type CredentialMetadataRelay struct {
-	Metadata  json.RawMessage
-	Encrypted bool
-}
+// FeatureTransactionDataV1 is declared by a client that can process OID4VP
+// `transaction_data` end to end: validate it against the attestation's type
+// metadata, show it to the user, and bind it into the presentation by hashing
+// each entry exactly as received (the base64url string, never a re-encoding of
+// it). A client must not declare it until all of that is implemented, because
+// a client that ignores the field signs a presentation without the hashes and
+// without the user ever seeing the transaction (EC TS12 payment SCA).
+const FeatureTransactionDataV1 = "transaction_data.v1"
 
-// Redacted returns a copy of the message with the credential_metadata object
-// (which may hold secrets) removed, together with its encrypted flag. It is
-// meant for event buffering only. It is NOT safe to log: the copy still carries
-// Credentials, RefreshToken and DPoPJWK (a private key); logging requires
-// redacting those as well. Whether a buffered completion message must also
-// drop credentials, the refresh token and the DPoP key is up to the buffering
-// party's replay semantics.
-func (m FlowCompleteMessage) Redacted() FlowCompleteMessage {
-	m.CredentialMetadata = nil
-	m.CredentialMetadataEncryptedResponse = false
-	return m
+// Supports reports whether the client declared feature. It is safe on a nil
+// message, which means "declared nothing".
+func (m *FlowStartMessage) Supports(feature string) bool {
+	if m == nil {
+		return false
+	}
+	for _, f := range m.Features {
+		if f == feature {
+			return true
+		}
+	}
+	return false
 }
 
 // authorizationDetailTypeOpenIDCredential is the only `type` OID4VCI 1.0
@@ -412,17 +447,21 @@ type FlowCompleteMessage struct {
 	// The client stores it with RefreshToken and presents it back as
 	// FlowStartMessage.DPoPKeyID on renewal.
 	DPoPKeyID string `json:"dpop_key_id,omitempty"`
-	// CredentialMetadata is the OID4VCI 1.1 response-level credential_metadata
-	// object of the issuer's Credential (or Deferred Credential) Response,
-	// relayed verbatim (compacted) and applying to every credential in
-	// Credentials. Unknown members are preserved. It may carry secrets
-	// (org.siros.secret_seed): never log it, and use Redacted before buffering.
+	// CredentialResponseEncrypted is true when the issuer's response was
+	// encrypted to a key only the client holds. The engine relayed the JWE
+	// without being able to read it, so Credentials carry no credential value
+	// and the response-level credential_metadata (which may hold a secret
+	// seed) is never relayed: the client already holds both from
+	// decrypt_credential_response and pairs Credentials[i] with the i-th
+	// decrypted credential. A count mismatch is an error on the client.
+	CredentialResponseEncrypted bool `json:"credential_response_encrypted,omitempty"`
+	// CredentialMetadata is set only for a PLAIN (unencrypted) issuer
+	// response: the display members (see displayMetadataMembers) of its
+	// response-level credential_metadata, applying to every credential in
+	// Credentials. Every other member, in particular the namespaced
+	// org.siros.secret_seed, is dropped by the engine and never relayed or
+	// logged. Never present when CredentialResponseEncrypted is true.
 	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
-	// CredentialMetadataEncryptedResponse is true only when CredentialMetadata
-	// came in a JWE-encrypted issuer response. Absent alongside a
-	// CredentialMetadata means it arrived as plain TLS-protected JSON (always
-	// the case for deferred issuance), so a client should refuse secret values.
-	CredentialMetadataEncryptedResponse bool `json:"credential_metadata_encrypted_response,omitempty"`
 }
 
 // CredentialNotificationMessage carries an OID4VCI §10 credential lifecycle
@@ -504,9 +543,35 @@ type SignRequestParams struct {
 	// session rather than the verifier's static identity. Empty for
 	// non-ZK presentations.
 	VerifierSessionID string `json:"verifier_session_id,omitempty"`
-	// TransactionData carries TS12 transaction data from the verifier's OID4VP request.
-	// The frontend must hash each item and include transaction_data_hashes in the KB-JWT.
+	// ClientMetadata is the verifier's client_metadata object, verbatim from
+	// the validated request object (sign_presentation only). Notably carries
+	// vp_formats_supported, which for a zkp_req presentation holds the
+	// system_id_values / proof_system_values. Absent when the request had none.
+	ClientMetadata json.RawMessage `json:"client_metadata,omitempty"`
+	// VerifiedRequest is the same VerifiedRequestInputs credential_selection
+	// carried (sign_presentation only).
+	VerifiedRequest *VerifiedRequestInputs `json:"verified_request,omitempty"`
+	// ResponseEncryption (sign_presentation, direct_post.jwt only) is the
+	// verifier key and JWE algorithms the CLIENT encrypts the JARM response
+	// to. The client builds the vp_token, the JARM claims (aud from
+	// verified_request.client_id, State) and the compact JWE itself and
+	// answers with response_jwe; the engine never sees the vp_token.
+	ResponseEncryption *ResponseEncryption `json:"response_encryption,omitempty"`
+	// State is the request's state (sign_presentation, direct_post.jwt only),
+	// a JARM claim the client includes when present.
+	State string `json:"state,omitempty"`
+	// TransactionData carries the verifier's OID4VP transaction_data (EC TS12
+	// payment SCA), one entry per element of the request's array and in its
+	// order. Sent only to a client that declared FeatureTransactionDataV1.
+	// The client binds the presentation to it by hashing each entry's Raw
+	// string (never the decoded members) into the KB-JWT's
+	// transaction_data_hashes, and takes what it shows the user from Raw too,
+	// treating the decoded members as an aid.
 	TransactionData []TransactionData `json:"transaction_data,omitempty"`
+	// ResponseMode is the verifier request's response_mode. Set only together
+	// with TransactionData: EC TS12 requires it in the key binding JWT of an
+	// SCA presentation.
+	ResponseMode string `json:"response_mode,omitempty"`
 	// ReissuanceKid, when set (a renewal request - credential re-issuance/
 	// renewal plan, Phase 1 Slice 2), asks the client to sign this
 	// generate_proof request with the EXISTING keypair identified by this
@@ -516,6 +581,16 @@ type SignRequestParams struct {
 	// sirosfoundation/wallet-frontend#70's Tier 2 "same-key re-signing" design
 	// (signWithExistingKeypair(kid, payload)). Empty for ordinary issuance.
 	ReissuanceKid string `json:"reissuance_kid,omitempty"`
+
+	// HolderCommitments, CredentialType and CredentialIssuer (generate_proof
+	// only; set when the issuer metadata advertises org.siros.holder_commitments
+	// with "psc"): the wallet MUST derive the commitment for (CredentialType,
+	// CredentialIssuer) and add the claim org.siros.psc =
+	// base64url(32 bytes) to every proof JWT payload before signing. The engine
+	// verifies the claim on the returned proofs and never computes or logs it.
+	HolderCommitments []string `json:"holder_commitments,omitempty"`
+	CredentialType    string   `json:"credential_type,omitempty"`
+	CredentialIssuer  string   `json:"credential_issuer,omitempty"`
 
 	// SignActionSignClientAuth parameters. HTM and HTU, when set, ask for a
 	// DPoP proof over that HTTP method and URL; DPoPNonce is the
@@ -535,6 +610,40 @@ type SignRequestParams struct {
 	// (draft-ietf-oauth-attestation-based-client-auth). Set after an AS rejects
 	// a PAR/token request with `use_attestation_challenge`.
 	AttestationChallenge string `json:"attestation_challenge,omitempty"`
+
+	// CredentialResponseEncryption, on generate_proof, asks the client for a
+	// fresh ephemeral response-encryption key for this request (the engine
+	// negotiated the alg/enc pair from the issuer metadata). The client keeps
+	// the private key, keyed by flow id, and returns the public JWK as
+	// SignResponseMessage.CredentialResponseEncryptionJWK. With no
+	// ProofTypesSupported the request is for the key alone: return no proofs.
+	CredentialResponseEncryption *CredentialResponseEncryptionParams `json:"credential_response_encryption,omitempty"`
+	// JWE is, on decrypt_credential_response, the issuer's compact JWE
+	// (a Credential or Deferred Credential Response), relayed unread.
+	JWE string `json:"jwe,omitempty"`
+	// Deferred is, on decrypt_credential_response, true when the JWE answers a
+	// Deferred Credential Request (always sent, false included).
+	Deferred *bool `json:"deferred,omitempty"`
+}
+
+// CredentialResponseEncryptionParams is the negotiated credential response
+// encryption the engine asks the client to generate a key for. Required means
+// the engine fails the issuance when the client declines (the issuer demands
+// encryption, or advertises org.siros.secret_seed).
+type CredentialResponseEncryptionParams struct {
+	Alg      string `json:"alg"`
+	Enc      string `json:"enc"`
+	Required bool   `json:"required"`
+}
+
+// ResponseEncryption is the resolved recipient of a direct_post.jwt response:
+// the verifier's public JWK (with kid when it has one; x5c-derived keys carry
+// only the key), and the JWE alg (key management) and enc (content
+// encryption) to use.
+type ResponseEncryption struct {
+	JWK json.RawMessage `json:"jwk"`
+	Alg string          `json:"alg"`
+	Enc string          `json:"enc"`
 }
 
 // CredentialRef references a credential for signing
@@ -557,6 +666,11 @@ type SignResponseMessage struct {
 	Message
 	ProofJWT string `json:"proof_jwt,omitempty"`
 	VPToken  string `json:"vp_token,omitempty"`
+	// ResponseJWE answers a sign_presentation request that carried
+	// response_encryption: the complete compact JWE the engine POSTs as
+	// response=<jwe>. It is never set together with VPToken, and a sign
+	// refusal (error/error_code, once the engine has one) carries no response_jwe.
+	ResponseJWE string `json:"response_jwe,omitempty"`
 	// Proofs contains the OID4VCI proof objects generated by the frontend.
 	Proofs []ProofObject `json:"proofs,omitempty"`
 	// ClientAttestation and ClientAttestationPoP carry the response to a
@@ -575,6 +689,28 @@ type SignResponseMessage struct {
 	// given.
 	DPoPKeyID string `json:"dpop_key_id,omitempty"`
 	DPoPProof string `json:"dpop_proof,omitempty"`
+	// CredentialResponseEncryptionJWK answers generate_proof when the request
+	// carried credential_response_encryption: the client's fresh ephemeral
+	// public JWK ({kty:"EC", crv:"P-256", x, y, use:"enc", alg}, kid optional).
+	// Absent or empty means the client declined.
+	CredentialResponseEncryptionJWK json.RawMessage `json:"credential_response_encryption_jwk,omitempty"`
+	// TransactionID, Interval and CredentialCount answer
+	// decrypt_credential_response and are the ONLY things the client reports
+	// from the decrypted response: transaction_id (+ optional interval) when
+	// the issuer deferred issuance, credential_count (the number of
+	// credentials the response held) otherwise. Exactly one of the two.
+	TransactionID   string `json:"transaction_id,omitempty"`
+	Interval        int    `json:"interval,omitempty"`
+	CredentialCount int    `json:"credential_count,omitempty"`
+	// Error reports a client-side failure of the request (for example a JWE
+	// that does not decrypt). The engine never logs or relays its text, as it
+	// is client-controlled and might echo response content.
+	Error string `json:"error,omitempty"`
+	// ErrorCode classifies Error, and on its own (Error omitted) still marks the
+	// reply a failure. Only ErrCodeUnsupportedTransactionData is acted
+	// on: the client refused the request's transaction_data. Any other value is
+	// dropped (see allowedSignErrorCode).
+	ErrorCode ErrorCode `json:"error_code,omitempty"`
 }
 
 // MatchRequestMessage requests client-side credential matching.
@@ -583,6 +719,12 @@ type SignResponseMessage struct {
 type MatchRequestMessage struct {
 	Message
 	DCQLQuery json.RawMessage `json:"dcql_query,omitempty"`
+	// ClientMetadata is the verifier's client_metadata object, verbatim from
+	// the validated request object. Optional; absent when the request had none.
+	ClientMetadata json.RawMessage `json:"client_metadata,omitempty"`
+	// VerifiedRequest carries the validated request inputs (see
+	// VerifiedRequestInputs). Optional.
+	VerifiedRequest *VerifiedRequestInputs `json:"verified_request,omitempty"`
 }
 
 // MatchResponseMessage is the client's matching response
@@ -609,8 +751,10 @@ type ErrorMessage struct {
 
 // CredentialResult represents an issued credential
 type CredentialResult struct {
-	Format       string          `json:"format"`
-	Credential   string          `json:"credential"`
+	Format string `json:"format"`
+	// Credential is empty (and omitted) when the issuer response was encrypted
+	// to the client's key: see FlowCompleteMessage.CredentialResponseEncrypted.
+	Credential   string          `json:"credential,omitempty"`
 	VCT          string          `json:"vct,omitempty"`
 	TypeMetadata json.RawMessage `json:"type_metadata,omitempty"`
 	// NotificationID is the OID4VCI §10 notification identifier returned by the
