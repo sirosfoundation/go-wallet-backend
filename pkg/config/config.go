@@ -543,8 +543,10 @@ type HTTPClientConfig struct {
 	MetadataType string `yaml:"metadata_type" envconfig:"METADATA_TYPE"`
 
 	// MetadataCacheDisabled turns off caching of OpenID4VCI issuer metadata,
-	// so every resolution fetches it afresh. Useful for testing scenarios where
-	// the same issuer URL is reused with different metadata.
+	// so every resolution fetches it afresh. This covers the issuer-metadata
+	// resolvers (engine and AuthZEN proxy) and the backend's
+	// GET /issuer/:id/metadata endpoint cache. Useful for testing scenarios
+	// where the same issuer URL is reused with different metadata.
 	// Env: WALLET_HTTP_CLIENT_METADATA_CACHE_DISABLED
 	MetadataCacheDisabled bool `yaml:"metadata_cache_disabled" envconfig:"METADATA_CACHE_DISABLED"`
 
