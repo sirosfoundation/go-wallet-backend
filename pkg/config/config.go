@@ -542,6 +542,12 @@ type HTTPClientConfig struct {
 	// role builds no resolver and ignores the field.
 	MetadataType string `yaml:"metadata_type" envconfig:"METADATA_TYPE"`
 
+	// MetadataCacheDisabled turns off caching of OpenID4VCI issuer metadata,
+	// so every resolution fetches it afresh. Useful for conformance testing,
+	// where the same issuer URL is reused with different metadata.
+	// Env: WALLET_HTTP_CLIENT_METADATA_CACHE_DISABLED
+	MetadataCacheDisabled bool `yaml:"metadata_cache_disabled" envconfig:"METADATA_CACHE_DISABLED"`
+
 	// TrustedIdPHosts lists hostnames of operator-configured OIDC identity
 	// providers that may resolve to private/loopback/link-local addresses.
 	// It applies only to the client NewIdPHTTPClient builds (the AS's OIDC

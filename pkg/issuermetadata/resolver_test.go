@@ -479,6 +479,34 @@ func TestResolve_Cached(t *testing.T) {
 	}
 }
 
+func TestResolve_CacheDisabled(t *testing.T) {
+	calls := 0
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL}) //nolint:errcheck
+	}))
+	defer server.Close()
+
+	r, err := New(Config{HTTPClient: testHTTPClient(), AllowHTTP: true, CacheDisabled: true})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	for i := 0; i < 2; i++ {
+		res, err := r.ResolveWithInfo(context.Background(), server.URL)
+		if err != nil {
+			t.Fatalf("Resolve() error: %v", err)
+		}
+		if res.Cached {
+			t.Errorf("call %d: result unexpectedly served from cache", i)
+		}
+	}
+	if calls != 2 {
+		t.Errorf("expected 2 HTTP requests, got %d", calls)
+	}
+}
+
 func TestResolve_TrailingSlashStripped(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
