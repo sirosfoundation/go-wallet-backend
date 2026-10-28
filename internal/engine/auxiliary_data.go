@@ -375,7 +375,13 @@ func parseAuxEntry(re json.RawMessage, list string) (auxEntry, string, error) {
 	if w.Type != auxTypeHashCommitment {
 		// An entry of an unrecognised type is ignored (section 3): its own
 		// parameters, a "commitment" or "opening" among them, are its own.
-		// Only required is read, and only in to_issuer.
+		// Only required is read, and only in to_issuer, where it must be a
+		// boolean (section 5).
+		if list == "to_issuer" {
+			if err := checkAuxRequired(w, list); err != nil {
+				return auxEntry{}, "", err
+			}
+		}
 		return auxEntry{typ: w.Type, required: unrecognisedRequired(w, list)}, "", nil
 	}
 	// Values, never metadata: no opening or commitment member at any depth.

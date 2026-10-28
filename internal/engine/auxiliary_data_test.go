@@ -1045,6 +1045,12 @@ func TestUnrecognisedEntries_AreIgnored(t *testing.T) {
 	assert.NotEmpty(t, d.unusable)
 	require.ErrorIs(t, d.usable(auxCfg(adv)), errAuxiliaryDataUnsupported)
 
+	// required in to_issuer is a boolean, whatever the type; in to_wallet it is ignored.
+	for _, bad := range []string{`"yes"`, `null`, `1`} {
+		_, err = secretDeliveryOf(auxCfg(`{"to_issuer":[{"type":"https://x.example/t","required":` + bad + `}]}`))
+		require.Error(t, err, bad)
+	}
+
 	// A type must still be there.
 	_, err = secretDeliveryOf(auxCfg(`{"to_wallet":[{"commitment":"x"}]}`))
 	require.Error(t, err)

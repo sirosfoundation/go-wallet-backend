@@ -722,7 +722,7 @@ credential_configurations_supported[cfg].auxiliary_data_supported
   `path` (a non-empty claims path of strings, nulls and non-negative integers)
   and must not carry `opening` or `commitment`. An entry of any other `type` is
   kept and ignored (section 3): of it only the `type` is checked, and `required`
-  when the entry is in `to_issuer`; its own parameters (a `commitment` or an
+  when the entry is in `to_issuer` (where it must be a boolean); its own parameters (a `commitment` or an
   `opening` among them) are its own. Anything else makes the configuration not offered,
   exactly like any malformed advertisement (dropped at decode, removed in the
   resolve endpoint).
