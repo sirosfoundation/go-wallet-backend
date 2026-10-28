@@ -1058,3 +1058,14 @@ func TestCredentialResponse_OversizedIsRefused(t *testing.T) {
 		assert.NotEqual(t, `"flow_complete"`, string(m["type"]))
 	}
 }
+
+// A valid claim whose numbers overflow float64 is still a valid claim: the
+// scan for an opening reads names, not values.
+func TestCheckProofsForwardNoOpening_HugeNumberIsNotAnError(t *testing.T) {
+	ps := []ProofObject{{ProofType: "jwt", JWT: rawProofJWT(`{"auxiliary_data":[{"type":"https://example.org/custom","alg":1e400}]}`)}}
+	for _, inspect := range []bool{true, false} {
+		require.NoError(t, checkProofsForwardNoOpening(ps, inspect), "inspect=%v", inspect)
+	}
+	ps[0].JWT = rawProofJWT(`{"auxiliary_data":[{"type":"https://example.org/custom","alg":1e400,"opening":"S"}]}`)
+	require.Error(t, checkProofsForwardNoOpening(ps, true))
+}

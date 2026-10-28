@@ -624,8 +624,13 @@ func checkProofsForwardNoOpening(proofs []ProofObject, inspect bool) error {
 		if !has {
 			continue
 		}
+		// Numbers stay numbers (json.Number): a valid claim such as
+		// {"alg":1e400} must not fail on a float64 overflow in a scan that
+		// only looks for member names.
 		var v any
-		if err := json.Unmarshal(claim, &v); err != nil {
+		dec := json.NewDecoder(bytes.NewReader(claim))
+		dec.UseNumber()
+		if err := dec.Decode(&v); err != nil {
 			return auxProofErr("auxiliary_data is not valid JSON")
 		}
 		if containsMember(v, "opening") {

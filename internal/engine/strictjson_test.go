@@ -39,6 +39,9 @@ func TestParseOffer_AmbiguousIsRefused(t *testing.T) {
 		"repeated grants": `{"credential_issuer":"https://i.example","credential_configuration_ids":["a"],"grants":{"authorization_code":{}},"grants":{}}`,
 		"repeated grant":  `{"credential_issuer":"https://i.example","credential_configuration_ids":["a"],"grants":{"authorization_code":{},"authorization_code":{"issuer_state":"x"}}}`,
 		"trailing data":   ok + ` {}`,
+		"alias Grants":    `{"credential_issuer":"https://i.example","credential_configuration_ids":["a"],"Grants":{"authorization_code":{}}}`,
+		"alias issuer":    `{"Credential_Issuer":"https://i.example","credential_configuration_ids":["a"]}`,
+		"alias ids":       `{"credential_issuer":"https://i.example","Credential_Configuration_IDs":["a"]}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := h.parseOffer(context.Background(), &FlowStartMessage{Offer: offer})
