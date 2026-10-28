@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -816,6 +817,31 @@ func TestBlind_FreshKeyPerProofRequest(t *testing.T) {
 }
 
 // --- the JWE relay itself ---
+
+// A failure that is not the client's report (here the flow's context ending) is
+// passed through unchanged, not rewritten as a client decryption failure. The
+// client never answers, so the context ending is the only way out of RequestSign
+// and the outcome does not depend on a reply racing the cancellation.
+func TestRelayEncryptedResponse_NonClientFailureIsNotRewritten(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srv *websocket.Conn) {
+		defer srv.Close()
+		for {
+			if _, _, err := srv.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop(), Flow: &Flow{ID: "f-blind", Session: testSession(conn), Data: map[string]interface{}{}}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := h.relayEncryptedResponse(ctx, "a.b.c.d.e", false, &responseEncryption{})
+	require.ErrorIs(t, err, context.Canceled)
+	var se *SignError
+	assert.False(t, errors.As(err, &se))
+}
 
 func TestRelayEncryptedResponse_RefusesMalformedJWE(t *testing.T) {
 	for name, jwe := range map[string]string{

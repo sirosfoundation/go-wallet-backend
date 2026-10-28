@@ -2571,9 +2571,6 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 	if err != nil {
 		return nil, nil, err
 	}
-	if resp.Error != "" {
-		return nil, nil, errors.New("client failed the proof request")
-	}
 
 	var respEnc *responseEncryption
 	if offer != nil {
