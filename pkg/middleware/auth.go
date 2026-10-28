@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
@@ -14,8 +15,66 @@ import (
 // TokenBlacklistChecker is an interface for checking if a token is
 // blacklisted, either individually by jti or in bulk for every token of a user (TokenBlacklist.RevokeUser).
 type TokenBlacklistChecker interface {
-	IsBlacklisted(ctx context.Context, jti string) bool
-	IsUserRevoked(ctx context.Context, userID string) bool
+	// IsBlacklisted and IsUserRevoked return an error when the revocation
+	// store cannot answer; callers must then refuse the request.
+	IsBlacklisted(ctx context.Context, jti string) (bool, error)
+	IsUserRevoked(ctx context.Context, userID string) (bool, error)
+}
+
+// IsAccountDeletion reports whether the request is the account deletion call
+// (DELETE /user/session). A user revocation means the deletion has begun, so
+// that call stays reachable to a revoked user: a deletion interrupted after
+// the revocation was stored (including a write whose acknowledgement was
+// lost) can then be completed by retrying, with every other token check
+// (signature, jti, family, expiry) still applied.
+func IsAccountDeletion(c *gin.Context) bool {
+	return c.Request.Method == http.MethodDelete && strings.TrimSuffix(c.FullPath(), "/") == "/user/session"
+}
+
+// IsLogout reports whether the request is the session logout call
+// (POST /user/session/logout).
+//
+// Logout is the one call that stays reachable to a token whose own jti is
+// already revoked, so that it is an idempotent completion path: a logout whose
+// revocation write reported an error may still have been applied (a MongoDB
+// write can land before its majority acknowledgement times out), and the jti
+// entry is never withdrawn because another request may have completed a
+// logout with it. Without this the retry would be rejected as "revoked" and
+// the client could not tell a completed logout from a failed one. A revoked
+// jti is the only check relaxed:
+// signature, expiry, user revocation, tenant and the store-unavailable
+// refusal all still apply, and the call only revokes the caller's own
+// session, so repeating it is harmless.
+func IsLogout(c *gin.Context) bool {
+	return c.Request.Method == http.MethodPost && strings.TrimSuffix(c.FullPath(), "/") == "/user/session/logout"
+}
+
+type logoutCompletionKey struct{}
+
+// WithLogoutCompletion marks ctx as belonging to a logout call, so a
+// revocation checker running inside token validation (which cannot see the
+// request) admits a token whose jti is already revoked. See IsLogout.
+func WithLogoutCompletion(ctx context.Context) context.Context {
+	return context.WithValue(ctx, logoutCompletionKey{}, true)
+}
+
+// IsLogoutCompletion reports whether ctx was marked by WithLogoutCompletion.
+func IsLogoutCompletion(ctx context.Context) bool {
+	v, _ := ctx.Value(logoutCompletionKey{}).(bool)
+	return v
+}
+
+// RefuseRevocationUnavailable aborts the request with 503 because the
+// revocation store could not say whether the token is revoked. Only the
+// error is logged, never token content.
+func RefuseRevocationUnavailable(c *gin.Context, logger *zap.Logger, err error) {
+	logger.Error("Revocation check failed; refusing request",
+		zap.Error(err),
+		zap.String("method", c.Request.Method),
+		zap.String("path", c.FullPath()),
+	)
+	c.JSON(503, gin.H{"error": "Token revocation check unavailable"})
+	c.Abort()
 }
 
 // GenerateAdminToken generates a secure random token for admin API authentication
