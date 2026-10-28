@@ -579,22 +579,76 @@ cp wallet.db.backup wallet.db
 
 #### Token revocation with several replicas
 
-Token revocation state is held **in memory, per process**: revoked access-token
-JTIs (logout) and revoked users (account deletion). With one replica a logout or
-account deletion is enforced immediately. With **several replicas, or after a
-restart**, a revocation recorded on one replica is not seen by the others, so a
-logged-out access token remains usable on a replica that never handled the
-logout until it expires (`as.default_token_ttl`, 2 minutes by default).
+Revoked access-token JTIs (logout) and revoked users (account deletion) are
+kept in the **revocation store**, selected by
+`security.token_blacklist.backend` (env
+`WALLET_SECURITY_TOKEN_BLACKLIST_BACKEND`):
 
-Until a shared revocation store exists (tracked in #407 / #415), either run a
-single replica for the token-issuing role, or route a user's requests to the
-same replica (session affinity) and accept that a restart forgets revocations.
-The AS session store itself is shared when it is MongoDB-backed, so sessions
-survive across replicas and restarts; only the revocation markers are process-local.
+| Value | Behaviour |
+|-------|-----------|
+| *(empty, default)* | `storage` when `storage.type` is `mongodb`, otherwise `memory` |
+| `storage` | MongoDB. Shared by all replicas and survives restarts. Requires `storage.type: mongodb` (rejected at startup otherwise) |
+| `memory` | Per process. Lost on restart and not seen by other replicas |
+
+The `storage` backend uses two collections in the storage database:
+`revoked_tokens` (`_id` is the JTI, `expires_at` with a TTL index, so entries
+disappear after the token's own expiry; the check compares `expires_at`
+itself because MongoDB's TTL monitor only runs about once a minute) and
+`revoked_users` (one document per revoked user, no TTL: a user revocation is
+permanent). Reads go to the primary and writes use majority write concern,
+so a revocation is seen by the next check on any replica. A secondary-read
+lag is therefore not a concern for these collections.
+
+The store fails closed. If it cannot be reached or set up, a revocation
+lookup that cannot be answered refuses the request instead of accepting it:
+API requests get `503 {"error":"Token revocation check unavailable"}`, the
+token-delegation endpoint answers 503, a WebSocket handshake is refused, and a
+token checked by the token validator is rejected with 401. Every lookup is
+bounded to 5 seconds. A revocation write that fails
+fails the request: logout (`POST /user/session/logout`, `DELETE /auth/session`)
+and account deletion answer 500 and change nothing the client cannot retry
+(the session cookie is kept, the user and their data are untouched); repeat
+the request once the store is back. Nothing is queued or replayed by the
+server: a failed revocation is not recorded until the client repeats the
+request. Account deletion revokes first. A write that reported an error may
+still have been stored, so a revoked user can still call `DELETE /user/session`
+(and only that route) to complete the deletion, and a token whose jti was
+revoked by an interrupted logout is still admitted by
+`POST /user/session/logout` (and only that route), so the retry succeeds. Both
+revocations are idempotent and are never withdrawn after a failure. If
+the store cannot be set up at startup the process still starts, logs an
+error and refuses authenticated requests until restarted.
+
+A process that has no storage backend of its own, a standalone engine
+(`--mode=engine`) or registry (`--mode=registry`), connects to the same
+revocation collections using `storage.mongodb` when the setting resolves to
+`storage`, so it rejects what the backend replicas revoked. Give such a
+process the same `storage.mongodb` settings as the backend. If the setting is
+`storage` (or unset with `storage.type: mongodb`) and the connection fails,
+that process does not start. With `memory`, or unset with non-MongoDB
+storage, it keeps no revocation state, because a process-local blacklist would
+never see a revocation. The isolated wallet-provider (`--mode=wallet-provider`)
+uses the same store through its own storage backend. The startup warning
+about process-local state is logged by every one of these roles.
+
+`Remove` (administrative override) deletes the jti revocation in the MongoDB
+store as well; `Count` only reports the entries held by the local process.
+
+Switching backend starts with an empty store: revocations recorded in the
+old one are not carried over, so tokens revoked shortly before the switch
+(access tokens live `as.default_token_ttl`, 2 minutes by default) may be
+accepted again until they expire.
+
+**Startup warning.** The configuration has no replica count, so a MongoDB
+storage backend is taken as the sign that several replicas are plausible. In
+that case the process logs a warning when `as.session_store` is `memory`
+(AS sessions are per process) or when the token blacklist is enabled with
+`backend: memory`. With in-memory storage nothing is logged: only one
+process is possible.
 
 ### Token revocation limits
 
-Token revocation (logout, revoked user) is enforced through an in-process token blacklist, so it only takes effect in the process that holds it (single-replica limitation, tracked in issues #407 and #415). A shared revocation source is not implemented.
+Revocation is enforced by the revocation store; see [Token revocation with several replicas](#token-revocation-with-several-replicas) for what the shared and the per-process backends cover.
 
 <a id="split-mode-as-jwks"></a>
 **Split mode: reaching the AS for its signing keys.** The standalone engine, a registry-only process and an isolated wallet-provider fetch the AS keys from `<as.external_url>/auth/.well-known/jwks.json`. In a split-pod deployment just set `as.external_url` to the AS's in-cluster URL (`http` or `https`). The JWKS is fetched by go-tokenauth without SSRF filtering or a plaintext check, because it is infrastructure-internal traffic between components of the same cluster; do not point `as.external_url` at anything outside your own infrastructure. Example (engine and registry pods):
@@ -604,12 +658,13 @@ as:
   external_url: http://backend.wallet.svc:8080
 ```
 
-**Standalone engine (`--mode=engine`, no backend provider):** when `as.external_url` is set, the engine accepts AS-signed ES256 session tokens, but it has no revocation checker and no token blacklist is wired into it. Consequence: after a logout or user revocation at the backend, a token **stays valid at the standalone engine until it expires**; a new WebSocket handshake with it is still accepted. The engine logs a warning at startup when it is built this way.
+**Standalone engine (`--mode=engine`, no backend provider):** with the shared MongoDB revocation store (see above) the engine rejects what the backend revoked. With `backend: memory`, or non-MongoDB storage, it keeps no revocation state: after a logout or user revocation at the backend, a token **stays valid at the standalone engine until it expires**, and a new WebSocket handshake with it is still accepted. The engine logs a warning at startup when it is built this way.
 
 Mitigations:
 
 - Use short access token TTLs, so the exposure window is bounded by the TTL.
 - Co-host the engine with the backend (the default all-in-one mode), which shares the token blacklist.
+- Use the shared MongoDB revocation store (see above), which a standalone engine reads too.
 
 ### Database Scaling
 

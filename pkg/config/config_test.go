@@ -3211,6 +3211,40 @@ func TestApplyASSecurityDefaults_Parity(t *testing.T) {
 	}
 }
 
+func TestConfig_Validate_TokenBlacklistBackend(t *testing.T) {
+	tests := []struct {
+		name    string
+		backend string
+		storage string
+		wantErr string
+	}{
+		{"default with memory storage", "", "memory", ""},
+		{"default with mongodb", "", "mongodb", ""},
+		{"memory with mongodb", "memory", "mongodb", ""},
+		{"storage with mongodb", "storage", "mongodb", ""},
+		{"storage needs mongodb", "storage", "memory", "requires storage.type=mongodb"},
+		{"unknown value", "redis", "mongodb", "invalid security.token_blacklist.backend"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validBaseConfig()
+			cfg.Storage.Type = tt.storage
+			cfg.Storage.MongoDB.URI = "mongodb://localhost"
+			cfg.Security.TokenBlacklist.Backend = tt.backend
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() = %v, want error containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 func TestDefaultConfig_StatusCheck(t *testing.T) {
 	sc := defaultConfig().StatusCheck
 	if !sc.Enabled || !sc.StatusListSignerFallback {
