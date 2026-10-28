@@ -485,3 +485,35 @@ func (s *WalletInstanceStore) DeleteForUser(ctx context.Context, id string, tena
 	}
 	return nil
 }
+
+// revokedAfterFilter matches revoked instances whose owner sorts after the given id.
+func revokedAfterFilter(after domain.UserID) bson.M {
+	return bson.M{
+		"status":  domain.InstanceStatusRevoked,
+		"user_id": bson.M{"$gt": after},
+	}
+}
+
+// ListUsersWithRevokedInstances seeks to the next owner once per result, so a
+// user with many revoked instances costs one index lookup, not a scan.
+func (s *WalletInstanceStore) ListUsersWithRevokedInstances(ctx context.Context, after domain.UserID, limit int) ([]domain.UserID, error) {
+	var out []domain.UserID
+	cursor := after
+	for len(out) < limit {
+		var doc struct {
+			UserID domain.UserID `bson:"user_id"`
+		}
+		err := s.collection.FindOne(ctx, revokedAfterFilter(cursor),
+			options.FindOne().SetSort(bson.D{{Key: "user_id", Value: 1}}).SetProjection(bson.M{"user_id": 1}),
+		).Decode(&doc)
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("%w: list users with revoked instances: %v", storage.ErrDatabase, err)
+		}
+		out = append(out, doc.UserID)
+		cursor = doc.UserID
+	}
+	return out, nil
+}

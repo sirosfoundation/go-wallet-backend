@@ -23,6 +23,7 @@ Environment variables use the prefix `WALLET_` (the registry role's settings are
 - [authzen_proxy](#authzen_proxy)
 - [audit](#audit)
 - [presentation](#presentation)
+- [lifecycle](#lifecycle)
 - [status_check](#status_check)
 - [registry](#registry)
 
@@ -325,6 +326,18 @@ Environment prefix: `WALLET_PRESENTATION`
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
 | `presentation.dcql_consent_check` | `WALLET_PRESENTATION_DCQL_CONSENT_CHECK` | DCQLConsentCheckMode | DCQLConsentCheck compares the user's consent (selected credential query ids and disclosed claims) with the DCQL query the backend sent to the client, before any signing. The frontend is not trusted to have honoured the query. Values: `off` (no check); `warn` (default: log a warning with the reason class and query id, never refuse; claim-path matching can disagree with a real verifier's notion of a path, so a deployer opts into enforcement); `enforce` (refuse with PRESENTATION_ERROR and answer the verifier access_denied, without signing). Nothing about claim names or values is logged. Not enforced: credential_sets satisfaction (only that no query outside every option is selected), `values` constraints, and the contents of the resulting vp_token. Unknown values fail at startup. Env: WALLET_PRESENTATION_DCQL_CONSENT_CHECK |
+
+## lifecycle
+
+Environment prefix: `WALLET_LIFECYCLE`
+
+| YAML Key | Env Variable | Type | Description |
+|----------|-------------|------|-------------|
+| `lifecycle.reconciler.enabled` | `WALLET_LIFECYCLE_RECONCILER_ENABLED` | boolean | Enabled controls whether the reconciler runs. On by default: it only completes erasures that revocation already decided on. |
+| `lifecycle.reconciler.dry_run` | `WALLET_LIFECYCLE_RECONCILER_DRY_RUN` | boolean | DryRun runs the full decision (liveness, grace period, leftover-data probe) but writes nothing: the reconciler only logs and counts the users it would erase. Recommended for the first run on an existing deployment. Default: false |
+| `lifecycle.reconciler.interval_seconds` | `WALLET_LIFECYCLE_RECONCILER_INTERVAL_SECONDS` | integer | IntervalSeconds is the time between runs, jittered by up to 10%. Default: 600 (10 minutes) |
+| `lifecycle.reconciler.grace_period_seconds` | `WALLET_LIFECYCLE_RECONCILER_GRACE_PERIOD_SECONDS` | integer | GracePeriodSeconds is how long after a user's latest revocation the reconciler leaves the user alone, so a request in flight on another replica can finish. Keep it above the WIA lifetime. Default: 900 (15 minutes) |
+| `lifecycle.reconciler.batch_size` | `WALLET_LIFECYCLE_RECONCILER_BATCH_SIZE` | integer | BatchSize is the most users examined per run; a cursor walks all users with a revoked instance over successive runs. Default: 50 |
 
 ## status_check
 
