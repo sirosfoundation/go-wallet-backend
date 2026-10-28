@@ -246,6 +246,16 @@ end
 return 0
 `)
 
+// compareAndSetScript updates a pointer only if it still names the value that
+// was observed, so a concurrent Put cannot be overwritten by reconciliation.
+var compareAndSetScript = redis.NewScript(`
+if redis.call("GET", KEYS[1]) == ARGV[1] then
+	redis.call("SET", KEYS[1], ARGV[2], "PX", ARGV[3])
+	return 1
+end
+return 0
+`)
+
 // indexAddLua records a session ID in an expiry-scored sorted set (the user set
 // and the tenant set share it), scored by expiry (unix ms), drops expired
 // members and expires the set with its longest-lived member, so a set cannot
@@ -415,26 +425,71 @@ func (r *RedisSessionStore) Get(ctx context.Context, sessionID string) (*Session
 
 func (r *RedisSessionStore) GetByUser(ctx context.Context, tenantID, userID string) (*SessionData, error) {
 	uk := r.userKey(tenantID, userID)
-	sessionID, err := r.client.Get(ctx, uk).Result()
-	if err == redis.Nil {
-		return r.getByLegacyUser(ctx, tenantID, userID)
-	}
-	if err != nil {
-		return nil, err
-	}
+	for {
+		sessionID, err := r.client.Get(ctx, uk).Result()
+		if err == redis.Nil {
+			legacy, err := r.getByLegacyUser(ctx, tenantID, userID)
+			if err != nil && err != ErrSessionNotFound {
+				return nil, err
+			}
+			currentID, currentErr := r.client.Get(ctx, uk).Result()
+			if currentErr == redis.Nil {
+				return legacy, err
+			}
+			if currentErr != nil {
+				return nil, currentErr
+			}
+			if err == nil && currentID == legacy.ID {
+				return legacy, nil
+			}
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
 
-	session, err := r.Get(ctx, sessionID)
-	if err != ErrSessionNotFound {
-		return session, err
+		session, err := r.Get(ctx, sessionID)
+		if err == ErrSessionNotFound {
+			// The pointer names a session that is gone. During a rolling
+			// upgrade an old replica can replace it under the legacy pointer.
+			// Drop this pointer only if it still names the dead session.
+			if err := compareAndDeleteScript.Run(ctx, r.client, []string{uk}, sessionID).Err(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if session.UserID != userID || normalizeTenant(session.TenantID) != normalizeTenant(tenantID) {
+			if err := compareAndDeleteScript.Run(ctx, r.client, []string{uk}, sessionID).Err(); err != nil {
+				return nil, err
+			}
+			continue
+		}
+
+		legacy, err := r.getByLegacyUser(ctx, tenantID, userID)
+		if err == ErrSessionNotFound || (err == nil && !legacy.CreatedAt.After(session.CreatedAt)) {
+			return session, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+
+		ttl := time.Until(legacy.ExpiresAt)
+		if ttl <= 0 {
+			return session, nil
+		}
+		updated, err := compareAndSetScript.Run(ctx, r.client, []string{uk}, sessionID, legacy.ID, max(1, ttl.Milliseconds())).Int()
+		if err != nil {
+			return nil, err
+		}
+		if updated == 1 {
+			return legacy, nil
+		}
+		// The scoped pointer changed concurrently; read it again and compare
+		// the current live sessions rather than returning a stale candidate.
 	}
-	// The pointer names a session that is gone. During a rolling upgrade an old
-	// replica deletes a (backfilled) session and writes its replacement under
-	// the legacy pointer only, leaving this pointer stale. Drop it - only if it
-	// still names the dead session - and resolve through the legacy pointer.
-	if err := compareAndDeleteScript.Run(ctx, r.client, []string{uk}, sessionID).Err(); err != nil {
-		return nil, err
-	}
-	return r.getByLegacyUser(ctx, tenantID, userID)
 }
 
 // getByLegacyUser resolves a session through the legacy pointer. It is

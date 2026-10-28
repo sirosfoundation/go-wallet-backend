@@ -361,6 +361,30 @@ func TestRedisSessionStore_LegacyBackfillDoesNotOverwriteNewerPointer(t *testing
 	assert.ElementsMatch(t, []string{"old", "new"}, members)
 }
 
+func TestRedisSessionStore_GetByUserPrefersNewerLegacySession(t *testing.T) {
+	store, _ := newTestRedisStore(t)
+	ctx := context.Background()
+	older := redisSess("older", "t1", "u1", time.Hour)
+	older.CreatedAt = time.Now().Add(-time.Hour)
+	seedLegacySession(t, store, older, time.Hour)
+
+	got, err := store.GetByUser(ctx, "t1", "u1")
+	require.NoError(t, err)
+	assert.Equal(t, "older", got.ID)
+
+	newer := redisSess("newer", "t1", "u1", time.Hour)
+	newer.CreatedAt = time.Now()
+	seedLegacySession(t, store, newer, time.Hour)
+
+	got, err = store.GetByUser(ctx, "t1", "u1")
+	require.NoError(t, err)
+	assert.Equal(t, "newer", got.ID)
+
+	stillPresent, err := store.Get(ctx, "older")
+	require.NoError(t, err, "reconciliation must not delete the older session record")
+	assert.Equal(t, "older", stillPresent.ID)
+}
+
 func TestRedisSessionStore_DeleteByUserRemovesEverythingInBatches(t *testing.T) {
 	store, mr := newTestRedisStore(t)
 	ctx := context.Background()
