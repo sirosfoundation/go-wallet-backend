@@ -153,7 +153,7 @@ func TestWIAAssurance_DisabledAlwaysIssuesAndKeepsVerifiedSource(t *testing.T) {
 		t.Fatalf("attestation_source = %v", got)
 	}
 	// development_attested is emitted verbatim without the policy.
-	tok, err = svc.signWIA(map[string]interface{}{"kty": "EC"}, "jkt-12345678", "t", nil, wiaAttestation{Source: "development_attested"}, "c")
+	tok, err = svc.signWIA(context.Background(), map[string]interface{}{"kty": "EC"}, "jkt-12345678", "t", nil, wiaAttestation{Source: "development_attested"}, "c", "", false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -205,7 +205,7 @@ func TestWIAAssurance_ProfileValueAndCertificationInfoAreEmitted(t *testing.T) {
 	if err := svc.applyAssurance(ctx, "jkt-native-12345", &att); err != nil {
 		t.Fatal(err)
 	}
-	tok, err := svc.signWIA(map[string]interface{}{"kty": "EC"}, "jkt-native-12345", "t", nil, att, "c")
+	tok, err := svc.signWIA(context.Background(), map[string]interface{}{"kty": "EC"}, "jkt-native-12345", "t", nil, att, "c", "", false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +231,7 @@ func TestWIAAssurance_ProfileValueAndCertificationInfoAreEmitted(t *testing.T) {
 	if err := svc.applyAssurance(ctx, "jkt-dev-123456", &dev); err != nil {
 		t.Fatal(err)
 	}
-	tok, err = svc.signWIA(map[string]interface{}{"kty": "EC"}, "jkt-dev-123456", "t", nil, dev, "c")
+	tok, err = svc.signWIA(context.Background(), map[string]interface{}{"kty": "EC"}, "jkt-dev-123456", "t", nil, dev, "c", "", false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +298,7 @@ func TestSignWIA_RecordsUnknownWSCDTypeForEverySource(t *testing.T) {
 	svc, instances := newTestWIAServiceWithInstances(t)
 	for i, src := range []string{"platform_attested", "development_attested", "backend_attested"} {
 		jkt := "jkt-wscd-source-" + string(rune('a'+i)) + "12345"
-		if _, err := svc.signWIA(map[string]interface{}{"kty": "EC"}, jkt, "t", nil, wiaAttestation{Source: src}, "c"); err != nil {
+		if _, err := svc.signWIA(context.Background(), map[string]interface{}{"kty": "EC"}, jkt, "t", nil, wiaAttestation{Source: src}, "c", "", false, nil); err != nil {
 			t.Fatal(err)
 		}
 		inst, err := instances.GetByID(context.Background(), jkt)
@@ -315,10 +315,10 @@ func TestSignWIA_RecordsUnknownWSCDTypeForEverySource(t *testing.T) {
 func TestSignWIA_OverwritesLegacyWSCDType(t *testing.T) {
 	svc, instances := newTestWIAServiceWithInstances(t)
 	const jkt = "jkt-legacy-wscd-123"
-	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: jkt, Status: domain.InstanceStatusActive, WSCDType: domain.WSCDTypeNativeIOS}); err != nil {
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: jkt, TenantID: "t", Status: domain.InstanceStatusActive, WSCDType: domain.WSCDTypeNativeIOS}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.signWIA(map[string]interface{}{"kty": "EC"}, jkt, "t", nil, wiaAttestation{Source: "platform_attested"}, "c"); err != nil {
+	if _, err := svc.signWIA(context.Background(), map[string]interface{}{"kty": "EC"}, jkt, "t", nil, wiaAttestation{Source: "platform_attested"}, "c", "", false, nil); err != nil {
 		t.Fatal(err)
 	}
 	inst, _ := instances.GetByID(context.Background(), jkt)
@@ -560,7 +560,7 @@ func TestWIAAssurance_IssuedAuditEventCarriesDecisionAndVerifiedSource(t *testin
 	if err := svc.applyAssurance(context.Background(), "jkt-dev-123456", &att); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.signWIA(map[string]interface{}{"kty": "EC"}, "jkt-dev-123456", "t", nil, att, "c"); err != nil {
+	if _, err := svc.signWIA(context.Background(), map[string]interface{}{"kty": "EC"}, "jkt-dev-123456", "t", nil, att, "c", "", false, nil); err != nil {
 		t.Fatal(err)
 	}
 	p := auditPayload(t, buf)
@@ -581,7 +581,7 @@ func TestWIAAssurance_DisabledAuditEventIsUnchanged(t *testing.T) {
 	svc, _ := newTestWIAService(t)
 	auditor, buf := capturingAuditor(t)
 	svc.audit = auditor
-	if _, err := svc.signWIA(map[string]interface{}{"kty": "EC"}, "jkt-12345678", "t", nil, wiaAttestation{Source: "development_attested"}, "c"); err != nil {
+	if _, err := svc.signWIA(context.Background(), map[string]interface{}{"kty": "EC"}, "jkt-12345678", "t", nil, wiaAttestation{Source: "development_attested"}, "c", "", false, nil); err != nil {
 		t.Fatal(err)
 	}
 	p := auditPayload(t, buf)
@@ -597,10 +597,10 @@ func TestSignWIA_ReattestationUpdatesVerifiedAppID(t *testing.T) {
 	svc, instances := newTestWIAServiceWithInstances(t)
 	const jkt = "jkt-reattest-123456"
 	cnf := map[string]interface{}{"kty": "EC"}
-	if _, err := svc.signWIA(cnf, jkt, "t", nil, wiaAttestation{Source: "backend_attested"}, "c"); err != nil {
+	if _, err := svc.signWIA(context.Background(), cnf, jkt, "t", nil, wiaAttestation{Source: "backend_attested"}, "c", "", false, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := svc.signWIA(cnf, jkt, "t", nil, wiaAttestation{Source: "platform_attested", AppID: "org.example.app"}, "c"); err != nil {
+	if _, err := svc.signWIA(context.Background(), cnf, jkt, "t", nil, wiaAttestation{Source: "platform_attested", AppID: "org.example.app"}, "c", "", false, nil); err != nil {
 		t.Fatal(err)
 	}
 	inst, err := instances.GetByID(context.Background(), jkt)

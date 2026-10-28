@@ -2083,6 +2083,10 @@ type SecurityConfig struct {
 	// TokenBlacklist contains token blacklist/revocation configuration
 	TokenBlacklist TokenBlacklistConfig `yaml:"token_blacklist" envconfig:"TOKEN_BLACKLIST"`
 
+	// DeletionTombstone contains the retention and cleanup settings of the
+	// account-deletion tombstones that keep a deleted user's old tokens refused
+	DeletionTombstone DeletionTombstoneConfig `yaml:"deletion_tombstone" envconfig:"DELETION_TOMBSTONE"`
+
 	// WebAuthn contains WebAuthn-specific security configuration
 	WebAuthn WebAuthnSecurityConfig `yaml:"webauthn" envconfig:"WEBAUTHN"`
 }
@@ -2249,6 +2253,101 @@ func (c *TokenBlacklistConfig) SetDefaults() {
 	if c.CleanupIntervalSeconds == 0 {
 		c.CleanupIntervalSeconds = 3600
 	}
+}
+
+// Upper bounds for DeletionTombstoneConfig, so the conversions to time.Duration
+// cannot overflow: an oversized interval would wrap and make time.NewTicker
+// panic, an oversized margin would wrap the retention into the past.
+const (
+	MaxDeletionTombstoneCleanupIntervalSeconds = 365 * 24 * 3600 // one year
+	MaxDeletionTombstoneRetentionMarginDays    = 36500           // 100 years
+)
+
+// DeletionTombstoneConfig configures the tombstones DeleteUser leaves so that
+// a deleted user's earlier tokens stay refused until they have all expired.
+type DeletionTombstoneConfig struct {
+	// CleanupIntervalSeconds is how often expired tombstones are swept.
+	// The sweeper is what expires tombstones on backends without a TTL index
+	// (memory) and a backstop on MongoDB.
+	// Must be between 0 and 31536000 (one year); 0 means the default.
+	// Default: 3600 (1 hour)
+	CleanupIntervalSeconds int `yaml:"cleanup_interval_seconds" envconfig:"CLEANUP_INTERVAL_SECONDS"`
+
+	// RetentionMarginDays is the safety margin added to the longest token
+	// lifetime (access token, refresh token, AS session; itself floored at one
+	// year, see MinTokenRetention) when a tombstone's expiry is computed.
+	// Must be between 0 and 36500; 0 means the default.
+	// Default: 30
+	RetentionMarginDays int `yaml:"retention_margin_days" envconfig:"RETENTION_MARGIN_DAYS"`
+}
+
+// SetDefaults sets default values for the deletion tombstone settings
+func (c *DeletionTombstoneConfig) SetDefaults() {
+	if c.CleanupIntervalSeconds == 0 {
+		c.CleanupIntervalSeconds = 3600
+	}
+	if c.RetentionMarginDays == 0 {
+		c.RetentionMarginDays = 30
+	}
+}
+
+// MinTokenRetention is the floor for how long a deletion tombstone is kept
+// (365 days). A token carries the expiry of the configuration it was minted
+// under, which may have been longer than the current one; the floor makes
+// retention non-shrinking across configuration changes for earlier
+// configurations with token lifetimes up to a year. Tombstones are tiny and
+// swept afterwards.
+const MinTokenRetention = 365 * 24 * time.Hour
+
+// DeletionTombstoneRetention is how long a deletion tombstone must be kept:
+// the longest bearer-token lifetime (JWT access/refresh, AS token and session
+// TTLs) plus RetentionMarginDays. The lifetimes are floored at
+// MinTokenRetention because tokens carry the expiry of the configuration they
+// were minted under, which may have been longer than the current one.
+func (c *Config) DeletionTombstoneRetention() time.Duration {
+	margin := c.Security.DeletionTombstone
+	margin.SetDefaults()
+
+	longest := saturatingDuration(c.JWT.ExpiryHours, time.Hour)
+	if r := saturatingDuration(c.JWT.RefreshDays, 24*time.Hour); r > longest {
+		longest = r
+	}
+	if c.AS.DefaultTokenTTL > longest {
+		longest = c.AS.DefaultTokenTTL
+	}
+	for _, ttl := range c.AS.AudienceTTLs {
+		if ttl > longest {
+			longest = ttl
+		}
+	}
+	sessionTTL := c.AS.SessionTTL
+	if sessionTTL == 0 {
+		sessionTTL = 24 * time.Hour // ASConfig.SetDefaults
+	}
+	if sessionTTL > longest {
+		longest = sessionTTL
+	}
+	if longest < MinTokenRetention {
+		longest = MinTokenRetention
+	}
+	m := saturatingDuration(margin.RetentionMarginDays, 24*time.Hour)
+	if longest > math.MaxInt64-m {
+		return time.Duration(math.MaxInt64)
+	}
+	return longest + m
+}
+
+// saturatingDuration is n*unit clamped to [0, MaxInt64]: a retention must never
+// wrap into the past, which would let a tombstone be swept while the tokens it
+// guards are still valid.
+func saturatingDuration(n int, unit time.Duration) time.Duration {
+	if n <= 0 {
+		return 0
+	}
+	if int64(n) > math.MaxInt64/int64(unit) {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(n) * unit
 }
 
 // SessionStoreConfig contains WebSocket session store configuration
@@ -2627,6 +2726,10 @@ func defaultConfig() *Config {
 				Enabled:                true, // Enabled by default for security
 				CleanupIntervalSeconds: 3600,
 			},
+			DeletionTombstone: DeletionTombstoneConfig{
+				CleanupIntervalSeconds: 3600,
+				RetentionMarginDays:    30,
+			},
 		},
 		HTTPClient: HTTPClientConfig{
 			Timeout:      30,                                              // 30 seconds default
@@ -2725,6 +2828,12 @@ func (c *Config) Validate() error {
 	}
 	if err := c.Server.validateTrustedProxies(); err != nil {
 		return err
+	}
+	if n := c.Security.DeletionTombstone.CleanupIntervalSeconds; n < 0 || n > MaxDeletionTombstoneCleanupIntervalSeconds {
+		return fmt.Errorf("security.deletion_tombstone.cleanup_interval_seconds must be between 0 and %d", MaxDeletionTombstoneCleanupIntervalSeconds)
+	}
+	if n := c.Security.DeletionTombstone.RetentionMarginDays; n < 0 || n > MaxDeletionTombstoneRetentionMarginDays {
+		return fmt.Errorf("security.deletion_tombstone.retention_margin_days must be between 0 and %d", MaxDeletionTombstoneRetentionMarginDays)
 	}
 
 	// Validate wallet-provider port when explicitly configured

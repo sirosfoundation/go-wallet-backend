@@ -80,6 +80,73 @@ func TestKeyAttestationStore_DistinctKeysDoNotShareEvidence(t *testing.T) {
 	}
 }
 
+func TestKeyAttestationStore_DeleteIfUnchanged(t *testing.T) {
+	ctx := context.Background()
+	kas := NewStore().KeyAttestations()
+
+	first := &domain.KeyAttestationRecord{KeyThumbprint: "t", VerifiedAt: time.Now().UTC()}
+	if err := kas.MarkKeyAttested(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	staleToken := first.WriteToken
+	if staleToken == "" {
+		t.Fatal("MarkKeyAttested must set a write token")
+	}
+	second := &domain.KeyAttestationRecord{KeyThumbprint: "t", VerifiedAt: time.Now().UTC()}
+	if err := kas.MarkKeyAttested(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := kas.DeleteIfUnchanged(ctx, "t", staleToken); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("a superseded write token must not delete, got %v", err)
+	}
+	if err := kas.DeleteIfUnchanged(ctx, "t", ""); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("an empty token must not delete, got %v", err)
+	}
+	if err := kas.DeleteIfUnchanged(ctx, "t", second.WriteToken); err != nil {
+		t.Fatalf("current token: %v", err)
+	}
+	if _, err := kas.GetByKeyThumbprint(ctx, "t"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("record must be gone, got %v", err)
+	}
+}
+
+func TestKeyAttestationStore_RestoreIfUnchanged(t *testing.T) {
+	ctx := context.Background()
+	kas := NewStore().KeyAttestations()
+
+	first := &domain.KeyAttestationRecord{KeyThumbprint: "t", AAGUID: "old", VerifiedAt: time.Now().UTC()}
+	if err := kas.MarkKeyAttested(ctx, first); err != nil {
+		t.Fatal(err)
+	}
+	if first.Previous != nil {
+		t.Fatal("a first insert has no previous evidence")
+	}
+	second := &domain.KeyAttestationRecord{KeyThumbprint: "t", AAGUID: "new", VerifiedAt: time.Now().UTC()}
+	if err := kas.MarkKeyAttested(ctx, second); err != nil {
+		t.Fatal(err)
+	}
+	if second.Previous == nil || second.Previous.AAGUID != "old" {
+		t.Fatalf("Previous = %+v, want the replaced record", second.Previous)
+	}
+	written := *second
+
+	stale := *first
+	if err := kas.RestoreIfUnchanged(ctx, &stale, second.Previous); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("a superseded write must not restore, got %v", err)
+	}
+	if err := kas.RestoreIfUnchanged(ctx, &written, second.Previous); err != nil {
+		t.Fatal(err)
+	}
+	got, err := kas.GetByKeyThumbprint(ctx, "t")
+	if err != nil || got.AAGUID != "old" || !got.CreatedAt.Equal(first.CreatedAt) {
+		t.Fatalf("restored = %+v, %v", got, err)
+	}
+	if err := kas.RestoreIfUnchanged(ctx, &written, second.Previous); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("a restore is itself a new write; replay must not match, got %v", err)
+	}
+}
+
 func TestKeyAttestationStore_UVRoundTripNoDowngrade(t *testing.T) {
 	ctx := context.Background()
 	kas := NewStore().KeyAttestations()
@@ -258,5 +325,78 @@ func TestKeyAttestationStore_ReplaceKeyEvidence(t *testing.T) {
 	got, _ := kas.GetByKeyThumbprint(ctx, "k1")
 	if got.ChainFingerprint != "new" || got.Home != domain.KeyHomeTEE || !got.CreatedAt.Equal(created.CreatedAt) || got.Revoked() {
 		t.Fatalf("got %+v", got)
+	}
+}
+
+// A write that does not land (weaker evidence never replaces stronger) carries
+// no write token and no previous record, so rolling it back is a no-op and
+// cannot delete the stronger record.
+func TestKeyAttestationStore_NoOpWriteHasNoRollbackHandle(t *testing.T) {
+	ctx := context.Background()
+	kas := NewStore().KeyAttestations()
+	strong := &domain.KeyAttestationRecord{KeyThumbprint: "tp-noop", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox, ChainFingerprint: "fp1", VerifiedAt: time.Now().UTC()}
+	must(t, kas.MarkKeyAttested(ctx, strong))
+	weak := &domain.KeyAttestationRecord{KeyThumbprint: "tp-noop", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE, ChainFingerprint: "fp2", VerifiedAt: time.Now().UTC()}
+	must(t, kas.MarkKeyAttested(ctx, weak))
+	eq(t, "", weak.WriteToken)
+	eq(t, true, weak.Previous == nil)
+	isNotFound(t, kas.DeleteIfUnchanged(ctx, "tp-noop", weak.WriteToken))
+	got, err := kas.GetByKeyThumbprint(ctx, "tp-noop")
+	must(t, err)
+	eq(t, domain.KeyHomeStrongBox, got.Home)
+}
+
+// Marking a record revoked and replacing stale evidence are writes of their
+// own: a rollback of the write that stored the record must not undo them.
+func TestKeyAttestationStore_RevokeAndReplaceRotateTheWriteToken(t *testing.T) {
+	ctx := context.Background()
+	kas := NewStore().KeyAttestations()
+	first := &domain.KeyAttestationRecord{KeyThumbprint: "tp-rot", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE, ChainFingerprint: "fp1", VerifiedAt: time.Now().UTC()}
+	must(t, kas.MarkKeyAttested(ctx, first))
+	written := *first
+
+	marked, err := kas.MarkKeyRevoked(ctx, "tp-rot", "fp1", "revoked", time.Now())
+	must(t, err)
+	eq(t, true, marked)
+	isNotFound(t, kas.DeleteIfUnchanged(ctx, "tp-rot", written.WriteToken))
+	isNotFound(t, kas.RestoreIfUnchanged(ctx, &written, &domain.KeyAttestationRecord{KeyThumbprint: "tp-rot", Home: domain.KeyHomeTEE}))
+	got, err := kas.GetByKeyThumbprint(ctx, "tp-rot")
+	must(t, err)
+	eq(t, true, got.Revoked())
+
+	repl := &domain.KeyAttestationRecord{KeyThumbprint: "tp-rot", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox, ChainFingerprint: "fp3", VerifiedAt: time.Now().UTC()}
+	ok, err := kas.ReplaceKeyEvidence(ctx, repl, "fp1")
+	must(t, err)
+	eq(t, true, ok)
+	if repl.WriteToken == "" || repl.WriteToken == written.WriteToken || repl.Previous == nil || repl.Previous.ChainFingerprint != "fp1" {
+		t.Fatalf("replacement handle = token %q previous %+v", repl.WriteToken, repl.Previous)
+	}
+	isNotFound(t, kas.DeleteIfUnchanged(ctx, "tp-rot", written.WriteToken))
+	// The replacement's own handle restores the record it replaced.
+	rolled := *repl
+	must(t, kas.RestoreIfUnchanged(ctx, &rolled, rolled.Previous))
+	got, err = kas.GetByKeyThumbprint(ctx, "tp-rot")
+	must(t, err)
+	eq(t, "fp1", got.ChainFingerprint)
+}
+
+func must(t *testing.T, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func eq(t *testing.T, want, got any) {
+	t.Helper()
+	if want != got {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+}
+
+func isNotFound(t *testing.T, err error) {
+	t.Helper()
+	if !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("err = %v, want ErrNotFound", err)
 	}
 }

@@ -139,7 +139,7 @@ func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *Assur
 		return nil, ErrAssuranceUnavailable
 	}
 
-	kaFacts := assurance.Facts{Fido2: s.fido2EvidenceFor(ctx, thumbprints, overlay)}
+	kaFacts := assurance.Facts{Fido2: s.fido2EvidenceFor(ctx, req.WalletInstanceID, thumbprints, overlay)}
 	if source != "" {
 		kaFacts.Platform = &assurance.PlatformVerified{Source: source, AppID: appID}
 	}

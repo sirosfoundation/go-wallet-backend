@@ -9,6 +9,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
 // WIAChallenge handles POST /wallet-provider/wia/challenge
@@ -60,6 +61,9 @@ type WIAGenerateRequest struct {
 	ClientID string `json:"client_id,omitempty"`
 	// NativeAttestation is optional platform attestation evidence (App Attest / Play Integrity)
 	NativeAttestation *service.NativeAttestationRequest `json:"native_attestation,omitempty"`
+	// CredentialID is the base64url WebAuthn credential id of the passkey this
+	// instance logs in with; revoking the instance refuses that passkey (SID-AUTH-06). Optional.
+	CredentialID string `json:"credential_id,omitempty"`
 	// KeyAttestation is optional evidence about the instance (PoP) key:
 	// {"type": "android_key" | "app_attest_assertion", ...}. See
 	// service.KeyAttestation.
@@ -97,33 +101,21 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 		Challenge:         req.Challenge,
 		ClientID:          req.ClientID,
 		NativeAttestation: req.NativeAttestation,
+		CredentialID:      req.CredentialID,
 		KeyAttestation:    req.KeyAttestation,
 	})
 	if err != nil {
-		switch {
-		case errors.Is(err, service.ErrWIAChallengeExpired):
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":   "CHALLENGE_INVALID",
-				"message": "Challenge is invalid",
-			})
-		case errors.Is(err, service.ErrWIAPopInvalid):
+		status, code, message := wiaFailure(err)
+		switch code {
+		case "POP_INVALID":
 			h.logger.Debug("WIA-PoP validation failed", zap.Error(err))
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":   "POP_INVALID",
-				"message": "WIA-PoP validation failed",
-			})
-		case errors.Is(err, service.ErrWIANativeAttestationUnavailable):
-			h.logger.Warn("native attestation cannot be verified", zap.Error(err))
-			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error":   "NATIVE_ATTESTATION_UNAVAILABLE",
-				"message": "The native attestation cannot be verified right now, retry later",
-			})
-		case errors.Is(err, service.ErrWIAKeyAttestationTypeUnsupported):
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":   "KEY_ATTESTATION_TYPE_UNSUPPORTED",
-				"message": "The key_attestation type is not supported",
-			})
-		case errors.Is(err, service.ErrWIAKeyAttestationNotQualifying):
+		case "WIA_GENERATION_FAILED", "ASSURANCE_UNAVAILABLE", "NATIVE_ATTESTATION_UNAVAILABLE", "KEY_ATTESTATION_UNAVAILABLE":
+			h.logger.Error("Failed to generate WIA", zap.Error(err))
+		default:
+			h.logger.Warn("WIA generation refused", zap.String("code", code), zap.Error(err))
+		}
+		body := gin.H{"error": code, "message": message}
+		if code == "KEY_ATTESTATION_NOT_QUALIFYING" {
 			// The reason is one of the fixed service.NoHome* values, never
 			// text from the evidence.
 			reason := ""
@@ -131,53 +123,51 @@ func (h *Handlers) WIAGenerate(c *gin.Context) {
 			if errors.As(err, &nq) {
 				reason = nq.SafeReason()
 			}
-			h.logger.Info("key attestation does not qualify", zap.String("reason", reason))
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":   "KEY_ATTESTATION_NOT_QUALIFYING",
-				"message": "The key_attestation evidence does not qualify",
-				"details": gin.H{"reason": reason},
-			})
-		case errors.Is(err, service.ErrWIAKeyAttestationInvalid):
-			h.logger.Debug("key attestation rejected", zap.Error(err))
-			c.JSON(http.StatusBadRequest, gin.H{
-				"error":   "KEY_ATTESTATION_INVALID",
-				"message": "The key_attestation evidence is invalid",
-			})
-		case errors.Is(err, service.ErrWIAKeyAttestationUnavailable):
-			h.logger.Warn("key attestation cannot be verified", zap.Error(err))
-			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error":   "KEY_ATTESTATION_UNAVAILABLE",
-				"message": "The key_attestation evidence cannot be verified right now, retry later",
-			})
-		case errors.Is(err, service.ErrWIAInstanceDeactivated):
-			h.logger.Warn("WIA generation refused for deactivated instance", zap.Error(err))
-			c.JSON(http.StatusForbidden, gin.H{
-				"error":   "INSTANCE_DEACTIVATED",
-				"message": "This wallet instance has been suspended or revoked",
-			})
-		case errors.Is(err, service.ErrWIARefusedByPolicy):
-			h.logger.Warn("WIA refused by assurance policy", zap.Error(err))
-			c.JSON(http.StatusForbidden, gin.H{
-				"error":   "WIA_REFUSED_BY_POLICY",
-				"message": "The wallet provider's assurance policy does not permit a Wallet Instance Attestation for this request",
-			})
-		case errors.Is(err, service.ErrAssuranceUnavailable):
-			h.logger.Error("WIA assurance policy unavailable", zap.Error(err))
-			c.JSON(http.StatusServiceUnavailable, gin.H{
-				"error":   "ASSURANCE_UNAVAILABLE",
-				"message": "The assurance policy is enabled but not loaded",
-			})
-		default:
-			h.logger.Error("Failed to generate WIA", zap.Error(err))
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error":   "WIA_GENERATION_FAILED",
-				"message": "Failed to generate Wallet Instance Attestation",
-			})
+			body["details"] = gin.H{"reason": reason}
 		}
+		c.JSON(status, body)
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
 		"wallet_instance_attestation": wia,
 	})
+}
+
+// wiaFailure maps an error from WIAService.GenerateWIA to the HTTP status and
+// the stable error code and message the client sees. Anything it does not
+// recognise is a 500 WIA_GENERATION_FAILED.
+func wiaFailure(err error) (status int, code, message string) {
+	switch {
+	case errors.Is(err, tokengate.ErrRevoked):
+		return http.StatusUnauthorized, "TOKEN_REVOKED", "Token has been revoked"
+	case errors.Is(err, service.ErrWIAChallengeExpired):
+		return http.StatusBadRequest, "CHALLENGE_INVALID", "Challenge is invalid"
+	case errors.Is(err, service.ErrWIACredentialNotOwned):
+		return http.StatusForbidden, "CREDENTIAL_NOT_OWNED", "credential_id must be one of your own registered passkeys"
+	case errors.Is(err, service.ErrWIAPopInvalid):
+		return http.StatusBadRequest, "POP_INVALID", "WIA-PoP validation failed"
+	case errors.Is(err, service.ErrWIAUnknownUser):
+		return http.StatusForbidden, "UNKNOWN_USER", "This account no longer exists"
+	case errors.Is(err, service.ErrWIAInstanceDeactivated):
+		return http.StatusForbidden, "INSTANCE_DEACTIVATED", "This wallet instance is not active"
+	case errors.Is(err, service.ErrWIARefusedByPolicy):
+		return http.StatusForbidden, "WIA_REFUSED_BY_POLICY", "The wallet provider's assurance policy does not permit a Wallet Instance Attestation for this request"
+	case errors.Is(err, service.ErrAssuranceUnavailable):
+		return http.StatusServiceUnavailable, "ASSURANCE_UNAVAILABLE", "The assurance policy is enabled but not loaded"
+	case errors.Is(err, service.ErrWIANativeAttestationUnavailable):
+		return http.StatusServiceUnavailable, "NATIVE_ATTESTATION_UNAVAILABLE", "The native attestation cannot be verified right now, retry later"
+	case errors.Is(err, service.ErrWIAKeyAttestationTypeUnsupported):
+		return http.StatusBadRequest, "KEY_ATTESTATION_TYPE_UNSUPPORTED", "The key_attestation type is not supported"
+	case errors.Is(err, service.ErrWIAKeyAttestationNotQualifying):
+		return http.StatusBadRequest, "KEY_ATTESTATION_NOT_QUALIFYING", "The key_attestation evidence does not qualify"
+	case errors.Is(err, service.ErrWIAKeyAttestationInvalid):
+		return http.StatusBadRequest, "KEY_ATTESTATION_INVALID", "The key_attestation evidence is invalid"
+	case errors.Is(err, service.ErrWIAKeyAttestationUnavailable):
+		return http.StatusServiceUnavailable, "KEY_ATTESTATION_UNAVAILABLE", "The key_attestation evidence cannot be verified right now, retry later"
+	case errors.Is(err, service.ErrWIAInstanceNotOwned):
+		return http.StatusForbidden, "INSTANCE_NOT_OWNED", "This wallet instance is registered to another tenant or user"
+	default:
+		return http.StatusInternalServerError, "WIA_GENERATION_FAILED", "Failed to generate Wallet Instance Attestation"
+	}
 }

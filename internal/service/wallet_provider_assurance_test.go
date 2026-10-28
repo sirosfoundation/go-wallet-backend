@@ -16,6 +16,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 )
@@ -33,7 +34,7 @@ func TestKeyAttestationTrustsBatch_PlatformSourceNames(t *testing.T) {
 	}
 	for source, want := range cases {
 		svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
-		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i", AttestationSource: source, LastAttestedAt: time.Now()}); err != nil {
+		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i", Status: domain.InstanceStatusActive, AttestationSource: source, LastAttestedAt: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
 		jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}
@@ -51,7 +52,7 @@ func TestGenerateKeyAttestation_LegacyPlatformAttestedEndToEnd(t *testing.T) {
 		"platform_attested":    "iso_18045_high",
 		"development_attested": "iso_18045_basic",
 	} {
-		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i-" + source, AttestationSource: source, LastAttestedAt: time.Now()}); err != nil {
+		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i-" + source, Status: domain.InstanceStatusActive, AttestationSource: source, LastAttestedAt: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
 		ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "n", sp, "i-"+source, "")
@@ -70,7 +71,7 @@ func TestGenerateKeyAttestation_AssuranceDisabledKeepsLegacyClamp(t *testing.T) 
 	svc, instances, _ := newTestWalletProviderServiceWithInstances(t)
 	svc.cfg.WalletProvider.Attestation.StatusList = config.StatusListConfig{Enabled: true}
 	svc.SetAssessor(newTestAssessor(t, nil, "# id: all\n(assure-ks (tier (* set basic enhanced-basic moderate high))(evidence))\n"))
-	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i", AttestationSource: "backend_attested"}); err != nil {
+	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i", Status: domain.InstanceStatusActive, AttestationSource: "backend_attested"}); err != nil {
 		t.Fatal(err)
 	}
 	jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}
@@ -247,7 +248,7 @@ func TestAssurance_PlatformSourceIsTheRealStoredString(t *testing.T) {
 		"ios_app_attest":       "iso_18045_basic",
 	} {
 		svc, instances, _ := assuranceSvc(t, nil, rules)
-		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i", AttestationSource: source, LastAttestedAt: time.Now()}); err != nil {
+		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i", Status: domain.InstanceStatusActive, AttestationSource: source, LastAttestedAt: time.Now()}); err != nil {
 			t.Fatal(err)
 		}
 		ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "n", nil, "i", "")
@@ -367,8 +368,15 @@ func TestAssurance_AuditLineHasRuleIDsPolicyHashAndNoNonce(t *testing.T) {
 	svc, _, keys := assuranceSvc(t, nil, fidoRules)
 	core, logs := observer.New(zap.InfoLevel)
 	svc.logger = zap.New(core)
-	markAttested(t, keys, jwks[0], "aa1")
-	markAttested(t, keys, jwks[1], "aa1")
+	for _, j := range jwks {
+		tp, err := jwk.Thumbprint(j)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := keys.MarkKeyAttested(context.Background(), &domain.KeyAttestationRecord{KeyThumbprint: tp, WalletInstanceID: "inst-1", AAGUID: "aa1", VerifiedAt: time.Now()}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	const nonce = "super-secret-nonce-value"
 	if _, err := svc.GenerateKeyAttestation(context.Background(), jwks, nonce, nil, "inst-1", ""); err != nil {
 		t.Fatal(err)
@@ -415,12 +423,12 @@ func TestInstanceOwnership_ForeignInstanceLendsNoEvidence(t *testing.T) {
 		inst   *domain.WalletInstance
 		want   bool
 	}{
-		{"owner", &KeyAttestationCaller{TenantID: "t1", UserID: "owner"}, &domain.WalletInstance{ID: "i", TenantID: "t1", UserID: &owner}, true},
-		{"other tenant", &KeyAttestationCaller{TenantID: "t2", UserID: "owner"}, &domain.WalletInstance{ID: "i", TenantID: "t1", UserID: &owner}, false},
-		{"other user", &KeyAttestationCaller{TenantID: "t1", UserID: "mallory"}, &domain.WalletInstance{ID: "i", TenantID: "t1", UserID: &owner}, false},
-		{"instance without user, same tenant", &KeyAttestationCaller{TenantID: "t1", UserID: "owner"}, &domain.WalletInstance{ID: "i", TenantID: "t1"}, true},
-		{"instance without user, other tenant", &KeyAttestationCaller{TenantID: "t2"}, &domain.WalletInstance{ID: "i", TenantID: "t1"}, false},
-		{"no caller in context: no check", nil, &domain.WalletInstance{ID: "i", TenantID: "t1", UserID: &owner}, true},
+		{"owner", &KeyAttestationCaller{TenantID: "t1", UserID: "owner"}, &domain.WalletInstance{ID: "i", TenantID: "t1", UserID: &owner, Status: domain.InstanceStatusActive}, true},
+		{"other tenant", &KeyAttestationCaller{TenantID: "t2", UserID: "owner"}, &domain.WalletInstance{ID: "i", TenantID: "t1", UserID: &owner, Status: domain.InstanceStatusActive}, false},
+		{"other user", &KeyAttestationCaller{TenantID: "t1", UserID: "mallory"}, &domain.WalletInstance{ID: "i", TenantID: "t1", UserID: &owner, Status: domain.InstanceStatusActive}, false},
+		{"instance without user, same tenant", &KeyAttestationCaller{TenantID: "t1", UserID: "owner"}, &domain.WalletInstance{ID: "i", TenantID: "t1", Status: domain.InstanceStatusActive}, true},
+		{"instance without user, other tenant", &KeyAttestationCaller{TenantID: "t2"}, &domain.WalletInstance{ID: "i", TenantID: "t1", Status: domain.InstanceStatusActive}, false},
+		{"no caller in context: no check", nil, &domain.WalletInstance{ID: "i", TenantID: "t1", UserID: &owner, Status: domain.InstanceStatusActive}, true},
 	}
 	for _, c := range cases {
 		svc, instances, _ := assuranceSvc(t, nil,
@@ -470,11 +478,11 @@ func TestAssurance_ReplacedISOSchemeClaimMatchesExactValueBeforeNormalizing(t *t
 // platform evidence, on both the legacy and the policy path.
 func TestInstanceStatus_DeactivatedInstanceLendsNoEvidence(t *testing.T) {
 	for status, want := range map[domain.InstanceStatus]bool{
-		domain.InstanceStatusActive:    true,
-		"":                             true, // records predating the field
-		domain.InstanceStatusSuspended: false,
-		domain.InstanceStatusRevoked:   false,
-		"something-new":                false,
+		domain.InstanceStatusActive:          true,
+		"":                                   true, // records predating the field
+		domain.InstanceStatusLegacySuspended: false,
+		domain.InstanceStatusRevoked:         false,
+		"something-new":                      false,
 	} {
 		svc, instances, _ := assuranceSvc(t, nil,
 			"# id: plat\n(assure-ks (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2)(platform (source platform_attested)))))\n")
@@ -486,6 +494,14 @@ func TestInstanceStatus_DeactivatedInstanceLendsNoEvidence(t *testing.T) {
 			t.Errorf("status %q: legacy trust = %v, want %v", status, got, want)
 		}
 		ka, err := svc.GenerateKeyAttestation(context.Background(), jwks, "n", nil, "i", "")
+		if !status.IsLive() {
+			// The lifecycle gate refuses a KA for an instance that is not live
+			// (including a record without a status) before any evidence is read.
+			if !errors.Is(err, tokengate.ErrRevoked) {
+				t.Errorf("status %q: GenerateKeyAttestation = %v, want a refusal", status, err)
+			}
+			continue
+		}
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -520,7 +536,7 @@ func TestInstanceFreshness_StalePlatformEvidenceLendsNothing(t *testing.T) {
 			"# id: plat\n(assure-ks (tier (* set basic enhanced-basic moderate))(evidence (verified (fido2)(platform (source platform_attested)))))\n")
 		svc.cfg.WalletProvider.Attestation.LifetimeSeconds = c.lifetime
 		svc.cfg.WalletProvider.WIA.MaxExpirySeconds = c.maxExp
-		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i", AttestationSource: "platform_attested", LastAttestedAt: c.at}); err != nil {
+		if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: "i", Status: domain.InstanceStatusActive, AttestationSource: "platform_attested", LastAttestedAt: c.at}); err != nil {
 			t.Fatal(err)
 		}
 		jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "abc", "y": "def"}}

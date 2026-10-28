@@ -48,6 +48,47 @@ func TestKeyAttestationStore_GetByKeyThumbprint_NotFound(t *testing.T) {
 	require.True(t, errors.Is(err, storage.ErrNotFound))
 }
 
+func TestKeyAttestationStore_DeleteIfUnchanged(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	kas := store.KeyAttestations()
+
+	first := &domain.KeyAttestationRecord{KeyThumbprint: "thumb-mongo-del", VerifiedAt: time.Now().UTC()}
+	require.NoError(t, kas.MarkKeyAttested(ctx, first))
+	stale := first.WriteToken
+	second := &domain.KeyAttestationRecord{KeyThumbprint: "thumb-mongo-del", VerifiedAt: time.Now().UTC()}
+	require.NoError(t, kas.MarkKeyAttested(ctx, second))
+
+	require.ErrorIs(t, kas.DeleteIfUnchanged(ctx, "thumb-mongo-del", stale), storage.ErrNotFound)
+	require.NoError(t, kas.DeleteIfUnchanged(ctx, "thumb-mongo-del", second.WriteToken))
+	_, err := kas.GetByKeyThumbprint(ctx, "thumb-mongo-del")
+	require.ErrorIs(t, err, storage.ErrNotFound)
+}
+
+func TestKeyAttestationStore_RestoreIfUnchanged(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	kas := store.KeyAttestations()
+
+	first := &domain.KeyAttestationRecord{KeyThumbprint: "thumb-mongo-restore", AAGUID: "old", VerifiedAt: time.Now().UTC(), CreatedAt: time.Now().UTC()}
+	require.NoError(t, kas.MarkKeyAttested(ctx, first))
+	require.Nil(t, first.Previous)
+	second := &domain.KeyAttestationRecord{KeyThumbprint: "thumb-mongo-restore", AAGUID: "new", VerifiedAt: time.Now().UTC()}
+	require.NoError(t, kas.MarkKeyAttested(ctx, second))
+	require.NotNil(t, second.Previous)
+	require.Equal(t, "old", second.Previous.AAGUID)
+
+	stale := *first
+	require.ErrorIs(t, kas.RestoreIfUnchanged(ctx, &stale, second.Previous), storage.ErrNotFound)
+	written := *second
+	require.NoError(t, kas.RestoreIfUnchanged(ctx, &written, second.Previous))
+	got, err := kas.GetByKeyThumbprint(ctx, "thumb-mongo-restore")
+	require.NoError(t, err)
+	require.Equal(t, "old", got.AAGUID)
+	require.ErrorIs(t, kas.RestoreIfUnchanged(ctx, &written, second.Previous), storage.ErrNotFound)
+	require.NoError(t, kas.DeleteIfUnchanged(ctx, "thumb-mongo-restore", got.WriteToken))
+}
+
 func TestKeyAttestationStore_UVRoundTripNoDowngrade(t *testing.T) {
 	store := skipIfNoMongo(t)
 	ctx := context.Background()
@@ -302,4 +343,63 @@ func TestKeyAttestationStore_ReplaceKeyEvidence(t *testing.T) {
 	ok, err = kas.ReplaceKeyEvidence(ctx, strong, "old")
 	require.NoError(t, err)
 	require.False(t, ok)
+}
+
+// A write that does not land (weaker evidence never replaces stronger) carries
+// no write token and no previous record, so rolling it back is a no-op and
+// cannot delete the stronger record.
+func TestKeyAttestationStore_NoOpWriteHasNoRollbackHandle(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	kas := store.KeyAttestations()
+	strong := &domain.KeyAttestationRecord{KeyThumbprint: "thumb-mongo-noop", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox, ChainFingerprint: "fp1", VerifiedAt: time.Now().UTC()}
+	require.NoError(t, kas.MarkKeyAttested(ctx, strong))
+	weak := &domain.KeyAttestationRecord{KeyThumbprint: "thumb-mongo-noop", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE, ChainFingerprint: "fp2", VerifiedAt: time.Now().UTC()}
+	require.NoError(t, kas.MarkKeyAttested(ctx, weak))
+	require.Equal(t, "", weak.WriteToken)
+	require.Equal(t, true, weak.Previous == nil)
+	requireNotFound(t, kas.DeleteIfUnchanged(ctx, "thumb-mongo-noop", weak.WriteToken))
+	got, err := kas.GetByKeyThumbprint(ctx, "thumb-mongo-noop")
+	require.NoError(t, err)
+	require.Equal(t, domain.KeyHomeStrongBox, got.Home)
+}
+
+// Marking a record revoked and replacing stale evidence are writes of their
+// own: a rollback of the write that stored the record must not undo them.
+func TestKeyAttestationStore_RevokeAndReplaceRotateTheWriteToken(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	kas := store.KeyAttestations()
+	first := &domain.KeyAttestationRecord{KeyThumbprint: "thumb-mongo-rot", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeTEE, ChainFingerprint: "fp1", VerifiedAt: time.Now().UTC()}
+	require.NoError(t, kas.MarkKeyAttested(ctx, first))
+	written := *first
+
+	marked, err := kas.MarkKeyRevoked(ctx, "thumb-mongo-rot", "fp1", "revoked", time.Now())
+	require.NoError(t, err)
+	require.Equal(t, true, marked)
+	requireNotFound(t, kas.DeleteIfUnchanged(ctx, "thumb-mongo-rot", written.WriteToken))
+	requireNotFound(t, kas.RestoreIfUnchanged(ctx, &written, &domain.KeyAttestationRecord{KeyThumbprint: "thumb-mongo-rot", Home: domain.KeyHomeTEE}))
+	got, err := kas.GetByKeyThumbprint(ctx, "thumb-mongo-rot")
+	require.NoError(t, err)
+	require.Equal(t, true, got.Revoked())
+
+	repl := &domain.KeyAttestationRecord{KeyThumbprint: "thumb-mongo-rot", Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox, ChainFingerprint: "fp3", VerifiedAt: time.Now().UTC()}
+	ok, err := kas.ReplaceKeyEvidence(ctx, repl, "fp1")
+	require.NoError(t, err)
+	require.Equal(t, true, ok)
+	if repl.WriteToken == "" || repl.WriteToken == written.WriteToken || repl.Previous == nil || repl.Previous.ChainFingerprint != "fp1" {
+		t.Fatalf("replacement handle = token %q previous %+v", repl.WriteToken, repl.Previous)
+	}
+	requireNotFound(t, kas.DeleteIfUnchanged(ctx, "thumb-mongo-rot", written.WriteToken))
+	// The replacement's own handle restores the record it replaced.
+	rolled := *repl
+	require.NoError(t, kas.RestoreIfUnchanged(ctx, &rolled, rolled.Previous))
+	got, err = kas.GetByKeyThumbprint(ctx, "thumb-mongo-rot")
+	require.NoError(t, err)
+	require.Equal(t, "fp1", got.ChainFingerprint)
+}
+
+func requireNotFound(t *testing.T, err error) {
+	t.Helper()
+	require.ErrorIs(t, err, storage.ErrNotFound)
 }

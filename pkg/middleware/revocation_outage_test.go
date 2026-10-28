@@ -59,7 +59,7 @@ func TestMongoOutage_RealWiringRefuses(t *testing.T) {
 	})
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	router.Use(TokenAuthMiddleware(v, tenants, svc.TokenBlacklist, zap.NewNop()))
+	router.Use(TokenAuthMiddleware(v, tenants, svc.TokenBlacklist, emptyUsers(), zap.NewNop()))
 	router.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	req := httptest.NewRequest(http.MethodGet, "/test", nil)

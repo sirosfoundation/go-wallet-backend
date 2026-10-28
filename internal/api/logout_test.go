@@ -379,7 +379,7 @@ func logoutRig(t *testing.T, store service.RevocationStore) (router http.Handler
 
 	rig := newSessionTokenRig(t, tokenRevocationChecker{services.TokenBlacklist})
 	r := gin.New()
-	r.Use(middleware.TokenAuthMiddleware(rig.validator, mem.Tenants(), services.TokenBlacklist, logger))
+	r.Use(middleware.TokenAuthMiddleware(rig.validator, mem.Tenants(), services.TokenBlacklist, mem.Users(), logger))
 	r.POST("/user/session/logout", handlers.Logout)
 	r.GET("/user/session/protected", func(c *gin.Context) { c.Status(http.StatusOK) })
 	return r, rig.sign(t, "user-1", "jti-x")
@@ -458,7 +458,7 @@ func TestDeleteUser_LostAckRevocation_RetryCompletesThroughRealMiddleware(t *tes
 
 	rig := newSessionTokenRig(t, tokenRevocationChecker{bl})
 	router := gin.New()
-	router.Use(middleware.TokenAuthMiddleware(rig.validator, mem.Tenants(), bl, logger))
+	router.Use(middleware.TokenAuthMiddleware(rig.validator, mem.Tenants(), bl, mem.Users(), logger))
 	router.DELETE("/user/session", handlers.DeleteUser)
 	router.GET("/user/session/account-info", func(c *gin.Context) { c.Status(http.StatusOK) })
 
@@ -469,8 +469,14 @@ func TestDeleteUser_LostAckRevocation_RetryCompletesThroughRealMiddleware(t *tes
 	require.NoError(t, err, "the user survives the failed attempt")
 	require.True(t, rs.users[user.UUID.String()], "precondition: the revocation was stored")
 
-	require.Equal(t, http.StatusUnauthorized, doReq(router, http.MethodGet, "/user/session/account-info", tok), "a revoked user stays locked out of every other route")
-	require.Equal(t, http.StatusOK, doReq(router, http.MethodDelete, "/user/session", tok), "the retry completes the deletion")
+	// The lifecycle cut-off advanced before the revocation was attempted, so
+	// the request's own token is refused; a retry needs a fresh login.
+	require.Equal(t, http.StatusUnauthorized, doReq(router, http.MethodDelete, "/user/session", tok), "the token that began the deletion is behind the cut-off")
+	time.Sleep(1100 * time.Millisecond) // token iat has one-second resolution
+	fresh := rig.sign(t, user.UUID.String(), "jti-d2")
+
+	require.Equal(t, http.StatusUnauthorized, doReq(router, http.MethodGet, "/user/session/account-info", fresh), "a revoked user stays locked out of every other route (store revocation, not the cut-off)")
+	require.Equal(t, http.StatusOK, doReq(router, http.MethodDelete, "/user/session", fresh), "the retry with a fresh login completes the deletion")
 	_, err = mem.Users().GetByID(context.Background(), user.UUID)
 	require.Error(t, err, "the user is deleted")
 }

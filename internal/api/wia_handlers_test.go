@@ -9,6 +9,8 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +24,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
@@ -64,7 +67,7 @@ func setupWIATestHandlers(t *testing.T, wiaEnabled bool) (*Handlers, *gin.Engine
 		}, &x509.Certificate{SerialNumber: big.NewInt(1)}, &privKey.PublicKey, privKey)
 		certB64 := base64.StdEncoding.EncodeToString(certDER)
 		jwtSigner, _ := signing.NewCryptoSignerES256(privKey)
-		services.WIA = service.NewWIAService(cfg, logger, jwtSigner, []string{certB64}, store.WalletInstances(), nil, nil)
+		services.WIA = service.NewWIAService(cfg, logger, jwtSigner, []string{certB64}, store.WalletInstances(), store.Users(), nil, nil)
 	}
 
 	handlers := NewHandlers(services, cfg, logger, []string{"test"})
@@ -327,5 +330,38 @@ func TestWIAGenerate_NotQualifyingCarriesOnlyTheReasonEnum(t *testing.T) {
 				t.Fatalf("evidence text leaked: %s", w.Body.String())
 			}
 		})
+	}
+}
+
+// WIA refusals are a stable client contract: each service error keeps its status
+// and code; an unknown error is 500.
+func TestWIAFailure_MapsEveryServiceRefusal(t *testing.T) {
+	cases := []struct {
+		err    error
+		status int
+		code   string
+	}{
+		{service.ErrWIAChallengeExpired, http.StatusBadRequest, "CHALLENGE_INVALID"},
+		{service.ErrWIACredentialNotOwned, http.StatusForbidden, "CREDENTIAL_NOT_OWNED"},
+		{service.ErrWIAPopInvalid, http.StatusBadRequest, "POP_INVALID"},
+		{tokengate.ErrRevoked, http.StatusUnauthorized, "TOKEN_REVOKED"},
+		{service.ErrWIAUnknownUser, http.StatusForbidden, "UNKNOWN_USER"},
+		{service.ErrWIAInstanceDeactivated, http.StatusForbidden, "INSTANCE_DEACTIVATED"},
+		{service.ErrWIAInstanceNotOwned, http.StatusForbidden, "INSTANCE_NOT_OWNED"},
+		{service.ErrWIARefusedByPolicy, http.StatusForbidden, "WIA_REFUSED_BY_POLICY"},
+		{service.ErrAssuranceUnavailable, http.StatusServiceUnavailable, "ASSURANCE_UNAVAILABLE"},
+		{service.ErrWIANativeAttestationUnavailable, http.StatusServiceUnavailable, "NATIVE_ATTESTATION_UNAVAILABLE"},
+		{service.ErrWIAKeyAttestationTypeUnsupported, http.StatusBadRequest, "KEY_ATTESTATION_TYPE_UNSUPPORTED"},
+		{service.ErrWIAKeyAttestationNotQualifying, http.StatusBadRequest, "KEY_ATTESTATION_NOT_QUALIFYING"},
+		{service.ErrWIAKeyAttestationInvalid, http.StatusBadRequest, "KEY_ATTESTATION_INVALID"},
+		{service.ErrWIAKeyAttestationUnavailable, http.StatusServiceUnavailable, "KEY_ATTESTATION_UNAVAILABLE"},
+		{fmt.Errorf("wrapped: %w", service.ErrWIAInstanceDeactivated), http.StatusForbidden, "INSTANCE_DEACTIVATED"},
+		{errors.New("storage exploded"), http.StatusInternalServerError, "WIA_GENERATION_FAILED"},
+	}
+	for _, tc := range cases {
+		status, code, message := wiaFailure(tc.err)
+		if status != tc.status || code != tc.code || message == "" {
+			t.Errorf("wiaFailure(%v) = %d %s %q, want %d %s", tc.err, status, code, message, tc.status, tc.code)
+		}
 	}
 }

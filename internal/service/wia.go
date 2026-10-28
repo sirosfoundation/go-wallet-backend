@@ -19,6 +19,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
@@ -30,7 +31,14 @@ var (
 	ErrWIAChallengeExpired     = errors.New("WIA challenge expired or invalid")
 	ErrWIAPopInvalid           = errors.New("WIA-PoP validation failed")
 	ErrWIAChallengeCapacityMax = errors.New("challenge capacity exceeded")
-	ErrWIAInstanceDeactivated  = errors.New("wallet instance is suspended or revoked")
+	ErrWIAInstanceDeactivated  = errors.New("wallet instance is revoked")
+	ErrWIAInstanceNotOwned     = errors.New("wallet instance is bound to another tenant or user")
+	// ErrWIACredentialNotOwned refuses a credential_id that is not one of the
+	// caller's own passkeys (the first link per instance wins).
+	ErrWIACredentialNotOwned = errors.New("credential_id is not one of the caller's passkeys")
+	// ErrWIAUnknownUser refuses an attestation naming a deleted user (the
+	// cut-off went with the record).
+	ErrWIAUnknownUser = errors.New("attestation names a user that does not exist")
 	// ErrWIARefusedByPolicy is returned when the assurance policy is enabled
 	// and no assure-wia-issue rule permits the evidence of this request.
 	ErrWIARefusedByPolicy = errors.New("WIA refused by assurance policy")
@@ -104,13 +112,13 @@ func (cs *challengeStore) put(c *WIAChallenge) bool {
 	return true
 }
 
-// consume removes and returns a challenge if it exists and is not expired.
-func (cs *challengeStore) consume(challenge string) (*WIAChallenge, bool) {
+// consume removes and returns an unexpired challenge minted for tenantID.
+func (cs *challengeStore) consume(tenantID domain.TenantID, challenge string) (*WIAChallenge, bool) {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
 	c, ok := cs.items[challenge]
-	if !ok {
+	if !ok || c.TenantID != tenantID {
 		return nil, false
 	}
 	cs.removeLocked(c)
@@ -168,7 +176,11 @@ type WIAService struct {
 	certChain    []string
 	nativeAttSvc *NativeAttestationService
 	instances    storage.WalletInstanceStore
-	audit        *audit.Emitter
+	// users checks a claimed credential_id; nil refuses every claim.
+	users storage.UserStore
+	audit *audit.Emitter
+	// lifecycle runs the revocation cascade for an instance this service revokes itself.
+	lifecycle *WalletLifecycleService
 
 	// keyAttestations holds per-key evidence verified by the backend. The WIA
 	// path reads it for the PoP (instance) key only; nil means no evidence is
@@ -199,9 +211,12 @@ type WIAService struct {
 	startOnce sync.Once
 }
 
+// SetLifecycle wires the lifecycle service used for self-revocation.
+func (s *WIAService) SetLifecycle(l *WalletLifecycleService) { s.lifecycle = l }
+
 // NewWIAService creates a new WIA service.
 // It shares the same signing key as the WalletProviderService (same x5c chain).
-func NewWIAService(cfg *config.Config, logger *zap.Logger, jwtSigner *signing.CryptoSignerES256, certChain []string, instances storage.WalletInstanceStore, auditor *audit.Emitter, challengeStore WIAChallengeStore) *WIAService {
+func NewWIAService(cfg *config.Config, logger *zap.Logger, jwtSigner *signing.CryptoSignerES256, certChain []string, instances storage.WalletInstanceStore, users storage.UserStore, auditor *audit.Emitter, challengeStore WIAChallengeStore) *WIAService {
 	if challengeStore == nil {
 		challengeStore = newMemoryWIAChallengeStore(maxChallenges, maxChallengesPerTenant)
 	}
@@ -211,6 +226,7 @@ func NewWIAService(cfg *config.Config, logger *zap.Logger, jwtSigner *signing.Cr
 		jwtSigner:  jwtSigner,
 		certChain:  certChain,
 		instances:  instances,
+		users:      users,
 		audit:      auditor,
 		challenges: challengeStore,
 	}
@@ -306,8 +322,8 @@ func (s *WIAService) CreateChallenge(ctx context.Context, tenantID domain.Tenant
 }
 
 // consumeChallenge validates and removes a challenge (single-use).
-func (s *WIAService) consumeChallenge(ctx context.Context, challenge string) error {
-	ok, err := s.challenges.Consume(ctx, challenge)
+func (s *WIAService) consumeChallenge(ctx context.Context, tenantID domain.TenantID, challenge string) error {
+	ok, err := s.challenges.Consume(ctx, tenantID, challenge)
 	if err != nil {
 		return fmt.Errorf("consume challenge: %w", err)
 	}
@@ -349,6 +365,9 @@ type WIARequest struct {
 	ClientID string `json:"client_id,omitempty"`
 	// NativeAttestation is optional platform attestation evidence
 	NativeAttestation *NativeAttestationRequest `json:"native_attestation,omitempty"`
+	// CredentialID is the optional base64url credential id of the instance's
+	// login passkey (SID-AUTH-06).
+	CredentialID string `json:"credential_id,omitempty"`
 	// KeyAttestation is optional evidence about the instance (PoP) key
 	// itself; see instance_key_evidence.go. Absent: the home stays unknown.
 	KeyAttestation *KeyAttestation `json:"key_attestation,omitempty"`
@@ -365,7 +384,7 @@ type WIAPopClaims struct {
 // recorded against the wallet instance so admin views/ownership checks work correctly.
 // userID is the authenticated caller's user ID, if known (may be nil) — recorded
 // against the instance so GetByUser / ListWalletInstancesByUser can find it.
-func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID, req *WIARequest) (string, error) {
+func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID, req *WIARequest) (wia string, err error) {
 	if !s.IsSupported() {
 		return "", ErrWIANotSupported
 	}
@@ -379,11 +398,22 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 		return "", err
 	}
 
+	// Evidence this request wrote is undone (conditionally on its own write)
+	// when the request is then refused for a lifecycle reason: the instance was
+	// revoked or taken, the user is gone or the token was cut off meanwhile. A
+	// refused request must not leave key evidence behind.
+	var submitted *domain.KeyAttestationRecord
+	defer func() {
+		if err != nil && submitted != nil && isLifecycleRefusal(err) {
+			err = s.undoKeyEvidenceWrite(ctx, submitted, err)
+		}
+	}()
+
 	// Step 1: Consume challenge (single-use, atomic).
 	// Must happen before PoP validation to prevent concurrent crypto amplification
 	// attacks on the same challenge (TOCTOU). The trade-off is that a malformed PoP
 	// burns the nonce, but this is acceptable — the nonce is single-use anyway.
-	if err := s.consumeChallenge(ctx, req.Challenge); err != nil {
+	if err := s.consumeChallenge(ctx, tenantID, req.Challenge); err != nil {
 		s.emitAuditFailure("challenge_invalid", err)
 		return "", err
 	}
@@ -406,23 +436,64 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 		return "", fmt.Errorf("%w: %v", ErrWIAPopInvalid, err)
 	}
 
-	// Step 2.5: Reject issuance for instances an admin has suspended or revoked.
+	// The named user must still exist: the cut-off goes with a deleted account.
+	if err := s.refuseIfUserGone(ctx, userID); err != nil {
+		return "", err
+	}
+
+	// Step 2.5: Reject issuance for instances an admin has revoked.
 	// Without this check, a wallet that still holds its instance key could simply
 	// request a fresh challenge/PoP and obtain a brand-new valid WIA, completely
 	// bypassing revocation.
+	firstAttestation := false
+	// before is the pre-write record, restored if the cut-off lands after the Upsert.
+	var before *domain.WalletInstance
 	if s.instances != nil {
 		existing, err := s.instances.GetByID(ctx, jkt)
 		switch {
 		case err == nil:
-			if existing.Status != domain.InstanceStatusActive {
+			before = existing
+			// Ownership before lifecycle: do not leak another wallet's state.
+			if err := checkInstanceBinding(existing, tenantID, userID); err != nil {
+				s.emitAuditFailure("instance_binding_mismatch", err)
+				return "", err
+			}
+			if !existing.Status.IsLive() {
+				if !existing.Status.IsKnownNonLive() {
+					s.emitAuditFailure("instance_status_unrecognized", fmt.Errorf("instance %s has unrecognized status %q", existing.ID, existing.Status))
+					return "", fmt.Errorf("check wallet instance status: instance %s has unrecognized status %q: %w", existing.ID, existing.Status, errInstanceStatusUnrecognized)
+				}
 				s.emitAuditFailure("instance_deactivated", fmt.Errorf("wallet instance status is %s", existing.Status))
 				return "", fmt.Errorf("%w: status is %s", ErrWIAInstanceDeactivated, existing.Status)
 			}
+			if existing.UserID == nil && userID != nil {
+				// First user binding of an anonymous instance counts as a new instance:
+				// a deactivated wallet must not adopt it (re-checked after the write).
+				firstAttestation = true
+				if err := s.refuseIfWalletDeactivated(ctx, tenantID, userID); err != nil {
+					return "", err
+				}
+			}
 		case errors.Is(err, storage.ErrNotFound):
-			// First attestation for this instance key — nothing to check yet.
+			firstAttestation = true
+			// A first attestation must not revive a deactivated wallet (SID-AUTH-06).
+			if err := s.refuseIfWalletDeactivated(ctx, tenantID, userID); err != nil {
+				return "", err
+			}
 		default:
 			return "", fmt.Errorf("check wallet instance status: %w", err)
 		}
+	}
+
+	// Step 2.6: a claimed passkey link must be the caller's own passkey.
+	if err := s.checkCredentialOwnership(ctx, tenantID, userID, req.CredentialID); err != nil {
+		s.emitAuditFailure("credential_not_owned", err)
+		return "", err
+	}
+
+	// Re-judge the token against the cut-off, which may have advanced since the middleware.
+	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
+		return "", err
 	}
 
 	// Step 3: Determine attestation source
@@ -463,7 +534,6 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	// Step 3.3: evidence the client submitted about that key is verified and
 	// stored first, so the lookup below sees it. Invalid evidence refuses the
 	// WIA; evidence that names no home changes nothing.
-	var submitted *domain.KeyAttestationRecord
 	if keyVerifier != nil {
 		submitted, err = s.verifyKeyAttestation(ctx, keyVerifier, req.KeyAttestation, tenantID, userIDString(userID), jkt, popKey, req.Challenge)
 		if err != nil {
@@ -500,7 +570,7 @@ func (s *WIAService) GenerateWIA(ctx context.Context, tenantID domain.TenantID, 
 	}
 
 	// Step 4: Generate WIA JWT
-	return s.signWIA(cnfJWK, jkt, tenantID, userID, att, req.ClientID)
+	return s.signWIA(ctx, cnfJWK, jkt, tenantID, userID, att, req.ClientID, req.CredentialID, firstAttestation, before)
 }
 
 // wiaAttestation is what one WIA request established and decided.
@@ -823,7 +893,9 @@ func effectiveWIALifetime(cfg *config.Config) (lifetime time.Duration, unset boo
 // signWIA creates the WIA JWT (typ: oauth-client-attestation+jwt).
 // jkt is the JWK Thumbprint of cnfJWK, precomputed by the caller (GenerateWIA)
 // so it can also be used for the instance-status guard before signing.
-func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, att wiaAttestation, clientID string) (string, error) {
+// firstAttestation: the record did not exist at the lifecycle check (or was anonymous); re-checked after the write.
+// before: the record as read at that check (nil when absent), restored if the write is fenced out.
+func (s *WIAService) signWIA(ctx context.Context, cnfJWK map[string]interface{}, jkt string, tenantID domain.TenantID, userID *domain.UserID, att wiaAttestation, clientID string, credentialID string, firstAttestation bool, before *domain.WalletInstance) (string, error) {
 	now := time.Now()
 	attestationSource := att.Source
 	claimSource := att.Claim
@@ -831,16 +903,7 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 		claimSource = att.Source
 	}
 
-	// WIA lifetime, capped by WIA max expiry. Deliberately short (default
-	// 300s / 5 min, see AttestationConfig) — this wallet provider has no
-	// client_status/revocation-chaining mechanism (see below); a short
-	// lifetime is the actual mechanism bounding exposure from a
-	// compromised/revoked wallet instance.
-	lifetime, lifetimeUnset := effectiveWIALifetime(s.cfg)
-	if lifetimeUnset {
-		s.logger.Warn("attestation.lifetime_seconds not set, defaulting to max_expiry_seconds",
-			zap.Duration("lifetime", lifetime))
-	}
+	lifetime := s.wiaLifetime()
 
 	// sub: draft-ietf-oauth-attestation-based-client-auth-10 requires "the sub
 	// claim MUST specify client_id value of the OAuth Client" - NOT the
@@ -968,15 +1031,26 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 		return "", err
 	}
 
+	// Final cut-off check at the mutation boundary, after the slow steps. Fail closed.
+	if err := tokengate.RefuseNow(ctx, s.users); err != nil {
+		return "", err
+	}
+
 	wiaGeneratedTotal.WithLabelValues(claimSource).Inc()
 	s.logger.Info("WIA generated", zap.String("jkt", jkt[:8]+"..."))
 
+	var written *domain.WalletInstance
 	// Record wallet instance (upsert: creates on first attestation, updates on subsequent).
-	// Status is only ever set here for a brand-new instance (defaults to Active on
-	// insert); Upsert must not overwrite the status of an existing instance — that
-	// would silently undo an admin suspend/revoke the next time this instance
-	// successfully re-attests. See the guard in GenerateWIA above.
+	// Upsert never overwrites the status of an existing instance (that would undo a revocation).
 	if s.instances != nil {
+		// Serialize with the lifecycle cascade (#330, in-process).
+		if s.lifecycle != nil && userID != nil {
+			defer s.lifecycle.LockUser(*userID)()
+			// Re-check under the lock: account deletion may have completed meanwhile.
+			if err := s.refuseIfUserGone(ctx, userID); err != nil {
+				return "", err
+			}
+		}
 		now := time.Now().UTC()
 		instance := &domain.WalletInstance{
 			ID:       jkt,
@@ -988,6 +1062,7 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 			// Integrity key. Its home is only known from verified per-key
 			// evidence for that very key; without it the type is unknown (never
 			// derived from the platform attestation or a client-reported plugin).
+			CredentialID:      credentialID,
 			WSCDType:          instanceWSCDType(att.KeyEvidence),
 			AttestationSource: attestationSource,
 			VerifiedAppID:     att.AppID,
@@ -995,9 +1070,45 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 			CreatedAt:         now,
 			UpdatedAt:         now,
 		}
-		if err := s.instances.Upsert(context.Background(), instance); err != nil {
-			s.logger.Warn("failed to record wallet instance", zap.Error(err), zap.String("jkt", jkt[:8]+"..."))
+		if err := s.instances.Upsert(ctx, instance); err != nil {
+			if errors.Is(err, storage.ErrAlreadyExists) {
+				s.emitAuditFailure("instance_not_owned", err)
+				return "", fmt.Errorf("%w: instance belongs to another tenant", ErrWIAInstanceNotOwned)
+			}
+			// Deleted and re-attested between upsert and bind/link: refuse.
+			if errors.Is(err, storage.ErrBindingChanged) {
+				s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was replaced during attestation"))
+				return "", fmt.Errorf("%w: instance was replaced during attestation", ErrWIAInstanceNotOwned)
+			}
+			s.emitAuditFailure("instance_record_failed", err)
+			return "", fmt.Errorf("record wallet instance: %w", err)
 		}
+		// The compensating revocation of a bound key in a deactivated wallet keeps
+		// the record as a tombstone attributable to its owner: no restore there.
+		if firstAttestation {
+			if err := s.revokeIfWalletDeactivatedMeanwhile(ctx, tenantID, userID, jkt); err != nil {
+				return "", err
+			}
+		}
+		if err := s.recheckLifecycleAfterWrite(ctx, tenantID, userID, jkt, credentialID, false); err != nil {
+			// A refused request must not leave its attestation or passkey link on
+			// a pre-existing record.
+			return "", s.restorePreexisting(ctx, before, instance, err)
+		}
+		written = instance
+		if err := s.fenceInstanceWrite(ctx, before, instance); err != nil {
+			return "", err
+		}
+	}
+
+	// A cut-off landing after the fence must still stop the token, and undo the
+	// record this request wrote.
+	if written != nil {
+		if err := s.fenceInstanceWrite(ctx, before, written); err != nil {
+			return "", err
+		}
+	} else if err := tokengate.RefuseNow(ctx, s.users); err != nil {
+		return "", err
 	}
 
 	// Emit audit event
@@ -1015,6 +1126,316 @@ func (s *WIAService) signWIA(cnfJWK map[string]interface{}, jkt string, tenantID
 	}
 
 	return tokenString, nil
+}
+
+// wiaLifetime is attestation.lifetime_seconds capped by wia.max_expiry_seconds.
+func (s *WIAService) wiaLifetime() time.Duration {
+	// Short on purpose: there is no revocation chaining, so lifetime bounds exposure.
+	lifetime, unset := effectiveWIALifetime(s.cfg)
+	if unset {
+		s.logger.Warn("attestation.lifetime_seconds not set, defaulting to max_expiry_seconds",
+			zap.Duration("lifetime", lifetime))
+	}
+	return lifetime
+}
+
+// checkInstanceBinding refuses a caller from another tenant or user before
+// signing. First user binding of an anonymous instance is allowed.
+func checkInstanceBinding(existing *domain.WalletInstance, tenantID domain.TenantID, userID *domain.UserID) error {
+	if existing.TenantID != tenantID {
+		return fmt.Errorf("%w: instance belongs to another tenant", ErrWIAInstanceNotOwned)
+	}
+	if existing.UserID != nil && userID != nil && *existing.UserID != *userID {
+		return fmt.Errorf("%w: instance belongs to another user", ErrWIAInstanceNotOwned)
+	}
+	return nil
+}
+
+// fenceInstanceWrite refuses the request if the cut-off landed during the
+// Upsert, removing the record it wrote. A record this request's Upsert inserted
+// (written.Inserted, reported by the store, not inferred from an earlier read
+// that another replica may have raced) is always removed; a pre-existing one only when the account was deleted, since the
+// deletion sweep may have run before the Upsert recreated it. The removal is
+// conditional on the written binding, so a record replaced since is untouched.
+// A pre-existing record kept after a logout or lifecycle cut-off is restored to
+// before (counter, attestation fields, and the owner or passkey link this
+// request set), so a refused request leaves no link behind.
+func (s *WIAService) fenceInstanceWrite(ctx context.Context, before, written *domain.WalletInstance) error {
+	err := tokengate.RefuseNow(ctx, s.users)
+	if err == nil {
+		return nil
+	}
+	if !written.Inserted && !errors.Is(err, tokengate.ErrAccountDeleted) {
+		return s.restorePreexisting(ctx, before, written, err)
+	}
+	id, tenantID, binding := written.ID, written.TenantID, written.Binding()
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	switch rerr := s.instances.DeleteIfRemovable(rctx, id, tenantID, binding); {
+	case rerr == nil,
+		errors.Is(rerr, storage.ErrNotFound),
+		errors.Is(rerr, storage.ErrBindingChanged),
+		errors.Is(rerr, domain.ErrInvalidStatusTransition):
+		// Gone, replaced by another request's record, or a tombstone that must survive.
+	default:
+		s.emitAuditFailure("instance_rollback_failed", rerr)
+		return errors.Join(err, fmt.Errorf("%w: %w", tokengate.ErrWriteNotRolledBack, rerr))
+	}
+	return err
+}
+
+// restorePreexisting undoes this request's Upsert on a record that existed
+// before it (counter, attestation fields, and the owner or passkey link it
+// set), returning cause, joined with ErrWriteNotRolledBack if the restore
+// failed. Status is never touched, so a compensating revocation's tombstone
+// stays. A record this request inserted, or one with no pre-write snapshot, is
+// left to the caller's own handling.
+func (s *WIAService) restorePreexisting(ctx context.Context, before, written *domain.WalletInstance, cause error) error {
+	if before == nil || written.Inserted {
+		return cause
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	switch rerr := s.instances.RestoreAttestation(rctx, before, written); {
+	case rerr == nil,
+		errors.Is(rerr, storage.ErrNotFound),
+		errors.Is(rerr, storage.ErrBindingChanged):
+		// Restored, gone, or a newer write owns the record.
+		return cause
+	default:
+		s.emitAuditFailure("instance_restore_failed", rerr)
+		return errors.Join(cause, fmt.Errorf("%w: %w", tokengate.ErrWriteNotRolledBack, rerr))
+	}
+}
+
+// recheckLifecycleAfterWrite closes the window between GenerateWIA's checks
+// and the write (Upsert preserves a concurrent revocation, but the WIA is signed).
+func (s *WIAService) recheckLifecycleAfterWrite(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID, jkt, credentialID string, firstAttestation bool) error {
+	if firstAttestation {
+		if err := s.revokeIfWalletDeactivatedMeanwhile(ctx, tenantID, userID, jkt); err != nil {
+			return err
+		}
+	}
+	inst, err := s.instances.GetByID(ctx, jkt)
+	if err != nil {
+		return fmt.Errorf("re-check wallet instance status: %w", err)
+	}
+	// Ownership before lifecycle, as in GenerateWIA.
+	if inst.TenantID != tenantID {
+		s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was recorded in another tenant during attestation"))
+		return fmt.Errorf("%w: instance belongs to another tenant", ErrWIAInstanceNotOwned)
+	}
+	if userID != nil && inst.UserID != nil && *inst.UserID != *userID {
+		s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was bound to another user during attestation"))
+		return fmt.Errorf("%w: instance was bound to another user", ErrWIAInstanceNotOwned)
+	}
+	if !inst.Status.IsLive() {
+		if !inst.Status.IsKnownNonLive() {
+			s.emitAuditFailure("instance_status_unrecognized", fmt.Errorf("instance %s has unrecognized status %q", inst.ID, inst.Status))
+			return fmt.Errorf("re-check wallet instance status: instance %s has unrecognized status %q: %w", inst.ID, inst.Status, errInstanceStatusUnrecognized)
+		}
+		s.emitAuditFailure("instance_deactivated", fmt.Errorf("wallet instance became %s during attestation", inst.Status))
+		return fmt.Errorf("%w: status is %s", ErrWIAInstanceDeactivated, inst.Status)
+	}
+	// The link is permanent (first link wins).
+	if credentialID != "" && inst.CredentialID != "" && inst.CredentialID != credentialID {
+		s.emitAuditFailure("credential_not_owned", errors.New("wallet instance is linked to a different passkey"))
+		return fmt.Errorf("%w: this instance is already linked to a different passkey", ErrWIACredentialNotOwned)
+	}
+	return nil
+}
+
+// refuseIfUserGone refuses an attestation naming a missing user.
+func (s *WIAService) refuseIfUserGone(ctx context.Context, userID *domain.UserID) error {
+	if userID == nil || s.users == nil {
+		return nil
+	}
+	if _, err := s.users.GetByID(ctx, *userID); err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			if derr := tokengate.RefuseIfDeleted(ctx, s.users, userID.String()); derr != nil {
+				s.emitAuditFailure("account_deleted", derr)
+				return derr
+			}
+			s.emitAuditFailure("unknown_user", errors.New("attestation names a user that does not exist"))
+			return ErrWIAUnknownUser
+		}
+		return fmt.Errorf("check attesting user: %w", err)
+	}
+	return nil
+}
+
+// refuseIfWalletDeactivated returns ErrWIAInstanceDeactivated when the user
+// has instances in the tenant and none is live. Anonymous attestations pass.
+func (s *WIAService) refuseIfWalletDeactivated(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID) error {
+	if userID == nil {
+		return nil
+	}
+	instances, err := s.instances.GetByUser(ctx, tenantID, *userID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("check wallet lifecycle: %w", err)
+	}
+	if len(instances) == 0 {
+		return nil
+	}
+	var unknown *domain.WalletInstance
+	for _, inst := range instances {
+		if inst.Status.IsLive() {
+			return nil
+		}
+		if !inst.Status.IsKnownNonLive() {
+			unknown = inst
+		}
+	}
+	if unknown != nil {
+		s.emitAuditFailure("instance_status_unrecognized", fmt.Errorf("instance %s has unrecognized status %q", unknown.ID, unknown.Status))
+		return fmt.Errorf("check wallet lifecycle: instance %s has unrecognized status %q: %w", unknown.ID, unknown.Status, errInstanceStatusUnrecognized)
+	}
+	s.emitAuditFailure("wallet_deactivated", errors.New("no live wallet instance remains for the user"))
+	return fmt.Errorf("%w: wallet deactivated, no live instance remains", ErrWIAInstanceDeactivated)
+}
+
+// revokeIfWalletDeactivatedMeanwhile is the post-insert half of the
+// first-attestation guard: if all the user's other instances are revoked, the
+// new one is revoked too and the attestation refused.
+func (s *WIAService) revokeIfWalletDeactivatedMeanwhile(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID, newID string) error {
+	if userID == nil {
+		return nil
+	}
+	instances, err := s.instances.GetByUser(ctx, tenantID, *userID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("re-check wallet lifecycle: %w", err)
+	}
+	others := 0
+	var unknown *domain.WalletInstance
+	for _, inst := range instances {
+		if inst.ID == newID {
+			continue
+		}
+		others++
+		if inst.Status.IsLive() {
+			return nil
+		}
+		if !inst.Status.IsKnownNonLive() {
+			unknown = inst
+		}
+	}
+	if others == 0 {
+		return nil
+	}
+	if unknown != nil {
+		// An unrecognised status must not trigger the destructive revoke.
+		s.emitAuditFailure("instance_status_unrecognized", fmt.Errorf("instance %s has unrecognized status %q", unknown.ID, unknown.Status))
+		return fmt.Errorf("re-check wallet lifecycle: instance %s has unrecognized status %q: %w", unknown.ID, unknown.Status, errInstanceStatusUnrecognized)
+	}
+	// A racing first attestation may have inserted newID under another owner;
+	// revoking would destroy the winner's instance, so re-read and refuse.
+	inserted, err := s.instances.GetByID(ctx, newID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("re-check wallet instance ownership: %w", err)
+	}
+	if inserted.TenantID != tenantID {
+		s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was recorded in another tenant during attestation"))
+		return fmt.Errorf("%w: instance belongs to another tenant", ErrWIAInstanceNotOwned)
+	}
+	if inserted.UserID != nil && *inserted.UserID != *userID {
+		s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was bound to another user during attestation"))
+		return fmt.Errorf("%w: instance was bound to another user", ErrWIAInstanceNotOwned)
+	}
+	const reason = "wallet deactivated during attestation"
+	revokedHere := true
+	// Conditional on owner and generation: the read and write are not atomic.
+	if err := s.instances.UpdateStatusIfUnchanged(ctx, newID, tenantID, inserted.Binding(), domain.InstanceStatusRevoked, reason); err != nil {
+		if errors.Is(err, storage.ErrBindingChanged) || errors.Is(err, storage.ErrNotFound) {
+			s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was replaced during attestation"))
+			return fmt.Errorf("%w: instance was replaced during attestation", ErrWIAInstanceNotOwned)
+		}
+		if !errors.Is(err, domain.ErrInvalidStatusTransition) {
+			return fmt.Errorf("revoke instance of deactivated wallet: %w", err)
+		}
+		// The store reports both "already revoked" and "status cannot be revoked"
+		// this way: only a persisted revocation of this very record is the intended outcome.
+		cur, gerr := s.instances.GetByID(ctx, newID)
+		if gerr != nil {
+			return fmt.Errorf("re-read instance after refused revocation: %w", errors.Join(err, gerr))
+		}
+		if cur.TenantID != tenantID || !inserted.Binding().Matches(cur) {
+			s.emitAuditFailure("instance_not_owned", errors.New("wallet instance was replaced during attestation"))
+			return fmt.Errorf("%w: instance was replaced during attestation", ErrWIAInstanceNotOwned)
+		}
+		if cur.Status != domain.InstanceStatusRevoked {
+			s.emitAuditFailure("instance_status_unrecognized", fmt.Errorf("instance %s has unrecognized status %q", cur.ID, cur.Status))
+			return fmt.Errorf("revoke instance of deactivated wallet: instance %s has status %q: %w", cur.ID, cur.Status, err)
+		}
+		inserted, revokedHere = cur, false
+	}
+	if s.audit != nil && revokedHere {
+		s.audit.EmitWithSubject(set.EventWIRevoked, newID, map[string]any{
+			"status": string(domain.InstanceStatusRevoked),
+			"reason": reason,
+			"actor":  "provider",
+		})
+	}
+	s.emitAuditFailure("wallet_deactivated", errors.New("wallet deactivated while the first attestation was in flight"))
+	// The cascade that revoked the last other instance may have kept the wallet
+	// data because it saw this record as active, or may have failed after the
+	// status change; re-decide now.
+	if s.lifecycle != nil {
+		inserted.Status = domain.InstanceStatusRevoked
+		if err := s.lifecycle.CascadeForRevokedLocked(ctx, tenantID, inserted, LifecycleActor{Kind: "provider"}); err != nil {
+			s.logger.Error("cascade after revoking a raced first attestation did not complete", zap.Error(err), zap.String("jkt", newID))
+			return fmt.Errorf("%w: wallet deactivated during attestation: %w", ErrWIAInstanceDeactivated, err)
+		}
+	}
+	return fmt.Errorf("%w: wallet deactivated during attestation", ErrWIAInstanceDeactivated)
+}
+
+// checkCredentialOwnership refuses a credential_id the caller cannot prove is
+// theirs (empty is fine). The credential must belong to this tenant; legacy
+// credentials count as the default tenant, as in the login path.
+func (s *WIAService) checkCredentialOwnership(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID, credentialID string) error {
+	if credentialID == "" {
+		return nil
+	}
+	if userID == nil {
+		return fmt.Errorf("%w: an anonymous attestation cannot claim a passkey", ErrWIACredentialNotOwned)
+	}
+	if s.users == nil {
+		return fmt.Errorf("%w: passkey ownership cannot be verified here", ErrWIACredentialNotOwned)
+	}
+	user, err := s.users.GetByID(ctx, *userID)
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return fmt.Errorf("%w: unknown user", ErrWIACredentialNotOwned)
+		}
+		return fmt.Errorf("check passkey ownership: %w", err)
+	}
+	wantTenant := tenantID
+	if wantTenant == "" {
+		wantTenant = domain.DefaultTenantID
+	}
+	for _, cred := range user.WebauthnCredentials {
+		if cred.ID != credentialID {
+			continue
+		}
+		credTenant := cred.TenantID
+		if credTenant == "" {
+			credTenant = domain.DefaultTenantID
+		}
+		if credTenant != wantTenant {
+			return fmt.Errorf("%w: the passkey belongs to another tenant", ErrWIACredentialNotOwned)
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: the user has no such passkey", ErrWIACredentialNotOwned)
 }
 
 // CleanupExpiredChallenges removes expired challenges from the store.
@@ -1116,4 +1537,45 @@ func instanceKeyAudit(rec *domain.KeyAttestationRecord, field func(*assurance.In
 		}
 	}
 	return assurance.None
+}
+
+// errInstanceStatusUnrecognized marks a refusal because an instance status is
+// not one this build knows (fail closed).
+var errInstanceStatusUnrecognized = errors.New("instance status not recognized")
+
+// isLifecycleRefusal reports whether err refuses a request because the
+// instance, its owner, the user or the token's authorization changed
+// lifecycle: the refusals after which the request must leave no key evidence
+// behind.
+func isLifecycleRefusal(err error) bool {
+	return errors.Is(err, ErrWIAInstanceDeactivated) ||
+		errors.Is(err, ErrWIAInstanceNotOwned) ||
+		errors.Is(err, ErrWIAUnknownUser) ||
+		errors.Is(err, ErrWIACredentialNotOwned) ||
+		errors.Is(err, errInstanceStatusUnrecognized) ||
+		errors.Is(err, tokengate.ErrRevoked)
+}
+
+// undoKeyEvidenceWrite undoes the key-evidence write a refused request made,
+// conditionally on that very write: a record rewritten since (by a concurrent
+// registration or a re-check) is left alone. A new record is deleted, a
+// replaced one is put back. A failed undo is joined to cause so the caller
+// can see the write was not rolled back.
+func (s *WIAService) undoKeyEvidenceWrite(ctx context.Context, written *domain.KeyAttestationRecord, cause error) error {
+	if s.keyAttestations == nil || written.WriteToken == "" {
+		return cause
+	}
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	var rerr error
+	if written.Previous != nil {
+		rerr = s.keyAttestations.RestoreIfUnchanged(rctx, written, written.Previous)
+	} else {
+		rerr = s.keyAttestations.DeleteIfUnchanged(rctx, written.KeyThumbprint, written.WriteToken)
+	}
+	if rerr != nil && !errors.Is(rerr, storage.ErrNotFound) {
+		s.emitAuditFailure("key_evidence_restore_failed", rerr)
+		return errors.Join(cause, fmt.Errorf("%w: %w", tokengate.ErrWriteNotRolledBack, rerr))
+	}
+	return cause
 }
