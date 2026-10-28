@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -19,14 +20,15 @@ func TestFetchIssuerMetadata_RootSlashCandidates(t *testing.T) {
 		{"/", []string{"/.well-known/openid-credential-issuer/", "/.well-known/openid-credential-issuer"}},
 	} {
 		var got []string
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var srv *httptest.Server
+		srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			got = append(got, r.URL.Path)
 			if r.URL.Path != "/.well-known/openid-credential-issuer" {
 				w.WriteHeader(http.StatusNotFound)
 				return
 			}
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{}`))
+			_, _ = w.Write([]byte(`{"credential_issuer":"` + srv.URL + tc.suffix + `"}`))
 		}))
 		if _, err := fetchIssuerMetadata(context.Background(), srv.URL+tc.suffix, srv.Client()); err != nil {
 			t.Fatalf("suffix %q: %v", tc.suffix, err)
@@ -43,9 +45,10 @@ func TestFetchIssuerMetadata_RootSlashCandidates(t *testing.T) {
 // defines the /.well-known/ namespace; the insertion rule is OpenID4VCI's.
 func TestFetchIssuerMetadata_PathIssuerKeepsPath(t *testing.T) {
 	var got []string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = append(got, r.URL.Path)
-		_, _ = w.Write([]byte(`{}`))
+		_, _ = w.Write([]byte(`{"credential_issuer":"` + srv.URL + `/tenant/"}`))
 	}))
 	defer srv.Close()
 	if _, err := fetchIssuerMetadata(context.Background(), srv.URL+"/tenant/", srv.Client()); err != nil {
@@ -66,5 +69,36 @@ func TestFetchIssuerMetadata_NoFallbackOn5xx(t *testing.T) {
 	defer srv.Close()
 	if _, err := fetchIssuerMetadata(context.Background(), srv.URL+"/tenant/", srv.Client()); err == nil || n != 1 {
 		t.Fatalf("err=%v requests=%d", err, n)
+	}
+}
+
+// Identity stays exact whichever candidate served the document: if /tenant/
+// 404s and the stripped endpoint declares the other identifier, it is refused.
+func TestFetchIssuerMetadata_FallbackCredentialIssuerMismatchRefused(t *testing.T) {
+	for _, claimSuffix := range []string{"/tenant", "/tenant/x", ""} {
+		var srv *httptest.Server
+		srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/.well-known/openid-credential-issuer/tenant/" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_, _ = w.Write([]byte(`{"credential_issuer":"` + srv.URL + claimSuffix + `"}`))
+		}))
+		_, err := fetchIssuerMetadata(context.Background(), srv.URL+"/tenant/", srv.Client())
+		srv.Close()
+		if err == nil || !strings.Contains(err.Error(), "does not match") {
+			t.Errorf("claim %q: expected mismatch, got %v", claimSuffix, err)
+		}
+	}
+}
+
+// The literal candidate's document is checked too (no claim at all is refused).
+func TestFetchIssuerMetadata_MissingCredentialIssuerRefused(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	if _, err := fetchIssuerMetadata(context.Background(), srv.URL+"/tenant/", srv.Client()); err == nil {
+		t.Fatal("expected refusal")
 	}
 }

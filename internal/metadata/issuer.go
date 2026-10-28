@@ -97,7 +97,16 @@ func fetchIssuerMetadata(ctx context.Context, issuerURL string, client *http.Cli
 		if status == http.StatusNotFound && i < len(candidates)-1 {
 			continue
 		}
-		return md, err
+		if err != nil {
+			return nil, err
+		}
+		// OpenID4VCI 12.2.4: credential_issuer MUST be identical to the
+		// identifier (simple string comparison, no normalisation); whichever
+		// candidate URL served the document, a mismatch is refused.
+		if md.CredentialIssuer != issuerURL {
+			return nil, fmt.Errorf("metadata 'credential_issuer' claim %q does not match issuer URL %q", md.CredentialIssuer, issuerURL)
+		}
+		return md, nil
 	}
 	return nil, fmt.Errorf("no metadata URL candidates")
 }

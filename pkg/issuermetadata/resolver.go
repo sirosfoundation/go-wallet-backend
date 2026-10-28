@@ -586,6 +586,12 @@ func (r *Resolver) handleJSONResponse(ctx context.Context, issuerURL string, bod
 			if err != nil {
 				return nil, err
 			}
+			// The verified claims must bind to the identifier exactly, whichever
+			// candidate URL served the document (sub and/or credential_issuer;
+			// at least one must be present, any present one must match).
+			if err := validateSignedMetadataIdentity(claims, issuerURL); err != nil {
+				return nil, err
+			}
 			// Validated only when a TrustEvaluator is configured and approved.
 			return &fetchResult{metadata: claims, validated: r.cfg.TrustEvaluator != nil, signed: true}, nil
 		}
@@ -614,6 +620,23 @@ func validateCredentialIssuerClaim(claims map[string]interface{}, issuerURL stri
 	}
 	if credentialIssuer != issuerURL {
 		return fmt.Errorf("metadata 'credential_issuer' claim %q does not match issuer URL %q", credentialIssuer, issuerURL)
+	}
+	return nil
+}
+
+// validateSignedMetadataIdentity checks the identity claims of the verified
+// signed_metadata payload against the identifier exactly (no normalisation).
+func validateSignedMetadataIdentity(claims map[string]interface{}, issuerURL string) error {
+	sub, hasSub := claims["sub"].(string)
+	ci, hasCI := claims["credential_issuer"].(string)
+	if !hasSub && !hasCI {
+		return fmt.Errorf("signed_metadata payload has neither 'sub' nor 'credential_issuer' to bind it to the issuer")
+	}
+	if hasSub && sub != issuerURL {
+		return fmt.Errorf("signed_metadata 'sub' claim %q does not match issuer URL %q", sub, issuerURL)
+	}
+	if hasCI && ci != issuerURL {
+		return fmt.Errorf("signed_metadata 'credential_issuer' claim %q does not match issuer URL %q", ci, issuerURL)
 	}
 	return nil
 }

@@ -89,7 +89,7 @@ func TestGetIssuerMetadata_Success(t *testing.T) {
 		if r.URL.Path == "/.well-known/openid-credential-issuer" {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"credential_issuer":   "https://issuer.example.com",
+				"credential_issuer":   "http://" + r.Host,
 				"credential_endpoint": "https://issuer.example.com/credential",
 				"credential_configurations_supported": map[string]interface{}{
 					"UniversityDegree": map[string]interface{}{
@@ -136,7 +136,7 @@ func TestGetIssuerMetadata_Success(t *testing.T) {
 	}
 
 	// The response should be the IssuerMetadata directly with proper JSON keys
-	if result["credential_issuer"] != "https://issuer.example.com" {
+	if result["credential_issuer"] != mockIssuer.URL {
 		t.Errorf("Expected credential_issuer, got %v", result["credential_issuer"])
 	}
 }
@@ -155,7 +155,7 @@ func mockIssuerWithVct(t *testing.T, vct string) *httptest.Server {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"credential_issuer":   "https://issuer.example.com",
+			"credential_issuer":   "http://" + r.Host,
 			"credential_endpoint": "https://issuer.example.com/credential",
 			"credential_configurations_supported": map[string]interface{}{
 				"ehic": map[string]interface{}{
@@ -202,7 +202,7 @@ func mockIssuerWithLogo(t *testing.T, logoURL string) *httptest.Server {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"credential_issuer":   "https://issuer.example.com",
+			"credential_issuer":   "http://" + r.Host,
 			"credential_endpoint": "https://issuer.example.com/credential",
 			"credential_configurations_supported": map[string]interface{}{
 				"ehic": map[string]interface{}{
@@ -394,7 +394,7 @@ func TestGetIssuerMetadata_EmbedsImagesWithoutVctOrDoctype(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"credential_issuer":   "https://issuer.example.com",
+			"credential_issuer":   "http://" + r.Host,
 			"credential_endpoint": "https://issuer.example.com/credential",
 			"credential_configurations_supported": map[string]interface{}{
 				"mystery": map[string]interface{}{
@@ -454,7 +454,7 @@ func TestGetIssuerMetadata_CachesResponses(t *testing.T) {
 		callCount++
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"credential_issuer":   "https://issuer.example.com",
+			"credential_issuer":   "http://" + r.Host,
 			"credential_endpoint": "https://issuer.example.com/credential",
 		})
 	}))

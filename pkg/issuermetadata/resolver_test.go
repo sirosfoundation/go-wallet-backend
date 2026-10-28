@@ -39,6 +39,32 @@ func newTestResolver(t *testing.T) *Resolver {
 
 // newTestResolverPreferSigned returns a resolver with the default staged
 // prefer-signed policy.
+// signedFixtureID is the identifier baked into the signed fixtures; the
+// identity check is exact, so those tests resolve this identifier and a
+// transport sends the request to the httptest server.
+const signedFixtureID = "https://issuer.example.com"
+
+func fixtureClient(srv *httptest.Server) *http.Client {
+	target := strings.TrimPrefix(srv.URL, "http://")
+	return &http.Client{Timeout: 10 * time.Second, Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host != "issuer.example.com" {
+			return http.DefaultTransport.RoundTrip(r)
+		}
+		r2 := r.Clone(r.Context())
+		r2.URL.Scheme, r2.URL.Host = "http", target
+		return http.DefaultTransport.RoundTrip(r2)
+	})}
+}
+
+func newFixtureResolver(t *testing.T, srv *httptest.Server, _ Config) *Resolver {
+	t.Helper()
+	r, err := New(Config{HTTPClient: fixtureClient(srv), CacheTTL: 5 * time.Minute, AllowHTTP: true, MetadataType: MetadataTypeAny})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
 func newTestResolverPreferSigned(t *testing.T) *Resolver {
 	t.Helper()
 	r, err := New(Config{HTTPClient: testHTTPClient(),
@@ -211,7 +237,7 @@ func TestResolve_SignedMetadata_InlineJWKS(t *testing.T) {
 	}))
 	defer server.Close()
 
-	got, err := newTestResolver(t).Resolve(context.Background(), server.URL)
+	got, err := newFixtureResolver(t, server, Config{}).Resolve(context.Background(), signedFixtureID)
 	if err != nil {
 		t.Fatalf("Resolve() error: %v", err)
 	}
@@ -269,7 +295,7 @@ func TestResolve_SignedMetadata_JWKSURI(t *testing.T) {
 	}))
 	defer server.Close()
 
-	got, err := newTestResolver(t).Resolve(context.Background(), server.URL)
+	got, err := newFixtureResolver(t, server, Config{}).Resolve(context.Background(), signedFixtureID)
 	if err != nil {
 		t.Fatalf("Resolve() error: %v", err)
 	}
@@ -372,7 +398,7 @@ func TestResolve_SignedMetadata_X5CFallback(t *testing.T) {
 	}))
 	defer server.Close()
 
-	got, err := newTestResolver(t).Resolve(context.Background(), server.URL)
+	got, err := newFixtureResolver(t, server, Config{}).Resolve(context.Background(), signedFixtureID)
 	if err != nil {
 		t.Fatalf("Resolve() error: %v", err)
 	}
@@ -445,7 +471,7 @@ func TestResolve_SignedMetadata_KIDSelection(t *testing.T) {
 	}))
 	defer server.Close()
 
-	got, err := newTestResolver(t).Resolve(context.Background(), server.URL)
+	got, err := newFixtureResolver(t, server, Config{}).Resolve(context.Background(), signedFixtureID)
 	if err != nil {
 		t.Fatalf("Resolve() error: %v", err)
 	}
@@ -997,11 +1023,11 @@ func TestResolveWithInfo_Validated_SignedMetadata(t *testing.T) {
 	defer server.Close()
 
 	evaluator := &mockTrustEvaluator{decision: true}
-	resolver, _ := New(Config{HTTPClient: testHTTPClient(),
+	resolver, _ := New(Config{HTTPClient: fixtureClient(server),
 		AllowHTTP:      true,
 		TrustEvaluator: evaluator,
 	})
-	result, err := resolver.ResolveWithInfo(context.Background(), server.URL)
+	result, err := resolver.ResolveWithInfo(context.Background(), signedFixtureID)
 	if err != nil {
 		t.Fatalf("ResolveWithInfo() error: %v", err)
 	}
@@ -1031,7 +1057,7 @@ func TestResolveWithInfo_NotValidated_SignedWithoutEvaluator(t *testing.T) {
 	}))
 	defer server.Close()
 
-	result, err := newTestResolver(t).ResolveWithInfo(context.Background(), server.URL)
+	result, err := newFixtureResolver(t, server, Config{}).ResolveWithInfo(context.Background(), signedFixtureID)
 	if err != nil {
 		t.Fatalf("ResolveWithInfo() error: %v", err)
 	}
@@ -1288,12 +1314,12 @@ func TestResolve_SignedMetadata_TrustEvaluatorCalled(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{HTTPClient: testHTTPClient(),
+	resolver, _ := New(Config{HTTPClient: fixtureClient(server),
 		AllowHTTP:      true,
 		TrustEvaluator: evaluator,
 	})
 
-	_, err := resolver.Resolve(context.Background(), server.URL)
+	_, err := resolver.Resolve(context.Background(), signedFixtureID)
 	if err != nil {
 		t.Fatalf("Resolve() error: %v", err)
 	}
@@ -1595,3 +1621,42 @@ func TestResolve_UsesCallerSuppliedGuardedClient(t *testing.T) {
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// Legacy JSON-wrapped signed_metadata is bound to the identifier exactly, also
+// when it is served by the fallback URL after a 404 on the literal one.
+func TestResolve_SignedMetadataIdentityExact_Fallback(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		claims map[string]interface{}
+		ok     bool
+	}{
+		{"credential_issuer other spelling", map[string]interface{}{"credential_issuer": "https://issuer.example.com/tenant"}, false},
+		{"sub other spelling", map[string]interface{}{"sub": "https://issuer.example.com/tenant", "credential_issuer": "https://issuer.example.com/tenant/"}, false},
+		{"no identity claim", map[string]interface{}{"x": "y"}, false},
+		{"exact", map[string]interface{}{"credential_issuer": "https://issuer.example.com/tenant/"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			priv, pub := newTestKey(t)
+			token := signClaims(t, priv, tc.claims)
+			outer := map[string]interface{}{"jwks": inlineJWKS(t, pub), "signed_metadata": token}
+			var paths []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				paths = append(paths, r.URL.Path)
+				if r.URL.Path == "/.well-known/openid-credential-issuer/tenant/" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(outer) //nolint:errcheck
+			}))
+			defer server.Close()
+			_, err := newFixtureResolver(t, server, Config{}).Resolve(context.Background(), signedFixtureID+"/tenant/")
+			if tc.ok != (err == nil) {
+				t.Fatalf("ok=%v err=%v", tc.ok, err)
+			}
+			if len(paths) != 2 {
+				t.Fatalf("requests = %v", paths)
+			}
+		})
+	}
+}
