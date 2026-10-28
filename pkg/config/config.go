@@ -1991,6 +1991,12 @@ func (c *TrustConfig) IsVerifierTrustEnabled() bool {
 
 // FeaturesConfig contains feature flags for controlling behavior
 type FeaturesConfig struct {
+	// DisableOpportunisticRequestEncryption disables optional OID4VCI credential
+	// request encryption, including deferred requests, for issuer compatibility.
+	// Required request encryption and encryption needed for an encrypted response
+	// are unaffected. Default: false (opportunistic encryption enabled).
+	DisableOpportunisticRequestEncryption bool `yaml:"disable_opportunistic_request_encryption" envconfig:"DISABLE_OPPORTUNISTIC_REQUEST_ENCRYPTION"`
+
 	// ProxyEnabled controls whether the /proxy endpoint is available.
 	// Set to false to disable the proxy (requires WebSocket engine for flows).
 	// Default: true (for backward compatibility)
