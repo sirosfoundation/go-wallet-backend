@@ -833,50 +833,38 @@ func (h *AuthZENProxyHandler) resolveAuthorizationServerMetadata(c *gin.Context,
 	// an additional request to /.well-known/openid-credential-issuer
 	// which can interfere with conformance suite state machines.
 	// The caller can pass the authorization server URL directly if different.
-	wellKnownURLs, err := oidc.AuthorizationServerMetadataURLs(issuerURL)
-	wellKnown := ""
-	if err == nil {
-		wellKnown = wellKnownURLs[0]
-	}
+	// Ordered candidates (RFC 8414 insertion, then OIDC Discovery append),
+	// 404-only fallback, exact issuer identity check: see
+	// oidc.FetchAuthorizationServerMetadata. The SSRF-protected httpClient is
+	// used for every candidate.
+	body, err := oidc.FetchAuthorizationServerMetadata(ctx, h.httpClient, issuerURL, 1<<20)
 	if err != nil {
-		h.logger.Error("could not construct authorization server well-known URL",
-			zap.String("issuer_url", issuerURL),
-			zap.Error(err),
-		)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "invalid authorization server URL"})
-		return
-	}
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wellKnown, nil)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-		return
-	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := h.httpClient.Do(req)
-	if err != nil {
-		h.logger.Debug("failed to fetch authorization server metadata",
-			zap.String("url", wellKnown),
-			zap.Error(err),
-		)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "authorization server metadata fetch failed"})
-		return
-	}
-	defer resp.Body.Close() //nolint:errcheck
-
-	if resp.StatusCode != http.StatusOK {
-		h.logger.Debug("authorization server metadata returned non-200",
-			zap.String("url", wellKnown),
-			zap.Int("status", resp.StatusCode),
-		)
-		c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("authorization server returned HTTP %d", resp.StatusCode)})
-		return
-	}
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		c.JSON(http.StatusBadGateway, gin.H{"error": "failed to read authorization server response"})
+		var statusErr *oidc.ASMetadataStatusError
+		switch {
+		case errors.Is(err, oidc.ErrASIssuerMismatch):
+			// Do not log or return the document's issuer (attacker-controlled).
+			h.logger.Warn("authorization server metadata issuer mismatch",
+				zap.String("tenant_id", tenantID),
+			)
+			c.JSON(http.StatusBadGateway, gin.H{"error": "authorization server metadata issuer mismatch"})
+		case errors.Is(err, oidc.ErrASMetadataNotFound):
+			h.logger.Debug("authorization server metadata not found", zap.String("issuer_url", issuerURL))
+			c.JSON(http.StatusBadGateway, gin.H{"error": "authorization server returned HTTP 404"})
+		case errors.As(err, &statusErr):
+			h.logger.Debug("authorization server metadata returned non-200",
+				zap.String("issuer_url", issuerURL),
+				zap.Int("status", statusErr.Status),
+			)
+			c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("authorization server returned HTTP %d", statusErr.Status)})
+		case errors.Is(err, oidc.ErrASMetadataInvalid):
+			c.JSON(http.StatusBadGateway, gin.H{"error": "invalid authorization server metadata JSON"})
+		default:
+			h.logger.Debug("failed to fetch authorization server metadata",
+				zap.String("issuer_url", issuerURL),
+				zap.Error(err),
+			)
+			c.JSON(http.StatusBadGateway, gin.H{"error": "authorization server metadata fetch failed"})
+		}
 		return
 	}
 
