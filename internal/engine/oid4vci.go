@@ -51,6 +51,7 @@ type OID4VCIHandler struct {
 	dpopNonce            string                 // server-provided DPoP nonce (RFC 9449 §8)
 	attestationChallenge string                 // server-provided Client Attestation PoP challenge (attestation-based client auth)
 	challengeEndpoint    string                 // AS challenge endpoint for fetching attestation challenges
+	asDocumentServed     bool                   // a matching AS document was served (token_endpoint guess is then forbidden)
 	asMetadataFetched    bool                   // AS metadata fetch attempted (see fetchOAuthMetadata)
 	redirectURI          string
 	// encryptedNotificationRegistered is set once the notification context of
@@ -113,6 +114,7 @@ func NewOID4VCIHandlerFactory(resolver MetadataResolver, issuerLookup Credential
 // oauthServerMetadata contains the OAuth Authorization Server metadata fields
 // relevant for the OID4VCI authorization code flow.
 type oauthServerMetadata struct {
+	Issuer                             string   `json:"issuer"`
 	AuthorizationEndpoint              string   `json:"authorization_endpoint"`
 	TokenEndpoint                      string   `json:"token_endpoint"`
 	PushedAuthorizationRequestEndpoint string   `json:"pushed_authorization_request_endpoint"`
@@ -126,6 +128,7 @@ type oauthServerMetadata struct {
 // so supportsPKCE can distinguish an absent field from an explicit empty list.
 func (m *oauthServerMetadata) UnmarshalJSON(data []byte) error {
 	type alias struct {
+		Issuer                             string    `json:"issuer"`
 		AuthorizationEndpoint              string    `json:"authorization_endpoint"`
 		TokenEndpoint                      string    `json:"token_endpoint"`
 		PushedAuthorizationRequestEndpoint string    `json:"pushed_authorization_request_endpoint"`
@@ -137,6 +140,7 @@ func (m *oauthServerMetadata) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
 	}
+	m.Issuer = aux.Issuer
 	m.AuthorizationEndpoint = aux.AuthorizationEndpoint
 	m.TokenEndpoint = aux.TokenEndpoint
 	m.PushedAuthorizationRequestEndpoint = aux.PushedAuthorizationRequestEndpoint
@@ -600,7 +604,11 @@ func (h *OID4VCIHandler) resolveAttestationChallenge(ctx context.Context, resp *
 		// may skip AS-metadata fetch when token_endpoint is already known) can
 		// still use it.
 		if h.challengeEndpoint == "" && metadata != nil {
-			h.fetchOAuthMetadata(ctx, metadata) // sets h.challengeEndpoint on success
+			// Sets h.challengeEndpoint on success; a discovery failure just
+			// means no endpoint is known (no challenge can be obtained).
+			if _, err := h.fetchOAuthMetadata(ctx, metadata); err != nil {
+				h.Logger.Debug("attestation challenge endpoint discovery failed", zap.Error(err))
+			}
 		}
 		if h.challengeEndpoint != "" {
 			var err error
@@ -1937,8 +1945,8 @@ func (h *OID4VCIHandler) handlePreAuthorized(ctx context.Context, metadata *Issu
 
 	// Fetch OAuth metadata to get token endpoint if not in issuer metadata
 	if metadata.TokenEndpoint == "" {
-		if oauthMeta := h.fetchOAuthMetadata(ctx, metadata); oauthMeta != nil && oauthMeta.TokenEndpoint != "" {
-			metadata.TokenEndpoint = oauthMeta.TokenEndpoint
+		if _, err := h.discoverTokenEndpoint(ctx, metadata); err != nil {
+			return nil, h.failASDiscovery(StepExchangingToken, ErrCodeTokenError, err)
 		}
 	}
 
@@ -1999,12 +2007,21 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 // whole loop.
 func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMetadata, logContext string, setGrantParams func(data url.Values)) (*TokenResponse, error) {
 	if !h.asMetadataFetched {
-		h.fetchOAuthMetadata(ctx, metadata)
+		if _, err := h.discoverTokenEndpoint(ctx, metadata); err != nil {
+			return nil, h.failASDiscovery(StepExchangingToken, ErrCodeTokenError, err)
+		}
 	}
 
 	tokenEndpoint := metadata.TokenEndpoint
+	if tokenEndpoint == "" && h.asDocumentServed {
+		// Defence in depth for every path that reaches here after discovery:
+		// never guess when a matching document was served without token_endpoint.
+		return nil, h.failASDiscovery(StepExchangingToken, ErrCodeTokenError,
+			errors.New("authorization server metadata has no token_endpoint"))
+	}
 	if tokenEndpoint == "" {
-		// Try to construct from issuer
+		// No token_endpoint discovered (no AS document at all, or none in it):
+		// construct from issuer
 		tokenEndpoint = strings.TrimSuffix(metadata.CredentialIssuer, "/") + "/token"
 	}
 
@@ -2125,46 +2142,96 @@ func (h *OID4VCIHandler) exchangeRefreshToken(ctx context.Context, metadata *Iss
 	})
 }
 
-// fetchOAuthMetadata fetches OAuth Authorization Server metadata from the well-known endpoint.
-// Returns nil (not an error) if the metadata cannot be fetched, allowing callers to use fallbacks.
-func (h *OID4VCIHandler) fetchOAuthMetadata(ctx context.Context, metadata *IssuerMetadata) *oauthServerMetadata {
+// discoverTokenEndpoint runs AS discovery for a token request. It sets
+// metadata.TokenEndpoint from the document when issuer metadata supplied none.
+//
+//   - Token endpoint already known: discovery is best effort (it still feeds the
+//     optional challenge endpoint and PKCE hints); a failed or refused document
+//     is not used and not fatal.
+//   - Not known: a failure, or a served document without token_endpoint, is an
+//     error. Only when no document exists at all ((nil, nil)) may the caller
+//     guess <issuer>/token.
+func (h *OID4VCIHandler) discoverTokenEndpoint(ctx context.Context, metadata *IssuerMetadata) (*oauthServerMetadata, error) {
+	oauthMeta, err := h.fetchOAuthMetadata(ctx, metadata)
+	if metadata.TokenEndpoint != "" {
+		if err != nil {
+			h.Logger.Debug("authorization server metadata discovery failed", zap.Error(err))
+			return nil, nil
+		}
+		return oauthMeta, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if oauthMeta == nil {
+		return nil, nil
+	}
+	if oauthMeta.TokenEndpoint == "" {
+		return nil, errors.New("authorization server metadata has no token_endpoint")
+	}
+	metadata.TokenEndpoint = oauthMeta.TokenEndpoint
+	return oauthMeta, nil
+}
+
+// failASDiscovery tells the client the flow failed (sanitized, fixed text: the
+// underlying error is logged, never sent) and returns err.
+func (h *OID4VCIHandler) failASDiscovery(step FlowStep, code ErrorCode, err error) error {
+	h.Logger.Warn("authorization server metadata discovery failed", zap.Error(err))
+	_ = h.Error(step, code, code.UserFacingMessage())
+	return err
+}
+
+// maxASMetadataBytes bounds an authorization server metadata document.
+const maxASMetadataBytes = 1 << 20
+
+// fetchOAuthMetadata discovers the OAuth Authorization Server metadata of the
+// AS named by the issuer metadata (else the credential issuer itself).
+//
+// Candidate URLs are tried in order (RFC 8414 section 3.1, then OIDC Discovery
+// section 4), falling back ONLY on HTTP 404; the document's "issuer" must equal
+// the AS identifier exactly (RFC 8414 section 3.3). See
+// oidc.FetchAuthorizationServerMetadata.
+//
+// Return values:
+//   - (meta, nil): a document was found and its issuer matches.
+//   - (nil, nil): discovery found NO document at all (every candidate 404). This
+//     is the only case in which callers may fall back to guessed endpoints
+//     (<issuer>/token, <AS>/authorize).
+//   - (nil, err): a document was served but must not be used (issuer mismatch,
+//     invalid), or the request failed (5xx, 401/403, network, timeout). Callers
+//     must NOT guess endpoints; err carries no issuer-controlled text.
+func (h *OID4VCIHandler) fetchOAuthMetadata(ctx context.Context, metadata *IssuerMetadata) (*oauthServerMetadata, error) {
 	h.asMetadataFetched = true
 	authServer := metadata.authorizationServer()
 	if authServer == "" {
 		authServer = metadata.CredentialIssuer
 	}
 
-	// Well-known URL construction for OAuth AS metadata: RFC 8414 section 3.1
-	// removes the terminating "/" (the builder does it; no separate trim).
-	oauthMetadataURLs, err := oidc.AuthorizationServerMetadataURLs(authServer)
-	if err != nil {
-		return nil
+	body, err := oidc.FetchAuthorizationServerMetadata(ctx, h.httpClient, authServer, maxASMetadataBytes)
+	if errors.Is(err, oidc.ErrASMetadataNotFound) {
+		return nil, nil
 	}
-	oauthMetadataURL := oauthMetadataURLs[0]
-	req, err := http.NewRequestWithContext(ctx, "GET", oauthMetadataURL, nil)
 	if err != nil {
-		return nil
-	}
-
-	resp, err := h.httpClient.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close() //nolint:errcheck
-
-	if resp.StatusCode != http.StatusOK {
-		return nil
+		// Do not wrap the transport error: it can carry the issuer-controlled URL.
+		var statusErr *oidc.ASMetadataStatusError
+		switch {
+		case errors.As(err, &statusErr), errors.Is(err, oidc.ErrASIssuerMismatch), errors.Is(err, oidc.ErrASMetadataInvalid), errors.Is(err, oidc.ErrASIdentifierInvalid):
+			return nil, fmt.Errorf("authorization server metadata discovery failed: %w", err)
+		default:
+			return nil, errors.New("authorization server metadata discovery failed: request error")
+		}
 	}
 
 	var oauthMeta oauthServerMetadata
-	if err := json.NewDecoder(resp.Body).Decode(&oauthMeta); err != nil {
-		return nil
+	if err := json.Unmarshal(body, &oauthMeta); err != nil {
+		return nil, fmt.Errorf("authorization server metadata discovery failed: %w", oidc.ErrASMetadataInvalid)
 	}
+	h.asDocumentServed = true
 	// Remember the challenge endpoint for attestation-PoP challenge retrieval.
 	if oauthMeta.ChallengeEndpoint != "" {
 		h.challengeEndpoint = oauthMeta.ChallengeEndpoint
 	}
-	return &oauthMeta
+	return &oauthMeta, nil
 }
 
 func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata, selectedConfig *CredentialConfig) (*TokenResponse, error) {
@@ -2174,9 +2241,26 @@ func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *Cre
 	}
 	fallbackEndpoint := strings.TrimSuffix(authServer, "/") + "/authorize"
 
-	oauthMeta := h.fetchOAuthMetadata(ctx, metadata)
-	if oauthMeta == nil || oauthMeta.AuthorizationEndpoint == "" {
-		// Fallback: construct auth URL directly, no PAR
+	oauthMeta, err := h.fetchOAuthMetadata(ctx, metadata)
+	if err != nil {
+		return nil, h.failASDiscovery(StepAuthorizationReq, ErrCodeAuthorizationFail, err)
+	}
+	if oauthMeta != nil && oauthMeta.AuthorizationEndpoint == "" {
+		// A served, identity-checked document without authorization_endpoint is
+		// not a "no document" case: no guess, and its other members (such as
+		// require_pushed_authorization_requests) must not be dropped.
+		return nil, h.failASDiscovery(StepAuthorizationReq, ErrCodeAuthorizationFail,
+			errors.New("authorization server metadata has no authorization_endpoint"))
+	}
+	if oauthMeta != nil && oauthMeta.TokenEndpoint == "" && metadata.TokenEndpoint == "" {
+		// The code would later be sent to a guessed <issuer>/token: refuse before
+		// starting authorization, as discoverTokenEndpoint does for the other grants.
+		return nil, h.failASDiscovery(StepAuthorizationReq, ErrCodeAuthorizationFail,
+			errors.New("authorization server metadata has no token_endpoint"))
+	}
+	if oauthMeta == nil {
+		// Fallback: discovery found no document at all (every candidate 404);
+		// never reached after an issuer mismatch or a failed request): construct auth URL directly, no PAR
 		return h.startAuthorizationFlow(ctx, offer, metadata, selectedConfig, &oauthServerMetadata{
 			AuthorizationEndpoint: fallbackEndpoint,
 		})
@@ -2497,9 +2581,9 @@ func (h *OID4VCIHandler) resumeWithAuthCode(ctx context.Context, msg *FlowStartM
 	_ = h.ProgressMessage(StepAuthorizationReq, "Resuming flow with authorization code")
 
 	// Fetch OAuth metadata to get token endpoint and check PKCE requirements
-	oauthMeta := h.fetchOAuthMetadata(ctx, metadata)
-	if oauthMeta != nil && oauthMeta.TokenEndpoint != "" && metadata.TokenEndpoint == "" {
-		metadata.TokenEndpoint = oauthMeta.TokenEndpoint
+	oauthMeta, err := h.discoverTokenEndpoint(ctx, metadata)
+	if err != nil {
+		return nil, h.failASDiscovery(StepAuthorizationReq, ErrCodeAuthorizationFail, err)
 	}
 
 	// Validate code_verifier: PKCE defaults to enabled (OID4VCI spec), so if the
@@ -2634,9 +2718,6 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 	resp, err := h.RequestSign(ctx, SignActionGenerateProof, params)
 	if err != nil {
 		return nil, nil, err
-	}
-	if resp.Error != "" {
-		return nil, nil, errors.New("client failed the proof request")
 	}
 
 	var respEnc *responseEncryption

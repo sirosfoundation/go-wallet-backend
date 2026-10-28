@@ -404,9 +404,10 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 	metadataResolver := sharedResolver
 	if metadataResolver == nil {
 		r, err := issuermetadata.New(issuermetadata.Config{
-			HTTPClient:   cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
-			AllowHTTP:    cfg.HTTPClient.AllowsPlaintext(),
-			MetadataType: issuermetadata.MetadataType(cfg.HTTPClient.MetadataType), // validated by Config.Validate and New
+			HTTPClient:    cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
+			AllowHTTP:     cfg.HTTPClient.AllowsPlaintext(),
+			MetadataType:  issuermetadata.MetadataType(cfg.HTTPClient.MetadataType), // validated by Config.Validate and New
+			CacheDisabled: cfg.HTTPClient.MetadataCacheDisabled,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("creating issuer metadata resolver: %w", err)
@@ -634,9 +635,10 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 	var metadataResolver *issuermetadata.Resolver
 	if cfg.AuthZENProxy.Enabled && cfg.AuthZENProxy.AllowResolution {
 		r, err := issuermetadata.New(issuermetadata.Config{
-			HTTPClient:   cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
-			AllowHTTP:    cfg.HTTPClient.AllowsPlaintext(),
-			MetadataType: issuermetadata.MetadataType(cfg.HTTPClient.MetadataType), // validated by Config.Validate and New
+			HTTPClient:    cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
+			AllowHTTP:     cfg.HTTPClient.AllowsPlaintext(),
+			MetadataType:  issuermetadata.MetadataType(cfg.HTTPClient.MetadataType), // validated by Config.Validate and New
+			CacheDisabled: cfg.HTTPClient.MetadataCacheDisabled,
 		})
 		if err != nil {
 			if closeErr := store.Close(); closeErr != nil {

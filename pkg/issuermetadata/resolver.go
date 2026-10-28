@@ -74,6 +74,10 @@ type Config struct {
 	// Default: 5 minutes.
 	CacheTTL time.Duration
 
+	// CacheDisabled turns off caching entirely: every Resolve fetches the
+	// metadata from the issuer. CacheTTL is ignored.
+	CacheDisabled bool
+
 	// HTTPClient is the HTTP client used for outbound requests.
 	// The caller is responsible for configuring timeouts, TLS settings,
 	// and SSRF protections (e.g. blocking private IP ranges); production
@@ -1034,6 +1038,9 @@ func (r *Resolver) fetchJWKSFromURI(ctx context.Context, uri string) (jose.JSONW
 }
 
 func (r *Resolver) getCachedEntry(issuerURL string) *cachedEntry {
+	if r.cfg.CacheDisabled {
+		return nil
+	}
 	r.mu.RLock()
 	entry, ok := r.cache[issuerURL]
 	if !ok {
@@ -1068,6 +1075,9 @@ func deepCopyMap(m map[string]interface{}) map[string]interface{} {
 }
 
 func (r *Resolver) setCache(issuerURL string, result *fetchResult) {
+	if r.cfg.CacheDisabled {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.cache[issuerURL] = &cachedEntry{

@@ -1819,11 +1819,22 @@ The server MUST implement strict controls on outbound requests:
 3. **Response validation**: All fetched content MUST validate against expected schemas:
    - Credential offers → OID4VCI CredentialOffer schema
    - Issuer metadata → OpenID4VCI Credential Issuer Metadata schema
-   - Authorization server metadata → RFC 8414 schema
+   - Authorization server metadata → RFC 8414 schema, and its `issuer` MUST equal the authorization server identifier exactly (see below)
 
 4. **Size limits**: Response bodies MUST NOT exceed 1MB (10MB for image embedding)
 
 5. **Timeouts**: Individual HTTP requests timeout after 10 seconds
+
+### Authorization Server Metadata Discovery
+
+The engine (`oid4vci` flow) and the AuthZEN proxy (`resource_type=oauth-authorization-server`) discover authorization server (AS) metadata the same way (`oidc.FetchAuthorizationServerMetadata`). The AS identifier is used as received (from `authorization_server`/`authorization_servers`, else the credential issuer identifier).
+
+1. **Ordered candidates**, each fetched with the same SSRF-guarded client and the same size/time limits:
+   1. RFC 8414 section 3.1: `/.well-known/oauth-authorization-server` inserted between host and path, a terminating `/` of the identifier removed (`https://h/t/` -> `https://h/.well-known/oauth-authorization-server/t`).
+   2. OpenID Connect Discovery section 4: `<issuer>/.well-known/openid-configuration` appended, a terminating `/` removed first (`https://h/t/` -> `https://h/t/.well-known/openid-configuration`).
+2. **Fallback only on HTTP 404.** Any other status (5xx, 401, 403, 410, ...), a network error or a timeout ends discovery after that one request.
+3. **Exact identity.** The document's `issuer` must equal the AS identifier as received, by simple string comparison (RFC 8414 section 3.3, OIDC Discovery section 4.3; no trailing-slash or case normalisation). Otherwise the document MUST NOT be used: the engine fails the flow, the proxy answers 502 without echoing the document or its issuer.
+4. **Endpoint guesses** (`<issuer>/token`, `<AS>/authorize`) are used only when discovery found no document at all (every candidate answered 404). They are never used after an identity mismatch, an invalid document, a 5xx or a network error. Where the token endpoint is already known from the credential issuer metadata, a failed or refused AS document is ignored (it is not used) and only the optional attestation `challenge_endpoint` discovery is lost.
 
 ### Rate Limiting
 
