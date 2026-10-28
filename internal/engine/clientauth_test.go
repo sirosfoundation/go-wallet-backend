@@ -6,6 +6,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -243,7 +245,52 @@ func TestResolveClientAuth_ClientHeld_AttestationChallengeRetry(t *testing.T) {
 	require.Len(t, reqs, 2)
 	assert.Empty(t, reqs[0].Params.AttestationChallenge, "first PoP carries no challenge yet")
 	assert.Equal(t, "chal-abc", reqs[1].Params.AttestationChallenge, "retry must carry the server challenge")
-	assert.Equal(t, "chal-abc", h.attestationChallenge)
+	assert.Empty(t, h.attestationChallenge, "spent once the AS accepts the request")
+}
+
+// TestResolveClientAuth_ClientHeld_ChallengeSurvivesNonceRetry: a challenge
+// rejected only for a missing DPoP nonce was never spent, and an AS without a
+// challenge_endpoint offers no way to get another.
+func TestResolveClientAuth_ClientHeld_ChallengeSurvivesNonceRetry(t *testing.T) {
+	client := supportingClient()
+
+	var mu sync.Mutex
+	var attempts int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		mu.Lock()
+		attempts++
+		n := attempts
+		mu.Unlock()
+		switch n {
+		case 1:
+			w.Header().Set("OAuth-Client-Attestation-Challenge", "chal-abc")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"use_attestation_challenge"}`))
+		case 2:
+			w.Header().Set("DPoP-Nonce", "server-nonce")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"use_dpop_nonce"}`))
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"at","token_type":"DPoP"}`))
+		}
+	}))
+	defer srv.Close()
+
+	h, _, cleanup := newClientAuthHandler(t, srv.Client(), client)
+	defer cleanup()
+
+	_, err := h.exchangePreAuthCode(context.Background(), &IssuerMetadata{TokenEndpoint: srv.URL}, "code", "")
+	require.NoError(t, err)
+
+	reqs := client.seen()
+	require.Len(t, reqs, 3)
+	assert.Equal(t, "chal-abc", reqs[1].Params.AttestationChallenge)
+	assert.Equal(t, "chal-abc", reqs[2].Params.AttestationChallenge, "nonce retry must keep the unspent challenge")
+	assert.Equal(t, "server-nonce", reqs[2].Params.DPoPNonce)
+	assert.Empty(t, h.attestationChallenge, "spent once the AS accepts the request")
 }
 
 func TestResolveClientAuth_ClientHeld_ResourceRequestCarriesATHOnly(t *testing.T) {
@@ -447,8 +494,342 @@ func TestSendFlowComplete_RelaysDPoPKeyID(t *testing.T) {
 	assert.False(t, hasJWK, "client-held mode relays no private key")
 }
 
+// challengeAS is an AS whose metadata advertises a challenge endpoint handing
+// out chal-1, chal-2, ..., and whose token endpoint records request headers.
+type challengeAS struct {
+	*httptest.Server
+	mu             sync.Mutex
+	metadataHits   int
+	challengeHits  int
+	challengeFails bool
+	tokenHeaders   []http.Header
+}
+
+func newChallengeAS(t *testing.T) *challengeAS {
+	t.Helper()
+	as := &challengeAS{}
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
+		as.mu.Lock()
+		as.metadataHits++
+		as.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"issuer":"` + as.URL + `","token_endpoint":"` + as.URL + `/token","challenge_endpoint":"` + as.URL + `/challenge"}`))
+	})
+
+	mux.HandleFunc("/challenge", func(w http.ResponseWriter, r *http.Request) {
+		as.mu.Lock()
+		as.challengeHits++
+		n := as.challengeHits
+		fail := as.challengeFails
+		as.mu.Unlock()
+		if fail {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("OAuth-Client-Attestation-Challenge", "chal-"+strconv.Itoa(n))
+	})
+
+	mux.HandleFunc("/par", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"request_uri":"urn:par:1"}`))
+	})
+
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		as.mu.Lock()
+		as.tokenHeaders = append(as.tokenHeaders, r.Header.Clone())
+		as.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"access_token":"at","token_type":"DPoP"}`))
+	})
+
+	as.Server = httptest.NewServer(mux)
+
+	t.Cleanup(as.Close)
+
+	return as
+}
+
+func (as *challengeAS) counts() (metadata, challenge, token int) {
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	return as.metadataHits, as.challengeHits, len(as.tokenHeaders)
+}
+
+func TestPrefetchChallenge_ClientHeld_FirstTokenRequestCarriesChallenge(t *testing.T) {
+	as := newChallengeAS(t)
+	client := supportingClient()
+	h, _, cleanup := newClientAuthHandler(t, as.Client(), client)
+	defer cleanup()
+
+	// token_endpoint already known from issuer metadata: AS metadata must
+	// still be read to discover challenge_endpoint.
+	metadata := &IssuerMetadata{CredentialIssuer: as.URL, TokenEndpoint: as.URL + "/token"}
+	_, err := h.exchangePreAuthCode(context.Background(), metadata, "code", "")
+	require.NoError(t, err)
+
+	metadataHits, challengeHits, tokenHits := as.counts()
+	assert.Equal(t, 1, metadataHits)
+	assert.Equal(t, 1, challengeHits)
+	assert.Equal(t, 1, tokenHits, "no use_attestation_challenge round-trip")
+
+	reqs := client.seen()
+	require.Len(t, reqs, 1)
+	assert.Equal(t, "chal-1", reqs[0].Params.AttestationChallenge)
+	assert.Empty(t, h.attestationChallenge, "spent once the AS accepts the request")
+}
+
+func TestPrefetchChallenge_ClientHeld_FreshChallengePerPoP(t *testing.T) {
+	as := newChallengeAS(t)
+	client := supportingClient()
+	h, _, cleanup := newClientAuthHandler(t, as.Client(), client)
+	defer cleanup()
+	h.challengeEndpoint = as.URL + "/challenge"
+
+	parAuth, err := h.resolveClientAuth(context.Background(), clientAuthNeeds{attestation: true})
+	require.NoError(t, err)
+	_, err = h.sendPushedAuthorizationRequest(context.Background(), as.URL+"/par", url.Values{}, parAuth)
+	require.NoError(t, err)
+	metadata := &IssuerMetadata{CredentialIssuer: as.URL, TokenEndpoint: as.URL + "/token"}
+	_, err = h.exchangeAuthCode(context.Background(), metadata, "code", "https://wallet.example.com/cb", "")
+	require.NoError(t, err)
+
+	reqs := client.seen()
+	require.Len(t, reqs, 2)
+	assert.Equal(t, "chal-1", reqs[0].Params.AttestationChallenge)
+	assert.Equal(t, "chal-2", reqs[1].Params.AttestationChallenge)
+}
+
+func TestPrefetchChallenge_Legacy_RequestAttestationCarriesChallenge(t *testing.T) {
+	as := newChallengeAS(t)
+	client := &clientAuthClient{respond: func(req SignRequestMessage) SignResponseMessage {
+		if req.Action == SignActionRequestAttestation {
+			return SignResponseMessage{ClientAttestation: "wia.jwt", ClientAttestationPoP: "legacy-pop"}
+		}
+		return SignResponseMessage{}
+	}}
+	h, _, cleanup := newClientAuthHandler(t, as.Client(), client)
+	defer cleanup()
+
+	metadata := &IssuerMetadata{CredentialIssuer: as.URL, TokenEndpoint: as.URL + "/token"}
+	_, err := h.exchangePreAuthCode(context.Background(), metadata, "code", "")
+	require.NoError(t, err)
+
+	reqs := client.seen()
+	require.Len(t, reqs, 2)
+	assert.Equal(t, SignActionRequestAttestation, reqs[1].Action)
+	assert.Equal(t, "chal-1", reqs[1].Params.AttestationChallenge, "unused probe challenge carries over")
+	_, challengeHits, _ := as.counts()
+	assert.Equal(t, 1, challengeHits)
+}
+
+func TestPrefetchChallenge_SkippedForPreSuppliedAttestation(t *testing.T) {
+	as := newChallengeAS(t)
+	client := supportingClient()
+	h, _, cleanup := newClientAuthHandler(t, as.Client(), client)
+	defer cleanup()
+	// What Execute does for FlowStartMessage{ClientAttestation, ClientAttestationPoP}.
+	h.attestationProvider = &TransportSuppliedAttestation{WIA: "wia.jwt", PoP: "upfront-pop", ID: h.clientID}
+	require.NoError(t, h.useLegacyClientAuth())
+
+	metadata := &IssuerMetadata{CredentialIssuer: as.URL, TokenEndpoint: as.URL + "/token"}
+	_, err := h.exchangePreAuthCode(context.Background(), metadata, "code", "")
+	require.NoError(t, err)
+
+	_, challengeHits, _ := as.counts()
+	assert.Zero(t, challengeHits, "a pre-signed PoP cannot carry a new challenge")
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	assert.Equal(t, "upfront-pop", as.tokenHeaders[0].Get("OAuth-Client-Attestation-PoP"))
+}
+
+func TestPrefetchChallenge_EndpointFailureIsNotFatal(t *testing.T) {
+	as := newChallengeAS(t)
+	as.challengeFails = true
+	client := supportingClient()
+	h, _, cleanup := newClientAuthHandler(t, as.Client(), client)
+	defer cleanup()
+
+	metadata := &IssuerMetadata{CredentialIssuer: as.URL, TokenEndpoint: as.URL + "/token"}
+	_, err := h.exchangePreAuthCode(context.Background(), metadata, "code", "")
+	require.NoError(t, err)
+
+	reqs := client.seen()
+	require.Len(t, reqs, 1)
+	assert.Empty(t, reqs[0].Params.AttestationChallenge)
+}
+
 func TestAccessTokenHash(t *testing.T) {
 	assert.Empty(t, accessTokenHash(""))
 	// RFC 9449 §4.2: base64url(SHA-256(access_token)), unpadded.
 	assert.Equal(t, "fUHyO2r2Z3DZ53EsNrWBb0xWXoaNy59IiKCAqksmQEo", accessTokenHash("Kz~8mXK1EalYznwH-LC-1fBAo.4Ljp~zsPE_NeO.gxU"))
+}
+
+// scriptedTokenAS is an AS whose token endpoint answers from a script, one
+// step per request. withChallengeEndpoint controls whether its metadata
+// advertises a challenge_endpoint (handing out chal-1, chal-2, ...).
+type scriptedTokenAS struct {
+	*httptest.Server
+	mu            sync.Mutex
+	steps         []func(w http.ResponseWriter)
+	tokenHits     int
+	challengeHits int
+}
+
+func tokenStepUseChallenge(challenge string) func(w http.ResponseWriter) {
+	return func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("OAuth-Client-Attestation-Challenge", challenge)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"use_attestation_challenge"}`))
+	}
+}
+
+func tokenStepUseNonce(nonce string) func(w http.ResponseWriter) {
+	return func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("DPoP-Nonce", nonce)
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"use_dpop_nonce"}`))
+	}
+}
+
+func tokenStepOK(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"access_token":"at","token_type":"DPoP"}`))
+}
+
+func newScriptedTokenAS(t *testing.T, withChallengeEndpoint bool, steps ...func(w http.ResponseWriter)) *scriptedTokenAS {
+	t.Helper()
+	as := &scriptedTokenAS{steps: steps}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/oauth-authorization-server", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		ce := ""
+		if withChallengeEndpoint {
+			ce = `,"challenge_endpoint":"` + as.URL + `/challenge"`
+		}
+		_, _ = w.Write([]byte(`{"issuer":"` + as.URL + `","token_endpoint":"` + as.URL + `/token"` + ce + `}`))
+	})
+	mux.HandleFunc("/challenge", func(w http.ResponseWriter, r *http.Request) {
+		as.mu.Lock()
+		as.challengeHits++
+		n := as.challengeHits
+		as.mu.Unlock()
+		w.Header().Set("OAuth-Client-Attestation-Challenge", "chal-"+strconv.Itoa(n))
+	})
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		as.mu.Lock()
+		i := as.tokenHits
+		as.tokenHits++
+		as.mu.Unlock()
+		if i >= len(as.steps) {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		as.steps[i](w)
+	})
+	as.Server = httptest.NewServer(mux)
+	t.Cleanup(as.Close)
+	return as
+}
+
+func exchangeScripted(t *testing.T, as *scriptedTokenAS, client *clientAuthClient) error {
+	t.Helper()
+	h, _, cleanup := newClientAuthHandler(t, as.Client(), client)
+	defer cleanup()
+	metadata := &IssuerMetadata{CredentialIssuer: as.URL, TokenEndpoint: as.URL + "/token"}
+	_, err := h.exchangePreAuthCode(context.Background(), metadata, "code", "")
+	return err
+}
+
+// A request rejected with use_dpop_nonce was not accepted, so the challenge it
+// carried may not have been consumed. Without a challenge endpoint the engine
+// cannot fetch another one, so the retry must resend the same challenge along
+// with the nonce rather than drop it.
+func TestChallengeRetry_NoEndpoint_NonceRetryKeepsChallenge(t *testing.T) {
+	as := newScriptedTokenAS(t, false,
+		tokenStepUseChallenge("C1"), tokenStepUseNonce("N1"), tokenStepOK)
+	client := supportingClient()
+	require.NoError(t, exchangeScripted(t, as, client))
+
+	reqs := client.seen()
+	require.Len(t, reqs, 3)
+	assert.Empty(t, reqs[0].Params.AttestationChallenge)
+	assert.Equal(t, "C1", reqs[1].Params.AttestationChallenge)
+	assert.Empty(t, reqs[1].Params.DPoPNonce)
+	assert.Equal(t, "C1", reqs[2].Params.AttestationChallenge, "nonce-only retry must keep the challenge")
+	assert.Equal(t, "N1", reqs[2].Params.DPoPNonce)
+}
+
+// The prefetched challenge is only spent once the AS accepts the request, so a
+// nonce-only retry reuses it instead of fetching another.
+func TestChallengeRetry_Endpoint_NonceRetryReusesUnspentChallenge(t *testing.T) {
+	as := newScriptedTokenAS(t, true, tokenStepUseNonce("N1"), tokenStepOK)
+	client := supportingClient()
+	require.NoError(t, exchangeScripted(t, as, client))
+
+	reqs := client.seen()
+	require.Len(t, reqs, 2)
+	assert.Equal(t, "chal-1", reqs[0].Params.AttestationChallenge)
+	assert.Equal(t, "chal-1", reqs[1].Params.AttestationChallenge)
+	assert.Equal(t, "N1", reqs[1].Params.DPoPNonce)
+	as.mu.Lock()
+	defer as.mu.Unlock()
+	assert.Equal(t, 1, as.challengeHits)
+}
+
+// challenge -> nonce -> challenge again (the AS consumed the first one) ->
+// success needs four requests: nonce retries must not eat the budget the
+// challenge retries need.
+func TestChallengeRetry_NonceRetryDoesNotExhaustBudget(t *testing.T) {
+	as := newScriptedTokenAS(t, false,
+		tokenStepUseChallenge("C1"), tokenStepUseNonce("N1"), tokenStepUseChallenge("C2"), tokenStepOK)
+	client := supportingClient()
+	require.NoError(t, exchangeScripted(t, as, client))
+
+	reqs := client.seen()
+	require.Len(t, reqs, 4)
+	assert.Equal(t, "C2", reqs[3].Params.AttestationChallenge)
+	assert.Equal(t, "N1", reqs[3].Params.DPoPNonce)
+}
+
+// In legacy mode the WIA+PoP is requested once and replayed. A PAR that the AS
+// accepted spent the challenge bound into that PoP, so the token request must
+// not replay it: the attestation is re-requested with a fresh challenge.
+func TestPrefetchChallenge_Legacy_PARSpendsChallengeTokenGetsFreshAttestation(t *testing.T) {
+	as := newChallengeAS(t)
+	client := &clientAuthClient{respond: func(req SignRequestMessage) SignResponseMessage {
+		if req.Action == SignActionRequestAttestation {
+			return SignResponseMessage{ClientAttestation: "wia.jwt", ClientAttestationPoP: "legacy-pop"}
+		}
+		return SignResponseMessage{}
+	}}
+	h, _, cleanup := newClientAuthHandler(t, as.Client(), client)
+	defer cleanup()
+	h.challengeEndpoint = as.URL + "/challenge"
+
+	parAuth, err := h.resolveClientAuth(context.Background(), clientAuthNeeds{attestation: true})
+	require.NoError(t, err)
+	_, err = h.sendPushedAuthorizationRequest(context.Background(), as.URL+"/par", url.Values{}, parAuth)
+	require.NoError(t, err)
+
+	metadata := &IssuerMetadata{CredentialIssuer: as.URL, TokenEndpoint: as.URL + "/token"}
+	_, err = h.exchangeAuthCode(context.Background(), metadata, "code", "https://wallet.example.com/cb", "")
+	require.NoError(t, err)
+
+	var attest []SignRequestMessage
+	for _, r := range client.seen() {
+		if r.Action == SignActionRequestAttestation {
+			attest = append(attest, r)
+		}
+	}
+	require.Len(t, attest, 2, "token request must not replay the PoP whose challenge PAR spent")
+	assert.Equal(t, "chal-1", attest[0].Params.AttestationChallenge)
+	assert.Equal(t, "chal-2", attest[1].Params.AttestationChallenge)
 }
