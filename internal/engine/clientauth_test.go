@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"sync"
 	"testing"
@@ -244,7 +245,52 @@ func TestResolveClientAuth_ClientHeld_AttestationChallengeRetry(t *testing.T) {
 	require.Len(t, reqs, 2)
 	assert.Empty(t, reqs[0].Params.AttestationChallenge, "first PoP carries no challenge yet")
 	assert.Equal(t, "chal-abc", reqs[1].Params.AttestationChallenge, "retry must carry the server challenge")
-	assert.Empty(t, h.attestationChallenge, "a challenge is bound into one PoP only")
+	assert.Empty(t, h.attestationChallenge, "spent once the AS accepts the request")
+}
+
+// TestResolveClientAuth_ClientHeld_ChallengeSurvivesNonceRetry: a challenge
+// rejected only for a missing DPoP nonce was never spent, and an AS without a
+// challenge_endpoint offers no way to get another.
+func TestResolveClientAuth_ClientHeld_ChallengeSurvivesNonceRetry(t *testing.T) {
+	client := supportingClient()
+
+	var mu sync.Mutex
+	var attempts int
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		mu.Lock()
+		attempts++
+		n := attempts
+		mu.Unlock()
+		switch n {
+		case 1:
+			w.Header().Set("OAuth-Client-Attestation-Challenge", "chal-abc")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"use_attestation_challenge"}`))
+		case 2:
+			w.Header().Set("DPoP-Nonce", "server-nonce")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"use_dpop_nonce"}`))
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"access_token":"at","token_type":"DPoP"}`))
+		}
+	}))
+	defer srv.Close()
+
+	h, _, cleanup := newClientAuthHandler(t, srv.Client(), client)
+	defer cleanup()
+
+	_, err := h.exchangePreAuthCode(context.Background(), &IssuerMetadata{TokenEndpoint: srv.URL}, "code", "")
+	require.NoError(t, err)
+
+	reqs := client.seen()
+	require.Len(t, reqs, 3)
+	assert.Equal(t, "chal-abc", reqs[1].Params.AttestationChallenge)
+	assert.Equal(t, "chal-abc", reqs[2].Params.AttestationChallenge, "nonce retry must keep the unspent challenge")
+	assert.Equal(t, "server-nonce", reqs[2].Params.DPoPNonce)
+	assert.Empty(t, h.attestationChallenge, "spent once the AS accepts the request")
 }
 
 func TestResolveClientAuth_ClientHeld_ResourceRequestCarriesATHOnly(t *testing.T) {
@@ -485,6 +531,13 @@ func newChallengeAS(t *testing.T) *challengeAS {
 		w.Header().Set("OAuth-Client-Attestation-Challenge", "chal-"+strconv.Itoa(n))
 	})
 
+	mux.HandleFunc("/par", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"request_uri":"urn:par:1"}`))
+	})
+
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
 		as.mu.Lock()
@@ -527,7 +580,7 @@ func TestPrefetchChallenge_ClientHeld_FirstTokenRequestCarriesChallenge(t *testi
 	reqs := client.seen()
 	require.Len(t, reqs, 1)
 	assert.Equal(t, "chal-1", reqs[0].Params.AttestationChallenge)
-	assert.Empty(t, h.attestationChallenge, "a challenge is bound into one PoP only")
+	assert.Empty(t, h.attestationChallenge, "spent once the AS accepts the request")
 }
 
 func TestPrefetchChallenge_ClientHeld_FreshChallengePerPoP(t *testing.T) {
@@ -537,10 +590,12 @@ func TestPrefetchChallenge_ClientHeld_FreshChallengePerPoP(t *testing.T) {
 	defer cleanup()
 	h.challengeEndpoint = as.URL + "/challenge"
 
-	// PAR then token request.
-	_, err := h.resolveClientAuth(context.Background(), clientAuthNeeds{attestation: true})
+	parAuth, err := h.resolveClientAuth(context.Background(), clientAuthNeeds{attestation: true})
 	require.NoError(t, err)
-	_, err = h.resolveClientAuth(context.Background(), clientAuthNeeds{attestation: true, dpop: true, htm: "POST", htu: as.URL + "/token"})
+	_, err = h.sendPushedAuthorizationRequest(context.Background(), as.URL+"/par", url.Values{}, parAuth)
+	require.NoError(t, err)
+	metadata := &IssuerMetadata{CredentialIssuer: as.URL, TokenEndpoint: as.URL + "/token"}
+	_, err = h.exchangeAuthCode(context.Background(), metadata, "code", "https://wallet.example.com/cb", "")
 	require.NoError(t, err)
 
 	reqs := client.seen()

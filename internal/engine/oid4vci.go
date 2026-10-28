@@ -853,7 +853,6 @@ func (h *OID4VCIHandler) requestClientAttestation(ctx context.Context) {
 		PoP: resp.ClientAttestationPoP,
 		ID:  h.clientID,
 	}
-	h.attestationChallenge = "" // single-use: now bound into the PoP
 	h.Logger.Info("using OAuth-Client-Attestation authentication (engine-requested, client-signed PoP)",
 		zap.String("auth_server_issuer", h.authServerIssuer),
 		zap.String("client_id", h.clientID))
@@ -1948,6 +1947,7 @@ func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMe
 			_ = h.Error(StepExchangingToken, ErrCodeTokenError, ErrCodeTokenError.UserFacingMessage())
 			return nil, parseOAuthError(resp.StatusCode, body)
 		}
+		h.attestationChallenge = "" // spent: the AS accepted it
 
 		var token TokenResponse
 		if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
@@ -2366,6 +2366,7 @@ func (h *OID4VCIHandler) sendPushedAuthorizationRequest(ctx context.Context, par
 		}
 		return "", fmt.Errorf("PAR endpoint returned status %d", resp.StatusCode)
 	}
+	h.attestationChallenge = "" // spent: the AS accepted it
 
 	var parResp PARResponse
 	if err := json.NewDecoder(resp.Body).Decode(&parResp); err != nil {
