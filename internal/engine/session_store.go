@@ -426,70 +426,97 @@ func (r *RedisSessionStore) Get(ctx context.Context, sessionID string) (*Session
 func (r *RedisSessionStore) GetByUser(ctx context.Context, tenantID, userID string) (*SessionData, error) {
 	uk := r.userKey(tenantID, userID)
 	for {
-		sessionID, err := r.client.Get(ctx, uk).Result()
-		if err == redis.Nil {
-			legacy, err := r.getByLegacyUser(ctx, tenantID, userID)
-			if err != nil && err != ErrSessionNotFound {
-				return nil, err
-			}
-			currentID, currentErr := r.client.Get(ctx, uk).Result()
-			if currentErr == redis.Nil {
-				return legacy, err
-			}
-			if currentErr != nil {
-				return nil, currentErr
-			}
-			if err == nil && currentID == legacy.ID {
-				return legacy, nil
-			}
-			continue
+		session, retry, err := r.getByUserOnce(ctx, uk, tenantID, userID)
+		if !retry {
+			return session, err
 		}
-		if err != nil {
-			return nil, err
-		}
-
-		session, err := r.Get(ctx, sessionID)
-		if err == ErrSessionNotFound {
-			// The pointer names a session that is gone. During a rolling
-			// upgrade an old replica can replace it under the legacy pointer.
-			// Drop this pointer only if it still names the dead session.
-			if err := compareAndDeleteScript.Run(ctx, r.client, []string{uk}, sessionID).Err(); err != nil {
-				return nil, err
-			}
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		if session.UserID != userID || normalizeTenant(session.TenantID) != normalizeTenant(tenantID) {
-			if err := compareAndDeleteScript.Run(ctx, r.client, []string{uk}, sessionID).Err(); err != nil {
-				return nil, err
-			}
-			continue
-		}
-
-		legacy, err := r.getByLegacyUser(ctx, tenantID, userID)
-		if err == ErrSessionNotFound || (err == nil && !legacy.CreatedAt.After(session.CreatedAt)) {
-			return session, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-
-		ttl := time.Until(legacy.ExpiresAt)
-		if ttl <= 0 {
-			return session, nil
-		}
-		updated, err := compareAndSetScript.Run(ctx, r.client, []string{uk}, sessionID, legacy.ID, max(1, ttl.Milliseconds())).Int()
-		if err != nil {
-			return nil, err
-		}
-		if updated == 1 {
-			return legacy, nil
-		}
-		// The scoped pointer changed concurrently; read it again and compare
-		// the current live sessions rather than returning a stale candidate.
 	}
+}
+
+// getByUserOnce makes one resolution attempt for GetByUser. retry is true when
+// the pointers changed or a dead pointer was dropped and the lookup must start
+// over; otherwise session and err are the final answer.
+func (r *RedisSessionStore) getByUserOnce(ctx context.Context, uk, tenantID, userID string) (session *SessionData, retry bool, err error) {
+	sessionID, err := r.client.Get(ctx, uk).Result()
+	if err == redis.Nil {
+		return r.resolveLegacyOnly(ctx, uk, tenantID, userID)
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return r.resolveScopedPointer(ctx, uk, sessionID, tenantID, userID)
+}
+
+// resolveLegacyOnly answers when there is no scoped pointer: it resolves the
+// legacy pointer (whose lazy backfill may create the scoped one) and, if the
+// scoped pointer appeared meanwhile for another session, asks to retry.
+func (r *RedisSessionStore) resolveLegacyOnly(ctx context.Context, uk, tenantID, userID string) (*SessionData, bool, error) {
+	legacy, err := r.getByLegacyUser(ctx, tenantID, userID)
+	if err != nil && err != ErrSessionNotFound {
+		return nil, false, err
+	}
+	currentID, currentErr := r.client.Get(ctx, uk).Result()
+	switch {
+	case currentErr == redis.Nil:
+		return legacy, false, err
+	case currentErr != nil:
+		return nil, false, currentErr
+	case err == nil && currentID == legacy.ID:
+		return legacy, false, nil
+	}
+	return nil, true, nil
+}
+
+// resolveScopedPointer validates the session the scoped pointer names. A
+// pointer to a gone session or to another user's/tenant's session is dropped
+// (only if it still names that session) and the lookup retried; a live match is
+// compared with the legacy pointer's session.
+func (r *RedisSessionStore) resolveScopedPointer(ctx context.Context, uk, sessionID, tenantID, userID string) (*SessionData, bool, error) {
+	session, err := r.Get(ctx, sessionID)
+	if err != nil && err != ErrSessionNotFound {
+		return nil, false, err
+	}
+	// A gone session: during a rolling upgrade an old replica can replace it
+	// under the legacy pointer, so drop this pointer and resolve again.
+	if err == ErrSessionNotFound || !sessionBelongsTo(session, tenantID, userID) {
+		if err := compareAndDeleteScript.Run(ctx, r.client, []string{uk}, sessionID).Err(); err != nil {
+			return nil, false, err
+		}
+		return nil, true, nil
+	}
+
+	legacy, err := r.getByLegacyUser(ctx, tenantID, userID)
+	if err != nil && err != ErrSessionNotFound {
+		return nil, false, err
+	}
+	if err == ErrSessionNotFound || !legacy.CreatedAt.After(session.CreatedAt) {
+		return session, false, nil
+	}
+	return r.swapToNewerLegacy(ctx, uk, session, legacy)
+}
+
+// sessionBelongsTo reports whether the session is the user's in the (normalised)
+// tenant.
+func sessionBelongsTo(s *SessionData, tenantID, userID string) bool {
+	return s.UserID == userID && normalizeTenant(s.TenantID) == normalizeTenant(tenantID)
+}
+
+// swapToNewerLegacy repoints the scoped pointer from session to the newer
+// legacy session by compare-and-set. If the pointer changed concurrently it
+// asks to retry so the current live sessions are compared again.
+func (r *RedisSessionStore) swapToNewerLegacy(ctx context.Context, uk string, session, legacy *SessionData) (*SessionData, bool, error) {
+	ttl := time.Until(legacy.ExpiresAt)
+	if ttl <= 0 {
+		return session, false, nil
+	}
+	updated, err := compareAndSetScript.Run(ctx, r.client, []string{uk}, session.ID, legacy.ID, max(1, ttl.Milliseconds())).Int()
+	if err != nil {
+		return nil, false, err
+	}
+	if updated == 1 {
+		return legacy, false, nil
+	}
+	return nil, true, nil
 }
 
 // getByLegacyUser resolves a session through the legacy pointer. It is
@@ -508,7 +535,7 @@ func (r *RedisSessionStore) getByLegacyUser(ctx context.Context, tenantID, userI
 	if err != nil {
 		return nil, err
 	}
-	if session.UserID != userID || normalizeTenant(session.TenantID) != normalizeTenant(tenantID) {
+	if !sessionBelongsTo(session, tenantID, userID) {
 		return nil, ErrSessionNotFound
 	}
 
