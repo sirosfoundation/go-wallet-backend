@@ -93,6 +93,20 @@ func (h *BaseHandler) RequestMatch(ctx context.Context, dcql json.RawMessage) (*
 	return h.Flow.Session.RequestMatch(ctx, h.Flow.ID, dcql)
 }
 
+// RequestMatchWithClientMetadata is RequestMatch that also passes the
+// validated request inputs (see VerifiedRequestInputs) to the client.
+//
+// The OID4VP handler does not call this: it hands the DCQL query to the client
+// inside credential_selection and the client matches and asks for consent in
+// that one step, so a separate match round-trip would only add a second
+// message that can disagree with the first. match_request is kept for flows
+// that do match first; any such caller must pass the value built by
+// evaluateVerifierTrust (AuthorizationRequest.Verified), never one assembled
+// from the raw request, so all three messages carry identical inputs.
+func (h *BaseHandler) RequestMatchWithClientMetadata(ctx context.Context, dcql json.RawMessage, request *VerifiedRequestInputs) (*MatchResponseMessage, error) {
+	return h.Flow.Session.RequestMatchWithClientMetadata(ctx, h.Flow.ID, dcql, request)
+}
+
 // WaitForAction waits for a client action
 func (h *BaseHandler) WaitForAction(ctx context.Context, expectedActions ...string) (*FlowActionMessage, error) {
 	return h.Flow.Session.WaitForAction(ctx, h.Flow.ID, expectedActions...)

@@ -63,8 +63,16 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist
 			return
 		}
 
-		// Validate via go-tokenauth (per-jti revocation happens inside Validate).
-		result, err := v.Validate(c.Request.Context(), rawToken)
+		// Validate via go-tokenauth.
+		// Per-jti revocation is already checked inside Validate itself (see
+		// this function's doc comment).
+		vctx := c.Request.Context()
+		if IsLogout(c) {
+			// Lets the validator's revocation checker admit an already
+			// revoked jti for the idempotent logout call; see IsLogout.
+			vctx = WithLogoutCompletion(vctx)
+		}
+		result, err := v.Validate(vctx, rawToken)
 		if err != nil {
 			logAuthReject(logger, c, "token_validation_failed", zap.Error(err))
 			c.JSON(401, gin.H{"error": "Invalid token"})
@@ -76,13 +84,20 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist
 		// deleted user, even one whose own jti was never individually
 		// blacklisted. A no-op for anonymous tokens (empty UserID - see
 		// TokenBlacklist.IsUserRevoked).
-		if blacklist != nil && blacklist.IsUserRevoked(c.Request.Context(), result.UserID) {
-			logger.Warn("Token for revoked user used",
-				zap.String("user_id", result.UserID),
-			)
-			c.JSON(401, gin.H{"error": "Token has been revoked"})
-			c.Abort()
-			return
+		if blacklist != nil {
+			userRevoked, err := blacklist.IsUserRevoked(c.Request.Context(), result.UserID)
+			if err != nil {
+				RefuseRevocationUnavailable(c, logger, err)
+				return
+			}
+			if userRevoked && !IsAccountDeletion(c) {
+				logger.Warn("Token for revoked user used",
+					zap.String("user_id", result.UserID),
+				)
+				c.JSON(401, gin.H{"error": "Token has been revoked"})
+				c.Abort()
+				return
+			}
 		}
 
 		// Tenant validation: look up and check enabled

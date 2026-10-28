@@ -767,3 +767,51 @@ func TestApplyLegacyRegistryConfig_EnvPresenceWarnsRegardlessOfValue(t *testing.
 		})
 	}
 }
+
+func TestLoadRegistryOnly_MongoPasswordForSharedRevocations(t *testing.T) {
+	dir := t.TempDir()
+	pw := writeFile(t, dir, "pw", "s3cret\n")
+	missing := filepath.Join(dir, "missing")
+	mongo := func(path, extra string) string {
+		return "as:\n  legacy:\n    enabled: false\nstorage:\n  type: mongodb\n  mongodb:\n    uri: mongodb://u:%PASSWORD%@db:27017\n    password_path: " + path + "\n" + extra
+	}
+
+	cfg, err := LoadRegistryOnly(writeFile(t, dir, "a.yaml", mongo(pw, "")))
+	require.NoError(t, err)
+	assert.Equal(t, "mongodb://u:s3cret@db:27017", cfg.Storage.MongoDB.URI, "default backend with MongoDB storage uses the shared store")
+
+	cfg, err = LoadRegistryOnly(writeFile(t, dir, "b.yaml", mongo(pw, "security:\n  token_blacklist:\n    backend: storage\n")))
+	require.NoError(t, err)
+	assert.Equal(t, "mongodb://u:s3cret@db:27017", cfg.Storage.MongoDB.URI)
+
+	_, err = LoadRegistryOnly(writeFile(t, dir, "c.yaml", mongo(missing, "")))
+	assert.ErrorContains(t, err, "storage.mongodb.password_path", "a needed password that cannot be read fails startup")
+
+	for name, extra := range map[string]string{
+		"backend memory":     "security:\n  token_blacklist:\n    backend: memory\n",
+		"blacklist disabled": "security:\n  token_blacklist:\n    enabled: false\n",
+	} {
+		cfg, err = LoadRegistryOnly(writeFile(t, dir, "d.yaml", mongo(missing, extra)))
+		require.NoError(t, err, name)
+		assert.Contains(t, cfg.Storage.MongoDB.URI, "%PASSWORD%", name)
+	}
+}
+
+func TestLoadRegistryOnly_RejectsBadRevocationBackend(t *testing.T) {
+	dir := t.TempDir()
+	load := func(name, extra string) error {
+		_, err := LoadRegistryOnly(writeFile(t, dir, name, "as:\n  legacy:\n    enabled: false\n"+extra))
+		return err
+	}
+	assert.ErrorContains(t, load("a.yaml", "security:\n  token_blacklist:\n    backend: storag\n"), "security.token_blacklist.backend")
+	assert.ErrorContains(t, load("b.yaml", "security:\n  token_blacklist:\n    backend: storage\n"), "requires storage.type=mongodb")
+	require.NoError(t, load("c.yaml", "security:\n  token_blacklist:\n    backend: memory\n"))
+	require.NoError(t, load("d.yaml", ""))
+
+	// A storage.type typo would silently select the per-process blacklist
+	// through the default backend; the registry-only load must refuse it.
+	assert.ErrorContains(t, load("e.yaml", "storage:\n  type: mongdb\n"), "invalid storage.type")
+	require.NoError(t, load("f.yaml", "storage:\n  type: mongodb\n"))
+	require.NoError(t, load("g.yaml", "storage:\n  type: mongdb\nsecurity:\n  token_blacklist:\n    backend: memory\n"),
+		"an explicit backend does not depend on storage.type")
+}
