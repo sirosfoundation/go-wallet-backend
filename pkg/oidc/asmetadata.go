@@ -82,7 +82,9 @@ func fetchASCandidate(ctx context.Context, client *http.Client, u string, maxByt
 		return nil, 0, err
 	}
 	req.Header.Set("Accept", "application/json")
-	resp, err := client.Do(req)
+	// The AS identifier is issuer-chosen by design; callers pass the SSRF-guarded
+	// client (private/loopback/metadata addresses refused at dial, incl. redirects).
+	resp, err := client.Do(req) // codeql[go/request-forgery]
 	if err != nil {
 		return nil, 0, err
 	}
