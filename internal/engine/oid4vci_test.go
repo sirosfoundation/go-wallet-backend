@@ -2777,6 +2777,7 @@ func TestResumeWithAuthCode_FetchesTokenEndpointFromOAuthMetadata(t *testing.T) 
 
 	h, cleanup := testOID4VCIHandler(t, server.Client())
 	defer cleanup()
+	h.asMetadataFetched = false
 
 	metadata := &IssuerMetadata{
 		CredentialIssuer: server.URL,
@@ -2797,8 +2798,9 @@ func TestResumeWithAuthCode_FetchesTokenEndpointFromOAuthMetadata(t *testing.T) 
 func TestResumeWithAuthCode_MissingCodeVerifier(t *testing.T) {
 	// When OAuth metadata is unreachable, PKCE defaults to required.
 	// An empty code_verifier should produce a clear error.
-	h, cleanup := testOID4VCIHandler(t, http.DefaultClient)
+	h, cleanup := testOID4VCIHandler(t, &http.Client{Transport: &errRoundTripper{}})
 	defer cleanup()
+	h.asMetadataFetched = false
 
 	metadata := &IssuerMetadata{
 		CredentialIssuer: "https://issuer.example.com",
@@ -2839,6 +2841,7 @@ func TestResumeWithAuthCode_PKCENotRequired(t *testing.T) {
 
 	h, cleanup := testOID4VCIHandler(t, server.Client())
 	defer cleanup()
+	h.asMetadataFetched = false
 
 	metadata := &IssuerMetadata{
 		CredentialIssuer: server.URL,
