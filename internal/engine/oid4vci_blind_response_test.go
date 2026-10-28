@@ -108,7 +108,7 @@ func (c *fakeClient) handle(data []byte) {
 	case SignActionDecryptCredentialResponse:
 		c.answerDecrypt(&req, &resp)
 	}
-	sess.signCh <- &resp
+	sess.dispatchSignResponse(&resp)
 }
 
 func (c *fakeClient) answerProof(req *SignRequestMessage, resp *SignResponseMessage) {
