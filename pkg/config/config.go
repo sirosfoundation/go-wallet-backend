@@ -2234,7 +2234,20 @@ type TokenBlacklistConfig struct {
 	// CleanupIntervalSeconds is how often to clean up expired blacklist entries
 	// Default: 3600 (1 hour)
 	CleanupIntervalSeconds int `yaml:"cleanup_interval_seconds" envconfig:"CLEANUP_INTERVAL_SECONDS"`
+
+	// Backend selects where revoked access-token jtis and revoked users are
+	// kept: "memory" (per process; lost on restart, not seen by other
+	// replicas) or "storage" (the MongoDB storage backend; shared by all
+	// replicas and survives restarts). Empty means "storage" when
+	// storage.type is mongodb and "memory" otherwise.
+	Backend string `yaml:"backend" envconfig:"BACKEND"`
 }
+
+// Token blacklist backends.
+const (
+	TokenBlacklistBackendMemory  = "memory"
+	TokenBlacklistBackendStorage = "storage"
+)
 
 // SetDefaults sets default values for token blacklist
 func (c *TokenBlacklistConfig) SetDefaults() {
@@ -2431,9 +2444,10 @@ func Load(configFile string) (*Config, error) {
 // caller after any deprecated-alias overlay (see ValidateRegistry and
 // ValidateRegistryStandalone).
 func LoadRegistryOnly(configFile string) (*Config, error) {
-	// No secret files are read: the registry validates AS tokens through the JWKS (a deprecated
-	// registry.yaml jwt secret is ignored).
-	return load(configFile, func(*Config) error { return nil }, (*Config).validateRegistryStandaloneServer)
+	// Only the MongoDB password is read, and only when the shared revocation
+	// store is in use: the registry validates AS tokens through the JWKS (a
+	// deprecated registry.yaml jwt secret is ignored).
+	return load(configFile, (*Config).loadRegistrySecrets, (*Config).validateRegistryStandaloneServer)
 }
 
 func load(configFile string, loadSecrets, validate func(*Config) error) (*Config, error) {
@@ -2634,16 +2648,43 @@ func (c *Config) loadSecretsFromFiles() error {
 		}
 	}
 
-	// Load MongoDB password from file and inject into URI
-	if c.Storage.MongoDB.PasswordPath != "" {
-		password, err := readSecretFile(c.Storage.MongoDB.PasswordPath)
-		if err != nil {
-			return fmt.Errorf("storage.mongodb.password_path: %w", err)
-		}
-		// Replace %PASSWORD% placeholder in URI (no-op if not present)
-		c.Storage.MongoDB.URI = strings.Replace(c.Storage.MongoDB.URI, "%PASSWORD%", password, 1)
-	}
+	return c.loadMongoPassword()
+}
 
+// validateTokenBlacklistBackend rejects an unknown revocation backend and the
+// storage backend without MongoDB storage. A typo must not silently turn
+// shared revocations off.
+func (c *Config) validateTokenBlacklistBackend() error {
+	switch c.Security.TokenBlacklist.Backend {
+	case "":
+		// The default follows storage.type, so a typo there would silently
+		// select the per-process blacklist; a registry-only process does not
+		// run the full storage validation.
+		if c.Security.TokenBlacklist.Enabled && c.Storage.Type != "mongodb" && c.Storage.Type != "memory" && c.Storage.Type != "" {
+			return fmt.Errorf("invalid storage.type: %q (must be memory or mongodb); it selects the default token revocation backend", c.Storage.Type)
+		}
+	case TokenBlacklistBackendMemory:
+	case TokenBlacklistBackendStorage:
+		if c.Storage.Type != "mongodb" {
+			return fmt.Errorf("security.token_blacklist.backend=storage requires storage.type=mongodb")
+		}
+	default:
+		return fmt.Errorf("invalid security.token_blacklist.backend: %q (must be memory or storage)", c.Security.TokenBlacklist.Backend)
+	}
+	return nil
+}
+
+// loadMongoPassword reads the MongoDB password file and injects it into the
+// URI's %PASSWORD% placeholder (a no-op if the URI has none).
+func (c *Config) loadMongoPassword() error {
+	if c.Storage.MongoDB.PasswordPath == "" {
+		return nil
+	}
+	password, err := readSecretFile(c.Storage.MongoDB.PasswordPath)
+	if err != nil {
+		return fmt.Errorf("storage.mongodb.password_path: %w", err)
+	}
+	c.Storage.MongoDB.URI = strings.Replace(c.Storage.MongoDB.URI, "%PASSWORD%", password, 1)
 	return nil
 }
 
@@ -2942,6 +2983,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("sqlite storage is not yet implemented - please use 'memory' or 'mongodb'")
 	default:
 		return fmt.Errorf("invalid storage type: %s (must be memory or mongodb)", c.Storage.Type)
+	}
+
+	if err := c.validateTokenBlacklistBackend(); err != nil {
+		return err
 	}
 
 	if c.Storage.Type == "mongodb" && c.Storage.MongoDB.URI == "" {

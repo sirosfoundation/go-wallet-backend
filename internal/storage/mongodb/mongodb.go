@@ -38,20 +38,9 @@ type Store struct {
 	appAttestKeys   *AppAttestKeyStore
 }
 
-// NewStore creates a MongoDB store and runs startup initialization (default tenant, indexes).
-func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
-	return newStore(ctx, cfg, true)
-}
-
-// NewReadOnlyStore connects like NewStore but performs no startup writes, for
-// a process that only reads (e.g. a standalone engine checking a token cut-off).
-// Its principal needs read rights on users and user_deletion_tombstones; the
-// gate fails closed if the tombstone read is denied.
-func NewReadOnlyStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
-	return newStore(ctx, cfg, false)
-}
-
-func newStore(ctx context.Context, cfg *config.MongoDBConfig, initialize bool) (*Store, error) {
+// Connect opens a client for cfg (including TLS settings) and verifies the
+// connection with a ping. It does not touch any collection.
+func Connect(ctx context.Context, cfg *config.MongoDBConfig) (*mongo.Client, error) {
 	clientOptions := options.Client().
 		ApplyURI(cfg.URI).
 		SetConnectTimeout(time.Duration(cfg.Timeout) * time.Second)
@@ -86,7 +75,29 @@ func newStore(ctx context.Context, cfg *config.MongoDBConfig, initialize bool) (
 
 	// Ping the database to verify connection
 	if err := client.Ping(ctx, nil); err != nil {
+		_ = client.Disconnect(context.Background())
 		return nil, fmt.Errorf("failed to ping MongoDB: %w", err)
+	}
+	return client, nil
+}
+
+// NewStore creates a MongoDB store and runs startup initialization (default tenant, indexes).
+func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
+	return newStore(ctx, cfg, true)
+}
+
+// NewReadOnlyStore connects like NewStore but performs no startup writes, for
+// a process that only reads (e.g. a standalone engine checking a token cut-off).
+// Its principal needs read rights on users and user_deletion_tombstones; the
+// gate fails closed if the tombstone read is denied.
+func NewReadOnlyStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
+	return newStore(ctx, cfg, false)
+}
+
+func newStore(ctx context.Context, cfg *config.MongoDBConfig, initialize bool) (*Store, error) {
+	client, err := Connect(ctx, cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	database := client.Database(cfg.Database)

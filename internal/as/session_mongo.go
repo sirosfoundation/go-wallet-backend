@@ -117,7 +117,7 @@ func (s *MongoSessionStore) Revoke(ctx context.Context, jti string) error {
 		return fmt.Errorf("revoke session: %w", err)
 	}
 	if res.MatchedCount == 0 {
-		return fmt.Errorf("session %s not found", jti)
+		return ErrSessionNotFound
 	}
 	return nil
 }

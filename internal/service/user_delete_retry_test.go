@@ -229,23 +229,29 @@ func TestDeleteUser_CutoffAdvanceFailureIsRetryableAndIrreversibleFree(t *testin
 	require.NoError(t, svc.DeleteUser(ctx, uid, uid.String()))
 }
 
-// A blacklist that did not take effect (RevokeUser failed) leaves a fresh
-// login able to pass the gate, so the second-cleaner failure stays retryable.
+// A blacklist revocation that fails stops the deletion with the record kept
+// (fail closed); the cleaner's second run never happens, and a fresh login
+// still passes the gate, so a repeat completes it.
 type failingRevoker struct{}
 
 func (failingRevoker) RevokeUser(context.Context, string) error { return errors.New("redis down") }
 
-func TestDeleteUser_CleanerFailingAfterFailedBlacklistRevocationStaysRetryable(t *testing.T) {
+func TestDeleteUser_BlacklistRevocationFailureFailsClosedAndStaysRetryable(t *testing.T) {
 	ctx := context.Background()
 	svc, fs, uid, _, _ := newDeleteFixture(t)
 	svc.SetTokenBlacklist(failingRevoker{})
-	svc.SetSessionCleaner(&scriptedCleaner{failOn: map[int]bool{2: true}})
+	cleaner := &scriptedCleaner{}
+	svc.SetSessionCleaner(cleaner)
+	ur := &countingUserRevoker{}
+	svc.AddUserRevoker(ur)
 
 	err := svc.DeleteUser(ctx, uid, uid.String())
-	require.ErrorIs(t, err, ErrDeletionIncomplete)
+	require.ErrorIs(t, err, ErrTokenRevocationFailed)
 	assert.NotErrorIs(t, err, ErrDeletionOperatorRequired)
+	assert.Equal(t, 1, cleaner.calls, "only the pre-revocation cleaner run happened")
+	assert.Zero(t, ur.calls, "the engine is not told the user is gone before the store revoked them")
 	_, gerr := fs.Store.Users().GetByID(ctx, uid)
-	assert.NoError(t, gerr)
+	assert.NoError(t, gerr, "the record is kept so the deletion can be repeated")
 }
 
 // countingHolderStore fails GetAllByHolder from the n-th call on, so only the
