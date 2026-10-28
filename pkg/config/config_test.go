@@ -2804,6 +2804,20 @@ func TestLoad_MetadataTypeEnvOverride(t *testing.T) {
 	}
 }
 
+func TestLoad_MetadataCacheDisabled(t *testing.T) {
+	if defaultConfig().HTTPClient.MetadataCacheDisabled {
+		t.Error("http_client.metadata_cache_disabled must default to false")
+	}
+	t.Setenv("WALLET_HTTP_CLIENT_METADATA_CACHE_DISABLED", "true")
+	cfg := defaultConfig()
+	if err := envconfig.Process("WALLET", cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.HTTPClient.MetadataCacheDisabled {
+		t.Error("env override not applied")
+	}
+}
+
 func TestConfig_Validate_DCQLConsentCheck(t *testing.T) {
 	for _, m := range []DCQLConsentCheckMode{"", DCQLConsentCheckOff, DCQLConsentCheckWarn, DCQLConsentCheckEnforce} {
 		if err := m.validate(); err != nil {
