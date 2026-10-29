@@ -90,3 +90,27 @@ func TestWMPEntitlement_TrustRefusalReason(t *testing.T) {
 	assert.Equal(t, "untrusted_verifier", trustRefusalReason(ErrCodeUntrustedVerifier))
 	assert.Empty(t, trustRefusalReason(ErrCodeSignError))
 }
+
+// ISSUER_NOT_ENTITLED is told apart from UNTRUSTED_ISSUER, and a findings list it
+// carries is bounded.
+func TestWMPBridge_IssuerNotEntitledRefusal(t *testing.T) {
+	assert.Equal(t, "issuer_not_entitled", trustRefusalReason(errCodeIssuerNotEntitled))
+	e := newWMPEnv(t)
+	var many []any
+	for i := 0; i < 40; i++ {
+		many = append(many, map[string]any{"code": "no_registration_certificate", "message": strings.Repeat("m", 1000), "issuer_text": "free"})
+	}
+	registerScripted(e.m, ProtocolOID4VCI, func(_ context.Context, f *Flow, _ *FlowStartMessage) error {
+		return f.Session.SendFlowError(f.ID, StepEvaluatingTrust, errCodeIssuerNotEntitled, "x", map[string]interface{}{"findings": many})
+	})
+	tok := e.token("alice", "t1", "ir", "j1")
+	sid := e.create(tok, "oid4vci")
+	st, _ := e.openStream(tok, sid, "")
+	require.Equal(t, 0, e.post(tok, sid, startVCI(sid, "f1")).code())
+	ev := st.nextMethod(t, wmp.MethodFlowError)
+	data := params(ev)["data"].(map[string]any)
+	assert.Equal(t, "issuer_not_entitled", data["reason"])
+	assert.Len(t, data["findings"], maxEntitlementFindings)
+	assert.Equal(t, true, data["findings_truncated"])
+	assert.NotContains(t, ev.Raw, "free")
+}

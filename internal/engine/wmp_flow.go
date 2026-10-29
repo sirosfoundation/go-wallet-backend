@@ -538,10 +538,7 @@ func (t *wmpTransport) sendFlowError(m *FlowErrorMessage) error {
 	if reason := trustRefusalReason(m.Error.Code); reason != "" {
 		// A trust refusal carries its reason, next to any details (OpenID4x has no
 		// code of its own for it; see wmp_entitlement.go).
-		merged := map[string]interface{}{}
-		for k, v := range m.Error.Details {
-			merged[k] = v
-		}
+		merged := boundedErrorDetails(m.Error.Code, m.Error.Details)
 		merged["reason"] = reason
 		data = merged
 	}
