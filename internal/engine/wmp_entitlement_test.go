@@ -91,8 +91,8 @@ func TestWMPEntitlement_TrustRefusalReason(t *testing.T) {
 	assert.Empty(t, trustRefusalReason(ErrCodeSignError))
 }
 
-// ISSUER_NOT_ENTITLED is told apart from UNTRUSTED_ISSUER, and a findings list it
-// carries is bounded.
+// ISSUER_NOT_ENTITLED is told apart from UNTRUSTED_ISSUER; its details
+// ({issuer, issuer_entitlement}, #522) are bounded and nothing else is relayed.
 func TestWMPBridge_IssuerNotEntitledRefusal(t *testing.T) {
 	assert.Equal(t, "issuer_not_entitled", trustRefusalReason(errCodeIssuerNotEntitled))
 	e := newWMPEnv(t)
@@ -101,16 +101,31 @@ func TestWMPBridge_IssuerNotEntitledRefusal(t *testing.T) {
 		many = append(many, map[string]any{"code": "no_registration_certificate", "message": strings.Repeat("m", 1000), "issuer_text": "free"})
 	}
 	registerScripted(e.m, ProtocolOID4VCI, func(_ context.Context, f *Flow, _ *FlowStartMessage) error {
-		return f.Session.SendFlowError(f.ID, StepEvaluatingTrust, errCodeIssuerNotEntitled, "x", map[string]interface{}{"findings": many})
+		return f.Session.SendFlowError(f.ID, StepEvaluatingTrust, errCodeIssuerNotEntitled, "Issuer is not registered to issue this credential", map[string]interface{}{
+			"issuer": "https://issuer.example", "extra": "dropped",
+			"issuer_entitlement": map[string]any{"allowed": false, "mode": "fail", "evaluated": true, "findings": many}})
 	})
 	tok := e.token("alice", "t1", "ir", "j1")
 	sid := e.create(tok, "oid4vci")
 	st, _ := e.openStream(tok, sid, "")
 	require.Equal(t, 0, e.post(tok, sid, startVCI(sid, "f1")).code())
 	ev := st.nextMethod(t, wmp.MethodFlowError)
+	assert.EqualValues(t, wmp.ErrFlowError, params(ev)["code"])
 	data := params(ev)["data"].(map[string]any)
 	assert.Equal(t, "issuer_not_entitled", data["reason"])
-	assert.Len(t, data["findings"], maxEntitlementFindings)
-	assert.Equal(t, true, data["findings_truncated"])
+	assert.Equal(t, "https://issuer.example", data["issuer"])
+	ent := data["issuer_entitlement"].(map[string]any)
+	assert.Equal(t, false, ent["allowed"])
+	assert.Len(t, ent["findings"], maxEntitlementFindings)
+	assert.Equal(t, true, ent["findings_truncated"])
 	assert.NotContains(t, ev.Raw, "free")
+	assert.NotContains(t, ev.Raw, "dropped")
+}
+
+// An engine error code the bridge does not know is a flow error (-31006), never
+// an internal error.
+func TestWMPBridge_UnknownEngineErrorCodeIsAFlowError(t *testing.T) {
+	assert.Equal(t, wmp.ErrFlowError, mapErrorCode("SOME_FUTURE_CODE"))
+	assert.Equal(t, wmp.ErrFlowError, mapErrorCode(errCodeIssuerNotEntitled))
+	assert.Equal(t, wmp.ErrFlowError, mapErrorCode(ErrCodeUntrustedIssuer))
 }

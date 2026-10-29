@@ -257,6 +257,10 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 		return nil, err
 	}
 	if out.Cancel {
+		// The flow ends with a terminal message first, so go-wmp's recovery state
+		// forgets it (a resume would otherwise re-send its last progress for a flow
+		// that no longer exists); then the engine flow is stopped.
+		f.endCancelled()
 		p.CancelSessionFlow(p.sessionID, params.FlowID)
 	} else if out.Msg.consent != nil {
 		if err := p.handOverSelection(ws, f, out.Msg); err != nil {
@@ -339,7 +343,11 @@ func (p *wmpFlowProfile) handOverSelection(ws *wmpSession, f *wmpFlow, msg *Flow
 // refused. The flow is declined, so the verifier is told access_denied, and it
 // ends -32602 (see wmpFlow.malformed).
 func (p *wmpFlowProfile) refuseSelection(ws *wmpSession, f *wmpFlow, flowID string) {
-	f.malformed.Store(true)
+	if f.malformed.Swap(true) {
+		// A refusal is already being carried out (the verifier is being told):
+		// a repeated malformed action must not cut it short.
+		return
+	}
 	// The flow waits for a selection only if none was handed to it yet: after a
 	// valid consent the step still says credential_selection until the engine's
 	// next progress, and the decline would never be consumed.
@@ -429,6 +437,14 @@ func (f *wmpFlow) claimSelection() bool {
 	first := !f.selectionClaimed
 	f.selectionClaimed = true
 	return first
+}
+
+// endCancelled ends the flow with the terminal -31006 {"reason":"cancelled"} of a
+// cancel by action (accept_offer with consent false, cancel), once.
+func (f *wmpFlow) endCancelled() {
+	if f.terminal.CompareAndSwap(false, true) {
+		_ = f.fc.Error(f.context(), wmp.ErrFlowError, "flow cancelled", map[string]string{"reason": "cancelled"})
+	}
 }
 
 // endMalformed ends the flow with the terminal -32602 of a malformed

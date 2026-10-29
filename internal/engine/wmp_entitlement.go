@@ -67,7 +67,14 @@ func entitlementPayload(m map[string]interface{}) (map[string]interface{}, bool)
 	if s, ok := boundedString(m["issuer"], maxEntitlementIssuerLen); ok {
 		out["issuer"] = s
 	}
-	raw, _ := m["issuer_entitlement"].(map[string]interface{})
+	out["issuer_entitlement"] = boundedDecision(m["issuer_entitlement"])
+	return out, true
+}
+
+// boundedDecision is the bounded form of the engine's entitlement decision
+// {allowed, mode, evaluated, findings, findings_truncated}.
+func boundedDecision(v interface{}) map[string]interface{} {
+	raw, _ := v.(map[string]interface{})
 	ent := map[string]interface{}{}
 	for _, k := range []string{"allowed", "evaluated"} {
 		if b, ok := raw[k].(bool); ok {
@@ -82,8 +89,7 @@ func entitlementPayload(m map[string]interface{}) (map[string]interface{}, bool)
 	if t, _ := raw["findings_truncated"].(bool); t || truncated {
 		ent["findings_truncated"] = true
 	}
-	out["issuer_entitlement"] = ent
-	return out, true
+	return ent
 }
 
 func boundedFindings(v interface{}) ([]map[string]interface{}, bool) {
@@ -130,21 +136,23 @@ func boundedString(v interface{}, max int) (string, bool) {
 	return s, true
 }
 
-// boundedErrorDetails is the data of a trust refusal: the engine's details, with
-// a findings list (ISSUER_NOT_ENTITLED) reduced to the bounded allowlist.
+// boundedErrorDetails is the data of a trust refusal: the engine's details, and
+// for ISSUER_NOT_ENTITLED ({issuer, issuer_entitlement}, #522) only those two,
+// bounded like the findings progress.
 func boundedErrorDetails(code ErrorCode, details map[string]interface{}) map[string]interface{} {
-	out := map[string]interface{}{}
+	if code == errCodeIssuerNotEntitled {
+		out := map[string]interface{}{}
+		if s, ok := boundedString(details["issuer"], maxEntitlementIssuerLen); ok {
+			out["issuer"] = s
+		}
+		if d, ok := details["issuer_entitlement"]; ok {
+			out["issuer_entitlement"] = boundedDecision(d)
+		}
+		return out
+	}
+	out := make(map[string]interface{}, len(details))
 	for k, v := range details {
 		out[k] = v
-	}
-	if code == errCodeIssuerNotEntitled {
-		if f, ok := out["findings"]; ok {
-			findings, truncated := boundedFindings(f)
-			out["findings"] = findings
-			if truncated {
-				out["findings_truncated"] = true
-			}
-		}
 	}
 	return out
 }
