@@ -197,3 +197,62 @@ func TestConsent_SameDecisionOnBothWires(t *testing.T) {
 		})
 	}
 }
+
+// A malformed selection after a valid one was handed over cannot be consumed as
+// a decline, even though the flow still reports the selection step: it ends the
+// flow, which does not run on to sign.
+func TestWMPBridge_MalformedSelectionAfterAConsent(t *testing.T) {
+	e := newWMPEnv(t)
+	ranOn := make(chan bool, 1)
+	registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
+		f.mu.Lock()
+		f.State = StepCredentialSelection // what BaseHandler.Progress records
+		f.mu.Unlock()
+		_ = f.Session.SendProgress(f.ID, StepCredentialSelection, nil)
+		if _, err := f.Session.WaitForAction(ctx, f.ID, ActionConsent); err != nil {
+			return err
+		}
+		// Consumed, the sign request not registered yet: the window.
+		select {
+		case <-ctx.Done():
+			ranOn <- false
+			return ctx.Err()
+		case <-time.After(1500 * time.Millisecond):
+			ranOn <- true
+			return f.Session.SendFlowComplete(f.ID, nil, "")
+		}
+	})
+	tok := e.token("alice", "t1", "ir", "j1")
+	sid := e.create(tok, "oid4vp")
+	st, _ := e.openStream(tok, sid, "")
+	require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
+	st.nextMethod(t, wmp.MethodFlowProgress)
+
+	good := map[string]any{"consent": true, "selections": []any{map[string]any{"query_id": "q", "selection_handle": testHandle}}}
+	assert.Equal(t, 0, e.post(tok, sid, req(wmp.MethodFlowAction, map[string]any{"wmp": meta(sid), "flow_id": "f1", "action": "select_credentials", "params": good})).code())
+	bad := map[string]any{"consent": true, "selections": []any{map[string]any{"query_id": "q", "selection_handle": testHandle, "credential_id": "c"}}}
+	assert.Equal(t, wmp.ErrInvalidParams, e.post(tok, sid, req(wmp.MethodFlowAction, map[string]any{"wmp": meta(sid), "flow_id": "f1", "action": "select_credentials", "params": bad})).code())
+	ev := st.nextMethod(t, wmp.MethodFlowError)
+	assert.EqualValues(t, wmp.ErrInvalidParams, params(ev)["code"])
+	assert.False(t, <-ranOn, "the flow was stopped, not left to sign and complete")
+}
+
+// A second valid selection is not queued for a flow that already has one.
+func TestWMPBridge_SecondSelectionIsRefused(t *testing.T) {
+	e := newWMPEnv(t)
+	registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
+		_ = f.Session.SendProgress(f.ID, StepCredentialSelection, nil)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	tok := e.token("alice", "t1", "ir", "j1")
+	sid := e.create(tok, "oid4vp")
+	require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
+	waitFlows(t, e, sid, 1)
+	do := func() int {
+		return e.post(tok, sid, req(wmp.MethodFlowAction, map[string]any{"wmp": meta(sid), "flow_id": "f1", "action": "select_credentials",
+			"params": map[string]any{"consent": true, "selections": []any{map[string]any{"query_id": "q", "selection_handle": testHandle}}}})).code()
+	}
+	assert.Equal(t, 0, do())
+	assert.Equal(t, wmp.ErrFlowError, do())
+}
