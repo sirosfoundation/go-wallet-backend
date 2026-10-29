@@ -187,3 +187,14 @@ func TestSummaryDropsRegistrationCertificateContent(t *testing.T) {
 		t.Error("Summary mutated the original decision")
 	}
 }
+
+// A WRPRC is public, so a certificate that merely carries the right
+// organisation identifier proves nothing: the chain has to be anchored.
+func TestEvaluateRefusesAnUnanchoredChain(t *testing.T) {
+	in := input(t, defaultWRPRC(), pidOffer) // everything else is in order
+	in.ChainAnchored = false
+	d := Evaluate(in, ModeFail)
+	if d.Allowed || !hasCode(d, CodeAccessCertificateNotTrusted) {
+		t.Fatalf("unanchored chain: allowed=%v findings=%v", d.Allowed, codes(d))
+	}
+}

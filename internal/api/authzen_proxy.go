@@ -770,7 +770,7 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	// offering. Distinct from the PDP decision above, which answers whether the
 	// issuer is trusted at all — a trusted issuer can still be unregistered for
 	// the credential type it is proposing.
-	entitlement := h.evaluateIssuerEntitlement(ctx, client, issuerURL, result, keyMaterial, credentialTypes)
+	entitlement := h.evaluateIssuerEntitlement(ctx, client, issuerURL, result, keyMaterial, trustResp.Decision, credentialTypes)
 	if entitlement != nil && !entitlement.Allowed {
 		h.logger.Warn("issuer is not entitled to issue the requested credential",
 			zap.String("issuer_url", issuerURL),
@@ -1347,6 +1347,7 @@ func (h *AuthZENProxyHandler) evaluateIssuerEntitlement(
 	issuerURL string,
 	result *issuermetadata.ResolveResult,
 	keyMaterial *trust.KeyMaterial,
+	chainTrusted bool,
 	credentialTypes []string,
 ) *issuertrust.Decision {
 	mode := issuertrust.ParseMode(h.cfg.IssuerEntitlementMode)
@@ -1365,6 +1366,9 @@ func (h *AuthZENProxyHandler) evaluateIssuerEntitlement(
 	return issuertrust.Evaluate(issuertrust.Input{
 		Chain:            chain,
 		RegistrationCert: registrationCert,
+		// keyMaterial is what the PDP decision above was made on, and chain is
+		// taken from it, so the decision covers the chain.
+		ChainAnchored:    chainTrusted,
 		Offers:           issuertrust.OffersFor(result.Metadata, credentialTypes),
 		RegistrationAuth: h.authenticateRegistrationCert(ctx, pdp, issuerURL, registrationCert),
 	}, mode)

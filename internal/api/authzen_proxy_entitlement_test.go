@@ -79,7 +79,7 @@ func TestEvaluateIssuerEntitlement_AuthenticatesTheRegistrar(t *testing.T) {
 	km := &trust.KeyMaterial{Type: "x5c", X5C: []string{x5cOf(t, forgedRegistrationCert(t))}}
 
 	untrusted := &recordingRegistrarPDP{decision: false}
-	d := h.evaluateIssuerEntitlement(context.Background(), untrusted, "https://issuer.example", result, km, []string{"pid"})
+	d := h.evaluateIssuerEntitlement(context.Background(), untrusted, "https://issuer.example", result, km, true, []string{"pid"})
 	if d == nil || d.Allowed {
 		t.Fatalf("a registration certificate from an untrusted registrar was believed: %+v", d)
 	}
@@ -95,7 +95,7 @@ func TestEvaluateIssuerEntitlement_AuthenticatesTheRegistrar(t *testing.T) {
 	}
 
 	// Claims of a certificate nobody authenticated are not used either.
-	d = h.evaluateIssuerEntitlement(context.Background(), nil, "https://issuer.example", result, km, []string{"pid"})
+	d = h.evaluateIssuerEntitlement(context.Background(), nil, "https://issuer.example", result, km, true, []string{"pid"})
 	if d == nil || d.Allowed || d.Evaluated {
 		t.Errorf("with no registrar trust path the claims were used: %+v", d)
 	}
@@ -109,4 +109,25 @@ func x5cOf(t *testing.T, token string) string {
 		t.Fatal(err)
 	}
 	return parsed.Header["x5c"].([]interface{})[0].(string)
+}
+
+// The PDP decision for the metadata signer is what anchors the WRPAC chain; a
+// chain nobody trusted must not satisfy the check however good the rest is.
+func TestEvaluateIssuerEntitlement_RequiresATrustedChain(t *testing.T) {
+	h := &AuthZENProxyHandler{cfg: &config.AuthZENProxyConfig{IssuerEntitlementMode: "fail"}, logger: zap.NewNop()}
+	result := &issuermetadata.ResolveResult{Signed: true, Metadata: map[string]interface{}{}}
+	km := &trust.KeyMaterial{Type: "x5c", X5C: []string{x5cOf(t, forgedRegistrationCert(t))}}
+
+	d := h.evaluateIssuerEntitlement(context.Background(), nil, "https://issuer.example", result, km, false, nil)
+
+	if d == nil || d.Allowed {
+		t.Fatalf("an untrusted chain passed: %+v", d)
+	}
+	found := false
+	for _, f := range d.Findings {
+		found = found || f.Code == issuertrust.CodeAccessCertificateNotTrusted
+	}
+	if !found {
+		t.Errorf("findings %+v lack access_certificate_not_trusted", d.Findings)
+	}
 }

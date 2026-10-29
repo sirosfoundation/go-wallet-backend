@@ -81,6 +81,9 @@ const (
 	// CodeRegistrarNotTrusted means the signature is valid but the trust
 	// evaluation did not recognise the signer as a Registrar.
 	CodeRegistrarNotTrusted Code = "registrar_not_trusted"
+	// CodeAccessCertificateNotTrusted means nothing established that the
+	// certificate chain that signed the metadata (the WRPAC) is trusted.
+	CodeAccessCertificateNotTrusted Code = "access_certificate_not_trusted"
 )
 
 // Bounds on what a Decision carries. The values come from issuer-controlled
@@ -148,6 +151,12 @@ type Input struct {
 	RegistrationCert string
 	// Offers are the credentials the wallet is about to request.
 	Offers []Offer
+	// ChainAnchored says the trust path accepted Chain as a trusted issuer
+	// chain. The profile check below is about its shape, not who vouches for
+	// it, and a WRPRC is public: without this, anyone could mint a certificate
+	// carrying a victim's organisation identifier and present the victim's
+	// registration certificate beside it. The zero value is false.
+	ChainAnchored bool
 	// RegistrationAuth is the outcome of authenticating RegistrationCert's
 	// signer (see AuthenticateRegistrationCert). The zero value is
 	// AuthUnchecked, so a caller that forgets this step gets findings and no
@@ -166,6 +175,13 @@ func Evaluate(in Input, mode Mode) *Decision {
 		return d.add(mode, Finding{
 			Code:    CodeNoAccessCertificate,
 			Message: "issuer metadata was not signed by a certificate chain",
+		})
+	}
+
+	if !in.ChainAnchored {
+		d.add(mode, Finding{
+			Code:    CodeAccessCertificateNotTrusted,
+			Message: "the certificate that signed the issuer metadata is not known to be trusted",
 		})
 	}
 

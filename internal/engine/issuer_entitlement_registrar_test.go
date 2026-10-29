@@ -199,7 +199,7 @@ func TestCheckIssuerEntitlement_ProgressOmitsRegistrationCertificateContent(t *t
 	offer := &CredentialOffer{CredentialIssuer: "https://issuer.example", CredentialConfigurationIDs: []string{"pid"}}
 	meta := forgedMeta(t, forgedClaims)
 
-	full := entitlementFor(issuertrust.ModeWarn, meta, offer.CredentialConfigurationIDs, issuertrust.AuthVerified)
+	full := entitlementFor(issuertrust.ModeWarn, meta, offer.CredentialConfigurationIDs, entitlementAuth{registration: issuertrust.AuthVerified, chainAnchored: true})
 	require.NotEmpty(t, full.Entitlements, "precondition: the verified certificate's content is in the decision")
 
 	require.NoError(t, h.checkIssuerEntitlement(context.Background(), offer.CredentialIssuer, meta, offer))
@@ -331,4 +331,39 @@ func drainAll(sent chan map[string]interface{}) []map[string]interface{} {
 			return out
 		}
 	}
+}
+
+// The WRPAC chain must be anchored by the trust path. extractIssuerKeyMaterial
+// prefers mdoc_iacas_uri, so the decision made earlier can be about other
+// certificates, and then the metadata signer is asked about separately.
+func TestChainAnchored(t *testing.T) {
+	meta := &metadataResult{SignerX5C: []string{selfSignedX5C(t)}}
+	ctx := context.Background()
+
+	t.Run("the evaluated chain is the signer chain", func(t *testing.T) {
+		pdp := &registrarPDP{decision: false} // must not be consulted
+		h, _ := newRegistrarHandler(t, "fail", pdp)
+		h.trustEvaluatedX5C = meta.SignerX5C
+		assert.True(t, h.chainAnchored(ctx, "https://issuer.example", meta))
+		assert.Empty(t, pdp.actions)
+	})
+	t.Run("evaluated something else (IACAs): ask about the signer", func(t *testing.T) {
+		h, _ := newRegistrarHandler(t, "fail", &registrarPDP{decision: true})
+		h.trustEvaluatedX5C = []string{"iaca"}
+		assert.True(t, h.chainAnchored(ctx, "https://issuer.example", meta))
+	})
+	t.Run("the trust path denies the signer", func(t *testing.T) {
+		h, _ := newRegistrarHandler(t, "fail", &registrarPDP{decision: false})
+		h.trustEvaluatedX5C = []string{"iaca"}
+		assert.False(t, h.chainAnchored(ctx, "https://issuer.example", meta))
+	})
+	t.Run("no PDP", func(t *testing.T) {
+		h, _ := newRegistrarHandler(t, "fail", nil)
+		h.trustEvaluatedX5C = []string{"iaca"}
+		assert.False(t, h.chainAnchored(ctx, "https://issuer.example", meta))
+	})
+	t.Run("no chain", func(t *testing.T) {
+		h, _ := newRegistrarHandler(t, "fail", &registrarPDP{decision: true})
+		assert.False(t, h.chainAnchored(ctx, "https://issuer.example", &metadataResult{}))
+	})
 }

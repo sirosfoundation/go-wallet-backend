@@ -11,6 +11,7 @@ func input(t *testing.T, o wrprcOpts, offers ...Offer) Input {
 	return Input{
 		Chain:            []*x509.Certificate{wrpac(t, testIdentifier)},
 		RegistrationCert: wrprc(t, o),
+		ChainAnchored:    true,
 		RegistrationAuth: AuthVerified,
 		Offers:           offers,
 	}

@@ -68,6 +68,7 @@ type OID4VCIHandler struct {
 	clientJWK            *ecdsa.PrivateKey // client private key for private_key_jwt authentication (optional)
 	clientKID            string            // key ID from client JWK (for JWT kid header)
 	authServerIssuer     string            // AS issuer URL (for private_key_jwt aud claim)
+	trustEvaluatedX5C    []string          // x5c chain the issuer trust decision was made on (see evaluateTrust), if it was one
 
 	// Client attestation provider for OAuth-Client-Attestation-based auth
 	// (draft-ietf-oauth-attestation-based-client-auth-04).
@@ -1557,6 +1558,14 @@ func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metad
 
 	// Extract key material from issuer metadata for trust evaluation
 	keyMaterial := h.extractIssuerKeyMaterial(ctx, metadata)
+	// Remember which chain the decision below is about. The issuer entitlement
+	// check needs to know whether the chain that signed the metadata is that
+	// one (extractIssuerKeyMaterial prefers mdoc_iacas_uri to it), and only
+	// consults this after the decision came back trusted.
+	h.trustEvaluatedX5C = nil
+	if keyMaterial != nil && keyMaterial.Type == "x5c" {
+		h.trustEvaluatedX5C = keyMaterial.X5C
+	}
 
 	// Collect credential types from the offered configurations for trust policy
 	if keyMaterial != nil && keyMaterial.CredentialType == "" {

@@ -60,14 +60,14 @@ func findingCodes(d *issuertrust.Decision) []issuertrust.Code {
 }
 
 func TestEntitlementFor_OffChecksNothing(t *testing.T) {
-	assert.Nil(t, entitlementFor(issuertrust.ModeOff, &metadataResult{Raw: metaWithIssuerInfo("")}, []string{"pid"}, issuertrust.AuthUnchecked))
+	assert.Nil(t, entitlementFor(issuertrust.ModeOff, &metadataResult{Raw: metaWithIssuerInfo("")}, []string{"pid"}, entitlementAuth{}))
 }
 
 // Metadata that was not signed by a certificate chain has no access
 // certificate. In fail mode that must refuse; reading it as "nothing to check"
 // would let any unsigned issuer through the very control meant to stop it.
 func TestEntitlementFor_FailRefusesUnsignedMetadata(t *testing.T) {
-	d := entitlementFor(issuertrust.ModeFail, &metadataResult{Raw: metaWithIssuerInfo("")}, []string{"pid"}, issuertrust.AuthUnchecked)
+	d := entitlementFor(issuertrust.ModeFail, &metadataResult{Raw: metaWithIssuerInfo("")}, []string{"pid"}, entitlementAuth{})
 
 	require.NotNil(t, d)
 	assert.False(t, d.Allowed)
@@ -76,7 +76,7 @@ func TestEntitlementFor_FailRefusesUnsignedMetadata(t *testing.T) {
 }
 
 func TestEntitlementFor_WarnReportsButAllows(t *testing.T) {
-	d := entitlementFor(issuertrust.ModeWarn, &metadataResult{Raw: metaWithIssuerInfo("")}, []string{"pid"}, issuertrust.AuthUnchecked)
+	d := entitlementFor(issuertrust.ModeWarn, &metadataResult{Raw: metaWithIssuerInfo("")}, []string{"pid"}, entitlementAuth{})
 
 	require.NotNil(t, d)
 	assert.True(t, d.Allowed)
@@ -92,7 +92,7 @@ func TestEntitlementFor_ReadsRegistrationCertificateFromRawMetadata(t *testing.T
 		SignerX5C: []string{selfSignedX5C(t)},
 	}
 
-	d := entitlementFor(issuertrust.ModeFail, meta, []string{"pid"}, issuertrust.AuthVerified)
+	d := entitlementFor(issuertrust.ModeFail, meta, []string{"pid"}, entitlementAuth{registration: issuertrust.AuthVerified, chainAnchored: true})
 
 	require.NotNil(t, d)
 	assert.False(t, d.Allowed)
@@ -147,7 +147,7 @@ func TestCheckIssuerEntitlement_UnsetModeIsWarnNotOff(t *testing.T) {
 
 	// Findings are produced (so the check ran) and issuance continues.
 	assert.NoError(t, h.checkIssuerEntitlement(context.Background(), offer.CredentialIssuer, &metadataResult{Raw: metaWithIssuerInfo("")}, offer))
-	d := entitlementFor(issuertrust.ParseMode(""), &metadataResult{Raw: metaWithIssuerInfo("")}, offer.CredentialConfigurationIDs, issuertrust.AuthUnchecked)
+	d := entitlementFor(issuertrust.ParseMode(""), &metadataResult{Raw: metaWithIssuerInfo("")}, offer.CredentialConfigurationIDs, entitlementAuth{})
 	require.NotNil(t, d)
 	assert.Equal(t, issuertrust.ModeWarn, d.Mode)
 }

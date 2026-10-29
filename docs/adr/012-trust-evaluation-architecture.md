@@ -479,6 +479,15 @@ yields a finding (`registration_certificate_unverified` or
 `registrar_not_trusted`) and the certificate's claims are not used, so in `fail`
 mode the flow is refused.
 
+**The WRPAC chain is anchored too.** A WRPRC is public, so a certificate that
+merely carries the right organisation identifier proves nothing. The chain that
+signed the metadata must be accepted by the trust path: either it is the chain
+the issuer trust decision was made on, or (the engine prefers `mdoc_iacas_uri`
+for that decision, so for mdoc issuers it is not) the engine asks the issuer PDP
+about it as a `credential-issuer`. Otherwise the finding is
+`access_certificate_not_trusted`. `/v1/resolve` uses its own PDP decision on the
+signer key material.
+
 **What is checked is what is issued.** The check covers the offer's
 `credential_configuration_ids`; `awaitCredentialSelection` accepts only those
 (every transport, including the WMP bridge, drives it through the flow's action
