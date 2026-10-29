@@ -32,7 +32,16 @@ const (
 const (
 	reasonUntrustedIssuer   = "untrusted_issuer"
 	reasonUntrustedVerifier = "untrusted_verifier"
-	reasonIssuerNotEntitled = "issuer_not_entitled"
+)
+
+// codeIssuerNotEntitled and issuerNotEntitledMessage are the WMP error of an
+// entitlement refusal (wmp spec #36/#37, go-wmp wmp.ErrIssuerNotEntitled and
+// openid4x.IssuerNotEntitledMessage, on go-wmp main, not in a release: v0.12.1 is
+// the latest). TODO: use go-wmp's constants and NewIssuerNotEntitledData once
+// v0.13.0 is tagged.
+const (
+	codeIssuerNotEntitled    = -31020
+	issuerNotEntitledMessage = "Issuer not entitled"
 )
 
 // errCodeIssuerNotEntitled is the engine's refusal of an issuer entitlement
@@ -48,8 +57,6 @@ func trustRefusalReason(code ErrorCode) string {
 		return reasonUntrustedIssuer
 	case ErrCodeUntrustedVerifier:
 		return reasonUntrustedVerifier
-	case errCodeIssuerNotEntitled:
-		return reasonIssuerNotEntitled
 	}
 	return ""
 }
@@ -71,10 +78,27 @@ func entitlementPayload(m map[string]interface{}) (map[string]interface{}, bool)
 	return out, true
 }
 
+// asJSONObject is v as a decoded JSON object: the engine puts typed values (a
+// struct decision) in an error's details, which only their JSON form describes.
+func asJSONObject(v interface{}) map[string]interface{} {
+	if m, ok := v.(map[string]interface{}); ok {
+		return m
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	var m map[string]interface{}
+	if json.Unmarshal(b, &m) != nil {
+		return nil
+	}
+	return m
+}
+
 // boundedDecision is the bounded form of the engine's entitlement decision
 // {allowed, mode, evaluated, findings, findings_truncated}.
 func boundedDecision(v interface{}) map[string]interface{} {
-	raw, _ := v.(map[string]interface{})
+	raw := asJSONObject(v)
 	ent := map[string]interface{}{}
 	for _, k := range []string{"allowed", "evaluated"} {
 		if b, ok := raw[k].(bool); ok {

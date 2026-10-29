@@ -149,9 +149,10 @@ query id that is not in the verifier's request, or repeated, is the terminal
 ### Issuer entitlement
 
 The enforcement of go-wallet-backend#522 is in the engine core and applies to every
-transport. The bridge (`wmp_entitlement.go`) maps its two outcomes: the refusal
-`UNTRUSTED_ISSUER` is `-31006` with `data.reason: "untrusted_issuer"` (Core 3.8 has
-no code for a trust refusal), and the findings progress (`trust_evaluated` with
+transport. The bridge (`wmp_entitlement.go`) maps its outcomes: the refusal
+`ISSUER_NOT_ENTITLED` is `-31020` (`Issuer not entitled`) with `data {issuer,
+issuer_entitlement}`, a trust-decision refusal `UNTRUSTED_ISSUER` stays `-31006` with
+`data.reason: "untrusted_issuer"`, and the findings progress (`trust_evaluated` with
 `issuer_entitlement_evaluated`) is relayed as a bounded allowlist without
 `trust_info`: at most 16 findings, each with `code`, `message` and `credential_type`
 length-bounded. A client cannot select a configuration outside the offer over WMP:

@@ -94,7 +94,7 @@ func TestWMPEntitlement_TrustRefusalReason(t *testing.T) {
 // ISSUER_NOT_ENTITLED is told apart from UNTRUSTED_ISSUER; its details
 // ({issuer, issuer_entitlement}, #522) are bounded and nothing else is relayed.
 func TestWMPBridge_IssuerNotEntitledRefusal(t *testing.T) {
-	assert.Equal(t, "issuer_not_entitled", trustRefusalReason(errCodeIssuerNotEntitled))
+	assert.Empty(t, trustRefusalReason(errCodeIssuerNotEntitled), "not a reason on -31006: it has its own code")
 	e := newWMPEnv(t)
 	var many []any
 	for i := 0; i < 40; i++ {
@@ -110,9 +110,10 @@ func TestWMPBridge_IssuerNotEntitledRefusal(t *testing.T) {
 	st, _ := e.openStream(tok, sid, "")
 	require.Equal(t, 0, e.post(tok, sid, startVCI(sid, "f1")).code())
 	ev := st.nextMethod(t, wmp.MethodFlowError)
-	assert.EqualValues(t, wmp.ErrFlowError, params(ev)["code"])
+	assert.EqualValues(t, -31020, params(ev)["code"])
+	assert.Equal(t, "Issuer not entitled", params(ev)["message"])
 	data := params(ev)["data"].(map[string]any)
-	assert.Equal(t, "issuer_not_entitled", data["reason"])
+	assert.NotContains(t, data, "reason")
 	assert.Equal(t, "https://issuer.example", data["issuer"])
 	ent := data["issuer_entitlement"].(map[string]any)
 	assert.Equal(t, false, ent["allowed"])
@@ -126,6 +127,32 @@ func TestWMPBridge_IssuerNotEntitledRefusal(t *testing.T) {
 // an internal error.
 func TestWMPBridge_UnknownEngineErrorCodeIsAFlowError(t *testing.T) {
 	assert.Equal(t, wmp.ErrFlowError, mapErrorCode("SOME_FUTURE_CODE"))
-	assert.Equal(t, wmp.ErrFlowError, mapErrorCode(errCodeIssuerNotEntitled))
+	assert.Equal(t, -31020, mapErrorCode(errCodeIssuerNotEntitled))
 	assert.Equal(t, wmp.ErrFlowError, mapErrorCode(ErrCodeUntrustedIssuer))
+}
+
+// The engine puts a typed decision (a struct) in the error's details: it is
+// normalised through its JSON form, not dropped.
+func TestWMPEntitlement_TypedDecisionInDetails(t *testing.T) {
+	type finding struct {
+		Code           string `json:"code"`
+		Message        string `json:"message"`
+		CredentialType string `json:"credential_type,omitempty"`
+	}
+	type decision struct {
+		Allowed   bool      `json:"allowed"`
+		Mode      string    `json:"mode"`
+		Evaluated bool      `json:"evaluated"`
+		Findings  []finding `json:"findings"`
+	}
+	out := boundedErrorDetails(errCodeIssuerNotEntitled, map[string]interface{}{
+		"issuer": "https://i",
+		"issuer_entitlement": &decision{Allowed: false, Mode: "fail", Evaluated: true,
+			Findings: []finding{{Code: "no_registration_certificate", Message: "fixed", CredentialType: "t"}}},
+	})
+	ent := out["issuer_entitlement"].(map[string]interface{})
+	assert.Equal(t, false, ent["allowed"])
+	assert.Equal(t, "fail", ent["mode"])
+	assert.Equal(t, true, ent["evaluated"])
+	assert.Len(t, ent["findings"], 1)
 }
