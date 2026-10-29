@@ -286,23 +286,29 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 }
 
 // refuseSignRequests answers every sign request pending for flowID with
-// SIGN_REFUSED and reports whether there was one.
+// SIGN_REFUSED and reports whether it did: true only if every pending request
+// took the refusal. A request whose reply is already buffered (the wallet's own
+// result got there first) keeps it and is not refused, so the caller has to end
+// the flow another way: that result is about to be submitted.
 func (s *Session) refuseSignRequests(flowID string) bool {
 	s.flowsMu.RLock()
-	var ids []string
+	defer s.flowsMu.RUnlock()
+	refused := false
 	for id, p := range s.outstandingRequests {
-		if p.flowID == flowID && p.sign != nil {
-			ids = append(ids, id)
+		if p.flowID != flowID || p.sign == nil {
+			continue
 		}
-	}
-	s.flowsMu.RUnlock()
-	for _, id := range ids {
-		s.dispatchSignResponse(&SignResponseMessage{
+		select {
+		case p.sign <- &SignResponseMessage{
 			Message:   Message{Type: TypeSignResponse, FlowID: flowID, MessageID: id},
 			ErrorCode: ErrCodeSignRefused,
-		})
+		}:
+			refused = true
+		default:
+			return false // a real reply is already there
+		}
 	}
-	return len(ids) > 0
+	return refused
 }
 
 // awaitsSelection reports whether the flow can still consume a selection: its

@@ -1487,3 +1487,37 @@ func TestWMPBridge_CredentialOfferParameter(t *testing.T) {
 	require.Equal(t, 0, r.code(), "%v", r.Body)
 	assert.Equal(t, "openid-credential-offer://?credential_offer_uri=x", <-offers)
 }
+
+// refuseSignRequests refuses a pending sign request, but not one whose reply is
+// already buffered: that result is about to be submitted, so the caller must end
+// the flow another way.
+func TestRefuseSignRequests(t *testing.T) {
+	newSession := func() *Session {
+		return &Session{flows: map[string]*Flow{}, closeCh: make(chan struct{}), logger: zap.NewNop()}
+	}
+	t.Run("pending request is refused", func(t *testing.T) {
+		s := newSession()
+		reply, done := s.trackSign("m1", "f1")
+		defer done()
+		assert.True(t, s.refuseSignRequests("f1"))
+		assert.Equal(t, ErrCodeSignRefused, (<-reply).ErrorCode)
+	})
+	t.Run("a buffered result is not overridden", func(t *testing.T) {
+		s := newSession()
+		reply, done := s.trackSign("m1", "f1")
+		defer done()
+		s.dispatchSignResponse(&SignResponseMessage{Message: Message{FlowID: "f1", MessageID: "m1"}, VPToken: "vp"})
+		assert.False(t, s.refuseSignRequests("f1"), "the refusal did not take: the caller ends the flow")
+		assert.Equal(t, "vp", (<-reply).VPToken, "the wallet's result is untouched")
+	})
+	t.Run("no pending request", func(t *testing.T) {
+		assert.False(t, newSession().refuseSignRequests("f1"))
+	})
+	t.Run("another flow's request is left alone", func(t *testing.T) {
+		s := newSession()
+		reply, done := s.trackSign("m1", "other")
+		defer done()
+		assert.False(t, s.refuseSignRequests("f1"))
+		assert.Empty(t, reply)
+	})
+}
