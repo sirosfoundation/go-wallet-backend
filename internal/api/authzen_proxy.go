@@ -3,7 +3,6 @@ package api
 
 import (
 	"context"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -1352,7 +1351,7 @@ func (h *AuthZENProxyHandler) evaluateIssuerEntitlement(
 		return nil
 	}
 
-	chain := parseX5CChain(keyMaterial)
+	chain := issuertrust.ChainFromX5C(keyMaterialX5C(keyMaterial))
 	if len(chain) == 0 && !result.Signed {
 		// Unsigned metadata is not an entitlement problem, and reporting it as
 		// one would double up on a decision already made above.
@@ -1362,83 +1361,15 @@ func (h *AuthZENProxyHandler) evaluateIssuerEntitlement(
 	return issuertrust.Evaluate(issuertrust.Input{
 		Chain:            chain,
 		RegistrationCert: issuermetadata.RegistrationCertificate(result.Metadata),
-		Offers:           offersFor(result.Metadata, credentialTypes),
+		Offers:           issuertrust.OffersFor(result.Metadata, credentialTypes),
 	}, mode)
 }
 
-// parseX5CChain decodes the base64 DER certificates the resolver extracted.
-// Certificates that do not parse are skipped rather than failing the request:
-// the leaf is what the checks need, and the resolver has already verified the
-// signature made with it.
-func parseX5CChain(km *trust.KeyMaterial) []*x509.Certificate {
+// keyMaterialX5C returns the x5c entries of key material, or nil when it is not
+// an x5c chain.
+func keyMaterialX5C(km *trust.KeyMaterial) []string {
 	if km == nil || km.Type != "x5c" {
 		return nil
 	}
-	out := make([]*x509.Certificate, 0, len(km.X5C))
-	for _, encoded := range km.X5C {
-		der, err := decodeX5C(encoded)
-		if err != nil {
-			continue
-		}
-		cert, err := x509.ParseCertificate(der)
-		if err != nil {
-			continue
-		}
-		out = append(out, cert)
-	}
-	return out
-}
-
-// decodeX5C accepts both base64 alphabets, matching what the signature
-// verification path already tolerates.
-//
-// RFC 7515 specifies standard base64 for x5c, but
-// trust.VerifyJWTWithEmbeddedKey falls back to raw URL encoding, so a chain it
-// accepted could be dropped here - and a dropped chain does not surface as a
-// decoding problem, it surfaces as "no_access_certificate", which reads as an
-// issuer that published nothing rather than one this code failed to read.
-func decodeX5C(encoded string) ([]byte, error) {
-	if der, err := base64.StdEncoding.DecodeString(encoded); err == nil {
-		return der, nil
-	}
-	return base64.RawURLEncoding.DecodeString(strings.TrimRight(encoded, "="))
-}
-
-// offersFor turns the credential configurations the wallet is about to request
-// into the (format, type) pairs provides_attestations is expressed in.
-//
-// credentialTypes names configuration ids from the offer; the metadata says
-// what format and vct or doctype each one actually is. Guessing the format
-// would make the check meaningless, so a configuration that cannot be resolved
-// is skipped and simply not checked.
-func offersFor(metadata map[string]interface{}, credentialTypes []string) []issuertrust.Offer {
-	configs, _ := metadata["credential_configurations_supported"].(map[string]interface{})
-	if configs == nil {
-		return nil
-	}
-	var offers []issuertrust.Offer
-	for _, id := range credentialTypes {
-		cfg, ok := configs[id].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		format, _ := cfg["format"].(string)
-		if format == "" {
-			continue
-		}
-		offers = append(offers, issuertrust.Offer{Format: format, Type: credentialTypeOf(cfg)})
-	}
-	return offers
-}
-
-// credentialTypeOf reads the type a configuration declares: vct for SD-JWT,
-// doctype for mdoc. An empty result means only the format is matched.
-func credentialTypeOf(cfg map[string]interface{}) string {
-	if vct, ok := cfg["vct"].(string); ok && vct != "" {
-		return vct
-	}
-	if doctype, ok := cfg["doctype"].(string); ok && doctype != "" {
-		return doctype
-	}
-	return ""
+	return km.X5C
 }

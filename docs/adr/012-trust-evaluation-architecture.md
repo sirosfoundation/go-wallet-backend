@@ -449,6 +449,21 @@ The trust evaluation system follows fail-closed principles:
 2. **SPOCP authorizer fails in production**: Server refuses to start
 3. **NoOpAuthorizer**: Cannot be used in production (GIN_MODE=release)
 
+### Issuer Entitlement (ARF §6.6.2.3)
+
+Whether an issuer is *trusted* and whether it is *registered to issue what it is
+offering* are separate questions. The first is the PDP's decision above. The
+second needs the issuer's registration certificate (WRPRC), which travels in the
+issuer metadata, so it is evaluated by the engine in `OID4VCIHandler`
+(`checkIssuerEntitlement`) right after the trust decision, using `pkg/issuertrust`.
+
+It is fail-closed in the same way: with `authzen_proxy.issuer_entitlement_mode`
+set to `fail`, a provider that cannot show it is registered (including metadata
+not signed by a certificate chain) blocks the flow. `warn` (the default) logs
+and reports the findings to the client and continues; `off` skips the check.
+The check runs whether trust was evaluated server-side or by the frontend, and
+the frontend takes no part in it.
+
 ### Concurrent Flow Limit
 
 Each WebSocket session is limited to `MaxPendingFlowsPerSession` (default: 3) concurrent

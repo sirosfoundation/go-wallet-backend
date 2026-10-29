@@ -1088,6 +1088,14 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 		return err
 	}
 
+	// Step 3b: Is this issuer registered to issue what it is offering? Trust
+	// above says who it is; this says what it may issue (ARF §6.6.2.3).
+	if err := h.checkIssuerEntitlement(offer.CredentialIssuer, metaResult, offer); err != nil {
+		h.Logger.Warn("Blocking issuer without entitlement", zap.Error(err))
+		_ = h.Error(StepEvaluatingTrust, ErrCodeUntrustedIssuer, ErrCodeUntrustedIssuer.UserFacingMessage())
+		return err
+	}
+
 	// Step 4: User selects credential configuration
 	selectedConfigID, selectedConfig, err := h.awaitCredentialSelection(ctx, offer, metadata)
 	if err != nil {
@@ -1408,6 +1416,8 @@ func (h *OID4VCIHandler) fetchOfferFromURI(ctx context.Context, uri string) (*Cr
 type metadataResult struct {
 	Metadata         *IssuerMetadata
 	Validated        bool                     // true when the resolver verified a signed metadata JWT
+	Raw              map[string]interface{}   // the resolved metadata as published, including members IssuerMetadata does not model (issuer_info)
+	SignerX5C        []string                 // x5c chain that signed the metadata, leaf first; empty when it was not signed by a chain
 	RegisteredIssuer *domain.CredentialIssuer // non-nil when the issuer is registered in this tenant
 }
 
@@ -1465,7 +1475,13 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*met
 		"validated":           result.Validated,
 	})
 
-	return &metadataResult{Metadata: &metadata, Validated: result.Validated, RegisteredIssuer: registeredIssuer}, nil
+	return &metadataResult{
+		Metadata:         &metadata,
+		Validated:        result.Validated,
+		Raw:              result.Metadata,
+		SignerX5C:        h.signerX5C(result, &metadata),
+		RegisteredIssuer: registeredIssuer,
+	}, nil
 }
 
 // logIgnoredCredentialConfigurations reports configurations that were present
@@ -1506,6 +1522,23 @@ func (h *OID4VCIHandler) logIgnoredCredentialConfigurations(source map[string]in
 				zap.String("credential_configuration_id", id))
 		}
 	}
+}
+
+// signerX5C returns the certificate chain that signed the issuer metadata, or
+// nil when it was not signed by one. The resolver has already verified the
+// signature; this only recovers the chain that made it.
+func (h *OID4VCIHandler) signerX5C(result *issuermetadata.ResolveResult, metadata *IssuerMetadata) []string {
+	if km := result.SignerKeyMaterial; km != nil && km.Type == "x5c" {
+		return km.X5C
+	}
+	if metadata.SignedMetadata == "" {
+		return nil
+	}
+	km, err := trust.VerifyJWTWithEmbeddedKey(metadata.SignedMetadata)
+	if err != nil || km == nil || km.Type != "x5c" {
+		return nil
+	}
+	return km.X5C
 }
 
 func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metadata *IssuerMetadata, metadataValidated bool) (*TrustInfo, error) {
