@@ -17,6 +17,8 @@ import (
 
 	"github.com/kelseyhightower/envconfig"
 	"gopkg.in/yaml.v3"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 )
 
 // Config represents the application configuration
@@ -539,6 +541,14 @@ type HTTPClientConfig struct {
 	// AuthZEN proxy URL resolution) and the engine role build. The registry
 	// role builds no resolver and ignores the field.
 	MetadataType string `yaml:"metadata_type" envconfig:"METADATA_TYPE"`
+
+	// MetadataCacheDisabled turns off caching of OpenID4VCI issuer metadata,
+	// so every resolution fetches it afresh. This covers the issuer-metadata
+	// resolvers (engine and AuthZEN proxy) and the backend's
+	// GET /issuer/:id/metadata endpoint cache. Useful for testing scenarios
+	// where the same issuer URL is reused with different metadata.
+	// Env: WALLET_HTTP_CLIENT_METADATA_CACHE_DISABLED
+	MetadataCacheDisabled bool `yaml:"metadata_cache_disabled" envconfig:"METADATA_CACHE_DISABLED"`
 
 	// TrustedIdPHosts lists hostnames of operator-configured OIDC identity
 	// providers that may resolve to private/loopback/link-local addresses.
@@ -1275,7 +1285,6 @@ func (c *CORSConfig) SetDefaults() {
 			"If-None-Match", "X-Private-Data-If-Match", "X-Private-Data-If-None-Match",
 			"Upgrade", "Connection", "Sec-WebSocket-Key",
 			"Sec-WebSocket-Version", "Sec-WebSocket-Protocol",
-			"Wmp-Session-Id", "Last-Event-ID",
 		}
 	}
 	if len(c.ExposedHeaders) == 0 {
@@ -1292,7 +1301,7 @@ type ExternalURLsConfig struct {
 	// BackendURL is the external URL for the backend service (for engine → backend calls)
 	BackendURL string `yaml:"backend_url" envconfig:"BACKEND_URL"`
 
-	// EngineURL is the external URL for the engine service (for WebSocket connections). WMP discovery requires wss:// (or https://); ws:// and http:// are accepted only for loopback hosts. WMP session state is process-local: with more than one engine replica, the load balancer must keep each client on one replica, keyed on a hash of the Authorization header (the only identifier on every WMP request), otherwise a request reaching another replica gets session not found (404). A refreshed token may land on another replica, where the session and its process-local resumption token are lost, so the client must create a new session. The Redis session store does not share this state (see issue 432)
+	// EngineURL is the external URL for the engine service (for WebSocket connections)
 	EngineURL string `yaml:"engine_url" envconfig:"ENGINE_URL"`
 
 	// RegistryURL is the external URL for the registry service (for VCTM lookups)
@@ -2228,7 +2237,20 @@ type TokenBlacklistConfig struct {
 	// CleanupIntervalSeconds is how often to clean up expired blacklist entries
 	// Default: 3600 (1 hour)
 	CleanupIntervalSeconds int `yaml:"cleanup_interval_seconds" envconfig:"CLEANUP_INTERVAL_SECONDS"`
+
+	// Backend selects where revoked access-token jtis and revoked users are
+	// kept: "memory" (per process; lost on restart, not seen by other
+	// replicas) or "storage" (the MongoDB storage backend; shared by all
+	// replicas and survives restarts). Empty means "storage" when
+	// storage.type is mongodb and "memory" otherwise.
+	Backend string `yaml:"backend" envconfig:"BACKEND"`
 }
+
+// Token blacklist backends.
+const (
+	TokenBlacklistBackendMemory  = "memory"
+	TokenBlacklistBackendStorage = "storage"
+)
 
 // SetDefaults sets default values for token blacklist
 func (c *TokenBlacklistConfig) SetDefaults() {
@@ -2266,9 +2288,10 @@ func Load(configFile string) (*Config, error) {
 // caller after any deprecated-alias overlay (see ValidateRegistry and
 // ValidateRegistryStandalone).
 func LoadRegistryOnly(configFile string) (*Config, error) {
-	// No secret files are read: the registry validates AS tokens through the JWKS (a deprecated
-	// registry.yaml jwt secret is ignored).
-	return load(configFile, func(*Config) error { return nil }, (*Config).validateRegistryStandaloneServer)
+	// Only the MongoDB password is read, and only when the shared revocation
+	// store is in use: the registry validates AS tokens through the JWKS (a
+	// deprecated registry.yaml jwt secret is ignored).
+	return load(configFile, (*Config).loadRegistrySecrets, (*Config).validateRegistryStandaloneServer)
 }
 
 func load(configFile string, loadSecrets, validate func(*Config) error) (*Config, error) {
@@ -2469,16 +2492,43 @@ func (c *Config) loadSecretsFromFiles() error {
 		}
 	}
 
-	// Load MongoDB password from file and inject into URI
-	if c.Storage.MongoDB.PasswordPath != "" {
-		password, err := readSecretFile(c.Storage.MongoDB.PasswordPath)
-		if err != nil {
-			return fmt.Errorf("storage.mongodb.password_path: %w", err)
-		}
-		// Replace %PASSWORD% placeholder in URI (no-op if not present)
-		c.Storage.MongoDB.URI = strings.Replace(c.Storage.MongoDB.URI, "%PASSWORD%", password, 1)
-	}
+	return c.loadMongoPassword()
+}
 
+// validateTokenBlacklistBackend rejects an unknown revocation backend and the
+// storage backend without MongoDB storage. A typo must not silently turn
+// shared revocations off.
+func (c *Config) validateTokenBlacklistBackend() error {
+	switch c.Security.TokenBlacklist.Backend {
+	case "":
+		// The default follows storage.type, so a typo there would silently
+		// select the per-process blacklist; a registry-only process does not
+		// run the full storage validation.
+		if c.Security.TokenBlacklist.Enabled && c.Storage.Type != "mongodb" && c.Storage.Type != "memory" && c.Storage.Type != "" {
+			return fmt.Errorf("invalid storage.type: %q (must be memory or mongodb); it selects the default token revocation backend", c.Storage.Type)
+		}
+	case TokenBlacklistBackendMemory:
+	case TokenBlacklistBackendStorage:
+		if c.Storage.Type != "mongodb" {
+			return fmt.Errorf("security.token_blacklist.backend=storage requires storage.type=mongodb")
+		}
+	default:
+		return fmt.Errorf("invalid security.token_blacklist.backend: %q (must be memory or storage)", c.Security.TokenBlacklist.Backend)
+	}
+	return nil
+}
+
+// loadMongoPassword reads the MongoDB password file and injects it into the
+// URI's %PASSWORD% placeholder (a no-op if the URI has none).
+func (c *Config) loadMongoPassword() error {
+	if c.Storage.MongoDB.PasswordPath == "" {
+		return nil
+	}
+	password, err := readSecretFile(c.Storage.MongoDB.PasswordPath)
+	if err != nil {
+		return fmt.Errorf("storage.mongodb.password_path: %w", err)
+	}
+	c.Storage.MongoDB.URI = strings.Replace(c.Storage.MongoDB.URI, "%PASSWORD%", password, 1)
 	return nil
 }
 
@@ -2587,8 +2637,8 @@ func defaultConfig() *Config {
 			},
 		},
 		HTTPClient: HTTPClientConfig{
-			Timeout:      30,                            // 30 seconds default
-			MetadataType: DefaultHTTPClientMetadataType, // signed first, unsigned on 406
+			Timeout:      30,                                              // 30 seconds default
+			MetadataType: string(issuermetadata.MetadataTypePreferSigned), // signed first, unsigned on 406
 			// AllowPrivateIPs defaults to false — SSRF protection blocks private/loopback IPs.
 			// Set allow_private_ips: true in config when issuers are on internal networks.
 		},
@@ -2676,26 +2726,6 @@ func (c ServerConfig) validateTrustedProxies() error {
 	return nil
 }
 
-// DefaultHTTPClientMetadataType is the default http_client.metadata_type.
-const DefaultHTTPClientMetadataType = "prefer-signed"
-
-// HTTPClientMetadataTypes lists the valid http_client.metadata_type values. It mirrors
-// issuermetadata.MetadataType, duplicated to avoid an import cycle; a test in
-// pkg/issuermetadata keeps them in sync.
-var HTTPClientMetadataTypes = []string{"any", "prefer-signed", "require-signed", "prefer-unsigned", "require-unsigned"}
-
-func isValidHTTPClientMetadataType(s string) bool {
-	if s == "" {
-		return true
-	}
-	for _, v := range HTTPClientMetadataTypes {
-		if s == v {
-			return true
-		}
-	}
-	return false
-}
-
 // Validate validates the configuration
 func (c *Config) Validate() error {
 	if c.Server.Port < 1 || c.Server.Port > 65535 {
@@ -2776,6 +2806,10 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("sqlite storage is not yet implemented - please use 'memory' or 'mongodb'")
 	default:
 		return fmt.Errorf("invalid storage type: %s (must be memory or mongodb)", c.Storage.Type)
+	}
+
+	if err := c.validateTokenBlacklistBackend(); err != nil {
+		return err
 	}
 
 	if c.Storage.Type == "mongodb" && c.Storage.MongoDB.URI == "" {
@@ -2985,11 +3019,8 @@ func (c *Config) Validate() error {
 		return err
 	}
 
-	// Not issuermetadata.ParseMetadataType: that package imports this one (its
-	// default HTTP client is built from HTTPClientConfig), so the list is
-	// mirrored here and a test in pkg/issuermetadata keeps the two in sync.
-	if !isValidHTTPClientMetadataType(c.HTTPClient.MetadataType) {
-		return fmt.Errorf("http_client.metadata_type: unknown value %q (want one of %s)", c.HTTPClient.MetadataType, strings.Join(HTTPClientMetadataTypes, ", "))
+	if _, err := issuermetadata.ParseMetadataType(c.HTTPClient.MetadataType); err != nil {
+		return fmt.Errorf("http_client.metadata_type: %w", err)
 	}
 
 	if err := c.Presentation.DCQLConsentCheck.validate(); err != nil {

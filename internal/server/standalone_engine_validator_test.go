@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -64,7 +66,7 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 	}
 
 	t.Run("ES256 accepted, HMAC refused", func(t *testing.T) {
-		v, err := NewStandaloneEngineTokenValidator(base(), zap.NewNop())
+		v, err := NewStandaloneEngineTokenValidator(base(), zap.NewNop(), nil)
 		require.NoError(t, err)
 		require.NotNil(t, v)
 		defer func() { _ = v.Close() }()
@@ -86,7 +88,7 @@ func TestNewStandaloneEngineTokenValidator(t *testing.T) {
 	t.Run("without external_url: refuse to start", func(t *testing.T) {
 		c := base()
 		c.AS.ExternalURL = ""
-		v, err := NewStandaloneEngineTokenValidator(c, zap.NewNop())
+		v, err := NewStandaloneEngineTokenValidator(c, zap.NewNop(), nil)
 		assert.ErrorContains(t, err, "as.external_url")
 		assert.Nil(t, v)
 	})
@@ -96,7 +98,7 @@ func TestRemoteASIssuerRefusesEmpty(t *testing.T) {
 	c := &config.Config{}
 	c.AS.ExternalURL = "https://as.example.com"
 
-	v, err := NewStandaloneEngineTokenValidator(c, zap.NewNop())
+	v, err := NewStandaloneEngineTokenValidator(c, zap.NewNop(), nil)
 	assert.ErrorContains(t, err, "expected issuer is required")
 	assert.Nil(t, v)
 
@@ -126,7 +128,7 @@ func TestNewStandaloneEngineTokenValidator_WarnsNoRevocation(t *testing.T) {
 	c.HTTPClient = config.HTTPClientConfig{AllowHTTP: true, AllowPrivateIPs: true}
 
 	core, logs := observer.New(zap.WarnLevel)
-	v, err := NewStandaloneEngineTokenValidator(c, zap.New(core))
+	v, err := NewStandaloneEngineTokenValidator(c, zap.New(core), nil)
 	require.NoError(t, err)
 	require.NotNil(t, v)
 	defer func() { _ = v.Close() }()
@@ -153,4 +155,94 @@ func TestASJWKSURL(t *testing.T) {
 	c.AS.ExternalURL = "ftp://x"
 	_, err := asJWKSURL(c)
 	assert.Error(t, err)
+}
+
+type downRevocationStore struct{}
+
+func (downRevocationStore) Add(context.Context, string, time.Time) error { return assert.AnError }
+func (downRevocationStore) Has(context.Context, string) (bool, error)    { return false, assert.AnError }
+func (downRevocationStore) RevokeUser(context.Context, string) error     { return assert.AnError }
+func (downRevocationStore) IsUserRevoked(context.Context, string) (bool, error) {
+	return false, assert.AnError
+}
+
+// With the shared blacklist the standalone validator rejects a revoked jti
+// (anonymous tokens included, which have no user to check) and refuses when
+// the store cannot answer; without a revoked jti the same token is accepted.
+func TestNewStandaloneEngineTokenValidator_ChecksJTIRevocation(t *testing.T) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	set := jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{Key: &key.PublicKey, KeyID: "k1", Algorithm: "ES256"}}}
+	var jwksHits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		jwksHits.Add(1)
+		_ = json.NewEncoder(w).Encode(set)
+	}))
+	defer srv.Close()
+
+	token := func(jti string) string {
+		sig, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.ES256, Key: key},
+			(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", "k1"))
+		require.NoError(t, err)
+		raw, err := gojosejwt.Signed(sig).Claims(map[string]any{
+			"iss": "as-issuer", "jti": jti, "tenant_id": "t", "aud": []string{"wallet-backend"}, // no sub: anonymous
+			"exp": time.Now().Add(time.Minute).Unix(), "iat": time.Now().Unix(),
+		}).Serialize()
+		require.NoError(t, err)
+		return raw
+	}
+	cfg := func() *config.Config {
+		c := &config.Config{}
+		c.AS.Enabled = true
+		c.AS.Issuer = "as-issuer"
+		c.AS.Audiences = []string{"wallet-backend"}
+		c.AS.ExternalURL = srv.URL
+		c.HTTPClient = config.HTTPClientConfig{AllowHTTP: true, AllowPrivateIPs: true}
+		return c
+	}
+	start := func(t *testing.T, bl *service.TokenBlacklist) (*StandaloneValidator, *observer.ObservedLogs) {
+		hitsBefore := jwksHits.Load()
+		core, logs := observer.New(zap.WarnLevel)
+		v, err := NewStandaloneEngineTokenValidator(cfg(), zap.New(core), bl)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = v.Close() })
+		// Readiness is the JWKS having been served, not the outcome of a probe
+		// validation: a blacklist may legitimately reject the probe, and a
+		// failed fetch must not be mistaken for a revocation verdict.
+		require.Eventually(t, func() bool { return jwksHits.Load() > hitsBefore }, 3*time.Second, 10*time.Millisecond, "JWKS was never fetched")
+		return v, logs
+	}
+	enabled := config.TokenBlacklistConfig{Enabled: true}
+
+	t.Run("revoked jti is rejected, other jti accepted, no warning", func(t *testing.T) {
+		bl := service.NewTokenBlacklist(enabled, zap.NewNop())
+		require.NoError(t, bl.Add(context.Background(), "revoked", time.Now().Add(time.Hour)))
+		v, logs := start(t, bl)
+		require.Eventually(t, func() bool {
+			_, err := v.Validate(context.Background(), token("fine"))
+			return err == nil
+		}, 3*time.Second, 20*time.Millisecond, "positive control")
+		_, err := v.Validate(context.Background(), token("revoked"))
+		assert.Error(t, err)
+		assert.Zero(t, logs.FilterMessageSnippet("no token revocation source").Len())
+	})
+
+	t.Run("store outage rejects", func(t *testing.T) {
+		bl := service.NewTokenBlacklistWithStore(enabled, zap.NewNop(), downRevocationStore{})
+		v, logs := start(t, bl)
+		// Wait for evidence that the revocation checker itself rejected the
+		// token (it logs the store failure), so the keys are loaded and a
+		// JWKS problem cannot satisfy the assertion.
+		require.Eventually(t, func() bool {
+			_, err := v.Validate(context.Background(), token("any"))
+			return err != nil && logs.FilterMessageSnippet("Revocation check failed").Len() > 0
+		}, 3*time.Second, 20*time.Millisecond, "revocation checker never rejected the token")
+	})
+
+	t.Run("without a blacklist the revoked jti is accepted (documented gap, warned)", func(t *testing.T) {
+		v, logs := start(t, nil)
+		_, err := v.Validate(context.Background(), token("revoked"))
+		assert.NoError(t, err)
+		assert.Equal(t, 1, logs.FilterMessageSnippet("no token revocation source").Len())
+	})
 }

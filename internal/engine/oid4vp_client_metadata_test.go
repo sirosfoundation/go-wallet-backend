@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,12 +25,20 @@ const zkpClientMetadata = `{"jwks":{"keys":[{"kty":"EC","crv":"P-256","use":"enc
 
 func TestExtractRawClientMetadata(t *testing.T) {
 	req := `{"client_id":"x","client_metadata":` + zkpClientMetadata + `}`
-	assert.JSONEq(t, zkpClientMetadata, string(extractRawClientMetadata([]byte(req))))
+	raw, err := extractRawClientMetadata([]byte(req))
+	require.NoError(t, err)
+	assert.JSONEq(t, zkpClientMetadata, string(raw))
 
-	assert.Nil(t, extractRawClientMetadata([]byte(`{"client_id":"x"}`)), "absent")
-	assert.Nil(t, extractRawClientMetadata([]byte(`{"client_metadata":null}`)), "null")
-	assert.Nil(t, extractRawClientMetadata([]byte(`{"client_metadata":"str"}`)), "not an object")
-	assert.Nil(t, extractRawClientMetadata([]byte(`not json`)), "garbage")
+	for name, in := range map[string]string{
+		"absent":        `{"client_id":"x"}`,
+		"null":          `{"client_metadata":null}`,
+		"not an object": `{"client_metadata":"str"}`,
+		"garbage":       `not json`,
+	} {
+		raw, err := extractRawClientMetadata([]byte(in))
+		require.NoError(t, err, name)
+		assert.Nil(t, raw, name)
+	}
 }
 
 func TestParseRequestJWT_KeepsClientMetadataVerbatim(t *testing.T) {
@@ -196,4 +206,117 @@ func TestRequestVPSignature_RelaysClientMetadataToSignRequest(t *testing.T) {
 	require.True(t, ok, "params: %v", params)
 	assert.Contains(t, cm, "vp_formats_supported")
 	assert.NotEmpty(t, params["verifier_jwk_thumbprint"])
+}
+
+// paddedClientMetadata returns a JSON object of exactly size bytes.
+func paddedClientMetadata(t *testing.T, size int) string {
+	t.Helper()
+	const head, tail = `{"pad":"`, `"}`
+	require.Greater(t, size, len(head)+len(tail))
+	out := head + strings.Repeat("x", size-len(head)-len(tail)) + tail
+	require.Len(t, out, size)
+	return out
+}
+
+func TestFetchClientMetadata_SizeBound(t *testing.T) {
+	atLimit := paddedClientMetadata(t, MaxClientMetadataBytes)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/over" {
+			_, _ = w.Write([]byte(paddedClientMetadata(t, MaxClientMetadataBytes+1)))
+			return
+		}
+		_, _ = w.Write([]byte(atLimit))
+	}))
+	defer srv.Close()
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}}
+	h.httpClient = srv.Client()
+
+	_, raw, err := h.fetchClientMetadata(context.Background(), srv.URL+"/at")
+	require.NoError(t, err, "exactly at the limit is accepted")
+	assert.Len(t, raw, MaxClientMetadataBytes)
+
+	cm, raw, err := h.fetchClientMetadata(context.Background(), srv.URL+"/over")
+	require.ErrorIs(t, err, errClientMetadataTooLarge, "limit+1 is refused, not truncated")
+	assert.Nil(t, cm)
+	assert.Nil(t, raw)
+}
+
+func TestClientMetadata_InlineSizeBound(t *testing.T) {
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}}
+
+	// Inside a request object (JWT payload and plain JSON).
+	for _, tc := range []struct {
+		size int
+		ok   bool
+	}{{MaxClientMetadataBytes, true}, {MaxClientMetadataBytes + 1, false}} {
+		cm := paddedClientMetadata(t, tc.size)
+		payload := `{"client_id":"x","client_metadata":` + cm + `}`
+		jwt := "e30." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + ".sig"
+		authReq, err := h.parseRequestJWT(jwt)
+		if tc.ok {
+			require.NoError(t, err)
+			assert.Len(t, authReq.ClientMetadataRaw, tc.size)
+		} else {
+			require.ErrorIs(t, err, errClientMetadataTooLarge)
+		}
+		raw, err := extractRawClientMetadata([]byte(payload))
+		if tc.ok {
+			require.NoError(t, err)
+			assert.Len(t, raw, tc.size)
+		} else {
+			require.ErrorIs(t, err, errClientMetadataTooLarge)
+		}
+	}
+
+	// Inline in the authorization request URL.
+	for _, tc := range []struct {
+		size int
+		ok   bool
+	}{{MaxClientMetadataBytes, true}, {MaxClientMetadataBytes + 1, false}} {
+		q := url.Values{"client_id": {"x"}, "client_metadata": {paddedClientMetadata(t, tc.size)}}
+		authReq, err := h.parseRequestFromURL(&url.URL{Scheme: "openid4vp", RawQuery: q.Encode()})
+		if tc.ok {
+			require.NoError(t, err)
+			assert.Len(t, authReq.ClientMetadataRaw, tc.size)
+		} else {
+			require.ErrorIs(t, err, errClientMetadataTooLarge)
+		}
+	}
+
+	// A normal few-KB value is untouched.
+	q := url.Values{"client_id": {"x"}, "client_metadata": {zkpClientMetadata}}
+	authReq, err := h.parseRequestFromURL(&url.URL{Scheme: "openid4vp", RawQuery: q.Encode()})
+	require.NoError(t, err)
+	assert.JSONEq(t, zkpClientMetadata, string(authReq.ClientMetadataRaw))
+}
+
+func TestParseRequestJWT_RefusesOversizeRequestObject(t *testing.T) {
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}}
+	_, err := h.parseRequestJWT("e30." + strings.Repeat("A", MaxRequestJWTBytes) + ".sig")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "exceeds")
+	assert.NotContains(t, err.Error(), "AAAA", "the value is never echoed")
+}
+
+func TestExtractRawClientMetadata_RefusesDuplicateMembers(t *testing.T) {
+	big := strings.Repeat("a", 100)
+	for name, obj := range map[string]string{
+		"exact duplicate":  `{"client_metadata":{"client_name":"` + big + `"},"client_metadata":{}}`,
+		"case variant":     `{"client_metadata":{"client_name":"x"},"Client_Metadata":{}}`,
+		"separated by key": `{"client_metadata":{},"nonce":"n","CLIENT_METADATA":{"a":1}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := extractRawClientMetadata([]byte(obj))
+			require.ErrorIs(t, err, errClientMetadataDuplicate)
+		})
+	}
+	raw, err := extractRawClientMetadata([]byte(`{"nonce":"n","x":{"client_metadata":{}},"client_metadata":{"a":1}}`))
+	require.NoError(t, err, "a nested client_metadata is not a duplicate")
+	assert.JSONEq(t, `{"a":1}`, string(raw))
+
+	// Both request-object paths go through it.
+	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop()}}
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"client_metadata":{"a":1},"client_metadata":{}}`))
+	_, err = h.parseRequestJWT("e30." + payload + ".sig")
+	require.ErrorIs(t, err, errClientMetadataDuplicate)
 }

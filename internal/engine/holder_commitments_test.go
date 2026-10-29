@@ -116,7 +116,7 @@ func runProofs(t *testing.T, cfg *CredentialConfig, jwt string) (SignRequestPara
 		}
 		var m SignResponseMessage
 		if json.Unmarshal(data, &m) == nil {
-			session.signCh <- &m
+			session.dispatchSignResponse(&m)
 		}
 	}()
 	h := &OID4VCIHandler{}
@@ -229,7 +229,7 @@ func TestPSCConflict_Relayed(t *testing.T) {
 		defer cleanup()
 		h, c2 := testOID4VCIHandler(t, srv.Client())
 		defer c2()
-		h.Flow.Session.transport = newWSTransport(conn)
+		h.Flow.Session.conn = conn
 		_, err := h.requestCredential(context.Background(), &IssuerMetadata{CredentialEndpoint: srv.URL},
 			&TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", hcCfg(hcAdv), nil, nil)
 		select {

@@ -51,6 +51,8 @@ type OID4VCIHandler struct {
 	dpopNonce            string                 // server-provided DPoP nonce (RFC 9449 §8)
 	attestationChallenge string                 // server-provided Client Attestation PoP challenge (attestation-based client auth)
 	challengeEndpoint    string                 // AS challenge endpoint for fetching attestation challenges
+	asDocumentServed     bool                   // a matching AS document was served (token_endpoint guess is then forbidden)
+	asMetadataFetched    bool                   // AS metadata fetch attempted (see fetchOAuthMetadata)
 	redirectURI          string
 	// encryptedNotificationRegistered is set once the notification context of
 	// an encrypted response has been registered for this issuance, so a later
@@ -112,6 +114,7 @@ func NewOID4VCIHandlerFactory(resolver MetadataResolver, issuerLookup Credential
 // oauthServerMetadata contains the OAuth Authorization Server metadata fields
 // relevant for the OID4VCI authorization code flow.
 type oauthServerMetadata struct {
+	Issuer                             string   `json:"issuer"`
 	AuthorizationEndpoint              string   `json:"authorization_endpoint"`
 	TokenEndpoint                      string   `json:"token_endpoint"`
 	PushedAuthorizationRequestEndpoint string   `json:"pushed_authorization_request_endpoint"`
@@ -125,6 +128,7 @@ type oauthServerMetadata struct {
 // so supportsPKCE can distinguish an absent field from an explicit empty list.
 func (m *oauthServerMetadata) UnmarshalJSON(data []byte) error {
 	type alias struct {
+		Issuer                             string    `json:"issuer"`
 		AuthorizationEndpoint              string    `json:"authorization_endpoint"`
 		TokenEndpoint                      string    `json:"token_endpoint"`
 		PushedAuthorizationRequestEndpoint string    `json:"pushed_authorization_request_endpoint"`
@@ -136,6 +140,7 @@ func (m *oauthServerMetadata) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
 	}
+	m.Issuer = aux.Issuer
 	m.AuthorizationEndpoint = aux.AuthorizationEndpoint
 	m.TokenEndpoint = aux.TokenEndpoint
 	m.PushedAuthorizationRequestEndpoint = aux.PushedAuthorizationRequestEndpoint
@@ -557,6 +562,9 @@ func isDPoPNonceError(resp *http.Response) bool {
 	return resp.Header.Get("DPoP-Nonce") != ""
 }
 
+// maxTokenAttempts bounds the token request retry loop (see doTokenExchange).
+const maxTokenAttempts = 4
+
 // errAttestationChallenge is returned internally once a use_attestation_challenge
 // rejection has been handled and a fresh challenge obtained, signalling the caller
 // to retry the request with the Client Attestation PoP carrying it.
@@ -592,7 +600,11 @@ func (h *OID4VCIHandler) resolveAttestationChallenge(ctx context.Context, resp *
 		// may skip AS-metadata fetch when token_endpoint is already known) can
 		// still use it.
 		if h.challengeEndpoint == "" && metadata != nil {
-			h.fetchOAuthMetadata(ctx, metadata) // sets h.challengeEndpoint on success
+			// Sets h.challengeEndpoint on success; a discovery failure just
+			// means no endpoint is known (no challenge can be obtained).
+			if _, err := h.fetchOAuthMetadata(ctx, metadata); err != nil {
+				h.Logger.Debug("attestation challenge endpoint discovery failed", zap.Error(err))
+			}
 		}
 		if h.challengeEndpoint != "" {
 			var err error
@@ -611,6 +623,38 @@ func (h *OID4VCIHandler) resolveAttestationChallenge(ctx context.Context, resp *
 	h.attestationProvider = nil
 	h.legacyAttestationRequested = false
 	return true
+}
+
+// prepareAttestationChallenge fetches a challenge from the AS challenge
+// endpoint before a new PoP is signed, so the request is not first rejected
+// with use_attestation_challenge. Failure is not fatal.
+func (h *OID4VCIHandler) prepareAttestationChallenge(ctx context.Context) {
+	if h.attestationChallenge != "" || h.challengeEndpoint == "" {
+		return
+	}
+	challenge, err := h.fetchAttestationChallenge(ctx, h.challengeEndpoint)
+	if err != nil {
+		h.Logger.Debug("failed to prefetch attestation challenge; proceeding without", zap.Error(err))
+		return
+	}
+	h.attestationChallenge = challenge
+}
+
+// spendAttestationChallenge retires the pending challenge once the AS has
+// accepted a request carrying it. In legacy mode the WIA+PoP is requested once
+// and replayed, so a PoP bound to the now-spent challenge must not be replayed
+// on the next request (e.g. the token request after PAR): drop it so the next
+// resolveLegacyClientAuth re-requests one with a fresh challenge. A pre-supplied
+// attestation (legacyAttestationRequested false) is left alone.
+func (h *OID4VCIHandler) spendAttestationChallenge() {
+	if h.attestationChallenge == "" {
+		return
+	}
+	h.attestationChallenge = ""
+	if h.clientAuthMode == clientAuthLegacy && h.legacyAttestationRequested && h.attestationProvider != nil {
+		h.attestationProvider = nil
+		h.legacyAttestationRequested = false
+	}
 }
 
 // fetchAttestationChallenge POSTs the AS challenge endpoint to obtain a fresh
@@ -648,7 +692,7 @@ func (h *OID4VCIHandler) fetchAttestationChallenge(ctx context.Context, endpoint
 	var challengeResp struct {
 		AttestationChallenge string `json:"attestation_challenge"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&challengeResp); err != nil {
+	if err := json.NewDecoder(io.LimitReader(resp.Body, MaxErrorBodyBytes)).Decode(&challengeResp); err != nil {
 		return "", fmt.Errorf("parsing challenge response: %w", err)
 	}
 	if challengeResp.AttestationChallenge == "" {
@@ -851,6 +895,25 @@ type OAuthError struct {
 
 // parseOAuthError attempts to parse a structured OAuth error from a response body.
 // Returns the parsed error or a generic error with the status code.
+// safeErrorCode returns an OAuth error code for logging: only a short token of
+// [A-Za-z0-9_.-] qualifies, anything else is reported as "unrecognized".
+func safeErrorCode(code string) string {
+	if code == "" {
+		return ""
+	}
+	if len(code) > 64 {
+		return "unrecognized"
+	}
+	for _, r := range code {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '_', r == '.', r == '-':
+		default:
+			return "unrecognized"
+		}
+	}
+	return code
+}
+
 func parseOAuthError(statusCode int, body []byte) error {
 	var oauthErr OAuthError
 	if err := json.Unmarshal(body, &oauthErr); err == nil && oauthErr.Error != "" {
@@ -1123,27 +1186,20 @@ func (h *OID4VCIHandler) issueCredential(ctx context.Context, metadata *IssuerMe
 		credential, credErr = h.requestCredential(ctx, metadata, token, selectedConfigID, selectedConfig, proofs, respEnc)
 		if credErr != nil {
 			var cNonceErr *CNonceRequiredError
-			if retries == 0 && errors.As(credErr, &cNonceErr) {
-				// Issuer signaled a nonce mismatch — get a fresh nonce and retry.
-				// Prefer Nonce Endpoint; fall back to the c_nonce from the error response.
-				if metadata.NonceEndpoint != "" {
-					if n, fetchErr := h.fetchNonce(ctx, metadata.NonceEndpoint); fetchErr == nil {
-						nonce = n
-					} else {
-						h.Logger.Debug("nonce endpoint retry failed, using error response c_nonce", zap.Error(fetchErr))
-						nonce = cNonceErr.NewNonce
-					}
-				} else {
-					nonce = cNonceErr.NewNonce
-				}
-				h.Logger.Debug("c_nonce refreshed, re-requesting proofs")
-				continue
-			}
-			// On the second attempt or for non-c_nonce errors, surface the error.
-			// For CNonceRequiredError on the final retry, send the flow error here
-			// and unwrap the underlying credential error so the caller receives a
-			// meaningful issuer error message (e.g. "invalid_nonce: ...").
 			if errors.As(credErr, &cNonceErr) {
+				// Issuer signaled a nonce mismatch. Retry ONCE with a fresh nonce
+				// (new nonce => new key proofs via generate_proof); never loop.
+				if retries == 0 {
+					if fresh, ok := h.freshNonceForRetry(ctx, metadata, cNonceErr); ok {
+						nonce = fresh
+						h.Logger.Debug("nonce refreshed, re-requesting proofs")
+						continue
+					}
+					h.Logger.Debug("issuer reported an invalid nonce but no fresh nonce is obtainable")
+				}
+				// No retry possible (second attempt, or no fresh nonce): send the
+				// flow error here and unwrap the underlying credential error so
+				// the caller receives the issuer's message (e.g. "invalid_nonce").
 				_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 				return cNonceErr.Err
 			}
@@ -1832,8 +1888,8 @@ func (h *OID4VCIHandler) handlePreAuthorized(ctx context.Context, metadata *Issu
 
 	// Fetch OAuth metadata to get token endpoint if not in issuer metadata
 	if metadata.TokenEndpoint == "" {
-		if oauthMeta := h.fetchOAuthMetadata(ctx, metadata); oauthMeta != nil && oauthMeta.TokenEndpoint != "" {
-			metadata.TokenEndpoint = oauthMeta.TokenEndpoint
+		if _, err := h.discoverTokenEndpoint(ctx, metadata); err != nil {
+			return nil, h.failASDiscovery(StepExchangingToken, ErrCodeTokenError, err)
 		}
 	}
 
@@ -1893,56 +1949,38 @@ func (h *OID4VCIHandler) exchangePreAuthCode(ctx context.Context, metadata *Issu
 // from different grants remain distinguishable in logs without duplicating the
 // whole loop.
 func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMetadata, logContext string, setGrantParams func(data url.Values)) (*TokenResponse, error) {
+	if !h.asMetadataFetched {
+		if _, err := h.discoverTokenEndpoint(ctx, metadata); err != nil {
+			return nil, h.failASDiscovery(StepExchangingToken, ErrCodeTokenError, err)
+		}
+	}
+
 	tokenEndpoint := metadata.TokenEndpoint
+	if tokenEndpoint == "" && h.asDocumentServed {
+		// Defence in depth for every path that reaches here after discovery:
+		// never guess when a matching document was served without token_endpoint.
+		return nil, h.failASDiscovery(StepExchangingToken, ErrCodeTokenError,
+			errors.New("authorization server metadata has no token_endpoint"))
+	}
 	if tokenEndpoint == "" {
-		// Try to construct from issuer
+		// No token_endpoint discovered (no AS document at all, or none in it):
+		// construct from issuer
 		tokenEndpoint = strings.TrimSuffix(metadata.CredentialIssuer, "/") + "/token"
 	}
 
 	// Token exchange with DPoP nonce (RFC 9449 §8) and attestation challenge
 	// (attestation-based client auth) retries.
-	for attempt := 0; attempt < 3; attempt++ {
-		// Resolve client auth first: whether the request is attested decides
-		// the form-body auth, and each attempt needs a fresh DPoP proof (new
-		// nonce) and, in client-held mode, a fresh attestation PoP.
-		auth, err := h.resolveClientAuth(ctx, clientAuthNeeds{
-			attestation: true,
-			dpop:        true,
-			htm:         "POST",
-			htu:         tokenEndpoint,
-		})
+	// The budget covers one nonce retry and one challenge retry in either
+	// order, plus a second challenge retry when the AS consumed the challenge
+	// of the nonce-rejected request, plus the final attempt.
+	for attempt := 0; attempt < maxTokenAttempts; attempt++ {
+		resp, err := h.sendTokenRequest(ctx, metadata, tokenEndpoint, setGrantParams)
 		if err != nil {
 			return nil, err
-		}
-
-		data := url.Values{}
-		setGrantParams(data)
-		// RFC 8707 resource indicator (cross-origin AS/issuer only): applied here
-		// so every grant type (pre-authorized_code, authorization_code,
-		// refresh_token) audience-restricts the access token to the Credential
-		// Issuer, matching the PAR-time decision (both derive it from the same
-		// metadata, as RFC 8707 requires).
-		if !sameOrigin(h.authServerIssuer, metadata.CredentialIssuer) {
-			data.Set("resource", metadata.CredentialIssuer)
-		}
-		if err := h.setClientAuth(data, auth.attested()); err != nil {
-			return nil, err
-		}
-
-		req, err := http.NewRequestWithContext(ctx, "POST", tokenEndpoint, strings.NewReader(data.Encode()))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		auth.apply(req)
-
-		resp, err := h.httpClient.Do(req)
-		if err != nil {
-			return nil, fmt.Errorf("token request failed: %w", err)
 		}
 
 		// Check for DPoP nonce requirement — retry with server-provided nonce
-		if attempt < 2 && isDPoPNonceError(resp) {
+		if attempt < maxTokenAttempts-1 && isDPoPNonceError(resp) {
 			h.updateDPoPNonce(resp)
 			_ = resp.Body.Close()
 			continue
@@ -1953,7 +1991,7 @@ func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMe
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 			_ = resp.Body.Close()
 			// Retry with the server-provided challenge in the attestation PoP.
-			if attempt < 2 && isAttestationChallengeError(resp.StatusCode, body) && h.resolveAttestationChallenge(ctx, resp, metadata) {
+			if attempt < maxTokenAttempts-1 && isAttestationChallengeError(resp.StatusCode, body) && h.resolveAttestationChallenge(ctx, resp, metadata) {
 				h.Logger.Debug(logContext + " endpoint requires attestation challenge, retrying with challenge")
 				continue
 			}
@@ -1961,6 +1999,7 @@ func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMe
 			_ = h.Error(StepExchangingToken, ErrCodeTokenError, ErrCodeTokenError.UserFacingMessage())
 			return nil, parseOAuthError(resp.StatusCode, body)
 		}
+		h.spendAttestationChallenge() // the AS accepted it
 
 		var token TokenResponse
 		if err := json.NewDecoder(resp.Body).Decode(&token); err != nil {
@@ -1974,6 +2013,49 @@ func (h *OID4VCIHandler) doTokenExchange(ctx context.Context, metadata *IssuerMe
 	}
 
 	return nil, fmt.Errorf("%s request failed after nonce/challenge retries", logContext)
+}
+
+// sendTokenRequest builds and sends one token request. Resolving client auth
+// comes first: whether the request is attested decides the form-body auth, and
+// each attempt needs a fresh DPoP proof (new nonce) and, in client-held mode, a
+// fresh attestation PoP.
+func (h *OID4VCIHandler) sendTokenRequest(ctx context.Context, metadata *IssuerMetadata, tokenEndpoint string, setGrantParams func(data url.Values)) (*http.Response, error) {
+	auth, err := h.resolveClientAuth(ctx, clientAuthNeeds{
+		attestation: true,
+		dpop:        true,
+		htm:         "POST",
+		htu:         tokenEndpoint,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	data := url.Values{}
+	setGrantParams(data)
+	// RFC 8707 resource indicator (cross-origin AS/issuer only): applied here
+	// so every grant type (pre-authorized_code, authorization_code,
+	// refresh_token) audience-restricts the access token to the Credential
+	// Issuer, matching the PAR-time decision (both derive it from the same
+	// metadata, as RFC 8707 requires).
+	if !sameOrigin(h.authServerIssuer, metadata.CredentialIssuer) {
+		data.Set("resource", metadata.CredentialIssuer)
+	}
+	if err := h.setClientAuth(data, auth.attested()); err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", tokenEndpoint, strings.NewReader(data.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	auth.apply(req)
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("token request failed: %w", err)
+	}
+	return resp, nil
 }
 
 // exchangeRefreshToken performs an OAuth 2.0 refresh_token grant against the
@@ -2003,46 +2085,96 @@ func (h *OID4VCIHandler) exchangeRefreshToken(ctx context.Context, metadata *Iss
 	})
 }
 
-// fetchOAuthMetadata fetches OAuth Authorization Server metadata from the well-known endpoint.
-// Returns nil (not an error) if the metadata cannot be fetched, allowing callers to use fallbacks.
-func (h *OID4VCIHandler) fetchOAuthMetadata(ctx context.Context, metadata *IssuerMetadata) *oauthServerMetadata {
+// discoverTokenEndpoint runs AS discovery for a token request. It sets
+// metadata.TokenEndpoint from the document when issuer metadata supplied none.
+//
+//   - Token endpoint already known: discovery is best effort (it still feeds the
+//     optional challenge endpoint and PKCE hints); a failed or refused document
+//     is not used and not fatal.
+//   - Not known: a failure, or a served document without token_endpoint, is an
+//     error. Only when no document exists at all ((nil, nil)) may the caller
+//     guess <issuer>/token.
+func (h *OID4VCIHandler) discoverTokenEndpoint(ctx context.Context, metadata *IssuerMetadata) (*oauthServerMetadata, error) {
+	oauthMeta, err := h.fetchOAuthMetadata(ctx, metadata)
+	if metadata.TokenEndpoint != "" {
+		if err != nil {
+			h.Logger.Debug("authorization server metadata discovery failed", zap.Error(err))
+			return nil, nil
+		}
+		return oauthMeta, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if oauthMeta == nil {
+		return nil, nil
+	}
+	if oauthMeta.TokenEndpoint == "" {
+		return nil, errors.New("authorization server metadata has no token_endpoint")
+	}
+	metadata.TokenEndpoint = oauthMeta.TokenEndpoint
+	return oauthMeta, nil
+}
+
+// failASDiscovery tells the client the flow failed (sanitized, fixed text: the
+// underlying error is logged, never sent) and returns err.
+func (h *OID4VCIHandler) failASDiscovery(step FlowStep, code ErrorCode, err error) error {
+	h.Logger.Warn("authorization server metadata discovery failed", zap.Error(err))
+	_ = h.Error(step, code, code.UserFacingMessage())
+	return err
+}
+
+// maxASMetadataBytes bounds an authorization server metadata document.
+const maxASMetadataBytes = 1 << 20
+
+// fetchOAuthMetadata discovers the OAuth Authorization Server metadata of the
+// AS named by the issuer metadata (else the credential issuer itself).
+//
+// Candidate URLs are tried in order (RFC 8414 section 3.1, then OIDC Discovery
+// section 4), falling back ONLY on HTTP 404; the document's "issuer" must equal
+// the AS identifier exactly (RFC 8414 section 3.3). See
+// oidc.FetchAuthorizationServerMetadata.
+//
+// Return values:
+//   - (meta, nil): a document was found and its issuer matches.
+//   - (nil, nil): discovery found NO document at all (every candidate 404). This
+//     is the only case in which callers may fall back to guessed endpoints
+//     (<issuer>/token, <AS>/authorize).
+//   - (nil, err): a document was served but must not be used (issuer mismatch,
+//     invalid), or the request failed (5xx, 401/403, network, timeout). Callers
+//     must NOT guess endpoints; err carries no issuer-controlled text.
+func (h *OID4VCIHandler) fetchOAuthMetadata(ctx context.Context, metadata *IssuerMetadata) (*oauthServerMetadata, error) {
+	h.asMetadataFetched = true
 	authServer := metadata.authorizationServer()
 	if authServer == "" {
 		authServer = metadata.CredentialIssuer
 	}
 
-	// RFC 8414 §2: the issuer identifier MUST NOT include a trailing '/'
-	authServer = strings.TrimRight(authServer, "/")
-
-	// RFC 8615 well-known URI construction for OAuth AS metadata
-	oauthMetadataURL, err := oidc.WellKnownURL(authServer, "oauth-authorization-server")
-	if err != nil {
-		return nil
+	body, err := oidc.FetchAuthorizationServerMetadata(ctx, h.httpClient, authServer, maxASMetadataBytes)
+	if errors.Is(err, oidc.ErrASMetadataNotFound) {
+		return nil, nil
 	}
-	req, err := http.NewRequestWithContext(ctx, "GET", oauthMetadataURL, nil)
 	if err != nil {
-		return nil
-	}
-
-	resp, err := h.httpClient.Do(req)
-	if err != nil {
-		return nil
-	}
-	defer resp.Body.Close() //nolint:errcheck
-
-	if resp.StatusCode != http.StatusOK {
-		return nil
+		// Do not wrap the transport error: it can carry the issuer-controlled URL.
+		var statusErr *oidc.ASMetadataStatusError
+		switch {
+		case errors.As(err, &statusErr), errors.Is(err, oidc.ErrASIssuerMismatch), errors.Is(err, oidc.ErrASMetadataInvalid), errors.Is(err, oidc.ErrASIdentifierInvalid):
+			return nil, fmt.Errorf("authorization server metadata discovery failed: %w", err)
+		default:
+			return nil, errors.New("authorization server metadata discovery failed: request error")
+		}
 	}
 
 	var oauthMeta oauthServerMetadata
-	if err := json.NewDecoder(resp.Body).Decode(&oauthMeta); err != nil {
-		return nil
+	if err := json.Unmarshal(body, &oauthMeta); err != nil {
+		return nil, fmt.Errorf("authorization server metadata discovery failed: %w", oidc.ErrASMetadataInvalid)
 	}
+	h.asDocumentServed = true
 	// Remember the challenge endpoint for attestation-PoP challenge retrieval.
 	if oauthMeta.ChallengeEndpoint != "" {
 		h.challengeEndpoint = oauthMeta.ChallengeEndpoint
 	}
-	return &oauthMeta
+	return &oauthMeta, nil
 }
 
 func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata, selectedConfig *CredentialConfig) (*TokenResponse, error) {
@@ -2052,9 +2184,26 @@ func (h *OID4VCIHandler) handleAuthorizationCode(ctx context.Context, offer *Cre
 	}
 	fallbackEndpoint := strings.TrimSuffix(authServer, "/") + "/authorize"
 
-	oauthMeta := h.fetchOAuthMetadata(ctx, metadata)
-	if oauthMeta == nil || oauthMeta.AuthorizationEndpoint == "" {
-		// Fallback: construct auth URL directly, no PAR
+	oauthMeta, err := h.fetchOAuthMetadata(ctx, metadata)
+	if err != nil {
+		return nil, h.failASDiscovery(StepAuthorizationReq, ErrCodeAuthorizationFail, err)
+	}
+	if oauthMeta != nil && oauthMeta.AuthorizationEndpoint == "" {
+		// A served, identity-checked document without authorization_endpoint is
+		// not a "no document" case: no guess, and its other members (such as
+		// require_pushed_authorization_requests) must not be dropped.
+		return nil, h.failASDiscovery(StepAuthorizationReq, ErrCodeAuthorizationFail,
+			errors.New("authorization server metadata has no authorization_endpoint"))
+	}
+	if oauthMeta != nil && oauthMeta.TokenEndpoint == "" && metadata.TokenEndpoint == "" {
+		// The code would later be sent to a guessed <issuer>/token: refuse before
+		// starting authorization, as discoverTokenEndpoint does for the other grants.
+		return nil, h.failASDiscovery(StepAuthorizationReq, ErrCodeAuthorizationFail,
+			errors.New("authorization server metadata has no token_endpoint"))
+	}
+	if oauthMeta == nil {
+		// Fallback: discovery found no document at all (every candidate 404);
+		// never reached after an issuer mismatch or a failed request): construct auth URL directly, no PAR
 		return h.startAuthorizationFlow(ctx, offer, metadata, selectedConfig, &oauthServerMetadata{
 			AuthorizationEndpoint: fallbackEndpoint,
 		})
@@ -2335,6 +2484,7 @@ func (h *OID4VCIHandler) sendPushedAuthorizationRequest(ctx context.Context, par
 		}
 		return "", fmt.Errorf("PAR endpoint returned status %d", resp.StatusCode)
 	}
+	h.spendAttestationChallenge() // the AS accepted it
 
 	var parResp PARResponse
 	if err := json.NewDecoder(resp.Body).Decode(&parResp); err != nil {
@@ -2374,9 +2524,9 @@ func (h *OID4VCIHandler) resumeWithAuthCode(ctx context.Context, msg *FlowStartM
 	_ = h.ProgressMessage(StepAuthorizationReq, "Resuming flow with authorization code")
 
 	// Fetch OAuth metadata to get token endpoint and check PKCE requirements
-	oauthMeta := h.fetchOAuthMetadata(ctx, metadata)
-	if oauthMeta != nil && oauthMeta.TokenEndpoint != "" && metadata.TokenEndpoint == "" {
-		metadata.TokenEndpoint = oauthMeta.TokenEndpoint
+	oauthMeta, err := h.discoverTokenEndpoint(ctx, metadata)
+	if err != nil {
+		return nil, h.failASDiscovery(StepAuthorizationReq, ErrCodeAuthorizationFail, err)
 	}
 
 	// Validate code_verifier: PKCE defaults to enabled (OID4VCI spec), so if the
@@ -2401,16 +2551,39 @@ func (h *OID4VCIHandler) resumeWithAuthCode(ctx context.Context, msg *FlowStartM
 }
 
 // CNonceRequiredError is returned by requestCredential when the credential
-// endpoint responds with an error that includes a refreshed c_nonce. The
-// engine should re-request all proofs from the frontend using the new nonce
-// and retry the credential request.
+// endpoint reports an invalid nonce: error "invalid_nonce" (OpenID4VCI 1.0
+// section 8.3.1.2, whose error response carries no c_nonce) or, for older
+// issuers, any error body that includes a refreshed c_nonce. The engine
+// should re-request all proofs from the frontend using a fresh nonce and
+// retry the credential request once.
 type CNonceRequiredError struct {
+	// NewNonce is the c_nonce from the error body; empty for a spec-conformant
+	// invalid_nonce response (the fresh nonce then comes from the Nonce Endpoint).
 	NewNonce string
 	Err      error
 }
 
 func (e *CNonceRequiredError) Error() string { return e.Err.Error() }
 func (e *CNonceRequiredError) Unwrap() error { return e.Err }
+
+// freshNonceForRetry returns the nonce to use for the single retry after an
+// invalid-nonce error. The Nonce Endpoint (section 7) is preferred; the
+// c_nonce from the error body is used only when the endpoint is not
+// advertised or fails (older/draft issuers). ok is false when neither
+// yields a nonce, in which case the error is terminal.
+func (h *OID4VCIHandler) freshNonceForRetry(ctx context.Context, metadata *IssuerMetadata, e *CNonceRequiredError) (string, bool) {
+	if metadata.NonceEndpoint != "" {
+		n, err := h.fetchNonce(ctx, metadata.NonceEndpoint)
+		if err == nil {
+			return n, true
+		}
+		h.Logger.Debug("nonce endpoint retry failed", zap.Error(err))
+	}
+	if e.NewNonce != "" {
+		return e.NewNonce, true
+	}
+	return "", false
+}
 
 func (h *OID4VCIHandler) needsProof(config *CredentialConfig) bool {
 	return len(config.ProofTypesSupported) > 0
@@ -2481,9 +2654,6 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 	resp, err := h.RequestSign(ctx, SignActionGenerateProof, params)
 	if err != nil {
 		return nil, nil, err
-	}
-	if resp.Error != "" {
-		return nil, nil, errors.New("client failed the proof request")
 	}
 
 	var respEnc *responseEncryption
@@ -2765,7 +2935,14 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 			_ = resp.Body.Close()
-			h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode), zap.String("body", string(body)))
+			var errResp struct {
+				Error  string `json:"error"`
+				CNonce string `json:"c_nonce"`
+			}
+			parsedErr := json.Unmarshal(body, &errResp) == nil
+			// Only the error code is logged, never the body or error_description:
+			// they are issuer-controlled free text and legacy ones carry a nonce.
+			h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode), zap.String("error", safeErrorCode(errResp.Error)))
 
 			// A holder commitment conflict is a final, user-actionable outcome:
 			// relay it as its own flow error code (never retried).
@@ -2773,13 +2950,12 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 				return nil, conflictErr
 			}
 
-			// Check whether the error response contains a refreshed c_nonce so the
-			// caller can re-request proofs and retry. Do NOT send a flow error here —
-			// that is the caller's responsibility when no retry is possible.
-			var errResp struct {
-				CNonce string `json:"c_nonce"`
-			}
-			if json.Unmarshal(body, &errResp) == nil && errResp.CNonce != "" {
+			// An invalid_nonce error (no c_nonce in the body per OpenID4VCI 1.0
+			// section 8.3.1.2) or any error carrying a refreshed c_nonce (older
+			// issuers) lets the caller re-request proofs and retry once. Do NOT
+			// send a flow error here: that is the caller's responsibility when
+			// no retry is possible.
+			if parsedErr && (errResp.Error == "invalid_nonce" || errResp.CNonce != "") {
 				return nil, &CNonceRequiredError{
 					NewNonce: errResp.CNonce,
 					Err:      parseOAuthError(resp.StatusCode, body),
