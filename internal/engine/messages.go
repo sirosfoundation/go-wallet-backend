@@ -409,6 +409,11 @@ type FlowActionMessage struct {
 	Message
 	Action  string          `json:"action"`
 	Payload json.RawMessage `json:"payload,omitempty"`
+
+	// consent is the transport-neutral answer a transport that has already
+	// translated its wire (the WMP bridge) hands to the flow instead of a
+	// payload. Unexported, so no client can send it.
+	consent *consentAnswer
 }
 
 // FlowAction types

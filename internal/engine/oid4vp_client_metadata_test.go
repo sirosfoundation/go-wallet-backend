@@ -160,7 +160,7 @@ func TestRequestVPSignature_DirectPostJWTWithoutKeyFailsBeforeSigning(t *testing
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	_, err := h.requestVPSignature(ctx, &AuthorizationRequest{ResponseMode: ResponseModeDirectPostJWT, ClientID: "x"},
-		[]ConsentSelection{{CredentialID: "c", CredentialQueryID: "q"}}, "")
+		decisionOf(ConsentSelection{CredentialID: "c", CredentialQueryID: "q"}), "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "direct_post.jwt")
 	select {
@@ -198,7 +198,7 @@ func TestRequestVPSignature_RelaysClientMetadataToSignRequest(t *testing.T) {
 		ClientID:          "x",
 		ClientMetadata:    &ClientMetadata{JWKS: json.RawMessage(`{"keys":[{"kty":"EC","crv":"P-256","use":"enc","x":"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU","y":"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"}]}`)},
 		ClientMetadataRaw: json.RawMessage(zkpClientMetadata),
-	}, []ConsentSelection{{CredentialID: "c", CredentialQueryID: "q"}}, "")
+	}, decisionOf(ConsentSelection{CredentialID: "c", CredentialQueryID: "q"}), "")
 
 	msg := awaitMessage(t, received, "sign_request")
 	params, _ := msg["params"].(map[string]any)

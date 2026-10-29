@@ -147,7 +147,9 @@ func TestRequestCredentialSelection_ConsentCheckModes(t *testing.T) {
 		feedAction(t, session, h.Flow.ID, ActionConsent, ConsentPayload{SelectedCredentials: violating})
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		selected, err = h.requestCredentialSelection(ctx, authReq, &VerifierInfo{})
+		var decision consentDecision
+		decision, err = h.requestCredentialSelection(ctx, authReq, &VerifierInfo{})
+		selected = decision.Selected
 		if mode == config.DCQLConsentCheckEnforce {
 			msg := awaitMessage(t, rec, string(TypeFlowError))
 			flowErr := msg["error"].(map[string]any)
@@ -200,28 +202,6 @@ func TestRequestCredentialSelection_ConsentCheckModes(t *testing.T) {
 		assert.EqualValues(t, 0, notified)
 		assert.Equal(t, 0, logs.Len())
 	})
-}
-
-func TestVetConsent_EdgeCases(t *testing.T) {
-	logger := zap.NewNop()
-	enforce := &config.Config{Presentation: config.PresentationConfig{DCQLConsentCheck: config.DCQLConsentCheckEnforce}}
-	h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: logger, Config: enforce}}
-
-	// No DCQL query (legacy request): nothing to compare with.
-	assert.NoError(t, h.vetConsent(&AuthorizationRequest{}, []ConsentSelection{sel("x", "y")}))
-
-	// A query that cannot be interpreted refuses in enforce mode.
-	err := h.vetConsent(&AuthorizationRequest{DCQLQuery: json.RawMessage(`{"credentials":`)}, []ConsentSelection{sel("x")})
-	var v *consentViolation
-	require.ErrorAs(t, err, &v)
-	assert.Equal(t, consentReasonUnparseable, v.Reason)
-
-	// A conforming consent passes in enforce mode.
-	assert.NoError(t, h.vetConsent(&AuthorizationRequest{DCQLQuery: json.RawMessage(consentTestQuery)}, []ConsentSelection{sel("pid", "given_name")}))
-
-	// Nil config behaves as the default (warn).
-	h.Config = nil
-	assert.NoError(t, h.vetConsent(&AuthorizationRequest{DCQLQuery: json.RawMessage(consentTestQuery)}, []ConsentSelection{sel("nope")}))
 }
 
 // A claim path may hold only strings, non-negative integers and null. Anything

@@ -3614,7 +3614,7 @@ func TestRequestCredentialSelection_NoMatchFailsFast(t *testing.T) {
 	selected, err := h.requestCredentialSelection(ctx, authReq, &VerifierInfo{})
 
 	require.Error(t, err, "an empty match set must end the flow, not wait for consent")
-	assert.Nil(t, selected)
+	assert.Equal(t, consentDecision{}, selected)
 	assert.Contains(t, err.Error(), "no credential matches")
 
 	// The verifier is told, so its session ends instead of expiring - with
@@ -3706,8 +3706,8 @@ func TestRequestCredentialSelection_NonEmptyMatchKeepsWaitingForConsent(t *testi
 	selected, err := h.requestCredentialSelection(ctx, &AuthorizationRequest{}, &VerifierInfo{})
 
 	require.NoError(t, err)
-	require.Len(t, selected, 1)
-	assert.Equal(t, "cred-1", selected[0].CredentialID)
+	require.Len(t, selected.Selected, 1)
+	assert.Equal(t, "cred-1", selected.Selected[0].CredentialID)
 }
 
 func TestWaitForSelectionAction_RepeatedMatchesDoNotExtendTheDeadline(t *testing.T) {

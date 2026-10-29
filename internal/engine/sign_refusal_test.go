@@ -101,7 +101,7 @@ func runRefusedPresentationSign(t *testing.T, respond func(reqMsgID string) stri
 	}
 
 	start := time.Now()
-	_, err := h.requestVPSignature(context.Background(), authReq, []ConsentSelection{{CredentialID: "c1"}}, "https://verifier.example.com")
+	_, err := h.requestVPSignature(context.Background(), authReq, decisionOf(ConsentSelection{CredentialID: "c1"}), "https://verifier.example.com")
 	took := time.Since(start)
 	require.Error(t, err)
 	h.failSign(context.Background(), authReq, err)
