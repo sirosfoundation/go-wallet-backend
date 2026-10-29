@@ -198,6 +198,12 @@ func (p *wmpFlowProfile) run(protocol Protocol) wmp.FlowFunc {
 		// its first step: ctx is the engine's.
 		p.a.manager.handleFlowStartContext(ctx, ws.session, start)
 
+		if !f.terminal.Load() && parent.Err() == nil && f.malformed.Load() {
+			// A refused sign request ended the flow without an engine message of
+			// its own: it ends with the terminal -32602 all the same.
+			f.endMalformed()
+			return nil
+		}
 		if !f.terminal.Load() && parent.Err() == nil {
 			// The engine ended the flow without a result (it timed out, or ended
 			// silently); the client was not cancelled, so go-wmp tells it.
@@ -251,7 +257,7 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 				f.malformed.Store(true)
 			}
 			ws.session.dispatchAction(&FlowActionMessage{Message: Message{Type: TypeFlowAction, FlowID: params.FlowID}, Action: ActionDecline})
-			if f != nil && flowStep(ws.session, params.FlowID) != StepCredentialSelection {
+			if f != nil && !ws.session.awaitsSelection(params.FlowID) {
 				// The flow is not waiting for the selection (it is signing, or
 				// submitting): nothing would consume the decline and the flow would
 				// run on. A pending sign request is refused, so the engine tells the
@@ -299,17 +305,27 @@ func (s *Session) refuseSignRequests(flowID string) bool {
 	return len(ids) > 0
 }
 
-// flowStep is the step an engine flow last reported.
-func flowStep(s *Session, flowID string) FlowStep {
+// awaitsSelection reports whether the flow can still consume a selection: its
+// last reported step is the credential selection and no sign request is pending
+// (after the consent the step stays credential_selection until the next
+// progress, so the step alone does not say the selection is still awaited).
+func (s *Session) awaitsSelection(flowID string) bool {
 	s.flowsMu.RLock()
 	f := s.flows[flowID]
+	pending := false
+	for _, p := range s.outstandingRequests {
+		if p.flowID == flowID {
+			pending = true
+			break
+		}
+	}
 	s.flowsMu.RUnlock()
-	if f == nil {
-		return ""
+	if f == nil || pending {
+		return false
 	}
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return f.State
+	return f.State == StepCredentialSelection
 }
 
 // wmpFlowTypeOf is the WMP flow type of an engine flow.

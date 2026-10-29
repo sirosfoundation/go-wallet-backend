@@ -590,6 +590,8 @@ func TestWMPBridge_MalformedSelectionDuringSigningRefusesTheVerifier(t *testing.
 		h.BaseHandler = BaseHandler{Logger: zap.NewNop(), Flow: f}
 		h.httpClient = verifier.Client()
 		authReq := &AuthorizationRequest{ClientID: "https://verifier.example.com", ResponseMode: ResponseModeDirectPost, ResponseURI: verifier.URL, State: "st-1", Nonce: "n"}
+		// The consent reports no progress, so while signing the step is still the selection.
+		_ = h.Progress(StepCredentialSelection, nil)
 		_, err := h.requestVPSignature(ctx, authReq, []ConsentSelection{{CredentialQueryID: "q1"}}, "https://verifier.example.com")
 		h.failSign(ctx, authReq, err)
 		return err
@@ -598,6 +600,7 @@ func TestWMPBridge_MalformedSelectionDuringSigningRefusesTheVerifier(t *testing.
 	sid := e.create(tok, "oid4vp")
 	st, _ := e.openStream(tok, sid, "")
 	require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
+	st.nextMethod(t, wmp.MethodFlowProgress)
 	st.nextMethod(t, wmp.MethodFlowStart) // the sign sub-flow is pending
 
 	r := e.post(tok, sid, req(wmp.MethodFlowAction, map[string]any{"wmp": meta(sid), "flow_id": "f1", "action": "select_credentials",
@@ -813,36 +816,55 @@ func TestWMPBridge_FlowEnds(t *testing.T) {
 }
 
 // A malformed select_credentials that arrives when the flow is not waiting for
-// the selection (it is signing) cannot be consumed as a decline: the flow ends at
-// once with the terminal -32602, and nothing it would have done afterwards
-// reaches the wallet.
+// the selection cannot be consumed as a decline: the flow ends at once with the
+// terminal -32602, and nothing it would have done afterwards reaches the wallet.
+// While signing the last reported step is still the selection (the consent
+// reports no progress), so a pending sign request is what says the flow has moved on.
 func TestWMPBridge_MalformedSelectionEndsAFlowThatIsNotWaiting(t *testing.T) {
-	e := newWMPEnv(t)
-	ranOn := make(chan bool, 1)
-	registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
-		_ = f.Session.SendProgress(f.ID, StepSubmittingResponse, nil) // past the selection step
-		select {
-		case <-ctx.Done():
-			ranOn <- false
-			return ctx.Err()
-		case <-time.After(1500 * time.Millisecond):
-			ranOn <- true
-			return f.Session.SendFlowComplete(f.ID, nil, "")
-		}
-	})
-	tok := e.token("alice", "t1", "ir", "j1")
-	sid := e.create(tok, "oid4vp")
-	st, _ := e.openStream(tok, sid, "")
-	require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
-	st.nextMethod(t, wmp.MethodFlowProgress)
+	for name, tc := range map[string]struct {
+		step FlowStep
+		sign bool
+	}{
+		"past the selection step":           {StepSubmittingResponse, false},
+		"signing, step still the selection": {StepCredentialSelection, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newWMPEnv(t)
+			ranOn := make(chan bool, 1)
+			registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
+				_ = f.Session.SendProgress(f.ID, tc.step, nil)
+				if tc.sign {
+					_, err := f.Session.RequestSign(ctx, f.ID, SignActionSignPresentation, SignRequestParams{Nonce: "n"})
+					ranOn <- err == nil
+					return err
+				}
+				select {
+				case <-ctx.Done():
+					ranOn <- false
+					return ctx.Err()
+				case <-time.After(1500 * time.Millisecond):
+					ranOn <- true
+					return f.Session.SendFlowComplete(f.ID, nil, "")
+				}
+			})
+			tok := e.token("alice", "t1", "ir", "j1")
+			sid := e.create(tok, "oid4vp")
+			st, _ := e.openStream(tok, sid, "")
+			require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
+			st.nextMethod(t, wmp.MethodFlowProgress)
+			if tc.sign {
+				st.nextMethod(t, wmp.MethodFlowStart) // the sign sub-flow is pending
+			}
 
-	r := e.post(tok, sid, req(wmp.MethodFlowAction, map[string]any{"wmp": meta(sid), "flow_id": "f1", "action": "select_credentials",
-		"params": map[string]any{"consent": true, "selections": []any{map[string]any{"query_id": "q1", "selection_handle": "abcdefghijklmnopqrstuv", "credential_id": "c"}}}}))
-	assert.Equal(t, wmp.ErrInvalidParams, r.code())
-	ev := st.nextMethod(t, wmp.MethodFlowError)
-	assert.EqualValues(t, wmp.ErrInvalidParams, params(ev)["code"])
-	assert.Nil(t, params(ev)["data"])
-	assert.False(t, <-ranOn, "the flow was stopped, not left to sign and complete")
+			r := e.post(tok, sid, req(wmp.MethodFlowAction, map[string]any{"wmp": meta(sid), "flow_id": "f1", "action": "select_credentials",
+				"params": map[string]any{"consent": true, "selections": []any{map[string]any{"query_id": "q1", "selection_handle": "abcdefghijklmnopqrstuv", "credential_id": "c"}}}}))
+			assert.Equal(t, wmp.ErrInvalidParams, r.code())
+			ev := st.nextMethod(t, wmp.MethodFlowError)
+			assert.EqualValues(t, wmp.ErrInvalidParams, params(ev)["code"])
+			assert.Nil(t, params(ev)["data"])
+			assert.False(t, <-ranOn, "the flow was stopped, not left to sign and complete")
+		})
+	}
 }
 
 // wmp.message.deliver as a request is -31008 (there is no participant to
