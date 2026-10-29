@@ -3,6 +3,9 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -10,6 +13,7 @@ import (
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 // A flow without a flow_id would run under an ID the engine makes up, while the
@@ -261,4 +265,60 @@ func TestWMPBridge_ActionCancelClearsRecoveryState(t *testing.T) {
 		assert.NotContains(t, ev.Raw, "awaiting_offer_acceptance", "no prompt for a flow that is gone")
 	case <-time.After(500 * time.Millisecond):
 	}
+}
+
+// A repeated malformed selection while the verifier is being told must not cut
+// that refusal short: the first one is carried out.
+func TestWMPBridge_RepeatedMalformedSelectionLeavesTheRefusalRunning(t *testing.T) {
+	hit := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	doRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	delivered := make(chan bool, 1)
+	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit <- struct{}{}
+		<-release
+		delivered <- r.Context().Err() == nil
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer verifier.Close()
+	defer doRelease() // a failing test must not leave the handler blocked
+
+	e := newWMPEnv(t)
+	registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
+		h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop(), Flow: f}, httpClient: verifier.Client()}
+		authReq := &AuthorizationRequest{ClientID: "https://v", ResponseMode: ResponseModeDirectPost, ResponseURI: verifier.URL, State: "st", Nonce: "n"}
+		f.mu.Lock()
+		f.State = StepCredentialSelection
+		f.mu.Unlock()
+		_, err := h.requestVPSignature(ctx, authReq, decisionOf(ConsentSelection{CredentialQueryID: "q1"}), "https://v")
+		h.failSign(ctx, authReq, err)
+		return err
+	})
+	tok := e.token("alice", "t1", "ir", "j1")
+	sid := e.create(tok, "oid4vp")
+	st, _ := e.openStream(tok, sid, "")
+	require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
+	st.nextMethod(t, wmp.MethodFlowStart) // the sign sub-flow is pending
+
+	bad := req(wmp.MethodFlowAction, map[string]any{"wmp": meta(sid), "flow_id": "f1", "action": "select_credentials",
+		"params": map[string]any{"consent": true, "selections": []any{map[string]any{"query_id": "q1", "selection_handle": testHandle, "credential_id": "c"}}}})
+	assert.Equal(t, wmp.ErrInvalidParams, e.post(tok, sid, bad).code())
+	<-hit // the sign request is gone, the verifier is being told
+	assert.Equal(t, wmp.ErrInvalidParams, e.post(tok, sid, bad).code())
+	select {
+	case ev := <-st.events:
+		t.Fatalf("the flow ended before the verifier was told: %s", ev.Raw)
+	case <-time.After(300 * time.Millisecond):
+	}
+	doRelease()
+	select {
+	case ok := <-delivered:
+		assert.True(t, ok, "the verifier's notification was not cancelled")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the verifier was not told")
+	}
+	ev := st.nextMethod(t, wmp.MethodFlowError)
+	assert.EqualValues(t, wmp.ErrInvalidParams, params(ev)["code"])
 }
