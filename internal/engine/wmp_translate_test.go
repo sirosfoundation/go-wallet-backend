@@ -167,7 +167,7 @@ func TestWMPTranslate_ProgressPayloads(t *testing.T) {
 func TestWMPTranslate_CompletionHasNoEnvelope(t *testing.T) {
 	m := &FlowCompleteMessage{Message: Message{Type: TypeFlowComplete, FlowID: "f1", MessageID: "m", Timestamp: Now()},
 		RedirectURI: "https://v/done", Credentials: []CredentialResult{{Format: "dc+sd-jwt", Credential: "c"}}}
-	raw, err := completionResult(m)
+	raw, err := completionResult(m, "")
 	require.NoError(t, err)
 	res := map[string]interface{}{}
 	require.NoError(t, json.Unmarshal(raw, &res))
@@ -356,4 +356,107 @@ func TestWMPBridge_SignStepsAndDroppedSteps(t *testing.T) {
 	prog := st.nextMethod(t, wmp.MethodFlowProgress)
 	assert.Equal(t, openid4x.StepGeneratingProof, params(prog)["step"], "the token steps were not sent")
 	st.nextMethod(t, wmp.MethodFlowStart)
+}
+
+func TestNormalizeSignResult(t *testing.T) {
+	for name, tc := range map[string]struct{ in, want string }{
+		"string": {`{"vp_token":"a"}`, `{"vp_token":"a"}`},
+		"array":  {`{"vp_token":["a","b"]}`, `{"vp_token":"a\nb"}`},
+		"object": {`{"vp_token":{"pid":["a"]}}`, `{"vp_token":"{\"pid\":[\"a\"]}"}`},
+		"none":   {`{"response_jwe":"x"}`, `{"response_jwe":"x"}`},
+	} {
+		assert.JSONEq(t, tc.want, string(normalizeSignResult(json.RawMessage(tc.in))), name)
+	}
+	assert.Equal(t, "x", string(normalizeSignResult(json.RawMessage("x"))), "not JSON: unchanged")
+}
+
+// A conforming sign result (a DCQL object, an array) reaches the engine instead
+// of failing the presentation.
+func TestWMPBridge_SignResultVPTokenForms(t *testing.T) {
+	for name, tc := range map[string]struct {
+		token any
+		want  string
+	}{
+		"object": {map[string]any{"pid": []string{"presentation"}}, `{"pid":["presentation"]}`},
+		"array":  {[]string{"p1", "p2"}, "p1\np2"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newWMPEnv(t)
+			got := make(chan *SignResponseMessage, 1)
+			registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
+				resp, err := f.Session.RequestSign(ctx, f.ID, SignActionSignPresentation, SignRequestParams{Audience: "https://v.example", Nonce: "n-1"})
+				if err != nil {
+					return err
+				}
+				got <- resp
+				return f.Session.SendFlowComplete(f.ID, nil, "")
+			})
+			tok := e.token("alice", "t1", "ir", "j1")
+			sid := e.create(tok, "oid4vp")
+			st, _ := e.openStream(tok, sid, "")
+			require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
+			start := st.nextMethod(t, wmp.MethodFlowStart)
+			sub := params(start)["flow_id"].(string)
+			e.post(tok, sid, map[string]any{"id": start.Data["id"], "result": map[string]any{"wmp": meta(sid), "flow_id": sub, "flow_type": "sign"}})
+			e.post(tok, sid, notification(wmp.MethodFlowComplete, map[string]any{"wmp": meta(sid), "flow_id": sub, "result": map[string]any{"vp_token": tc.token}}))
+			select {
+			case resp := <-got:
+				assert.Empty(t, resp.Error)
+				assert.Equal(t, tc.want, resp.VPToken)
+			case <-time.After(5 * time.Second):
+				t.Fatal("the engine's RequestSign did not return")
+			}
+		})
+	}
+}
+
+const preAuthSecret = "SECRET-PRE-AUTH-CODE"
+
+// The pre-authorized code is the engine's: not in the parsed offer, not in the
+// credential offer of the authorization step, and not in the replay log.
+func TestWMPBridge_PreAuthorizedCodeNeverRelayed(t *testing.T) {
+	grants := map[string]any{"urn:ietf:params:oauth:grant-type:pre-authorized_code": map[string]any{"pre-authorized_code": preAuthSecret}, "authorization_code": map[string]any{}}
+	e := newWMPEnv(t)
+	registerScripted(e.m, ProtocolOID4VCI, func(_ context.Context, f *Flow, _ *FlowStartMessage) error {
+		_ = f.Session.SendProgress(f.ID, StepAuthorizationReq, map[string]any{"authorization_url": "https://as", "credential_offer": map[string]any{"grants": grants}})
+		_ = f.Session.SendProgress(f.ID, StepOfferParsed, map[string]any{"credential_issuer": "https://i", "grants": grants})
+		return f.Session.SendFlowComplete(f.ID, nil, "")
+	})
+	tok := e.token("alice", "t1", "ir", "j1")
+	sid := e.create(tok, "oid4vci")
+	live, _ := e.openStream(tok, sid, "")
+	require.Equal(t, 0, e.post(tok, sid, startVCI(sid, "f1")).code())
+	first := live.nextMethod(t, wmp.MethodFlowProgress)
+	second := live.nextMethod(t, wmp.MethodFlowProgress)
+	live.nextMethod(t, wmp.MethodFlowComplete)
+	for _, ev := range []sseEvent{first, second} {
+		assert.NotContains(t, ev.Raw, preAuthSecret)
+	}
+	assert.Contains(t, first.Raw, "https://as", "the rest of the step is relayed")
+	assert.Contains(t, second.Raw, "https://i", "the rest of the offer is relayed")
+	replayed, status := e.openStream(tok, sid, first.ID)
+	require.Equal(t, 200, status)
+	assert.NotContains(t, replayed.next(t).Raw, preAuthSecret)
+}
+
+func TestWMPBridge_AcceptOfferNeedsAffirmativeConsent(t *testing.T) {
+	e := newWMPEnv(t)
+	actions := make(chan *FlowActionMessage, 2)
+	registerScripted(e.m, ProtocolOID4VCI, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
+		_ = f.Session.SendProgress(f.ID, StepAwaitingSelection, map[string]any{"available_credentials": []any{map[string]any{"id": "a"}, map[string]any{"id": "b"}}})
+		act, err := f.Session.WaitForAction(ctx, f.ID, ActionSelectCredential)
+		if err == nil {
+			actions <- act
+		}
+		return err
+	})
+	tok := e.token("alice", "t1", "ir", "j1")
+	sid := e.create(tok, "oid4vci")
+	st, _ := e.openStream(tok, sid, "")
+	require.Equal(t, 0, e.post(tok, sid, startVCI(sid, "f1")).code())
+	st.nextMethod(t, wmp.MethodFlowProgress)
+	for name, p := range map[string]map[string]any{"missing": {"selected_indices": []int{0}}, "null": {"selected_indices": []int{0}, "consent": nil}} {
+		assert.Equal(t, wmp.ErrInvalidParams, e.post(tok, sid, flowAction(sid, "f1", "accept_offer", p)).code(), name)
+	}
+	assert.Empty(t, actions)
 }

@@ -4,10 +4,12 @@ package engine
 // client receives them. The engine core enforces; this file only maps its two
 // outcomes, and bounds what is relayed whatever the core sent:
 //
-//   - a refusal is the flow error UNTRUSTED_ISSUER, which WMP carries as
-//     -31006 (Flow error) with data {"reason": "untrusted_issuer"}: Core 3.8
-//     has no code for a trust refusal, so the reason is the additive member
-//     the client keys on, as it is for "rejected" (Core 6.2);
+//   - a refusal of the trust decision is the flow error UNTRUSTED_ISSUER,
+//     which WMP carries as -31006 (Flow error) with
+//     openid4x.NewUntrustedIssuerData() ({"reason": "untrusted_issuer",
+//     "retryable": false}); a refusal that rests on entitlement findings is
+//     ISSUER_NOT_ENTITLED, -31020 (wmp.ErrIssuerNotEntitled) with
+//     openid4x.NewIssuerNotEntitledData(). Never both for one flow;
 //   - the findings are a trust_evaluated progress whose payload has
 //     issuer_entitlement_evaluated: true. It carries no trust_info and is not a
 //     trust decision (the issuer's own trust_evaluated is the one with
@@ -15,67 +17,36 @@ package engine
 
 import (
 	"encoding/json"
-	"unicode/utf8"
+
+	"github.com/sirosfoundation/go-wmp/pkg/wmp/openid4x"
 )
 
-// Bounds on what the bridge relays of the findings, whatever the engine sent.
-const (
-	maxEntitlementFindings   = 16
-	maxEntitlementCodeLen    = 64
-	maxEntitlementMessageLen = 256
-	maxEntitlementTypeLen    = 128
-	maxEntitlementIssuerLen  = 2048
-	maxEntitlementModeLen    = 16
-)
-
-// The reasons of the -31006 data of a trust refusal.
-const (
-	reasonUntrustedIssuer   = "untrusted_issuer"
-	reasonUntrustedVerifier = "untrusted_verifier"
-)
-
-// codeIssuerNotEntitled and issuerNotEntitledMessage are the WMP error of an
-// entitlement refusal (wmp spec #36/#37, go-wmp wmp.ErrIssuerNotEntitled and
-// openid4x.IssuerNotEntitledMessage, on go-wmp main, not in a release: v0.12.1 is
-// the latest). TODO: use go-wmp's constants and NewIssuerNotEntitledData once
-// v0.13.0 is tagged.
-const (
-	codeIssuerNotEntitled    = -31020
-	issuerNotEntitledMessage = "Issuer not entitled"
-)
+// The reason of the -31006 data of a verifier trust refusal (the issuer's is
+// openid4x.ReasonUntrustedIssuer).
+const reasonUntrustedVerifier = "untrusted_verifier"
 
 // errCodeIssuerNotEntitled is the engine's refusal of an issuer entitlement
-// check in fail mode (go-wallet-backend#522); UNTRUSTED_ISSUER stays the trust
-// decision's. Declared here until #522's constant is on main.
+// check in fail mode (go-wallet-backend#522, messages.go: ErrCodeIssuerNotEntitled,
+// the same string). Declared here until #522 is on main; remove it then.
 const errCodeIssuerNotEntitled ErrorCode = "ISSUER_NOT_ENTITLED"
 
-// trustRefusalReason is the data.reason of a flow error that is a trust
-// refusal, or "" for any other error.
-func trustRefusalReason(code ErrorCode) string {
+// untrustedRefusalData is the data of a trust-decision refusal (-31006), or nil
+// for any other error. The issuer's is go-wmp's closed shape (the engine
+// attaches no details to the refusal); the verifier's keeps its reason next to
+// the engine's details, the reason winning over a member of the same name.
+func untrustedRefusalData(code ErrorCode, details map[string]interface{}) interface{} {
 	switch code {
 	case ErrCodeUntrustedIssuer:
-		return reasonUntrustedIssuer
+		return openid4x.NewUntrustedIssuerData()
 	case ErrCodeUntrustedVerifier:
-		return reasonUntrustedVerifier
+		out := make(map[string]interface{}, len(details)+1)
+		for k, v := range details {
+			out[k] = v
+		}
+		out["reason"] = reasonUntrustedVerifier
+		return out
 	}
-	return ""
-}
-
-// entitlementPayload is the bounded trust_evaluated payload of the findings, and
-// whether m is one (it names issuer_entitlement_evaluated). Only the members
-// the engine defines are relayed, strings are length-bounded and at most
-// maxEntitlementFindings findings are kept; no free text of the issuer travels
-// (the message of a finding is fixed text per code, credential_type is bounded).
-func entitlementPayload(m map[string]interface{}) (map[string]interface{}, bool) {
-	if evaluated, _ := m["issuer_entitlement_evaluated"].(bool); !evaluated {
-		return nil, false
-	}
-	out := map[string]interface{}{"issuer_entitlement_evaluated": true}
-	if s, ok := boundedString(m["issuer"], maxEntitlementIssuerLen); ok {
-		out["issuer"] = s
-	}
-	out["issuer_entitlement"] = boundedDecision(m["issuer_entitlement"])
-	return out, true
+	return nil
 }
 
 // asJSONObject is v as a decoded JSON object: the engine puts typed values (a
@@ -95,93 +66,71 @@ func asJSONObject(v interface{}) map[string]interface{} {
 	return m
 }
 
-// boundedDecision is the bounded form of the engine's entitlement decision
-// {allowed, mode, evaluated, findings, findings_truncated}.
-func boundedDecision(v interface{}) map[string]interface{} {
+// entitlementDecision is the engine's decision {allowed, mode, evaluated,
+// findings, findings_truncated} (#522 issuertrust.Decision.Summary) as go-wmp's
+// type, bounded by go-wmp (findings, lengths, characters, finding codes of the
+// defined form) whatever the engine sent. The registration certificate's own
+// content (entitlements, subject) is issuer-controlled and display-only: not
+// relayed. A decision that is not an object, or a member of the wrong type,
+// yields false.
+func entitlementDecision(v interface{}) (openid4x.IssuerEntitlement, bool) {
 	raw := asJSONObject(v)
-	ent := map[string]interface{}{}
-	for _, k := range []string{"allowed", "evaluated"} {
-		if b, ok := raw[k].(bool); ok {
-			ent[k] = b
-		}
+	if raw == nil {
+		return openid4x.IssuerEntitlement{}, false
 	}
-	if s, ok := boundedString(raw["mode"], maxEntitlementModeLen); ok {
-		ent["mode"] = s
+	delete(raw, "entitlements")
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return openid4x.IssuerEntitlement{}, false
 	}
-	findings, truncated := boundedFindings(raw["findings"])
-	ent["findings"] = findings
-	if t, _ := raw["findings_truncated"].(bool); t || truncated {
-		ent["findings_truncated"] = true
+	var e openid4x.IssuerEntitlement
+	if json.Unmarshal(b, &e) != nil {
+		return openid4x.IssuerEntitlement{}, false
 	}
-	return ent
+	return e.Bounded(), true
 }
 
-func boundedFindings(v interface{}) ([]map[string]interface{}, bool) {
-	in, _ := v.([]interface{})
-	out := make([]map[string]interface{}, 0, len(in))
-	truncated := false
-	for _, e := range in {
-		if len(out) == maxEntitlementFindings {
-			truncated = true
-			break
-		}
-		f, ok := e.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		code, ok := boundedString(f["code"], maxEntitlementCodeLen)
-		if !ok {
-			continue
-		}
-		finding := map[string]interface{}{"code": code}
-		if s, ok := boundedString(f["message"], maxEntitlementMessageLen); ok {
-			finding["message"] = s
-		}
-		if s, ok := boundedString(f["credential_type"], maxEntitlementTypeLen); ok {
-			finding["credential_type"] = s
-		}
-		out = append(out, finding)
+// entitlementPayload is the typed trust_evaluated payload of the findings, and
+// whether m is one (it names issuer_entitlement_evaluated). ok is true with a
+// nil payload when m names it but go-wmp refuses what it carries (no issuer, a
+// mode that is neither warn nor fail): the progress is then dropped rather
+// than relayed unvalidated or as a trust decision.
+func entitlementPayload(m map[string]interface{}) (payload *openid4x.IssuerEntitlementPayload, ok bool) {
+	if evaluated, _ := m["issuer_entitlement_evaluated"].(bool); !evaluated {
+		return nil, false
 	}
-	return out, truncated
+	issuer, _ := m["issuer"].(string)
+	dec, valid := entitlementDecision(m["issuer_entitlement"])
+	if !valid {
+		return nil, true
+	}
+	p, err := openid4x.NewIssuerEntitlementPayload(issuer, dec)
+	if err != nil {
+		return nil, true
+	}
+	return p, true
 }
 
-// boundedString is v as a string of at most max bytes (cut at a rune boundary).
-func boundedString(v interface{}, max int) (string, bool) {
-	s, ok := v.(string)
+// notEntitledData is the data of the -31020 refusal from the details of the
+// engine's ISSUER_NOT_ENTITLED ({issuer, issuer_entitlement}, #522). It is nil
+// when go-wmp does not accept what the engine sent as a refusal (an empty
+// issuer, a decision that is not allowed=false, mode=fail with a finding); the
+// caller then ends the flow with a plain flow error, not a made-up decision.
+func notEntitledData(details map[string]interface{}) *openid4x.IssuerNotEntitledData {
+	issuer, _ := details["issuer"].(string)
+	dec, ok := entitlementDecision(details["issuer_entitlement"])
 	if !ok {
-		return "", false
+		return nil
 	}
-	if len(s) > max {
-		s = s[:max]
-		for len(s) > 0 && !utf8.ValidString(s) {
-			s = s[:len(s)-1]
-		}
+	d, err := openid4x.NewIssuerNotEntitledData(issuer, dec)
+	if err != nil {
+		return nil
 	}
-	return s, true
+	return d
 }
 
-// boundedErrorDetails is the data of a trust refusal: the engine's details, and
-// for ISSUER_NOT_ENTITLED ({issuer, issuer_entitlement}, #522) only those two,
-// bounded like the findings progress.
-func boundedErrorDetails(code ErrorCode, details map[string]interface{}) map[string]interface{} {
-	if code == errCodeIssuerNotEntitled {
-		out := map[string]interface{}{}
-		if s, ok := boundedString(details["issuer"], maxEntitlementIssuerLen); ok {
-			out["issuer"] = s
-		}
-		if d, ok := details["issuer_entitlement"]; ok {
-			out["issuer_entitlement"] = boundedDecision(d)
-		}
-		return out
-	}
-	out := make(map[string]interface{}, len(details))
-	for k, v := range details {
-		out[k] = v
-	}
-	return out
-}
-
-// entitlementRaw decodes a trust_evaluated payload for entitlementPayload.
-func entitlementRaw(payload json.RawMessage) (map[string]interface{}, bool) {
+// entitlementRaw decodes a trust_evaluated payload for entitlementPayload. A
+// nil payload with ok true is a findings progress the bridge does not relay.
+func entitlementRaw(payload json.RawMessage) (*openid4x.IssuerEntitlementPayload, bool) {
 	return entitlementPayload(payloadObject(payload))
 }

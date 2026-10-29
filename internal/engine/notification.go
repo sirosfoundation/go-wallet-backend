@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sirosfoundation/go-wmp/pkg/wmp/openid4x"
 	"go.uber.org/zap"
 )
 
@@ -56,7 +57,23 @@ type notificationContext struct {
 	// is validated against this value before any notification is forwarded.
 	notificationID string
 	expiresAt      time.Time
+
+	// issuer is the credential issuer identifier (the DPoP audience of a
+	// client-signed proof). principal is the WMP principal that ran the
+	// issuance, "" over WebSocket, where the connection is the binding; a WMP
+	// notification flow can use only a context of its own principal.
+	issuer    string
+	principal string
+	// notified are the notification_ids already forwarded over WMP: each id is
+	// single use (WMP OpenID4x 3.4.2). A context whose notificationID is empty
+	// (an encrypted response, whose id the engine never saw) accepts any id
+	// the wallet names, once each, up to maxBlindNotificationIDs.
+	notified map[string]struct{}
 }
+
+// maxBlindNotificationIDs bounds the ids a context that knows none accepts
+// (WMP OpenID4x 3.4.2: 256 per issuance).
+const maxBlindNotificationIDs = 256
 
 // notificationContextStore is an in-memory, TTL-bounded registry of
 // notificationContext values keyed by flow ID. All state is ephemeral and
@@ -96,6 +113,55 @@ func (s *notificationContextStore) take(flowID string) *notificationContext {
 		return nil
 	}
 	return nc
+}
+
+// claim is the WMP counterpart of take: it marks notificationID of the context
+// of flowID as notified and returns a copy of the context to forward with, or nil
+// when there is none to use: the context is absent, expired, retained for
+// another principal, the id is not one the context knows or was already
+// notified, or a context that knows no id has accepted its maximum. The
+// reasons are not told apart. The context stays for the issuance's other ids
+// until its TTL; once its only known id is notified it is gone.
+func (s *notificationContextStore) claim(flowID, principal, notificationID string) *notificationContext {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nc, ok := s.ctx[flowID]
+	if !ok || time.Now().After(nc.expiresAt) || nc.principal == "" || nc.principal != principal || notificationID == "" {
+		return nil
+	}
+	if _, done := nc.notified[notificationID]; done {
+		return nil
+	}
+	if nc.notificationID != "" {
+		if nc.notificationID != notificationID {
+			return nil
+		}
+		delete(s.ctx, flowID) // its one id is used
+	} else {
+		if len(nc.notified) >= maxBlindNotificationIDs {
+			return nil
+		}
+		if nc.notified == nil {
+			nc.notified = make(map[string]struct{})
+		}
+		nc.notified[notificationID] = struct{}{}
+	}
+	used := *nc
+	used.notified = nil
+	return &used
+}
+
+// wmpEndpointFor is the notification endpoint of the live context of flowID, when
+// it was retained for a WMP principal, or "": what the WMP completion tells the
+// wallet to record.
+func (s *notificationContextStore) wmpEndpointFor(flowID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nc, ok := s.ctx[flowID]
+	if !ok || time.Now().After(nc.expiresAt) || nc.principal == "" {
+		return ""
+	}
+	return nc.endpoint
 }
 
 // hasValid reports whether a non-expired notification context exists for the
@@ -167,7 +233,7 @@ func sendNotification(ctx context.Context, httpClient *http.Client, nc *notifica
 		req.Header.Set("Content-Type", "application/json")
 		setNotificationAuthHeader(req, nc)
 		if nc.dpopSigner != nil && strings.EqualFold(nc.tokenType, "DPoP") {
-			proof, err := nc.dpopSigner.Proof(ctx, req.Method, nc.endpoint, nc.accessToken, dpopNonce)
+			proof, err := nc.dpopSigner.Proof(ctx, req.Method, dpopHTU(nc.endpoint), nc.accessToken, dpopNonce)
 			if err != nil {
 				return fmt.Errorf("failed to create DPoP proof for notification: %w", err)
 			}
@@ -202,6 +268,16 @@ func sendNotification(ctx context.Context, httpClient *http.Client, nc *notifica
 		return fmt.Errorf("notification endpoint returned status %d", resp.StatusCode)
 	}
 	return fmt.Errorf("notification request failed after DPoP nonce retry")
+}
+
+// dpopHTU is the htu of a DPoP proof for the request to endpoint: the endpoint
+// without query and fragment (RFC 9449 section 4.2); the request itself goes to
+// the full endpoint. WMP OpenID4x 3.4.3 has the wallet sign exactly this.
+func dpopHTU(endpoint string) string {
+	if htu, err := openid4x.NotificationHTU(endpoint); err == nil {
+		return htu
+	}
+	return endpoint
 }
 
 // setNotificationAuthHeader sets the Authorization header using the DPoP scheme

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -196,4 +197,119 @@ func TestConsent_SameDecisionOnBothWires(t *testing.T) {
 			assert.Equal(t, wsIDs, wmpIDs)
 		})
 	}
+}
+
+// A malformed selection after a valid one was handed over cannot be consumed as
+// a decline, even though the flow still reports the selection step: it ends the
+// flow, which does not run on to sign.
+func TestWMPBridge_MalformedSelectionAfterAConsent(t *testing.T) {
+	e := newWMPEnv(t)
+	ranOn := make(chan bool, 1)
+	registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
+		f.mu.Lock()
+		f.State = StepCredentialSelection // what BaseHandler.Progress records
+		f.mu.Unlock()
+		_ = f.Session.SendProgress(f.ID, StepCredentialSelection, nil)
+		if _, err := f.Session.WaitForAction(ctx, f.ID, ActionConsent); err != nil {
+			return err
+		}
+		// Consumed, the sign request not registered yet: the window.
+		select {
+		case <-ctx.Done():
+			ranOn <- false
+			return ctx.Err()
+		case <-time.After(1500 * time.Millisecond):
+			ranOn <- true
+			return f.Session.SendFlowComplete(f.ID, nil, "")
+		}
+	})
+	tok := e.token("alice", "t1", "ir", "j1")
+	sid := e.create(tok, "oid4vp")
+	st, _ := e.openStream(tok, sid, "")
+	require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
+	st.nextMethod(t, wmp.MethodFlowProgress)
+
+	good := map[string]any{"consent": true, "selections": []any{map[string]any{"query_id": "q", "selection_handle": testHandle}}}
+	assert.Equal(t, 0, e.post(tok, sid, req(wmp.MethodFlowAction, map[string]any{"wmp": meta(sid), "flow_id": "f1", "action": "select_credentials", "params": good})).code())
+	bad := map[string]any{"consent": true, "selections": []any{map[string]any{"query_id": "q", "selection_handle": testHandle, "credential_id": "c"}}}
+	assert.Equal(t, wmp.ErrInvalidParams, e.post(tok, sid, req(wmp.MethodFlowAction, map[string]any{"wmp": meta(sid), "flow_id": "f1", "action": "select_credentials", "params": bad})).code())
+	ev := st.nextMethod(t, wmp.MethodFlowError)
+	assert.EqualValues(t, wmp.ErrInvalidParams, params(ev)["code"])
+	assert.False(t, <-ranOn, "the flow was stopped, not left to sign and complete")
+}
+
+// A second valid selection is not queued for a flow that already has one.
+func TestWMPBridge_SecondSelectionIsRefused(t *testing.T) {
+	e := newWMPEnv(t)
+	registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
+		_ = f.Session.SendProgress(f.ID, StepCredentialSelection, nil)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	tok := e.token("alice", "t1", "ir", "j1")
+	sid := e.create(tok, "oid4vp")
+	require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
+	waitFlows(t, e, sid, 1)
+	do := func() int {
+		return e.post(tok, sid, req(wmp.MethodFlowAction, map[string]any{"wmp": meta(sid), "flow_id": "f1", "action": "select_credentials",
+			"params": map[string]any{"consent": true, "selections": []any{map[string]any{"query_id": "q", "selection_handle": testHandle}}}})).code()
+	}
+	assert.Equal(t, 0, do())
+	assert.Equal(t, wmp.ErrFlowError, do())
+}
+
+// A repeated malformed selection while the verifier is being told must not cut
+// that refusal short: the first one is carried out.
+func TestWMPBridge_RepeatedMalformedSelectionLeavesTheRefusalRunning(t *testing.T) {
+	hit := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	doRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	delivered := make(chan bool, 1)
+	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hit <- struct{}{}
+		<-release
+		delivered <- r.Context().Err() == nil
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer verifier.Close()
+	defer doRelease() // a failing test must not leave the handler blocked
+
+	e := newWMPEnv(t)
+	registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
+		h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop(), Flow: f}, httpClient: verifier.Client()}
+		authReq := &AuthorizationRequest{ClientID: "https://v", ResponseMode: ResponseModeDirectPost, ResponseURI: verifier.URL, State: "st", Nonce: "n"}
+		f.mu.Lock()
+		f.State = StepCredentialSelection
+		f.mu.Unlock()
+		_, err := h.requestVPSignature(ctx, authReq, decisionOf(ConsentSelection{CredentialQueryID: "q1"}), "https://v")
+		h.failSign(ctx, authReq, err)
+		return err
+	})
+	tok := e.token("alice", "t1", "ir", "j1")
+	sid := e.create(tok, "oid4vp")
+	st, _ := e.openStream(tok, sid, "")
+	require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
+	st.nextMethod(t, wmp.MethodFlowStart) // the sign sub-flow is pending
+
+	bad := req(wmp.MethodFlowAction, map[string]any{"wmp": meta(sid), "flow_id": "f1", "action": "select_credentials",
+		"params": map[string]any{"consent": true, "selections": []any{map[string]any{"query_id": "q1", "selection_handle": testHandle, "credential_id": "c"}}}})
+	assert.Equal(t, wmp.ErrInvalidParams, e.post(tok, sid, bad).code())
+	<-hit // the sign request is gone, the verifier is being told
+	assert.Equal(t, wmp.ErrInvalidParams, e.post(tok, sid, bad).code())
+	select {
+	case ev := <-st.events:
+		t.Fatalf("the flow ended before the verifier was told: %s", ev.Raw)
+	case <-time.After(300 * time.Millisecond):
+	}
+	doRelease()
+	select {
+	case ok := <-delivered:
+		assert.True(t, ok, "the verifier's notification was not cancelled")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the verifier was not told")
+	}
+	ev := st.nextMethod(t, wmp.MethodFlowError)
+	assert.EqualValues(t, wmp.ErrInvalidParams, params(ev)["code"])
 }

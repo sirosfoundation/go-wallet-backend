@@ -164,6 +164,8 @@ github.com/sirosfoundation/go-wmp v0.12.0 h1:SW7Fxv9MeTCgjVUkviu+m7OwN5Sl3tptLw2
 github.com/sirosfoundation/go-wmp v0.12.0/go.mod h1:GGKr5tveqkn4tv4tcVTQe3CZ2DfOYGPyYZO/9YxCKSk=
 github.com/sirosfoundation/go-wmp v0.12.1 h1:HBc5F/h0a+zTnA0+TjcseOE5jnA6mbSU5FC26p+X8ZM=
 github.com/sirosfoundation/go-wmp v0.12.1/go.mod h1:GGKr5tveqkn4tv4tcVTQe3CZ2DfOYGPyYZO/9YxCKSk=
+github.com/sirosfoundation/go-wmp v0.13.0 h1:dv21DSdHJnI2QEE2UqegcFJVMx2cE+V2NdkkrZpfPwk=
+github.com/sirosfoundation/go-wmp v0.13.0/go.mod h1:GGKr5tveqkn4tv4tcVTQe3CZ2DfOYGPyYZO/9YxCKSk=
 github.com/sirosfoundation/virtualwebauthn v0.0.0-20260701135251-caac157287c5 h1:1UkTjkgj6NSA04SogK6tvfvlMZVT7vkdfWsJurwe69Q=
 github.com/sirosfoundation/virtualwebauthn v0.0.0-20260701135251-caac157287c5/go.mod h1:gAxbvM0HnnY4c3aNYo6Za97nPpGSbqLfjUtxJ8qNGjs=
 github.com/sirupsen/logrus v1.10.2 h1:G2SED73/qrAu6YwbdxOD6peLkCBI3z7L+ykJFTXJBBo=
