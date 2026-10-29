@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -996,6 +997,16 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	h.SetData("offer", offer)
 	h.SetData("credential_issuer", offer.CredentialIssuer)
 
+	// authorization_details name what the wallet asks the AS to grant. They may
+	// only name configurations the offer names: those are the ones the issuer
+	// entitlement check covers, so anything else would reach the AS unchecked.
+	for _, detail := range msg.AuthorizationDetails {
+		if detail.CredentialConfigurationID != "" && !slices.Contains(offer.CredentialConfigurationIDs, detail.CredentialConfigurationID) {
+			_ = h.Error(StepParsingOffer, ErrCodeInvalidMessage, "authorization_details name a credential configuration the offer does not")
+			return errors.New("authorization_details name a credential configuration outside the offer")
+		}
+	}
+
 	// Step 2: Fetch issuer metadata
 	metaResult, err := h.fetchMetadata(ctx, offer.CredentialIssuer)
 	if err != nil {
@@ -1890,7 +1901,15 @@ func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *Cr
 		return "", nil, err
 	}
 
+	// Only what the offer named, which is what the issuer entitlement check
+	// covered. metadata.CredentialConfigurationsSupported lists everything the
+	// issuer supports, and a configuration outside the offer was never checked
+	// for registration; this is the one place a selection is accepted, for
+	// every transport.
 	config, ok := metadata.CredentialConfigurationsSupported[selection.CredentialConfigurationID]
+	if ok && !slices.Contains(offer.CredentialConfigurationIDs, selection.CredentialConfigurationID) {
+		ok = false
+	}
 	if !ok {
 		_ = h.Error(StepAwaitingSelection, ErrCodeInvalidMessage, "Invalid credential configuration")
 		return "", nil, errors.New("invalid credential configuration")
