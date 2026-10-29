@@ -234,6 +234,19 @@ func (a *WMPAdapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.ServeAuthenticated(w, r, p)
 }
 
+// wmpRoute is the part of a JSON-RPC message go-wmp routes on: the sessions it
+// names in the params.
+type wmpRoute struct {
+	Params struct {
+		WMP       wmpSessionRef `json:"wmp"`
+		SessionID string        `json:"session_id"`
+	} `json:"params"`
+}
+
+type wmpSessionRef struct {
+	SessionID string `json:"session_id"`
+}
+
 // maxWMPBody bounds the POST body read to tell a response from a request.
 const maxWMPBody = 1 << 20
 
@@ -272,14 +285,7 @@ func (a *WMPAdapter) ServeAuthenticated(w http.ResponseWriter, r *http.Request, 
 		if err != nil || msg.IsResponse() {
 			// The sources go-wmp routes on: the header and the session named in
 			// the params (a response has none of its own).
-			var named struct {
-				Params struct {
-					WMP struct {
-						SessionID string `json:"session_id"`
-					} `json:"wmp"`
-					SessionID string `json:"session_id"`
-				} `json:"params"`
-			}
+			var named wmpRoute
 			_ = json.Unmarshal(body, &named)
 			ids = append(ids, named.Params.WMP.SessionID, named.Params.SessionID)
 		} else {

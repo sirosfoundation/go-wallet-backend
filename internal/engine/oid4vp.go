@@ -1804,10 +1804,10 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 		h.Logger.Info("user declined presentation", zap.String("reason", decline.Reason))
 		redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)
 		if redirectURI != "" {
-			_ = h.ErrorWithDetails(StepCredentialSelection, ErrCodePresentationError, "User declined the request",
+			_ = h.ErrorWithDetails(StepCredentialSelection, ErrCodePresentationError, userDeclinedMessage,
 				map[string]interface{}{"redirect_uri": redirectURI})
 		} else {
-			_ = h.Error(StepCredentialSelection, ErrCodePresentationError, "User declined the request")
+			_ = h.Error(StepCredentialSelection, ErrCodePresentationError, userDeclinedMessage)
 		}
 		return nil, errors.New("user declined presentation")
 	}
@@ -1885,6 +1885,10 @@ func (h *OID4VPHandler) waitForSelectionActionUntil(ctx context.Context, authReq
 		return nil, h.failNoMatchingCredential(ctx, authReq, matched.NoMatchReason)
 	}
 }
+
+// userDeclinedMessage is the client-facing text of a flow error for a refusal:
+// the user declined at consent, or the wallet refused to sign.
+const userDeclinedMessage = "User declined the request"
 
 // verifierRefusedDescription is the error_description every refusal sends to
 // the verifier, whether the user declined, the wallet held nothing that
@@ -2142,11 +2146,11 @@ func (h *OID4VPHandler) failSign(ctx context.Context, authReq *AuthorizationRequ
 func (h *OID4VPHandler) failSignRefused(ctx context.Context, authReq *AuthorizationRequest) {
 	h.Logger.Info("client refused to sign the presentation")
 	if redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription); redirectURI != "" {
-		_ = h.ErrorWithDetails(StepSubmittingResponse, ErrCodePresentationError, "User declined the request",
+		_ = h.ErrorWithDetails(StepSubmittingResponse, ErrCodePresentationError, userDeclinedMessage,
 			map[string]interface{}{"redirect_uri": redirectURI})
 		return
 	}
-	_ = h.Error(StepSubmittingResponse, ErrCodePresentationError, "User declined the request")
+	_ = h.Error(StepSubmittingResponse, ErrCodePresentationError, userDeclinedMessage)
 }
 
 // minResponseEncryptionRSABits is the smallest RSA modulus accepted for a
