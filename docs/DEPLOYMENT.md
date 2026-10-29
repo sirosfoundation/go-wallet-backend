@@ -272,6 +272,45 @@ own, after which the fallback finds nothing. Sessions still written by old
 replicas during the rollout stay covered for the same window; complete the
 rollout within it and no migration step is needed.
 
+### WMP session affinity
+
+The engine serves WMP over HTTP+SSE (`POST` and `GET` `/api/v2/wallet/rpc`,
+`GET /api/v2/wallet/rpc/events`; discovery at `/.well-known/wmp-configuration`).
+Session handling is go-wmp's (`wmp.SessionService`, `httpsse.NewSecuredServerHandler`);
+what it keeps, it keeps in the memory of the replica that created the session:
+
+- the stored WMP session, its owner and its resumption token;
+- the per-session event log that `Last-Event-ID` replay reads, and the state go-wmp
+  re-sends on `wmp.session.resume`;
+- the engine session and the flows that run in it (they do not survive a replica
+  change in any case).
+
+With more than one engine replica the load balancer MUST therefore keep each client
+on one replica. Every WMP request (`wmp.session.create`, every `POST`, the event
+stream) carries the `Authorization: Bearer` header, so key affinity on a hash of
+that header; `Wmp-Session-Id` and the `session_id` query parameter are present on
+every request except `wmp.session.create`. A request that reaches another replica
+is answered `-31000` (session not found; an unknown session and another user's are
+indistinguishable by design) and the client has to create a new session.
+
+Limits of header affinity: a refreshed token hashes differently and may land on
+another replica, which has neither the session nor its resumption token, so the
+client must create a new session after a token refresh unless the balancer keys on
+`Wmp-Session-Id`. A replica that is restarted or drained (`SIGTERM` ends the
+event streams and the sessions) loses its sessions the same way.
+
+Everything else is spelled out by the protocol, not by deployment:
+
+- A client that falls behind the replay window gets `410 Gone` on the event stream
+  and resumes with `wmp.session.resume`; it then re-reads the state of its flows.
+- `refresh_token`, `dpop_jwk` and `dpop_key_id` of a completed issuance are in the
+  live event only; a replayed completion lists them in `redacted_members`.
+- The Redis session store described above is the WebSocket engine's. It does
+  not hold WMP sessions. Shared WMP
+  session state needs a Redis `SessionStore` and `EventLog` for go-wmp, which is
+  planned as a separate go-wmp module, and engine flows that survive a replica
+  change; until then affinity is required.
+
 ### Horizontal Pod Autoscaler
 
 Create `k8s/hpa.yaml`:
