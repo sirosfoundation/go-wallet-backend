@@ -160,8 +160,6 @@ github.com/sirosfoundation/go-trust v0.26.0 h1:hZcii002VP15g9JevqYCzZrGf6Kpipo7Y
 github.com/sirosfoundation/go-trust v0.26.0/go.mod h1:/bfPbXR7fnNM4lBRYmWQRgqHutGfX6wuRlsj1CeB0eg=
 github.com/sirosfoundation/go-ts11client v0.0.0-20260820233304-8809951d6f67 h1:eJT3WaDRt6dPJMuob9cNDREkEaKCKVCPkIgQMP2ISos=
 github.com/sirosfoundation/go-ts11client v0.0.0-20260820233304-8809951d6f67/go.mod h1:orKb1BE+vDIHbSYAl6dGpDWHs7poqSTKvQyF5F/2PmA=
-github.com/sirosfoundation/go-wmp v0.9.1 h1:AMYva5E+TrVIzzjeP1kOMsi47Ejh0XeCnElBd3GYOLg=
-github.com/sirosfoundation/go-wmp v0.9.1/go.mod h1:GGKr5tveqkn4tv4tcVTQe3CZ2DfOYGPyYZO/9YxCKSk=
 github.com/sirosfoundation/go-wmp v0.12.0 h1:SW7Fxv9MeTCgjVUkviu+m7OwN5Sl3tptLw2578fTqy8=
 github.com/sirosfoundation/go-wmp v0.12.0/go.mod h1:GGKr5tveqkn4tv4tcVTQe3CZ2DfOYGPyYZO/9YxCKSk=
 github.com/sirosfoundation/virtualwebauthn v0.0.0-20260701135251-caac157287c5 h1:1UkTjkgj6NSA04SogK6tvfvlMZVT7vkdfWsJurwe69Q=

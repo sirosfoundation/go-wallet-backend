@@ -36,6 +36,7 @@ var roleCapabilities = map[string][]string{
 	},
 	"engine": {
 		"websocket", // WebSocket v2 protocol at /api/v2/wallet
+		"wmp",       // WMP over HTTP+SSE at /api/v2/wallet/rpc (POST JSON-RPC, GET event stream)
 	},
 	"auth": {
 		"webauthn",       // WebAuthn registration/authentication

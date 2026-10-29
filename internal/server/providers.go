@@ -363,6 +363,7 @@ type EngineProvider struct {
 	// is a restatement of the rule rather than a check of it.
 	metadataResolver *issuermetadata.Resolver
 	manager          *wsengine.Manager
+	wmpAdapter       *wsengine.WMPAdapter
 }
 
 // NewEngineProvider creates a new WebSocket engine route provider.
@@ -420,11 +421,15 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 	manager.RegisterFlowHandler(wsengine.ProtocolOID4VP, wsengine.NewOID4VPHandler)
 	manager.RegisterFlowHandler(wsengine.ProtocolVCTM, wsengine.NewVCTMHandler)
 
+	wmpAdapter := wsengine.NewWMPAdapter(manager, logger, middleware.ExtractBearerToken)
+	configureWMPExternalURL(wmpAdapter, cfg, logger)
+
 	return &EngineProvider{
 		cfg:              cfg,
 		logger:           logger,
 		metadataResolver: metadataResolver,
 		manager:          manager,
+		wmpAdapter:       wmpAdapter,
 	}, nil
 }
 
@@ -518,10 +523,36 @@ func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
 	router.GET("/api/v2/wallet", func(c *gin.Context) {
 		p.manager.HandleConnection(c.Writer, c.Request)
 	})
+
+	// WMP: go-wmp's secured HTTP+SSE handler authenticates each request with the
+	// engine's bearer token and serves POST (JSON-RPC) and GET (event stream)
+	// on one path. WMP session state is process-local (see docs/DEPLOYMENT.md,
+	// "WMP session affinity").
+	wmpHandler := func(c *gin.Context) { p.wmpAdapter.ServeHTTP(c.Writer, c.Request) }
+	router.POST(wsengine.WMPRPCPath, wmpHandler)
+	router.GET(wsengine.WMPRPCPath, wmpHandler)
+	// The event stream at the URL go-wmp's client derives (rpc endpoint + "/events"),
+	// and at the alias.
+	router.GET(wsengine.WMPClientEventsPath, wmpHandler)
+	router.GET(wsengine.WMPEventsPath, wmpHandler)
+	// GET /.well-known/wmp-configuration: public discovery, no auth (needed before a token exists).
+	router.GET("/.well-known/wmp-configuration", func(c *gin.Context) {
+		p.wmpAdapter.HandleWMPConfiguration(c.Writer, c.Request)
+	})
+}
+
+// CloseWMP drains the WMP adapter and ends its sessions, bounded by ctx. It is
+// the first shutdown step: listeners are still up, and http.Server.Shutdown
+// does not end event streams.
+func (p *EngineProvider) CloseWMP(ctx context.Context) {
+	if p.wmpAdapter != nil {
+		p.wmpAdapter.CloseContext(ctx)
+	}
 }
 
 // Close shuts down the engine manager
 func (p *EngineProvider) Close() {
+	p.CloseWMP(context.Background())
 	if p.manager != nil {
 		p.manager.Close()
 	}
@@ -1342,6 +1373,21 @@ func (p *WalletProviderProvider) Close() error {
 // Returns nil if audit is not enabled (audit is then a no-op).
 func newAuditEmitter(cfg *config.Config, logger *zap.Logger) *audit.Emitter {
 	return audit.NewFromConfig(cfg, logger)
+}
+
+// configureWMPExternalURL sets the WMP discovery base URL from
+// server.external_urls.engine_url (ws/wss mapped to https by SetExternalURL). The WMP
+// routes are on the engine port only, so as.external_url is deliberately not a
+// fallback. Unset or invalid leaves discovery failing closed (503).
+func configureWMPExternalURL(adapter *wsengine.WMPAdapter, cfg *config.Config, logger *zap.Logger) {
+	engineURL := cfg.Server.ExternalURLs.EngineURL
+	if engineURL == "" {
+		logger.Warn("server.external_urls.engine_url is not set; /.well-known/wmp-configuration will return 503")
+		return
+	}
+	if err := adapter.SetExternalURL(engineURL); err != nil {
+		logger.Warn("server.external_urls.engine_url is not usable for WMP discovery; /.well-known/wmp-configuration will return 503", zap.Error(err))
+	}
 }
 
 // asJWKSURL returns <as.external_url>/auth/.well-known/jwks.json. The AS is
