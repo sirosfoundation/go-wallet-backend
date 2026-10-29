@@ -917,3 +917,15 @@ func TestNotificationContextStore_HasValidReadsTheConsumptionRecord(t *testing.T
 	assert.Nil(t, s.takeForNotification("f1", "id-a"))
 	assert.NotNil(t, s.takeForNotification("f1", "id-b"))
 }
+
+// An id longer than the profile's bound is refused by both entry points and never
+// recorded, so a context that knows no id cannot be made to hold 256 huge ones.
+func TestNotificationContextStore_OverlongIDIsNeverRecorded(t *testing.T) {
+	s := newNotificationContextStore()
+	s.put("f1", &notificationContext{endpoint: "https://i/n", principal: "p"})
+	long := strings.Repeat("x", openid4x.MaxNotificationIDLen+1)
+	assert.Nil(t, s.claim("f1", "p", long))
+	assert.Nil(t, s.takeForNotification("f1", long))
+	assert.Empty(t, s.ctx["f1"].notified, "nothing recorded")
+	assert.NotNil(t, s.claim("f1", "p", strings.Repeat("x", openid4x.MaxNotificationIDLen)), "the bound itself is fine")
+}

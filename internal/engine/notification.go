@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp/openid4x"
 	"go.uber.org/zap"
@@ -141,7 +142,9 @@ func (s *notificationContextStore) claim(flowID, principal, notificationID strin
 // maximum. It is the one consumption record both notification entry points
 // (the flow and the legacy method) use. Caller must hold s.mu.
 func (s *notificationContextStore) useLocked(flowID string, nc *notificationContext, notificationID string) *notificationContext {
-	if time.Now().After(nc.expiresAt) || notificationID == "" {
+	if time.Now().After(nc.expiresAt) || notificationID == "" || utf8.RuneCountInString(notificationID) > openid4x.MaxNotificationIDLen {
+		// An id beyond the profile's bound is never recorded: a context that
+		// knows no id would otherwise hold up to 256 of them, however long.
 		return nil
 	}
 	if _, done := nc.notified[notificationID]; done {
