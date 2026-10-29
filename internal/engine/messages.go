@@ -531,6 +531,10 @@ type SignRequestParams struct {
 	// Defaults to 1 when absent.
 	Count                int             `json:"count,omitempty"`
 	CredentialsToInclude []CredentialRef `json:"credentials_to_include,omitempty"`
+	// SelectionHandle is the handle of the consent CredentialsToInclude comes
+	// from, relayed unchanged to a client that gave one (WMP select_credentials,
+	// OpenID4x 3.2.5). Empty over WebSocket.
+	SelectionHandle string `json:"selection_handle,omitempty"`
 	// ResponseURI is the verifier's response endpoint, needed for mdoc session transcript.
 	ResponseURI string `json:"response_uri,omitempty"`
 	// VerifierJwkThumbprint is the base64url-encoded JWK SHA-256 thumbprint of the

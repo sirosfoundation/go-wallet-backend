@@ -34,6 +34,9 @@ import (
 type OID4VPHandler struct {
 	BaseHandler
 	httpClient *http.Client
+	// selectionHandle is the handle of the consent being signed (see
+	// ConsentPayload.SelectionHandle).
+	selectionHandle string
 }
 
 // NewOID4VPHandler creates a new OID4VP flow handler
@@ -220,6 +223,10 @@ type CredentialsMatchedPayload struct {
 // ConsentPayload is the payload for consent action
 type ConsentPayload struct {
 	SelectedCredentials []ConsentSelection `json:"selected_credentials"`
+	// SelectionHandle is the opaque handle of a WMP select_credentials action
+	// (OpenID4x 3.2.3.1); the engine hands it back unchanged in the
+	// sign_presentation that follows (3.2.5). Empty on the WebSocket path.
+	SelectionHandle string `json:"selection_handle,omitempty"`
 }
 
 // Execute runs the OID4VP flow
@@ -1829,6 +1836,7 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 		return nil, err
 	}
 
+	h.selectionHandle = payload.SelectionHandle
 	return payload.SelectedCredentials, nil
 }
 
@@ -2011,6 +2019,7 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 		Audience:              audience,
 		Nonce:                 authReq.Nonce,
 		CredentialsToInclude:  credRefs,
+		SelectionHandle:       h.selectionHandle,
 		ResponseURI:           responseURI,
 		VerifierJwkThumbprint: verifierJwkThumbprint,
 		VerifierSessionID:     authReq.VerifierSessionID,
