@@ -1288,7 +1288,7 @@ func (h *OID4VCIHandler) registerNotificationContext(ctx context.Context, metada
 	if h.Flow == nil || h.Flow.Session == nil || h.Flow.Session.notifications == nil {
 		return
 	}
-	principal, retain := h.Flow.Session.notificationBinding(ctx)
+	principal, retain := h.Flow.Session.bindNotification(ctx)
 	if !retain {
 		return
 	}
