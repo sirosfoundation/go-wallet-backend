@@ -2,7 +2,7 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 	"go.uber.org/zap"
@@ -56,9 +56,15 @@ func (h *wmpHandler) CredentialNotification(_ context.Context, params *wmp.Crede
 	})
 }
 
-// Resolve answers wmp.resolve for vctm (Core 5.8, OpenID4x 2): the type
-// metadata of a vct, looked up as the VCTM flow does. Every other type is
-// unsupported (-31005).
+// Resolve answers wmp.resolve for vctm (Core 5.8.1, OpenID4x 2): the type
+// metadata of a vct, looked up as the VCTM flow does, as the six members the
+// resolution carries (go-wmp's ProjectVCTM). A lookup that finds no document,
+// cannot reach one or finds one that is not an object is the -32603 error
+// {"reason": "metadata_fetch_error"}, carrying nothing of the failure; null
+// metadata is only for a lookup that knows the type is unknown (the registry
+// has no entry and the vct is not a URL). An empty uri is -32602; the egress
+// policy (loopback, private, non-HTTPS refused) is that of the lookup's HTTP
+// client. Every other type is unsupported (-31005).
 func (h *wmpHandler) Resolve(ctx context.Context, params *wmp.ResolveParams) (*wmp.ResolveResult, error) {
 	sess := wmp.SessionFromContext(ctx)
 	if params.Type != wmp.ResolveTypeVCTM {
@@ -66,6 +72,9 @@ func (h *wmpHandler) Resolve(ctx context.Context, params *wmp.ResolveParams) (*w
 	}
 	if sess == nil || !sess.HasCapability("resolve") {
 		return nil, wmp.NewUnsupportedError("resolve", nil)
+	}
+	if err := wmp.ValidateVCTMResolveParams(params); err != nil {
+		return nil, err
 	}
 	h.a.manager.handlersMu.RLock()
 	factory, ok := h.a.manager.flowHandlers[ProtocolVCTM]
@@ -82,15 +91,18 @@ func (h *wmpHandler) Resolve(ctx context.Context, params *wmp.ResolveParams) (*w
 	if !ok {
 		return nil, wmp.NewUnsupportedError(params.Type, nil)
 	}
-	metadata, err := vctm.lookupVCT(ctx, params.URI)
+	doc, err := vctm.lookupVCTDocument(ctx, params.URI)
+	if errors.Is(err, errVCTMUnknown) {
+		return wmp.NewUnknownResolveResult(sess.ID, params.Type, params.URI), nil
+	}
 	if err != nil {
-		// Core 5.8: not found is a null metadata, not an error.
 		h.a.logger.Debug("WMP resolve vctm failed", zap.Error(err))
-		return &wmp.ResolveResult{WMP: wmp.Metadata{Version: wmp.Version, SessionID: sess.ID}, Type: params.Type, URI: params.URI, Metadata: json.RawMessage("null")}, nil
+		return nil, wmp.NewMetadataFetchError()
 	}
-	body, err := json.Marshal(metadata)
+	res, err := wmp.NewVCTMResolveResult(sess.ID, params.URI, doc)
 	if err != nil {
-		return nil, wmp.NewRPCError(wmp.ErrInternalError, nil)
+		h.a.logger.Debug("WMP resolve vctm: document cannot be carried", zap.Error(err))
+		return nil, wmp.NewMetadataFetchError()
 	}
-	return &wmp.ResolveResult{WMP: wmp.Metadata{Version: wmp.Version, SessionID: sess.ID}, Type: params.Type, URI: params.URI, Metadata: body}, nil
+	return res, nil
 }

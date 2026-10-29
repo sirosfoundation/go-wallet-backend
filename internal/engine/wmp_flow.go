@@ -55,6 +55,9 @@ func newWMPFlowProfile(a *WMPAdapter, sessionID string) *wmpFlowProfile {
 			p.Handle(flowType, p.run(protocol))
 		}
 	}
+	if _, ok := a.manager.flowHandlers[ProtocolOID4VCI]; ok {
+		p.Handle(openid4x.FlowTypeCredentialNotification, p.runNotification())
+	}
 	return p
 }
 
@@ -66,6 +69,10 @@ func (p *wmpFlowProfile) Init(pc wmp.PeerContext) error {
 	}
 	if mw, ok := pc.(interface{ UseMiddleware(wmp.Middleware) }); ok {
 		mw.UseMiddleware(p.guard.middleware)
+		// A credential_notification start the session did not negotiate is -31005
+		// and invalid params are -32602, as the response to the start (an
+		// AsyncFlowProfile does not consult RequiredCapability).
+		mw.UseMiddleware(openid4x.NotificationStartMiddleware(notificationEvents))
 	}
 	if ws := p.a.session(p.sessionID); ws != nil {
 		ws.tr.setPeer(pc)
@@ -78,6 +85,9 @@ func (p *wmpFlowProfile) Init(pc wmp.PeerContext) error {
 func (p *wmpFlowProfile) RequiredCapability(flowType string) string {
 	if _, ok := wmpFlowTypes[flowType]; ok {
 		return flowType
+	}
+	if flowType == openid4x.FlowTypeCredentialNotification {
+		return openid4x.CapabilityCredentialNotification
 	}
 	return ""
 }
@@ -448,6 +458,20 @@ func (t *wmpTransport) add(id string, f *wmpFlow) {
 	t.mu.Unlock()
 }
 
+// addIfAbsent registers f under id unless a flow of the session already has it.
+func (t *wmpTransport) addIfAbsent(id string, f *wmpFlow) bool {
+	if f.verdict == nil {
+		f.verdict = make(chan bool, 1)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if _, taken := t.flows[id]; taken {
+		return false
+	}
+	t.flows[id] = f
+	return true
+}
+
 func (t *wmpTransport) remove(id string) {
 	t.mu.Lock()
 	delete(t.flows, id)
@@ -464,6 +488,33 @@ func (t *wmpTransport) peerContext() wmp.PeerContext {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.peer
+}
+
+// notificationBinding implements notificationContextPolicy. The issuance context
+// is kept only when the session negotiated credential_notification (WMP
+// OpenID4x 2.4, 3.4: nothing is retained for a wallet that will not use it),
+// bound to the principal that ran the issuance. A flow without a principal in
+// its context retains nothing (fail closed).
+func (t *wmpTransport) notificationBinding(ctx context.Context) (string, bool) {
+	p, ok := wmp.PrincipalFromContext(ctx)
+	if !ok || p.Key() == "" {
+		return "", false
+	}
+	sess, found := t.a.svc.Store().Get(t.id)
+	if !found || sess.IsExpired() || !sess.HasCapability(openid4x.CapabilityCredentialNotification) {
+		return "", false
+	}
+	return p.Key(), true
+}
+
+// notificationEndpoint is the issuer's notification endpoint of the context the
+// engine retained for the issuance flow, or "".
+func (t *wmpTransport) notificationEndpoint(flowID string) string {
+	ws := t.a.session(t.id)
+	if ws == nil || ws.session.notifications == nil {
+		return ""
+	}
+	return ws.session.notifications.wmpEndpointFor(flowID)
 }
 
 // consentAwaited implements consentObserver.
@@ -525,7 +576,7 @@ func (t *wmpTransport) SendJSON(msg interface{}) error {
 		if !f.terminal.CompareAndSwap(false, true) {
 			return nil // the flow already ended (a malformed selection): one terminal message
 		}
-		result, err := completionResult(m)
+		result, err := completionResult(m, t.notificationEndpoint(m.FlowID))
 		if err != nil {
 			return err
 		}
@@ -590,16 +641,23 @@ func (t *wmpTransport) sendFlowError(m *FlowErrorMessage) error {
 		redirect, _ := m.Error.Details["redirect_uri"].(string)
 		data = openid4x.TransactionDataUnsupportedData(redirect)
 	}
-	if m.Error.Code == errCodeIssuerNotEntitled {
-		// -31020 with {issuer, issuer_entitlement}, bounded (see wmp_entitlement.go).
-		data = boundedErrorDetails(m.Error.Code, m.Error.Details)
-		code = codeIssuerNotEntitled
-		m.Error.Message = issuerNotEntitledMessage
-	} else if reason := trustRefusalReason(m.Error.Code); reason != "" {
-		// A trust-decision refusal carries its reason, next to any details.
-		merged := boundedErrorDetails(m.Error.Code, m.Error.Details)
-		merged["reason"] = reason
-		data = merged
+	switch m.Error.Code {
+	case errCodeIssuerNotEntitled:
+		// -31020 with go-wmp's typed {issuer, issuer_entitlement}, bounded by
+		// go-wmp (see wmp_entitlement.go). A refusal go-wmp does not accept as
+		// one (no issuer, a decision that is not a refusal) is a plain flow
+		// error with no data, never a made-up decision.
+		if d := notEntitledData(m.Error.Details); d != nil {
+			data, code, m.Error.Message = d, wmp.ErrIssuerNotEntitled, openid4x.IssuerNotEntitledMessage
+		} else {
+			t.a.logger.Warn("ISSUER_NOT_ENTITLED without a usable decision; ending the flow with a plain flow error")
+			data, code = nil, wmp.ErrFlowError
+		}
+	default:
+		// A trust-decision refusal carries its reason.
+		if d := untrustedRefusalData(m.Error.Code, m.Error.Details); d != nil {
+			data = d
+		}
 	}
 	if f := t.flow(m.FlowID); f != nil {
 		if !f.terminal.CompareAndSwap(false, true) {
@@ -858,7 +916,7 @@ func convertCredentialsToInclude(in []CredentialRef) []openid4x.CredentialQueryR
 func mapErrorCode(code ErrorCode) int {
 	switch code {
 	case errCodeIssuerNotEntitled:
-		return codeIssuerNotEntitled
+		return wmp.ErrIssuerNotEntitled
 	case ErrCodeAuthFailed, ErrCodeAuthorizationFail, ErrCodeForbidden:
 		return wmp.ErrNotAuthorized
 	case ErrCodeInvalidMessage:
@@ -955,6 +1013,10 @@ func (g *wmpGuard) protocolOf(method string, params json.RawMessage) (Protocol, 
 		return ProtocolOID4VCI, true
 	case wmp.MethodFlowStart:
 		_ = json.Unmarshal(params, &p)
+		if p.FlowType == openid4x.FlowTypeCredentialNotification {
+			// Authorized exactly as oid4vci (OpenID4x 3.4.2): never more broadly.
+			return ProtocolOID4VCI, true
+		}
 		protocol, ok := wmpFlowTypes[p.FlowType]
 		return protocol, ok
 	case wmp.MethodFlowAction, wmp.MethodFlowCancel, wmp.MethodFlowProgress, wmp.MethodFlowComplete, wmp.MethodFlowError:
@@ -994,6 +1056,11 @@ func (t *wmpTransport) parentProtocol(session *Session, id string) (Protocol, bo
 		for _, sub := range f.fc.PendingSubFlows() {
 			if sub.FlowID != id {
 				continue
+			}
+			if f.fc.FlowType == openid4x.FlowTypeCredentialNotification {
+				// A sign_client_auth sub-flow of a notification needs what the
+				// notification needs: the issuance permission.
+				return ProtocolOID4VCI, true
 			}
 			session.flowsMu.RLock()
 			parent := session.flows[f.fc.FlowID]

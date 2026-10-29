@@ -1247,7 +1247,7 @@ func (h *OID4VCIHandler) finishIssuance(ctx context.Context, resp *CredentialRes
 		return err
 	}
 	results := h.buildCredentialResults(ctx, resp, config, trust)
-	h.registerNotificationContext(metadata, token, resp)
+	h.registerNotificationContext(ctx, metadata, token, resp)
 	return h.Flow.Session.sendFlowComplete(h.Flow.ID, results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token), h.dpopKeyIDForRefreshToken(token), resp.Encrypted, displayMetadata(resp))
 }
 
@@ -1278,7 +1278,7 @@ func (h *OID4VCIHandler) dpopJWKForRefreshToken(token *TokenResponse) string {
 // whatever id the client then supplies in credential_notification (the client
 // read it from the decrypted response). The stored context is short-lived,
 // in-memory, and one-shot; no credential data is retained.
-func (h *OID4VCIHandler) registerNotificationContext(metadata *IssuerMetadata, token *TokenResponse, resp *CredentialResponse) {
+func (h *OID4VCIHandler) registerNotificationContext(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, resp *CredentialResponse) {
 	if metadata == nil || token == nil || resp == nil {
 		return
 	}
@@ -1286,6 +1286,10 @@ func (h *OID4VCIHandler) registerNotificationContext(metadata *IssuerMetadata, t
 		return
 	}
 	if h.Flow == nil || h.Flow.Session == nil || h.Flow.Session.notifications == nil {
+		return
+	}
+	principal, retain := h.Flow.Session.notificationBinding(ctx)
+	if !retain {
 		return
 	}
 	if resp.Encrypted {
@@ -1305,6 +1309,8 @@ func (h *OID4VCIHandler) registerNotificationContext(metadata *IssuerMetadata, t
 		dpopSigner:     h.dpopSigner(),
 		dpopNonce:      h.dpopNonce,
 		notificationID: resp.NotificationID,
+		issuer:         metadata.CredentialIssuer,
+		principal:      principal,
 	})
 }
 
@@ -2981,7 +2987,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			// reject what it decrypts (a seed that fails its checks) and then
 			// owes the issuer a credential_failure notification, so the
 			// notification context must exist before the client answers.
-			h.registerNotificationContext(metadata, token, &CredentialResponse{Encrypted: true})
+			h.registerNotificationContext(ctx, metadata, token, &CredentialResponse{Encrypted: true})
 			answer, relayErr := h.relayEncryptedResponse(ctx, string(body), false, respEnc)
 			if relayErr != nil {
 				// A malformed JWE, a client that could not decrypt or
@@ -3122,7 +3128,7 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 				// and the client may reject what it decrypts and then owes the
 				// issuer a credential_failure notification, so the context
 				// must exist before the client answers.
-				h.registerNotificationContext(metadata, token, &CredentialResponse{Encrypted: true})
+				h.registerNotificationContext(ctx, metadata, token, &CredentialResponse{Encrypted: true})
 				answer, err := h.relayEncryptedResponse(ctx, string(body), true, respEnc)
 				if err != nil {
 					return nil, err
