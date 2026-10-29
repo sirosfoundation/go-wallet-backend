@@ -300,8 +300,15 @@ func (s *Session) refuseSignRequests(flowID string) bool {
 			continue
 		}
 		if !p.answered.CompareAndSwap(false, true) {
+			if p.refused.Load() {
+				// Already refused by an earlier malformed action: that refusal is
+				// being carried out (the verifier is being told), not cut short.
+				refused = true
+				continue
+			}
 			return false // the wallet's result came first
 		}
+		p.refused.Store(true)
 		p.sign <- &SignResponseMessage{
 			Message:   Message{Type: TypeSignResponse, FlowID: flowID, MessageID: id},
 			ErrorCode: ErrCodeSignRefused,

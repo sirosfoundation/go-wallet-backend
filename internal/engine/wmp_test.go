@@ -1522,6 +1522,15 @@ func TestRefuseSignRequests(t *testing.T) {
 		assert.False(t, s.refuseSignRequests("f1"), "the wallet answered first: the caller ends the flow")
 		assert.Empty(t, reply, "no refusal is queued for a waiter that has gone")
 	})
+	t.Run("a second refusal leaves the first to finish", func(t *testing.T) {
+		s := newSession()
+		reply, done := s.trackSign("m1", "f1")
+		defer done()
+		assert.True(t, s.refuseSignRequests("f1"))
+		assert.True(t, s.refuseSignRequests("f1"), "a repeated malformed action must not cancel the flow before the verifier is told")
+		assert.Equal(t, ErrCodeSignRefused, (<-reply).ErrorCode)
+		assert.Empty(t, reply, "one refusal is delivered")
+	})
 	t.Run("no pending request", func(t *testing.T) {
 		assert.False(t, newSession().refuseSignRequests("f1"))
 	})

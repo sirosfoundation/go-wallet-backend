@@ -169,6 +169,9 @@ type pendingRequest struct {
 	// go through the same compare-and-swap, so which one came first is decided
 	// once, whether or not the waiter has taken it from the channel yet.
 	answered atomic.Bool
+	// refused records that the reply that won was the engine's own refusal (a
+	// second malformed action finds it and leaves the refusal to finish).
+	refused atomic.Bool
 }
 
 // trackRequest registers p under messageID until the returned func is called.
