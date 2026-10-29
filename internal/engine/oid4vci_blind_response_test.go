@@ -34,7 +34,7 @@ const (
 	secretTx    = "tx-opaque-1"
 )
 
-var blindSecrets = []string{secretCred1, secretCred2, secretNotif, secretSeedA, secretSeedB, "org.siros.secret_seed"}
+var blindSecrets = []string{secretCred1, secretCred2, secretNotif, secretSeedA, secretSeedB}
 
 // fakeClient plays the wallet client over the websocket the handler talks to:
 // it generates the response-encryption key, decrypts relayed JWEs and answers
@@ -55,6 +55,10 @@ type fakeClient struct {
 	errorOnProof bool                                        // generate_proof answers error
 	decryptErr   bool                                        // decrypt answers error (with the plaintext in the text)
 	reply        func(pt []byte) (SignResponseMessage, bool) // override the decrypt answer
+	// proofMaker overrides the proof JWT the client returns for proof i; by
+	// default a request carrying auxiliary_data_to_issuer is answered with a
+	// proof holding a valid commitment for every advertised entry.
+	proofMaker func(i int, req *SignRequestMessage) string
 }
 
 func (c *fakeClient) setSession(s *Session) {
@@ -131,7 +135,14 @@ func (c *fakeClient) answerProof(req *SignRequestMessage, resp *SignResponseMess
 			n = 1
 		}
 		for i := 0; i < n; i++ {
-			resp.Proofs = append(resp.Proofs, ProofObject{ProofType: "jwt", JWT: fmt.Sprintf("proof-%d", i)})
+			jwt := fmt.Sprintf("proof-%d", i)
+			switch {
+			case c.proofMaker != nil:
+				jwt = c.proofMaker(i, req)
+			case len(req.Params.AuxiliaryDataToIssuer) > 0:
+				jwt = auxProofJWT(c.t, validAuxClaim(c.t, req.Params.AuxiliaryDataToIssuer, 0))
+			}
+			resp.Proofs = append(resp.Proofs, ProofObject{ProofType: "jwt", JWT: jwt})
 		}
 	}
 }
@@ -369,10 +380,11 @@ func gcmCfg(required bool) *CredentialResponseEncryptionConfig {
 }
 
 const seedResponse = `{"credentials":[{"credential":"` + secretCred1 + `"},{"credential":"` + secretCred2 + `"}],` +
-	`"notification_id":"` + secretNotif + `","credential_metadata":{"org.siros.secret_seed":{"ns":"` + secretSeedA + `"}}}`
+	`"notification_id":"` + secretNotif + `","credential_metadata":{"auxiliary_data":[{"type":"hash_commitment","alg":"sha-256",` +
+	`"path":["org.iso.18013.5.1","ssc"],"opening":"` + secretSeedA + `"}]}}`
 
 func seedConfig() *CredentialConfig {
-	c := seedCfg(advOK)
+	c := seedCfg()
 	c.Format = "vc+sd-jwt"
 	c.ProofTypesSupported = map[string]interface{}{"jwt": map[string]interface{}{}}
 	return c
@@ -775,7 +787,7 @@ func TestBlind_NoProofConfigStillGetsKey(t *testing.T) {
 	fc := &fakeClient{t: t}
 	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
-	cfg := seedCfg(advOK)
+	cfg := seedCfg()
 	cfg.Format = "vc+sd-jwt"
 	require.NoError(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", cfg, nil, ""))
 	assert.Equal(t, []SignAction{SignActionGenerateProof, SignActionDecryptCredentialResponse}, fc.actions())
@@ -1056,7 +1068,8 @@ func TestBlind_SeedRefusals(t *testing.T) {
 		fc := &fakeClient{t: t}
 		h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
 		defer cleanup()
-		cfg := seedCfg(`{"org.siros.secret_seed":{"ns":"` + secretSeedA + `"}}`)
+		cfg := seedCfg()
+		cfg.AuxiliaryDataSupported = json.RawMessage(`{"to_wallet":[{"type":"hash_commitment","alg":"sha-256","path":["a"],"opening":"` + secretSeedA + `"}]}`)
 		err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", cfg, nil, "")
 		require.Error(t, err)
 		assert.NotContains(t, err.Error(), secretSeedA)
@@ -1069,7 +1082,7 @@ func TestBlind_SeedRefusals(t *testing.T) {
 func TestBlind_SeedAdvertisementMakesEncryptionRequired(t *testing.T) {
 	h, _, cleanup := newBlindHandler(t, &fakeClient{t: t}, http.DefaultClient)
 	defer cleanup()
-	got, err := h.negotiateResponseEncryption(&IssuerMetadata{CredentialResponseEncryption: gcmCfg(false)}, seedCfg(advOK))
+	got, err := h.negotiateResponseEncryption(&IssuerMetadata{CredentialResponseEncryption: gcmCfg(false)}, seedCfg())
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	assert.True(t, got.Required)
@@ -1091,29 +1104,6 @@ func TestFlowComplete_PlainResponseUnchanged(t *testing.T) {
 	require.Len(t, creds, 2)
 	assert.Equal(t, "c0", creds[0].Credential)
 	assert.Equal(t, "n-1", creds[0].NotificationID)
-}
-
-// A plain response carrying the seed is refused, whatever else it carries.
-func TestPlainResponse_SeedRefused(t *testing.T) {
-	core, logs := observer.New(zap.DebugLevel)
-	h, ch, cleanup := captureHandler(t)
-	defer cleanup()
-	h.Logger = zap.New(core)
-	var resp CredentialResponse
-	body := `{"credentials":["c0"],"credential_metadata":{"display":[{"name":"D"}],"claims":[],"org.example.x":"EXT",` +
-		`"org.siros.secret_seed":{"ns":"` + secretSeedA + `"}}}`
-	require.NoError(t, json.Unmarshal([]byte(body), &resp))
-	err := h.finishIssuance(context.Background(), &resp, &CredentialConfig{Format: "x"}, nil, nil, &TokenResponse{})
-	require.Error(t, err)
-	assertNoSecrets(t, "error", err.Error())
-	m := nextMsg(t, ch)
-	assert.JSONEq(t, `"flow_error"`, string(m["type"]))
-	assertNoSecrets(t, "logs", logDump(logs))
-	select {
-	case extra := <-ch:
-		t.Fatalf("unexpected %s", extra["type"])
-	case <-time.After(100 * time.Millisecond):
-	}
 }
 
 // Plain response without a seed: only display and claims are relayed; every

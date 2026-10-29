@@ -126,10 +126,23 @@ const (
 	ErrCodeUnsupportedTransactionData ErrorCode = "UNSUPPORTED_TRANSACTION_DATA"
 	ErrCodeInternalError              ErrorCode = "INTERNAL_ERROR"
 	ErrCodeTooManyRequests            ErrorCode = "TOO_MANY_REQUESTS"
-	// ErrCodePSCConflict: the issuer already holds a different holder
-	// commitment (psc) for this subject. The message is the issuer's own text
-	// and tells the user what to do (operator-approved reset).
-	ErrCodePSCConflict ErrorCode = "PSC_CONFLICT"
+	// ErrCodeAuxiliaryDataUnsupported: the credential configuration needs
+	// auxiliary data this wallet cannot handle (a to_wallet entry with an alg
+	// or encoding Auxiliary Data v0.1 does not define, or a required to_issuer
+	// entry the wallet cannot send). Refused before any authorization or
+	// request.
+	ErrCodeAuxiliaryDataUnsupported ErrorCode = "AUXILIARY_DATA_UNSUPPORTED"
+	// ErrCodeAuxiliaryDataConflict: the issuer rejected the credential request
+	// with the OpenID4VCI Credential Auxiliary Data error code
+	// auxiliary_data_conflict (an entry conflicts with a value it holds for
+	// the subject; retrying never helps, the issuer resolves it out of band).
+	// The flow_error details carry the issuer's code unchanged under "error";
+	// no other issuer text is relayed.
+	ErrCodeAuxiliaryDataConflict ErrorCode = "AUXILIARY_DATA_CONFLICT"
+	// ErrCodeAuxiliaryDataProofInvalid: a key proof the client returned carries
+	// an opening (a secret) or cannot be inspected for one. Nothing was sent to
+	// the issuer. Whether the entries are acceptable is the issuer's to decide.
+	ErrCodeAuxiliaryDataProofInvalid ErrorCode = "AUXILIARY_DATA_PROOF_INVALID"
 )
 
 // UserFacingMessage returns a generic user-facing message for an error code.
@@ -184,8 +197,12 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "Internal server error"
 	case ErrCodeTooManyRequests:
 		return "Too many requests"
-	case ErrCodePSCConflict:
-		return "The issuer holds a different holder commitment for you"
+	case ErrCodeAuxiliaryDataProofInvalid:
+		return "The wallet's key proof carries auxiliary data that cannot be sent to the issuer"
+	case ErrCodeAuxiliaryDataConflict:
+		return "The issuer holds a conflicting value for you; it must be resolved with the issuer"
+	case ErrCodeAuxiliaryDataUnsupported:
+		return "The issuer needs auxiliary data that this wallet does not support"
 	default:
 		return "An error occurred"
 	}
@@ -458,9 +475,9 @@ type FlowCompleteMessage struct {
 	// CredentialMetadata is set only for a PLAIN (unencrypted) issuer
 	// response: the display members (see displayMetadataMembers) of its
 	// response-level credential_metadata, applying to every credential in
-	// Credentials. Every other member, in particular the namespaced
-	// org.siros.secret_seed, is dropped by the engine and never relayed or
-	// logged. Never present when CredentialResponseEncrypted is true.
+	// Credentials. Every other member, in particular auxiliary_data, is dropped
+	// by the engine and never relayed or logged (a plain response that carries
+	// auxiliary_data is refused). Never present when CredentialResponseEncrypted is true.
 	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
 }
 
@@ -582,15 +599,33 @@ type SignRequestParams struct {
 	// (signWithExistingKeypair(kid, payload)). Empty for ordinary issuance.
 	ReissuanceKid string `json:"reissuance_kid,omitempty"`
 
-	// HolderCommitments, CredentialType and CredentialIssuer (generate_proof
-	// only; set when the issuer metadata advertises org.siros.holder_commitments
-	// with "psc"): the wallet MUST derive the commitment for (CredentialType,
-	// CredentialIssuer) and add the claim org.siros.psc =
-	// base64url(32 bytes) to every proof JWT payload before signing. The engine
-	// verifies the claim on the returned proofs and never computes or logs it.
-	HolderCommitments []string `json:"holder_commitments,omitempty"`
-	CredentialType    string   `json:"credential_type,omitempty"`
-	CredentialIssuer  string   `json:"credential_issuer,omitempty"`
+	// AuxiliaryDataToIssuer (generate_proof only): the issuer's advertised
+	// credential_configurations_supported.<id>.auxiliary_data_supported.to_issuer
+	// entries, verbatim (type, alg, path, required, and any other member the
+	// issuer put there). The wallet decides placement: for each entry it
+	// recognises it puts an auxiliary_data entry {type, alg, path, commitment}
+	// in the SIGNED part of every key proof it returns, the same value in all
+	// proofs of the request, and it MUST send every entry with required=true
+	// (OpenID4VCI Credential Auxiliary Data v0.1, section 6). The engine never
+	// computes or logs a commitment value; it reads the returned proofs only to
+	// check that no opening is present.
+	AuxiliaryDataToIssuer []json.RawMessage `json:"auxiliary_data_to_issuer,omitempty"`
+	// AuxiliaryDataToWallet (generate_proof only): the issuer's advertised
+	// to_wallet entries, verbatim. The client uses them to check the entries of
+	// the response it decrypts (each entry listed MUST be present, and
+	// SHA-256(opening) MUST equal the commitment the claim at path represents,
+	// Auxiliary Data v0.1 section 7.2) and refuses the issuance otherwise. The
+	// engine has already refused an entry whose alg or encoding is undefined
+	// there; the client MUST NOT assume it ran.
+	AuxiliaryDataToWallet []json.RawMessage `json:"auxiliary_data_to_wallet,omitempty"`
+	// CredentialType and CredentialIssuer (generate_proof only; set whenever
+	// AuxiliaryDataToIssuer is non-empty): the wallet derives its per-issuer
+	// value for (CredentialType, CredentialIssuer).
+	// CredentialType is the configuration's `vct`, or its `doctype` for mdoc;
+	// CredentialIssuer is the exact `credential_issuer` string of the issuer
+	// metadata.
+	CredentialType   string `json:"credential_type,omitempty"`
+	CredentialIssuer string `json:"credential_issuer,omitempty"`
 
 	// SignActionSignClientAuth parameters. HTM and HTU, when set, ask for a
 	// DPoP proof over that HTTP method and URL; DPoPNonce is the
@@ -629,7 +664,7 @@ type SignRequestParams struct {
 // CredentialResponseEncryptionParams is the negotiated credential response
 // encryption the engine asks the client to generate a key for. Required means
 // the engine fails the issuance when the client declines (the issuer demands
-// encryption, or advertises org.siros.secret_seed).
+// encryption, or advertises secret delivery to the wallet).
 type CredentialResponseEncryptionParams struct {
 	Alg      string `json:"alg"`
 	Enc      string `json:"enc"`

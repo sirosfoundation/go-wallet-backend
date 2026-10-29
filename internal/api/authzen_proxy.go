@@ -760,12 +760,11 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	if !metadataIsSigned || trustResp.Decision {
 		h.inlineLogos(ctx, result.Metadata)
 	}
-	// A valid org.siros.secret_seed advertisement (names only) stays; a
-	// malformed one makes the configuration "not offered" (5A.3). This runs
+	// A valid auxiliary_data_supported stays; a malformed one makes the
+	// configuration "not offered". This runs
 	// after key extraction and the trust decision above, so dropping the
 	// original signed_metadata JWT here cannot change that decision.
-	sanitizeSecretSeedAdvertisement(result.Metadata)
-	sanitizeHolderCommitmentsAdvertisement(result.Metadata)
+	sanitizeAuxiliaryDataAdvertisement(result.Metadata)
 
 	// Step 6: Evaluate whether this provider is entitled to issue what it is
 	// offering. Distinct from the PDP decision above, which answers whether the
@@ -1100,13 +1099,14 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 	return nil, false
 }
 
-// sanitizeSecretSeedAdvertisement enforces privatedata-spec 5A.3/5A.4 on the
-// issuer metadata served to the wallet, in place. A valid advertisement
-// ({"org.siros.secret_seed":{"namespaces":[...]}}, names only) is public and is
-// served unchanged, because the wallet needs it to request response encryption.
-// A credential configuration whose org.siros.secret_seed member is malformed
-// (carrying hex or any other non-list content) is treated as not offered: the
-// whole configuration is removed, so no such value reaches the wallet.
+// sanitizeAuxiliaryDataAdvertisement enforces the OpenID4VCI Credential
+// Auxiliary Data advertisement rules on the issuer metadata served to the
+// wallet, in place. A valid auxiliary_data_supported (to_wallet/to_issuer
+// entries) is public and is served unchanged, because the wallet needs it to
+// request response encryption and to place its commitments. A credential
+// configuration whose advertisement is malformed (a value where a name or
+// entry is expected, an auxiliary_data member or an opening in the metadata,
+// a bad entry) is treated as not offered: the whole configuration is removed.
 //
 // When a configuration is removed, the original signed_metadata JWT (kept by
 // the resolver for legacy signed metadata) is also dropped from the served
@@ -1115,52 +1115,18 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 // receives the sanitized claims without that JWT. The signature was verified
 // and the trust decision taken before this runs; the effect is only that the
 // wallet cannot re-verify the (by now modified) document itself.
-func sanitizeSecretSeedAdvertisement(metadata map[string]interface{}) {
-	sanitizeAdvertisement(metadata, "org.siros.secret_seed", func(raw []byte) bool {
-		present, valid := engine.SecretSeedAdvertisement(raw)
-		return present && !valid
-	})
-}
-
-// sanitizeAdvertisement removes every credential configuration whose
-// credential_metadata[member] is judged malformed by malformed (which receives
-// the whole credential_metadata object, JSON encoded), and drops
-// signed_metadata when it removed one.
-func sanitizeAdvertisement(metadata map[string]interface{}, member string, malformed func(raw []byte) bool) {
+func sanitizeAuxiliaryDataAdvertisement(metadata map[string]interface{}) {
 	ccs, ok := metadata["credential_configurations_supported"].(map[string]interface{})
 	if !ok {
 		return
 	}
 	for id, ccRaw := range ccs {
-		cc, ok := ccRaw.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		cm, ok := cc["credential_metadata"].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		if _, has := cm[member]; !has {
-			continue
-		}
-		raw, err := json.Marshal(cm)
-		if err != nil || malformed(raw) {
+		raw, err := json.Marshal(ccRaw)
+		if err != nil || engine.AdvertisementMalformed(raw) {
 			delete(ccs, id)
 			delete(metadata, "signed_metadata")
 		}
 	}
-}
-
-// sanitizeHolderCommitmentsAdvertisement removes, in place, every credential
-// configuration whose org.siros.holder_commitments member is malformed (not
-// {"commitments": [1..4 short names]}, or carrying hex-looking values), so no
-// such value reaches the wallet; signed_metadata is dropped when that happens,
-// for the same reason as in sanitizeSecretSeedAdvertisement.
-func sanitizeHolderCommitmentsAdvertisement(metadata map[string]interface{}) {
-	sanitizeAdvertisement(metadata, "org.siros.holder_commitments", func(raw []byte) bool {
-		present, _, valid := engine.HolderCommitmentsAdvertisement(raw)
-		return present && !valid
-	})
 }
 
 // inlineLogos walks the metadata tree and replaces logo URIs with data: URIs.

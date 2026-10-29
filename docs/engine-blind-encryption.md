@@ -52,10 +52,10 @@ read what it relays (OID4VCI section 13.4 covers this setup). The honest-but-cur
    negotiates the pair from issuer metadata. Supported: `ECDH-ES`,
    `ECDH-ES+A128KW`, `ECDH-ES+A256KW` with `A128GCM`, `A256GCM`,
    `A128CBC-HS256`, `A256CBC-HS512`. It is present when the issuer supports
-   response encryption. On this branch the engine also still sets `required`
-   when the configuration advertises the superseded `org.siros.secret_seed`
-   (and refuses a plain response carrying it); that handling is removed by
-   https://github.com/sirosfoundation/go-wallet-backend/pull/480.
+   response encryption. `required` is also set when the configuration delivers a
+   Secret Value to the wallet (`auxiliary_data_supported.to_wallet` with a
+   `hash_commitment` entry); with no usable issuer encryption the issuance then
+   fails before any request is sent.
 2. The client generates a fresh ephemeral P-256 key per `generate_proof`
    request, keeps the private key in memory keyed by flow id, and returns the
    public JWK as `credential_response_encryption_jwk` in the `sign_response`
@@ -88,12 +88,8 @@ read what it relays (OID4VCI section 13.4 covers this setup). The honest-but-cur
    any.
 9. Seed delivery is gone. The superseded shapes (`org.siros.secret_seed`,
    `org.siros.holder_commitments`, `org.siros.psc`, `secret_members`) are
-   refused by the wallet clients, on immediate, deferred and plain
-   completions. The replacement is Credential Auxiliary Data (`auxiliary_data`),
-   implemented in the engine by
-   https://github.com/sirosfoundation/go-wallet-backend/pull/480 (not part of
-   this PR; this branch still carries the old engine-side seed handling until
-   that PR lands). Whatever the wallet validates and stores from the decrypted
+   ordinary unknown members, ignored by the engine. The replacement is Credential
+   Auxiliary Data (`auxiliary_data`). Whatever the wallet validates and stores from the decrypted
    response stays wallet-side: the only client-supplied answers in the
    encrypted-response relay stay `credential_count` (1 to 256) or
    `transaction_id` (with an optional `interval`), or an `error` whose text the

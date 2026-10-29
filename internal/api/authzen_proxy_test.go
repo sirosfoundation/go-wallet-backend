@@ -2085,14 +2085,16 @@ func TestResolve_URLSubject_LogoInlining(t *testing.T) {
 								},
 							},
 						},
-						"credential_metadata": map[string]interface{}{
-							"org.siros.secret_seed": map[string]interface{}{"namespaces": []interface{}{"x"}},
+						"auxiliary_data_supported": map[string]interface{}{
+							"to_wallet": []interface{}{map[string]interface{}{
+								"type": "hash_commitment", "alg": "sha-256", "path": []interface{}{"x", "ssc"},
+							}},
 						},
 					},
 					"leaky": map[string]interface{}{
 						"format": "vc+sd-jwt",
 						"credential_metadata": map[string]interface{}{
-							"org.siros.secret_seed": map[string]interface{}{"ns": "00112233445566778899aabbccddeeff"},
+							"org.siros.secret_seed": map[string]interface{}{"namespaces": []interface{}{"x"}},
 						},
 					},
 				},
@@ -2159,17 +2161,13 @@ func TestResolve_URLSubject_LogoInlining(t *testing.T) {
 		t.Errorf("expected inlined data: URI for credential logo, got: %s", credLogoURI)
 	}
 
-	// A valid advertisement (names only) is public and is served; a malformed
-	// one (hex values) makes the configuration "not offered".
-	cm, _ := pid["credential_metadata"].(map[string]interface{})
-	if cm == nil || cm["org.siros.secret_seed"] == nil {
-		t.Error("valid org.siros.secret_seed advertisement must be served to the wallet")
+	// A valid advertisement is public and is served; a configuration with a
+	// superseded member name is an ordinary unknown member: served unchanged.
+	if pid["auxiliary_data_supported"] == nil {
+		t.Error("valid auxiliary_data_supported must be served to the wallet")
 	}
-	if _, present := ccs["leaky"]; present {
-		t.Error("configuration with a malformed secret seed member must not be offered")
-	}
-	if strings.Contains(w.Body.String(), "00112233445566778899aabbccddeeff") {
-		t.Error("seed value must never reach the wallet")
+	if _, present := ccs["leaky"]; !present {
+		t.Error("a superseded member name is an unknown member: the configuration is still offered")
 	}
 }
 
@@ -2298,9 +2296,10 @@ func TestResolve_URLSubject_SignedMetadata_VerificationFailed_Error(t *testing.T
 	}
 }
 
-func TestResolve_URLSubject_SignedMetadata_MalformedSeedConfigAndJWTNotServed(t *testing.T) {
+func TestResolve_URLSubject_SignedMetadata_MalformedAdvertisementAndJWTNotServed(t *testing.T) {
 	// A legacy signed document keeps the original JWT in signed_metadata; its
-	// payload still carries a rejected configuration (with a seed value). When
+	// payload still carries a rejected configuration (a malformed
+	// auxiliary_data_supported, with a marker value). When
 	// sanitisation removes the configuration the JWT must not be served either.
 	const seedHex = "00112233445566778899aabbccddeeff"
 	pdpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2309,7 +2308,7 @@ func TestResolve_URLSubject_SignedMetadata_MalformedSeedConfigAndJWTNotServed(t 
 	}))
 	defer pdpServer.Close()
 
-	cc := `{"leaky":{"format":"vc+sd-jwt","credential_metadata":{"org.siros.secret_seed":{"ns":"` + seedHex + `"}}}}`
+	cc := `{"leaky":{"format":"vc+sd-jwt","auxiliary_data_supported":{"to_wallet":[],"marker":"` + seedHex + `"}}}`
 	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"credential_issuer":"https://signed.example.com","credential_configurations_supported":` + cc + `}`))
 	// No embedded key in the header: key material falls through to inline jwks.
 	jwt := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"ES256"}`)) + "." + payload + ".sig"

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -14,7 +15,6 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
-	"regexp"
 	"strings"
 	"time"
 
@@ -285,9 +285,13 @@ type CredentialConfig struct {
 	// in either shape (some send an array) does not fail the whole document (#370).
 	Claims json.RawMessage `json:"claims,omitempty"`
 	// CredentialMetadata is the 1.0/1.1 credential_metadata member, kept raw.
-	// The engine reads only its org.siros.secret_seed advertisement (see
-	// secretSeedAdvertised); display data is never taken from it here.
+	// The engine reads only the secret delivery advertisement (see
+	// secretDeliveryOf); display data is never taken from it here.
 	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
+	// AuxiliaryDataSupported is the OpenID4VCI Credential Auxiliary Data
+	// advertisement (to_wallet / to_issuer entries), kept raw; see
+	// secretDeliveryOf for what the engine takes from it.
+	AuxiliaryDataSupported json.RawMessage `json:"auxiliary_data_supported,omitempty"`
 }
 
 // CredentialConfigurations is credential_configurations_supported, decoded
@@ -322,13 +326,9 @@ func (c *CredentialConfigurations) UnmarshalJSON(data []byte) error {
 		if err := json.Unmarshal(entry, &cfg); err != nil {
 			continue
 		}
-		// A malformed org.siros.secret_seed advertisement means the
-		// configuration is not offered (privatedata-spec 5A.3).
-		if present, ok := SecretSeedAdvertisement(cfg.CredentialMetadata); present && !ok {
-			continue
-		}
-		// Likewise for a malformed org.siros.holder_commitments advertisement.
-		if present, _, ok := HolderCommitmentsAdvertisement(cfg.CredentialMetadata); present && !ok {
+		// A malformed secret delivery advertisement (auxiliary_data_supported)
+		// means the configuration is not offered.
+		if _, err := secretDeliveryOf(&cfg); err != nil {
 			continue
 		}
 		parsed[id] = cfg
@@ -372,8 +372,9 @@ type CredentialResponse struct {
 	Interval        int           `json:"interval,omitempty"`
 	NotificationID  string        `json:"notification_id,omitempty"`
 	// CredentialMetadata is the raw response-level credential_metadata of a
-	// PLAIN response. It may carry a secret (org.siros.secret_seed): never log
-	// it; only displayMetadata(...) of it may leave the engine.
+	// PLAIN response. It may carry a secret (auxiliary_data, which is
+	// refused): never log it; only displayMetadata(...) of it
+	// may leave the engine.
 	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
 
 	// The fields below are local state, never part of the wire format.
@@ -925,6 +926,29 @@ func parseOAuthError(statusCode int, body []byte) error {
 	return fmt.Errorf("endpoint returned status %d", statusCode)
 }
 
+// oauthErrorCodeOnly is parseOAuthError without the issuer's description or
+// URI: only a well-formed error code (token characters, bounded) is returned.
+func oauthErrorCodeOnly(statusCode int, body []byte) error {
+	var oauthErr OAuthError
+	if err := json.Unmarshal(body, &oauthErr); err == nil && validOAuthErrorCode(oauthErr.Error) {
+		return fmt.Errorf("%s", oauthErr.Error)
+	}
+	return fmt.Errorf("endpoint returned status %d", statusCode)
+}
+
+func validOAuthErrorCode(code string) bool {
+	if code == "" || len(code) > 64 {
+		return false
+	}
+	for _, r := range code {
+		ok := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.'
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // setAuthorizationHeader sets the Authorization header using DPoP scheme when the token
 // was DPoP-bound, otherwise uses Bearer.
 func (h *OID4VCIHandler) setAuthorizationHeader(req *http.Request, token *TokenResponse) {
@@ -1161,11 +1185,11 @@ func (h *OID4VCIHandler) issueCredential(ctx context.Context, metadata *IssuerMe
 	// Credential response encryption is decided from the issuer metadata
 	// before any proof is requested: the client generates the key in its
 	// generate_proof answer. The engine never holds a response key.
+	if err := configRefusal(selectedConfig); err != nil {
+		return h.failConfigRefusal(err)
+	}
 	respOffer, err := h.negotiateResponseEncryption(metadata, selectedConfig)
 	if err != nil {
-		return err
-	}
-	if err := h.checkPSCNeedsProof(selectedConfig); err != nil {
 		return err
 	}
 	var credential *CredentialResponse
@@ -1177,7 +1201,11 @@ func (h *OID4VCIHandler) issueCredential(ctx context.Context, metadata *IssuerMe
 			proofs, respEnc, proofErr = h.requestProofs(ctx, metadata, selectedConfig, nonce, reissuanceKid, respOffer)
 			if proofErr != nil {
 				h.Logger.Debug("failed to request proofs", zap.Error(proofErr))
-				_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+				code := ErrCodeSignError
+				if errors.Is(proofErr, errAuxiliaryDataProof) {
+					code = ErrCodeAuxiliaryDataProofInvalid
+				}
+				_ = h.Error(StepRequestingCredential, code, code.UserFacingMessage())
 				return proofErr
 			}
 		}
@@ -1221,7 +1249,9 @@ func (h *OID4VCIHandler) issueCredential(ctx context.Context, metadata *IssuerMe
 		deferredResp, err := h.pollDeferredCredential(ctx, metadata, token, credential.TransactionID, credential.Interval, credential.ResponseEncryption)
 		if err != nil {
 			h.Logger.Debug("deferred polling failed", zap.Error(err))
-			_ = h.Error(StepDeferred, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
+			if !errors.Is(err, errFlowReported) {
+				_ = h.Error(StepDeferred, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
+			}
 			return err
 		}
 
@@ -1238,13 +1268,12 @@ func (h *OID4VCIHandler) issueCredential(ctx context.Context, metadata *IssuerMe
 // the completion says so (credential_response_encrypted): the client already
 // holds the credentials and the response-level credential_metadata.
 func (h *OID4VCIHandler) finishIssuance(ctx context.Context, resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo, metadata *IssuerMetadata, token *TokenResponse) error {
-	// A plain response never delivers a seed (privatedata-spec 5A.4), whether
-	// advertised or not: refuse it, without quoting any content.
-	if !resp.Encrypted && hasSecretSeedMember(resp.CredentialMetadata) {
-		err := errors.New("secret seed credential_metadata arrived in a plain response")
-		h.Logger.Warn("rejecting credential response", zap.Error(err))
-		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer returned malformed credential metadata")
-		return err
+	// A plain response never carries a Secret Value (Auxiliary Data v0.1,
+	// section 7.1): refuse it, without quoting any content, and store nothing.
+	if !resp.Encrypted {
+		if err := h.refusePlainSecretMembers(resp.CredentialMetadata); err != nil {
+			return err
+		}
 	}
 	results := h.buildCredentialResults(ctx, resp, config, trust)
 	h.registerNotificationContext(metadata, token, resp)
@@ -1366,7 +1395,9 @@ func (h *OID4VCIHandler) parseOffer(ctx context.Context, msg *FlowStartMessage) 
 	}
 
 	var offer CredentialOffer
-	if err := json.Unmarshal([]byte(offerStr), &offer); err != nil {
+	// A credential offer is read by the engine and by the client that handed it
+	// over: a repeated member (two grants, two issuers) would let them differ.
+	if err := decodeStrict([]byte(offerStr), &offer); err != nil {
 		return nil, fmt.Errorf("invalid offer JSON: %w", err)
 	}
 
@@ -1395,8 +1426,12 @@ func (h *OID4VCIHandler) fetchOfferFromURI(ctx context.Context, uri string) (*Cr
 		return nil, fmt.Errorf("offer fetch returned status %d", resp.StatusCode)
 	}
 
+	offerBody, err := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes+1))
+	if err != nil || len(offerBody) > MaxHTTPResponseBodyBytes {
+		return nil, errors.New("failed to read offer")
+	}
 	var offer CredentialOffer
-	if err := json.NewDecoder(resp.Body).Decode(&offer); err != nil {
+	if err := decodeStrict(offerBody, &offer); err != nil {
 		return nil, fmt.Errorf("failed to parse offer: %w", err)
 	}
 
@@ -1496,13 +1531,9 @@ func (h *OID4VCIHandler) logIgnoredCredentialConfigurations(source map[string]in
 			h.Logger.Warn("ignoring credential configuration with a broken format",
 				zap.String("credential_configuration_id", id),
 				zap.Error(err))
-		} else if present, ok := SecretSeedAdvertisement(cfg.CredentialMetadata); present && !ok {
-			// Never log the member: a malformed one may carry seed values.
-			h.Logger.Warn("ignoring credential configuration with a malformed secret seed advertisement",
-				zap.String("credential_configuration_id", id))
-		} else if present, _, ok := HolderCommitmentsAdvertisement(cfg.CredentialMetadata); present && !ok {
-			// Never log the member: a malformed one may carry commitment values.
-			h.Logger.Warn("ignoring credential configuration with a malformed holder commitments advertisement",
+		} else if _, err := secretDeliveryOf(&cfg); err != nil {
+			// Never log the member: a malformed one may carry secret values.
+			h.Logger.Warn("ignoring credential configuration with a malformed secret delivery advertisement",
 				zap.String("credential_configuration_id", id))
 		}
 	}
@@ -1813,9 +1844,17 @@ func (h *OID4VCIHandler) fetchIACACertificates(ctx context.Context, iacasURL str
 func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata) (string, *CredentialConfig, error) {
 	// Build available credentials list
 	available := make([]AvailableCredential, 0, len(offer.CredentialConfigurationIDs))
+	var refusal error
 	for _, configID := range offer.CredentialConfigurationIDs {
 		config, ok := metadata.CredentialConfigurationsSupported[configID]
 		if !ok {
+			continue
+		}
+		// A configuration the wallet must not use is not offered, and using it
+		// is refused before any authorization: a malformed advertisement, or
+		// auxiliary data it cannot handle (AUXILIARY_DATA_UNSUPPORTED).
+		if err := configRefusal(&config); err != nil {
+			refusal = err
 			continue
 		}
 		var display *CredentialDisplay
@@ -1828,6 +1867,19 @@ func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *Cr
 			Format:  config.Format,
 			VCT:     config.VCT,
 		})
+	}
+
+	if len(available) == 0 {
+		if refusal != nil {
+			return "", nil, h.failConfigRefusal(refusal)
+		}
+		// Nothing the wallet can use is left (a configuration with a malformed
+		// advertisement is dropped when the metadata is decoded): waiting for a
+		// selection could never succeed.
+		err := errors.New("the offer names no credential configuration this wallet can use")
+		h.Logger.Warn("no usable credential configuration in the offer")
+		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "No usable credential configuration in the offer")
+		return "", nil, fmt.Errorf("%w: %w", err, errFlowReported)
 	}
 
 	// If only one credential, auto-select
@@ -1861,6 +1913,9 @@ func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *Cr
 	if !ok {
 		_ = h.Error(StepAwaitingSelection, ErrCodeInvalidMessage, "Invalid credential configuration")
 		return "", nil, errors.New("invalid credential configuration")
+	}
+	if err := configRefusal(&config); err != nil {
+		return "", nil, h.failConfigRefusal(err)
 	}
 
 	return selection.CredentialConfigurationID, &config, nil
@@ -2634,19 +2689,26 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 	if offer != nil {
 		params.CredentialResponseEncryption = offer.params()
 	}
-	wantPSC, err := holderCommitmentPSCAdvertised(config)
+	delivery, err := secretDeliveryOf(config)
 	if err != nil {
 		return nil, nil, err
 	}
-	if wantPSC {
+	params.AuxiliaryDataToWallet = delivery.toWallet
+	// Entries travel in a key proof: with no proof type declared there is
+	// nothing to place them in (a required one was refused at selection).
+	if len(delivery.toIssuer) > 0 && h.needsProof(config) {
 		credType := config.VCT
 		if credType == "" {
 			credType = config.Doctype
 		}
-		if credType == "" {
-			return nil, nil, errors.New("issuer advertises a holder commitment but the credential configuration has no vct or doctype")
+		// The type is what the wallet derives a commitment from, so it is
+		// needed only for an entry type the wallet recognises; an entry of an
+		// unrecognised type is ignored (Auxiliary Data: recipients ignore
+		// types they do not know) and must not stop ordinary proof generation.
+		if credType == "" && delivery.toIssuerRecognised {
+			return nil, nil, errors.New("issuer advertises auxiliary data for the issuer but the credential configuration has no vct or doctype")
 		}
-		params.HolderCommitments = []string{HolderCommitmentPSC}
+		params.AuxiliaryDataToIssuer = delivery.toIssuer
 		params.CredentialType = credType
 		params.CredentialIssuer = metadata.CredentialIssuer
 	}
@@ -2690,11 +2752,10 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 		if _, ok := config.ProofTypesSupported[proof.ProofType]; !ok {
 			return nil, nil, fmt.Errorf("unsupported proof type %q: not listed in proof_types_supported", proof.ProofType)
 		}
-		if wantPSC {
-			if err := verifyProofCarriesPSC(proof); err != nil {
-				return nil, nil, err
-			}
-		}
+	}
+
+	if err := checkProofsForwardNoOpening(resp.Proofs, len(delivery.toIssuer) > 0); err != nil {
+		return nil, nil, err
 	}
 
 	return resp.Proofs, respEnc, nil
@@ -2841,20 +2902,19 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 	// carries secret material that must not travel as plain JSON. The pair was
 	// negotiated and the client's key obtained before this call (see
 	// negotiateResponseEncryption); the engine holds no response key.
-	seedAdvertised, seedErr := secretSeedAdvertised(config)
+	delivery, seedErr := secretDeliveryOf(config)
 	if seedErr != nil {
-		h.Logger.Warn("rejecting issuer metadata", zap.Error(seedErr))
-		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer advertised malformed secret seed metadata")
-		return nil, seedErr
+		return nil, h.failSecretDelivery(seedErr)
 	}
+	seedAdvertised := delivery.requireEncryption
 	refuseSeed := func(msg string) (*CredentialResponse, error) {
 		err := errors.New(msg)
 		h.Logger.Warn("rejecting credential request", zap.Error(err))
-		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer cannot deliver the secret seed over an encrypted response")
+		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer cannot deliver secret values over an encrypted response")
 		return nil, err
 	}
 	if seedAdvertised && (respEnc == nil || len(respEnc.JWK) == 0) {
-		return refuseSeed("issuer advertises secret seed delivery but no response encryption key is available")
+		return refuseSeed("issuer delivers auxiliary data to the wallet but no response encryption key is available")
 	}
 
 	// Credential response encryption (OID4VCI §7.3): the client's public key.
@@ -2922,9 +2982,9 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		// Check for DPoP nonce requirement — retry once with server-provided nonce
 		if attempt == 0 && isDPoPNonceError(resp) {
 			h.updateDPoPNonce(resp)
-			// A psc conflict is terminal even when the response also carries a
-			// DPoP-Nonce header: never retry it, never hide it.
-			if conflictErr := h.relayPSCConflict(resp); conflictErr != nil {
+			// An auxiliary data conflict is terminal even when the response
+			// also carries a DPoP-Nonce header: never retry it, never hide it.
+			if conflictErr := h.relayAuxiliaryDataConflict(resp); conflictErr != nil {
 				return nil, conflictErr
 			}
 			_ = resp.Body.Close()
@@ -2933,32 +2993,40 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		h.updateDPoPNonce(resp)
 
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+			body, readErr := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes+1))
 			_ = resp.Body.Close()
-			var errResp struct {
-				Error  string `json:"error"`
-				CNonce string `json:"c_nonce"`
+			if readErr != nil || len(body) > MaxErrorBodyBytes {
+				// Unreadable or too large to classify: it could be an
+				// auxiliary_data_conflict, which is final. Fail closed.
+				h.Logger.Debug("credential endpoint error body unreadable or too large", zap.Int("status", resp.StatusCode))
+				_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
+				return nil, fmt.Errorf("credential endpoint returned status %d with an oversized error body", resp.StatusCode)
 			}
+			// A conflict is final and never retried: recognise it before any
+			// retry is considered.
+			if conflictErr := h.auxiliaryDataConflictError(resp.StatusCode, body); conflictErr != nil {
+				return nil, conflictErr
+			}
+			var errResp errorBodyWire
 			parsedErr := json.Unmarshal(body, &errResp) == nil
+			var nonceResp errorNonceWire
+			if json.Unmarshal(body, &nonceResp) != nil {
+				nonceResp = errorNonceWire{} // a non-string c_nonce is no nonce
+			}
 			// Only the error code is logged, never the body or error_description:
 			// they are issuer-controlled free text and legacy ones carry a nonce.
 			h.Logger.Debug("credential endpoint error", zap.Int("status", resp.StatusCode), zap.String("error", safeErrorCode(errResp.Error)))
-
-			// A holder commitment conflict is a final, user-actionable outcome:
-			// relay it as its own flow error code (never retried).
-			if conflictErr := h.pscConflictError(resp.StatusCode, body); conflictErr != nil {
-				return nil, conflictErr
-			}
 
 			// An invalid_nonce error (no c_nonce in the body per OpenID4VCI 1.0
 			// section 8.3.1.2) or any error carrying a refreshed c_nonce (older
 			// issuers) lets the caller re-request proofs and retry once. Do NOT
 			// send a flow error here: that is the caller's responsibility when
-			// no retry is possible.
-			if parsedErr && (errResp.Error == "invalid_nonce" || errResp.CNonce != "") {
+			// no retry is possible. The error carries the code only: a legacy
+			// description may hold the nonce.
+			if parsedErr && (errResp.Error == "invalid_nonce" || nonceResp.CNonce != "") {
 				return nil, &CNonceRequiredError{
-					NewNonce: errResp.CNonce,
-					Err:      parseOAuthError(resp.StatusCode, body),
+					NewNonce: nonceResp.CNonce,
+					Err:      oauthErrorCodeOnly(resp.StatusCode, body),
 				}
 			}
 
@@ -2966,10 +3034,16 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			return nil, parseOAuthError(resp.StatusCode, body)
 		}
 
-		body, err := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))
+		body, err := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes+1))
 		_ = resp.Body.Close()
 		if err != nil {
 			return nil, fmt.Errorf("failed to read credential response: %w", err)
+		}
+		if len(body) > MaxHTTPResponseBodyBytes {
+			// A prefix is not the response: a strict check of it could pass
+			// what the whole body fails (trailing data after padding).
+			_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
+			return nil, errors.New("credential response is too large")
 		}
 
 		// Detect encrypted response (JWE compact serialization)
@@ -2999,14 +3073,21 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 		if seedAdvertised {
 			// Plain response although seed delivery was advertised: refuse
 			// without parsing, so no contents can reach errors or logs.
-			return refuseSeed("issuer answered a secret seed credential request without encrypting the response")
+			return refuseSeed("issuer answered an auxiliary data credential request without encrypting the response")
 		}
 
 		var credResp CredentialResponse
 		if err := json.Unmarshal(body, &credResp); err != nil {
+			// Terminal and generic: nothing of the body is logged or returned.
+			_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 			return nil, errors.New("failed to parse credential response")
 		}
 		credResp.ResponseEncryption = respEnc
+		// Every plain response, a pending one too, is checked: a forbidden
+		// member must end the issuance before its metadata is discarded.
+		if err := h.refusePlainSecretMembers(credResp.CredentialMetadata); err != nil {
+			return nil, err
+		}
 
 		return &credResp, nil
 	}
@@ -3031,160 +3112,233 @@ var (
 // answer goes to the client exactly like the first response, with
 // deferred=true.
 func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, transactionID string, interval int, respEnc *responseEncryption) (*CredentialResponse, error) {
-	// Determine deferred endpoint (OpenID4VCI spec: {credential_issuer}/deferred_credential or from metadata)
-	deferredEndpoint := strings.TrimSuffix(metadata.CredentialIssuer, "/") + "/deferred_credential"
-
-	// Default polling interval and max attempts
-	wait := deferredPollDefaultInterval
-	if interval > 0 {
-		wait = time.Duration(interval) * deferredPollIntervalUnit
+	p := &deferredPoll{
+		h:             h,
+		metadata:      metadata,
+		token:         token,
+		respEnc:       respEnc,
+		transactionID: transactionID,
+		// Determine deferred endpoint (OpenID4VCI spec: {credential_issuer}/deferred_credential or from metadata)
+		endpoint: strings.TrimSuffix(metadata.CredentialIssuer, "/") + "/deferred_credential",
+		// Default polling interval
+		wait: deferredPollDefaultInterval,
 	}
-	maxAttempts := 60 // 5 minutes at 5 second intervals
+	if interval > 0 {
+		p.wait = time.Duration(interval) * deferredPollIntervalUnit
+	}
+	const maxAttempts = 60 // 5 minutes at 5 second intervals
 
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(wait):
+		case <-time.After(p.wait):
 		}
-
-		// Send progress update
-		_ = h.Progress(StepDeferred, map[string]interface{}{
-			"transaction_id": transactionID,
-			"attempt":        attempt + 1,
-			"max_attempts":   maxAttempts,
-			"message":        fmt.Sprintf("Polling for credential (attempt %d/%d)", attempt+1, maxAttempts),
-		})
-
-		// Build request body
-		reqBody := map[string]interface{}{
-			"transaction_id": transactionID,
-		}
-		if respEnc != nil {
-			// The client keeps its key for the whole flow; without this the
-			// issuer answers the deferred request in clear (§9.1).
-			reqBody["credential_response_encryption"] = respEnc.requestMember()
-		}
-		bodyBytes, _ := json.Marshal(reqBody)
-		contentType := "application/json"
-		// OID4VCI 1.0 §9.1: the deferred request is encrypted like the
-		// credential request when the issuer requires it, or when it asks for
-		// an encrypted response (an issuer may refuse that in a plain request).
-		if reqEnc := metadata.CredentialRequestEncryption; reqEnc != nil && (reqEnc.EncryptionRequired || respEnc != nil) {
-			jwe, err := reqEnc.encryptRequest(bodyBytes)
-			if err != nil {
-				return nil, fmt.Errorf("cannot encrypt deferred credential request: %w", err)
-			}
-			bodyBytes = []byte(jwe)
-			contentType = "application/jwt"
-		}
-
-		req, err := http.NewRequestWithContext(ctx, "POST", deferredEndpoint, strings.NewReader(string(bodyBytes)))
-		if err != nil {
-			return nil, err
-		}
-		req.Header.Set("Content-Type", contentType)
-		h.setAuthorizationHeader(req, token)
-		if strings.EqualFold(token.TokenType, "DPoP") {
-			auth, err := h.resolveClientAuth(ctx, clientAuthNeeds{dpop: true, htm: "POST", htu: deferredEndpoint, accessToken: token.AccessToken})
-			if err != nil {
-				return nil, err
-			}
-			auth.apply(req)
-		}
-
-		resp, err := h.httpClient.Do(req)
-		if err != nil {
-			h.Logger.Warn("Deferred polling request failed", zap.Error(err), zap.Int("attempt", attempt+1))
-			continue // Retry on network errors
-		}
-
-		// Handle DPoP nonce on deferred responses
-		h.updateDPoPNonce(resp)
-		if isDPoPNonceError(resp) {
-			_ = resp.Body.Close()
-			continue // Retry immediately with new nonce (counts as one attempt)
-		}
-
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))
-		_ = resp.Body.Close()
-
-		// An issuer answers a request that asked for an encrypted response
-		// with a JWE whatever the status: 200 carries the credentials, 202 a
-		// still-pending answer (transaction_id, interval) that is just as
-		// encrypted. Handle that before any status-specific JSON parsing,
-		// which would silently drop it.
-		if respEnc != nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted) {
-			mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
-			if mediaType == "application/jwt" || mediaType == "application/jose" {
-				// Encrypted to the client's key: relay it unread. The initial
-				// response may have been plain (no notification context yet),
-				// and the client may reject what it decrypts and then owes the
-				// issuer a credential_failure notification, so the context
-				// must exist before the client answers.
-				h.registerNotificationContext(metadata, token, &CredentialResponse{Encrypted: true})
-				answer, err := h.relayEncryptedResponse(ctx, string(body), true, respEnc)
-				if err != nil {
-					return nil, err
-				}
-				if answer.TransactionID != "" {
-					// Still not ready: keep polling with what the client reported.
-					transactionID = answer.TransactionID
-					if answer.Interval > 0 {
-						wait = time.Duration(answer.Interval) * deferredPollIntervalUnit
-					}
-					continue
-				}
-				if resp.StatusCode == http.StatusAccepted {
-					// 202 means "not ready": credentials in it are a protocol violation.
-					return nil, errors.New("issuer answered a pending deferred request with credentials")
-				}
-				h.Logger.Info("Deferred credential received", zap.String("transaction_id", transactionID))
-				return answer, nil
-			}
-			if respEnc.Seed {
-				// A seed is never delivered in clear: refuse unread.
-				return nil, errors.New("issuer answered a secret seed deferred request without encrypting the response")
-			}
-		}
-
-		switch resp.StatusCode {
-		case http.StatusOK:
-			// Credential is ready
-			var credResp CredentialResponse
-			if err := json.Unmarshal(body, &credResp); err != nil {
-				return nil, errors.New("failed to parse deferred credential response")
-			}
-			h.Logger.Info("Deferred credential received", zap.String("transaction_id", transactionID))
-			return &credResp, nil
-
-		case http.StatusAccepted:
-			// Still pending, continue polling
-			// Check for new interval if provided in response
-			var pendingResp struct {
-				Interval int `json:"interval,omitempty"`
-			}
-			if err := json.Unmarshal(body, &pendingResp); err == nil && pendingResp.Interval > 0 {
-				wait = time.Duration(pendingResp.Interval) * deferredPollIntervalUnit
-			}
-			h.Logger.Debug("Deferred credential still pending",
-				zap.String("transaction_id", transactionID),
-				zap.Int("attempt", attempt+1))
-			continue
-
-		case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
-			// Non-retryable errors
-			return nil, fmt.Errorf("deferred credential request failed with status %d: %s", resp.StatusCode, string(body))
-
-		default:
-			h.Logger.Warn("Unexpected deferred response status",
-				zap.Int("status", resp.StatusCode),
-				zap.String("body", string(body)))
-			continue // Retry on unexpected responses
+		cred, done, err := p.once(ctx, attempt, maxAttempts)
+		if done || err != nil {
+			return cred, err
 		}
 	}
 
 	return nil, fmt.Errorf("deferred credential polling timeout after %d attempts", maxAttempts)
+}
+
+// deferredPoll is the state of one deferred credential polling loop.
+type deferredPoll struct {
+	h             *OID4VCIHandler
+	metadata      *IssuerMetadata
+	token         *TokenResponse
+	respEnc       *responseEncryption
+	endpoint      string
+	transactionID string
+	wait          time.Duration
+}
+
+// request builds one deferred credential request.
+func (p *deferredPoll) request(ctx context.Context) (*http.Request, error) {
+	reqBody := map[string]interface{}{
+		"transaction_id": p.transactionID,
+	}
+	if p.respEnc != nil {
+		// The client keeps its key for the whole flow; without this the
+		// issuer answers the deferred request in clear (§9.1).
+		reqBody["credential_response_encryption"] = p.respEnc.requestMember()
+	}
+	bodyBytes, _ := json.Marshal(reqBody)
+	contentType := "application/json"
+	// OID4VCI 1.0 §9.1: the deferred request is encrypted like the
+	// credential request when the issuer requires it, or when it asks for
+	// an encrypted response (an issuer may refuse that in a plain request).
+	if reqEnc := p.metadata.CredentialRequestEncryption; reqEnc != nil && (reqEnc.EncryptionRequired || p.respEnc != nil) {
+		jwe, err := reqEnc.encryptRequest(bodyBytes)
+		if err != nil {
+			return nil, fmt.Errorf("cannot encrypt deferred credential request: %w", err)
+		}
+		bodyBytes = []byte(jwe)
+		contentType = "application/jwt"
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", p.endpoint, strings.NewReader(string(bodyBytes)))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	p.h.setAuthorizationHeader(req, p.token)
+	if strings.EqualFold(p.token.TokenType, "DPoP") {
+		auth, err := p.h.resolveClientAuth(ctx, clientAuthNeeds{dpop: true, htm: "POST", htu: p.endpoint, accessToken: p.token.AccessToken})
+		if err != nil {
+			return nil, err
+		}
+		auth.apply(req)
+	}
+	return req, nil
+}
+
+// once makes one polling attempt. done is false when polling continues.
+func (p *deferredPoll) once(ctx context.Context, attempt, maxAttempts int) (cred *CredentialResponse, done bool, err error) {
+	h := p.h
+	// Send progress update
+	_ = h.Progress(StepDeferred, map[string]interface{}{
+		"transaction_id": p.transactionID,
+		"attempt":        attempt + 1,
+		"max_attempts":   maxAttempts,
+		"message":        fmt.Sprintf("Polling for credential (attempt %d/%d)", attempt+1, maxAttempts),
+	})
+
+	req, err := p.request(ctx)
+	if err != nil {
+		return nil, true, err
+	}
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		h.Logger.Warn("Deferred polling request failed", zap.Error(err), zap.Int("attempt", attempt+1))
+		return nil, false, nil // Retry on network errors
+	}
+
+	// Handle DPoP nonce on deferred responses
+	h.updateDPoPNonce(resp)
+	if isDPoPNonceError(resp) {
+		// A terminal conflict is never retried, with or without the header.
+		if err := h.relayAuxiliaryDataConflict(resp); err != nil {
+			return nil, true, err
+		}
+		_ = resp.Body.Close()
+		return nil, false, nil // Retry immediately with new nonce (counts as one attempt)
+	}
+
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes+1))
+	_ = resp.Body.Close()
+	if readErr != nil || len(body) > MaxHTTPResponseBodyBytes {
+		// Unreadable or cut short: it cannot be classified (it may be a
+		// conflict, which is final) and is not acted on. Terminal and generic.
+		return nil, true, errors.New("deferred response is unreadable or too large")
+	}
+
+	// An issuer answers a request that asked for an encrypted response
+	// with a JWE whatever the status: 200 carries the credentials, 202 a
+	// still-pending answer (transaction_id, interval) that is just as
+	// encrypted. Handle that before any status-specific JSON parsing,
+	// which would silently drop it.
+	if p.respEnc != nil && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted) {
+		return p.encryptedAnswer(ctx, resp, body, attempt)
+	}
+	return p.plainAnswer(resp.StatusCode, body, attempt)
+}
+
+// encryptedAnswer handles a 200 or 202 answer to a request that asked for an
+// encrypted response. done is false when polling continues.
+func (p *deferredPoll) encryptedAnswer(ctx context.Context, resp *http.Response, body []byte, attempt int) (*CredentialResponse, bool, error) {
+	h := p.h
+	mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
+	if mediaType != "application/jwt" && mediaType != "application/jose" {
+		if p.respEnc.Seed {
+			// A Secret Value is never delivered in clear: refuse unread.
+			return nil, true, errors.New("issuer answered an auxiliary data deferred request without encrypting the response")
+		}
+		return p.plainAnswer(resp.StatusCode, body, attempt)
+	}
+	// Encrypted to the client's key: relay it unread. The initial
+	// response may have been plain (no notification context yet),
+	// and the client may reject what it decrypts and then owes the
+	// issuer a credential_failure notification, so the context
+	// must exist before the client answers.
+	h.registerNotificationContext(p.metadata, p.token, &CredentialResponse{Encrypted: true})
+	answer, err := h.relayEncryptedResponse(ctx, string(body), true, p.respEnc)
+	if err != nil {
+		return nil, true, err
+	}
+	if answer.TransactionID != "" {
+		// Still not ready: keep polling with what the client reported.
+		p.transactionID = answer.TransactionID
+		if answer.Interval > 0 {
+			p.wait = time.Duration(answer.Interval) * deferredPollIntervalUnit
+		}
+		return nil, false, nil
+	}
+	if resp.StatusCode == http.StatusAccepted {
+		// 202 means "not ready": credentials in it are a protocol violation.
+		return nil, true, errors.New("issuer answered a pending deferred request with credentials")
+	}
+	h.Logger.Info("Deferred credential received", zap.String("transaction_id", p.transactionID))
+	return answer, true, nil
+}
+
+// plainAnswer interprets an unencrypted answer by status. done is false when
+// polling continues.
+func (p *deferredPoll) plainAnswer(status int, body []byte, attempt int) (*CredentialResponse, bool, error) {
+	h := p.h
+	switch status {
+	case http.StatusOK:
+		// Credential is ready
+		var credResp CredentialResponse
+		if err := json.Unmarshal(body, &credResp); err != nil {
+			return nil, true, errors.New("failed to parse deferred credential response")
+		}
+		h.Logger.Info("Deferred credential received", zap.String("transaction_id", p.transactionID))
+		return &credResp, true, nil
+
+	case http.StatusAccepted:
+		// Still pending, continue polling
+		// Check for new interval if provided in response
+		var pendingResp struct {
+			Interval           int             `json:"interval,omitempty"`
+			CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
+		}
+		// A body that cannot be read ends the issuance rather than being
+		// skipped (it may carry a forbidden member).
+		if len(bytes.TrimSpace(body)) > 0 {
+			if err := json.Unmarshal(body, &pendingResp); err != nil {
+				return nil, true, errors.New("failed to parse deferred pending response")
+			}
+			if err := h.refusePlainSecretMembers(pendingResp.CredentialMetadata); err != nil {
+				return nil, true, err
+			}
+		}
+		if pendingResp.Interval > 0 {
+			p.wait = time.Duration(pendingResp.Interval) * deferredPollIntervalUnit
+		}
+		h.Logger.Debug("Deferred credential still pending",
+			zap.String("transaction_id", p.transactionID),
+			zap.Int("attempt", attempt+1))
+		return nil, false, nil
+
+	case http.StatusBadRequest, http.StatusUnauthorized, http.StatusForbidden:
+		// Non-retryable errors
+		if err := h.auxiliaryDataConflictError(status, body); err != nil {
+			return nil, true, err
+		}
+		return nil, true, fmt.Errorf("deferred credential request failed with status %d: %s", status, string(body))
+
+	default:
+		// A conflict is final, whatever the status.
+		if err := h.auxiliaryDataConflictError(status, body); err != nil {
+			return nil, true, err
+		}
+		h.Logger.Warn("Unexpected deferred response status",
+			zap.Int("status", status),
+			zap.String("body", string(body)))
+		return nil, false, nil // Retry on unexpected responses
+	}
 }
 
 func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo) []CredentialResult {
@@ -3234,77 +3388,6 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 	return results
 }
 
-const (
-	maxSeedNamespaces     = 8  // privatedata-spec 5A.1/5A.4: 1..8 namespaces
-	maxSeedNamespaceBytes = 64 // privatedata-spec 5A.1: 1..64 UTF-8 bytes
-
-	// secretSeedMember is the SIROS extension member of credential_metadata.
-	// The engine only reads the issuer-metadata advertisement of it
-	// ({"namespaces": [...]}); a delivered seed travels in the encrypted
-	// response and is handled by the client alone.
-	secretSeedMember = "org.siros.secret_seed"
-)
-
-// SecretSeedAdvertisement inspects the credential_metadata of one credential
-// configuration of the issuer metadata for the org.siros.secret_seed member.
-// present reports whether the member exists; ok is true only for the valid
-// advertisement form {"namespaces": [1..8 distinct names of 1..64 bytes, none
-// "namespaces"]} (privatedata-spec 5A.4). Anything else, in particular a member
-// carrying hex or other values instead of a name list, is malformed
-// (present && !ok). A credential_metadata that is not an object has no member.
-func SecretSeedAdvertisement(credentialMetadata json.RawMessage) (present, ok bool) {
-	if len(credentialMetadata) == 0 {
-		return false, false
-	}
-	var md map[string]json.RawMessage
-	if json.Unmarshal(credentialMetadata, &md) != nil {
-		return false, false
-	}
-	raw, present := md[secretSeedMember]
-	if !present {
-		return false, false
-	}
-	var adv map[string]json.RawMessage
-	if json.Unmarshal(raw, &adv) != nil || len(adv) != 1 {
-		return true, false
-	}
-	var ns []string
-	if json.Unmarshal(adv["namespaces"], &ns) != nil || len(ns) == 0 || len(ns) > maxSeedNamespaces {
-		return true, false
-	}
-	seen := make(map[string]struct{}, len(ns))
-	for _, n := range ns {
-		if !validSeedNamespace(n) {
-			return true, false
-		}
-		if _, dup := seen[n]; dup {
-			return true, false
-		}
-		seen[n] = struct{}{}
-	}
-	return true, true
-}
-
-// secretSeedAdvertised reports whether a credential configuration advertises
-// seed delivery. A malformed advertisement returns an error that never
-// includes the offending content.
-func secretSeedAdvertised(config *CredentialConfig) (bool, error) {
-	if config == nil {
-		return false, nil
-	}
-	present, ok := SecretSeedAdvertisement(config.CredentialMetadata)
-	if present && !ok {
-		return false, fmt.Errorf("issuer metadata %s advertisement is malformed", secretSeedMember)
-	}
-	return ok, nil
-}
-
-// validSeedNamespace: 1..64 bytes, and not the name "namespaces", which is
-// reserved for the issuer-metadata advertisement (5A.1).
-func validSeedNamespace(n string) bool {
-	return n != "" && n != "namespaces" && len(n) <= maxSeedNamespaceBytes
-}
-
 // credentialToString normalizes an issuer-returned credential value into the
 // string form carried to the client. The value may be a raw string, a wrapped
 // object containing a "credential" string, or some other JSON value (which is
@@ -3325,212 +3408,58 @@ func credentialToString(cred interface{}) string {
 	}
 }
 
-// hasSecretSeedMember reports whether a response-level credential_metadata
-// object has the org.siros.secret_seed member.
-func hasSecretSeedMember(md json.RawMessage) bool {
-	var m map[string]json.RawMessage
-	if json.Unmarshal(md, &m) != nil {
-		return false
-	}
-	_, ok := m[secretSeedMember]
-	return ok
+// auxiliaryDataConflictCode is the OpenID4VCI Credential Auxiliary Data error
+// code the engine relays to the wallet unchanged.
+const auxiliaryDataConflictCode = "auxiliary_data_conflict"
+
+// errorBodyWire is the member of a credential endpoint error body the engine
+// classifies on.
+type errorBodyWire struct {
+	Error string `json:"error"`
 }
 
-// Holder commitments (SIROS extension): the wallet derives a commitment from a
-// per-issuer secret it never shares and puts it in the proof JWT, so the issuer
-// can bind the credential subject to it. The engine only relays the request and
-// verifies the claim is present and well-formed; it never computes or logs it.
-const (
-	holderCommitmentsMember = "org.siros.holder_commitments"
-	// HolderCommitmentPSC is the commitment name SHA-256(private_seed).
-	HolderCommitmentPSC = "psc"
-	// PSCProofClaim is the proof JWT payload claim carrying the psc value.
-	PSCProofClaim = "org.siros.psc"
-	// PSCConflictPrefix starts the error_description of the issuer's 400
-	// response when it already holds a different psc for the subject.
-	PSCConflictPrefix = "org.siros.psc_conflict:"
-
-	maxHolderCommitments       = 4
-	maxHolderCommitmentNameLen = 32
-	maxPSCConflictMessageBytes = 512
-)
-
-var holderCommitmentNameRE = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
-
-// validHolderCommitmentName: a short lowercase name that does not look like a
-// hex value (16 or more hex characters), so a value can never pass as a name.
-func validHolderCommitmentName(n string) bool {
-	if n == "" || len(n) > maxHolderCommitmentNameLen || !holderCommitmentNameRE.MatchString(n) {
-		return false
-	}
-	if len(n) >= 16 {
-		allHex := true
-		for _, c := range n {
-			if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
-				allHex = false
-				break
-			}
-		}
-		if allHex {
-			return false
-		}
-	}
-	return true
+// errorNonceWire is the refreshed nonce an older issuer puts in an error body.
+// It is decoded apart from errorBodyWire so that a c_nonce of the wrong type can
+// never keep the error code (an auxiliary_data_conflict, say) from being read.
+type errorNonceWire struct {
+	CNonce string `json:"c_nonce"`
 }
 
-// HolderCommitmentsAdvertisement inspects the credential_metadata of one
-// credential configuration for the org.siros.holder_commitments member. present
-// reports whether the member exists; ok is true only for the valid form
-// {"commitments": [1..4 distinct short names]}. Anything else (extra members,
-// values instead of names, hex-looking strings, wrong counts) is malformed
-// (present && !ok). Unknown but well-formed names are kept in names.
-func HolderCommitmentsAdvertisement(credentialMetadata json.RawMessage) (present bool, names []string, ok bool) {
-	if len(credentialMetadata) == 0 {
-		return false, nil, false
-	}
-	var md map[string]json.RawMessage
-	if json.Unmarshal(credentialMetadata, &md) != nil {
-		return false, nil, false
-	}
-	raw, present := md[holderCommitmentsMember]
-	if !present {
-		return false, nil, false
-	}
-	var adv map[string]json.RawMessage
-	if json.Unmarshal(raw, &adv) != nil || len(adv) != 1 {
-		return true, nil, false
-	}
-	var ns []string
-	if json.Unmarshal(adv["commitments"], &ns) != nil || len(ns) == 0 || len(ns) > maxHolderCommitments {
-		return true, nil, false
-	}
-	seen := make(map[string]struct{}, len(ns))
-	for _, n := range ns {
-		if !validHolderCommitmentName(n) {
-			return true, nil, false
-		}
-		if _, dup := seen[n]; dup {
-			return true, nil, false
-		}
-		seen[n] = struct{}{}
-	}
-	return true, ns, true
-}
-
-// holderCommitmentPSCAdvertised reports whether the configuration advertises
-// the psc commitment. A malformed advertisement returns an error that never
-// includes the offending content.
-func holderCommitmentPSCAdvertised(config *CredentialConfig) (bool, error) {
-	if config == nil {
-		return false, nil
-	}
-	present, names, ok := HolderCommitmentsAdvertisement(config.CredentialMetadata)
-	if present && !ok {
-		return false, fmt.Errorf("issuer metadata %s advertisement is malformed", holderCommitmentsMember)
-	}
-	for _, n := range names {
-		if n == HolderCommitmentPSC {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// verifyProofCarriesPSC checks that a returned proof is a JWT whose payload has
-// org.siros.psc as an unpadded base64url encoding of exactly 32 bytes. Errors
-// never include the value.
-func verifyProofCarriesPSC(proof ProofObject) error {
-	if proof.ProofType != "jwt" || proof.JWT == "" {
-		return errors.New("a holder commitment was requested but the proof is not a JWT")
-	}
-	parts := strings.Split(proof.JWT, ".")
-	if len(parts) != 3 {
-		return errors.New("a holder commitment was requested but the proof is not a compact JWT")
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		return errors.New("a holder commitment was requested but the proof payload is not base64url")
-	}
-	var claims map[string]json.RawMessage
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return errors.New("a holder commitment was requested but the proof payload is not a JSON object")
-	}
-	rawClaim, has := claims[PSCProofClaim]
-	if !has {
-		return fmt.Errorf("a holder commitment was requested but the proof lacks %s", PSCProofClaim)
-	}
-	var val string
-	if json.Unmarshal(rawClaim, &val) != nil {
-		return fmt.Errorf("%s in the proof is not a string", PSCProofClaim)
-	}
-	// Re-encoding must reproduce the input: the decoder ignores CR/LF and
-	// accepts nonzero trailing bits, neither of which is canonical base64url.
-	dec, err := base64.RawURLEncoding.DecodeString(val)
-	if err != nil || len(dec) != 32 || base64.RawURLEncoding.EncodeToString(dec) != val {
-		return fmt.Errorf("%s in the proof is not a 32-byte base64url value", PSCProofClaim)
-	}
-	return nil
-}
-
-// checkPSCNeedsProof fails the flow when the configuration advertises a psc
-// commitment but declares no proof type, since the commitment can only travel
-// in a proof: sending a credential request without it would bypass the binding.
-func (h *OID4VCIHandler) checkPSCNeedsProof(config *CredentialConfig) error {
-	adv, err := holderCommitmentPSCAdvertised(config)
-	if err == nil && adv && !h.needsProof(config) {
-		err = errors.New("issuer advertises a holder commitment but declares no proof type to carry it")
-	}
-	if err != nil {
-		_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
-	}
-	return err
-}
-
-// pscConflictError relays the issuer's psc conflict, if body is one, as a
-// PSC_CONFLICT flow error and returns the error to fail the flow with; nil when
-// the response is not a conflict.
-func (h *OID4VCIHandler) pscConflictError(status int, body []byte) error {
-	msg, ok := pscConflictMessage(status, body)
-	if !ok {
+// auxiliaryDataConflictError relays the issuer's auxiliary_data_conflict, if
+// the 400 body is one, as a flow error with code AUXILIARY_DATA_CONFLICT and
+// the issuer's code under details.error, and returns the error to fail the flow
+// with; nil when the response is not a conflict. No other issuer text is
+// relayed.
+func (h *OID4VCIHandler) auxiliaryDataConflictError(status int, body []byte) error {
+	var e errorBodyWire
+	err := json.Unmarshal(body, &e)
+	if status != http.StatusBadRequest || err != nil || e.Error != auxiliaryDataConflictCode {
 		return nil
 	}
-	_ = h.Error(StepRequestingCredential, ErrCodePSCConflict, msg)
-	return parseOAuthError(status, body)
+	_ = h.ErrorWithDetails(StepRequestingCredential, ErrCodeAuxiliaryDataConflict,
+		ErrCodeAuxiliaryDataConflict.UserFacingMessage(),
+		map[string]interface{}{"error": auxiliaryDataConflictCode})
+	return fmt.Errorf("credential request rejected: %s: %w", auxiliaryDataConflictCode, errFlowReported)
 }
 
-// relayPSCConflict reads (and closes) the body of a 400 response and relays it
-// as a psc conflict if it is one. Other responses are left for the caller.
-func (h *OID4VCIHandler) relayPSCConflict(resp *http.Response) error {
-	if resp.StatusCode != http.StatusBadRequest {
-		return nil
+// relayAuxiliaryDataConflict reads (and closes) the body of a 400 response and
+// relays it if it is an auxiliary_data_conflict. Other responses are left for the caller with their body restored.
+func (h *OID4VCIHandler) relayAuxiliaryDataConflict(resp *http.Response) error {
+	body, readErr := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes+1))
+	if readErr != nil || len(body) > MaxErrorBodyBytes {
+		// Unreadable or too large to classify (it may be a conflict): fail
+		// closed, no retry.
+		_ = resp.Body.Close()
+		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
+		return fmt.Errorf("credential endpoint returned status %d with an oversized error body: %w", resp.StatusCode, errFlowReported)
 	}
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
-	if err := h.pscConflictError(resp.StatusCode, body); err != nil {
+	if err := h.auxiliaryDataConflictError(resp.StatusCode, body); err != nil {
 		_ = resp.Body.Close()
 		return err
 	}
+	// Not a conflict: close the original body (it may be unread past the
+	// limit) and hand a buffered copy back for the caller's own handling.
+	_ = resp.Body.Close()
+	resp.Body = io.NopCloser(bytes.NewReader(body))
 	return nil
-}
-
-// pscConflictMessage recognises the issuer's psc conflict response (HTTP 400,
-// error_description starting with PSCConflictPrefix) and returns the issuer's
-// message, control characters removed and length capped.
-func pscConflictMessage(status int, body []byte) (string, bool) {
-	if status != http.StatusBadRequest {
-		return "", false
-	}
-	var e OAuthError
-	if json.Unmarshal(body, &e) != nil || !strings.HasPrefix(e.ErrorDescription, PSCConflictPrefix) {
-		return "", false
-	}
-	msg := strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f {
-			return -1
-		}
-		return r
-	}, e.ErrorDescription)
-	if len(msg) > maxPSCConflictMessageBytes {
-		msg = strings.ToValidUTF8(msg[:maxPSCConflictMessageBytes], "")
-	}
-	return msg, true
 }
