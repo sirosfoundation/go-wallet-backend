@@ -130,3 +130,29 @@ func TestWMPBridge_UnknownEngineErrorCodeIsAFlowError(t *testing.T) {
 	assert.Equal(t, -31020, mapErrorCode(errCodeIssuerNotEntitled))
 	assert.Equal(t, wmp.ErrFlowError, mapErrorCode(ErrCodeUntrustedIssuer))
 }
+
+// The engine puts a typed decision (a struct) in the error's details: it is
+// normalised through its JSON form, not dropped.
+func TestWMPEntitlement_TypedDecisionInDetails(t *testing.T) {
+	type finding struct {
+		Code           string `json:"code"`
+		Message        string `json:"message"`
+		CredentialType string `json:"credential_type,omitempty"`
+	}
+	type decision struct {
+		Allowed   bool      `json:"allowed"`
+		Mode      string    `json:"mode"`
+		Evaluated bool      `json:"evaluated"`
+		Findings  []finding `json:"findings"`
+	}
+	out := boundedErrorDetails(errCodeIssuerNotEntitled, map[string]interface{}{
+		"issuer": "https://i",
+		"issuer_entitlement": &decision{Allowed: false, Mode: "fail", Evaluated: true,
+			Findings: []finding{{Code: "no_registration_certificate", Message: "fixed", CredentialType: "t"}}},
+	})
+	ent := out["issuer_entitlement"].(map[string]interface{})
+	assert.Equal(t, false, ent["allowed"])
+	assert.Equal(t, "fail", ent["mode"])
+	assert.Equal(t, true, ent["evaluated"])
+	assert.Len(t, ent["findings"], 1)
+}

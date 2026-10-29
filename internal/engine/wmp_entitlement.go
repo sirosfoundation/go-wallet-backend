@@ -78,10 +78,27 @@ func entitlementPayload(m map[string]interface{}) (map[string]interface{}, bool)
 	return out, true
 }
 
+// asJSONObject is v as a decoded JSON object: the engine puts typed values (a
+// struct decision) in an error's details, which only their JSON form describes.
+func asJSONObject(v interface{}) map[string]interface{} {
+	if m, ok := v.(map[string]interface{}); ok {
+		return m
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil
+	}
+	var m map[string]interface{}
+	if json.Unmarshal(b, &m) != nil {
+		return nil
+	}
+	return m
+}
+
 // boundedDecision is the bounded form of the engine's entitlement decision
 // {allowed, mode, evaluated, findings, findings_truncated}.
 func boundedDecision(v interface{}) map[string]interface{} {
-	raw, _ := v.(map[string]interface{})
+	raw := asJSONObject(v)
 	ent := map[string]interface{}{}
 	for _, k := range []string{"allowed", "evaluated"} {
 		if b, ok := raw[k].(bool); ok {
