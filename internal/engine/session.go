@@ -164,15 +164,21 @@ type pendingRequest struct {
 	flowID string
 	sign   chan *SignResponseMessage
 	match  chan *MatchResponseMessage
-	// answered is set by whoever delivers the first reply of a sign request
-	// (the wallet's, or the engine's own refusal, see refuseSignRequests). Both
-	// go through the same compare-and-swap, so which one came first is decided
-	// once, whether or not the waiter has taken it from the channel yet.
-	answered atomic.Bool
-	// refused records that the reply that won was the engine's own refusal (a
-	// second malformed action finds it and leaves the refusal to finish).
-	refused atomic.Bool
+	// reply is decided once, by compare-and-swap from replyNone, by whoever
+	// delivers the first reply of a sign request: the wallet (replyWallet) or the
+	// engine's own refusal (replyRefused, see refuseSignRequests). It is decided
+	// whether or not the waiter has taken the reply from the channel yet, and
+	// the winner is readable at once, so overlapping refusals see a refusal
+	// already under way, not a half-set pair of flags.
+	reply atomic.Int32
 }
+
+// Who delivered the first reply of a sign request (pendingRequest.reply).
+const (
+	replyNone int32 = iota
+	replyWallet
+	replyRefused
+)
 
 // trackRequest registers p under messageID until the returned func is called.
 // The func removes the entry, so a reply arriving after completion, timeout or
@@ -798,7 +804,7 @@ func (s *Session) dispatchSignResponse(msg *SignResponseMessage) {
 		// Only the first reply is delivered (cap 1: it never blocks); a duplicate is
 		// dropped silently, since the request has an owner and UNKNOWN_FLOW
 		// (terminal) would be untrue.
-		if p.answered.CompareAndSwap(false, true) {
+		if p.reply.CompareAndSwap(replyNone, replyWallet) {
 			p.sign <- msg
 		}
 	}

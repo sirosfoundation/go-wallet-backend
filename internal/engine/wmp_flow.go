@@ -289,7 +289,7 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 // SIGN_REFUSED and reports whether it did: true only if every pending request
 // took the refusal. A request the wallet has already answered (its result is
 // buffered, or the waiter has taken it and is submitting) is not refused: the
-// first reply wins, decided by the request's answered flag, so the caller has to
+// first reply wins, decided once by the request's reply state, so the caller has to
 // end the flow another way.
 func (s *Session) refuseSignRequests(flowID string) bool {
 	s.flowsMu.RLock()
@@ -299,16 +299,15 @@ func (s *Session) refuseSignRequests(flowID string) bool {
 		if p.flowID != flowID || p.sign == nil {
 			continue
 		}
-		if !p.answered.CompareAndSwap(false, true) {
-			if p.refused.Load() {
-				// Already refused by an earlier malformed action: that refusal is
-				// being carried out (the verifier is being told), not cut short.
+		if !p.reply.CompareAndSwap(replyNone, replyRefused) {
+			if p.reply.Load() == replyRefused {
+				// Already refused by an earlier (or overlapping) malformed action:
+				// that refusal is being carried out, not cut short.
 				refused = true
 				continue
 			}
 			return false // the wallet's result came first
 		}
-		p.refused.Store(true)
 		p.sign <- &SignResponseMessage{
 			Message:   Message{Type: TypeSignResponse, FlowID: flowID, MessageID: id},
 			ErrorCode: ErrCodeSignRefused,
