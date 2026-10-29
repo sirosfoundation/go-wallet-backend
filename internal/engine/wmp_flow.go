@@ -248,6 +248,10 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 		return nil, wmp.NewRPCError(wmp.ErrFlowError, map[string]string{"reason": "flow not found or already completed"})
 	}
 
+	if nf := ws.tr.flow(params.FlowID); nf != nil && nf.fc.FlowType == openid4x.FlowTypeCredentialNotification {
+		// The credential_notification flow has no actions (OpenID4x 3.4).
+		return nil, errInvalidParams("unknown action for flow type")
+	}
 	flowType := wmpFlowTypeOf(ws, params.FlowID)
 	if err := openid4x.ValidateAction(flowType, params.Action); err != nil {
 		return nil, err
@@ -600,29 +604,10 @@ var errNoWMPPeer = errors.New("WMP session has no live peer")
 func (t *wmpTransport) SendJSON(msg interface{}) error {
 	switch m := msg.(type) {
 	case *FlowProgressMessage:
-		f := t.flow(m.FlowID)
-		if f == nil || f.terminal.Load() {
-			return nil // the flow is over; nothing to report progress on
-		}
-		out, ok := translateProgress(f, f.fc.FlowType, m.Step, m.Payload)
-		if !ok {
-			return nil // a step the profile has no counterpart for
-		}
-		return f.fc.Progress(f.context(), out.Step, out.Payload)
+		return t.sendProgress(m)
 
 	case *FlowCompleteMessage:
-		f := t.flow(m.FlowID)
-		if f == nil {
-			return errNoFlow
-		}
-		if !f.terminal.CompareAndSwap(false, true) {
-			return nil // the flow already ended (a malformed selection): one terminal message
-		}
-		result, err := completionResult(m, t.notificationEndpoint(m.FlowID))
-		if err != nil {
-			return err
-		}
-		return f.fc.Complete(f.context(), result)
+		return t.sendComplete(m)
 
 	case *FlowErrorMessage:
 		return t.sendFlowError(m)
@@ -644,27 +629,62 @@ func (t *wmpTransport) SendJSON(msg interface{}) error {
 		return nil
 
 	default:
-		// No dedicated WMP method (notification acks, push): wrap in
-		// wmp.message.deliver so every stream event is valid JSON-RPC.
-		peer := t.peerContext()
-		if peer == nil {
-			return errNoWMPPeer
-		}
-		data, err := json.Marshal(msg)
-		if err != nil {
-			return err
-		}
-		var probe struct {
-			Type string `json:"type"`
-		}
-		_ = json.Unmarshal(data, &probe)
-		return peer.Notify(context.Background(), wmp.MethodMessageDeliver, &wmp.MessageDeliverParams{
-			WMP:         wmp.Metadata{Version: wmp.Version, SessionID: t.id},
-			ContentType: "application/json",
-			MessageType: probe.Type,
-			Body:        data,
-		})
+		return t.deliverUnrouted(msg)
 	}
+}
+
+// sendProgress relays an engine progress message as a wmp.flow.progress.
+func (t *wmpTransport) sendProgress(m *FlowProgressMessage) error {
+	f := t.flow(m.FlowID)
+	if f == nil || f.terminal.Load() {
+		return nil // the flow is over; nothing to report progress on
+	}
+	out, ok := translateProgress(f, f.fc.FlowType, m.Step, m.Payload)
+	if !ok {
+		return nil // a step the profile has no counterpart for
+	}
+	return f.fc.Progress(f.context(), out.Step, out.Payload)
+}
+
+// sendComplete relays an engine completion as the flow's terminal
+// wmp.flow.complete.
+func (t *wmpTransport) sendComplete(m *FlowCompleteMessage) error {
+	f := t.flow(m.FlowID)
+	if f == nil {
+		return errNoFlow
+	}
+	if !f.terminal.CompareAndSwap(false, true) {
+		return nil // the flow already ended (a malformed selection): one terminal message
+	}
+	result, err := completionResult(m, t.notificationEndpoint(m.FlowID))
+	if err != nil {
+		return err
+	}
+	return f.fc.Complete(f.context(), result)
+}
+
+// deliverUnrouted sends an engine message that has no dedicated WMP method
+// (notification acks, push) wrapped in wmp.message.deliver, so every stream event
+// is valid JSON-RPC.
+func (t *wmpTransport) deliverUnrouted(msg interface{}) error {
+	peer := t.peerContext()
+	if peer == nil {
+		return errNoWMPPeer
+	}
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	var probe struct {
+		Type string `json:"type"`
+	}
+	_ = json.Unmarshal(data, &probe)
+	return peer.Notify(context.Background(), wmp.MethodMessageDeliver, &wmp.MessageDeliverParams{
+		WMP:         wmp.Metadata{Version: wmp.Version, SessionID: t.id},
+		ContentType: "application/json",
+		MessageType: probe.Type,
+		Body:        data,
+	})
 }
 
 var errNoFlow = errors.New("flow is not running over WMP")
@@ -674,33 +694,7 @@ var errNoFlow = errors.New("flow is not running over WMP")
 // refusal is -31005 {"unsupported":"transaction_data"} (OpenID4x 2.3) with the
 // redirect_uri as an additive member.
 func (t *wmpTransport) sendFlowError(m *FlowErrorMessage) error {
-	code := mapErrorCode(m.Error.Code)
-	var data interface{}
-	if len(m.Error.Details) > 0 {
-		data = m.Error.Details
-	}
-	if m.Error.Code == ErrCodeUnsupportedTransactionData {
-		redirect, _ := m.Error.Details["redirect_uri"].(string)
-		data = openid4x.TransactionDataUnsupportedData(redirect)
-	}
-	switch m.Error.Code {
-	case errCodeIssuerNotEntitled:
-		// -31020 with go-wmp's typed {issuer, issuer_entitlement}, bounded by
-		// go-wmp (see wmp_entitlement.go). A refusal go-wmp does not accept as
-		// one (no issuer, a decision that is not a refusal) is a plain flow
-		// error with no data, never a made-up decision.
-		if d := notEntitledData(m.Error.Details); d != nil {
-			data, code, m.Error.Message = d, wmp.ErrIssuerNotEntitled, openid4x.IssuerNotEntitledMessage
-		} else {
-			t.a.logger.Warn("ISSUER_NOT_ENTITLED without a usable decision; ending the flow with a plain flow error")
-			data, code = nil, wmp.ErrFlowError
-		}
-	default:
-		// A trust-decision refusal carries its reason.
-		if d := untrustedRefusalData(m.Error.Code, m.Error.Details); d != nil {
-			data = d
-		}
-	}
+	code, message, data := t.errorWire(m)
 	if f := t.flow(m.FlowID); f != nil {
 		if !f.terminal.CompareAndSwap(false, true) {
 			return nil // already ended: one terminal message
@@ -710,7 +704,7 @@ func (t *wmpTransport) sendFlowError(m *FlowErrorMessage) error {
 			// nothing of the engine's decline (or of the params) in it.
 			return f.fc.Error(f.context(), wmp.ErrInvalidParams, wmp.ErrorMessage(wmp.ErrInvalidParams), nil)
 		}
-		return f.fc.Error(f.context(), code, m.Error.Message, data)
+		return f.fc.Error(f.context(), code, message, data)
 	}
 	// An error about no running flow (a message for an unknown flow): go-wmp
 	// has no FlowContext to send it on, so it goes straight to the Peer.
@@ -730,9 +724,39 @@ func (t *wmpTransport) sendFlowError(m *FlowErrorMessage) error {
 		WMP:     wmp.Metadata{Version: wmp.Version, SessionID: t.id},
 		FlowID:  m.FlowID,
 		Code:    code,
-		Message: m.Error.Message,
+		Message: message,
 		Data:    raw,
 	})
+}
+
+// errorWire is the WMP code, message and data of an engine flow error: the
+// engine's details travel as data (a transaction_data refusal, an entitlement
+// refusal and a trust refusal have their own shapes).
+func (t *wmpTransport) errorWire(m *FlowErrorMessage) (code int, message string, data interface{}) {
+	code, message = mapErrorCode(m.Error.Code), m.Error.Message
+	if len(m.Error.Details) > 0 {
+		data = m.Error.Details
+	}
+	switch m.Error.Code {
+	case ErrCodeUnsupportedTransactionData:
+		redirect, _ := m.Error.Details["redirect_uri"].(string)
+		return code, message, openid4x.TransactionDataUnsupportedData(redirect)
+	case errCodeIssuerNotEntitled:
+		// -31020 with go-wmp's typed {issuer, issuer_entitlement}, bounded by
+		// go-wmp (see wmp_entitlement.go). A refusal go-wmp does not accept as
+		// one (no issuer, a decision that is not a refusal) is a plain flow
+		// error with no data, never a made-up decision.
+		if d := notEntitledData(m.Error.Details); d != nil {
+			return wmp.ErrIssuerNotEntitled, openid4x.IssuerNotEntitledMessage, d
+		}
+		t.a.logger.Warn("ISSUER_NOT_ENTITLED without a usable decision; ending the flow with a plain flow error")
+		return wmp.ErrFlowError, message, nil
+	}
+	// A trust-decision refusal carries its reason.
+	if d := untrustedRefusalData(m.Error.Code, m.Error.Details); d != nil {
+		data = d
+	}
+	return code, message, data
 }
 
 // relaySign runs a sign sub-flow and hands its outcome to the engine's waiting
@@ -1106,11 +1130,6 @@ func (t *wmpTransport) parentProtocol(session *Session, id string) (Protocol, bo
 		for _, sub := range f.fc.PendingSubFlows() {
 			if sub.FlowID != id {
 				continue
-			}
-			if f.fc.FlowType == openid4x.FlowTypeCredentialNotification {
-				// A sign_client_auth sub-flow of a notification needs what the
-				// notification needs: the issuance permission.
-				return ProtocolOID4VCI, true
 			}
 			session.flowsMu.RLock()
 			parent := session.flows[f.fc.FlowID]

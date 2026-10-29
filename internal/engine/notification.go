@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp/openid4x"
 	"go.uber.org/zap"
@@ -123,10 +124,27 @@ func (s *notificationContextStore) take(flowID string) *notificationContext {
 // reasons are not told apart. The context stays for the issuance's other ids
 // until its TTL; once its only known id is notified it is gone.
 func (s *notificationContextStore) claim(flowID, principal, notificationID string) *notificationContext {
+	if principal == "" {
+		return nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	nc, ok := s.ctx[flowID]
-	if !ok || time.Now().After(nc.expiresAt) || nc.principal == "" || nc.principal != principal || notificationID == "" {
+	if !ok || nc.principal != principal {
+		return nil
+	}
+	return s.useLocked(flowID, nc, notificationID)
+}
+
+// useLocked marks notificationID of nc notified, once, and returns a copy of the
+// context to forward with; nil when the context expired, the id is empty,
+// unknown, already notified, or a context that knows no id has accepted its
+// maximum. It is the one consumption record both notification entry points
+// (the flow and the legacy method) use. Caller must hold s.mu.
+func (s *notificationContextStore) useLocked(flowID string, nc *notificationContext, notificationID string) *notificationContext {
+	if time.Now().After(nc.expiresAt) || notificationID == "" || utf8.RuneCountInString(notificationID) > openid4x.MaxNotificationIDLen {
+		// An id beyond the profile's bound is never recorded: a context that
+		// knows no id would otherwise hold up to 256 of them, however long.
 		return nil
 	}
 	if _, done := nc.notified[notificationID]; done {
@@ -149,6 +167,22 @@ func (s *notificationContextStore) claim(flowID, principal, notificationID strin
 	used := *nc
 	used.notified = nil
 	return &used
+}
+
+// takeForNotification is the legacy wmp.credential.notification / WebSocket
+// counterpart of claim: a WebSocket context (no principal) is consumed whole, as
+// take does; a context retained for a WMP session is used per notification_id
+// through the same record as claim, so an id forwarded by the flow cannot be
+// forwarded again by the legacy method, and the unused ids stay usable.
+func (s *notificationContextStore) takeForNotification(flowID, notificationID string) *notificationContext {
+	s.mu.Lock()
+	nc, ok := s.ctx[flowID]
+	if ok && nc.principal != "" {
+		defer s.mu.Unlock()
+		return s.useLocked(flowID, nc, notificationID)
+	}
+	s.mu.Unlock()
+	return s.take(flowID)
 }
 
 // wmpEndpointFor is the notification endpoint of the live context of flowID, when
@@ -175,6 +209,9 @@ func (s *notificationContextStore) hasValid(flowID, notificationID string) bool 
 	defer s.mu.Unlock()
 	nc, ok := s.ctx[flowID]
 	if !ok || time.Now().After(nc.expiresAt) {
+		return false
+	}
+	if _, done := nc.notified[notificationID]; done {
 		return false
 	}
 	return nc.notificationID == "" || nc.notificationID == notificationID

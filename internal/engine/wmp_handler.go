@@ -91,6 +91,11 @@ func (h *wmpHandler) Resolve(ctx context.Context, params *wmp.ResolveParams) (*w
 	if !ok {
 		return nil, wmp.NewUnsupportedError(params.Type, nil)
 	}
+	// The registry lookup is made for the session's tenant (X-Tenant-ID), as the
+	// engine's own flows do.
+	if cl, ok := wmpClaimsFrom(ctx); ok {
+		ctx = ContextWithTenant(ctx, cl.TenantID)
+	}
 	doc, err := vctm.lookupVCTDocument(ctx, params.URI)
 	if errors.Is(err, errVCTMUnknown) {
 		return wmp.NewUnknownResolveResult(sess.ID, params.Type, params.URI), nil

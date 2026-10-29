@@ -459,4 +459,11 @@ func TestWMPBridge_AcceptOfferNeedsAffirmativeConsent(t *testing.T) {
 		assert.Equal(t, wmp.ErrInvalidParams, e.post(tok, sid, flowAction(sid, "f1", "accept_offer", p)).code(), name)
 	}
 	assert.Empty(t, actions)
+
+	// A null index is not index 0.
+	for name, idx := range map[string]any{"null element": []any{nil}, "null": nil, "two": []any{0, 1}, "negative": []any{-1}} {
+		r := e.post(tok, sid, flowAction(sid, "f1", "accept_offer", map[string]any{"selected_indices": idx, "consent": true}))
+		assert.Equal(t, wmp.ErrInvalidParams, r.code(), name)
+	}
+	assert.Empty(t, actions, "nothing was selected")
 }

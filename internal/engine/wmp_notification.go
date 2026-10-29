@@ -57,10 +57,22 @@ func (p *wmpFlowProfile) runNotification() wmp.FlowFunc {
 		}
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
-		// The flow is registered so that the guard can tell the sign sub-flow's
-		// parent (parentProtocol); a flow_id already in use is not a new flow.
+		// The flow takes a slot of the session's concurrent-flow limit, like every
+		// flow (an unanswered sign request holds it until the flow's timeout), and
+		// is registered as an oid4vci flow: that is what makes the guard require the
+		// issuance permission of every message about it and about its sign
+		// sub-flow. A flow_id already in use is not a new flow. At the limit the
+		// flow ends busy, retryable.
+		if _, err := ws.session.reserveFlow(fc.FlowID, ProtocolOID4VCI, true); err != nil {
+			if errors.Is(err, errFlowIDInUse) || errors.Is(err, errSessionEnded) {
+				return err
+			}
+			return fc.Error(ctx, wmp.ErrFlowError, wmp.ErrorMessage(wmp.ErrFlowError),
+				openid4x.NotificationErrorData{Reason: openid4x.NotificationReasonBusy, Retryable: true})
+		}
+		defer ws.session.releaseFlow(fc.FlowID)
 		if !ws.tr.addIfAbsent(fc.FlowID, &wmpFlow{fc: fc, session: wmp.SessionFromContext(ctx)}) {
-			return errors.New("flow id in use")
+			return errFlowIDInUse
 		}
 		defer ws.tr.remove(fc.FlowID)
 		return flow(ctx, fc)
