@@ -89,8 +89,9 @@ options of a session) and `WMPAdapter.Service()` drive the same engine over any
 | progress, complete, error | `wmp.flow.progress`, `wmp.flow.complete`, `wmp.flow.error` |
 | sign request | sign sub-flow (`openid4x.RequestSign`); the result becomes the engine's `sign_response` |
 | match request | match sub-flow (`openid4x.RequestMatch`); only satisfiability is relayed |
-| `wmp.resolve` type `vctm` (capability `resolve`) | the VCTM lookup of the engine's VCTM handler; `vctm` is not a flow type |
-| `wmp.credential.notification` | `dispatchCredentialNotification` |
+| `wmp.resolve` type `vctm` (capability `resolve`) | the VCTM lookup of the engine's VCTM handler (see "Resolve"); `vctm` is not a flow type |
+| `wmp.flow.start` `credential_notification` (capability of the same name) | go-wmp's `NotificationFlow` over the engine's notification context (see "Credential notification") |
+| `wmp.credential.notification` | `dispatchCredentialNotification`. **Superseded** by the `credential_notification` flow (it is not in the profile, has no result and cannot ask for a DPoP proof); kept as it was, no removal. It finds a context only in a session that negotiated `credential_notification` (nothing is retained otherwise) |
 | `wmp.message.deliver` (request) | `-31008`; `ack` and `status` are logged and dropped |
 
 Only the actions of the profile are accepted: the engine's own action names
@@ -148,14 +149,78 @@ query id that is not in the verifier's request, or repeated, is the terminal
 ### Issuer entitlement
 
 The enforcement of go-wallet-backend#522 is in the engine core and applies to every
-transport. The bridge (`wmp_entitlement.go`) maps its outcomes: the refusal
-`ISSUER_NOT_ENTITLED` is `-31020` (`Issuer not entitled`) with `data {issuer,
-issuer_entitlement}`, a trust-decision refusal `UNTRUSTED_ISSUER` stays `-31006` with
-`data.reason: "untrusted_issuer"`, and the findings progress (`trust_evaluated` with
-`issuer_entitlement_evaluated`) is relayed as a bounded allowlist without
-`trust_info`: at most 16 findings, each with `code`, `message` and `credential_type`
-length-bounded. A client cannot select a configuration outside the offer over WMP:
-`accept_offer` names an index of the credentials the engine listed.
+transport. The bridge (`wmp_entitlement.go`) maps its outcomes with go-wmp v0.13.0's
+types: the refusal `ISSUER_NOT_ENTITLED` is `wmp.ErrIssuerNotEntitled` (`-31020`,
+`openid4x.IssuerNotEntitledMessage`) with `openid4x.NewIssuerNotEntitledData`, the
+decision bounded by `IssuerEntitlement.Bounded()`; a trust-decision refusal
+`UNTRUSTED_ISSUER` stays `-31006` with `openid4x.NewUntrustedIssuerData()`
+(`{reason: "untrusted_issuer", retryable: false}`); never both for one flow. The
+findings progress (`trust_evaluated` with `issuer_entitlement_evaluated`) is relayed
+as `openid4x.NewIssuerEntitlementPayload`, without `trust_info`, bounded by go-wmp
+(at most 16 findings, a finding whose code is not of the defined form dropped, an
+over-long or non-printable `message` / `credential_type` left out, the
+certificate's own `entitlements` not relayed). A progress go-wmp refuses is not
+relayed; a refusal go-wmp does not accept as one (no issuer, not `allowed:false`,
+`mode:fail` with a finding) ends the flow with a plain `-31006` without data, never a
+made-up decision. An engine error code the bridge does not know is `-31006`. The
+shapes are those of #522 (`ISSUER_NOT_ENTITLED` details `{issuer,
+issuer_entitlement}` where the decision is `issuertrust.Decision.Summary()`); the
+engine constant is declared locally until #522 lands. A client cannot select a
+configuration outside the offer over WMP: `accept_offer` names an index of the
+credentials the engine listed.
+
+### Resolve
+
+`wmp.resolve` type `vctm` (Core 5.8.1) answers with go-wmp's helpers. The engine looks
+the `vct` up as the VCTM flow does (registry first; on a miss or an unreachable
+registry, the `vct` itself when it is an absolute URL; any other outcome of the
+registry lookup is a failure and does not fall through), and the result carries
+exactly `vct`, `name`, `description`, `display`, `claims` and `schema` of the
+document (`ProjectVCTM`; `vct` is the uri when the document has none). A lookup that
+finds no document, cannot reach one, or finds one that is not an object is `-32603`
+`{"reason": "metadata_fetch_error"}` with nothing of the failure; `metadata: null` only
+when the registry says it has no entry and the `vct` is not a URL to try; an empty
+uri is `-32602`. A URL is fetched with the engine's HTTP client policy: loopback,
+private, link-local and metadata addresses and non-HTTPS are refused, redirects
+included, unless the deployment is configured for local development; the document is
+read up to 1 MiB.
+
+### Credential notification
+
+After an issuance completes the wallet reports an OID4VCI notification with a new
+`credential_notification` flow (OpenID4x 3.4; go-wmp's `NotificationFlow`,
+`NotificationStartMiddleware`, `ParseCredentialNotificationStart`; the engine
+implements `NotificationForwarder` in `wmp_notification.go`). The engine advertises
+the `credential_notification` capability (events `credential_accepted`,
+`credential_failure`, `context_ttl_seconds` the engine's 5 minutes) and registers the
+flow on the profile and the start middleware on the Peer (a start in a session that did
+not negotiate it is `-31005`, invalid params `-32602 {"member"}`, both as the response
+to the start; the flow type is authorized exactly as `oid4vci`).
+
+- The notification context (`notificationContextStore`) is kept only when the session
+  negotiated the capability, bound to the issuance session and the principal that ran
+  it (a WebSocket session keeps it as before). Each `notification_id` is single use
+  (`claim`); an encrypted issuer response, whose ids the engine never saw, accepts the
+  wallet's ids once each, up to 256. The context lives until its TTL.
+- The completion gains `notification_endpoint` (when a context was retained) and keeps
+  `credentials[].notification_id` for plain responses only, each within the profile's
+  bounds (256 and 2048 characters).
+- Forwarding: the forwarding limit is checked first (`busy`, retryable, the context
+  and id are kept), then the id is claimed (`context_unavailable` for an absent,
+  expired, other-session, other-principal, unknown or spent context, not
+  distinguished). A token bound to a key the wallet holds gets its proof from a
+  `sign_client_auth` sub-flow of the notification flow (`htu` = the endpoint without
+  query and fragment, `openid4x.NotificationHTU`; the request goes to the full
+  endpoint; no `key_id`; each proof bounded by go-wmp's 20 s); a wallet that
+  fails or answers without a proof is `signing_failed`; the issuer's refusal is
+  `forward_failed`; the flow's own timeout (the client's, default 1 minute) is
+  `timeout`. Only the reason and `retryable` reach the wallet. The engine-held key
+  needs no sub-flow.
+- The DPoP `htu` of a notification is now the endpoint without query and fragment on
+  every transport (RFC 9449 4.2); the request goes to the full endpoint.
+
+The older `wmp.credential.notification` method is not in the profile; it is
+superseded by this flow and kept unchanged.
 
 ### Errors
 
@@ -184,8 +249,8 @@ engine).
 
 Advertised from the flow handlers registered on the manager, with go-wmp's
 descriptors: `oid4vci` (grants, formats), `oid4vp` (response modes, formats),
-`transaction_data` (versions), `flows` (`max_concurrent`) and `resolve`
-(`supported_types: ["vctm"]`). The session negotiates the offered capabilities
+`transaction_data` (versions), `credential_notification`, `flows` (`max_concurrent`) and
+`resolve` (`supported_types: ["vctm"]`). The session negotiates the offered capabilities
 that the engine serves; offering none negotiates none. `transaction_data` needs a
 version the client offered.
 
@@ -206,20 +271,25 @@ version the client offered.
   shape is go-wallet-backend#502 and a WebSocket wire change for the SDKs and
   wallet-frontend. Over WMP the engine accepts the closed `select_credentials`
   and sends the closed `credentials_to_include` / `selection_handle`.
-- OpenID4x 3.2.3.1 requires refusing a `select_credentials` whose `query_id` is not
-  in the request; the engine applies `dcql_consent_check` (default `warn`: logged,
-  accepted) to both transports. Under `enforce` the refusal is the terminal `-32602`.
-- The engine does not run the `match` flow for OID4VP, so the selection handle is
-  not compared with a match result's, and a wallet that holds nothing declines
-  (`select_credentials` with `consent: false`); the WebSocket `credentials_matched`
-  with no match (`NO_MATCHING_CREDENTIALS`, with the requested types) has no WMP
-  counterpart.
+- The WMP bridge mirrors the WebSocket path (behaviour, defaults, refusal semantics,
+  what the verifier and issuer see): no WMP-only strictness. OpenID4x 3.2.3.1 requires
+  refusing a `select_credentials` whose `query_id` is not in the request; the engine
+  applies `dcql_consent_check` (default `warn`: logged, accepted) to both transports,
+  so by default the spec's MUST-refuse does not hold. Under `enforce` the refusal is the
+  terminal `-32602`. Owner decision: `dcql_consent_check` is not flipped for WMP.
+- The engine does not run the `match` flow for OID4VP (nor on WebSocket), so the
+  selection handle is not compared with a match result's. A wallet that holds nothing
+  declines (`select_credentials` with `consent: false`): the verifier-visible outcome is
+  identical to the WebSocket `credentials_matched` with no match
+  (`NO_MATCHING_CREDENTIALS`): `access_denied` with the same generic description. What
+  the client sees differs: the WebSocket client gets the flow error
+  `NO_MATCHING_CREDENTIALS` with `requested_types`, `no_match_reason` and the verifier's
+  `redirect_uri`; a WMP client gets the decline's `-31006` "User declined the request"
+  with `redirect_uri` and nothing else (the WMP wallet matched locally and already knows
+  what it holds).
 - The profile has no step for deferred issuance, no `state` on `authorize` and no
   action for the engine's request that the client evaluates trust itself
   (`trust_result`); they travel as additive members (see the wire-change document).
-- A credential notification that needs a client-held DPoP signature after the
-  issuance completed has no flow to run the sign sub-flow in: go-wmp sub-flows
-  belong to a running flow. Over WMP such a notification is not forwarded.
 - `holder_commitments` (the legacy proof-claim advert) is not relayed: go-wmp has
   no such member. Credential Auxiliary Data (go-wallet-backend#480) replaces it.
 - The engine's match request is not used for OID4VP (the client matches inside the
