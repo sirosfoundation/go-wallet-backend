@@ -49,8 +49,9 @@ func decodeX5C(encoded string) ([]byte, error) {
 //
 // credentialTypes names configuration ids from the offer; the metadata says
 // what format and vct or doctype each one actually is. Guessing the format
-// would make the check meaningless, so a configuration that cannot be resolved
-// is skipped and simply not checked.
+// would make the check meaningless, so an id the metadata does not define is
+// skipped. It cannot be issued either: the engine only lets a flow select
+// configurations the metadata defines.
 func OffersFor(metadata map[string]interface{}, credentialTypes []string) []Offer {
 	configs, _ := metadata["credential_configurations_supported"].(map[string]interface{})
 	if configs == nil {
@@ -62,10 +63,10 @@ func OffersFor(metadata map[string]interface{}, credentialTypes []string) []Offe
 		if !ok {
 			continue
 		}
+		// A configuration with no format is still offered, so it is still
+		// checked: an empty format matches no registered attestation, which
+		// makes it a finding rather than a way past the check.
 		format, _ := cfg["format"].(string)
-		if format == "" {
-			continue
-		}
 		offers = append(offers, Offer{Format: format, Type: credentialTypeOf(cfg)})
 	}
 	return offers

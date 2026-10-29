@@ -30,8 +30,10 @@ func TestOffersForReadsFormatAndType(t *testing.T) {
 	}
 }
 
-// A configuration we cannot resolve is skipped rather than guessed at. Inventing
-// a format would produce a check that passes for the wrong reason.
+// An id the metadata does not define is skipped (it cannot be issued either).
+// A defined configuration with no format is kept with an empty format, which
+// matches no registered attestation: skipping it would leave a selectable
+// configuration unchecked. Inventing a format would pass for the wrong reason.
 func TestOffersForSkipsWhatItCannotResolve(t *testing.T) {
 	m := issuerMetadataWith(map[string]interface{}{
 		"known":     map[string]interface{}{"format": "dc+sd-jwt", "vct": "urn:eudi:pid:1"},
@@ -39,8 +41,8 @@ func TestOffersForSkipsWhatItCannotResolve(t *testing.T) {
 	})
 
 	got := OffersFor(m, []string{"known", "no_format", "not_in_metadata"})
-	if len(got) != 1 || got[0].Format != "dc+sd-jwt" {
-		t.Errorf("got %+v, want only the resolvable configuration", got)
+	if len(got) != 2 || got[0].Format != "dc+sd-jwt" || got[1].Format != "" || got[1].Type != "urn:eudi:pid:1" {
+		t.Errorf("got %+v, want the known configuration and the format-less one, not the undefined id", got)
 	}
 }
 
@@ -125,5 +127,23 @@ func TestDecodeX5CAcceptsBothBase64Alphabets(t *testing.T) {
 
 	if _, err := decodeX5C("not base64 at all!!"); err == nil {
 		t.Error("expected an error for a value that is neither alphabet")
+	}
+}
+
+// ChainFromX5C keeps what parses, in order, in either base64 alphabet, and
+// drops the rest: the resolver accepted the chain, so a dropped entry must not
+// turn a signed document into "no access certificate" silently for the others.
+func TestChainFromX5C(t *testing.T) {
+	if got := ChainFromX5C(nil); got != nil {
+		t.Errorf("nil x5c = %v, want nil", got)
+	}
+	leaf := wrpac(t, testIdentifier)
+	other := plainCert(t)
+	std := base64.StdEncoding.EncodeToString(leaf.Raw)
+	rawURL := base64.RawURLEncoding.EncodeToString(other.Raw)
+
+	got := ChainFromX5C([]string{std, "!!not base64!!", base64.StdEncoding.EncodeToString([]byte("not a cert")), rawURL})
+	if len(got) != 2 || !got[0].Equal(leaf) || !got[1].Equal(other) {
+		t.Fatalf("got %d certificates, want the leaf then the other, bad entries skipped", len(got))
 	}
 }

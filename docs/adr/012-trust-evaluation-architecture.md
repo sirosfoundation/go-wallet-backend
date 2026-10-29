@@ -464,6 +464,45 @@ and reports the findings to the client and continues; `off` skips the check.
 The check runs whether trust was evaluated server-side or by the frontend, and
 the frontend takes no part in it.
 
+**The registration certificate is authenticated, not just parsed.** The metadata
+signature authenticates the metadata signer, who is the provider, so it cannot
+vouch for the provider's own registration. The engine (and `/v1/resolve`)
+therefore verifies the WRPRC's JWS against the x5c leaf in its own header
+(`typ` must be `rc-wrp+jwt`) and asks the PDP whether that chain is a trusted
+Registrar: AuthZEN `action.name` `wrprc-registrar`, `resource.type` `x5c`,
+subject the issuer identifier (`trust.Service.EvaluateRegistrar`). Trust stays
+in go-trust; the backend holds no registrar trust store. The go-trust
+deployment **must define a policy named `wrprc-registrar`** (an unknown action
+falls to the DEFAULT policy). Anything short of a verified signature plus a
+positive PDP answer — bad signature, PDP denial, PDP error, no PDP configured —
+yields a finding (`registration_certificate_unverified` or
+`registrar_not_trusted`) and the certificate's claims are not used, so in `fail`
+mode the flow is refused.
+
+**What is checked is what is issued.** The check covers the offer's
+`credential_configuration_ids`; `awaitCredentialSelection` accepts only those
+(every transport, including the WMP bridge, drives it through the flow's action
+channel), and `authorization_details` in `flow_start` may only name them.
+
+**What the client is told.** A refusal is a flow error at step `evaluating_trust`
+with code `UNTRUSTED_ISSUER` and the fixed user-facing message; no findings are
+attached to the error. Findings are sent as a `trust_evaluated` progress whose
+payload is additive to the issuer trust report and deliberately lacks
+`issuer_trust_evaluated` (the key SDKs use to recognise a trust report):
+
+```json
+{"issuer_entitlement_evaluated": true, "issuer": "<issuer id>",
+ "issuer_entitlement": {"allowed": true, "mode": "warn", "evaluated": false,
+   "findings": [{"code": "registrar_not_trusted", "message": "<fixed text per code>",
+                 "credential_type": "<optional, <=128 bytes, sanitised>"}],
+   "findings_truncated": false}}
+```
+
+At most 16 findings, so the payload stays under about 5 KB; messages are fixed
+per code and contain no issuer text; the registration certificate's own content
+(entitlements, subject) is omitted (it is still in the `/v1/resolve` decision,
+where it is display-only and length-bounded). Codes are open-ended strings.
+
 ### Concurrent Flow Limit
 
 Each WebSocket session is limited to `MaxPendingFlowsPerSession` (default: 3) concurrent

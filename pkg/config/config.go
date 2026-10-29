@@ -2043,6 +2043,11 @@ type AuthZENProxyConfig struct {
 	// simply not been registered yet would break issuance that is currently
 	// legitimate. An unrecognised value is treated as warn rather than off, so
 	// a typo cannot silently disable the check.
+	//
+	// The registration certificate is only believed if its signer is a
+	// trusted Registrar according to the issuer PDP (AuthZEN action
+	// "wrprc-registrar"); without a PDP, or when it cannot be evaluated, the
+	// certificate counts as unverified, which "fail" refuses.
 	IssuerEntitlementMode string `yaml:"issuer_entitlement_mode" envconfig:"ISSUER_ENTITLEMENT_MODE"`
 
 	// AllowResolution controls whether resolution-only requests are allowed.

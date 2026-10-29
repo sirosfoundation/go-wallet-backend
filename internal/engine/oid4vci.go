@@ -1090,7 +1090,7 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 
 	// Step 3b: Is this issuer registered to issue what it is offering? Trust
 	// above says who it is; this says what it may issue (ARF §6.6.2.3).
-	if err := h.checkIssuerEntitlement(offer.CredentialIssuer, metaResult, offer); err != nil {
+	if err := h.checkIssuerEntitlement(ctx, offer.CredentialIssuer, metaResult, offer); err != nil {
 		h.Logger.Warn("Blocking issuer without entitlement", zap.Error(err))
 		_ = h.Error(StepEvaluatingTrust, ErrCodeUntrustedIssuer, ErrCodeUntrustedIssuer.UserFacingMessage())
 		return err

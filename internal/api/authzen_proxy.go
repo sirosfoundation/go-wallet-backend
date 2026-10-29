@@ -770,7 +770,7 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	// offering. Distinct from the PDP decision above, which answers whether the
 	// issuer is trusted at all — a trusted issuer can still be unregistered for
 	// the credential type it is proposing.
-	entitlement := h.evaluateIssuerEntitlement(result, keyMaterial, credentialTypes)
+	entitlement := h.evaluateIssuerEntitlement(ctx, client, issuerURL, result, keyMaterial, credentialTypes)
 	if entitlement != nil && !entitlement.Allowed {
 		h.logger.Warn("issuer is not entitled to issue the requested credential",
 			zap.String("issuer_url", issuerURL),
@@ -1342,6 +1342,9 @@ func getActionName(req *gotrust.EvaluationRequest) string {
 // Returns nil when there is nothing to say — mode off, or metadata that was
 // never signed, in which case the trust decision above has already dealt with it.
 func (h *AuthZENProxyHandler) evaluateIssuerEntitlement(
+	ctx context.Context,
+	pdp registrarPDP,
+	issuerURL string,
 	result *issuermetadata.ResolveResult,
 	keyMaterial *trust.KeyMaterial,
 	credentialTypes []string,
@@ -1358,11 +1361,43 @@ func (h *AuthZENProxyHandler) evaluateIssuerEntitlement(
 		return nil
 	}
 
+	registrationCert := issuermetadata.RegistrationCertificate(result.Metadata)
 	return issuertrust.Evaluate(issuertrust.Input{
 		Chain:            chain,
-		RegistrationCert: issuermetadata.RegistrationCertificate(result.Metadata),
+		RegistrationCert: registrationCert,
 		Offers:           issuertrust.OffersFor(result.Metadata, credentialTypes),
+		RegistrationAuth: h.authenticateRegistrationCert(ctx, pdp, issuerURL, registrationCert),
 	}, mode)
+}
+
+// registrarPDP is the slice of the AuthZEN client the registrar check needs.
+type registrarPDP interface {
+	Evaluate(ctx context.Context, req *gotrust.EvaluationRequest) (*gotrust.EvaluationResponse, error)
+}
+
+// authenticateRegistrationCert verifies the registration certificate's
+// signature and asks the PDP whether its signer is a trusted Registrar
+// (action trust.RegistrarAction). Any failure to establish that is
+// AuthUnchecked, which Evaluate reports as a finding.
+func (h *AuthZENProxyHandler) authenticateRegistrationCert(ctx context.Context, pdp registrarPDP, issuerURL, token string) issuertrust.AuthResult {
+	if token == "" || pdp == nil {
+		return issuertrust.AuthUnchecked
+	}
+	return issuertrust.AuthenticateRegistrationCert(ctx, token, func(ctx context.Context, km *trust.KeyMaterial) (bool, error) {
+		keys := make([]interface{}, len(km.X5C))
+		for i, cert := range km.X5C {
+			keys[i] = cert
+		}
+		resp, err := pdp.Evaluate(ctx, &gotrust.EvaluationRequest{
+			Subject:  gotrust.Subject{Type: "key", ID: issuerURL},
+			Resource: gotrust.Resource{Type: "x5c", ID: issuerURL, Key: keys},
+			Action:   &gotrust.Action{Name: trust.RegistrarAction},
+		})
+		if err != nil {
+			return false, err
+		}
+		return resp != nil && resp.Decision, nil
+	})
 }
 
 // keyMaterialX5C returns the x5c entries of key material, or nil when it is not
