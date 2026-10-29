@@ -251,7 +251,7 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 				f.malformed.Store(true)
 			}
 			ws.session.dispatchAction(&FlowActionMessage{Message: Message{Type: TypeFlowAction, FlowID: params.FlowID}, Action: ActionDecline})
-			if f != nil && flowStep(ws.session, params.FlowID) != StepCredentialSelection {
+			if f != nil && !ws.session.awaitsSelection(params.FlowID) {
 				// The flow is not waiting for the selection (it is signing, or
 				// submitting): nothing would consume the decline and the flow would
 				// run on. It ends now, with the same terminal -32602.
@@ -275,17 +275,27 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 	}, nil
 }
 
-// flowStep is the step an engine flow last reported.
-func flowStep(s *Session, flowID string) FlowStep {
+// awaitsSelection reports whether the flow can still consume a selection: its
+// last reported step is the credential selection and no sign request is pending
+// (after the consent the step stays credential_selection until the next
+// progress, so the step alone does not say the selection is still awaited).
+func (s *Session) awaitsSelection(flowID string) bool {
 	s.flowsMu.RLock()
 	f := s.flows[flowID]
+	pending := false
+	for _, p := range s.outstandingRequests {
+		if p.flowID == flowID {
+			pending = true
+			break
+		}
+	}
 	s.flowsMu.RUnlock()
-	if f == nil {
-		return ""
+	if f == nil || pending {
+		return false
 	}
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return f.State
+	return f.State == StepCredentialSelection
 }
 
 // wmpFlowTypeOf is the WMP flow type of an engine flow.
