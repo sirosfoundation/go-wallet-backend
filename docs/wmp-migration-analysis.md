@@ -3,7 +3,7 @@
 The engine serves the Wallet Messaging Protocol (WMP, `sirosfoundation/wmp`:
 Core and the OpenID4x profile) over HTTP+SSE next to its WebSocket protocol
 (`websocket-protocol-spec.md`). The protocol lives in
-[go-wmp](https://github.com/sirosfoundation/go-wmp) (v0.12.0); the backend is a
+[go-wmp](https://github.com/sirosfoundation/go-wmp) (v0.12.1); the backend is a
 thin bridge between it and the engine's flow handlers. This document describes
 the bridge. The wire behaviour is the specification's, not this document's.
 
@@ -83,8 +83,8 @@ options of a session) and `WMPAdapter.Service()` drive the same engine over any
 | WMP | Engine |
 |---|---|
 | `wmp.flow.start` `oid4vci` / `oid4vp` (needs the capability of the same name) | `Manager.handleFlowStart`; `params` is a `FlowStartMessage`; transaction_data is enabled only for a client that offered the `transaction_data` capability with version 1 |
-| `wmp.flow.action` `accept_offer`, `provide_tx_code`, `authorize`, `cancel` | `consent`, `provide_pin`, `authorization_complete`, `decline` |
-| `wmp.flow.action` `select_credentials` (closed: `consent`, `selections[{query_id, selection_handle}]`) | `consent` with the query ids and the handle (see below), or `decline` |
+| `wmp.flow.action` `accept_offer`, `provide_tx_code`, `authorize`, `cancel` | `select_credential` (the index names the configuration the engine offered), `provide_pin`, `authorization_complete` (`auth_code` becomes `code`; `state` is an additive param), a cancelled flow (OID4VCI) or `decline` (OID4VP) |
+| `wmp.flow.action` `select_credentials` (closed: `consent`, `selections[{query_id, selection_handle}]`) | the transport-neutral consent answer (see "Consent"), or `decline` |
 | `wmp.flow.cancel` | cancels the engine flow |
 | progress, complete, error | `wmp.flow.progress`, `wmp.flow.complete`, `wmp.flow.error` |
 | sign request | sign sub-flow (`openid4x.RequestSign`); the result becomes the engine's `sign_response` |
@@ -92,6 +92,11 @@ options of a session) and `WMPAdapter.Service()` drive the same engine over any
 | `wmp.resolve` type `vctm` (capability `resolve`) | the VCTM lookup of the engine's VCTM handler; `vctm` is not a flow type |
 | `wmp.credential.notification` | `dispatchCredentialNotification` |
 | `wmp.message.deliver` (request) | `-31008`; `ack` and `status` are logged and dropped |
+
+Only the actions of the profile are accepted: the engine's own action names
+(`consent`, `decline`, `provide_pin`, `authorization_complete`, `select_credential`,
+`credentials_matched`) are refused `-32602`. `trust_result` (the engine asking the
+client to evaluate trust) is the one additive action.
 
 A `select_credentials` the closed shape refuses is answered `-32602` without
 data and the flow ends with a terminal `-32602` without data. If the flow is
@@ -101,6 +106,49 @@ at once and the verifier is not told.
 
 A flow that ends without a result, or outlives the timeout the client named in
 `wmp.flow.start` (capped at 5 minutes), is reported as `-31006`.
+
+### Steps and payloads
+
+The engine keeps its own step names and payloads (the WebSocket protocol is
+unchanged); `translateProgress` in `wmp_translate.go` maps them to OpenID4x 3.1.2
+and 3.2.2 at the bridge. A step the profile has no counterpart for
+(`exchanging_token`, `token_obtained`, `submitting_response`) is not sent;
+`generating_proof` and `generating_presentation` are sent when the sign
+sub-flow starts. The complete table, with the payload of every step and action,
+is in the wire-change document handed to the SDK and wallet-frontend owners. A test asserts that every engine step is
+either translated or deliberately dropped.
+
+### Consent
+
+One transport-neutral component decides every consent, `consent.go`: a
+transport translates its wire to a `consentAnswer` (WebSocket: `consent_ws.go`;
+WMP: `consentFromSelectCredentials`, which parses the closed `select_credentials`
+with go-wmp) and the OID4VP flow asks `consentPolicy.Decide` whether the answer is
+acceptable for the request it sent. The component owns the vetting against the
+verifier's DCQL query (`presentation.dcql_consent_check`: `off`, `warn` (default),
+`enforce`), the refusal outcomes and what the sign request carries afterwards
+(`consentDecision.signInclusion`: the credential references and the selection
+handle, nothing else). Both transports therefore apply the same checks with the
+same refusal semantics; what differs is the wire (the WebSocket `consent` action
+carries `credential_id` and `disclosed_claims`, which the engine vets and relays as
+before; a WMP `select_credentials` is a closed set and carries neither, and a
+selection handle that the WebSocket protocol does not have).
+
+A consent the policy refuses ends the flow, the verifier is told `access_denied`
+without a description, and the client gets the flow error; over WMP a refusal for a
+query id that is not in the verifier's request, or repeated, is the terminal
+`-32602` without data of OpenID4x 3.2.3.1.
+
+### Issuer entitlement
+
+The enforcement of go-wallet-backend#522 is in the engine core and applies to every
+transport. The bridge (`wmp_entitlement.go`) maps its two outcomes: the refusal
+`UNTRUSTED_ISSUER` is `-31006` with `data.reason: "untrusted_issuer"` (Core 3.8 has
+no code for a trust refusal), and the findings progress (`trust_evaluated` with
+`issuer_entitlement_evaluated`) is relayed as a bounded allowlist without
+`trust_info`: at most 16 findings, each with `code`, `message` and `credential_type`
+length-bounded. A client cannot select a configuration outside the offer over WMP:
+`accept_offer` names an index of the credentials the engine listed.
 
 ### Errors
 
@@ -146,15 +194,22 @@ version the client offered.
 
 ## Not done here
 
-- The engine's own consent protocol is still the old shape (credential ids, claim
-  names): over WMP the engine accepts the closed `select_credentials` and sends
-  the closed `credentials_to_include` / `selection_handle`. Moving the engine and
-  the WebSocket protocol to the credential-data-free shape is go-wallet-backend#502.
-- The interactive steps and actions of OpenID4x 3.1.2, 3.1.3 and 3.2.2 are not
-  translated: progress steps keep the engine's names (`credential_selection`,
-  `awaiting_selection`, `authorization_required`), and `accept_offer` and
-  `authorize` map to the engine's actions without reshaping `selected_indices`
-  or `auth_code` and the OAuth state. This is as before the go-wmp rebuild.
+- The engine's own WebSocket consent protocol is still the old shape (`consent`
+  with credential ids and claim names): moving it to the credential-data-free
+  shape is go-wallet-backend#502 and a WebSocket wire change for the SDKs and
+  wallet-frontend. Over WMP the engine accepts the closed `select_credentials`
+  and sends the closed `credentials_to_include` / `selection_handle`.
+- OpenID4x 3.2.3.1 requires refusing a `select_credentials` whose `query_id` is not
+  in the request; the engine applies `dcql_consent_check` (default `warn`: logged,
+  accepted) to both transports. Under `enforce` the refusal is the terminal `-32602`.
+- The engine does not run the `match` flow for OID4VP, so the selection handle is
+  not compared with a match result's, and a wallet that holds nothing declines
+  (`select_credentials` with `consent: false`); the WebSocket `credentials_matched`
+  with no match (`NO_MATCHING_CREDENTIALS`, with the requested types) has no WMP
+  counterpart.
+- The profile has no step for deferred issuance, no `state` on `authorize` and no
+  action for the engine's request that the client evaluates trust itself
+  (`trust_result`); they travel as additive members (see the wire-change document).
 - A credential notification that needs a client-held DPoP signature after the
   issuance completed has no flow to run the sign sub-flow in: go-wmp sub-flows
   belong to a running flow. Over WMP such a notification is not forwarded.
