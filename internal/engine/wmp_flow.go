@@ -246,10 +246,17 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 			// echoed. The flow is declined, so the verifier is told access_denied,
 			// and it ends -32602 (see wmpFlow.malformed); the offending members go
 			// no further.
-			if f := ws.tr.flow(params.FlowID); f != nil {
+			f := ws.tr.flow(params.FlowID)
+			if f != nil {
 				f.malformed.Store(true)
 			}
 			ws.session.dispatchAction(&FlowActionMessage{Message: Message{Type: TypeFlowAction, FlowID: params.FlowID}, Action: ActionDecline})
+			if f != nil && flowStep(ws.session, params.FlowID) != StepCredentialSelection {
+				// The flow is not waiting for the selection (it is signing, or
+				// submitting): nothing would consume the decline and the flow would
+				// run on. It ends now, with the same terminal -32602.
+				f.endMalformed()
+			}
 			return nil, wmp.NewRPCError(wmp.ErrInvalidParams, nil)
 		}
 	} else if engineAction, ok := specToEngineAction[action]; ok {
@@ -266,6 +273,19 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 		Action: params.Action,
 		Status: "accepted",
 	}, nil
+}
+
+// flowStep is the step an engine flow last reported.
+func flowStep(s *Session, flowID string) FlowStep {
+	s.flowsMu.RLock()
+	f := s.flows[flowID]
+	s.flowsMu.RUnlock()
+	if f == nil {
+		return ""
+	}
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.State
 }
 
 // wmpFlowTypeOf is the WMP flow type of an engine flow.
@@ -311,6 +331,15 @@ type wmpFlow struct {
 	// refuses: the flow is declined, and ends -32602 with no data (OpenID4x
 	// 3.2.3.1), not as an ordinary decline.
 	malformed atomic.Bool
+}
+
+// endMalformed ends the flow with the terminal -32602 of a malformed
+// select_credentials (no data), once. It cancels the flow, so nothing the engine
+// does afterwards reaches the client.
+func (f *wmpFlow) endMalformed() {
+	if f.terminal.CompareAndSwap(false, true) {
+		_ = f.fc.Error(f.context(), wmp.ErrInvalidParams, wmp.ErrorMessage(wmp.ErrInvalidParams), nil)
+	}
 }
 
 // context is the context for what the engine sends on the flow. It carries the
@@ -377,7 +406,7 @@ func (t *wmpTransport) SendJSON(msg interface{}) error {
 	switch m := msg.(type) {
 	case *FlowProgressMessage:
 		f := t.flow(m.FlowID)
-		if f == nil {
+		if f == nil || f.terminal.Load() {
 			return nil // the flow is over; nothing to report progress on
 		}
 		return f.fc.Progress(f.context(), string(m.Step), m.Payload)
@@ -387,7 +416,9 @@ func (t *wmpTransport) SendJSON(msg interface{}) error {
 		if f == nil {
 			return errNoFlow
 		}
-		f.terminal.Store(true)
+		if !f.terminal.CompareAndSwap(false, true) {
+			return nil // the flow already ended (a malformed selection): one terminal message
+		}
 		return f.fc.Complete(f.context(), m)
 
 	case *FlowErrorMessage:
@@ -450,7 +481,9 @@ func (t *wmpTransport) sendFlowError(m *FlowErrorMessage) error {
 		data = openid4x.TransactionDataUnsupportedData(redirect)
 	}
 	if f := t.flow(m.FlowID); f != nil {
-		f.terminal.Store(true)
+		if !f.terminal.CompareAndSwap(false, true) {
+			return nil // already ended: one terminal message
+		}
 		if f.malformed.Load() {
 			// The terminal error of a malformed select_credentials: -32602, and
 			// nothing of the engine's decline (or of the params) in it.

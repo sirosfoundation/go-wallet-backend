@@ -93,6 +93,12 @@ options of a session) and `WMPAdapter.Service()` drive the same engine over any
 | `wmp.credential.notification` | `dispatchCredentialNotification` |
 | `wmp.message.deliver` (request) | `-31008`; `ack` and `status` are logged and dropped |
 
+A `select_credentials` the closed shape refuses is answered `-32602` without
+data and the flow ends with a terminal `-32602` without data. If the flow is
+waiting for the selection it is declined (the verifier is told `access_denied`);
+if it is already past that step nothing would consume a decline, so it is stopped
+at once and the verifier is not told.
+
 A flow that ends without a result, or outlives the timeout the client named in
 `wmp.flow.start` (capped at 5 minutes), is reported as `-31006`.
 
