@@ -579,16 +579,17 @@ func TestWMPBridge_SelectCredentials(t *testing.T) {
 			if act.Action == ActionDecline {
 				return f.Session.SendFlowError(f.ID, StepCredentialSelection, ErrCodePresentationError, "declined")
 			}
-			var consent ConsentPayload
-			if err := json.Unmarshal(act.Payload, &consent); err != nil {
+			answer, err := consentAnswerFrom(act)
+			if err != nil {
 				return err
 			}
-			refs := make([]CredentialRef, len(consent.SelectedCredentials))
-			for i, s := range consent.SelectedCredentials {
-				refs[i] = CredentialRef(s)
+			decision, err := newConsentPolicy(nil, zap.NewNop()).Decide(nil, answer)
+			if err != nil {
+				return err
 			}
+			refs, handle := decision.signInclusion()
 			_, err = f.Session.RequestSign(ctx, f.ID, SignActionSignPresentation, SignRequestParams{
-				CredentialsToInclude: refs, SelectionHandle: consent.SelectionHandle})
+				CredentialsToInclude: refs, SelectionHandle: handle})
 			return err
 		})
 		return e, actions
@@ -732,7 +733,7 @@ func TestWMPBridge_MalformedSelectionEndsAFlowThatIsNotWaiting(t *testing.T) {
 		step FlowStep
 		sign bool
 	}{
-		"past the selection step":           {StepSubmittingResponse, false},
+		"past the selection step":           {StepTrustEvaluated, false},
 		"signing, step still the selection": {StepCredentialSelection, true},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -967,7 +968,7 @@ func TestWMPBridge_SessionLifecycle(t *testing.T) {
 func TestWMPBridge_ReplayRedactionAndGap(t *testing.T) {
 	e := newWMPEnv(t)
 	registerScripted(e.m, ProtocolOID4VCI, func(_ context.Context, f *Flow, _ *FlowStartMessage) error {
-		_ = f.Session.SendProgress(f.ID, StepParsingRequest, nil)
+		_ = f.Session.SendProgress(f.ID, StepParsingOffer, nil)
 		return f.Session.SendFlowCompleteWithRefreshToken(f.ID, nil, "", "rt-secret", `{"kty":"EC"}`, "")
 	})
 	tok := e.token("alice", "t1", "ir", "j1")

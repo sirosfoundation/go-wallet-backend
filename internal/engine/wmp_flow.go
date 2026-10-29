@@ -24,16 +24,6 @@ import (
 // subFlowTimeout bounds a sign or match sub-flow, as Session.RequestSign does.
 const subFlowTimeout = 3 * time.Minute
 
-// specToEngineAction maps WMP spec action names to engine action names. The
-// presentation consent, select_credentials, is handled apart (see
-// translateSelectCredentials).
-var specToEngineAction = map[string]string{
-	openid4x.ActionAcceptOffer:   ActionConsent,
-	openid4x.ActionProvideTxCode: ActionProvidePin,
-	openid4x.ActionAuthorize:     ActionAuthorizationComplete,
-	openid4x.ActionCancel:        ActionDecline,
-}
-
 // wmpFlowTypes maps the flow types served over WMP to the engine protocols and
 // the capability that gates each (Core 10.3). vctm is not a WMP flow type
 // (OpenID4x 2 routes VCTM through wmp.resolve).
@@ -220,9 +210,10 @@ func capSeconds(seconds int, limit time.Duration) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-// HandleAction translates a wmp.flow.action to the engine's action and hands it
-// to the flow. The checks that need the engine's tables (flow known, closed
-// shape of select_credentials) are answered synchronously.
+// HandleAction translates a wmp.flow.action to the engine's action (see
+// translateAction) and hands it to the flow. The checks that need the engine's
+// tables (flow known, closed shape of select_credentials, the offer's
+// credentials) are answered synchronously.
 func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionParams) (*wmp.FlowActionResult, error) {
 	ws := p.a.session(p.sessionID)
 	if ws == nil {
@@ -235,44 +226,49 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 		return nil, wmp.NewRPCError(wmp.ErrFlowError, map[string]string{"reason": "flow not found or already completed"})
 	}
 
-	if err := openid4x.ValidateAction(wmpFlowTypeOf(ws, params.FlowID), params.Action); err != nil {
+	flowType := wmpFlowTypeOf(ws, params.FlowID)
+	if err := openid4x.ValidateAction(flowType, params.Action); err != nil {
 		return nil, err
 	}
-	action, payload := params.Action, params.Params
-	if action == openid4x.ActionSelectCredentials {
-		var err error
-		if action, payload, err = translateSelectCredentials(params.Params); err != nil {
+	f := ws.tr.flow(params.FlowID)
+	if f == nil {
+		return nil, wmp.NewRPCError(wmp.ErrFlowError, map[string]string{"reason": "flow not found or already completed"})
+	}
+	out, err := translateAction(f, flowType, params)
+	if err != nil {
+		if params.Action == openid4x.ActionSelectCredentials {
+			p.refuseSelection(ws, f, params.FlowID)
 			// -32602 without data (OpenID4x 3.2.3.1): nothing of the params is
-			// echoed. The flow is declined, so the verifier is told access_denied,
-			// and it ends -32602 (see wmpFlow.malformed); the offending members go
-			// no further.
-			f := ws.tr.flow(params.FlowID)
-			if f != nil {
-				f.malformed.Store(true)
-			}
-			ws.session.dispatchAction(&FlowActionMessage{Message: Message{Type: TypeFlowAction, FlowID: params.FlowID}, Action: ActionDecline})
-			if f != nil && !ws.session.awaitsSelection(params.FlowID) {
-				// The flow is not waiting for the selection (it is signing, or
-				// submitting): nothing would consume the decline and the flow would
-				// run on. It ends now, with the same terminal -32602.
-				f.endMalformed()
-			}
+			// echoed, and the offending members go no further.
 			return nil, wmp.NewRPCError(wmp.ErrInvalidParams, nil)
 		}
-	} else if engineAction, ok := specToEngineAction[action]; ok {
-		action = engineAction
+		return nil, err
 	}
-	ws.session.dispatchAction(&FlowActionMessage{
-		Message: Message{Type: TypeFlowAction, FlowID: params.FlowID},
-		Action:  action,
-		Payload: payload,
-	})
+	if out.Cancel {
+		p.CancelSessionFlow(p.sessionID, params.FlowID)
+	} else {
+		ws.session.dispatchAction(out.Msg)
+	}
 	return &wmp.FlowActionResult{
 		WMP:    wmp.Metadata{Version: wmp.Version, SessionID: p.sessionID},
 		FlowID: params.FlowID,
 		Action: params.Action,
 		Status: "accepted",
 	}, nil
+}
+
+// refuseSelection ends a flow whose select_credentials the closed shape
+// refused. The flow is declined, so the verifier is told access_denied, and it
+// ends -32602 (see wmpFlow.malformed).
+func (p *wmpFlowProfile) refuseSelection(ws *wmpSession, f *wmpFlow, flowID string) {
+	f.malformed.Store(true)
+	ws.session.dispatchAction(&FlowActionMessage{Message: Message{Type: TypeFlowAction, FlowID: flowID}, Action: ActionDecline})
+	if !ws.session.awaitsSelection(flowID) {
+		// The flow is not waiting for the selection (it is signing, or
+		// submitting): nothing would consume the decline and the flow would
+		// run on. It ends now, with the same terminal -32602.
+		f.endMalformed()
+	}
 }
 
 // awaitsSelection reports whether the flow can still consume a selection: its
@@ -308,27 +304,6 @@ func wmpFlowTypeOf(ws *wmpSession, flowID string) string {
 	return ""
 }
 
-// translateSelectCredentials maps the closed select_credentials params
-// (OpenID4x 3.2.3.1) to the engine's consent action. The engine learns the
-// verifier's query ids and the opaque selection handle, nothing about the
-// credentials; a decline is the engine's decline. See also #502, which moves
-// the engine's own protocol to this shape.
-func translateSelectCredentials(raw json.RawMessage) (action string, payload json.RawMessage, err error) {
-	sel, err := openid4x.ParseSelectCredentials(raw)
-	if err != nil {
-		return "", nil, err
-	}
-	if !sel.Consent {
-		return ActionDecline, nil, nil
-	}
-	consent := ConsentPayload{SelectionHandle: sel.Selections[0].SelectionHandle}
-	for _, s := range sel.Selections {
-		consent.SelectedCredentials = append(consent.SelectedCredentials, ConsentSelection{CredentialQueryID: s.QueryID})
-	}
-	payload, err = json.Marshal(consent)
-	return ActionConsent, payload, err
-}
-
 // --- transport ---------------------------------------------------------------
 
 // wmpFlow is a running WMP flow: its FlowContext, and the WMP session it runs in.
@@ -341,6 +316,13 @@ type wmpFlow struct {
 	// refuses: the flow is declined, and ends -32602 with no data (OpenID4x
 	// 3.2.3.1), not as an ordinary decline.
 	malformed atomic.Bool
+
+	// mu guards what the translation of the flow's steps records for its later
+	// actions: the configuration ids of the offer awaiting acceptance (the
+	// indices of accept_offer refer to them) and the issuer.
+	mu       sync.Mutex
+	offerIDs []string
+	issuer   map[string]interface{}
 }
 
 // endMalformed ends the flow with the terminal -32602 of a malformed
@@ -401,6 +383,19 @@ func (t *wmpTransport) peerContext() wmp.PeerContext {
 	return t.peer
 }
 
+// consentRefused implements consentRefusalObserver: the policy refused the
+// consent of a flow. A selection that is not in the verifier's request, or
+// repeats a query, is what OpenID4x 3.2.3.1 refuses with -32602 and no data, as
+// it does a malformed one; the flow then ends that way (see wmpFlow.malformed).
+func (t *wmpTransport) consentRefused(flowID, reason string) {
+	if reason != consentReasonOutsideQuery && reason != consentReasonDuplicate {
+		return
+	}
+	if f := t.flow(flowID); f != nil {
+		f.malformed.Store(true)
+	}
+}
+
 // Close ends the session from the engine's side (user revoked, superseded,
 // shutdown). It may be called with the manager's locks held, so the work is
 // done asynchronously.
@@ -419,7 +414,11 @@ func (t *wmpTransport) SendJSON(msg interface{}) error {
 		if f == nil || f.terminal.Load() {
 			return nil // the flow is over; nothing to report progress on
 		}
-		return f.fc.Progress(f.context(), string(m.Step), m.Payload)
+		out, ok := translateProgress(f, f.fc.FlowType, m.Step, m.Payload)
+		if !ok {
+			return nil // a step the profile has no counterpart for
+		}
+		return f.fc.Progress(f.context(), out.Step, out.Payload)
 
 	case *FlowCompleteMessage:
 		f := t.flow(m.FlowID)
@@ -429,7 +428,11 @@ func (t *wmpTransport) SendJSON(msg interface{}) error {
 		if !f.terminal.CompareAndSwap(false, true) {
 			return nil // the flow already ended (a malformed selection): one terminal message
 		}
-		return f.fc.Complete(f.context(), m)
+		result, err := completionResult(m)
+		if err != nil {
+			return err
+		}
+		return f.fc.Complete(f.context(), result)
 
 	case *FlowErrorMessage:
 		return t.sendFlowError(m)
@@ -528,6 +531,9 @@ func (t *wmpTransport) sendFlowError(m *FlowErrorMessage) error {
 // RequestSign, as a sign_response.
 func (t *wmpTransport) relaySign(f *wmpFlow, m *SignRequestMessage) {
 	resp := &SignResponseMessage{Message: Message{Type: TypeSignResponse, FlowID: m.FlowID, MessageID: m.MessageID}}
+	if step, ok := signStep(m.Action); ok && !f.terminal.Load() {
+		_ = f.fc.Progress(f.context(), step, nil)
+	}
 	params, err := signSubFlowParams(m)
 	if err == nil {
 		var result json.RawMessage
