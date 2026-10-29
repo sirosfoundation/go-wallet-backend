@@ -2,19 +2,24 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
 
 	"go.uber.org/zap"
 
-	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuertrust"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
-// entitlementFor applies the ARF §6.6.2.3 provider checks to resolved issuer
-// metadata: is the signing certificate a WRPAC, is the registration
+// errIssuerNotEntitled is what checkIssuerEntitlement returns for a refusal, so
+// the caller can tell it from anything else going wrong.
+var errIssuerNotEntitled = errors.New("issuer is not registered to issue the requested credential")
+
+// entitlementFor applies the ARF §6.6.2.3 provider checks (see
+// issuertrust.Assess, which /v1/resolve calls too) to resolved issuer
+// metadata: is the signing certificate a trusted WRPAC, is the registration
 // certificate signed by a trusted registrar, does it describe this provider,
 // and is it registered for the configurations being offered.
 //
@@ -22,31 +27,56 @@ import (
 // can still be unregistered for what it is proposing to issue, so this runs in
 // addition to trust, not instead of it.
 //
-// auth is the outcome of authenticating the registration certificate's signer
-// (see authenticateRegistration); its claims are not used unless it is
-// issuertrust.AuthVerified.
+// The offered configurations are read from the parsed metadata, the same
+// configurations awaitCredentialSelection accepts, not from a second reading
+// of the raw document: what can be selected is what is checked.
 //
-// Returns nil only when the mode is off. Otherwise a decision is always made:
-// metadata that was never signed by a certificate chain yields a finding, and
-// in fail mode that is a refusal, not a pass.
-func entitlementFor(mode issuertrust.Mode, meta *metadataResult, configIDs []string, auth entitlementAuth) *issuertrust.Decision {
-	if mode == issuertrust.ModeOff {
-		return nil
+// Returns nil only when the mode is off.
+func entitlementFor(ctx context.Context, mode issuertrust.Mode, meta *metadataResult, configIDs []string, registrar issuertrust.RegistrarTrust, chainAnchored bool) *issuertrust.Decision {
+	configs := map[string]issuertrust.ConfigView{}
+	if meta.Metadata != nil {
+		for id, c := range meta.Metadata.CredentialConfigurationsSupported {
+			configs[id] = issuertrust.ConfigView{Format: c.Format, VCT: c.VCT, Doctype: c.Doctype}
+		}
 	}
-	return issuertrust.Evaluate(issuertrust.Input{
-		Chain:            issuertrust.ChainFromX5C(meta.SignerX5C),
-		RegistrationCert: issuermetadata.RegistrationCertificate(meta.Raw),
-		Offers:           issuertrust.OffersFor(meta.Raw, configIDs),
-		ChainAnchored:    auth.chainAnchored,
-		RegistrationAuth: auth.registration,
+	return issuertrust.Assess(ctx, issuertrust.Source{
+		Metadata:      meta.Raw,
+		SignerX5C:     meta.SignerX5C,
+		ChainAnchored: chainAnchored,
+		Registrar:     registrar,
+		Configs:       configs,
+		IDs:           configIDs,
 	}, mode)
 }
 
-// entitlementAuth is what the trust path established about the two documents
-// the check reads. The zero value establishes nothing.
-type entitlementAuth struct {
-	registration  issuertrust.AuthResult // the registration certificate's signer
-	chainAnchored bool                   // the chain that signed the metadata (the WRPAC)
+// registrarTrust is the RegistrarTrust the engine uses: the issuer PDP,
+// action trust.RegistrarAction (ADR-012). With no PDP, or on any evaluation
+// error, the answer is "cannot tell", never "trusted".
+func (h *OID4VCIHandler) registrarTrust(issuer string) issuertrust.RegistrarTrust {
+	if h.TrustSvc == nil || h.Config == nil {
+		return nil
+	}
+	endpoint := h.Config.Trust.GetIssuerPDPURL()
+	if endpoint == "" {
+		return nil
+	}
+	return func(ctx context.Context, km *trust.KeyMaterial) (bool, error) {
+		info, err := h.TrustSvc.EvaluateRegistrar(h.withTenant(ctx), issuer, endpoint, km)
+		if err != nil {
+			return false, err
+		}
+		if info.EvaluationFailed {
+			return false, errors.New("registrar evaluation failed")
+		}
+		return info.Trusted, nil
+	}
+}
+
+func (h *OID4VCIHandler) withTenant(ctx context.Context) context.Context {
+	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
+		return trust.ContextWithTenant(ctx, h.Flow.Session.TenantID)
+	}
+	return ctx
 }
 
 // chainAnchored reports whether the trust path accepts the chain that signed
@@ -69,60 +99,26 @@ func (h *OID4VCIHandler) chainAnchored(ctx context.Context, issuer string, meta 
 	if endpoint == "" {
 		return false
 	}
-	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
-		ctx = trust.ContextWithTenant(ctx, h.Flow.Session.TenantID)
-	}
-	info, err := h.TrustSvc.EvaluateIssuer(ctx, issuer, endpoint, &trust.KeyMaterial{Type: "x5c", X5C: meta.SignerX5C})
+	info, err := h.TrustSvc.EvaluateIssuer(h.withTenant(ctx), issuer, endpoint, &trust.KeyMaterial{Type: "x5c", X5C: meta.SignerX5C})
 	return err == nil && info != nil && info.Trusted && !info.EvaluationFailed
 }
 
-// authenticateRegistration verifies the registration certificate's signature
-// and asks the issuer PDP whether its signer is a trusted Registrar. The trust
-// decision is the PDP's (ADR-012); with no PDP configured, or any evaluation
-// error, the result is "unverified", which entitlementFor reports as a finding
-// and, in fail mode, refuses.
-func (h *OID4VCIHandler) authenticateRegistration(ctx context.Context, issuer string, meta *metadataResult) issuertrust.AuthResult {
-	token := issuermetadata.RegistrationCertificate(meta.Raw)
-	if token == "" || h.TrustSvc == nil || h.Config == nil {
-		return issuertrust.AuthUnchecked
-	}
-	endpoint := h.Config.Trust.GetIssuerPDPURL()
-	if endpoint == "" {
-		return issuertrust.AuthUnchecked
-	}
-	if h.Flow != nil && h.Flow.Session != nil && h.Flow.Session.TenantID != "" {
-		ctx = trust.ContextWithTenant(ctx, h.Flow.Session.TenantID)
-	}
-	return issuertrust.AuthenticateRegistrationCert(ctx, token, func(ctx context.Context, km *trust.KeyMaterial) (bool, error) {
-		info, err := h.TrustSvc.EvaluateRegistrar(ctx, issuer, endpoint, km)
-		if err != nil {
-			return false, err
-		}
-		if info.EvaluationFailed {
-			return false, fmt.Errorf("registrar evaluation failed")
-		}
-		return info.Trusted, nil
-	})
-}
-
-// checkIssuerEntitlement enforces entitlementFor for a flow. It returns an
-// error only when the decision refuses issuance; in warn mode the findings are
-// logged and reported to the client, and the flow continues.
+// checkIssuerEntitlement enforces entitlementFor for a flow. It returns
+// errIssuerNotEntitled (with the decision, for the caller to report) only when
+// the decision refuses issuance; in warn mode the findings are logged and
+// reported to the client, and the flow continues.
 //
 // The configurations checked are offer.CredentialConfigurationIDs, and
 // awaitCredentialSelection lets the flow select nothing else, so what is
 // issued is what was checked.
-func (h *OID4VCIHandler) checkIssuerEntitlement(ctx context.Context, issuer string, meta *metadataResult, offer *CredentialOffer) error {
-	mode := issuertrust.ParseMode(h.Config.AuthZENProxy.IssuerEntitlementMode)
+func (h *OID4VCIHandler) checkIssuerEntitlement(ctx context.Context, issuer string, meta *metadataResult, offer *CredentialOffer) (*issuertrust.Decision, error) {
+	mode := issuertrust.ParseMode(h.Config.EffectiveIssuerEntitlementMode())
 	if mode == issuertrust.ModeOff {
-		return nil
+		return nil, nil
 	}
-	d := entitlementFor(mode, meta, offer.CredentialConfigurationIDs, entitlementAuth{
-		registration:  h.authenticateRegistration(ctx, issuer, meta),
-		chainAnchored: h.chainAnchored(ctx, issuer, meta),
-	})
+	d := entitlementFor(ctx, mode, meta, offer.CredentialConfigurationIDs, h.registrarTrust(issuer), h.chainAnchored(ctx, issuer, meta))
 	if d == nil {
-		return nil
+		return nil, nil
 	}
 
 	if len(d.Findings) > 0 {
@@ -145,9 +141,20 @@ func (h *OID4VCIHandler) checkIssuerEntitlement(ctx context.Context, issuer stri
 	}
 
 	if d.Allowed {
-		return nil
+		return d, nil
 	}
-	return fmt.Errorf("issuer is not registered to issue the requested credential: %s", strings.Join(findingCodeStrings(d), ", "))
+	return d, fmt.Errorf("%w: %s", errIssuerNotEntitled, strings.Join(findingCodeStrings(d), ", "))
+}
+
+// failNotEntitled reports an entitlement refusal to the client: code
+// ISSUER_NOT_ENTITLED, the fixed message, and details carrying the issuer and
+// the same bounded decision the progress message carries.
+func (h *OID4VCIHandler) failNotEntitled(issuer string, d *issuertrust.Decision) {
+	details := map[string]interface{}{"issuer": issuer}
+	if d != nil {
+		details["issuer_entitlement"] = d.Summary()
+	}
+	_ = h.ErrorWithDetails(StepEvaluatingTrust, ErrCodeIssuerNotEntitled, ErrCodeIssuerNotEntitled.UserFacingMessage(), details)
 }
 
 func findingCodeStrings(d *issuertrust.Decision) []string {

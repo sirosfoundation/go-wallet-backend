@@ -457,7 +457,10 @@ second needs the issuer's registration certificate (WRPRC), which travels in the
 issuer metadata, so it is evaluated by the engine in `OID4VCIHandler`
 (`checkIssuerEntitlement`) right after the trust decision, using `pkg/issuertrust`.
 
-It is fail-closed in the same way: with `authzen_proxy.issuer_entitlement_mode`
+It is fail-closed in the same way: with `trust.issuer_entitlement_mode`
+(`WALLET_TRUST_ISSUER_ENTITLEMENT_MODE`; the former `authzen_proxy.issuer_entitlement_mode`
+still works, with a startup warning, and loses to the new key; an unrecognised
+value refuses to start)
 set to `fail`, a provider that cannot show it is registered (including metadata
 not signed by a certificate chain) blocks the flow. `warn` (the default) logs
 and reports the findings to the client and continues; `off` skips the check.
@@ -493,11 +496,20 @@ signer key material.
 (every transport, including the WMP bridge, drives it through the flow's action
 channel), and `authorization_details` in `flow_start` may only name them.
 
-**What the client is told.** A refusal is a flow error at step `evaluating_trust`
-with code `UNTRUSTED_ISSUER` and the fixed user-facing message; no findings are
-attached to the error. Findings are sent as a `trust_evaluated` progress whose
-payload is additive to the issuer trust report and deliberately lacks
-`issuer_trust_evaluated` (the key SDKs use to recognise a trust report):
+**One evaluation, two routes.** The engine and `/v1/resolve` both call
+`issuertrust.Assess`, so they cannot disagree: unsigned metadata is a finding
+(a refusal in `fail`) on both, and the mode is one resolved value
+(`Config.EffectiveIssuerEntitlementMode`).
+
+**What the client is told.** An entitlement refusal in `fail` mode is a flow
+error at step `evaluating_trust` with code `ISSUER_NOT_ENTITLED`
+(`UNTRUSTED_ISSUER` stays for trust-decision refusals), the fixed message
+"Issuer is not registered to issue this credential", and `details`:
+`{"issuer": "<issuer id>", "issuer_entitlement": <decision>}` with the decision
+below. In `warn` the same decision is sent as progress and the flow continues.
+Findings are sent as a `trust_evaluated` progress whose payload is additive to
+the issuer trust report and deliberately lacks `issuer_trust_evaluated` (the
+key SDKs use to recognise a trust report):
 
 ```json
 {"issuer_entitlement_evaluated": true, "issuer": "<issuer id>",
@@ -509,8 +521,15 @@ payload is additive to the issuer trust report and deliberately lacks
 
 At most 16 findings, so the payload stays under about 5 KB; messages are fixed
 per code and contain no issuer text; the registration certificate's own content
-(entitlements, subject) is omitted (it is still in the `/v1/resolve` decision,
-where it is display-only and length-bounded). Codes are open-ended strings.
+(entitlements, subject) is omitted from the engine's messages (it is still in
+the `/v1/resolve` decision, where it is display-only and length-bounded). Codes
+are open-ended strings.
+
+`/v1/resolve` (the frontend's route to the same policy): mode `off` returns no
+`issuer_entitlement` member (absent means not checked); `warn` and `fail`
+always return it on success (HTTP 200, `allowed` true, findings listed); a
+`fail` refusal is HTTP 403 with
+`{"error": "...", "code": "ISSUER_NOT_ENTITLED", "issuer_entitlement": {"allowed": false, ...}}`.
 
 ### Concurrent Flow Limit
 

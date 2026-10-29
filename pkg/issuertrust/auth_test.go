@@ -198,3 +198,35 @@ func TestEvaluateRefusesAnUnanchoredChain(t *testing.T) {
 		t.Fatalf("unanchored chain: allowed=%v findings=%v", d.Allowed, codes(d))
 	}
 }
+
+// Assess is the one evaluation path the engine and /v1/resolve share.
+func TestAssess(t *testing.T) {
+	ctx := context.Background()
+	src := Source{
+		Metadata: map[string]interface{}{"credential_configurations_supported": map[string]interface{}{
+			"pid": map[string]interface{}{"format": "dc+sd-jwt", "vct": "urn:eudi:pid:1"},
+		}},
+		Configs: map[string]ConfigView{"pid": {Format: "dc+sd-jwt", VCT: "urn:eudi:pid:1"}},
+		IDs:     []string{"pid"},
+	}
+
+	if Assess(ctx, src, ModeOff) != nil {
+		t.Error("off must be the only way to get no decision")
+	}
+	// Unsigned metadata: a finding in warn, a refusal in fail, never skipped.
+	if d := Assess(ctx, src, ModeWarn); d == nil || !d.Allowed || !hasCode(d, CodeNoAccessCertificate) {
+		t.Errorf("warn: %+v", d)
+	}
+	if d := Assess(ctx, src, ModeFail); d == nil || d.Allowed || !hasCode(d, CodeNoAccessCertificate) {
+		t.Errorf("fail: %+v", d)
+	}
+}
+
+// A known format whose configuration names no type cannot be matched to a
+// registration; an empty type would match any registered query of the format.
+func TestEvaluateRefusesAKnownFormatWithoutAType(t *testing.T) {
+	d := Evaluate(input(t, defaultWRPRC(), Offer{Format: "dc+sd-jwt"}), ModeFail)
+	if d.Allowed || !hasCode(d, CodeTypeNotRegistered) {
+		t.Errorf("typeless sd-jwt offer: allowed=%v %v", d.Allowed, codes(d))
+	}
+}

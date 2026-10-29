@@ -8,10 +8,15 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/json"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
 	gotrust "github.com/sirosfoundation/go-trust/pkg/authzen"
 	"go.uber.org/zap"
@@ -65,7 +70,7 @@ func forgedRegistrationCert(t *testing.T) string {
 // /v1/resolve has the same hole as the engine: the registration certificate's
 // signer must be authenticated before its claims are used.
 func TestEvaluateIssuerEntitlement_AuthenticatesTheRegistrar(t *testing.T) {
-	h := &AuthZENProxyHandler{cfg: &config.AuthZENProxyConfig{IssuerEntitlementMode: "fail"}, logger: zap.NewNop()}
+	h := &AuthZENProxyHandler{entitlementMode: "fail", logger: zap.NewNop()}
 	result := &issuermetadata.ResolveResult{Signed: true, Metadata: map[string]interface{}{
 		"credential_configurations_supported": map[string]interface{}{
 			"pid": map[string]interface{}{"format": "dc+sd-jwt", "vct": "urn:eudi:pid:1"},
@@ -114,7 +119,7 @@ func x5cOf(t *testing.T, token string) string {
 // The PDP decision for the metadata signer is what anchors the WRPAC chain; a
 // chain nobody trusted must not satisfy the check however good the rest is.
 func TestEvaluateIssuerEntitlement_RequiresATrustedChain(t *testing.T) {
-	h := &AuthZENProxyHandler{cfg: &config.AuthZENProxyConfig{IssuerEntitlementMode: "fail"}, logger: zap.NewNop()}
+	h := &AuthZENProxyHandler{entitlementMode: "fail", logger: zap.NewNop()}
 	result := &issuermetadata.ResolveResult{Signed: true, Metadata: map[string]interface{}{}}
 	km := &trust.KeyMaterial{Type: "x5c", X5C: []string{x5cOf(t, forgedRegistrationCert(t))}}
 
@@ -129,5 +134,79 @@ func TestEvaluateIssuerEntitlement_RequiresATrustedChain(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("findings %+v lack access_certificate_not_trusted", d.Findings)
+	}
+}
+
+// --- the /v1/resolve outcome contract ---------------------------------------
+
+func resolveEntitlement(t *testing.T, mode string, signed bool) (int, map[string]interface{}) {
+	t.Helper()
+	pdp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(gotrust.EvaluationResponse{Decision: true})
+	}))
+	defer pdp.Close()
+	resolver := &mockMetadataResolver{result: &issuermetadata.ResolveResult{
+		Signed: signed,
+		Metadata: map[string]interface{}{
+			"credential_issuer": "https://issuer.example",
+			"credential_configurations_supported": map[string]interface{}{
+				"pid": map[string]interface{}{"format": "dc+sd-jwt", "vct": "urn:eudi:pid:1"},
+			},
+		},
+	}}
+	cfg := &config.AuthZENProxyConfig{Enabled: true, PDPURL: pdp.URL, Timeout: 30, AllowResolution: true, IssuerEntitlementMode: mode}
+	h := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, http.DefaultClient, zap.NewNop())
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set("tenant_id", "t"); c.Next() })
+	router.POST("/v1/resolve", h.Resolve)
+	body, _ := json.Marshal(map[string]interface{}{"subject_id": "https://issuer.example", "subject_type": "url", "credential_types": []string{"pid"}})
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body))))
+	var out map[string]interface{}
+	_ = json.Unmarshal(w.Body.Bytes(), &out)
+	return w.Code, out
+}
+
+// fail: metadata not signed by a certificate chain is refused, exactly as in
+// the engine, with the engine's code and the decision, never an ambiguous
+// "nothing to report".
+func TestResolve_FailModeRefusesWithTheEngineCode(t *testing.T) {
+	code, out := resolveEntitlement(t, "fail", false)
+	if code != http.StatusForbidden {
+		t.Fatalf("status %d, want 403", code)
+	}
+	if out["code"] != "ISSUER_NOT_ENTITLED" {
+		t.Errorf("code = %v, want ISSUER_NOT_ENTITLED", out["code"])
+	}
+	ent, _ := out["issuer_entitlement"].(map[string]interface{})
+	if ent == nil || ent["allowed"] != false || ent["mode"] != "fail" {
+		t.Errorf("issuer_entitlement = %v, want allowed=false mode=fail", ent)
+	}
+}
+
+// warn: the same findings, status 200, allowed=true: the result is always
+// present when the check ran, so its absence can only mean mode off.
+func TestResolve_WarnModeReportsFindingsWith200(t *testing.T) {
+	code, out := resolveEntitlement(t, "warn", false)
+	if code != http.StatusOK {
+		t.Fatalf("status %d, want 200", code)
+	}
+	ent, _ := out["issuer_entitlement"].(map[string]interface{})
+	if ent == nil || ent["allowed"] != true || ent["mode"] != "warn" {
+		t.Fatalf("issuer_entitlement = %v", ent)
+	}
+	if f, _ := ent["findings"].([]interface{}); len(f) == 0 {
+		t.Error("warn must report the findings")
+	}
+}
+
+func TestResolve_OffModeOmitsTheResult(t *testing.T) {
+	code, out := resolveEntitlement(t, "off", false)
+	if code != http.StatusOK {
+		t.Fatalf("status %d, want 200", code)
+	}
+	if _, present := out["issuer_entitlement"]; present {
+		t.Error("off must not report a result (absent means not checked)")
 	}
 }

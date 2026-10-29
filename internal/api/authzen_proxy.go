@@ -73,10 +73,13 @@ type resolveURLResponse struct {
 // AuthZENProxyHandler handles AuthZEN evaluation requests by proxying to a PDP.
 // It provides an authenticated endpoint for the frontend to make trust decisions.
 type AuthZENProxyHandler struct {
-	cfg              *config.AuthZENProxyConfig
-	authorizer       authz.Authorizer
-	tenantLookup     TenantLookup
-	issuerLookup     IssuerLookup
+	cfg          *config.AuthZENProxyConfig
+	authorizer   authz.Authorizer
+	tenantLookup TenantLookup
+	issuerLookup IssuerLookup
+	// entitlementMode is the resolved issuer entitlement mode, the same value
+	// the engine reads (config.Config.EffectiveIssuerEntitlementMode).
+	entitlementMode  string
 	metadataResolver IssuerMetadataResolver
 	clients          map[string]*authzenclient.Client
 	clientsMu        sync.RWMutex
@@ -99,6 +102,7 @@ type AuthZENProxyHandler struct {
 func NewAuthZENProxyHandler(cfg *config.AuthZENProxyConfig, authorizer authz.Authorizer, tenantLookup TenantLookup, issuerLookup IssuerLookup, metadataResolver IssuerMetadataResolver, httpClient *http.Client, pdpClient *http.Client, logger *zap.Logger) *AuthZENProxyHandler {
 	return &AuthZENProxyHandler{
 		cfg:              cfg,
+		entitlementMode:  cfg.IssuerEntitlementMode, //nolint:staticcheck // the alias is the only thing this constructor sees; NewAuthZENProxyHandlerFromConfig overrides it with the resolved value
 		authorizer:       authorizer,
 		tenantLookup:     tenantLookup,
 		issuerLookup:     issuerLookup,
@@ -181,6 +185,7 @@ func NewAuthZENProxyHandlerFromConfig(cfg *config.Config, tenantLookup TenantLoo
 	// Propagate the HTTP client's allow_http setting so that logo and
 	// jwks_uri fetches respect the same policy as metadata resolution.
 	handler.allowHTTP = cfg.HTTPClient.AllowsPlaintext()
+	handler.entitlementMode = cfg.EffectiveIssuerEntitlementMode()
 
 	logger.Info("AuthZEN proxy initialized",
 		zap.String("pdp_url", pdpURL),
@@ -774,9 +779,13 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	if entitlement != nil && !entitlement.Allowed {
 		h.logger.Warn("issuer is not entitled to issue the requested credential",
 			zap.String("issuer_url", issuerURL),
-			zap.Any("findings", entitlement.Findings))
+			zap.Strings("codes", entitlementCodes(entitlement)))
+		// 403 with an explicit result: the refusal carries the same code the
+		// engine sends on the WebSocket (ISSUER_NOT_ENTITLED) and the decision
+		// with allowed=false, so it cannot be read as "not checked".
 		c.JSON(http.StatusForbidden, gin.H{
 			"error":              "issuer is not registered to issue the requested credential",
+			"code":               "ISSUER_NOT_ENTITLED",
 			"issuer_entitlement": entitlement,
 		})
 		return
@@ -1336,11 +1345,15 @@ func getActionName(req *gotrust.EvaluationRequest) string {
 }
 
 // evaluateIssuerEntitlement applies the ARF §6.6.2.3 wallet-side checks to a
-// resolved provider: is the signing certificate a WRPAC, does the registration
-// certificate describe this provider, and is it registered for what it offers.
+// resolved provider through issuertrust.Assess, the same evaluation the engine
+// runs: is the signing certificate a trusted WRPAC, is the registration
+// certificate signed by a trusted registrar, does it describe this provider,
+// and is it registered for what it offers.
 //
-// Returns nil when there is nothing to say — mode off, or metadata that was
-// never signed, in which case the trust decision above has already dealt with it.
+// Returns nil only when the mode is off. Metadata that is not signed by a
+// certificate chain is a finding here exactly as in the engine (a refusal in
+// fail mode), and chainTrusted is the PDP's decision on the key material the
+// chain was taken from.
 func (h *AuthZENProxyHandler) evaluateIssuerEntitlement(
 	ctx context.Context,
 	pdp registrarPDP,
@@ -1350,28 +1363,29 @@ func (h *AuthZENProxyHandler) evaluateIssuerEntitlement(
 	chainTrusted bool,
 	credentialTypes []string,
 ) *issuertrust.Decision {
-	mode := issuertrust.ParseMode(h.cfg.IssuerEntitlementMode)
-	if mode == issuertrust.ModeOff || result == nil {
+	mode := issuertrust.ParseMode(h.entitlementMode)
+	if result == nil {
 		return nil
 	}
-
-	chain := issuertrust.ChainFromX5C(keyMaterialX5C(keyMaterial))
-	if len(chain) == 0 && !result.Signed {
-		// Unsigned metadata is not an entitlement problem, and reporting it as
-		// one would double up on a decision already made above.
-		return nil
-	}
-
-	registrationCert := issuermetadata.RegistrationCertificate(result.Metadata)
-	return issuertrust.Evaluate(issuertrust.Input{
-		Chain:            chain,
-		RegistrationCert: registrationCert,
-		// keyMaterial is what the PDP decision above was made on, and chain is
+	chain := keyMaterialX5C(keyMaterial)
+	return issuertrust.Assess(ctx, issuertrust.Source{
+		Metadata:  result.Metadata,
+		SignerX5C: chain,
+		// keyMaterial is what the PDP decision was made on, and the chain is
 		// taken from it, so the decision covers the chain.
-		ChainAnchored:    chainTrusted,
-		Offers:           issuertrust.OffersFor(result.Metadata, credentialTypes),
-		RegistrationAuth: h.authenticateRegistrationCert(ctx, pdp, issuerURL, registrationCert),
+		ChainAnchored: chainTrusted,
+		Registrar:     h.registrarTrust(pdp, issuerURL),
+		Configs:       issuertrust.ConfigsFromRaw(result.Metadata),
+		IDs:           credentialTypes,
 	}, mode)
+}
+
+func entitlementCodes(d *issuertrust.Decision) []string {
+	codes := make([]string, 0, len(d.Findings))
+	for _, f := range d.Findings {
+		codes = append(codes, string(f.Code))
+	}
+	return codes
 }
 
 // registrarPDP is the slice of the AuthZEN client the registrar check needs.
@@ -1379,15 +1393,13 @@ type registrarPDP interface {
 	Evaluate(ctx context.Context, req *gotrust.EvaluationRequest) (*gotrust.EvaluationResponse, error)
 }
 
-// authenticateRegistrationCert verifies the registration certificate's
-// signature and asks the PDP whether its signer is a trusted Registrar
-// (action trust.RegistrarAction). Any failure to establish that is
-// AuthUnchecked, which Evaluate reports as a finding.
-func (h *AuthZENProxyHandler) authenticateRegistrationCert(ctx context.Context, pdp registrarPDP, issuerURL, token string) issuertrust.AuthResult {
-	if token == "" || pdp == nil {
-		return issuertrust.AuthUnchecked
+// registrarTrust asks the PDP whether a registration certificate's signer is a
+// trusted Registrar (action trust.RegistrarAction). Nil when there is no PDP.
+func (h *AuthZENProxyHandler) registrarTrust(pdp registrarPDP, issuerURL string) issuertrust.RegistrarTrust {
+	if pdp == nil {
+		return nil
 	}
-	return issuertrust.AuthenticateRegistrationCert(ctx, token, func(ctx context.Context, km *trust.KeyMaterial) (bool, error) {
+	return func(ctx context.Context, km *trust.KeyMaterial) (bool, error) {
 		keys := make([]interface{}, len(km.X5C))
 		for i, cert := range km.X5C {
 			keys[i] = cert
@@ -1401,7 +1413,7 @@ func (h *AuthZENProxyHandler) authenticateRegistrationCert(ctx context.Context, 
 			return false, err
 		}
 		return resp != nil && resp.Decision, nil
-	})
+	}
 }
 
 // keyMaterialX5C returns the x5c entries of key material, or nil when it is not

@@ -3,6 +3,7 @@ package issuertrust
 import (
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/json"
 	"strings"
 )
 
@@ -44,42 +45,84 @@ func decodeX5C(encoded string) ([]byte, error) {
 	return base64.RawURLEncoding.DecodeString(strings.TrimRight(encoded, "="))
 }
 
-// OffersFor turns the credential configurations the wallet is about to request
-// into the (format, type) pairs provides_attestations is expressed in.
-//
-// credentialTypes names configuration ids from the offer; the metadata says
-// what format and vct or doctype each one actually is. Guessing the format
-// would make the check meaningless, so an id the metadata does not define is
-// skipped. It cannot be issued either: the engine only lets a flow select
-// configurations the metadata defines.
-func OffersFor(metadata map[string]interface{}, credentialTypes []string) []Offer {
-	configs, _ := metadata["credential_configurations_supported"].(map[string]interface{})
-	if configs == nil {
-		return nil
+// ConfigView is the part of a credential configuration the check reads.
+type ConfigView struct {
+	Format  string
+	VCT     string
+	Doctype string
+}
+
+// OfferFor turns a configuration into the (format, type) pair
+// provides_attestations is expressed in. The type discriminator is chosen by
+// format, as the credential request will be: doctype for mso_mdoc, vct for
+// SD-JWT VC. Reading "whichever field is set" would let a configuration carry
+// a registered value in the field its format ignores and an unregistered one
+// in the field that counts.
+func OfferFor(c ConfigView) Offer {
+	switch c.Format {
+	case "mso_mdoc":
+		return Offer{Format: c.Format, Type: c.Doctype}
+	case "dc+sd-jwt", "vc+sd-jwt":
+		return Offer{Format: c.Format, Type: c.VCT}
 	}
+	if c.VCT != "" {
+		return Offer{Format: c.Format, Type: c.VCT}
+	}
+	return Offer{Format: c.Format, Type: c.Doctype}
+}
+
+// OffersFromConfigs lists what the wallet is about to request. configs must
+// be the configurations the flow can actually select (the engine's parsed
+// metadata), not a second reading of the raw document: a configuration the
+// selection accepts but this skipped would be issued unchecked. An id that is
+// not in configs cannot be selected, so it is skipped.
+func OffersFromConfigs(configs map[string]ConfigView, ids []string) []Offer {
 	var offers []Offer
-	for _, id := range credentialTypes {
-		cfg, ok := configs[id].(map[string]interface{})
+	for _, id := range ids {
+		cfg, ok := configs[id]
 		if !ok {
 			continue
 		}
-		// A configuration with no format is still offered, so it is still
-		// checked: an empty format matches no registered attestation, which
-		// makes it a finding rather than a way past the check.
-		format, _ := cfg["format"].(string)
-		offers = append(offers, Offer{Format: format, Type: credentialTypeOf(cfg)})
+		offers = append(offers, OfferFor(cfg))
 	}
 	return offers
 }
 
-// credentialTypeOf reads the type a configuration declares: vct for SD-JWT,
-// doctype for mdoc. An empty result means only the format is matched.
-func credentialTypeOf(cfg map[string]interface{}) string {
-	if vct, ok := cfg["vct"].(string); ok && vct != "" {
-		return vct
+// ConfigsFromRaw reads credential_configurations_supported out of a raw
+// metadata map the way encoding/json reads it into the engine's typed
+// metadata: member names match case-insensitively, a null configuration is an
+// empty one (selectable, so checked, and a finding), and a configuration whose
+// fields have the wrong type counts as empty rather than being skipped. Two
+// members that differ only in case are ambiguous, so every configuration in
+// either is treated as empty.
+func ConfigsFromRaw(metadata map[string]interface{}) map[string]ConfigView {
+	var members []map[string]interface{}
+	for k, v := range metadata {
+		if !strings.EqualFold(k, "credential_configurations_supported") {
+			continue
+		}
+		if m, ok := v.(map[string]interface{}); ok {
+			members = append(members, m)
+		}
 	}
-	if doctype, ok := cfg["doctype"].(string); ok && doctype != "" {
-		return doctype
+	out := map[string]ConfigView{}
+	for _, m := range members {
+		for id, v := range m {
+			if len(members) > 1 {
+				out[id] = ConfigView{}
+				continue
+			}
+			var view struct {
+				Format  string `json:"format"`
+				VCT     string `json:"vct"`
+				Doctype string `json:"doctype"`
+			}
+			if encoded, err := json.Marshal(v); err == nil && json.Unmarshal(encoded, &view) == nil {
+				out[id] = ConfigView{Format: view.Format, VCT: view.VCT, Doctype: view.Doctype}
+			} else {
+				out[id] = ConfigView{}
+			}
+		}
 	}
-	return ""
+	return out
 }

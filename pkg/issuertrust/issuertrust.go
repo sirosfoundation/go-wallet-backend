@@ -291,7 +291,9 @@ func Evaluate(in Input, mode Mode) *Decision {
 	}
 
 	for _, o := range in.Offers {
-		if !ent.ProvidesAttestation(o.Format, o.Type) {
+		// A known format with no type cannot be matched to a registration: an
+		// empty type would match any registered query of that format.
+		if o.Type == "" && requiresType(o.Format) || !ent.ProvidesAttestation(o.Format, o.Type) {
 			d.add(mode, Finding{
 				Code:           CodeTypeNotRegistered,
 				Message:        "provider is not registered to issue this credential",
@@ -375,4 +377,13 @@ func boundedList(in []string, maxN, maxLen int) []string {
 		out = append(out, sanitizeText(v, maxLen))
 	}
 	return out
+}
+
+// requiresType reports formats whose configuration must name what it issues.
+func requiresType(format string) bool {
+	switch format {
+	case "mso_mdoc", "dc+sd-jwt", "vc+sd-jwt":
+		return true
+	}
+	return false
 }

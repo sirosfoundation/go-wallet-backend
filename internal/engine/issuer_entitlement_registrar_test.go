@@ -10,6 +10,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"math/big"
+	"net/http"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -83,7 +85,7 @@ func newRegistrarHandler(t *testing.T, mode string, pdp *registrarPDP) (*OID4VCI
 		}
 	})
 	t.Cleanup(cleanup)
-	cfg := &config.Config{AuthZENProxy: config.AuthZENProxyConfig{IssuerEntitlementMode: mode}}
+	cfg := &config.Config{Trust: config.TrustConfig{IssuerEntitlementMode: mode}}
 	var svc *TrustService
 	if pdp != nil {
 		cfg.Trust.PDPURL = "http://pdp.test"
@@ -102,10 +104,7 @@ func newRegistrarHandler(t *testing.T, mode string, pdp *registrarPDP) (*OID4VCI
 }
 
 func forgedMeta(t *testing.T, claims jwt.MapClaims) *metadataResult {
-	return &metadataResult{
-		Raw:       metaWithIssuerInfo(signedRegistrationCert(t, claims)),
-		SignerX5C: []string{selfSignedX5C(t)},
-	}
+	return metaOf(t, metaWithIssuerInfo(signedRegistrationCert(t, claims)), selfSignedX5C(t))
 }
 
 var forgedClaims = jwt.MapClaims{
@@ -116,28 +115,35 @@ var forgedClaims = jwt.MapClaims{
 
 // The hole: the registration certificate was parsed without authenticating its
 // signer, so a provider could register itself. Without a trusted Registrar
-// the claims must not be believed, in fail mode that refuses, and the PDP is
-// asked with the dedicated action.
-func TestAuthenticateRegistration_AsksThePDPAboutTheRegistrarKey(t *testing.T) {
-	meta := forgedMeta(t, forgedClaims)
+// the claims must not be believed, and the PDP is asked with the dedicated
+// action.
+func TestRegistrarTrust_AsksThePDPAboutTheRegistrarKey(t *testing.T) {
+	km := &trust.KeyMaterial{Type: "x5c", X5C: []string{"AAAA"}}
+	ctx := context.Background()
 
 	t.Run("trusted registrar", func(t *testing.T) {
 		pdp := &registrarPDP{decision: true}
 		h, _ := newRegistrarHandler(t, "fail", pdp)
-		assert.Equal(t, issuertrust.AuthVerified, h.authenticateRegistration(context.Background(), "https://issuer.example", meta))
+		ok, err := h.registrarTrust("https://issuer.example")(ctx, km)
+		assert.NoError(t, err)
+		assert.True(t, ok)
 		assert.Equal(t, []string{trust.RegistrarAction}, pdp.actions)
 	})
 	t.Run("untrusted registrar", func(t *testing.T) {
 		h, _ := newRegistrarHandler(t, "fail", &registrarPDP{decision: false})
-		assert.Equal(t, issuertrust.AuthUntrustedRegistrar, h.authenticateRegistration(context.Background(), "https://issuer.example", meta))
+		ok, err := h.registrarTrust("https://issuer.example")(ctx, km)
+		assert.NoError(t, err)
+		assert.False(t, ok)
 	})
-	t.Run("pdp failure is not a pass", func(t *testing.T) {
+	t.Run("pdp failure is an error, not a pass", func(t *testing.T) {
 		h, _ := newRegistrarHandler(t, "fail", &registrarPDP{decision: true, failed: true})
-		assert.Equal(t, issuertrust.AuthUnchecked, h.authenticateRegistration(context.Background(), "https://issuer.example", meta))
+		ok, err := h.registrarTrust("https://issuer.example")(ctx, km)
+		assert.Error(t, err)
+		assert.False(t, ok)
 	})
-	t.Run("no pdp configured is not a pass", func(t *testing.T) {
+	t.Run("no pdp configured: no trust path", func(t *testing.T) {
 		h, _ := newRegistrarHandler(t, "fail", nil)
-		assert.Equal(t, issuertrust.AuthUnchecked, h.authenticateRegistration(context.Background(), "https://issuer.example", meta))
+		assert.Nil(t, h.registrarTrust("https://issuer.example"))
 	})
 }
 
@@ -145,9 +151,9 @@ func TestCheckIssuerEntitlement_FailModeRefusesAnUntrustedRegistrar(t *testing.T
 	h, _ := newRegistrarHandler(t, "fail", &registrarPDP{decision: false})
 	offer := &CredentialOffer{CredentialIssuer: "https://issuer.example", CredentialConfigurationIDs: []string{"pid"}}
 
-	err := h.checkIssuerEntitlement(context.Background(), offer.CredentialIssuer, forgedMeta(t, forgedClaims), offer)
+	_, err := h.checkIssuerEntitlement(context.Background(), offer.CredentialIssuer, forgedMeta(t, forgedClaims), offer)
 
-	require.Error(t, err)
+	require.ErrorIs(t, err, errIssuerNotEntitled)
 	assert.Contains(t, err.Error(), string(issuertrust.CodeRegistrarNotTrusted))
 	assert.NotContains(t, err.Error(), "anyone", "claims of the forged certificate are not echoed")
 }
@@ -158,7 +164,8 @@ func TestCheckIssuerEntitlement_ProgressPayloadShape(t *testing.T) {
 	h, sent := newRegistrarHandler(t, "warn", &registrarPDP{decision: false})
 	offer := &CredentialOffer{CredentialIssuer: "https://issuer.example", CredentialConfigurationIDs: []string{"pid"}}
 
-	require.NoError(t, h.checkIssuerEntitlement(context.Background(), offer.CredentialIssuer, forgedMeta(t, forgedClaims), offer))
+	_, err := h.checkIssuerEntitlement(context.Background(), offer.CredentialIssuer, forgedMeta(t, forgedClaims), offer)
+	require.NoError(t, err)
 
 	var msg map[string]interface{}
 	select {
@@ -199,10 +206,11 @@ func TestCheckIssuerEntitlement_ProgressOmitsRegistrationCertificateContent(t *t
 	offer := &CredentialOffer{CredentialIssuer: "https://issuer.example", CredentialConfigurationIDs: []string{"pid"}}
 	meta := forgedMeta(t, forgedClaims)
 
-	full := entitlementFor(issuertrust.ModeWarn, meta, offer.CredentialConfigurationIDs, entitlementAuth{registration: issuertrust.AuthVerified, chainAnchored: true})
+	full := entitlementFor(context.Background(), issuertrust.ModeWarn, meta, offer.CredentialConfigurationIDs, trustingRegistrar, true)
 	require.NotEmpty(t, full.Entitlements, "precondition: the verified certificate's content is in the decision")
 
-	require.NoError(t, h.checkIssuerEntitlement(context.Background(), offer.CredentialIssuer, meta, offer))
+	_, err := h.checkIssuerEntitlement(context.Background(), offer.CredentialIssuer, meta, offer)
+	require.NoError(t, err)
 	msg := <-sent
 	raw, _ := json.Marshal(msg["payload"])
 	assert.NotContains(t, string(raw), "anyone")
@@ -214,7 +222,8 @@ func TestCheckIssuerEntitlement_ProgressOmitsRegistrationCertificateContent(t *t
 func TestCheckIssuerEntitlement_UnknownModeStillChecks(t *testing.T) {
 	h, sent := newRegistrarHandler(t, "FAIL ", &registrarPDP{decision: false})
 	offer := &CredentialOffer{CredentialIssuer: "https://issuer.example", CredentialConfigurationIDs: []string{"pid"}}
-	require.NoError(t, h.checkIssuerEntitlement(context.Background(), offer.CredentialIssuer, forgedMeta(t, forgedClaims), offer))
+	_, err := h.checkIssuerEntitlement(context.Background(), offer.CredentialIssuer, forgedMeta(t, forgedClaims), offer)
+	require.NoError(t, err)
 	select {
 	case <-sent:
 	case <-time.After(2 * time.Second):
@@ -289,9 +298,53 @@ func TestExecute_FailModeBlocksBeforeSelection(t *testing.T) {
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not registered to issue", "refused by the entitlement check, not by the timeout")
-	steps, errCodes := drain(f.sent)
+	msgs := drainAll(f.sent)
+	var steps []string
+	var flowErr map[string]interface{}
+	for _, m := range msgs {
+		if st, _ := m["step"].(string); st != "" {
+			steps = append(steps, st)
+		}
+		if m["type"] == "flow_error" {
+			flowErr, _ = m["error"].(map[string]interface{})
+		}
+	}
 	assert.NotContains(t, steps, string(StepAwaitingSelection), "the flow must not reach selection")
-	assert.Contains(t, errCodes, string(ErrCodeUntrustedIssuer))
+
+	// The wire contract (docs/websocket-protocol-spec.md): a distinct code, the
+	// fixed message, and details with the issuer and the bounded decision.
+	require.NotNil(t, flowErr, "no flow_error was sent")
+	assert.Equal(t, "ISSUER_NOT_ENTITLED", flowErr["code"])
+	assert.Equal(t, ErrCodeIssuerNotEntitled.UserFacingMessage(), flowErr["message"])
+	details, _ := flowErr["details"].(map[string]interface{})
+	require.NotNil(t, details)
+	assert.Equal(t, "https://issuer.example", details["issuer"])
+	ent, _ := details["issuer_entitlement"].(map[string]interface{})
+	require.NotNil(t, ent)
+	assert.Equal(t, false, ent["allowed"])
+	assert.Equal(t, "fail", ent["mode"])
+	assert.NotEmpty(t, ent["findings"])
+	assert.NotContains(t, ent, "entitlements")
+	assert.NotContains(t, ent, "subject")
+}
+
+// A trust-decision refusal keeps its own code: UNTRUSTED_ISSUER is not
+// "not registered".
+func TestExecute_UntrustedIssuerKeepsItsCode(t *testing.T) {
+	f := newExecuteFixture(t, "fail")
+	f.h.TrustSvc = trust.NewService(f.h.Config, zap.NewNop(),
+		func(string, time.Duration) (trust.TrustEvaluator, error) { return &registrarPDP{decision: false}, nil })
+
+	require.Error(t, f.h.Execute(context.Background(), f.msg))
+
+	var code string
+	for _, m := range drainAll(f.sent) {
+		if m["type"] == "flow_error" {
+			e, _ := m["error"].(map[string]interface{})
+			code, _ = e["code"].(string)
+		}
+	}
+	assert.Equal(t, "UNTRUSTED_ISSUER", code)
 }
 
 func TestExecute_WarnModeReportsAndReachesSelection(t *testing.T) {
@@ -366,4 +419,76 @@ func TestChainAnchored(t *testing.T) {
 		h, _ := newRegistrarHandler(t, "fail", &registrarPDP{decision: true})
 		assert.False(t, h.chainAnchored(ctx, "https://issuer.example", &metadataResult{}))
 	})
+}
+
+// selectivePDP trusts the registrar and the IACA certificates, and nothing else:
+// in particular not a certificate chain the issuer made for itself.
+type selectivePDP struct{ trustedKey string }
+
+func (p *selectivePDP) Evaluate(_ context.Context, req *trust.EvaluationRequest) (*trust.EvaluationResponse, error) {
+	if req.Action == trust.RegistrarAction {
+		return &trust.EvaluationResponse{Decision: true}, nil
+	}
+	keys, _ := req.Key.([]string)
+	return &trust.EvaluationResponse{Decision: len(keys) == 1 && keys[0] == p.trustedKey}, nil
+}
+func (p *selectivePDP) Name() string { return "selective-pdp" }
+func (p *selectivePDP) SupportedResourceTypes() []trust.ResourceType {
+	return []trust.ResourceType{trust.ResourceTypeX5C}
+}
+func (p *selectivePDP) Healthy() bool { return true }
+
+// For an mdoc issuer the issuer trust decision is made on mdoc_iacas_uri
+// certificates (extractIssuerKeyMaterial prefers them), not on the chain that
+// signed the metadata. A WRPRC is public, so a self-made WRPAC carrying the
+// right organisation identifier beside the genuine WRPRC must still be
+// refused: the signer chain has to be anchored on its own.
+func TestExecute_MdocIssuerWithSelfMadeWRPACIsRefused(t *testing.T) {
+	iaca := selfSignedX5C(t)
+	iacas := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"iacas": []map[string]string{{"certificate": iaca}}})
+	}))
+	defer iacas.Close()
+
+	f := newExecuteFixture(t, "fail")
+	f.h.httpClient = iacas.Client()
+	f.h.TrustSvc = trust.NewService(f.h.Config, zap.NewNop(),
+		func(string, time.Duration) (trust.TrustEvaluator, error) { return &selectivePDP{trustedKey: iaca}, nil })
+	f.h.metadataResolver = fakeMetadataResolver{result: &issuermetadata.ResolveResult{
+		Metadata: map[string]interface{}{
+			"credential_issuer":   "https://issuer.example",
+			"credential_endpoint": "https://issuer.example/credential",
+			"mdoc_iacas_uri":      iacas.URL,
+			"credential_configurations_supported": map[string]interface{}{
+				"pid": map[string]interface{}{"format": "dc+sd-jwt", "vct": "urn:eudi:pid:1"},
+				"mdl": map[string]interface{}{"format": "dc+sd-jwt", "vct": "urn:eudi:mdl:1"},
+			},
+			// The genuine registration certificate, replayed (it is public).
+			"issuer_info": []interface{}{map[string]interface{}{
+				"format": issuermetadata.FormatRegistrationCert, "data": signedRegistrationCert(t, forgedClaims),
+			}},
+		},
+		Signed: true, Validated: true,
+		SignerKeyMaterial: &issuermetadata.SignerKeyMaterial{Type: "x5c", X5C: []string{selfSignedX5C(t)}},
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	err := f.h.Execute(ctx, f.msg)
+
+	require.ErrorIs(t, err, errIssuerNotEntitled, "the issuer trust step passed (IACAs); the entitlement step must refuse")
+	var codes []interface{}
+	for _, m := range drainAll(f.sent) {
+		if m["type"] != "flow_error" {
+			continue
+		}
+		e, _ := m["error"].(map[string]interface{})
+		assert.Equal(t, "ISSUER_NOT_ENTITLED", e["code"])
+		d, _ := e["details"].(map[string]interface{})
+		ent, _ := d["issuer_entitlement"].(map[string]interface{})
+		for _, raw := range ent["findings"].([]interface{}) {
+			codes = append(codes, raw.(map[string]interface{})["code"])
+		}
+	}
+	assert.Contains(t, codes, string(issuertrust.CodeAccessCertificateNotTrusted))
 }

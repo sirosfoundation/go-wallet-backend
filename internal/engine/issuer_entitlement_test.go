@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/json"
 	"math/big"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuertrust"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
 func selfSignedX5C(t *testing.T) string {
@@ -59,15 +61,26 @@ func findingCodes(d *issuertrust.Decision) []issuertrust.Code {
 	return out
 }
 
+// metaOf builds what fetchMetadata returns: the raw document, and the typed
+// metadata parsed from it the same way.
+func metaOf(t *testing.T, raw map[string]interface{}, signerX5C ...string) *metadataResult {
+	t.Helper()
+	b, err := json.Marshal(raw)
+	require.NoError(t, err)
+	var typed IssuerMetadata
+	require.NoError(t, json.Unmarshal(b, &typed))
+	return &metadataResult{Metadata: &typed, Raw: raw, SignerX5C: signerX5C}
+}
+
 func TestEntitlementFor_OffChecksNothing(t *testing.T) {
-	assert.Nil(t, entitlementFor(issuertrust.ModeOff, &metadataResult{Raw: metaWithIssuerInfo("")}, []string{"pid"}, entitlementAuth{}))
+	assert.Nil(t, entitlementFor(context.Background(), issuertrust.ModeOff, metaOf(t, metaWithIssuerInfo("")), []string{"pid"}, nil, false))
 }
 
 // Metadata that was not signed by a certificate chain has no access
 // certificate. In fail mode that must refuse; reading it as "nothing to check"
 // would let any unsigned issuer through the very control meant to stop it.
 func TestEntitlementFor_FailRefusesUnsignedMetadata(t *testing.T) {
-	d := entitlementFor(issuertrust.ModeFail, &metadataResult{Raw: metaWithIssuerInfo("")}, []string{"pid"}, entitlementAuth{})
+	d := entitlementFor(context.Background(), issuertrust.ModeFail, metaOf(t, metaWithIssuerInfo("")), []string{"pid"}, nil, false)
 
 	require.NotNil(t, d)
 	assert.False(t, d.Allowed)
@@ -76,30 +89,29 @@ func TestEntitlementFor_FailRefusesUnsignedMetadata(t *testing.T) {
 }
 
 func TestEntitlementFor_WarnReportsButAllows(t *testing.T) {
-	d := entitlementFor(issuertrust.ModeWarn, &metadataResult{Raw: metaWithIssuerInfo("")}, []string{"pid"}, entitlementAuth{})
+	d := entitlementFor(context.Background(), issuertrust.ModeWarn, metaOf(t, metaWithIssuerInfo("")), []string{"pid"}, nil, false)
 
 	require.NotNil(t, d)
 	assert.True(t, d.Allowed)
 	assert.NotEmpty(t, d.Findings)
 }
 
+func trustingRegistrar(context.Context, *trust.KeyMaterial) (bool, error) { return true, nil }
+
 // The raw metadata is what carries issuer_info. The typed IssuerMetadata drops
 // it, so a regression to reading that would report "no registration
 // certificate" for an issuer that published one.
 func TestEntitlementFor_ReadsRegistrationCertificateFromRawMetadata(t *testing.T) {
-	meta := &metadataResult{
-		Raw:       metaWithIssuerInfo("not.a.jwt"),
-		SignerX5C: []string{selfSignedX5C(t)},
-	}
+	meta := metaOf(t, metaWithIssuerInfo(signedRegistrationCert(t, forgedClaims)), selfSignedX5C(t))
 
-	d := entitlementFor(issuertrust.ModeFail, meta, []string{"pid"}, entitlementAuth{registration: issuertrust.AuthVerified, chainAnchored: true})
+	d := entitlementFor(context.Background(), issuertrust.ModeFail, meta, []string{"pid"}, trustingRegistrar, true)
 
 	require.NotNil(t, d)
 	assert.False(t, d.Allowed)
 	codes := findingCodes(d)
 	assert.Contains(t, codes, issuertrust.CodeNotWRPAC, "the signing certificate was read")
-	assert.Contains(t, codes, issuertrust.CodeRegistrationMalformed, "the registration certificate was read")
-	assert.NotContains(t, codes, issuertrust.CodeNoRegistrationCert)
+	assert.NotContains(t, codes, issuertrust.CodeNoRegistrationCert, "the registration certificate was read")
+	assert.NotContains(t, codes, issuertrust.CodeRegistrationUnverified)
 }
 
 func newEntitlementTestHandler(t *testing.T, mode string) *OID4VCIHandler {
@@ -119,7 +131,7 @@ func newEntitlementTestHandler(t *testing.T, mode string) *OID4VCIHandler {
 	h.BaseHandler = BaseHandler{
 		Flow:   flow,
 		Logger: zap.NewNop(),
-		Config: &config.Config{AuthZENProxy: config.AuthZENProxyConfig{IssuerEntitlementMode: mode}},
+		Config: &config.Config{Trust: config.TrustConfig{IssuerEntitlementMode: mode}},
 	}
 	return h
 }
@@ -128,7 +140,7 @@ func TestCheckIssuerEntitlement_FailModeBlocksFlow(t *testing.T) {
 	h := newEntitlementTestHandler(t, "fail")
 	offer := &CredentialOffer{CredentialIssuer: "https://issuer.example", CredentialConfigurationIDs: []string{"pid"}}
 
-	err := h.checkIssuerEntitlement(context.Background(), offer.CredentialIssuer, &metadataResult{Raw: metaWithIssuerInfo("")}, offer)
+	_, err := h.checkIssuerEntitlement(context.Background(), offer.CredentialIssuer, metaOf(t, metaWithIssuerInfo("")), offer)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), string(issuertrust.CodeNoAccessCertificate))
@@ -138,7 +150,8 @@ func TestCheckIssuerEntitlement_WarnModeContinues(t *testing.T) {
 	h := newEntitlementTestHandler(t, "warn")
 	offer := &CredentialOffer{CredentialIssuer: "https://issuer.example", CredentialConfigurationIDs: []string{"pid"}}
 
-	assert.NoError(t, h.checkIssuerEntitlement(context.Background(), offer.CredentialIssuer, &metadataResult{Raw: metaWithIssuerInfo("")}, offer))
+	_, err := h.checkIssuerEntitlement(context.Background(), offer.CredentialIssuer, metaOf(t, metaWithIssuerInfo("")), offer)
+	assert.NoError(t, err)
 }
 
 func TestCheckIssuerEntitlement_UnsetModeIsWarnNotOff(t *testing.T) {
@@ -146,8 +159,9 @@ func TestCheckIssuerEntitlement_UnsetModeIsWarnNotOff(t *testing.T) {
 	offer := &CredentialOffer{CredentialIssuer: "https://issuer.example", CredentialConfigurationIDs: []string{"pid"}}
 
 	// Findings are produced (so the check ran) and issuance continues.
-	assert.NoError(t, h.checkIssuerEntitlement(context.Background(), offer.CredentialIssuer, &metadataResult{Raw: metaWithIssuerInfo("")}, offer))
-	d := entitlementFor(issuertrust.ParseMode(""), &metadataResult{Raw: metaWithIssuerInfo("")}, offer.CredentialConfigurationIDs, entitlementAuth{})
+	_, err := h.checkIssuerEntitlement(context.Background(), offer.CredentialIssuer, metaOf(t, metaWithIssuerInfo("")), offer)
+	assert.NoError(t, err)
+	d := entitlementFor(context.Background(), issuertrust.ParseMode(""), metaOf(t, metaWithIssuerInfo("")), offer.CredentialConfigurationIDs, nil, false)
 	require.NotNil(t, d)
 	assert.Equal(t, issuertrust.ModeWarn, d.Mode)
 }
@@ -177,4 +191,36 @@ func TestFetchMetadata_KeepsRawMetadataAndSignerChain(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "a.b.c", issuermetadata.RegistrationCertificate(got.Raw))
 	assert.Equal(t, []string{x5c}, got.SignerX5C)
+}
+
+// What is checked is what can be selected. The offers come from the parsed
+// metadata, which decodes the way encoding/json does (member names match
+// case-insensitively, a null configuration is an empty, selectable one), not
+// from a second, exact-name reading of the raw document. Both configurations
+// below are issuable and neither is registered.
+func TestEntitlementFor_ChecksWhatTheParsedMetadataCanSelect(t *testing.T) {
+	raw := map[string]interface{}{
+		"Credential_Configurations_Supported": map[string]interface{}{
+			"pid":     map[string]interface{}{"format": "dc+sd-jwt", "vct": "urn:eudi:pid:1"},
+			"nul":     nil,
+			"diploma": map[string]interface{}{"Format": "dc+sd-jwt", "VCT": "urn:eudi:diploma:1"},
+		},
+		"issuer_info": []interface{}{map[string]interface{}{
+			"format": "registration_cert", "data": signedRegistrationCert(t, forgedClaims),
+		}},
+	}
+	meta := metaOf(t, raw, selfSignedX5C(t))
+	require.Len(t, meta.Metadata.CredentialConfigurationsSupported, 3, "precondition: all three are selectable")
+
+	d := entitlementFor(context.Background(), issuertrust.ModeFail, meta, []string{"pid", "nul", "diploma"}, trustingRegistrar, true)
+
+	require.NotNil(t, d)
+	assert.False(t, d.Allowed)
+	var unregistered int
+	for _, c := range findingCodes(d) {
+		if c == issuertrust.CodeTypeNotRegistered {
+			unregistered++
+		}
+	}
+	assert.Equal(t, 2, unregistered, "the null and the case-variant configurations were checked")
 }
