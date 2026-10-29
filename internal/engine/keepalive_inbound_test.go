@@ -154,9 +154,8 @@ func TestPingLoop_NotBlockedByHeldSendMutex(t *testing.T) {
 		}
 	}()
 
-	wst := s.transport.(*wsTransport)
-	wst.sendMu.Lock() // simulates an in-flight, blocked s.Send
-	defer wst.sendMu.Unlock()
+	s.sendMu.Lock() // simulates an in-flight, blocked s.Send
+	defer s.sendMu.Unlock()
 	go s.pingLoop() // stopped by handleSession's cleanup, which owns stopPing
 
 	require.Eventually(t, func() bool { return pings.Load() >= 2 }, 2*time.Second, 20*time.Millisecond,

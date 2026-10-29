@@ -243,7 +243,12 @@ kubectl apply -f k8s/deployment.yaml
 Earlier releases kept the per-user session pointer at `<prefix>user:<userID>`.
 This release scopes it by tenant at `<prefix>usert:<b64url(tenant)>:<b64url(userID)>`
 (unpadded base64url, so the `:` separator is unambiguous) and adds a
-`<prefix>userall:<userID>` index used for account deletion. The new pointer
+`<prefix>userall:<userID>` index used for account deletion. The per-tenant
+index moves from the TTL-less set `<prefix>tenant:<tenantID>` to the sorted set
+`<prefix>tenantx:<tenantID>`; both indexes are scored by expiry, pruned on every
+add and expire with their longest-lived member, so neither grows without bound.
+The legacy `tenant:` sets are no longer written; `List`, `Delete` and
+`DeleteByUser` drain them. The new pointer
 deliberately does not reuse the `user:` namespace: the legacy key is the raw
 user ID, so with `:` in IDs a legacy user `default:u` and the new
 (tenant `default`, user `u`) would otherwise share one key and could overwrite
@@ -253,6 +258,11 @@ during a rolling upgrade, the store falls back to the legacy pointer:
 - `GetByUser` uses the legacy pointer when the new one is absent, returns the
   session only if its user and (normalised) tenant match the request, and
   lazily backfills the new pointer and index.
+  If the new pointer names a session that no longer exists (an old replica
+  deleted it and wrote a replacement under the legacy pointer only), the stale
+  pointer is dropped and the lookup resolves through the legacy pointer.
+- Listing the `default` tenant also includes sessions that old replicas wrote
+  with no tenant claim (the raw empty-tenant set).
 - `DeleteByUser` and `Delete` also remove the legacy pointer, and delete the
   session it names only if that session belongs to the target user.
 
@@ -261,6 +271,45 @@ unless configured): legacy keys carry the session TTL and disappear on their
 own, after which the fallback finds nothing. Sessions still written by old
 replicas during the rollout stay covered for the same window; complete the
 rollout within it and no migration step is needed.
+
+### WMP session affinity
+
+The engine serves WMP over HTTP+SSE (`POST` and `GET` `/api/v2/wallet/rpc`,
+`GET /api/v2/wallet/rpc/events`; discovery at `/.well-known/wmp-configuration`).
+Session handling is go-wmp's (`wmp.SessionService`, `httpsse.NewSecuredServerHandler`);
+what it keeps, it keeps in the memory of the replica that created the session:
+
+- the stored WMP session, its owner and its resumption token;
+- the per-session event log that `Last-Event-ID` replay reads, and the state go-wmp
+  re-sends on `wmp.session.resume`;
+- the engine session and the flows that run in it (they do not survive a replica
+  change in any case).
+
+With more than one engine replica the load balancer MUST therefore keep each client
+on one replica. Every WMP request (`wmp.session.create`, every `POST`, the event
+stream) carries the `Authorization: Bearer` header, so key affinity on a hash of
+that header; `Wmp-Session-Id` and the `session_id` query parameter are present on
+every request except `wmp.session.create`. A request that reaches another replica
+is answered `-31000` (session not found; an unknown session and another user's are
+indistinguishable by design) and the client has to create a new session.
+
+Limits of header affinity: a refreshed token hashes differently and may land on
+another replica, which has neither the session nor its resumption token, so the
+client must create a new session after a token refresh unless the balancer keys on
+`Wmp-Session-Id`. A replica that is restarted or drained (`SIGTERM` ends the
+event streams and the sessions) loses its sessions the same way.
+
+Everything else is spelled out by the protocol, not by deployment:
+
+- A client that falls behind the replay window gets `410 Gone` on the event stream
+  and resumes with `wmp.session.resume`; it then re-reads the state of its flows.
+- `refresh_token`, `dpop_jwk` and `dpop_key_id` of a completed issuance are in the
+  live event only; a replayed completion lists them in `redacted_members`.
+- The Redis session store described above is the WebSocket engine's. It does
+  not hold WMP sessions. Shared WMP
+  session state needs a Redis `SessionStore` and `EventLog` for go-wmp, which is
+  planned as a separate go-wmp module, and engine flows that survive a replica
+  change; until then affinity is required.
 
 ### Horizontal Pod Autoscaler
 
@@ -510,6 +559,42 @@ scrape_configs:
       - targets: ['wallet-backend:8080']
 ```
 
+### WebSocket close reasons
+
+Every engine WebSocket session that ends logs exactly one Info line,
+`Session close reason`, and increments the counter
+`siros_engine_ws_session_closed_total{reason}`. Use it to tell *why* clients
+that keep reconnecting are being dropped.
+
+| `reason` | Meaning | Extra fields |
+| --- | --- | --- |
+| `read_deadline` | No frame, ping or pong from the client within the read window (`ping_interval` + `pong_timeout`, default 3 s + 5 s) | `read_window`, `since_last_inbound` |
+| `peer_close` | The client sent a close frame or the TCP connection was closed | `close_code` (numeric only; the peer's close text is never logged) |
+| `superseded` | A newer connection for the same user replaced this one ("last connection wins") | `superseded_by_session_id` |
+| `account_deleted`, `token_revoked`, `revocation_check_failed` | Closed by the server because the user or token was revoked, or the revocation store could not answer | |
+| `write_error` | A ping or handshake write failed | |
+| `server_shutdown` | `engine.Manager.Close` closed the session. The server binary does not currently call it on SIGTERM, so this is not expected in production | |
+| `read_error` | Any other read failure | `error_class` (Go type only, no message) |
+| `server_close` | Any other server-initiated close | |
+
+Common fields: `session_id`, `session` (short user id), `tenant_id`,
+`remote_addr` (the raw socket peer: behind a proxy this is the proxy, not the
+client), `session_age`, `ping_interval`, `pong_timeout`.
+
+The default JSON logger uses zap's production sampling (the first 100 lines
+per second for a given level and message are kept, then every 100th), so a
+burst of more than 100 disconnects in one second can drop some `Session close
+reason` lines. The counter is never sampled and is the exact source for
+totals.
+
+When a connection supersedes another, the `Closing existing session` Info
+line carries `old_session_id`/`new_session_id`, both ages and both remote
+addresses, and the new connection's `Session established` line carries
+`superseded_session_id` (empty if it superseded nothing). A client that
+reconnects every few seconds with `read_deadline` closes points at keepalive
+(the client not answering pings, or a proxy swallowing them); a stream of
+`superseded` closes points at two sockets for one user fighting each other.
+
 ### Logs
 
 Logs are output to stdout in JSON format:
@@ -603,87 +688,76 @@ cp wallet.db.backup wallet.db
 
 #### Token revocation with several replicas
 
-Token revocation state is held **in memory, per process**: revoked access-token
-JTIs (logout) and revoked users (account deletion). With one replica a logout or
-account deletion is enforced immediately. With **several replicas, or after a
-restart**, a revocation recorded on one replica is not seen by the others, so a
-logged-out access token remains usable on a replica that never handled the
-logout until it expires (`as.default_token_ttl`, 2 minutes by default).
+Revoked access-token JTIs (logout) and revoked users (account deletion) are
+kept in the **revocation store**, selected by
+`security.token_blacklist.backend` (env
+`WALLET_SECURITY_TOKEN_BLACKLIST_BACKEND`):
 
-Until a shared revocation store exists (tracked in #407 / #415), either run a
-single replica for the token-issuing role, or route a user's requests to the
-same replica (session affinity) and accept that a restart forgets revocations.
-The AS session store itself is shared when it is MongoDB-backed, so sessions
-survive across replicas and restarts; only the revocation markers are process-local.
+| Value | Behaviour |
+|-------|-----------|
+| *(empty, default)* | `storage` when `storage.type` is `mongodb`, otherwise `memory` |
+| `storage` | MongoDB. Shared by all replicas and survives restarts. Requires `storage.type: mongodb` (rejected at startup otherwise) |
+| `memory` | Per process. Lost on restart and not seen by other replicas |
 
-#### WMP sessions need load-balancer affinity
+The `storage` backend uses two collections in the storage database:
+`revoked_tokens` (`_id` is the JTI, `expires_at` with a TTL index, so entries
+disappear after the token's own expiry; the check compares `expires_at`
+itself because MongoDB's TTL monitor only runs about once a minute) and
+`revoked_users` (one document per revoked user, no TTL: a user revocation is
+permanent). Reads go to the primary and writes use majority write concern,
+so a revocation is seen by the next check on any replica. A secondary-read
+lag is therefore not a concern for these collections.
 
-The WMP (HTTP+SSE) transport keeps its session state in the memory of the
-engine process that created the session. This is process-local and is **not**
-shared between replicas:
+The store fails closed. If it cannot be reached or set up, a revocation
+lookup that cannot be answered refuses the request instead of accepting it:
+API requests get `503 {"error":"Token revocation check unavailable"}`, the
+token-delegation endpoint answers 503, a WebSocket handshake is refused, and a
+token checked by the token validator is rejected with 401. Every lookup is
+bounded to 5 seconds. A revocation write that fails
+fails the request: logout (`POST /user/session/logout`, `DELETE /auth/session`)
+and account deletion answer 500 and change nothing the client cannot retry
+(the session cookie is kept, the user and their data are untouched); repeat
+the request once the store is back. Nothing is queued or replayed by the
+server: a failed revocation is not recorded until the client repeats the
+request. Account deletion revokes first. A write that reported an error may
+still have been stored, so a revoked user can still call `DELETE /user/session`
+(and only that route) to complete the deletion, and a token whose jti was
+revoked by an interrupted logout is still admitted by
+`POST /user/session/logout` (and only that route), so the retry succeeds. Both
+revocations are idempotent and are never withdrawn after a failure. If
+the store cannot be set up at startup the process still starts, logs an
+error and refuses authenticated requests until restarted.
 
-- the WMP session registry (the peer, the authenticated user and tenant, the
-  session TTL and the resumption tokens),
-- the active flows and their handler goroutines, and
-- the per-session SSE event buffer used for `Last-Event-ID` replay (a replayed
-  `wmp.flow.complete` never carries `refresh_token`, `dpop_jwk` or `dpop_key_id`
-  (OpenID4x 3.1.4.2); they are delivered only live. The display-only
-  `credential_metadata` is not a secret and is retained, see
-  `docs/wmp-migration-analysis.md`).
+A process that has no storage backend of its own, a standalone engine
+(`--mode=engine`) or registry (`--mode=registry`), connects to the same
+revocation collections using `storage.mongodb` when the setting resolves to
+`storage`, so it rejects what the backend replicas revoked. Give such a
+process the same `storage.mongodb` settings as the backend. If the setting is
+`storage` (or unset with `storage.type: mongodb`) and the connection fails,
+that process does not start. With `memory`, or unset with non-MongoDB
+storage, it keeps no revocation state, because a process-local blacklist would
+never see a revocation. The isolated wallet-provider (`--mode=wallet-provider`)
+uses the same store through its own storage backend. The startup warning
+about process-local state is logged by every one of these roles.
 
-The Redis session store does **not** change this: it backs the WebSocket
-engine's persisted session bookkeeping, not the WMP session registry, event
-buffer or flows. Without affinity, a `POST /api/v2/wallet/rpc` or an SSE `GET`
-(`/api/v2/wallet/events`, `/api/v2/wallet/rpc/events`) that lands on a replica
-which did not create the session fails with `session not found` (HTTP 404), and
-a flow in progress cannot continue.
+`Remove` (administrative override) deletes the jti revocation in the MongoDB
+store as well; `Count` only reports the entries held by the local process.
 
-With more than one engine replica you must therefore configure the load
-balancer to route every request of a WMP session to the same replica. The
-only key present on every request is the Authorization bearer token:
+Switching backend starts with an empty store: revocations recorded in the
+old one are not carried over, so tokens revoked shortly before the switch
+(access tokens live `as.default_token_ttl`, 2 minutes by default) may be
+accepted again until they expire.
 
-- Which routing identifiers each request carries (stock go-wmp HTTPS+SSE
-  client, which is constructed before `session.create` and sends only the
-  headers it was configured with):
-
-  | Request | Authorization bearer | `Wmp-Session-Id` header | `params.wmp.session_id` | `params.session_id` | `session_id` query |
-  |---|---|---|---|---|---|
-  | `wmp.session.create` POST | yes | no | no | no | no |
-  | RPC POST | yes | optional (not set by the stock client) | yes | no | no |
-  | `wmp.session.resume` POST | yes | optional | no | yes (top level) | no |
-  | SSE GET | yes | optional | no | no | yes |
-  | Response to a server-initiated request | yes | optional | no | no | no |
-
-- Key affinity on a hash of the `Authorization` header value. It is the only
-  key present on every request, including `session.create` and the responses
-  to server-initiated requests, so the whole lifetime of a session lands on the
-  replica that created it. For example `hash $http_authorization consistent;`
-  in an NGINX `upstream`, or a header hash policy on `authorization` in Envoy.
-  Several sessions of one token share a replica, which is fine.
-- Limits: access tokens rotate on refresh. A request carrying a refreshed token
-  may hash to a different replica, where the session is not found (404).
-  `wmp.session.resume` does not recover from this: the resumption token and the
-  session registry are process-local too, so that replica answers
-  `session not found` for the resume as well. The client must create a new
-  session (`wmp.session.create`) and restart its flows. Resume works only while
-  routing still reaches the original replica. Do not
-  rely on `Wmp-Session-Id` or the `session_id` query parameter alone: they are
-  secondary hints usable only for requests that carry them, and the stock client
-  does not send the header at all.
-- The server does not set an affinity cookie: the stock go-wmp HTTPS+SSE client
-  uses `http.DefaultClient`, which has no cookie jar, so a cookie would not be
-  returned on later requests.
-- Make sure the proxy forwards `Authorization` and does not buffer the SSE
-  stream.
-
-The engine logs a warning at startup, when the WMP routes are mounted, as a
-reminder of this requirement. Sharing WMP session state between replicas, which
-would remove the requirement, is tracked in
-[#432](https://github.com/sirosfoundation/go-wallet-backend/issues/432).
+**Startup warning.** The configuration has no replica count, so a MongoDB
+storage backend is taken as the sign that several replicas are plausible. In
+that case the process logs a warning when `as.session_store` is `memory`
+(AS sessions are per process) or when the token blacklist is enabled with
+`backend: memory`. With in-memory storage nothing is logged: only one
+process is possible.
 
 ### Token revocation limits
 
-Token revocation (logout, revoked user) is enforced through an in-process token blacklist, so it only takes effect in the process that holds it (single-replica limitation, tracked in issues #407 and #415). A shared revocation source is not implemented.
+Revocation is enforced by the revocation store; see [Token revocation with several replicas](#token-revocation-with-several-replicas) for what the shared and the per-process backends cover.
 
 <a id="split-mode-as-jwks"></a>
 **Split mode: reaching the AS for its signing keys.** The standalone engine, a registry-only process and an isolated wallet-provider fetch the AS keys from `<as.external_url>/auth/.well-known/jwks.json`. In a split-pod deployment just set `as.external_url` to the AS's in-cluster URL (`http` or `https`). The JWKS is fetched by go-tokenauth without SSRF filtering or a plaintext check, because it is infrastructure-internal traffic between components of the same cluster; do not point `as.external_url` at anything outside your own infrastructure. Example (engine and registry pods):
@@ -693,12 +767,13 @@ as:
   external_url: http://backend.wallet.svc:8080
 ```
 
-**Standalone engine (`--mode=engine`, no backend provider):** when `as.external_url` is set, the engine accepts AS-signed ES256 session tokens, but it has no revocation checker and no token blacklist is wired into it. Consequence: after a logout or user revocation at the backend, a token **stays valid at the standalone engine until it expires**; a new WebSocket handshake with it is still accepted. The engine logs a warning at startup when it is built this way.
+**Standalone engine (`--mode=engine`, no backend provider):** with the shared MongoDB revocation store (see above) the engine rejects what the backend revoked. With `backend: memory`, or non-MongoDB storage, it keeps no revocation state: after a logout or user revocation at the backend, a token **stays valid at the standalone engine until it expires**, and a new WebSocket handshake with it is still accepted. The engine logs a warning at startup when it is built this way.
 
 Mitigations:
 
 - Use short access token TTLs, so the exposure window is bounded by the TTL.
 - Co-host the engine with the backend (the default all-in-one mode), which shares the token blacklist.
+- Use the shared MongoDB revocation store (see above), which a standalone engine reads too.
 
 ### Database Scaling
 

@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -104,7 +105,7 @@ func (c *fakeClient) handle(data []byte) {
 	case SignActionDecryptCredentialResponse:
 		c.answerDecrypt(&req, &resp)
 	}
-	sess.signCh <- &resp
+	sess.dispatchSignResponse(&resp)
 }
 
 func (c *fakeClient) answerProof(req *SignRequestMessage, resp *SignResponseMessage) {
@@ -269,7 +270,7 @@ func jweTo(t *testing.T, enc map[string]any, plaintext string) string {
 	var wk jose.JSONWebKey
 	require.NoError(t, json.Unmarshal(jb, &wk))
 	e, err := jose.NewEncrypter(jose.ContentEncryption(enc["enc"].(string)),
-		jose.Recipient{Algorithm: jose.KeyAlgorithm(enc["alg"].(string)), Key: &wk}, nil)
+		jose.Recipient{Algorithm: jose.KeyAlgorithm(wk.Algorithm), Key: &wk}, nil)
 	require.NoError(t, err)
 	out, err := e.Encrypt([]byte(plaintext))
 	require.NoError(t, err)
@@ -457,9 +458,10 @@ func TestBlind_ImmediateIssuance_EngineNeverHoldsContents(t *testing.T) {
 	// The credential request carried the client's public key and the pair.
 	require.Len(t, st.requests, 1)
 	enc := st.requests[0]["credential_response_encryption"].(map[string]any)
-	assert.Equal(t, "ECDH-ES", enc["alg"])
+	assert.NotContains(t, enc, "alg")
 	assert.Equal(t, "A128GCM", enc["enc"])
 	jwk := enc["jwk"].(map[string]any)
+	assert.Equal(t, "ECDH-ES", jwk["alg"])
 	assert.NotContains(t, jwk, "d", "only the public key is sent")
 	assert.Equal(t, "enc", jwk["use"])
 
@@ -816,6 +818,31 @@ func TestBlind_FreshKeyPerProofRequest(t *testing.T) {
 
 // --- the JWE relay itself ---
 
+// A failure that is not the client's report (here the flow's context ending) is
+// passed through unchanged, not rewritten as a client decryption failure. The
+// client never answers, so the context ending is the only way out of RequestSign
+// and the outcome does not depend on a reply racing the cancellation.
+func TestRelayEncryptedResponse_NonClientFailureIsNotRewritten(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srv *websocket.Conn) {
+		defer srv.Close()
+		for {
+			if _, _, err := srv.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+	h := &OID4VCIHandler{}
+	h.BaseHandler = BaseHandler{Logger: zap.NewNop(), Flow: &Flow{ID: "f-blind", Session: testSession(conn), Data: map[string]interface{}{}}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := h.relayEncryptedResponse(ctx, "a.b.c.d.e", false, &responseEncryption{})
+	require.ErrorIs(t, err, context.Canceled)
+	var se *SignError
+	assert.False(t, errors.As(err, &se))
+}
+
 func TestRelayEncryptedResponse_RefusesMalformedJWE(t *testing.T) {
 	for name, jwe := range map[string]string{
 		"empty":            "",
@@ -869,7 +896,8 @@ func TestRelayEncryptedResponse_ClientAnswers(t *testing.T) {
 			k := fc.newKey()
 			var jm any
 			require.NoError(t, json.Unmarshal(mustJWK(t, k), &jm))
-			enc := map[string]any{"alg": "ECDH-ES", "enc": "A128GCM", "jwk": jm}
+			jm.(map[string]any)["alg"] = "ECDH-ES"
+			enc := map[string]any{"enc": "A128GCM", "jwk": jm}
 			out, err := h.relayEncryptedResponse(context.Background(), jweTo(t, enc, `{"credential":"c"}`), false, &responseEncryption{})
 			if tc.wantErr {
 				require.Error(t, err)

@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -57,6 +56,7 @@ type AuthProvider struct {
 var newServices = service.NewServices
 
 func NewAuthProvider(cfg *config.Config, store backend.Backend, logger *zap.Logger, roles []string) *AuthProvider {
+	warnProcessLocalState(cfg, logger, true)
 	services := newServices(store, cfg, logger)
 	services.Start()
 	handlers := api.NewHandlers(services, cfg, logger, roles)
@@ -364,9 +364,6 @@ type EngineProvider struct {
 	metadataResolver *issuermetadata.Resolver
 	manager          *wsengine.Manager
 	wmpAdapter       *wsengine.WMPAdapter
-
-	// wmpAffinityWarnOnce makes the affinity warning fire once per provider.
-	wmpAffinityWarnOnce sync.Once
 }
 
 // NewEngineProvider creates a new WebSocket engine route provider.
@@ -408,9 +405,10 @@ func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.Ver
 	metadataResolver := sharedResolver
 	if metadataResolver == nil {
 		r, err := issuermetadata.New(issuermetadata.Config{
-			HTTPClient:   cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
-			AllowHTTP:    cfg.HTTPClient.AllowsPlaintext(),
-			MetadataType: issuermetadata.MetadataType(cfg.HTTPClient.MetadataType), // validated by Config.Validate and New
+			HTTPClient:    cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
+			AllowHTTP:     cfg.HTTPClient.AllowsPlaintext(),
+			MetadataType:  issuermetadata.MetadataType(cfg.HTTPClient.MetadataType), // validated by Config.Validate and New
+			CacheDisabled: cfg.HTTPClient.MetadataCacheDisabled,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("creating issuer metadata resolver: %w", err)
@@ -467,9 +465,14 @@ func (v StandaloneValidator) Close() error { v.Stop(); return nil }
 // provider (--mode=engine). The JWKS comes from as.external_url; without it every connection would be
 // rejected, so it returns an error and startup fails.
 //
-// A standalone engine has no revocation source (shared blacklist tracked in #407 and #415): a token
-// stays valid until it expires, even after logout or user revocation. A warning is logged.
-func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (*StandaloneValidator, error) {
+// blacklist is the shared revocation store (see NewSharedBlacklist) when the
+// configuration selects it: the validator then checks every token's jti against
+// it, so a logged-out token (anonymous ones included) cannot open a connection.
+// User-level revocation is checked by the engine itself (see
+// EngineProvider.SetTokenBlacklist). With a nil blacklist a standalone engine
+// has no revocation source: a token stays valid until it expires, even after
+// logout or user revocation. A warning is logged.
+func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger, blacklist *service.TokenBlacklist) (*StandaloneValidator, error) {
 	if cfg.AS.ExternalURL == "" {
 		return nil, fmt.Errorf("standalone engine needs as.external_url to fetch the AS JWKS; refusing to start with no way to authenticate connections (legacy HMAC tokens no longer exist)")
 	}
@@ -481,14 +484,20 @@ func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger) (
 	if err != nil {
 		return nil, err
 	}
-	v := tokenvalidator.New(tokenvalidator.Config{
+	vcfg := tokenvalidator.Config{
 		JWKSURL:   jwksURL,
 		Issuer:    issuer,
 		Audiences: cfg.SessionAudiences(),
-	})
+	}
+	if blacklist != nil {
+		vcfg.Revocation = blacklistRevocationChecker{blacklist: blacklist, logger: logger}
+	}
+	v := tokenvalidator.New(vcfg)
 	v.Start(context.Background())
-	logger.Warn("Standalone engine has no token revocation source: AS session tokens stay valid at this engine until they expire, even after logout or user revocation. Mitigate with short access token TTLs, or co-host the engine with the backend (shared blacklist).",
-		zap.String("jwks_source", "as.external_url"))
+	if blacklist == nil {
+		logger.Warn("Standalone engine has no token revocation source: AS session tokens stay valid at this engine until they expire, even after logout or user revocation. Mitigate with short access token TTLs, use the shared MongoDB revocation store, or co-host the engine with the backend.",
+			zap.String("jwks_source", "as.external_url"))
+	}
 	logger.Info("Standalone engine token validator started")
 	return &StandaloneValidator{Validator: v}, nil
 }
@@ -509,86 +518,41 @@ func (p *EngineProvider) SetTokenBlacklist(b wsengine.TokenBlacklistChecker) {
 	p.manager.SetTokenBlacklist(b)
 }
 
-// wmpAffinityWarning is logged when the WMP routes are mounted.
-const wmpAffinityWarning = "WMP session state is process-local: with more than one engine replica, " +
-	"the load balancer must keep each client on one replica. The only identifier present on every WMP request " +
-	"(session.create, RPC POSTs, SSE GET and responses to server-initiated requests) is the Authorization bearer token, " +
-	"so key affinity on a hash of the Authorization header; Wmp-Session-Id, params.wmp.session_id and the SSE " +
-	"session_id query parameter are secondary hints that not every request carries. " +
-	"Limits: a refreshed token may be routed to another replica, where the session is not found and resume cannot recover it (the resumption token is process-local too), so the client must create a new session. " +
-	"Without affinity a request reaching another replica fails with session not found (404). " +
-	"The Redis session store does not share this state. Shared WMP session state is tracked in " +
-	"https://github.com/sirosfoundation/go-wallet-backend/issues/432"
-
-// warnWMPSessionAffinity logs once that WMP session state is process-local (#432).
-func (p *EngineProvider) warnWMPSessionAffinity() {
-	p.wmpAffinityWarnOnce.Do(func() {
-		if p.logger == nil {
-			return
-		}
-		p.logger.Warn(wmpAffinityWarning,
-			zap.String("rpc_path", wsengine.WMPRPCPath),
-			zap.String("events_path", wsengine.WMPEventsPath),
-			zap.String("affinity_key", "Authorization"),
-			zap.String("issue", "#432"))
-	})
-}
-
 func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
-	p.warnWMPSessionAffinity()
-
 	// WebSocket v2 endpoint
 	router.GET("/api/v2/wallet", func(c *gin.Context) {
 		p.manager.HandleConnection(c.Writer, c.Request)
 	})
 
-	// WMP endpoints share the engine's auth (Authorization: Bearer) and security posture.
-	// POST /api/v2/wallet/rpc: JSON-RPC 2.0 request/response.
-	router.POST(wsengine.WMPRPCPath, func(c *gin.Context) {
-		p.wmpAdapter.HandleWMPRPC(c.Writer, c.Request)
-	})
-	// GET /api/v2/wallet/events: SSE stream of notifications. It outlives the server's
-	// WriteTimeout; the handler arms its own write deadline around every write.
-	router.GET(wsengine.WMPEventsPath, func(c *gin.Context) {
-		p.wmpAdapter.HandleWMPEvents(c.Writer, c.Request)
-	})
-	// GET /api/v2/wallet/rpc/events: the same stream at the URL go-wmp's client derives
-	// (rpc endpoint + "/events").
-	router.GET(wsengine.WMPClientEventsPath, func(c *gin.Context) {
-		p.wmpAdapter.HandleWMPEvents(c.Writer, c.Request)
-	})
+	// WMP: go-wmp's secured HTTP+SSE handler authenticates each request with the
+	// engine's bearer token and serves POST (JSON-RPC) and GET (event stream)
+	// on one path. WMP session state is process-local (see docs/DEPLOYMENT.md,
+	// "WMP session affinity").
+	wmpHandler := func(c *gin.Context) { p.wmpAdapter.ServeHTTP(c.Writer, c.Request) }
+	router.POST(wsengine.WMPRPCPath, wmpHandler)
+	router.GET(wsengine.WMPRPCPath, wmpHandler)
+	// The event stream at the URL go-wmp's client derives (rpc endpoint + "/events"),
+	// and at the alias.
+	router.GET(wsengine.WMPClientEventsPath, wmpHandler)
+	router.GET(wsengine.WMPEventsPath, wmpHandler)
 	// GET /.well-known/wmp-configuration: public discovery, no auth (needed before a token exists).
 	router.GET("/.well-known/wmp-configuration", func(c *gin.Context) {
 		p.wmpAdapter.HandleWMPConfiguration(c.Writer, c.Request)
 	})
 }
 
-// Drain is the first shutdown step: the WMP adapter and WebSocket manager refuse new
-// requests, sessions and upgrades (503) while listeners are still up. Idempotent;
-// Close implies it.
-func (p *EngineProvider) Drain() {
-	if p.wmpAdapter != nil {
-		p.wmpAdapter.Drain()
-	}
-	if p.manager != nil {
-		p.manager.Drain()
-	}
-}
-
-// Close closes the engine without a deadline; see CloseContext.
-func (p *EngineProvider) Close() {
-	p.CloseContext(context.Background())
-}
-
-// CloseContext closes the engine, bounding the WMP sessions' persistent cleanup
-// by ctx.
-func (p *EngineProvider) CloseContext(ctx context.Context) {
-	p.Drain()
-	// Close the WMP adapter first so nothing can register a session behind its cleanup,
-	// then the manager (which closes the remaining transports).
+// CloseWMP drains the WMP adapter and ends its sessions, bounded by ctx. It is
+// the first shutdown step: listeners are still up, and http.Server.Shutdown
+// does not end event streams.
+func (p *EngineProvider) CloseWMP(ctx context.Context) {
 	if p.wmpAdapter != nil {
 		p.wmpAdapter.CloseContext(ctx)
 	}
+}
+
+// Close shuts down the engine manager
+func (p *EngineProvider) Close() {
+	p.CloseWMP(context.Background())
 	if p.manager != nil {
 		p.manager.Close()
 	}
@@ -611,11 +575,24 @@ func (p *EngineProvider) CheckReady(ctx context.Context) error {
 // (IsRevoked vs IsBlacklisted), so Logout/DeleteUser revocation applies to AS-issued tokens.
 type blacklistRevocationChecker struct {
 	blacklist *service.TokenBlacklist
+	logger    *zap.Logger // optional
 }
 
-// IsRevoked implements revocation.Checker.
+// IsRevoked implements revocation.Checker. The interface has no error
+// return, so a store failure is reported as "revoked": the Validator then
+// rejects the token (401) rather than accepting it unchecked.
 func (c blacklistRevocationChecker) IsRevoked(ctx context.Context, jti string) bool {
-	return c.blacklist.IsBlacklisted(ctx, jti)
+	revoked, err := c.blacklist.IsBlacklisted(ctx, jti)
+	if err != nil {
+		if c.logger != nil {
+			c.logger.Error("Revocation check failed; rejecting token", zap.Error(err))
+		}
+		return true
+	}
+	// A logout call may present a token whose jti is already revoked, to
+	// complete a logout that was interrupted (see middleware.IsLogout). Only
+	// a definite "revoked" answer is relaxed; a store error still rejects.
+	return revoked && !middleware.IsLogoutCompletion(ctx)
 }
 
 // =============================================================================
@@ -689,9 +666,10 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 	var metadataResolver *issuermetadata.Resolver
 	if cfg.AuthZENProxy.Enabled && cfg.AuthZENProxy.AllowResolution {
 		r, err := issuermetadata.New(issuermetadata.Config{
-			HTTPClient:   cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
-			AllowHTTP:    cfg.HTTPClient.AllowsPlaintext(),
-			MetadataType: issuermetadata.MetadataType(cfg.HTTPClient.MetadataType), // validated by Config.Validate and New
+			HTTPClient:    cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
+			AllowHTTP:     cfg.HTTPClient.AllowsPlaintext(),
+			MetadataType:  issuermetadata.MetadataType(cfg.HTTPClient.MetadataType), // validated by Config.Validate and New
+			CacheDisabled: cfg.HTTPClient.MetadataCacheDisabled,
 		})
 		if err != nil {
 			if closeErr := store.Close(); closeErr != nil {
@@ -762,7 +740,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 			Issuer:    issuer,
 			Audiences: cfg.AS.Audiences,
 			// Same blacklist as the rest of the process: the Validator has its own validation path that would not consult it.
-			Revocation: blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist},
+			Revocation: blacklistRevocationChecker{blacklist: authProvider.services.TokenBlacklist, logger: logger},
 		})
 		tv.Start(context.Background())
 		logger.Info("Authorization Server module initialized",
@@ -876,7 +854,17 @@ func (p *BackendProvider) CheckReady(ctx context.Context) error {
 	// Use a short timeout for readiness checks
 	checkCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
 	defer cancel()
-	return p.store.Ping(checkCtx)
+	if err := p.store.Ping(checkCtx); err != nil {
+		return err
+	}
+	// A revocation store that failed to initialize refuses every
+	// authenticated request until restart; do not report ready meanwhile.
+	if p.auth != nil && p.auth.services != nil {
+		if err := p.auth.services.TokenBlacklist.Ready(); err != nil {
+			return fmt.Errorf("token revocation store unavailable: %w", err)
+		}
+	}
+	return nil
 }
 
 // Store returns the underlying storage backend
@@ -1261,6 +1249,7 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 		return nil, fmt.Errorf("create backend: %w", err)
 	}
 
+	warnProcessLocalState(cfg, logger, false)
 	services := newServices(store, cfg, logger)
 	// HasSigningKey (not IsSupported): a cert-less signing key is a valid
 	// standalone deployment when only "ietf"-mode WIA is needed. Key
@@ -1300,7 +1289,7 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 		Audiences: cfg.SessionAudiences(),
 		// Same wiring as NewBackendProvider; this provider's own TokenBlacklist is used as-is (it is never
 		// co-hosted with BackendProvider).
-		Revocation: blacklistRevocationChecker{blacklist: services.TokenBlacklist},
+		Revocation: blacklistRevocationChecker{blacklist: services.TokenBlacklist, logger: logger},
 	})
 	tv.Start(context.Background())
 
@@ -1317,6 +1306,20 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 
 func (p *WalletProviderProvider) Transport() Transport { return TransportWalletProvider }
 func (p *WalletProviderProvider) Name() string         { return "wallet-provider" }
+
+// CheckReady implements health.ReadinessChecker for WalletProviderProvider.
+// A revocation store that failed to initialize refuses every authenticated
+// request until restart, so the isolated wallet-provider must not report
+// ready meanwhile.
+func (p *WalletProviderProvider) CheckReady(_ context.Context) error {
+	if p.services == nil {
+		return nil
+	}
+	if err := p.services.TokenBlacklist.Ready(); err != nil {
+		return fmt.Errorf("token revocation store unavailable: %w", err)
+	}
+	return nil
+}
 
 // authMiddleware returns the auth middleware for the wallet-provider routes. This provider never runs
 // co-hosted with BackendProvider, so its own Services.TokenBlacklist is used as-is.

@@ -1,142 +1,74 @@
 package oidc
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
-func TestWellKnownURL(t *testing.T) {
-	tests := []struct {
-		name    string
-		baseURL string
-		suffix  string
-		want    string
-		wantErr bool
+func TestCredentialIssuerMetadataURLs(t *testing.T) {
+	const w = "/.well-known/openid-credential-issuer"
+	for _, tt := range []struct {
+		name, in string
+		want     []string
+		wantErr  bool
 	}{
-		{
-			name:    "no path",
-			baseURL: "https://example.com",
-			suffix:  "openid-credential-issuer",
-			want:    "https://example.com/.well-known/openid-credential-issuer",
-		},
-		{
-			name:    "with path",
-			baseURL: "https://example.com/test/a/alias",
-			suffix:  "openid-credential-issuer",
-			want:    "https://example.com/.well-known/openid-credential-issuer/test/a/alias",
-		},
-		{
-			name:    "trailing slash preserved",
-			baseURL: "https://example.com/issuer/",
-			suffix:  "openid-credential-issuer",
-			want:    "https://example.com/.well-known/openid-credential-issuer/issuer/",
-		},
-		{
-			name:    "oauth authorization server",
-			baseURL: "https://as.example.com/tenant/1",
-			suffix:  "oauth-authorization-server",
-			want:    "https://as.example.com/.well-known/oauth-authorization-server/tenant/1",
-		},
-		{
-			name:    "openid-configuration",
-			baseURL: "https://idp.example.com",
-			suffix:  "openid-configuration",
-			want:    "https://idp.example.com/.well-known/openid-configuration",
-		},
-		{
-			name:    "percent-encoded path preserved",
-			baseURL: "https://example.com/path%2Fwith%2Fslashes/issuer",
-			suffix:  "openid-credential-issuer",
-			want:    "https://example.com/.well-known/openid-credential-issuer/path%2Fwith%2Fslashes/issuer",
-		},
-		{
-			name:    "with port",
-			baseURL: "https://localhost:8443/test/a/siros-wallet",
-			suffix:  "openid-credential-issuer",
-			want:    "https://localhost:8443/.well-known/openid-credential-issuer/test/a/siros-wallet",
-		},
-		{
-			name:    "invalid URL",
-			baseURL: "://not-a-url",
-			suffix:  "openid-credential-issuer",
-			wantErr: true,
-		},
-	}
-
-	for _, tt := range tests {
+		{"1.1 example: path", "https://issuer.example.com/tenant", []string{"https://issuer.example.com" + w + "/tenant"}, false},
+		{"1.1 example: path with terminating slash", "https://issuer.example.com/tenant/",
+			[]string{"https://issuer.example.com" + w + "/tenant/", "https://issuer.example.com" + w + "/tenant"}, false},
+		{"1.1 example: host only", "https://tenant.issuer.example.com", []string{"https://tenant.issuer.example.com" + w}, false},
+		{"OIDF conformance (issue 505)", "https://www.certification.openid.net/test/a/siros-wallet-vci-test-tecca-1/",
+			[]string{"https://www.certification.openid.net" + w + "/test/a/siros-wallet-vci-test-tecca-1/", "https://www.certification.openid.net" + w + "/test/a/siros-wallet-vci-test-tecca-1"}, false},
+		{"bare root slash", "https://h.example/", []string{"https://h.example" + w + "/", "https://h.example" + w}, false},
+		{"nested path", "https://example.com/test/a/alias", []string{"https://example.com" + w + "/test/a/alias"}, false},
+		{"percent-encoded path preserved", "https://example.com/path%2Fwith%2Fslashes/issuer",
+			[]string{"https://example.com" + w + "/path%2Fwith%2Fslashes/issuer"}, false},
+		{"percent-encoded with terminating slash", "https://example.com/a%2Fb/",
+			[]string{"https://example.com" + w + "/a%2Fb/", "https://example.com" + w + "/a%2Fb"}, false},
+		{"repeated terminating slash: strips one", "https://example.com/t//",
+			[]string{"https://example.com" + w + "/t//", "https://example.com" + w + "/t/"}, false},
+		{"port", "https://localhost:8443/t", []string{"https://localhost:8443" + w + "/t"}, false},
+		{"invalid", "://not-a-url", nil, true},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := WellKnownURL(tt.baseURL, tt.suffix)
+			got, err := CredentialIssuerMetadataURLs(tt.in)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("WellKnownURL() error = %v, wantErr %v", err, tt.wantErr)
+				t.Fatalf("error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("got %v\nwant %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// RFC 8414 section 3.1 insertion first, OIDC Discovery section 4 append second;
+// one terminating slash removed in each.
+func TestAuthorizationServerMetadataURLs(t *testing.T) {
+	const w = "/.well-known/oauth-authorization-server"
+	const o = "/.well-known/openid-configuration"
+	for _, tt := range []struct {
+		name, in string
+		want     []string
+		wantErr  bool
+	}{
+		{"path", "https://as.example.com/tenant/1", []string{"https://as.example.com" + w + "/tenant/1", "https://as.example.com/tenant/1" + o}, false},
+		{"path with terminating slash", "https://as.example.com/tenant/", []string{"https://as.example.com" + w + "/tenant", "https://as.example.com/tenant" + o}, false},
+		{"host only", "https://as.example.com", []string{"https://as.example.com" + w, "https://as.example.com" + o}, false},
+		{"root slash", "https://as.example.com/", []string{"https://as.example.com" + w, "https://as.example.com" + o}, false},
+		{"percent-encoded", "https://as.example.com/a%2Fb", []string{"https://as.example.com" + w + "/a%2Fb", "https://as.example.com/a%2Fb" + o}, false},
+		{"repeated slash strips one", "https://as.example.com/t//", []string{"https://as.example.com" + w + "/t/", "https://as.example.com/t/" + o}, false},
+		{"invalid", "://not-a-url", nil, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := AuthorizationServerMetadataURLs(tt.in)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err %v", err)
+			}
+			if tt.wantErr {
 				return
 			}
-			if got != tt.want {
-				t.Errorf("WellKnownURL()\n  got  = %s\n  want = %s", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestNormalizeIssuerURL(t *testing.T) {
-	tests := []struct {
-		name string
-		in   string
-		want string
-	}{
-		{"no path, no slash", "https://issuer.example.com", "https://issuer.example.com"},
-		{"no path, trailing slash", "https://issuer.example.com/", "https://issuer.example.com"},
-		{"meaningful path, no trailing slash", "https://issuer.example.com/tenant", "https://issuer.example.com/tenant"},
-		{"meaningful path, trailing slash preserved", "https://issuer.example.com/tenant/", "https://issuer.example.com/tenant/"},
-		{"query ending in slash is preserved", "https://issuer.example.com/?redirect=https://client/", "https://issuer.example.com?redirect=https://client/"},
-		{"query without path", "https://issuer.example.com?redirect=https://client/", "https://issuer.example.com?redirect=https://client/"},
-		{"fragment ending in slash is preserved", "https://issuer.example.com/#frag/", "https://issuer.example.com#frag/"},
-		{"query and fragment on root path", "https://issuer.example.com/?a=b/#c/", "https://issuer.example.com?a=b/#c/"},
-		{"meaningful path keeps query", "https://issuer.example.com/tenant/?a=b/", "https://issuer.example.com/tenant/?a=b/"},
-		{"uppercase scheme keeps its spelling", "HTTPS://issuer.example.com/", "HTTPS://issuer.example.com"},
-		{"uppercase scheme without slash unchanged", "HTTPS://issuer.example.com", "HTTPS://issuer.example.com"},
-		{"empty fragment is preserved", "https://issuer.example.com/#", "https://issuer.example.com#"},
-		{"empty fragment without slash unchanged", "https://issuer.example.com#", "https://issuer.example.com#"},
-		{"unicode fragment is preserved", "https://issuer.example.com/#\u00e5\u00e4\u00f6", "https://issuer.example.com#\u00e5\u00e4\u00f6"},
-		{"empty query is preserved", "https://issuer.example.com/?", "https://issuer.example.com?"},
-		{"invalid URL returned unchanged", "://not-a-url", "://not-a-url"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := NormalizeIssuerURL(tt.in)
-			if got != tt.want {
-				t.Errorf("NormalizeIssuerURL(%q) = %q, want %q", tt.in, got, tt.want)
-			}
-		})
-	}
-}
-
-func TestSameIssuerIdentifier(t *testing.T) {
-	tests := []struct {
-		name string
-		a, b string
-		want bool
-	}{
-		{"identical", "https://i.example.com", "https://i.example.com", true},
-		{"root slash on left", "https://i.example.com/", "https://i.example.com", true},
-		{"root slash on right", "https://i.example.com", "https://i.example.com/", true},
-		{"root slash both", "https://i.example.com/", "https://i.example.com/", true},
-		{"path identical", "https://i.example.com/t", "https://i.example.com/t", true},
-		{"path slash left only differs", "https://i.example.com/t/", "https://i.example.com/t", false},
-		{"path slash right only differs", "https://i.example.com/t", "https://i.example.com/t/", false},
-		{"different path", "https://i.example.com/a", "https://i.example.com/b", false},
-		{"different host", "https://i.example.com", "https://j.example.com", false},
-		{"query identical", "https://i.example.com/?x=1", "https://i.example.com/?x=1", true},
-		{"query slash value kept", "https://i.example.com?r=https://c/", "https://i.example.com?r=https://c", false},
-		{"query vs none", "https://i.example.com?x=1", "https://i.example.com", false},
-		{"uppercase scheme root slash", "HTTPS://i.example.com/", "HTTPS://i.example.com", true},
-		{"empty fragment, slash vs none", "https://i.example.com/#", "https://i.example.com#", true},
-		{"empty fragment vs no fragment", "https://i.example.com#", "https://i.example.com", false},
-		{"root slash then query equal", "https://i.example.com/?x=1", "https://i.example.com?x=1", true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := SameIssuerIdentifier(tt.a, tt.b); got != tt.want {
-				t.Errorf("SameIssuerIdentifier(%q,%q)=%v want %v", tt.a, tt.b, got, tt.want)
-			}
-			if got := SameIssuerIdentifier(tt.b, tt.a); got != tt.want {
-				t.Errorf("not symmetric for (%q,%q)", tt.b, tt.a)
+			if len(got) != 2 || got[0] != tt.want[0] || got[1] != tt.want[1] {
+				t.Errorf("got %q, want %q", got, tt.want)
 			}
 		})
 	}

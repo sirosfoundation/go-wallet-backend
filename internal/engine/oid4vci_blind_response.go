@@ -55,7 +55,7 @@ func (e *responseEncryption) params() *CredentialResponseEncryptionParams {
 // requestMember is the credential_response_encryption member of a Credential
 // (or Deferred Credential) Request.
 func (e *responseEncryption) requestMember() map[string]interface{} {
-	return map[string]interface{}{"alg": e.Alg, "enc": e.Enc, "jwk": e.JWK}
+	return map[string]interface{}{"enc": e.Enc, "jwk": e.JWK}
 }
 
 // negotiateResponseEncryption decides, from the issuer metadata alone, whether
@@ -162,7 +162,7 @@ func resolveClientEncryptionKey(offer *responseEncryption, raw json.RawMessage) 
 // (RFC 7516 §7.1): five base64url segments, of which only the encrypted key
 // may be empty. It does not parse or decrypt anything.
 func isCompactJWE(s string) bool {
-	parts := strings.Split(s, ".")
+	parts := strings.SplitN(s, ".", 6)
 	if len(parts) != 5 {
 		return false
 	}
@@ -190,10 +190,13 @@ func (h *OID4VCIHandler) relayEncryptedResponse(ctx context.Context, jwe string,
 	}
 	resp, err := h.RequestSign(ctx, SignActionDecryptCredentialResponse, SignRequestParams{JWE: jwe, Deferred: &deferred})
 	if err != nil {
+		// RequestSign turns a client-reported failure into a SignError; its text is
+		// the client's and is neither logged nor relayed.
+		var signErr *SignError
+		if errors.As(err, &signErr) {
+			return nil, errors.New("client could not decrypt the credential response")
+		}
 		return nil, err
-	}
-	if resp.Error != "" {
-		return nil, errors.New("client could not decrypt the credential response")
 	}
 	out := &CredentialResponse{Encrypted: true, ResponseEncryption: enc}
 	switch {
@@ -222,22 +225,11 @@ var displayMetadataMembers = []string{"display", "claims"}
 // metadata. A value that is not an object yields nil; no error or log ever
 // quotes the content.
 func displayMetadata(resp *CredentialResponse) json.RawMessage {
-	if resp == nil || resp.Encrypted {
-		return nil
-	}
-	return restrictToDisplayMetadata(resp.CredentialMetadata)
-}
-
-// restrictToDisplayMetadata keeps only displayMetadataMembers of a
-// credential_metadata object, compacted, or returns nil. It is applied again
-// where the completion is built, so no caller can relay another member
-// (OpenID4x 3.1.4.1: the sender drops every other member).
-func restrictToDisplayMetadata(raw json.RawMessage) json.RawMessage {
-	if len(raw) == 0 {
+	if resp == nil || resp.Encrypted || len(resp.CredentialMetadata) == 0 {
 		return nil
 	}
 	var members map[string]json.RawMessage
-	if json.Unmarshal(raw, &members) != nil {
+	if json.Unmarshal(resp.CredentialMetadata, &members) != nil {
 		return nil
 	}
 	out := make(map[string]json.RawMessage, len(displayMetadataMembers))

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1329,6 +1330,23 @@ func TestCORSConfig_SetDefaults(t *testing.T) {
 	}
 	if len(cfg.AllowedHeaders) == 0 {
 		t.Error("AllowedHeaders should have default value")
+	}
+}
+
+// WMP over HTTP+SSE needs a browser to send its session header and the SSE
+// resume cursor cross-origin, so they are allowed by default.
+func TestCORSConfig_DefaultAllowedHeadersIncludeWMP(t *testing.T) {
+	cfg := CORSConfig{}
+	cfg.SetDefaults()
+	for _, h := range []string{"Wmp-Session-Id", "Last-Event-ID"} {
+		if !slices.Contains(cfg.AllowedHeaders, h) {
+			t.Errorf("default AllowedHeaders lacks %s: %v", h, cfg.AllowedHeaders)
+		}
+	}
+	explicit := CORSConfig{AllowedHeaders: []string{"X-Only"}}
+	explicit.SetDefaults()
+	if slices.Contains(explicit.AllowedHeaders, "Wmp-Session-Id") {
+		t.Error("an explicit AllowedHeaders must not be extended")
 	}
 }
 
@@ -2804,6 +2822,20 @@ func TestLoad_MetadataTypeEnvOverride(t *testing.T) {
 	}
 }
 
+func TestLoad_MetadataCacheDisabled(t *testing.T) {
+	if defaultConfig().HTTPClient.MetadataCacheDisabled {
+		t.Error("http_client.metadata_cache_disabled must default to false")
+	}
+	t.Setenv("WALLET_HTTP_CLIENT_METADATA_CACHE_DISABLED", "true")
+	cfg := defaultConfig()
+	if err := envconfig.Process("WALLET", cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.HTTPClient.MetadataCacheDisabled {
+		t.Error("env override not applied")
+	}
+}
+
 func TestConfig_Validate_DCQLConsentCheck(t *testing.T) {
 	for _, m := range []DCQLConsentCheckMode{"", DCQLConsentCheckOff, DCQLConsentCheckWarn, DCQLConsentCheckEnforce} {
 		if err := m.validate(); err != nil {
@@ -2918,22 +2950,6 @@ func TestNewIdPHTTPClient_TrustedHostSet(t *testing.T) {
 	}
 	if (HTTPClientConfig{}).trustedIdPHostSet() != nil {
 		t.Fatal("empty config must yield no trusted hosts")
-	}
-}
-
-func TestCORSConfig_SetDefaults_WMPHeaders(t *testing.T) {
-	cfg := CORSConfig{}
-	cfg.SetDefaults()
-	for _, want := range []string{"Wmp-Session-Id", "Last-Event-ID"} {
-		found := false
-		for _, h := range cfg.AllowedHeaders {
-			if h == want {
-				found = true
-			}
-		}
-		if !found {
-			t.Errorf("default AllowedHeaders missing %q (needed for WMP SSE reconnects)", want)
-		}
 	}
 }
 
@@ -3224,6 +3240,40 @@ func TestApplyASSecurityDefaults_Parity(t *testing.T) {
 	d.applyASSecurityDefaults()
 	if len(d.AS.Audiences) != 0 {
 		t.Errorf("AS disabled must not get audiences: %v", d.AS.Audiences)
+	}
+}
+
+func TestConfig_Validate_TokenBlacklistBackend(t *testing.T) {
+	tests := []struct {
+		name    string
+		backend string
+		storage string
+		wantErr string
+	}{
+		{"default with memory storage", "", "memory", ""},
+		{"default with mongodb", "", "mongodb", ""},
+		{"memory with mongodb", "memory", "mongodb", ""},
+		{"storage with mongodb", "storage", "mongodb", ""},
+		{"storage needs mongodb", "storage", "memory", "requires storage.type=mongodb"},
+		{"unknown value", "redis", "mongodb", "invalid security.token_blacklist.backend"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validBaseConfig()
+			cfg.Storage.Type = tt.storage
+			cfg.Storage.MongoDB.URI = "mongodb://localhost"
+			cfg.Security.TokenBlacklist.Backend = tt.backend
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() = %v, want error containing %q", err, tt.wantErr)
+			}
+		})
 	}
 }
 

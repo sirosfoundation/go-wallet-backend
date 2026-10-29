@@ -89,7 +89,7 @@ func TestGetIssuerMetadata_Success(t *testing.T) {
 		if r.URL.Path == "/.well-known/openid-credential-issuer" {
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"credential_issuer":   "https://issuer.example.com",
+				"credential_issuer":   "http://" + r.Host,
 				"credential_endpoint": "https://issuer.example.com/credential",
 				"credential_configurations_supported": map[string]interface{}{
 					"UniversityDegree": map[string]interface{}{
@@ -136,7 +136,7 @@ func TestGetIssuerMetadata_Success(t *testing.T) {
 	}
 
 	// The response should be the IssuerMetadata directly with proper JSON keys
-	if result["credential_issuer"] != "https://issuer.example.com" {
+	if result["credential_issuer"] != mockIssuer.URL {
 		t.Errorf("Expected credential_issuer, got %v", result["credential_issuer"])
 	}
 }
@@ -155,7 +155,7 @@ func mockIssuerWithVct(t *testing.T, vct string) *httptest.Server {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"credential_issuer":   "https://issuer.example.com",
+			"credential_issuer":   "http://" + r.Host,
 			"credential_endpoint": "https://issuer.example.com/credential",
 			"credential_configurations_supported": map[string]interface{}{
 				"ehic": map[string]interface{}{
@@ -202,7 +202,7 @@ func mockIssuerWithLogo(t *testing.T, logoURL string) *httptest.Server {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"credential_issuer":   "https://issuer.example.com",
+			"credential_issuer":   "http://" + r.Host,
 			"credential_endpoint": "https://issuer.example.com/credential",
 			"credential_configurations_supported": map[string]interface{}{
 				"ehic": map[string]interface{}{
@@ -394,7 +394,7 @@ func TestGetIssuerMetadata_EmbedsImagesWithoutVctOrDoctype(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"credential_issuer":   "https://issuer.example.com",
+			"credential_issuer":   "http://" + r.Host,
 			"credential_endpoint": "https://issuer.example.com/credential",
 			"credential_configurations_supported": map[string]interface{}{
 				"mystery": map[string]interface{}{
@@ -454,7 +454,7 @@ func TestGetIssuerMetadata_CachesResponses(t *testing.T) {
 		callCount++
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"credential_issuer":   "https://issuer.example.com",
+			"credential_issuer":   "http://" + r.Host,
 			"credential_endpoint": "https://issuer.example.com/credential",
 		})
 	}))
@@ -560,7 +560,7 @@ func TestGetIssuerMetadata_CrossTenantBlocked(t *testing.T) {
 }
 
 func TestIssuerMetadataCache(t *testing.T) {
-	cache := newIssuerMetadataCache()
+	cache := newIssuerMetadataCache(false)
 
 	// Miss on empty cache
 	_, ok := cache.get("https://example.com")
@@ -580,5 +580,30 @@ func TestIssuerMetadataCache(t *testing.T) {
 	}
 	if cached != m {
 		t.Error("Cached result does not match")
+	}
+}
+
+func TestIssuerMetadataCache_Disabled(t *testing.T) {
+	cache := newIssuerMetadataCache(true)
+	cache.put("https://example.com", &metadata.IssuerMetadata{CredentialIssuer: "https://example.com"})
+	if _, ok := cache.get("https://example.com"); ok {
+		t.Error("disabled cache must always miss")
+	}
+}
+
+func TestNewHandlers_MetadataCacheDisabledWiring(t *testing.T) {
+	for _, disabled := range []bool{false, true} {
+		cfg := &config.Config{}
+		cfg.HTTPClient.MetadataCacheDisabled = disabled
+
+		h := NewHandlers(&service.Services{}, cfg, zap.NewNop(), []string{"test"})
+		if h.metadataCache.disabled != disabled {
+			t.Errorf("NewHandlers disabled = %v, want %v", h.metadataCache.disabled, disabled)
+		}
+
+		hs := NewHandlersWithStore(&service.Services{}, nil, cfg, zap.NewNop(), []string{"test"})
+		if hs.metadataCache.disabled != disabled {
+			t.Errorf("NewHandlersWithStore disabled = %v, want %v", hs.metadataCache.disabled, disabled)
+		}
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto"
 	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
@@ -33,6 +34,9 @@ import (
 type OID4VPHandler struct {
 	BaseHandler
 	httpClient *http.Client
+	// selectionHandle is the handle of the consent being signed (see
+	// ConsentPayload.SelectionHandle).
+	selectionHandle string
 }
 
 // NewOID4VPHandler creates a new OID4VP flow handler
@@ -219,6 +223,10 @@ type CredentialsMatchedPayload struct {
 // ConsentPayload is the payload for consent action
 type ConsentPayload struct {
 	SelectedCredentials []ConsentSelection `json:"selected_credentials"`
+	// SelectionHandle is the opaque handle of a WMP select_credentials action
+	// (OpenID4x 3.2.3.1); the engine hands it back unchanged in the
+	// sign_presentation that follows (3.2.5). Empty on the WebSocket path.
+	SelectionHandle string `json:"selection_handle,omitempty"`
 }
 
 // Execute runs the OID4VP flow
@@ -290,7 +298,7 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	}
 
 	// Step 4: Request VP signing from client (use configured ClientID for audience if set)
-	vpToken, err := h.requestVPSignature(ctx, authReq, selectedCredentials, verifier.ClientID)
+	submission, err := h.requestVPSignature(ctx, authReq, selectedCredentials, verifier.ClientID)
 	if err != nil {
 		h.Logger.Debug("VP signature failed", zap.Error(err))
 		h.failSign(ctx, authReq, err)
@@ -298,7 +306,7 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	}
 
 	// Step 5: Submit VP response to verifier
-	redirectURI, err := h.submitResponse(ctx, authReq, vpToken)
+	redirectURI, err := h.submitResponse(ctx, authReq, submission)
 	if err != nil {
 		h.Logger.Debug("VP submission failed", zap.Error(err))
 		_ = h.Error(StepSubmittingResponse, ErrCodePresentationError, ErrCodePresentationError.UserFacingMessage())
@@ -474,8 +482,12 @@ func (h *OID4VPHandler) parseRequestFromURL(u *url.URL) (*AuthorizationRequest, 
 		if err := json.Unmarshal([]byte(cmStr), &cm); err != nil {
 			return nil, fmt.Errorf("invalid client_metadata: %w", err)
 		}
+		raw, err := boundedRawObject(json.RawMessage(cmStr))
+		if err != nil {
+			return nil, err
+		}
 		authReq.ClientMetadata = &cm
-		authReq.ClientMetadataRaw = rawObject(json.RawMessage(cmStr))
+		authReq.ClientMetadataRaw = raw
 	}
 	authReq.ClientMetadataURI = q.Get("client_metadata_uri")
 
@@ -488,6 +500,9 @@ func (h *OID4VPHandler) parseRequestFromURL(u *url.URL) (*AuthorizationRequest, 
 }
 
 func (h *OID4VPHandler) parseRequestJWT(jwtStr string) (*AuthorizationRequest, error) {
+	if len(jwtStr) > MaxRequestJWTBytes {
+		return nil, fmt.Errorf("request JWT exceeds %d bytes", MaxRequestJWTBytes)
+	}
 	// Parse JWT without verification (verification happens during trust evaluation)
 	parts := strings.Split(jwtStr, ".")
 	if len(parts) != 3 {
@@ -505,7 +520,10 @@ func (h *OID4VPHandler) parseRequestJWT(jwtStr string) (*AuthorizationRequest, e
 		return nil, fmt.Errorf("failed to parse JWT payload: %w", err)
 	}
 
-	authReq.ClientMetadataRaw = extractRawClientMetadata(payload)
+	authReq.ClientMetadataRaw, err = extractRawClientMetadata(payload)
+	if err != nil {
+		return nil, err
+	}
 
 	// Store the raw JWT so we can extract key material from its header later
 	authReq.RequestJWT = jwtStr
@@ -592,7 +610,7 @@ func (h *OID4VPHandler) fetchRequestFromURI(ctx context.Context, uri string) (*A
 		if err != nil {
 			err = fmt.Errorf("failed to parse request: %w", err)
 		} else {
-			authReq.ClientMetadataRaw = extractRawClientMetadata([]byte(bodyStr))
+			authReq.ClientMetadataRaw, err = extractRawClientMetadata([]byte(bodyStr))
 		}
 	} else {
 		// Likely a JWT
@@ -1666,9 +1684,14 @@ func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*C
 		return nil, nil, fmt.Errorf("metadata fetch returned status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxHTTPResponseBodyBytes))
+	// Read one byte past the limit so an oversize body is refused rather than
+	// silently truncated (which would also hand back invalid JSON).
+	body, err := io.ReadAll(io.LimitReader(resp.Body, MaxClientMetadataBytes+1))
 	if err != nil {
 		return nil, nil, err
+	}
+	if len(body) > MaxClientMetadataBytes {
+		return nil, nil, errClientMetadataTooLarge
 	}
 
 	var cm ClientMetadata
@@ -1679,6 +1702,19 @@ func (h *OID4VPHandler) fetchClientMetadata(ctx context.Context, uri string) (*C
 	return &cm, rawObject(json.RawMessage(body)), nil
 }
 
+// errClientMetadataTooLarge reports a client_metadata over
+// MaxClientMetadataBytes. It carries no remote-supplied text.
+var errClientMetadataTooLarge = fmt.Errorf("client_metadata exceeds %d bytes", MaxClientMetadataBytes)
+
+// boundedRawObject is rawObject with the MaxClientMetadataBytes bound applied,
+// so a padded value cannot be retained and relayed however it arrived.
+func boundedRawObject(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) > MaxClientMetadataBytes {
+		return nil, errClientMetadataTooLarge
+	}
+	return rawObject(raw), nil
+}
+
 // rawObject returns raw when it is a JSON object and nil otherwise.
 func rawObject(raw json.RawMessage) json.RawMessage {
 	if t := bytes.TrimSpace(raw); len(t) > 0 && t[0] == '{' {
@@ -1687,16 +1723,52 @@ func rawObject(raw json.RawMessage) json.RawMessage {
 	return nil
 }
 
+var errClientMetadataDuplicate = errors.New("client_metadata appears more than once in the request")
+
+// countClientMetadataMembers counts the top-level members of the JSON object
+// whose name matches client_metadata the way encoding/json does (ASCII case
+// folding). A malformed or non-object input yields 0; the caller's own decode
+// reports it.
+func countClientMetadataMembers(object []byte) int {
+	dec := json.NewDecoder(bytes.NewReader(object))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return 0
+	}
+	n := 0
+	for dec.More() {
+		k, err := dec.Token()
+		if err != nil {
+			return n
+		}
+		if name, ok := k.(string); ok && strings.EqualFold(name, "client_metadata") {
+			n++
+		}
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return n
+		}
+	}
+	return n
+}
+
 // extractRawClientMetadata returns the request object's client_metadata
 // member verbatim, or nil when it is absent or not an object.
-func extractRawClientMetadata(requestObject []byte) json.RawMessage {
+// It fails with errClientMetadataTooLarge when the member exceeds
+// MaxClientMetadataBytes.
+func extractRawClientMetadata(requestObject []byte) (json.RawMessage, error) {
+	if countClientMetadataMembers(requestObject) > 1 {
+		// The typed decoder merges every occurrence while this raw copy keeps
+		// the last, so a duplicate would let an oversized earlier object stay in
+		// the engine past the size bound. Go also matches names case-insensitively.
+		return nil, errClientMetadataDuplicate
+	}
 	var probe struct {
 		ClientMetadata json.RawMessage `json:"client_metadata"`
 	}
 	if err := json.Unmarshal(requestObject, &probe); err != nil {
-		return nil
+		return nil, nil
 	}
-	return rawObject(probe.ClientMetadata)
+	return boundedRawObject(probe.ClientMetadata)
 }
 
 // requestCredentialSelection sends dcql_query + verifier to the client in a single
@@ -1764,6 +1836,7 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 		return nil, err
 	}
 
+	h.selectionHandle = payload.SelectionHandle
 	return payload.SelectedCredentials, nil
 }
 
@@ -1907,7 +1980,24 @@ func requestedCredentialTypes(dcql json.RawMessage) []string {
 	return types
 }
 
-func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *AuthorizationRequest, selected []ConsentSelection, audience string) (string, error) {
+// vpSubmission is what the client produced for the verifier: either a vp_token
+// the engine submits as is (plain direct_post, query, fragment: the verifier
+// chose to receive it in clear) or, for direct_post.jwt, the finished
+// compact JWE the engine only relays. Exactly one member is set.
+type vpSubmission struct {
+	vpToken     string
+	responseJWE string
+}
+
+// responseEncryptionError marks a failure of the direct_post.jwt encryption
+// contract (no usable verifier key, or a response_jwe that is not what the
+// request asked for). Its text never carries response content.
+type responseEncryptionError struct{ err error }
+
+func (e *responseEncryptionError) Error() string { return e.err.Error() }
+func (e *responseEncryptionError) Unwrap() error { return e.err }
+
+func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *AuthorizationRequest, selected []ConsentSelection, audience string) (*vpSubmission, error) {
 	credRefs := make([]CredentialRef, len(selected))
 	for i, s := range selected {
 		credRefs[i] = CredentialRef(s)
@@ -1924,13 +2014,14 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 
 	verifierJwkThumbprint, err := h.computeVerifierJWKThumbprint(authReq)
 	if err != nil {
-		return "", err
+		return nil, &responseEncryptionError{err}
 	}
 
 	params := SignRequestParams{
 		Audience:              audience,
 		Nonce:                 authReq.Nonce,
 		CredentialsToInclude:  credRefs,
+		SelectionHandle:       h.selectionHandle,
 		ResponseURI:           responseURI,
 		VerifierJwkThumbprint: verifierJwkThumbprint,
 		VerifierSessionID:     authReq.VerifierSessionID,
@@ -1944,16 +2035,300 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 	if len(authReq.TransactionData) > 0 {
 		params.ResponseMode = effectiveResponseMode(authReq)
 	}
+
+	// direct_post.jwt: the client builds the JARM response and encrypts it to
+	// the verifier itself, so the engine never holds the vp_token. The engine
+	// resolves the key and algorithms (its existing selection) and relays the
+	// finished JWE.
+	jwtMode := authReq.ResponseMode == ResponseModeDirectPostJWT
+	var respEnc *ResponseEncryption
+	if jwtMode {
+		respEnc, err = h.resolveResponseEncryption(authReq)
+		if err != nil {
+			return nil, &responseEncryptionError{err}
+		}
+		params.ResponseEncryption = respEnc
+		params.State = authReq.State
+	}
+
 	resp, err := h.RequestSign(ctx, SignActionSignPresentation, params)
 	if err != nil {
-		return "", err
+		return nil, err
+	}
+
+	if jwtMode {
+		// A client that still answers with a vp_token (or without a
+		// response_jwe) is refused: falling back to encrypting here would put
+		// the vp_token back in the engine.
+		if resp.VPToken != "" {
+			return nil, &responseEncryptionError{errors.New("direct_post.jwt: the client answered with a vp_token instead of response_jwe")}
+		}
+		if err := validateResponseJWE(resp.ResponseJWE, respEnc); err != nil {
+			return nil, &responseEncryptionError{err}
+		}
+		return &vpSubmission{responseJWE: resp.ResponseJWE}, nil
+	}
+	if resp.ResponseJWE != "" {
+		return nil, errors.New("client answered with a response_jwe for a response mode that does not encrypt")
 	}
 
 	if len(authReq.DCQLQuery) > 0 {
-		return buildDCQLVPToken(resp.VPToken, selected)
+		vpToken, err := buildDCQLVPToken(resp.VPToken, selected)
+		if err != nil {
+			return nil, err
+		}
+		return &vpSubmission{vpToken: vpToken}, nil
 	}
 
-	return resp.VPToken, nil
+	return &vpSubmission{vpToken: resp.VPToken}, nil
+}
+
+// refuseVerifierOnEncryptionError tells the verifier its session is over when
+// the direct_post.jwt contract failed: no usable key, or a response_jwe that is
+// not what was asked for. It sends the description every refusal carries and
+// nothing about why. Any other error (a sign refusal included) is left alone.
+// It returns the redirect_uri the verifier answered with, if any, so the caller
+// can hand it to the wallet like every other refusal path does.
+func (h *OID4VPHandler) refuseVerifierOnEncryptionError(ctx context.Context, authReq *AuthorizationRequest, err error) string {
+	var encErr *responseEncryptionError
+	if errors.As(err, &encErr) {
+		if authReq.ResponseMode == ResponseModeDirectPostJWT {
+			// An error for direct_post.jwt must itself be a JWT (JARM), which
+			// submitErrorResponse does not build: it posts plain form fields
+			// that such a verifier rejects. As in failTransactionData, the
+			// verifier is not contacted and its session ends by timeout.
+			h.Logger.Info("not notifying a direct_post.jwt verifier of the response encryption failure: error responses in this mode are not implemented")
+			return ""
+		}
+		return h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)
+	}
+	return ""
+}
+
+// failSign reports a failed VP signature to the wallet as SIGN_ERROR. When the
+// failure was the direct_post.jwt contract, the verifier is refused first and
+// the redirect_uri it answered with (if any) travels in details, as it does for
+// every other refusal. A client may also refuse a transaction type only it can
+// judge; the verifier is then told invalid_transaction_data rather than left
+// waiting.
+func (h *OID4VPHandler) failSign(ctx context.Context, authReq *AuthorizationRequest, err error) {
+	if redirectURI := h.refuseVerifierOnEncryptionError(ctx, authReq, err); redirectURI != "" {
+		_ = h.ErrorWithDetails(StepSubmittingResponse, ErrCodeSignError, ErrCodeSignError.UserFacingMessage(),
+			map[string]interface{}{"redirect_uri": redirectURI})
+		return
+	}
+	var signErr *SignError
+	if len(authReq.TransactionData) > 0 && errors.As(err, &signErr) && signErr.Code == ErrCodeUnsupportedTransactionData {
+		h.failTransactionData(ctx, authReq, &transactionDataError{code: ErrCodeUnsupportedTransactionData, err: err})
+		return
+	}
+	if errors.As(err, &signErr) && signErr.Code == ErrCodeSignRefused {
+		h.failSignRefused(ctx, authReq)
+		return
+	}
+	_ = h.Error(StepSubmittingResponse, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+}
+
+// failSignRefused ends the flow when the client refused the sign request: the
+// verifier gets access_denied at once, as for a decline at consent, and the
+// client gets the same decline error with the verifier's redirect, if any.
+//
+// The verifier is sent access_denied with the request's state and no
+// error_description (OpenID4x 3.2.6), the same public shape as every other
+// refusal (verifierRefusedDescription). The wallet's reason - an untrusted
+// verifier, a missing thumbprint - is the wallet's business and must not reach
+// the verifier in any form; the engine does not keep it (SignError holds only
+// the allowlisted code).
+func (h *OID4VPHandler) failSignRefused(ctx context.Context, authReq *AuthorizationRequest) {
+	h.Logger.Info("client refused to sign the presentation")
+	if redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription); redirectURI != "" {
+		_ = h.ErrorWithDetails(StepSubmittingResponse, ErrCodePresentationError, "User declined the request",
+			map[string]interface{}{"redirect_uri": redirectURI})
+		return
+	}
+	_ = h.Error(StepSubmittingResponse, ErrCodePresentationError, "User declined the request")
+}
+
+// minResponseEncryptionRSABits is the smallest RSA modulus accepted for a
+// verifier's response-encryption key.
+const minResponseEncryptionRSABits = 2048
+
+// checkResponseEncryptionKey verifies that the key-management algorithm can be
+// used with the verifier's key, so the client is never sent a sign request it
+// cannot fulfil: ECDH-ES* needs an EC key on P-256/384/521, RSA-OAEP* an RSA
+// key of at least 2048 bits. Anything else is refused.
+func checkResponseEncryptionKey(alg string, key interface{}) error {
+	switch alg {
+	case "ECDH-ES", "ECDH-ES+A128KW", "ECDH-ES+A256KW":
+		pub, ok := key.(*ecdsa.PublicKey)
+		if !ok {
+			return fmt.Errorf("direct_post.jwt: %s needs an EC response-encryption key", alg)
+		}
+		switch pub.Curve {
+		case elliptic.P256(), elliptic.P384(), elliptic.P521():
+			return nil
+		}
+		return fmt.Errorf("direct_post.jwt: %s does not support the verifier key's curve", alg)
+	case "RSA-OAEP", "RSA-OAEP-256":
+		pub, ok := key.(*rsa.PublicKey)
+		if !ok {
+			return fmt.Errorf("direct_post.jwt: %s needs an RSA response-encryption key", alg)
+		}
+		if pub.N.BitLen() < minResponseEncryptionRSABits {
+			return fmt.Errorf("direct_post.jwt: the verifier's RSA key is shorter than %d bits", minResponseEncryptionRSABits)
+		}
+		return nil
+	}
+	return fmt.Errorf("unsupported JARM key algorithm: %s", alg)
+}
+
+// maxResponseJWEBytes caps the response_jwe the engine relays.
+const maxResponseJWEBytes = 4 << 20
+
+// validateResponseJWE checks that the client's response_jwe is a compact JWE
+// shaped as the sign request asked: five base64url segments, the requested
+// alg and enc (and the verifier key's kid, when it has one) in the protected
+// header. The engine cannot decrypt it and does not try. Errors never include
+// the value.
+func validateResponseJWE(jwe string, want *ResponseEncryption) error {
+	if want == nil {
+		return errors.New("direct_post.jwt: no response encryption was requested")
+	}
+	if jwe == "" {
+		return errors.New("direct_post.jwt: the client returned no response_jwe")
+	}
+	if len(jwe) > maxResponseJWEBytes {
+		return errors.New("direct_post.jwt: response_jwe is too large")
+	}
+	parts := strings.SplitN(jwe, ".", 6)
+	if len(parts) != 5 {
+		return errors.New("direct_post.jwt: response_jwe is not a compact JWE")
+	}
+	decoded := make([][]byte, len(parts))
+	for i, p := range parts {
+		b, err := base64.RawURLEncoding.DecodeString(p)
+		if err != nil {
+			return errors.New("direct_post.jwt: response_jwe is not a compact JWE")
+		}
+		decoded[i] = b
+	}
+	// The encrypted key is empty exactly for direct ECDH-ES agreement (RFC
+	// 7516 section 5.1) and present for every key-wrapping algorithm; every
+	// other segment is always present.
+	direct := want.Alg == "ECDH-ES"
+	for i, b := range decoded {
+		if i == 1 && direct {
+			if len(b) != 0 {
+				return errors.New("direct_post.jwt: response_jwe is not a compact JWE")
+			}
+			continue
+		}
+		if len(b) == 0 {
+			return errors.New("direct_post.jwt: response_jwe is not a compact JWE")
+		}
+	}
+	var header struct {
+		Alg string `json:"alg"`
+		Enc string `json:"enc"`
+		Kid string `json:"kid"`
+	}
+	if err := json.Unmarshal(decoded[0], &header); err != nil {
+		return errors.New("direct_post.jwt: response_jwe has an unreadable protected header")
+	}
+	if header.Alg != want.Alg || header.Enc != want.Enc {
+		return errors.New("direct_post.jwt: response_jwe does not use the requested alg and enc")
+	}
+	var jwk struct {
+		Kid string `json:"kid"`
+	}
+	_ = json.Unmarshal(want.JWK, &jwk)
+	if jwk.Kid != "" && header.Kid != jwk.Kid {
+		return errors.New("direct_post.jwt: response_jwe does not name the verifier key")
+	}
+	return nil
+}
+
+// resolveResponseEncryption picks the verifier's response-encryption key and
+// the JWE algorithms for a direct_post.jwt request: the key from
+// client_metadata.jwks (use=enc preferred) or the request JWT's x5c, alg from
+// client_metadata, else the JWK's own JARM alg, else the key type; enc
+// defaults to A128GCM. Anything unusable fails closed.
+func (h *OID4VPHandler) resolveResponseEncryption(authReq *AuthorizationRequest) (*ResponseEncryption, error) {
+	var encAlg, encEnc string
+	if authReq.ClientMetadata != nil {
+		encAlg = authReq.ClientMetadata.AuthorizationEncryptedResponseAlg
+		encEnc = authReq.ClientMetadata.AuthorizationEncryptedResponseEnc
+	}
+
+	jwk, err := h.extractVerifierEncryptionJWK(authReq)
+	if err != nil {
+		if encAlg == "" {
+			return nil, fmt.Errorf("direct_post.jwt requires authorization_encrypted_response_alg in client_metadata (key inference also failed: %w)", err)
+		}
+		return nil, fmt.Errorf("failed to extract verifier encryption key: %w", err)
+	}
+	if !jwk.Valid() || !jwk.IsPublic() {
+		return nil, errors.New("direct_post.jwt: the verifier's response-encryption key is not a usable public key")
+	}
+
+	// Per spec, authorization_encrypted_response_alg is required for direct_post.jwt.
+	// When absent (e.g. x509_san_dns verifiers that omit client_metadata), infer a
+	// sensible default from the available public key material rather than failing hard:
+	//   EC key  -> ECDH-ES  (RFC 7518 section 4.6)
+	//   RSA key -> RSA-OAEP (RFC 7518 section 4.3)
+	// This allows interoperability with verifiers that embed their key in the request
+	// JWT x5c header but do not explicitly declare JARM encryption parameters.
+	if encAlg == "" {
+		// Only honor the JWK's declared "alg" when it is a JARM key-management
+		// algorithm we support.
+		if jwk.Algorithm != "" {
+			if _, err := mapKeyAlgorithm(jwk.Algorithm); err == nil {
+				encAlg = jwk.Algorithm
+			}
+		}
+		if encAlg == "" {
+			switch jwk.Key.(type) {
+			case *ecdsa.PublicKey:
+				encAlg = "ECDH-ES"
+			case *rsa.PublicKey:
+				encAlg = "RSA-OAEP"
+			default:
+				return nil, fmt.Errorf("direct_post.jwt: cannot infer encryption algorithm from key type %T; set authorization_encrypted_response_alg in client_metadata", jwk.Key)
+			}
+		}
+		h.Logger.Info("direct_post.jwt: selected encryption algorithm",
+			zap.String("alg", encAlg),
+			zap.String("verifier", authReq.ClientID))
+	}
+	if encEnc == "" {
+		// A128CBC-HS256 is RFC 7518's first mandatory-to-implement JWE
+		// "enc" algorithm, but it is not universally implemented in
+		// practice: confirmed live against verifier.multipaz.org, whose
+		// own JsonWebEncryption decrypter (multipaz/src/commonMain/kotlin/
+		// org/multipaz/crypto/JsonWebEncryption.kt) only implements the
+		// GCM family (A128GCM/A192GCM/A256GCM) and rejects CBC-HS256
+		// outright with "No algorithm with JOSE identifier A128CBC-HS256" -
+		// despite not declaring encrypted_response_enc_values_supported to
+		// signal that restriction. GCM is an equally spec-valid default
+		// choice absent an explicit verifier preference and has broader
+		// real-world interop, so prefer it.
+		encEnc = "A128GCM"
+	}
+	if _, err := mapKeyAlgorithm(encAlg); err != nil {
+		return nil, err
+	}
+	if _, err := mapContentEncryption(encEnc); err != nil {
+		return nil, err
+	}
+	if err := checkResponseEncryptionKey(encAlg, jwk.Key); err != nil {
+		return nil, err
+	}
+
+	jwkJSON, err := jwk.MarshalJSON()
+	if err != nil {
+		return nil, errors.New("direct_post.jwt: cannot serialize the verifier's response-encryption key")
+	}
+	return &ResponseEncryption{JWK: jwkJSON, Alg: encAlg, Enc: encEnc}, nil
 }
 
 // effectiveResponseMode is the response_mode this engine actually answers the
@@ -2038,7 +2413,8 @@ func sanitizeEndpointURL(endpoint string) (string, error) {
 	return clean.String(), nil
 }
 
-func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *AuthorizationRequest, vpToken string) (string, error) {
+func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *AuthorizationRequest, sub *vpSubmission) (string, error) {
+	vpToken := sub.vpToken
 	_ = h.ProgressMessage(StepSubmittingResponse, "Submitting VP response")
 
 	// Determine response endpoint
@@ -2063,7 +2439,7 @@ func (h *OID4VPHandler) submitResponse(ctx context.Context, authReq *Authorizati
 	case ResponseModeDirectPost:
 		return h.submitDirectPost(ctx, sanitizedEndpoint, authReq, vpToken)
 	case ResponseModeDirectPostJWT:
-		return h.submitDirectPostJWT(ctx, sanitizedEndpoint, authReq, vpToken)
+		return h.submitDirectPostJWT(ctx, sanitizedEndpoint, sub.responseJWE)
 	case ResponseModeFragment:
 		return h.buildFragmentRedirect(sanitizedEndpoint, authReq, vpToken), nil
 	case ResponseModeQuery:
@@ -2687,41 +3063,6 @@ func dcqlCredentialIDs(dcql json.RawMessage) map[string]bool {
 	return ids
 }
 
-// failSign reports a failed signing request. The client may refuse a transaction
-// type only it can judge; the verifier is then told invalid_transaction_data
-// rather than left waiting.
-func (h *OID4VPHandler) failSign(ctx context.Context, authReq *AuthorizationRequest, err error) {
-	var signErr *SignError
-	if len(authReq.TransactionData) > 0 && errors.As(err, &signErr) && signErr.Code == ErrCodeUnsupportedTransactionData {
-		h.failTransactionData(ctx, authReq, &transactionDataError{code: ErrCodeUnsupportedTransactionData, err: err})
-		return
-	}
-	if errors.As(err, &signErr) && signErr.Code == ErrCodeSignRefused {
-		h.failSignRefused(ctx, authReq, signErr)
-		return
-	}
-	_ = h.Error(StepSubmittingResponse, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
-}
-
-// failSignRefused ends the flow when the client refused the sign request: the
-// verifier gets access_denied at once, as for a decline at consent, and the
-// client gets the same decline error with the verifier's redirect, if any.
-//
-// The verifier is sent access_denied with the request's state and no
-// error_description (OpenID4x 3.2.6), the same public shape as every other
-// refusal (verifierRefusedDescription). The wallet's reason - an untrusted
-// verifier, a missing thumbprint - is the wallet's business and must not reach
-// the verifier in any form. The client's own text (signErr) is only logged here.
-func (h *OID4VPHandler) failSignRefused(ctx context.Context, authReq *AuthorizationRequest, signErr *SignError) {
-	h.Logger.Info("client refused to sign the presentation", zap.String("client_reason", signErr.ClientText()))
-	if redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription); redirectURI != "" {
-		_ = h.ErrorWithDetails(StepSubmittingResponse, ErrCodePresentationError, "User declined the request",
-			map[string]interface{}{"redirect_uri": redirectURI})
-		return
-	}
-	_ = h.Error(StepSubmittingResponse, ErrCodePresentationError, "User declined the request")
-}
-
 // failTransactionData ends the flow for a transaction_data problem. The
 // verifier is told so its session ends now, as for a decline, and the client
 // gets the error code (and any redirect the verifier returned) to explain it to
@@ -2748,123 +3089,11 @@ func (h *OID4VPHandler) failTransactionData(ctx context.Context, authReq *Author
 // missing.
 const transactionDataVerifierDescription = "The wallet cannot process the transaction data in this request"
 
-func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string, authReq *AuthorizationRequest, vpToken string) (string, error) {
-	now := time.Now()
-
-	var vpTokenValue interface{} = vpToken
-	if json.Valid([]byte(vpToken)) {
-		var parsed interface{}
-		if err := json.Unmarshal([]byte(vpToken), &parsed); err == nil {
-			vpTokenValue = parsed
-		}
-	}
-
-	// Build JWT claims per OID4VP §6.2 / JARM §4.1
-	claims := map[string]interface{}{
-		"iss":      "https://self-issued.me/v2",
-		"aud":      authReq.ClientID,
-		"exp":      now.Add(5 * time.Minute).Unix(),
-		"iat":      now.Unix(),
-		"vp_token": vpTokenValue,
-	}
-	if authReq.State != "" {
-		claims["state"] = authReq.State
-	}
-
-	claimsJSON, err := json.Marshal(claims)
-	if err != nil {
-		return "", fmt.Errorf("failed to marshal JARM claims: %w", err)
-	}
-
-	// Determine JARM mode from client_metadata
-	var encAlg, encEnc string
-	if authReq.ClientMetadata != nil {
-		encAlg = authReq.ClientMetadata.AuthorizationEncryptedResponseAlg
-		encEnc = authReq.ClientMetadata.AuthorizationEncryptedResponseEnc
-	}
-
-	// Per spec, authorization_encrypted_response_alg is required for direct_post.jwt.
-	// When absent (e.g. x509_san_dns verifiers that omit client_metadata), infer a
-	// sensible default from the available public key material rather than failing hard:
-	//   EC key  → ECDH-ES  (RFC 7518 §4.6)
-	//   RSA key → RSA-OAEP (RFC 7518 §4.3)
-	// This allows interoperability with verifiers that embed their key in the request
-	// JWT x5c header but do not explicitly declare JARM encryption parameters.
-	if encAlg == "" {
-		inferredKey, _, jwkAlg, keyErr := h.extractVerifierEncryptionKey(authReq)
-		if keyErr != nil {
-			return "", fmt.Errorf("direct_post.jwt requires authorization_encrypted_response_alg in client_metadata (key inference also failed: %w)", keyErr)
-		}
-		// Only honor the JWK's declared "alg" when it is a JARM key-management
-		// algorithm we support.
-		if jwkAlg != "" {
-			if _, err := mapKeyAlgorithm(jwkAlg); err == nil {
-				encAlg = jwkAlg
-			}
-		}
-		if encAlg == "" {
-			switch inferredKey.(type) {
-			case *ecdsa.PublicKey:
-				encAlg = "ECDH-ES"
-			case *rsa.PublicKey:
-				encAlg = "RSA-OAEP"
-			default:
-				return "", fmt.Errorf("direct_post.jwt: cannot infer encryption algorithm from key type %T; set authorization_encrypted_response_alg in client_metadata", inferredKey)
-			}
-		}
-		h.Logger.Info("direct_post.jwt: selected encryption algorithm",
-			zap.String("alg", encAlg),
-			zap.String("verifier", authReq.ClientID))
-	}
-	if encEnc == "" {
-		// A128CBC-HS256 is RFC 7518's first mandatory-to-implement JWE
-		// "enc" algorithm, but it is not universally implemented in
-		// practice: confirmed live against verifier.multipaz.org, whose
-		// own JsonWebEncryption decrypter (multipaz/src/commonMain/kotlin/
-		// org/multipaz/crypto/JsonWebEncryption.kt) only implements the
-		// GCM family (A128GCM/A192GCM/A256GCM) and rejects CBC-HS256
-		// outright with "No algorithm with JOSE identifier A128CBC-HS256" -
-		// despite not declaring encrypted_response_enc_values_supported to
-		// signal that restriction. GCM is an equally spec-valid default
-		// choice absent an explicit verifier preference and has broader
-		// real-world interop, so prefer it.
-		encEnc = "A128GCM"
-	}
-
-	// Extract verifier's public key for encryption
-	verifierKey, kid, _, err := h.extractVerifierEncryptionKey(authReq)
-	if err != nil {
-		return "", fmt.Errorf("failed to extract verifier encryption key: %w", err)
-	}
-
-	// Map algorithm strings to go-jose constants
-	keyAlg, err := mapKeyAlgorithm(encAlg)
-	if err != nil {
-		return "", err
-	}
-	contentEnc, err := mapContentEncryption(encEnc)
-	if err != nil {
-		return "", err
-	}
-
-	// Build JWE
-	encrypter, err := jose.NewEncrypter(
-		contentEnc,
-		jose.Recipient{Algorithm: keyAlg, Key: verifierKey, KeyID: kid},
-		(&jose.EncrypterOptions{}).WithContentType("JWT"),
-	)
-	if err != nil {
-		return "", fmt.Errorf("failed to create JWE encrypter: %w", err)
-	}
-
-	jweObj, err := encrypter.Encrypt(claimsJSON)
-	if err != nil {
-		return "", fmt.Errorf("failed to encrypt JARM response: %w", err)
-	}
-
-	jweString, err := jweObj.CompactSerialize()
-	if err != nil {
-		return "", fmt.Errorf("failed to serialize JWE: %w", err)
+// submitDirectPostJWT POSTs the client-built, client-encrypted JARM response to
+// the verifier. The engine cannot read it: it relays the compact JWE.
+func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string, jweString string) (string, error) {
+	if jweString == "" {
+		return "", errors.New("direct_post.jwt: no response_jwe to submit")
 	}
 
 	// POST response=<jwe> per OID4VP §6.2
@@ -2907,76 +3136,6 @@ func (h *OID4VPHandler) submitDirectPostJWT(ctx context.Context, endpoint string
 	}
 
 	return "", fmt.Errorf("JARM response submission failed with status %d: %s", resp.StatusCode, string(respBody))
-}
-
-func (h *OID4VPHandler) extractVerifierEncryptionKey(authReq *AuthorizationRequest) (interface{}, string, string, error) {
-	// Prefer client_metadata.jwks — this is where verifiers put their
-	// ephemeral encryption key for JARM (ECDH-ES key agreement).
-	if authReq.ClientMetadata != nil && len(authReq.ClientMetadata.JWKS) > 0 {
-		var jwks struct {
-			Keys []json.RawMessage `json:"keys"`
-		}
-		if err := json.Unmarshal(authReq.ClientMetadata.JWKS, &jwks); err == nil && len(jwks.Keys) > 0 {
-			// Select the best key for encryption: prefer use="enc", else fall
-			// back to the first parseable key. The JWK's own "alg" is returned
-			// so the caller can honor the verifier's declared algorithm instead
-			// of inferring one from the key type.
-			var fallbackKey *jose.JSONWebKey
-			for _, raw := range jwks.Keys {
-				var jwk jose.JSONWebKey
-				if err := jwk.UnmarshalJSON(raw); err != nil {
-					continue
-				}
-				if jwk.Use == "enc" {
-					return jwk.Key, jwk.KeyID, jwk.Algorithm, nil
-				}
-				if fallbackKey == nil {
-					k := jwk // copy
-					fallbackKey = &k
-				}
-			}
-			if fallbackKey != nil {
-				return fallbackKey.Key, fallbackKey.KeyID, fallbackKey.Algorithm, nil
-			}
-		}
-	}
-
-	// Fallback: x5c from request JWT header (signing key, used when no
-	// dedicated encryption key is provided in client_metadata). The x5c
-	// certificate carries no JARM key-management alg, so none is returned
-	// and the caller infers one from the key type.
-	if authReq.RequestJWT != "" {
-		parts := strings.Split(authReq.RequestJWT, ".")
-		var kid string
-		if len(parts) >= 2 {
-			headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
-			if err == nil {
-				var header struct {
-					Kid string `json:"kid"`
-				}
-				_ = json.Unmarshal(headerBytes, &header)
-				kid = header.Kid
-			}
-		}
-
-		km := trust.ExtractKeyMaterialFromJWT(authReq.RequestJWT)
-		if km != nil && km.Type == "x5c" && len(km.X5C) > 0 {
-			certDER, err := base64.StdEncoding.DecodeString(km.X5C[0])
-			if err != nil {
-				certDER, err = base64.RawURLEncoding.DecodeString(km.X5C[0])
-				if err != nil {
-					return nil, "", "", fmt.Errorf("failed to decode x5c certificate: %w", err)
-				}
-			}
-			cert, err := x509.ParseCertificate(certDER)
-			if err != nil {
-				return nil, "", "", fmt.Errorf("failed to parse x5c certificate: %w", err)
-			}
-			return cert.PublicKey, kid, "", nil
-		}
-	}
-
-	return nil, "", "", errors.New("no verifier encryption key found in client_metadata.jwks or request JWT x5c")
 }
 
 // Returns the verifier's encryption key as a JSONWebKey.

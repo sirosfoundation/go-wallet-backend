@@ -28,7 +28,7 @@ func TestParseMetadataType(t *testing.T) {
 			t.Errorf("ParseMetadataType(%q) must fail", bad)
 		}
 	}
-	if _, err := New(Config{MetadataType: "bogus"}); err == nil {
+	if _, err := New(Config{HTTPClient: testHTTPClient(), MetadataType: "bogus"}); err == nil {
 		t.Error("New must reject an unknown metadata type")
 	}
 }
@@ -182,7 +182,7 @@ func TestResolve_MetadataTypeMatrix(t *testing.T) {
 			}))
 			defer server.Close()
 
-			r, err := New(Config{AllowHTTP: true, UnsafeAllowPrivateAddressesForTesting: true, MetadataType: tc.mode})
+			r, err := New(Config{HTTPClient: testHTTPClient(), AllowHTTP: true, MetadataType: tc.mode})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -211,7 +211,7 @@ func TestResolve_PreferModes_TerminalStatuses(t *testing.T) {
 				n++
 				w.WriteHeader(status)
 			}))
-			r, _ := New(Config{AllowHTTP: true, UnsafeAllowPrivateAddressesForTesting: true, MetadataType: mode})
+			r, _ := New(Config{HTTPClient: testHTTPClient(), AllowHTTP: true, MetadataType: mode})
 			if _, err := r.Resolve(context.Background(), server.URL); err == nil || n != 1 {
 				t.Errorf("%s/%d: err=%v requests=%d, want error and 1 request", mode, status, err, n)
 			}
@@ -236,6 +236,7 @@ func TestNew_DeprecatedPreferSignedPrecedence(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			tc.cfg.HTTPClient = testHTTPClient()
 			r, err := New(tc.cfg)
 			if err != nil {
 				t.Fatal(err)
@@ -245,7 +246,7 @@ func TestNew_DeprecatedPreferSignedPrecedence(t *testing.T) {
 			}
 		})
 	}
-	if _, err := New(Config{MetadataType: "bogus", PreferSigned: &yes}); err == nil {
+	if _, err := New(Config{HTTPClient: testHTTPClient(), MetadataType: "bogus", PreferSigned: &yes}); err == nil {
 		t.Error("an invalid MetadataType must still be rejected when PreferSigned is set")
 	}
 }
@@ -262,7 +263,7 @@ func TestResolve_DeprecatedPreferSignedFalseAsksJSONFirst(t *testing.T) {
 		_, _ = w.Write([]byte(`{"credential_issuer":"` + server.URL + `"}`))
 	}))
 	defer server.Close()
-	r, err := New(Config{AllowHTTP: true, UnsafeAllowPrivateAddressesForTesting: true, PreferSigned: &no})
+	r, err := New(Config{HTTPClient: testHTTPClient(), AllowHTTP: true, PreferSigned: &no})
 	if err != nil {
 		t.Fatal(err)
 	}

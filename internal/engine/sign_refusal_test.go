@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -85,7 +84,7 @@ func runRefusedPresentationSign(t *testing.T, respond func(reqMsgID string) stri
 		if err := json.Unmarshal([]byte(respond(id)), &resp); err != nil {
 			panic(err)
 		}
-		sess.signCh <- &resp
+		sess.dispatchSignResponse(&resp)
 	}()
 
 	h := &OID4VPHandler{}
@@ -184,41 +183,4 @@ func TestSignRefusal_SignErrorMessageFallback(t *testing.T) {
 	_, err := signResult(&SignResponseMessage{ErrorCode: ErrCodeSignRefused})
 	require.Error(t, err)
 	assert.NotEmpty(t, err.Error())
-}
-
-func TestWMP_FlowErrorRejected_RefusesParentSign(t *testing.T) {
-	a, m := testWMPAdapter()
-	defer cleanupWMP(a, m)
-	sid := createWMPSession(t, a)
-	a.mu.RLock()
-	ws := a.peers[sid]
-	a.mu.RUnlock()
-
-	ws.handler.registerChildFlow("child-r", "parent", "msg-r", "sign")
-	ws.handler.FlowError(context.Background(), &wmp.FlowErrorParams{
-		FlowID: "child-r", Code: wmp.ErrFlowError, Message: "declined",
-		Data: json.RawMessage(`{"reason":"rejected"}`),
-	})
-	got := <-ws.session.signCh
-	assert.Equal(t, ErrCodeSignRefused, got.ErrorCode)
-	_, err := signResult(got)
-	var se *SignError
-	require.ErrorAs(t, err, &se)
-	assert.Equal(t, ErrCodeSignRefused, se.Code)
-
-	// Any other reason stays a plain failure.
-	ws.handler.registerChildFlow("child-f", "parent", "msg-f", "sign")
-	ws.handler.FlowError(context.Background(), &wmp.FlowErrorParams{
-		FlowID: "child-f", Code: wmp.ErrFlowError, Message: "boom",
-		Data: json.RawMessage(`{"reason":"timeout"}`),
-	})
-	got = <-ws.session.signCh
-	assert.Empty(t, got.ErrorCode)
-}
-
-func TestFlowErrorRejected(t *testing.T) {
-	assert.True(t, flowErrorRejected(json.RawMessage(`{"reason":"rejected"}`)))
-	assert.False(t, flowErrorRejected(nil))
-	assert.False(t, flowErrorRejected(json.RawMessage(`"rejected"`)))
-	assert.False(t, flowErrorRejected(json.RawMessage(`{"reason":"timeout"}`)))
 }

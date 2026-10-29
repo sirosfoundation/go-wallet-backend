@@ -1,140 +1,104 @@
 package metadata
 
 import (
-	"encoding/json"
+	"context"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
+	"strings"
 	"testing"
 )
 
-func TestDiscoverIssuer_Success(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/.well-known/openid-credential-issuer" {
-			t.Errorf("unexpected path %q", r.URL.Path)
+// Candidate order for a root identifier: the 1.0 literal form (path "/") first,
+// the 1.1 draft form second, only on 404. A host-only identifier has one.
+func TestFetchIssuerMetadata_RootSlashCandidates(t *testing.T) {
+	for _, tc := range []struct {
+		suffix string
+		want   []string
+	}{
+		{"", []string{"/.well-known/openid-credential-issuer"}},
+		{"/", []string{"/.well-known/openid-credential-issuer/", "/.well-known/openid-credential-issuer"}},
+	} {
+		var got []string
+		var srv *httptest.Server
+		srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			got = append(got, r.URL.Path)
+			if r.URL.Path != "/.well-known/openid-credential-issuer" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"credential_issuer":"` + srv.URL + tc.suffix + `"}`))
+		}))
+		if _, err := fetchIssuerMetadata(context.Background(), srv.URL+tc.suffix, srv.Client()); err != nil {
+			t.Fatalf("suffix %q: %v", tc.suffix, err)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(IssuerMetadata{
-			CredentialIssuer:   "https://issuer.example.com",
-			CredentialEndpoint: "https://issuer.example.com/credential",
-		})
-	}))
-	defer ts.Close()
-
-	result := DiscoverIssuer(t.Context(), ts.URL, ts.Client())
-	if result.Error != nil {
-		t.Fatalf("unexpected error: %v", result.Error)
-	}
-	if result.Metadata == nil || result.Metadata.CredentialIssuer != "https://issuer.example.com" {
-		t.Fatalf("unexpected metadata: %+v", result.Metadata)
-	}
-	if result.Partial {
-		t.Error("expected Partial=false when there's no mdoc_iacas_uri")
-	}
-}
-
-// TestDiscoverIssuer_TrailingSlashNormalized: a bare trailing slash must not change the well-known path.
-func TestDiscoverIssuer_TrailingSlashNormalized(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/.well-known/openid-credential-issuer" {
-			t.Errorf("unexpected path %q (issuer URL trailing slash should have been trimmed)", r.URL.Path)
+		srv.Close()
+		if !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("suffix %q: requests %v, want %v", tc.suffix, got, tc.want)
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(IssuerMetadata{CredentialIssuer: "https://issuer.example.com"})
+	}
+}
+
+// An issuer with a path keeps that path after the well-known segment, with a
+// terminating slash kept in the first (1.0 literal) request. RFC 8615 only
+// defines the /.well-known/ namespace; the insertion rule is OpenID4VCI's.
+func TestFetchIssuerMetadata_PathIssuerKeepsPath(t *testing.T) {
+	var got []string
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = append(got, r.URL.Path)
+		_, _ = w.Write([]byte(`{"credential_issuer":"` + srv.URL + `/tenant/"}`))
 	}))
-	defer ts.Close()
-
-	result := DiscoverIssuer(t.Context(), ts.URL+"/", ts.Client())
-	if result.Error != nil {
-		t.Fatalf("unexpected error: %v", result.Error)
+	defer srv.Close()
+	if _, err := fetchIssuerMetadata(context.Background(), srv.URL+"/tenant/", srv.Client()); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"/.well-known/openid-credential-issuer/tenant/"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("requests %v, want %v", got, want)
 	}
 }
 
-func TestDiscoverIssuer_MetadataFetchError(t *testing.T) {
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
+// 5xx on the first candidate is not retried against the second.
+func TestFetchIssuerMetadata_NoFallbackOn5xx(t *testing.T) {
+	n := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n++
+		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
-	defer ts.Close()
-
-	result := DiscoverIssuer(t.Context(), ts.URL, ts.Client())
-	if result.Error == nil {
-		t.Fatal("expected an error when the well-known endpoint fails")
-	}
-	if result.Metadata != nil {
-		t.Errorf("expected nil metadata on error, got %+v", result.Metadata)
+	defer srv.Close()
+	if _, err := fetchIssuerMetadata(context.Background(), srv.URL+"/tenant/", srv.Client()); err == nil || n != 1 {
+		t.Fatalf("err=%v requests=%d", err, n)
 	}
 }
 
-func TestDiscoverIssuer_IACAPartialFailure(t *testing.T) {
-	var iacasURL string
-	mux := http.NewServeMux()
-	ts := httptest.NewServer(mux)
-	defer ts.Close()
-	iacasURL = ts.URL + "/iacas"
-
-	mux.HandleFunc("/.well-known/openid-credential-issuer", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(IssuerMetadata{
-			CredentialIssuer: ts.URL,
-			MdocIacasURI:     iacasURL,
-		})
-	})
-	mux.HandleFunc("/iacas", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNotFound)
-	})
-
-	result := DiscoverIssuer(t.Context(), ts.URL, ts.Client())
-	if result.Metadata == nil {
-		t.Fatal("expected metadata to be populated despite IACA failure")
-	}
-	if !result.Partial {
-		t.Error("expected Partial=true when IACA fetch fails")
-	}
-	if result.Error == nil {
-		t.Error("expected a non-nil Error describing the IACA failure")
+// Identity stays exact whichever candidate served the document: if /tenant/
+// 404s and the stripped endpoint declares the other identifier, it is refused.
+func TestFetchIssuerMetadata_FallbackCredentialIssuerMismatchRefused(t *testing.T) {
+	for _, claimSuffix := range []string{"/tenant", "/tenant/x", ""} {
+		var srv *httptest.Server
+		srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/.well-known/openid-credential-issuer/tenant/" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_, _ = w.Write([]byte(`{"credential_issuer":"` + srv.URL + claimSuffix + `"}`))
+		}))
+		_, err := fetchIssuerMetadata(context.Background(), srv.URL+"/tenant/", srv.Client())
+		srv.Close()
+		if err == nil || !strings.Contains(err.Error(), "does not match") {
+			t.Errorf("claim %q: expected mismatch, got %v", claimSuffix, err)
+		}
 	}
 }
 
-func TestDiscoverIssuer_IACASuccess(t *testing.T) {
-	var iacasURL string
-	mux := http.NewServeMux()
-	ts := httptest.NewServer(mux)
-	defer ts.Close()
-	iacasURL = ts.URL + "/iacas"
-
-	mux.HandleFunc("/.well-known/openid-credential-issuer", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(IssuerMetadata{
-			CredentialIssuer: ts.URL,
-			MdocIacasURI:     iacasURL,
-		})
-	})
-	mux.HandleFunc("/iacas", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(IACAsResponse{
-			Iacas: []IACACertificate{{Certificate: "deadbeef"}},
-		})
-	})
-
-	result := DiscoverIssuer(t.Context(), ts.URL, ts.Client())
-	if result.Error != nil {
-		t.Fatalf("unexpected error: %v", result.Error)
-	}
-	if result.Partial {
-		t.Error("expected Partial=false on full success")
-	}
-	if len(result.Certificates) != 1 {
-		t.Fatalf("unexpected certificates: %+v", result.Certificates)
-	}
-	want := "-----BEGIN CERTIFICATE-----\ndeadbeef\n-----END CERTIFICATE-----"
-	if result.Certificates[0] != want {
-		t.Errorf("Certificates[0] = %q, want %q", result.Certificates[0], want)
-	}
-}
-
-func TestDiscoverIssuer_DefaultClient(t *testing.T) {
-	// A nil httpClient must not panic; use an unroutable address to fail fast.
-	result := DiscoverIssuer(t.Context(), "http://127.0.0.1:0", nil)
-	if result.Error == nil {
-		t.Fatal("expected an error connecting to an unroutable address")
+// The literal candidate's document is checked too (no claim at all is refused).
+func TestFetchIssuerMetadata_MissingCredentialIssuerRefused(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+	if _, err := fetchIssuerMetadata(context.Background(), srv.URL+"/tenant/", srv.Client()); err == nil {
+		t.Fatal("expected refusal")
 	}
 }

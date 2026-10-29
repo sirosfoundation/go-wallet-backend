@@ -35,7 +35,8 @@ func TestMetadataResolverConfig_HTTPRejectedByDefault(t *testing.T) {
 	defer srv.Close()
 
 	resolver, err := issuermetadata.New(issuermetadata.Config{
-		AllowHTTP: false, // default — HTTPS required
+		HTTPClient: config.HTTPClientConfig{}.NewHTTPClient(10 * time.Second),
+		AllowHTTP:  false, // default — HTTPS required
 	})
 	if err != nil {
 		t.Fatalf("failed to create resolver: %v", err)
@@ -60,8 +61,8 @@ func TestMetadataResolverConfig_HTTPAllowedWhenSet(t *testing.T) {
 	defer srv.Close()
 
 	resolver, err := issuermetadata.New(issuermetadata.Config{
-		AllowHTTP:                             true,
-		UnsafeAllowPrivateAddressesForTesting: true, // loopback test server
+		HTTPClient: config.HTTPClientConfig{AllowPrivateIPs: true}.NewHTTPClient(10 * time.Second), // loopback test server
+		AllowHTTP:  true,
 	})
 	if err != nil {
 		t.Fatalf("failed to create resolver: %v", err)
@@ -216,7 +217,6 @@ func TestNewEngineProvider_AllowHTTPWiring(t *testing.T) {
 			if err != nil {
 				t.Fatalf("NewEngineProvider failed: %v", err)
 			}
-			t.Cleanup(provider.Close)
 
 			if provider.metadataResolver == nil {
 				t.Fatal("the provider registered its flow handlers without a metadata resolver")
