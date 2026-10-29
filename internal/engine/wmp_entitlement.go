@@ -32,7 +32,13 @@ const (
 const (
 	reasonUntrustedIssuer   = "untrusted_issuer"
 	reasonUntrustedVerifier = "untrusted_verifier"
+	reasonIssuerNotEntitled = "issuer_not_entitled"
 )
+
+// errCodeIssuerNotEntitled is the engine's refusal of an issuer entitlement
+// check in fail mode (go-wallet-backend#522); UNTRUSTED_ISSUER stays the trust
+// decision's. Declared here until #522's constant is on main.
+const errCodeIssuerNotEntitled ErrorCode = "ISSUER_NOT_ENTITLED"
 
 // trustRefusalReason is the data.reason of a flow error that is a trust
 // refusal, or "" for any other error.
@@ -42,6 +48,8 @@ func trustRefusalReason(code ErrorCode) string {
 		return reasonUntrustedIssuer
 	case ErrCodeUntrustedVerifier:
 		return reasonUntrustedVerifier
+	case errCodeIssuerNotEntitled:
+		return reasonIssuerNotEntitled
 	}
 	return ""
 }
@@ -120,6 +128,25 @@ func boundedString(v interface{}, max int) (string, bool) {
 		}
 	}
 	return s, true
+}
+
+// boundedErrorDetails is the data of a trust refusal: the engine's details, with
+// a findings list (ISSUER_NOT_ENTITLED) reduced to the bounded allowlist.
+func boundedErrorDetails(code ErrorCode, details map[string]interface{}) map[string]interface{} {
+	out := map[string]interface{}{}
+	for k, v := range details {
+		out[k] = v
+	}
+	if code == errCodeIssuerNotEntitled {
+		if f, ok := out["findings"]; ok {
+			findings, truncated := boundedFindings(f)
+			out["findings"] = findings
+			if truncated {
+				out["findings_truncated"] = true
+			}
+		}
+	}
+	return out
 }
 
 // entitlementRaw decodes a trust_evaluated payload for entitlementPayload.
