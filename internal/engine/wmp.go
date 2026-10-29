@@ -598,7 +598,10 @@ func (a *WMPAdapter) Close() { a.CloseContext(context.Background()) }
 func (a *WMPAdapter) CloseContext(ctx context.Context) {
 	a.Drain()
 	a.stopOnce.Do(func() { close(a.stopCh) })
-	<-a.loopDone
+	select {
+	case <-a.loopDone:
+	case <-ctx.Done():
+	}
 	if err := a.server.Close(ctx); err != nil {
 		a.logger.Warn("WMP server close", zap.Error(err))
 	}
@@ -608,8 +611,19 @@ func (a *WMPAdapter) CloseContext(ctx context.Context) {
 		ids = append(ids, id)
 	}
 	a.mu.Unlock()
-	for _, id := range ids {
-		a.endSession(id, false)
+	// Ending a session deletes its persisted state, which a slow store can hold up:
+	// the work is bounded by ctx, and carries on in the background past it.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for _, id := range ids {
+			a.endSession(id, false)
+		}
+	}()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		a.logger.Warn("WMP shutdown deadline passed while ending sessions", zap.Int("sessions", len(ids)))
 	}
 }
 

@@ -42,7 +42,7 @@ func translateVCIProgress(f *wmpFlow, step FlowStep, payload json.RawMessage) (w
 		return wmpStep{Step: openid4x.StepParsingOffer}, true
 	case StepOfferParsed:
 		// The parsed offer is the payload of parsing_offer (3.1.2).
-		return wmpStep{Step: openid4x.StepParsingOffer, Payload: map[string]interface{}{"offer": payloadObject(payload)}}, true
+		return wmpStep{Step: openid4x.StepParsingOffer, Payload: map[string]interface{}{"offer": withoutPreAuthorizedCode(payloadObject(payload))}}, true
 	case StepFetchingMetadata:
 		return wmpStep{Step: openid4x.StepResolvingMetadata}, true
 	case StepMetadataFetched:
@@ -174,7 +174,38 @@ func authorizationStep(payload json.RawMessage) wmpStep {
 	// authorization_url is the profile's; expected_redirect_uri, state,
 	// code_verifier and credential_offer are additive members the client needs
 	// to complete the authorization (the engine checks the state it gets back).
+	if offer, ok := m["credential_offer"]; ok {
+		m["credential_offer"] = withoutPreAuthorizedCode(offer)
+	}
 	return wmpStep{Step: openid4x.StepAuthorizationPending, Payload: m}
+}
+
+// preAuthorizedCodeMember is the member of the pre-authorized_code grant that
+// carries the code. The code is the engine's to redeem: it must not reach a
+// client or the replay log.
+const preAuthorizedCodeMember = "pre-authorized_code"
+
+// withoutPreAuthorizedCode returns v (a decoded JSON value) with every
+// pre-authorized_code member removed at any depth.
+func withoutPreAuthorizedCode(v interface{}) interface{} {
+	switch t := v.(type) {
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(t))
+		for k, e := range t {
+			if k == preAuthorizedCodeMember {
+				continue
+			}
+			out[k] = withoutPreAuthorizedCode(e)
+		}
+		return out
+	case []interface{}:
+		out := make([]interface{}, len(t))
+		for i, e := range t {
+			out[i] = withoutPreAuthorizedCode(e)
+		}
+		return out
+	}
+	return v
 }
 
 // deferredPayload is the payload a deferred issuance's progress carries: the
@@ -371,7 +402,12 @@ func translateAcceptOffer(f *wmpFlow, params *wmp.FlowActionParams) (*actionOutc
 	if err := decodeActionParams(params.Params, &in); err != nil {
 		return nil, errInvalidParams("accept_offer params are malformed")
 	}
-	if in.Consent != nil && !*in.Consent {
+	// Consent is affirmative or it is nothing: a missing or null consent must not
+	// advance the issuance.
+	if in.Consent == nil {
+		return nil, errInvalidParams("consent is required")
+	}
+	if !*in.Consent {
 		return &actionOutcome{Cancel: true}, nil
 	}
 	f.mu.Lock()

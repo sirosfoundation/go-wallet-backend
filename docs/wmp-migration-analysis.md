@@ -134,6 +134,12 @@ carries `credential_id` and `disclosed_claims`, which the engine vets and relays
 before; a WMP `select_credentials` is a closed set and carries neither, and a
 selection handle that the WebSocket protocol does not have).
 
+A transport that has a decision to report to its client implements `consentObserver`:
+the WMP bridge answers a `select_credentials` the policy refuses (a query not in the
+request) with the correlated `-32602` before acknowledging it (it waits up to 3 s for
+the flow's decision), a second selection for a flow is refused, and a malformed one
+after a valid one ends the flow (the bridge tracks that a selection was handed over).
+
 A consent the policy refuses ends the flow, the verifier is told `access_denied`
 without a description, and the client gets the flow error; over WMP a refusal for a
 query id that is not in the verifier's request, or repeated, is the terminal

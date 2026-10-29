@@ -1783,6 +1783,7 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 		selection["client_metadata"] = authReq.ClientMetadataRaw
 	}
 	selection["verified_request"] = verifiedInputs(authReq)
+	h.Flow.Session.noteConsentAwaited(h.Flow.ID)
 	_ = h.Progress(StepCredentialSelection, selection)
 
 	action, err := h.waitForSelectionAction(ctx, authReq)
@@ -1802,6 +1803,7 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 	if err != nil {
 		return consentDecision{}, h.refuseConsent(ctx, authReq, err)
 	}
+	h.Flow.Session.noteConsentDecided(h.Flow.ID, "")
 	if decision.Declined {
 		h.Logger.Info("user declined presentation", zap.String("reason", decision.Reason))
 		redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)
@@ -1824,12 +1826,12 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 // answer, not a decline, so it can report that in its own terms.
 func (h *OID4VPHandler) refuseConsent(ctx context.Context, authReq *AuthorizationRequest, refusal error) error {
 	var r *consentRefusal
-	if errors.As(refusal, &r) && r.Reason == consentReasonNoSelection {
+	if errors.As(refusal, &r) {
+		h.Flow.Session.noteConsentDecided(h.Flow.ID, r.Reason)
+	}
+	if r != nil && r.Reason == consentReasonNoSelection {
 		_ = h.Error(StepCredentialSelection, ErrCodePresentationError, "No credentials selected")
 		return errors.New("no credentials selected")
-	}
-	if r != nil {
-		h.Flow.Session.noteConsentRefused(h.Flow.ID, r.Reason)
 	}
 	redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)
 	if redirectURI != "" {

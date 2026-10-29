@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -121,6 +122,11 @@ func parseStart(params *wmp.FlowStartParams) (*FlowStartMessage, error) {
 // StartFlow validates the start synchronously, so a bad request is answered
 // -32602, then lets go-wmp run the flow.
 func (p *wmpFlowProfile) StartFlow(ctx context.Context, params *wmp.FlowStartParams) (*wmp.FlowStartResult, error) {
+	if params.FlowID == "" {
+		// The engine would generate an ID of its own while the WMP flow stays keyed
+		// by "": nothing of the flow could be found again.
+		return nil, wmp.NewRPCError(wmp.ErrInvalidParams, map[string]string{"reason": "flow_id is required"})
+	}
 	if len(params.FlowID) > maxFlowIDLength {
 		return nil, wmp.NewRPCError(wmp.ErrInvalidParams, map[string]string{"reason": "flow_id exceeds maximum length"})
 	}
@@ -246,6 +252,10 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 	}
 	if out.Cancel {
 		p.CancelSessionFlow(p.sessionID, params.FlowID)
+	} else if out.Msg.consent != nil {
+		if err := p.handOverSelection(ws, f, out.Msg); err != nil {
+			return nil, err
+		}
 	} else {
 		ws.session.dispatchAction(out.Msg)
 	}
@@ -257,13 +267,47 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 	}, nil
 }
 
+// consentVerdictWait bounds the wait for the engine's decision on a selection
+// before the action is acknowledged; the policy is local, so it is short.
+const consentVerdictWait = 3 * time.Second
+
+// handOverSelection hands the consent answer of a select_credentials to the
+// engine. A flow that decides consents itself answers whether the policy refused
+// it, and a refusal of a query that is not in the request is the correlated
+// -32602 without data of OpenID4x 3.2.3.1 (the flow ends with the terminal one).
+func (p *wmpFlowProfile) handOverSelection(ws *wmpSession, f *wmpFlow, msg *FlowActionMessage) error {
+	if !f.claimSelection() {
+		return wmp.NewRPCError(wmp.ErrFlowError, map[string]string{"reason": "selection already given"})
+	}
+	select { // a verdict of an earlier selection is stale
+	case <-f.verdict:
+	default:
+	}
+	ws.session.dispatchAction(msg)
+	if msg.Action != ActionConsent || !f.decides.Load() {
+		return nil
+	}
+	select {
+	case refused := <-f.verdict:
+		if refused {
+			return wmp.NewRPCError(wmp.ErrInvalidParams, nil)
+		}
+	case <-time.After(consentVerdictWait):
+	}
+	return nil
+}
+
 // refuseSelection ends a flow whose select_credentials the closed shape
 // refused. The flow is declined, so the verifier is told access_denied, and it
 // ends -32602 (see wmpFlow.malformed).
 func (p *wmpFlowProfile) refuseSelection(ws *wmpSession, f *wmpFlow, flowID string) {
 	f.malformed.Store(true)
+	// The flow waits for a selection only if none was handed to it yet: after a
+	// valid consent the step still says credential_selection until the engine's
+	// next progress, and the decline would never be consumed.
+	awaiting := f.claimSelection() && ws.session.awaitsSelection(flowID)
 	ws.session.dispatchAction(&FlowActionMessage{Message: Message{Type: TypeFlowAction, FlowID: flowID}, Action: ActionDecline})
-	if !ws.session.awaitsSelection(flowID) {
+	if !awaiting {
 		// The flow is not waiting for the selection (it is signing, or
 		// submitting): nothing would consume the decline and the flow would
 		// run on. It ends now, with the same terminal -32602.
@@ -323,6 +367,26 @@ type wmpFlow struct {
 	mu       sync.Mutex
 	offerIDs []string
 	issuer   map[string]interface{}
+	// selectionClaimed is set when a selection (or the decline that stands in for
+	// a malformed one) has been handed to the engine: the flow no longer waits for
+	// one, whatever step it reports.
+	selectionClaimed bool
+
+	// decides is set by an engine flow that decides consents itself (see
+	// consentObserver); verdict then carries its decision on a handed-over
+	// selection: true when the selection must be refused -32602.
+	decides atomic.Bool
+	verdict chan bool
+}
+
+// claimSelection records that a selection was handed to the engine and reports
+// whether it was the first.
+func (f *wmpFlow) claimSelection() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	first := !f.selectionClaimed
+	f.selectionClaimed = true
+	return first
 }
 
 // endMalformed ends the flow with the terminal -32602 of a malformed
@@ -360,6 +424,9 @@ func (t *wmpTransport) setPeer(p wmp.PeerContext) {
 }
 
 func (t *wmpTransport) add(id string, f *wmpFlow) {
+	if f.verdict == nil {
+		f.verdict = make(chan bool, 1)
+	}
 	t.mu.Lock()
 	t.flows[id] = f
 	t.mu.Unlock()
@@ -383,16 +450,30 @@ func (t *wmpTransport) peerContext() wmp.PeerContext {
 	return t.peer
 }
 
-// consentRefused implements consentRefusalObserver: the policy refused the
-// consent of a flow. A selection that is not in the verifier's request, or
-// repeats a query, is what OpenID4x 3.2.3.1 refuses with -32602 and no data, as
-// it does a malformed one; the flow then ends that way (see wmpFlow.malformed).
-func (t *wmpTransport) consentRefused(flowID, reason string) {
-	if reason != consentReasonOutsideQuery && reason != consentReasonDuplicate {
+// consentAwaited implements consentObserver.
+func (t *wmpTransport) consentAwaited(flowID string) {
+	if f := t.flow(flowID); f != nil {
+		f.decides.Store(true)
+	}
+}
+
+// consentDecided implements consentObserver: the policy decided the consent of a
+// flow. A selection that is not in the verifier's request, or repeats a query, is
+// what OpenID4x 3.2.3.1 refuses with -32602 and no data, as it does a malformed
+// one: the action is answered so, and the flow ends that way (see
+// wmpFlow.malformed).
+func (t *wmpTransport) consentDecided(flowID, refusal string) {
+	f := t.flow(flowID)
+	if f == nil {
 		return
 	}
-	if f := t.flow(flowID); f != nil {
+	invalid := refusal == consentReasonOutsideQuery || refusal == consentReasonDuplicate
+	if invalid {
 		f.malformed.Store(true)
+	}
+	select {
+	case f.verdict <- invalid:
+	default:
 	}
 }
 
@@ -546,7 +627,7 @@ func (t *wmpTransport) relaySign(f *wmpFlow, m *SignRequestMessage) {
 		var result json.RawMessage
 		result, err = openid4x.RequestSign(f.context(), f.fc, params, subFlowTimeout)
 		if err == nil {
-			if jerr := json.Unmarshal(result, resp); jerr != nil {
+			if jerr := json.Unmarshal(normalizeSignResult(result), resp); jerr != nil {
 				err = jerr
 			}
 			resp.Type, resp.FlowID, resp.MessageID = TypeSignResponse, m.FlowID, m.MessageID
@@ -558,6 +639,47 @@ func (t *wmpTransport) relaySign(f *wmpFlow, m *SignRequestMessage) {
 	if ws := t.a.session(t.id); ws != nil {
 		ws.session.dispatchSignResponse(resp)
 	}
+}
+
+// normalizeSignResult turns the vp_token of a sign result into the engine's
+// representation, a string (OpenID4x 3.2.4 lets it be a string, an array of
+// strings or, for DCQL, an object keyed by query id): an array becomes the
+// newline-separated form the engine splits, an object its JSON text, which the
+// engine submits as it is.
+func normalizeSignResult(raw json.RawMessage) json.RawMessage {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(raw, &m) != nil {
+		return raw
+	}
+	vp, ok := m["vp_token"]
+	if !ok {
+		return raw
+	}
+	var s string
+	if json.Unmarshal(vp, &s) == nil {
+		return raw
+	}
+	var joined string
+	var arr []string
+	var obj map[string]json.RawMessage
+	switch {
+	case json.Unmarshal(vp, &arr) == nil && arr != nil:
+		joined = strings.Join(arr, "\n")
+	case json.Unmarshal(vp, &obj) == nil && obj != nil:
+		joined = string(vp)
+	default:
+		return raw
+	}
+	b, err := json.Marshal(joined)
+	if err != nil {
+		return raw
+	}
+	m["vp_token"] = b
+	out, err := json.Marshal(m)
+	if err != nil {
+		return raw
+	}
+	return out
 }
 
 // signFailure is the engine's view of a failed sign sub-flow. Wallet text and
