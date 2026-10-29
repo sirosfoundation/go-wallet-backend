@@ -263,18 +263,9 @@ func sendNotification(ctx context.Context, httpClient *http.Client, nc *notifica
 	// credential request path.
 	dpopNonce := nc.dpopNonce
 	for attempt := 0; attempt < 2; attempt++ {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, nc.endpoint, bytes.NewReader(bodyBytes))
+		req, err := newNotificationRequest(ctx, nc, bodyBytes, dpopNonce)
 		if err != nil {
 			return err
-		}
-		req.Header.Set("Content-Type", "application/json")
-		setNotificationAuthHeader(req, nc)
-		if nc.dpopSigner != nil && strings.EqualFold(nc.tokenType, "DPoP") {
-			proof, err := nc.dpopSigner.Proof(ctx, req.Method, dpopHTU(nc.endpoint), nc.accessToken, dpopNonce)
-			if err != nil {
-				return fmt.Errorf("failed to create DPoP proof for notification: %w", err)
-			}
-			req.Header.Set("DPoP", proof)
 		}
 
 		resp, err := httpClient.Do(req)
@@ -290,21 +281,25 @@ func sendNotification(ctx context.Context, httpClient *http.Client, nc *notifica
 			continue
 		}
 
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
-		_ = resp.Body.Close()
-
-		// Per OID4VCI §10, the issuer responds with 204 No Content on success.
-		if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
-			return nil
-		}
-		if logger != nil {
-			logger.Debug("notification endpoint returned non-success status",
-				zap.Int("status", resp.StatusCode),
-				zap.String("body", string(body)))
-		}
-		return fmt.Errorf("notification endpoint returned status %d", resp.StatusCode)
+		return notificationResult(resp, logger)
 	}
 	return fmt.Errorf("notification request failed after DPoP nonce retry")
+}
+
+// notificationResult is the outcome of the issuer's answer to a Notification
+// Request: per OID4VCI §10 it responds with 204 No Content on success.
+func notificationResult(resp *http.Response, logger *zap.Logger) error {
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+	_ = resp.Body.Close()
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+		return nil
+	}
+	if logger != nil {
+		logger.Debug("notification endpoint returned non-success status",
+			zap.Int("status", resp.StatusCode),
+			zap.String("body", string(body)))
+	}
+	return fmt.Errorf("notification endpoint returned status %d", resp.StatusCode)
 }
 
 // dpopHTU is the htu of a DPoP proof for the request to endpoint: the endpoint
@@ -315,6 +310,26 @@ func dpopHTU(endpoint string) string {
 		return htu
 	}
 	return endpoint
+}
+
+// newNotificationRequest builds the Notification Request to the full endpoint,
+// authorized with the retained token and, when the token is DPoP-bound, with a
+// proof over the endpoint without query and fragment.
+func newNotificationRequest(ctx context.Context, nc *notificationContext, body []byte, dpopNonce string) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, nc.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setNotificationAuthHeader(req, nc)
+	if nc.dpopSigner != nil && strings.EqualFold(nc.tokenType, "DPoP") {
+		proof, err := nc.dpopSigner.Proof(ctx, req.Method, dpopHTU(nc.endpoint), nc.accessToken, dpopNonce)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create DPoP proof for notification: %w", err)
+		}
+		req.Header.Set("DPoP", proof)
+	}
+	return req, nil
 }
 
 // setNotificationAuthHeader sets the Authorization header using the DPoP scheme

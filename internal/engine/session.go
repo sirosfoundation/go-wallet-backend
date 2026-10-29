@@ -1615,20 +1615,20 @@ func (s *Session) SendNotificationAck(flowID, notificationID, status, errMsg str
 	return s.Send(&msg)
 }
 
-// notificationContextPolicy is implemented by a transport that decides whether
+// notificationBinder is implemented by a transport that decides whether
 // the issuance context of a notification is retained and for whom (the WMP
 // transport: only for a session that negotiated credential_notification, bound
 // to the principal that ran the issuance).
-type notificationContextPolicy interface {
-	notificationBinding(ctx context.Context) (principal string, retain bool)
+type notificationBinder interface {
+	bindNotification(ctx context.Context) (principal string, retain bool)
 }
 
-// notificationBinding is the principal a notification context is retained for
+// bindNotification is the principal a notification context is retained for
 // and whether it is retained at all. A WebSocket connection retains it (the
 // connection is the binding, principal ""), as it always has.
-func (s *Session) notificationBinding(ctx context.Context) (string, bool) {
-	if p, ok := s.transport.(notificationContextPolicy); ok {
-		return p.notificationBinding(ctx)
+func (s *Session) bindNotification(ctx context.Context) (string, bool) {
+	if p, ok := s.transport.(notificationBinder); ok {
+		return p.bindNotification(ctx)
 	}
 	return "", true
 }

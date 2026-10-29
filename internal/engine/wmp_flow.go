@@ -494,12 +494,12 @@ func (t *wmpTransport) peerContext() wmp.PeerContext {
 	return t.peer
 }
 
-// notificationBinding implements notificationContextPolicy. The issuance context
+// bindNotification implements notificationBinder. The issuance context
 // is kept only when the session negotiated credential_notification (WMP
 // OpenID4x 2.4, 3.4: nothing is retained for a wallet that will not use it),
 // bound to the principal that ran the issuance. A flow without a principal in
 // its context retains nothing (fail closed).
-func (t *wmpTransport) notificationBinding(ctx context.Context) (string, bool) {
+func (t *wmpTransport) bindNotification(ctx context.Context) (string, bool) {
 	p, ok := wmp.PrincipalFromContext(ctx)
 	if !ok || p.Key() == "" {
 		return "", false
