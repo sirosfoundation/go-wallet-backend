@@ -180,7 +180,7 @@ document (`ProjectVCTM`; `vct` is the uri when the document has none). A lookup 
 finds no document, cannot reach one, or finds one that is not an object is `-32603`
 `{"reason": "metadata_fetch_error"}` with nothing of the failure; `metadata: null` only
 when the registry says it has no entry and the `vct` is not a URL to try; an empty
-uri is `-32602`. A URL is fetched with the engine's HTTP client policy: loopback,
+uri is `-32602`. The lookup carries the session's tenant (`X-Tenant-ID`). A URL is fetched with the engine's HTTP client policy: loopback,
 private, link-local and metadata addresses and non-HTTPS are refused, redirects
 included, unless the deployment is configured for local development; the document is
 read up to 1 MiB.
@@ -201,7 +201,13 @@ to the start; the flow type is authorized exactly as `oid4vci`).
   negotiated the capability, bound to the issuance session and the principal that ran
   it (a WebSocket session keeps it as before). Each `notification_id` is single use
   (`claim`); an encrypted issuer response, whose ids the engine never saw, accepts the
-  wallet's ids once each, up to 256. The context lives until its TTL.
+  wallet's ids once each, up to 256. The context lives until its TTL. The legacy
+  `wmp.credential.notification` method reads and writes the same per-id record for a
+  WMP context, so an id forwarded by one cannot be forwarded by the other.
+- The flow takes a slot of the session's concurrent-flow limit (`reserveFlow`, the same
+  atomic check as every flow; at the limit it ends `busy`, retryable) and is registered
+  as an `oid4vci` flow, so the guard requires the issuance permission for every
+  message about it and its sign sub-flow. It has no actions.
 - The completion gains `notification_endpoint` (when a context was retained) and keeps
   `credentials[].notification_id` for plain responses only, each within the profile's
   bounds (256 and 2048 characters).

@@ -754,3 +754,166 @@ type dpopSignerFunc func(ctx context.Context, htm, htu, accessToken, nonce strin
 func (f dpopSignerFunc) Proof(ctx context.Context, htm, htu, accessToken, nonce string) (string, error) {
 	return f(ctx, htm, htu, accessToken, nonce)
 }
+
+// ---------------------------------------------------------------------------
+// Review round 1
+// ---------------------------------------------------------------------------
+
+// The flow and the legacy wmp.credential.notification method use one consumption
+// record per notification_id: an id forwarded by either cannot be forwarded by
+// the other (a conflicting event with the same issuance token), and ids that were
+// not used stay usable by either.
+func TestWMPNotification_FlowAndLegacyMethodShareTheConsumptionRecord(t *testing.T) {
+	e := newChanEnv(t, "Bearer", true) // encrypted: the wallet names the ids
+	w := e.wallet("alice", fullTAC, "oid4vci", "credential_notification")
+	w.issue("f1")
+	legacy := func(id, event string) string {
+		ws := e.a.session(w.sid)
+		e.m.dispatchCredentialNotification(ws.session, &CredentialNotificationMessage{
+			Message: Message{Type: TypeCredentialNotification, FlowID: "f1"}, NotificationID: id, Event: event})
+		ev := w.method(wmp.MethodMessageDeliver)
+		body, _ := rpcParams(ev)["body"].(map[string]any)
+		return body["status"].(string)
+	}
+
+	w.notify("n1", "f1", "id-a", "credential_accepted")
+	method, _ := w.outcome("n1")
+	require.Equal(t, wmp.MethodFlowComplete, method)
+	assert.Equal(t, "rejected", legacy("id-a", "credential_failure"), "spent by the flow")
+	assert.Equal(t, 1, e.iss.count())
+
+	assert.Equal(t, "forwarded", legacy("id-b", "credential_accepted"))
+	w.notify("n2", "f1", "id-b", "credential_failure")
+	reason, _ := w.reason("n2")
+	assert.Equal(t, "context_unavailable", reason, "spent by the legacy method")
+	assert.Equal(t, 2, e.iss.count())
+
+	w.notify("n3", "f1", "id-c", "credential_accepted")
+	method, _ = w.outcome("n3")
+	assert.Equal(t, wmp.MethodFlowComplete, method, "an unused id is still usable")
+	assert.Equal(t, 3, e.iss.count())
+}
+
+// A message about a running notification flow, or its sign sub-flow, needs the
+// issuance permission like any message about an oid4vci flow: a token with only
+// "r" cannot end the flow, and the wallet can still finish it.
+func TestWMPNotification_ReducedPermissionCannotEndTheFlow(t *testing.T) {
+	e := newChanEnv(t, "DPoP", false)
+	w := e.wallet("alice", fullTAC, "oid4vci", "credential_notification")
+	w.issue("f1")
+	w.notify("n1", "f1", "nid-1", "credential_accepted")
+	signStart := w.method(wmp.MethodFlowStart) // the flow waits for the proof
+
+	weakP := NewWMPPrincipal("alice", "t1", "jti-alice", "r")
+	weak := wmp.ContextWithPrincipal(w.ctx, weakP)
+	h, opts := e.a.NewSessionHandler(weak, weakP, w.sid)
+	peer := wmp.NewPeer(wmp.NewChannelTransport(8, 8), h, opts...)
+	send := func(method string, id any, params map[string]any) *wmp.Response {
+		m := map[string]any{"jsonrpc": "2.0", "method": method, "params": params}
+		if id != nil {
+			m["id"] = id
+		}
+		body, _ := json.Marshal(m)
+		out, err := peer.HandleRequestSync(weak, body)
+		require.NoError(t, err)
+		if len(out) == 0 {
+			return nil
+		}
+		var resp wmp.Response
+		require.NoError(t, json.Unmarshal(out, &resp))
+		return &resp
+	}
+	sub := rpcParams(signStart)["flow_id"].(string)
+	for name, tc := range map[string]struct {
+		method string
+		params map[string]any
+	}{
+		"cancel the notification":   {wmp.MethodFlowCancel, map[string]any{"wmp": meta(w.sid), "flow_id": "n1"}},
+		"complete the notification": {wmp.MethodFlowComplete, map[string]any{"wmp": meta(w.sid), "flow_id": "n1", "result": map[string]any{"status": "forwarded", "notification_id": "nid-1"}}},
+		"error the notification":    {wmp.MethodFlowError, map[string]any{"wmp": meta(w.sid), "flow_id": "n1", "code": wmp.ErrFlowError, "message": "x"}},
+		"complete the sub-flow":     {wmp.MethodFlowComplete, map[string]any{"wmp": meta(w.sid), "flow_id": sub, "result": map[string]any{"dpop_proof": "forged"}}},
+		"error the sub-flow":        {wmp.MethodFlowError, map[string]any{"wmp": meta(w.sid), "flow_id": sub, "code": wmp.ErrFlowError, "message": "x"}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var id any
+			if tc.method == wmp.MethodFlowCancel {
+				id = "weak-1"
+			}
+			if resp := send(tc.method, id, tc.params); resp != nil {
+				require.NotNil(t, resp.Error, "%v", resp)
+				assert.Equal(t, wmp.ErrNotAuthorized, resp.Error.Code)
+			}
+		})
+	}
+	assert.Equal(t, 0, e.iss.count())
+
+	// The flow is still running: the wallet finishes it.
+	p := rpcParams(signStart)
+	sp := p["params"].(map[string]any)
+	proof, err := createDPoPProof(e.key, sp["htm"].(string), sp["htu"].(string), "access-1", "")
+	require.NoError(t, err)
+	w.push(map[string]any{"id": signStart["id"], "result": map[string]any{"wmp": meta(w.sid), "flow_id": sub, "flow_type": "sign"}})
+	w.push(notification(wmp.MethodFlowComplete, map[string]any{"wmp": meta(w.sid), "flow_id": sub, "result": map[string]any{"dpop_proof": proof}}))
+	method, out := w.outcome("n1")
+	require.Equal(t, wmp.MethodFlowComplete, method, "%v", out)
+	assert.Equal(t, 1, e.iss.count())
+}
+
+// A notification flow takes a slot of the session's concurrent-flow limit like
+// every flow: flows that wait for an unanswered proof cannot exceed it, the next
+// one ends busy (retryable), and a slot given back is usable again.
+func TestWMPNotification_TakesASessionFlowSlot(t *testing.T) {
+	e := newChanEnv(t, "DPoP", true)
+	w := e.wallet("alice", fullTAC, "oid4vci", "credential_notification")
+	w.issue("f1")
+	for i := 0; i < MaxPendingFlowsPerSession; i++ {
+		r := w.notify("n"+string(rune('1'+i)), "f1", "id-"+string(rune('a'+i)), "credential_accepted")
+		require.Nil(t, r["error"], "%v", r)
+		w.method(wmp.MethodFlowStart) // each waits for its proof
+	}
+	w.notify("n-over", "f1", "id-z", "credential_accepted")
+	reason, retryable := w.reason("n-over")
+	assert.Equal(t, "busy", reason)
+	assert.True(t, retryable)
+	assert.Equal(t, 0, e.iss.count())
+
+	// An engine flow is refused by the same limit.
+	w.start("oid4vci", "f2", map[string]any{"credential_offer": "openid-credential-offer://x"})
+	errMsg := w.recv(func(m map[string]any) bool {
+		return m["method"] == wmp.MethodFlowError && rpcParams(m)["flow_id"] == "f2"
+	})
+	assert.EqualValues(t, wmp.ErrRateLimited, rpcParams(errMsg)["code"])
+
+	// A cancelled notification gives its slot back.
+	w.call(wmp.MethodFlowCancel, map[string]any{"wmp": meta(w.sid), "flow_id": "n1"})
+	require.Eventually(t, func() bool {
+		ws := e.a.session(w.sid)
+		ws.session.flowsMu.RLock()
+		defer ws.session.flowsMu.RUnlock()
+		return len(ws.session.flows) < MaxPendingFlowsPerSession
+	}, 3*time.Second, 20*time.Millisecond)
+}
+
+// No action is accepted for a notification flow: it has none (OpenID4x 3.4).
+func TestWMPNotification_HasNoActions(t *testing.T) {
+	e := newChanEnv(t, "DPoP", false)
+	w := e.wallet("alice", fullTAC, "oid4vci", "credential_notification")
+	w.issue("f1")
+	w.notify("n1", "f1", "nid-1", "credential_accepted")
+	w.method(wmp.MethodFlowStart)
+	r := w.call(wmp.MethodFlowAction, map[string]any{"wmp": meta(w.sid), "flow_id": "n1", "action": "cancel", "params": map[string]any{}})
+	code, _ := rpcError(r)
+	assert.Equal(t, wmp.ErrInvalidParams, code)
+}
+
+// hasValid, the legacy pre-check, reads the same record: an id the flow spent is
+// not valid, an unused one is.
+func TestNotificationContextStore_HasValidReadsTheConsumptionRecord(t *testing.T) {
+	s := newNotificationContextStore()
+	s.put("f1", &notificationContext{endpoint: "https://i/n", principal: "p"}) // knows no id
+	require.NotNil(t, s.claim("f1", "p", "id-a"))
+	assert.False(t, s.hasValid("f1", "id-a"))
+	assert.True(t, s.hasValid("f1", "id-b"))
+	assert.Nil(t, s.takeForNotification("f1", "id-a"))
+	assert.NotNil(t, s.takeForNotification("f1", "id-b"))
+}

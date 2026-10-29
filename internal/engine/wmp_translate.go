@@ -321,66 +321,17 @@ func errInvalidParams(reason string) error {
 // must not send), plus trust_result, the engine's request for the client to
 // evaluate trust, which the profile has no action for.
 func translateAction(f *wmpFlow, flowType string, params *wmp.FlowActionParams) (*actionOutcome, error) {
-	msg := func(action string, payload interface{}) (*actionOutcome, error) {
-		raw, err := json.Marshal(payload)
-		if err != nil {
-			return nil, err
-		}
-		return &actionOutcome{Msg: &FlowActionMessage{
-			Message: Message{Type: TypeFlowAction, FlowID: params.FlowID}, Action: action, Payload: raw,
-		}}, nil
-	}
+	var out *actionOutcome
+	var err error
+	handled := false
 	switch flowType {
 	case openid4x.FlowTypeOID4VCI:
-		switch params.Action {
-		case openid4x.ActionAcceptOffer:
-			return translateAcceptOffer(f, params)
-		case openid4x.ActionProvideTxCode:
-			var in struct {
-				TxCode string `json:"tx_code"`
-			}
-			if err := decodeActionParams(params.Params, &in); err != nil || in.TxCode == "" {
-				return nil, errInvalidParams("tx_code is required")
-			}
-			return msg(ActionProvidePin, map[string]string{"tx_code": in.TxCode})
-		case openid4x.ActionAuthorize:
-			var in struct {
-				AuthCode     string `json:"auth_code"`
-				CodeVerifier string `json:"code_verifier"`
-				State        string `json:"state"`
-			}
-			if err := decodeActionParams(params.Params, &in); err != nil || in.AuthCode == "" {
-				return nil, errInvalidParams("auth_code is required")
-			}
-			// state is an additive member: the engine checks it against the one
-			// it sent in authorization_pending, so it must come from the client.
-			return msg(ActionAuthorizationComplete, map[string]string{
-				"code": in.AuthCode, "state": in.State, "code_verifier": in.CodeVerifier,
-			})
-		case openid4x.ActionCancel:
-			return &actionOutcome{Cancel: true}, nil
-		}
+		out, err, handled = translateVCIAction(f, params)
 	case openid4x.FlowTypeOID4VP:
-		switch params.Action {
-		case openid4x.ActionSelectCredentials:
-			answer, err := consentFromSelectCredentials(params.Params)
-			if err != nil {
-				return nil, err
-			}
-			action := ActionConsent
-			if answer.Declined {
-				action = ActionDecline
-			}
-			return &actionOutcome{Msg: &FlowActionMessage{
-				Message: Message{Type: TypeFlowAction, FlowID: params.FlowID}, Action: action, consent: answer,
-			}}, nil
-		case openid4x.ActionCancel:
-			var in struct {
-				Reason string `json:"reason"`
-			}
-			_ = decodeActionParams(params.Params, &in)
-			return msg(ActionDecline, map[string]string{"reason": in.Reason})
-		}
+		out, err, handled = translateVPAction(params)
+	}
+	if handled {
+		return out, err
 	}
 	if params.Action == ActionTrustResult {
 		return &actionOutcome{Msg: &FlowActionMessage{
@@ -388,6 +339,80 @@ func translateAction(f *wmpFlow, flowType string, params *wmp.FlowActionParams) 
 		}}, nil
 	}
 	return nil, errInvalidParams("unknown action for flow type")
+}
+
+// actionMessage is the engine action msg of a flow with a JSON payload.
+func actionMessage(params *wmp.FlowActionParams, action string, payload interface{}) (*actionOutcome, error) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+	return &actionOutcome{Msg: &FlowActionMessage{
+		Message: Message{Type: TypeFlowAction, FlowID: params.FlowID}, Action: action, Payload: raw,
+	}}, nil
+}
+
+// translateVCIAction translates the actions of an oid4vci flow; handled is false
+// for an action the profile does not define for it.
+func translateVCIAction(f *wmpFlow, params *wmp.FlowActionParams) (out *actionOutcome, err error, handled bool) {
+	switch params.Action {
+	case openid4x.ActionAcceptOffer:
+		out, err = translateAcceptOffer(f, params)
+	case openid4x.ActionProvideTxCode:
+		var in struct {
+			TxCode string `json:"tx_code"`
+		}
+		if err = decodeActionParams(params.Params, &in); err != nil || in.TxCode == "" {
+			return nil, errInvalidParams("tx_code is required"), true
+		}
+		out, err = actionMessage(params, ActionProvidePin, map[string]string{"tx_code": in.TxCode})
+	case openid4x.ActionAuthorize:
+		var in struct {
+			AuthCode     string `json:"auth_code"`
+			CodeVerifier string `json:"code_verifier"`
+			State        string `json:"state"`
+		}
+		if err = decodeActionParams(params.Params, &in); err != nil || in.AuthCode == "" {
+			return nil, errInvalidParams("auth_code is required"), true
+		}
+		// state is an additive member: the engine checks it against the one
+		// it sent in authorization_pending, so it must come from the client.
+		out, err = actionMessage(params, ActionAuthorizationComplete, map[string]string{
+			"code": in.AuthCode, "state": in.State, "code_verifier": in.CodeVerifier,
+		})
+	case openid4x.ActionCancel:
+		out = &actionOutcome{Cancel: true}
+	default:
+		return nil, nil, false
+	}
+	return out, err, true
+}
+
+// translateVPAction translates the actions of an oid4vp flow; handled is false
+// for an action the profile does not define for it.
+func translateVPAction(params *wmp.FlowActionParams) (out *actionOutcome, err error, handled bool) {
+	switch params.Action {
+	case openid4x.ActionSelectCredentials:
+		answer, cerr := consentFromSelectCredentials(params.Params)
+		if cerr != nil {
+			return nil, cerr, true
+		}
+		action := ActionConsent
+		if answer.Declined {
+			action = ActionDecline
+		}
+		return &actionOutcome{Msg: &FlowActionMessage{
+			Message: Message{Type: TypeFlowAction, FlowID: params.FlowID}, Action: action, consent: answer,
+		}}, nil, true
+	case openid4x.ActionCancel:
+		var in struct {
+			Reason string `json:"reason"`
+		}
+		_ = decodeActionParams(params.Params, &in)
+		out, err = actionMessage(params, ActionDecline, map[string]string{"reason": in.Reason})
+		return out, err, true
+	}
+	return nil, nil, false
 }
 
 // decodeActionParams decodes the params of an action; absent params are the

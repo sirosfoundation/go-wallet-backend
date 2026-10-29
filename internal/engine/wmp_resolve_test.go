@@ -173,3 +173,15 @@ func TestWMPResolve_EgressPolicy(t *testing.T) {
 	require.Equal(t, 0, r.code(), "%v", r.Body)
 	assert.EqualValues(t, 1, hits.Load(), "development configuration reaches it")
 }
+
+// The registry lookup is made for the session's tenant, as the engine's own flows
+// make theirs (X-Tenant-ID).
+func TestWMPResolve_LookupCarriesTheSessionsTenant(t *testing.T) {
+	var tenant atomic.Value
+	r := resolveEnv(t, func(w http.ResponseWriter, r *http.Request) {
+		tenant.Store(r.Header.Get("X-Tenant-ID"))
+		_, _ = w.Write([]byte(`{"name":"N"}`))
+	}, nil)("urn:example:id")
+	require.Equal(t, 0, r.code(), "%v", r.Body)
+	assert.Equal(t, "t1", tenant.Load(), "the harness token's tenant")
+}

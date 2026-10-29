@@ -1002,29 +1002,17 @@ func (m *Manager) handleFlowStartContext(parent context.Context, session *Sessio
 	}
 
 	// Check concurrent flow limit and register atomically to prevent race condition.
-	// We hold the lock from check through registration to ensure atomic check-and-add.
-	session.flowsMu.Lock()
-	if session.ended {
-		session.flowsMu.Unlock()
+	flow, err := session.reserveFlow(flowID, msg.Protocol, false)
+	switch {
+	case errors.Is(err, errSessionEnded):
 		logger.Debug("Rejected flow start - session ended")
 		return
-	}
-	pendingFlows := len(session.flows)
-	if pendingFlows >= MaxPendingFlowsPerSession {
-		session.flowsMu.Unlock()
+	case err != nil:
 		_ = session.SendFlowError(flowID, "", ErrCodeTooManyRequests, "Too many pending flows. Complete or cancel existing flows before starting new ones.")
 		logger.Warn("Rejected flow start - too many pending flows",
-			zap.Int("pending_flows", pendingFlows),
 			zap.Int("limit", MaxPendingFlowsPerSession))
 		return
 	}
-
-	// Create flow while still holding lock
-	flow := newFlow(flowID, msg.Protocol, session)
-
-	// Register flow immediately to reserve slot
-	session.flows[flowID] = flow
-	session.flowsMu.Unlock()
 
 	// Create handler (after releasing lock to avoid holding it during potentially slow operations)
 	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient, m.verifierStore, m.trustCache)
@@ -1059,6 +1047,41 @@ func (m *Manager) handleFlowStartContext(parent context.Context, session *Sessio
 		return
 	}
 	logger.Info("Flow completed")
+}
+
+var (
+	errSessionEnded = errors.New("session ended")
+	errTooManyFlows = errors.New("too many pending flows")
+	errFlowIDInUse  = errors.New("flow id in use")
+)
+
+// reserveFlow checks the per-session limit of concurrent flows and registers the
+// flow in one step under the lock, so the check and the slot cannot be split by a
+// race; the caller releases the slot with releaseFlow. With rejectDuplicate a
+// flow_id that is already registered is refused (errFlowIDInUse) instead of
+// replaced.
+func (s *Session) reserveFlow(flowID string, protocol Protocol, rejectDuplicate bool) (*Flow, error) {
+	s.flowsMu.Lock()
+	defer s.flowsMu.Unlock()
+	if s.ended {
+		return nil, errSessionEnded
+	}
+	if len(s.flows) >= MaxPendingFlowsPerSession {
+		return nil, errTooManyFlows
+	}
+	if _, taken := s.flows[flowID]; taken && rejectDuplicate {
+		return nil, errFlowIDInUse
+	}
+	flow := newFlow(flowID, protocol, s)
+	s.flows[flowID] = flow
+	return flow, nil
+}
+
+// releaseFlow gives a flow's slot back.
+func (s *Session) releaseFlow(flowID string) {
+	s.flowsMu.Lock()
+	delete(s.flows, flowID)
+	s.flowsMu.Unlock()
 }
 
 // checkSharedRevocation consults the shared revocation store before
@@ -1674,7 +1697,7 @@ func (m *Manager) forwardCredentialNotification(session *Session, msg *Credentia
 		}
 	}()
 
-	nc := session.notifications.take(msg.FlowID)
+	nc := session.notifications.takeForNotification(msg.FlowID, msg.NotificationID)
 	if nc == nil {
 		// Raced with TTL expiry or another in-flight notification for the same
 		// flow consumed the one-shot context.
