@@ -1510,6 +1510,18 @@ func TestRefuseSignRequests(t *testing.T) {
 		assert.False(t, s.refuseSignRequests("f1"), "the refusal did not take: the caller ends the flow")
 		assert.Equal(t, "vp", (<-reply).VPToken, "the wallet's result is untouched")
 	})
+	t.Run("a result the waiter has already taken is not overridden", func(t *testing.T) {
+		// RequestSign took the reply and is submitting; its cleanup (done) has not
+		// removed the request yet, so the channel is empty but the request is
+		// still registered.
+		s := newSession()
+		reply, done := s.trackSign("m1", "f1")
+		defer done()
+		s.dispatchSignResponse(&SignResponseMessage{Message: Message{FlowID: "f1", MessageID: "m1"}, VPToken: "vp"})
+		require.Equal(t, "vp", (<-reply).VPToken)
+		assert.False(t, s.refuseSignRequests("f1"), "the wallet answered first: the caller ends the flow")
+		assert.Empty(t, reply, "no refusal is queued for a waiter that has gone")
+	})
 	t.Run("no pending request", func(t *testing.T) {
 		assert.False(t, newSession().refuseSignRequests("f1"))
 	})

@@ -164,6 +164,11 @@ type pendingRequest struct {
 	flowID string
 	sign   chan *SignResponseMessage
 	match  chan *MatchResponseMessage
+	// answered is set by whoever delivers the first reply of a sign request
+	// (the wallet's, or the engine's own refusal, see refuseSignRequests). Both
+	// go through the same compare-and-swap, so which one came first is decided
+	// once, whether or not the waiter has taken it from the channel yet.
+	answered atomic.Bool
 }
 
 // trackRequest registers p under messageID until the returned func is called.
@@ -787,11 +792,11 @@ func (s *Session) dispatchSignResponse(msg *SignResponseMessage) {
 	if p := s.outstandingRequests[msg.MessageID]; p != nil && p.sign != nil &&
 		(msg.FlowID == "" || msg.FlowID == p.flowID) {
 		owned = true
-		// Cap 1: a duplicate reply finds it full and is dropped silently; the
-		// request has an owner, so UNKNOWN_FLOW (terminal) would be untrue.
-		select {
-		case p.sign <- msg:
-		default:
+		// Only the first reply is delivered (cap 1: it never blocks); a duplicate is
+		// dropped silently, since the request has an owner and UNKNOWN_FLOW
+		// (terminal) would be untrue.
+		if p.answered.CompareAndSwap(false, true) {
+			p.sign <- msg
 		}
 	}
 	_, flowExists := s.flows[msg.FlowID]
