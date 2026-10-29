@@ -610,9 +610,17 @@ func TestWMPBridge_SelectCredentials(t *testing.T) {
 				require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
 				waitFlows(t, e, sid, 1)
 
+				st, _ := e.openStream(tok, sid, "")
 				r := e.post(tok, sid, selectAction(sid, p))
 				assert.Equal(t, wmp.ErrInvalidParams, r.code())
 				assert.Nil(t, r.errData(), "nothing of the params is echoed")
+				// The flow ends with a terminal -32602 carrying no data and nothing of the
+				// offending params (not as an ordinary decline, -31006).
+				ev := st.nextMethod(t, wmp.MethodFlowError)
+				assert.EqualValues(t, wmp.ErrInvalidParams, params(ev)["code"])
+				assert.Nil(t, params(ev)["data"])
+				assert.NotContains(t, ev.Raw, "credential_id")
+				assert.NotContains(t, ev.Raw, "disclosed_claims")
 				select {
 				case act := <-actions:
 					assert.Equal(t, ActionDecline, act.Action, "the flow is declined")
@@ -1188,4 +1196,142 @@ func TestWMPBridge_ErrorForUnknownFlow(t *testing.T) {
 	ev := st.nextMethod(t, wmp.MethodFlowError)
 	assert.Equal(t, "ghost", params(ev)["flow_id"])
 	assert.EqualValues(t, wmp.ErrFlowError, params(ev)["code"])
+}
+
+// Attaching a stream and answering a request need a token that grants every
+// permission the session was created with: go-wmp checks the owner, not the TAC,
+// and a response can fail the flow that waits for it. A weaker token of the same
+// user is refused (403) and leaves the pending request usable; another user sees
+// what an unknown session looks like.
+func TestWMPBridge_StreamAndResponsesNeedTheSessionsPermissions(t *testing.T) {
+	e := newWMPEnv(t)
+	got := make(chan *SignResponseMessage, 1)
+	registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
+		resp, err := f.Session.RequestSign(ctx, f.ID, SignActionSignPresentation, SignRequestParams{Nonce: "n"})
+		if err == nil {
+			got <- resp
+		}
+		return err
+	})
+	full := e.token("alice", "t1", "ir", "j1")
+	weak := e.token("alice", "t1", "i", "j2")
+	other := e.token("bob", "t1", "ir", "j3")
+	sid := e.create(full, "oid4vp")
+	st, _ := e.openStream(full, sid, "")
+	require.Equal(t, 0, e.post(full, sid, startOID4VP(sid, "f1")).code())
+
+	_, status := e.openStream(weak, sid, "")
+	assert.Equal(t, http.StatusForbidden, status, "a weaker token may not attach to the stream")
+	_, status = e.openStream(other, sid, "")
+	assert.Equal(t, http.StatusNotFound, status, "another user's session looks like an unknown one")
+
+	start := st.nextMethod(t, wmp.MethodFlowStart)
+	sub := params(start)["flow_id"].(string)
+	// The weak token cannot answer the request, and so cannot fail the flow.
+	r := e.post(weak, sid, map[string]any{"id": start.Data["id"], "error": map[string]any{"code": wmp.ErrFlowError, "message": "no"}})
+	assert.Equal(t, http.StatusForbidden, r.Status)
+	// The right token still can.
+	e.post(full, sid, map[string]any{"id": start.Data["id"], "result": map[string]any{"wmp": meta(sid), "flow_id": sub, "flow_type": "sign"}})
+	e.post(full, sid, notification(wmp.MethodFlowComplete, map[string]any{"wmp": meta(sid), "flow_id": sub, "result": map[string]any{"vp_token": "vp-1"}}))
+	select {
+	case resp := <-got:
+		assert.Equal(t, "vp-1", resp.VPToken)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pending sign request was failed or lost")
+	}
+}
+
+// A Peer built for a session by an in-process caller serves only that session's
+// owner, and only messages that name that session.
+func TestWMPBridge_GuardChecksOwnershipWithoutHTTP(t *testing.T) {
+	m := NewManager(&config.Config{}, zap.NewNop())
+	a := NewWMPAdapter(m, zap.NewNop(), func(*http.Request) string { return "" })
+	t.Cleanup(func() { a.Close(); m.Close() })
+	registerScripted(m, ProtocolOID4VP, func(_ context.Context, f *Flow, _ *FlowStartMessage) error {
+		return f.Session.SendFlowComplete(f.ID, nil, "")
+	})
+
+	alice := NewWMPPrincipal("alice", "t1", "j1", "ir")
+	ctxA := wmp.ContextWithPrincipal(context.Background(), alice)
+	h, opts := a.NewSessionHandler(ctxA, alice, "")
+	createPeer := wmp.NewPeer(wmp.NewChannelTransport(8, 8), h, opts...)
+	body, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": "c1", "method": wmp.MethodSessionCreate, "params": map[string]any{
+		"wmp": map[string]any{"version": wmp.Version}, "capabilities_offered": map[string]any{"oid4vp": map[string]any{}}}})
+	out, err := createPeer.HandleRequestSync(ctxA, body)
+	require.NoError(t, err)
+	var created wmp.Response
+	require.NoError(t, json.Unmarshal(out, &created))
+	var res wmp.SessionCreateResult
+	require.NoError(t, json.Unmarshal(created.Result, &res))
+	sid := res.WMP.SessionID
+
+	start := func(named string) []byte {
+		b, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": "s1", "method": wmp.MethodFlowStart, "params": map[string]any{
+			"wmp": meta(named), "flow_type": "oid4vp", "flow_id": "f-" + named, "params": map[string]any{"request_uri": "openid4vp://x"}}})
+		return b
+	}
+	code := func(peer *wmp.Peer, ctx context.Context, b []byte) int {
+		out, err := peer.HandleRequestSync(ctx, b)
+		require.NoError(t, err)
+		var r wmp.Response
+		require.NoError(t, json.Unmarshal(out, &r))
+		if r.Error != nil {
+			return r.Error.Code
+		}
+		return 0
+	}
+	hB, optsB := a.NewSessionHandler(ctxA, alice, sid)
+	bound := wmp.NewPeer(wmp.NewChannelTransport(8, 8), hB, optsB...)
+
+	bob := NewWMPPrincipal("bob", "t1", "j2", "ir")
+	assert.Equal(t, wmp.ErrNotAuthorized, code(bound, wmp.ContextWithPrincipal(context.Background(), bob), start(sid)),
+		"another principal cannot drive the session through a Peer bound to it")
+	assert.Equal(t, wmp.ErrNotAuthorized, code(bound, ctxA, start("ses-other")),
+		"a message naming another session than the Peer's is refused")
+	assert.Equal(t, 0, code(bound, ctxA, start(sid)), "the owner can")
+}
+
+// Cancelling a flow before the engine has built its handler still stops the
+// flow: the engine's context is the WMP flow's from the first step.
+func TestWMPBridge_CancelDuringStartup(t *testing.T) {
+	e := newWMPEnv(t)
+	building, release := make(chan struct{}), make(chan struct{})
+	ctxErr := make(chan error, 1)
+	e.m.RegisterFlowHandler(ProtocolOID4VP, func(flow *Flow, _ *config.Config, _ *zap.Logger, _ *TrustService, _ *RegistryClient, _ storage.VerifierStore, _ *TrustCache) (FlowHandler, error) {
+		close(building)
+		<-release // the handler is still being built when the cancel arrives
+		return &scriptedFlow{flow: flow, run: func(ctx context.Context, _ *Flow, _ *FlowStartMessage) error {
+			ctxErr <- ctx.Err()
+			return ctx.Err()
+		}}, nil
+	})
+	tok := e.token("alice", "t1", "ir", "j1")
+	sid := e.create(tok, "oid4vp")
+	require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
+	<-building
+	r := e.post(tok, sid, req(wmp.MethodFlowCancel, map[string]any{"wmp": meta(sid), "flow_id": "f1"}))
+	require.Equal(t, 0, r.code(), "%v", r.Body)
+	close(release)
+	select {
+	case err := <-ctxErr:
+		assert.Error(t, err, "the engine flow started with its context already cancelled")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the flow never ran")
+	}
+}
+
+// The profile's credential_offer start parameter is the engine's offer.
+func TestWMPBridge_CredentialOfferParameter(t *testing.T) {
+	e := newWMPEnv(t)
+	offers := make(chan string, 1)
+	registerScripted(e.m, ProtocolOID4VCI, func(_ context.Context, f *Flow, msg *FlowStartMessage) error {
+		offers <- msg.Offer
+		return f.Session.SendFlowComplete(f.ID, nil, "")
+	})
+	tok := e.token("alice", "t1", "ir", "j1")
+	sid := e.create(tok, "oid4vci")
+	r := e.post(tok, sid, req(wmp.MethodFlowStart, map[string]any{"wmp": meta(sid), "flow_type": "oid4vci", "flow_id": "f1",
+		"params": map[string]any{"credential_offer": "openid-credential-offer://?credential_offer_uri=x"}}))
+	require.Equal(t, 0, r.code(), "%v", r.Body)
+	assert.Equal(t, "openid-credential-offer://?credential_offer_uri=x", <-offers)
 }

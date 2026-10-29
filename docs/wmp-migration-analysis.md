@@ -57,6 +57,21 @@ current request's must grant the permission of the flow's protocol (`i` for
 oid4vci, `r` for oid4vp); otherwise `-31002` with `data.reason`. The results of a
 sign or match sub-flow are judged by the protocol of the flow waiting for them.
 
+Two kinds of message reach a session without passing the Peer's request guard:
+attaching an event stream (everything the session emits, credentials included) and
+a JSON-RPC response to a sign or match request (it can fail the flow that waits
+for it). `ServeAuthenticated` checks both with `CheckSessionAccess`: the token's
+TAC must grant every permission the session was created with, else `403` (the
+owner's weak token is refused; a session that is unknown, expired or someone
+else's is answered by go-wmp as before). A stream is authorized when it is
+attached; it ends when the session does (user revoked, superseded, closed).
+
+The Peer's `Authorizer` also refuses a request from another Principal than the
+session's owner and one that names another session than the Peer's, so a Peer an
+in-process caller built from `NewSessionHandler` is as closed as the HTTP one. An
+in-process caller that feeds responses to a Peer itself calls `CheckSessionAccess`
+first.
+
 An embedder that has its own Principal needs no HTTP: `NewWMPPrincipal(...)`,
 `WMPAdapter.NewSessionHandler(ctx, principal, sessionID)` (the handler and Peer
 options of a session) and `WMPAdapter.Service()` drive the same engine over any
@@ -127,10 +142,16 @@ version the client offered.
 
 - The engine's own consent protocol is still the old shape (credential ids, claim
   names): over WMP the engine accepts the closed `select_credentials` and sends
-  the closed `credentials_to_include` / `selection_handle`, but a consent that
-  names only query ids is what reaches `vetConsent` and the sign request. Moving
-  the engine and the WebSocket protocol to the credential-data-free shape is
-  tracked in go-wallet-backend#502.
+  the closed `credentials_to_include` / `selection_handle`. Moving the engine and
+  the WebSocket protocol to the credential-data-free shape is go-wallet-backend#502.
+- The interactive steps and actions of OpenID4x 3.1.2, 3.1.3 and 3.2.2 are not
+  translated: progress steps keep the engine's names (`credential_selection`,
+  `awaiting_selection`, `authorization_required`), and `accept_offer` and
+  `authorize` map to the engine's actions without reshaping `selected_indices`
+  or `auth_code` and the OAuth state. This is as before the go-wmp rebuild.
+- A credential notification that needs a client-held DPoP signature after the
+  issuance completed has no flow to run the sign sub-flow in: go-wmp sub-flows
+  belong to a running flow. Over WMP such a notification is not forwarded.
 - `holder_commitments` (the legacy proof-claim advert) is not relayed: go-wmp has
   no such member. Credential Auxiliary Data (go-wallet-backend#480) replaces it.
 - The engine's match request is not used for OID4VP (the client matches inside the

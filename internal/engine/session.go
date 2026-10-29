@@ -949,6 +949,13 @@ var requiredTACForProtocol = map[Protocol]string{
 }
 
 func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
+	m.handleFlowStartContext(context.Background(), session, msg)
+}
+
+// handleFlowStartContext is handleFlowStart whose flow ends with parent: a
+// transport that can cancel a flow (WMP) cancels it from the first step on,
+// not only once the flow's handler exists.
+func (m *Manager) handleFlowStartContext(parent context.Context, session *Session, msg *FlowStartMessage) {
 	flowID := msg.FlowID
 	if flowID == "" {
 		flowID = uuid.New().String()
@@ -1042,7 +1049,7 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	}()
 
 	// Execute flow
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
 	defer cancel()
 
 	logger.Info("Starting flow")

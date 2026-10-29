@@ -16,10 +16,12 @@ package engine
 //   - wmp_flow.go translates between the engine's messages and WMP flows.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -70,6 +72,10 @@ const (
 	// defaultFlowTimeout is the server-side default, and the cap, for the
 	// timeout a client may name in wmp.flow.start.
 	defaultFlowTimeout = 5 * time.Minute
+
+	// msgWMPShuttingDown is the answer to a request that arrives while the
+	// adapter drains.
+	msgWMPShuttingDown = "server shutting down"
 
 	// wmpOrphanSweepInterval is how often engine sessions whose WMP session has
 	// left the store are ended.
@@ -178,10 +184,9 @@ func NewWMPAdapter(manager *Manager, logger *zap.Logger, bearerToken func(*http.
 		ExpireHooks:   []wmp.SessionExpirer{wmpExpirer{a}},
 	})
 	a.server = httpsse.NewSecuredServerHandler(httpsse.ServerConfig{
-		Service:      a.svc,
-		Authenticate: a.Authenticate,
-		NewHandler:   a.NewSessionHandler,
-		Stream:       httpsse.StreamConfig{Log: a.events},
+		Service:    a.svc,
+		NewHandler: a.NewSessionHandler,
+		Stream:     httpsse.StreamConfig{Log: a.events},
 	})
 	go a.sweepOrphans()
 	return a
@@ -214,23 +219,89 @@ func (a *WMPAdapter) PrincipalForToken(ctx context.Context, token string) (wmp.P
 	return p, nil
 }
 
-// ServeHTTP serves the WMP endpoints (POST JSON-RPC, GET event stream).
+// ServeHTTP serves the WMP endpoints (POST JSON-RPC, GET event stream): it
+// authenticates the request, then serves it as ServeAuthenticated does.
 func (a *WMPAdapter) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if a.isDraining() {
-		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+		http.Error(w, msgWMPShuttingDown, http.StatusServiceUnavailable)
 		return
 	}
-	a.server.ServeHTTP(w, r)
+	p, err := a.Authenticate(r)
+	if err != nil || p.Key() == "" {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	a.ServeAuthenticated(w, r, p)
 }
+
+// maxWMPBody bounds the POST body read to tell a response from a request.
+const maxWMPBody = 1 << 20
 
 // ServeAuthenticated serves a request for an already authenticated Principal
 // (see NewWMPPrincipal), skipping the bearer-token step.
+//
+// go-wmp checks that the Principal owns the session. Two kinds of message reach
+// a session without passing the Peer's request guard, so they are checked here:
+// attaching an event stream (everything the session emits, issued credentials
+// included, goes to it) and a JSON-RPC response (it answers a sign or match
+// request and can fail the flow that waits for it). Both need a token that
+// grants every permission the session was created with (CheckSessionAccess).
 func (a *WMPAdapter) ServeAuthenticated(w http.ResponseWriter, r *http.Request, p wmp.Principal) {
 	if a.isDraining() {
-		http.Error(w, "server shutting down", http.StatusServiceUnavailable)
+		http.Error(w, msgWMPShuttingDown, http.StatusServiceUnavailable)
 		return
 	}
+	sessionID := r.Header.Get("Wmp-Session-Id")
+	switch r.Method {
+	case http.MethodGet:
+		if q := r.URL.Query().Get("session_id"); sessionID == "" {
+			sessionID = q
+		}
+		if !a.CheckSessionAccess(p, sessionID) {
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+	case http.MethodPost:
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxWMPBody+1))
+		if err != nil {
+			http.Error(w, "read error", http.StatusBadRequest)
+			return
+		}
+		if len(body) > maxWMPBody {
+			http.Error(w, "request too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		var probe struct {
+			Method string `json:"method"`
+		}
+		if json.Unmarshal(body, &probe) == nil && probe.Method == "" && !a.CheckSessionAccess(p, sessionID) {
+			// A response (or something that is not a request): it needs the
+			// permissions of the session it answers in.
+			http.Error(w, "forbidden", http.StatusForbidden)
+			return
+		}
+	}
 	a.server.ServeAuthenticated(w, r, p)
+}
+
+// CheckSessionAccess reports whether p may attach an event stream to, or answer a
+// request of, the session: the TAC of p's token must grant every permission the
+// session was created with. It refuses only the owner whose token is too weak.
+// A session that is unknown, expired or owned by someone else passes: go-wmp
+// answers all three alike (-31000 or -31001), so this check is no existence
+// oracle. An in-process embedder that feeds responses to a Peer itself calls it
+// first.
+func (a *WMPAdapter) CheckSessionAccess(p wmp.Principal, sessionID string) bool {
+	ws := a.session(sessionID)
+	if ws == nil {
+		return true
+	}
+	if rec, ok := a.svc.Store().Get(sessionID); !ok || rec.IsExpired() || !rec.OwnedBy(p.Key()) {
+		return true
+	}
+	cl, ok := p.Claims.(*wmpClaims)
+	return ok && cl != nil && ws.session.TAC.IsSubsetOf(cl.TAC)
 }
 
 // Service is the SessionService, for a caller that drives sessions in-process
@@ -367,7 +438,7 @@ func (a *WMPAdapter) create(ctx context.Context, sess *wmp.Session) error {
 	if a.draining {
 		a.mu.Unlock()
 		release()
-		return wmp.NewRPCError(wmp.ErrRateLimited, map[string]string{"reason": "server shutting down"})
+		return wmp.NewRPCError(wmp.ErrRateLimited, map[string]string{"reason": msgWMPShuttingDown})
 	}
 	a.sessions[sess.ID] = ws
 	a.mu.Unlock()

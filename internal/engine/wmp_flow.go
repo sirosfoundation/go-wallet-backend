@@ -100,7 +100,9 @@ func (p *wmpFlowProfile) OnSessionCreate(ctx context.Context, s *wmp.Session, _ 
 // OnSessionClose implements wmp.SessionHook. The engine session ends with the
 // stored session (see wmpHandler.SessionClose), not here: go-wmp has not
 // necessarily deleted it yet.
-func (p *wmpFlowProfile) OnSessionClose(context.Context, *wmp.Session, *wmp.SessionCloseParams) {}
+func (p *wmpFlowProfile) OnSessionClose(context.Context, *wmp.Session, *wmp.SessionCloseParams) {
+	// Nothing to do here, on purpose: see above.
+}
 
 // parseStart decodes the engine's flow start from the wmp.flow.start params.
 func parseStart(params *wmp.FlowStartParams) (*FlowStartMessage, error) {
@@ -109,6 +111,17 @@ func parseStart(params *wmp.FlowStartParams) (*FlowStartMessage, error) {
 		if err := json.Unmarshal(params.Params, &start); err != nil {
 			return nil, wmp.NewRPCError(wmp.ErrInvalidParams, map[string]string{"reason": "invalid flow params"})
 		}
+	}
+	// The profile names the OID4VCI offer credential_offer (OpenID4x 3.1.1); the
+	// engine's own message calls it offer.
+	var named struct {
+		CredentialOffer string `json:"credential_offer"`
+	}
+	if len(params.Params) > 0 {
+		_ = json.Unmarshal(params.Params, &named)
+	}
+	if start.Offer == "" {
+		start.Offer = named.CredentialOffer
 	}
 	start.FlowID = params.FlowID
 	start.Protocol = wmpFlowTypes[params.FlowType]
@@ -177,24 +190,13 @@ func (p *wmpFlowProfile) run(protocol Protocol) wmp.FlowFunc {
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
-		f := &wmpFlow{fc: fc, ctx: ctx}
+		f := &wmpFlow{fc: fc, session: wmp.SessionFromContext(ctx)}
 		ws.tr.add(fc.FlowID, f)
 		defer ws.tr.remove(fc.FlowID)
 
-		// A cancel, the timeout or the end of the Peer ends the engine flow.
-		done := make(chan struct{})
-		defer close(done)
-		go func() {
-			select {
-			case <-ctx.Done():
-				if !f.terminal.Load() {
-					ws.session.cancelFlow(fc.FlowID)
-				}
-			case <-done:
-			}
-		}()
-
-		p.a.manager.handleFlowStart(ws.session, start)
+		// A cancel, the timeout or the end of the Peer ends the engine flow from
+		// its first step: ctx is the engine's.
+		p.a.manager.handleFlowStartContext(ctx, ws.session, start)
 
 		if !f.terminal.Load() && parent.Err() == nil {
 			// The engine ended the flow without a result (it timed out, or ended
@@ -216,16 +218,6 @@ func capSeconds(seconds int, limit time.Duration) time.Duration {
 		return limit
 	}
 	return time.Duration(seconds) * time.Second
-}
-
-// cancelFlow cancels the engine flow flowID, if it is still running.
-func (s *Session) cancelFlow(flowID string) {
-	s.flowsMu.RLock()
-	flow := s.flows[flowID]
-	s.flowsMu.RUnlock()
-	if flow != nil && flow.Handler != nil {
-		flow.Handler.Cancel()
-	}
 }
 
 // HandleAction translates a wmp.flow.action to the engine's action and hands it
@@ -251,8 +243,12 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 		var err error
 		if action, payload, err = translateSelectCredentials(params.Params); err != nil {
 			// -32602 without data (OpenID4x 3.2.3.1): nothing of the params is
-			// echoed. The flow is declined, so the verifier is told and the
-			// offending members go no further.
+			// echoed. The flow is declined, so the verifier is told access_denied,
+			// and it ends -32602 (see wmpFlow.malformed); the offending members go
+			// no further.
+			if f := ws.tr.flow(params.FlowID); f != nil {
+				f.malformed.Store(true)
+			}
 			ws.session.dispatchAction(&FlowActionMessage{Message: Message{Type: TypeFlowAction, FlowID: params.FlowID}, Action: ActionDecline})
 			return nil, wmp.NewRPCError(wmp.ErrInvalidParams, nil)
 		}
@@ -305,13 +301,24 @@ func translateSelectCredentials(raw json.RawMessage) (action string, payload jso
 
 // --- transport ---------------------------------------------------------------
 
-// wmpFlow is a running WMP flow: its FlowContext, and the context its function
-// runs under (which carries the session and the Principal).
+// wmpFlow is a running WMP flow: its FlowContext, and the WMP session it runs in.
 type wmpFlow struct {
-	fc  *wmp.FlowContext
-	ctx context.Context
+	fc      *wmp.FlowContext
+	session *wmp.Session
 	// terminal is set once the engine sent the flow's completion or error.
 	terminal atomic.Bool
+	// malformed is set when the wallet sent a select_credentials the closed shape
+	// refuses: the flow is declined, and ends -32602 with no data (OpenID4x
+	// 3.2.3.1), not as an ordinary decline.
+	malformed atomic.Bool
+}
+
+// context is the context for what the engine sends on the flow. It carries the
+// WMP session (RequestMatch checks the negotiated capability in it) and is not
+// cancelled with the flow: the terminal message is sent as the flow ends, and a
+// sub-flow ends with its parent through the FlowContext.
+func (f *wmpFlow) context() context.Context {
+	return wmp.ContextWithSession(context.Background(), f.session)
 }
 
 // wmpTransport is the engine's SessionTransport for a WMP session: it turns
@@ -373,7 +380,7 @@ func (t *wmpTransport) SendJSON(msg interface{}) error {
 		if f == nil {
 			return nil // the flow is over; nothing to report progress on
 		}
-		return f.fc.Progress(context.WithoutCancel(f.ctx), string(m.Step), m.Payload)
+		return f.fc.Progress(f.context(), string(m.Step), m.Payload)
 
 	case *FlowCompleteMessage:
 		f := t.flow(m.FlowID)
@@ -381,7 +388,7 @@ func (t *wmpTransport) SendJSON(msg interface{}) error {
 			return errNoFlow
 		}
 		f.terminal.Store(true)
-		return f.fc.Complete(context.WithoutCancel(f.ctx), m)
+		return f.fc.Complete(f.context(), m)
 
 	case *FlowErrorMessage:
 		return t.sendFlowError(m)
@@ -444,7 +451,12 @@ func (t *wmpTransport) sendFlowError(m *FlowErrorMessage) error {
 	}
 	if f := t.flow(m.FlowID); f != nil {
 		f.terminal.Store(true)
-		return f.fc.Error(context.WithoutCancel(f.ctx), code, m.Error.Message, data)
+		if f.malformed.Load() {
+			// The terminal error of a malformed select_credentials: -32602, and
+			// nothing of the engine's decline (or of the params) in it.
+			return f.fc.Error(f.context(), wmp.ErrInvalidParams, wmp.ErrorMessage(wmp.ErrInvalidParams), nil)
+		}
+		return f.fc.Error(f.context(), code, m.Error.Message, data)
 	}
 	// An error about no running flow (a message for an unknown flow): go-wmp
 	// has no FlowContext to send it on, so it goes straight to the Peer.
@@ -476,7 +488,7 @@ func (t *wmpTransport) relaySign(f *wmpFlow, m *SignRequestMessage) {
 	params, err := signSubFlowParams(m)
 	if err == nil {
 		var result json.RawMessage
-		result, err = openid4x.RequestSign(f.ctx, f.fc, params, subFlowTimeout)
+		result, err = openid4x.RequestSign(f.context(), f.fc, params, subFlowTimeout)
 		if err == nil {
 			if jerr := json.Unmarshal(result, resp); jerr != nil {
 				err = jerr
@@ -520,7 +532,7 @@ func signFailure(m *SignRequestMessage, err error) *SignResponseMessage {
 // so only satisfiability is relayed.
 func (t *wmpTransport) relayMatch(f *wmpFlow, m *MatchRequestMessage) {
 	resp := &MatchResponseMessage{Message: Message{Type: TypeMatchResponse, FlowID: m.FlowID, MessageID: m.MessageID}}
-	result, err := openid4x.RequestMatch(f.ctx, f.fc, openid4x.MatchSubFlowParams{
+	result, err := openid4x.RequestMatch(f.context(), f.fc, openid4x.MatchSubFlowParams{
 		DCQLQuery:       m.DCQLQuery,
 		ClientMetadata:  m.ClientMetadata,
 		VerifiedRequest: marshalOrNil(m.VerifiedRequest),
@@ -676,10 +688,35 @@ type wmpGuard struct {
 	sessionID string
 }
 
-// Authorize implements wmp.Authorizer.
-func (g *wmpGuard) Authorize(ctx context.Context, _ string, _ json.RawMessage) bool {
-	_, ok := wmpClaimsFrom(ctx)
-	return ok
+// Authorize implements wmp.Authorizer. It refuses a request that does not come
+// from the Principal that owns the session the Peer is bound to (the HTTP server
+// checks that before it builds the Peer; a Peer built by an in-process caller
+// has no such check), a request that names another session than the Peer's, and
+// one without an engine Principal.
+func (g *wmpGuard) Authorize(ctx context.Context, _ string, params json.RawMessage) bool {
+	p, ok := wmp.PrincipalFromContext(ctx)
+	if !ok {
+		return false
+	}
+	if _, ok := wmpClaimsFrom(ctx); !ok {
+		return false
+	}
+	if g.sessionID == "" {
+		return true // the throw-away Peer of wmp.session.create or resume: the service decides
+	}
+	rec, found := g.a.svc.Store().Get(g.sessionID)
+	if !found || rec.IsExpired() || !rec.OwnedBy(p.Key()) {
+		return false
+	}
+	var named struct {
+		WMP struct {
+			SessionID string `json:"session_id"`
+		} `json:"wmp"`
+	}
+	if json.Unmarshal(params, &named) == nil && named.WMP.SessionID != "" && named.WMP.SessionID != g.sessionID {
+		return false
+	}
+	return true
 }
 
 var errInsufficientTAC = map[string]string{"reason": "insufficient permissions for flow type"}
