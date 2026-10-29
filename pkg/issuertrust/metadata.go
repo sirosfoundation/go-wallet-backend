@@ -92,7 +92,7 @@ func OffersFromConfigs(configs map[string]ConfigView, ids []string) []Offer {
 // metadata map the way encoding/json reads it into the engine's typed
 // metadata: member names match case-insensitively, a null configuration is an
 // empty one (selectable, so checked, and a finding), and a configuration whose
-// fields have the wrong type counts as empty rather than being skipped. Two
+// fields have the wrong type is omitted, as the engine omits it. Two
 // members that differ only in case are ambiguous, so every configuration in
 // either is treated as empty.
 func ConfigsFromRaw(metadata map[string]interface{}) map[string]ConfigView {
@@ -117,10 +117,12 @@ func ConfigsFromRaw(metadata map[string]interface{}) map[string]ConfigView {
 				VCT     string `json:"vct"`
 				Doctype string `json:"doctype"`
 			}
+			// A configuration whose fields have the wrong type is not selectable:
+			// the engine omits it from its parsed metadata, so it is omitted
+			// here too. Anything the engine would keep is kept (this decodes
+			// only three fields, so it can only keep more, never less).
 			if encoded, err := json.Marshal(v); err == nil && json.Unmarshal(encoded, &view) == nil {
 				out[id] = ConfigView{Format: view.Format, VCT: view.VCT, Doctype: view.Doctype}
-			} else {
-				out[id] = ConfigView{}
 			}
 		}
 	}

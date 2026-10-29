@@ -1450,6 +1450,15 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*met
 	if err := json.Unmarshal(b, &metadata); err != nil {
 		return nil, fmt.Errorf("failed to parse metadata: %w", err)
 	}
+	// encoding/json matches member names case-insensitively, so an unsigned
+	// document with "Signed_Metadata" fills this field although the resolver
+	// never saw, verified or bound it to the issuer. Only a signed_metadata the
+	// resolver verified (exact name, document marked signed) may be used: the
+	// trust decision and the signer chain are both taken from it, and a replayed
+	// authentic JWT would otherwise stand in for them.
+	if exact, _ := result.Metadata["signed_metadata"].(string); !result.Signed || exact != metadata.SignedMetadata {
+		metadata.SignedMetadata = ""
+	}
 	h.logIgnoredCredentialConfigurations(result.Metadata, metadata.CredentialConfigurationsSupported)
 
 	// Look up registered issuer record from backend storage when a lookup is wired.

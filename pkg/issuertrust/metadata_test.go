@@ -79,15 +79,18 @@ func TestConfigsFromRawReadsTheWayTheEngineDoes(t *testing.T) {
 			"typed": map[string]interface{}{"format": 5},
 		},
 	}
+	// "typed" has a wrongly typed format: the engine drops it from its parsed
+	// metadata (it cannot be selected), so it must not become a finding that
+	// refuses an otherwise entitled offer.
 	got := offersFromRaw(m, "upper", "null", "typed")
-	if len(got) != 3 {
-		t.Fatalf("got %+v, want an offer for each selectable configuration", got)
+	if len(got) != 2 {
+		t.Fatalf("got %+v, want an offer for each selectable configuration and none for the dropped one", got)
 	}
 	if got[0].Format != "dc+sd-jwt" || got[0].Type != "urn:x" {
 		t.Errorf("case-variant names not read: %+v", got[0])
 	}
-	if got[1].Format != "" || got[2].Format != "" {
-		t.Errorf("null / mistyped configurations must be empty offers: %+v", got[1:])
+	if got[1].Format != "" {
+		t.Errorf("a null configuration must be an empty offer: %+v", got[1])
 	}
 }
 

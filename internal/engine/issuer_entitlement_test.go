@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -223,4 +224,24 @@ func TestEntitlementFor_ChecksWhatTheParsedMetadataCanSelect(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 2, unregistered, "the null and the case-variant configurations were checked")
+}
+
+// An unsigned document that spells the member "Signed_Metadata" fills the typed
+// field (encoding/json is case-insensitive) although the resolver never
+// verified it. Trust and the signer chain must not be recovered from it: a
+// replayed authentic JWT would otherwise stand in for the issuer's own.
+func TestFetchMetadata_IgnoresSignedMetadataTheResolverDidNotVerify(t *testing.T) {
+	replayed := signedRegistrationCert(t, jwt.MapClaims{"sub": "victim"}) // an authentic JWT with an x5c header
+	raw := metaWithIssuerInfo("")
+	raw["credential_issuer"] = "https://issuer.example"
+	raw["Signed_Metadata"] = replayed
+	h := newEntitlementTestHandler(t, "fail")
+	h.metadataResolver = fakeMetadataResolver{result: &issuermetadata.ResolveResult{Metadata: raw, Signed: false}}
+
+	got, err := h.fetchMetadata(context.Background(), "https://issuer.example")
+
+	require.NoError(t, err)
+	assert.Empty(t, got.Metadata.SignedMetadata)
+	assert.Nil(t, got.SignerX5C, "no chain may be recovered from an unverified JWT")
+	assert.Nil(t, h.extractIssuerKeyMaterial(context.Background(), got.Metadata), "nor key material for the trust decision")
 }
