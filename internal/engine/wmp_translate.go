@@ -114,6 +114,9 @@ var trustEvaluatedMembers = []string{"trusted", "framework", "reason", "certific
 // 3.2.2) next to the engine's own members, which stay (Section 7.4 reads
 // verifier_trust_evaluated and context from them).
 func trustEvaluatedPayload(payload json.RawMessage) interface{} {
+	if ent, ok := entitlementRaw(payload); ok {
+		return ent // the findings of the issuer-entitlement check, not a trust decision
+	}
 	m := payloadObject(payload)
 	info := map[string]interface{}{}
 	for _, k := range trustEvaluatedMembers {

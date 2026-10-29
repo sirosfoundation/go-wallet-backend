@@ -493,6 +493,16 @@ func (t *wmpTransport) sendFlowError(m *FlowErrorMessage) error {
 		redirect, _ := m.Error.Details["redirect_uri"].(string)
 		data = openid4x.TransactionDataUnsupportedData(redirect)
 	}
+	if reason := trustRefusalReason(m.Error.Code); reason != "" {
+		// A trust refusal carries its reason, next to any details (OpenID4x has no
+		// code of its own for it; see wmp_entitlement.go).
+		merged := map[string]interface{}{}
+		for k, v := range m.Error.Details {
+			merged[k] = v
+		}
+		merged["reason"] = reason
+		data = merged
+	}
 	if f := t.flow(m.FlowID); f != nil {
 		if !f.terminal.CompareAndSwap(false, true) {
 			return nil // already ended: one terminal message
