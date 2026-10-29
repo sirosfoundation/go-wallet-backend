@@ -32,7 +32,16 @@ const (
 const (
 	reasonUntrustedIssuer   = "untrusted_issuer"
 	reasonUntrustedVerifier = "untrusted_verifier"
-	reasonIssuerNotEntitled = "issuer_not_entitled"
+)
+
+// codeIssuerNotEntitled and issuerNotEntitledMessage are the WMP error of an
+// entitlement refusal (wmp spec #36/#37, go-wmp wmp.ErrIssuerNotEntitled and
+// openid4x.IssuerNotEntitledMessage, on go-wmp main, not in a release: v0.12.1 is
+// the latest). TODO: use go-wmp's constants and NewIssuerNotEntitledData once
+// v0.13.0 is tagged.
+const (
+	codeIssuerNotEntitled    = -31020
+	issuerNotEntitledMessage = "Issuer not entitled"
 )
 
 // errCodeIssuerNotEntitled is the engine's refusal of an issuer entitlement
@@ -48,8 +57,6 @@ func trustRefusalReason(code ErrorCode) string {
 		return reasonUntrustedIssuer
 	case ErrCodeUntrustedVerifier:
 		return reasonUntrustedVerifier
-	case errCodeIssuerNotEntitled:
-		return reasonIssuerNotEntitled
 	}
 	return ""
 }

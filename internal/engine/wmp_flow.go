@@ -590,9 +590,13 @@ func (t *wmpTransport) sendFlowError(m *FlowErrorMessage) error {
 		redirect, _ := m.Error.Details["redirect_uri"].(string)
 		data = openid4x.TransactionDataUnsupportedData(redirect)
 	}
-	if reason := trustRefusalReason(m.Error.Code); reason != "" {
-		// A trust refusal carries its reason, next to any details (OpenID4x has no
-		// code of its own for it; see wmp_entitlement.go).
+	if m.Error.Code == errCodeIssuerNotEntitled {
+		// -31020 with {issuer, issuer_entitlement}, bounded (see wmp_entitlement.go).
+		data = boundedErrorDetails(m.Error.Code, m.Error.Details)
+		code = codeIssuerNotEntitled
+		m.Error.Message = issuerNotEntitledMessage
+	} else if reason := trustRefusalReason(m.Error.Code); reason != "" {
+		// A trust-decision refusal carries its reason, next to any details.
 		merged := boundedErrorDetails(m.Error.Code, m.Error.Details)
 		merged["reason"] = reason
 		data = merged
@@ -853,6 +857,8 @@ func convertCredentialsToInclude(in []CredentialRef) []openid4x.CredentialQueryR
 // mapErrorCode converts engine string error codes to WMP integer codes.
 func mapErrorCode(code ErrorCode) int {
 	switch code {
+	case errCodeIssuerNotEntitled:
+		return codeIssuerNotEntitled
 	case ErrCodeAuthFailed, ErrCodeAuthorizationFail, ErrCodeForbidden:
 		return wmp.ErrNotAuthorized
 	case ErrCodeInvalidMessage:
