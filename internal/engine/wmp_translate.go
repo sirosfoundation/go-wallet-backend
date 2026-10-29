@@ -432,8 +432,8 @@ func decodeActionParams(raw json.RawMessage, out interface{}) error {
 // consent that is not true ends the flow.
 func translateAcceptOffer(f *wmpFlow, params *wmp.FlowActionParams) (*actionOutcome, error) {
 	var in struct {
-		SelectedIndices []int `json:"selected_indices"`
-		Consent         *bool `json:"consent"`
+		SelectedIndices []*int `json:"selected_indices"`
+		Consent         *bool  `json:"consent"`
 	}
 	if err := decodeActionParams(params.Params, &in); err != nil {
 		return nil, errInvalidParams("accept_offer params are malformed")
@@ -455,7 +455,11 @@ func translateAcceptOffer(f *wmpFlow, params *wmp.FlowActionParams) (*actionOutc
 	if len(in.SelectedIndices) != 1 {
 		return nil, errInvalidParams("exactly one selected index is supported")
 	}
-	i := in.SelectedIndices[0]
+	if in.SelectedIndices[0] == nil {
+		// A null element would decode as 0 and select the first configuration.
+		return nil, errInvalidParams("selected index is not one of the offered credentials")
+	}
+	i := *in.SelectedIndices[0]
 	if i < 0 || i >= len(ids) {
 		return nil, errInvalidParams("selected index is not one of the offered credentials")
 	}
