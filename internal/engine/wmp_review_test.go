@@ -227,3 +227,38 @@ func (s slowDeleteStore) Delete(ctx context.Context, tenantID, userID, sessionID
 	<-s.release
 	return s.SessionStore.Delete(ctx, tenantID, userID, sessionID)
 }
+
+// Cancelling by action ends the flow with a terminal message, so a resume does not
+// re-send the flow's last progress.
+func TestWMPBridge_ActionCancelClearsRecoveryState(t *testing.T) {
+	e := newWMPEnv(t)
+	registerScripted(e.m, ProtocolOID4VCI, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
+		_ = f.Session.SendProgress(f.ID, StepAwaitingSelection, map[string]any{"available_credentials": []any{map[string]any{"id": "a"}, map[string]any{"id": "b"}}})
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	tok := e.token("alice", "t1", "ir", "j1")
+	r := e.post(tok, "", req(wmp.MethodSessionCreate, map[string]any{
+		"wmp": map[string]any{"version": wmp.Version}, "security": map[string]any{"mode": "tls"},
+		"capabilities_offered": map[string]any{"oid4vci": map[string]any{}}}))
+	require.Equal(t, 0, r.code())
+	sid, _ := r.result()["wmp"].(map[string]any)["session_id"].(string)
+	resumption, _ := r.result()["resumption_token"].(string)
+	require.NotEmpty(t, resumption)
+	st, _ := e.openStream(tok, sid, "")
+	require.Equal(t, 0, e.post(tok, sid, startVCI(sid, "f1")).code())
+	st.nextMethod(t, wmp.MethodFlowProgress)
+
+	assert.Equal(t, 0, e.post(tok, sid, flowAction(sid, "f1", "accept_offer", map[string]any{"selected_indices": []int{0}, "consent": false})).code())
+	ev := st.nextMethod(t, wmp.MethodFlowError)
+	assert.Equal(t, "cancelled", params(ev)["data"].(map[string]any)["reason"])
+
+	r = e.post(tok, sid, req(wmp.MethodSessionResume, map[string]any{"wmp": meta(sid), "session_id": sid, "resumption_token": resumption}))
+	require.Equal(t, 0, r.code(), "%v", r.Body)
+	st2, _ := e.openStream(tok, sid, "")
+	select {
+	case ev := <-st2.events:
+		assert.NotContains(t, ev.Raw, "awaiting_offer_acceptance", "no prompt for a flow that is gone")
+	case <-time.After(500 * time.Millisecond):
+	}
+}
