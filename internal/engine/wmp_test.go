@@ -1230,6 +1230,13 @@ func TestWMPBridge_StreamAndResponsesNeedTheSessionsPermissions(t *testing.T) {
 	// The weak token cannot answer the request, and so cannot fail the flow.
 	r := e.post(weak, sid, map[string]any{"id": start.Data["id"], "error": map[string]any{"code": wmp.ErrFlowError, "message": "no"}})
 	assert.Equal(t, http.StatusForbidden, r.Status)
+	// Neither a nonempty method nor naming the session in the params instead of
+	// the header gets a response past the check: go-wmp calls anything with a
+	// result or an error a response, and routes it by any of those session sources.
+	r = e.post(weak, sid, map[string]any{"id": start.Data["id"], "method": "wmp.noop", "error": map[string]any{"code": wmp.ErrFlowError, "message": "no"}})
+	assert.Equal(t, http.StatusForbidden, r.Status, "a response with a method member is still a response")
+	r = e.post(weak, "", map[string]any{"id": start.Data["id"], "params": map[string]any{"wmp": meta(sid)}, "error": map[string]any{"code": wmp.ErrFlowError, "message": "no"}})
+	assert.Equal(t, http.StatusForbidden, r.Status, "the session named in params.wmp is a source too")
 	// The right token still can.
 	e.post(full, sid, map[string]any{"id": start.Data["id"], "result": map[string]any{"wmp": meta(sid), "flow_id": sub, "flow_type": "sign"}})
 	e.post(full, sid, notification(wmp.MethodFlowComplete, map[string]any{"wmp": meta(sid), "flow_id": sub, "result": map[string]any{"vp_token": "vp-1"}}))

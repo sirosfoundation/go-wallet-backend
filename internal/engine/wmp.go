@@ -251,16 +251,10 @@ func (a *WMPAdapter) ServeAuthenticated(w http.ResponseWriter, r *http.Request, 
 		http.Error(w, msgWMPShuttingDown, http.StatusServiceUnavailable)
 		return
 	}
-	sessionID := r.Header.Get("Wmp-Session-Id")
+	ids := []string{r.Header.Get("Wmp-Session-Id")}
 	switch r.Method {
 	case http.MethodGet:
-		if q := r.URL.Query().Get("session_id"); sessionID == "" {
-			sessionID = q
-		}
-		if !a.CheckSessionAccess(p, sessionID) {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
+		ids = append(ids, r.URL.Query().Get("session_id"))
 	case http.MethodPost:
 		body, err := io.ReadAll(io.LimitReader(r.Body, maxWMPBody+1))
 		if err != nil {
@@ -272,12 +266,28 @@ func (a *WMPAdapter) ServeAuthenticated(w http.ResponseWriter, r *http.Request, 
 			return
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
-		var probe struct {
-			Method string `json:"method"`
+		// go-wmp's classification: anything with a result or an error is a
+		// response, whatever else it carries; what does not decode is gated too.
+		msg, err := wmp.DecodeMessage(body)
+		if err != nil || msg.IsResponse() {
+			// The sources go-wmp routes on: the header and the session named in
+			// the params (a response has none of its own).
+			var named struct {
+				Params struct {
+					WMP struct {
+						SessionID string `json:"session_id"`
+					} `json:"wmp"`
+					SessionID string `json:"session_id"`
+				} `json:"params"`
+			}
+			_ = json.Unmarshal(body, &named)
+			ids = append(ids, named.Params.WMP.SessionID, named.Params.SessionID)
+		} else {
+			ids = nil // a request: the Peer's guard judges it
 		}
-		if json.Unmarshal(body, &probe) == nil && probe.Method == "" && !a.CheckSessionAccess(p, sessionID) {
-			// A response (or something that is not a request): it needs the
-			// permissions of the session it answers in.
+	}
+	for _, id := range ids {
+		if id != "" && !a.CheckSessionAccess(p, id) {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
