@@ -1828,6 +1828,23 @@ type TrustConfig struct {
 	// Deprecated: This field will be removed in a future release.
 	DefaultEndpoint string `yaml:"default_endpoint" envconfig:"DEFAULT_ENDPOINT"`
 
+	// IssuerEntitlementMode decides what happens when a PID or attestation
+	// provider is not registered for what it is offering: "warn" (default,
+	// report and continue), "fail" (refuse), or "off" (do not check).
+	//
+	// The default is warn, not fail, because the ARF obligation to verify
+	// registration certificates applies 24 months after the amending
+	// Regulation enters into force. Until then, refusing a provider that has
+	// simply not been registered yet would break issuance that is currently
+	// legitimate. An unrecognised value is treated as warn rather than off, so
+	// a typo cannot silently disable the check.
+	//
+	// The registration certificate is only believed if its signer is a
+	// trusted Registrar according to the issuer PDP (AuthZEN action
+	// "wrprc-registrar"); without a PDP, or when it cannot be evaluated, the
+	// certificate counts as unverified, which "fail" refuses.
+	IssuerEntitlementMode string `yaml:"issuer_entitlement_mode" envconfig:"ISSUER_ENTITLEMENT_MODE"`
+
 	// RegistryURL is the URL for the VCTM registry service.
 	RegistryURL string `yaml:"registry_url" envconfig:"REGISTRY_URL"`
 	// Timeout is the HTTP timeout for trust evaluation requests (seconds).
@@ -1949,6 +1966,17 @@ func (c *TrustConfig) GetPDPURL() string {
 	return c.DefaultEndpoint
 }
 
+// EffectiveIssuerEntitlementMode returns the issuer entitlement mode:
+// trust.issuer_entitlement_mode, else the deprecated
+// authzen_proxy.issuer_entitlement_mode. Unrecognised values are handled by
+// issuertrust.ParseMode.
+func (c *Config) EffectiveIssuerEntitlementMode() string {
+	if c.Trust.IssuerEntitlementMode != "" {
+		return c.Trust.IssuerEntitlementMode
+	}
+	return c.AuthZENProxy.IssuerEntitlementMode
+}
+
 // GetIssuerPDPURL returns the effective PDP URL for issuer (OID4VCI) flows.
 // Returns empty string if trust is explicitly disabled for this flow.
 // Priority: flow-specific PDPURL > global PDPURL > deprecated DefaultEndpoint.
@@ -2033,16 +2061,11 @@ type AuthZENProxyConfig struct {
 	// If empty, default wallet rules are used.
 	RulesFile string `yaml:"rules_file" envconfig:"RULES_FILE"`
 
-	// IssuerEntitlementMode decides what happens when a PID or attestation
-	// provider is not registered for what it is offering: "warn" (default,
-	// report and continue), "fail" (refuse), or "off" (do not check).
+	// IssuerEntitlementMode is the former home of trust.issuer_entitlement_mode,
+	// which both the engine and /v1/resolve read.
 	//
-	// The default is warn, not fail, because the ARF obligation to verify
-	// registration certificates applies 24 months after the amending
-	// Regulation enters into force. Until then, refusing a provider that has
-	// simply not been registered yet would break issuance that is currently
-	// legitimate. An unrecognised value is treated as warn rather than off, so
-	// a typo cannot silently disable the check.
+	// Deprecated: use trust.issuer_entitlement_mode. Still honoured when that
+	// is unset.
 	IssuerEntitlementMode string `yaml:"issuer_entitlement_mode" envconfig:"ISSUER_ENTITLEMENT_MODE"`
 
 	// AllowResolution controls whether resolution-only requests are allowed.
@@ -2321,6 +2344,12 @@ func load(configFile string, loadSecrets, validate func(*Config) error) (*Config
 
 	// Override with environment variables (highest priority)
 	// Since we removed `default:` tags, this only applies actual env vars
+	defer func() {
+		if cfg.Trust.IssuerEntitlementMode == "" && cfg.AuthZENProxy.IssuerEntitlementMode != "" {
+			cfg.loadWarnings = append(cfg.loadWarnings,
+				"authzen_proxy.issuer_entitlement_mode (WALLET_AUTHZEN_PROXY_ISSUER_ENTITLEMENT_MODE) is deprecated: use trust.issuer_entitlement_mode (WALLET_TRUST_ISSUER_ENTITLEMENT_MODE)")
+		}
+	}()
 	if _, ok := os.LookupEnv("WALLET_AS_ENABLED"); ok {
 		cfg.asEnabledExplicit = true
 	}
@@ -2810,6 +2839,15 @@ func (c *Config) Validate() error {
 
 	if err := c.validateTokenBlacklistBackend(); err != nil {
 		return err
+	}
+
+	// An unrecognised mode would otherwise be read as warn at run time. That is
+	// the safe direction, but silently: an operator who typed "fial" believes
+	// the check refuses. Refuse to start instead.
+	switch c.EffectiveIssuerEntitlementMode() {
+	case "", "warn", "fail", "off":
+	default:
+		return fmt.Errorf("invalid issuer entitlement mode %q (trust.issuer_entitlement_mode / WALLET_TRUST_ISSUER_ENTITLEMENT_MODE): must be warn, fail or off", c.EffectiveIssuerEntitlementMode())
 	}
 
 	if c.Storage.Type == "mongodb" && c.Storage.MongoDB.URI == "" {
