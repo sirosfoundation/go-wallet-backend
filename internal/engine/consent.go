@@ -140,10 +140,11 @@ func (p consentPolicy) vet(dcql json.RawMessage, selected []ConsentSelection) er
 	return nil
 }
 
-// consentObserver is implemented by a SessionTransport that reports the
-// consent decision in its own terms (the WMP bridge answers the select_credentials
+// consentObserver is implemented by a transport that reports the consent
+// decision in its own terms (the WMP bridge answers the select_credentials
 // action with -32602 and ends the flow so, as OpenID4x 3.2.3.1 says of a selection
-// that is not in the request).
+// that is not in the request). A session has one when its transport set it
+// (Session.consentObserver); the WebSocket session has none.
 type consentObserver interface {
 	// consentAwaited announces that the flow decides consents itself.
 	consentAwaited(flowID string)
@@ -152,18 +153,18 @@ type consentObserver interface {
 	consentDecided(flowID, refusal string)
 }
 
-// noteConsentAwaited tells the session's transport, if it cares, that flowID is
-// about to wait for a consent.
+// noteConsentAwaited tells the session's consent observer, if it has one, that
+// flowID is about to wait for a consent.
 func (s *Session) noteConsentAwaited(flowID string) {
-	if o, ok := s.transport.(consentObserver); ok {
-		o.consentAwaited(flowID)
+	if s.consentObserver != nil {
+		s.consentObserver.consentAwaited(flowID)
 	}
 }
 
-// noteConsentDecided tells the session's transport, if it cares, how the consent
-// of flowID was decided.
+// noteConsentDecided tells the session's consent observer, if it has one, how
+// the consent of flowID was decided.
 func (s *Session) noteConsentDecided(flowID, refusal string) {
-	if o, ok := s.transport.(consentObserver); ok {
-		o.consentDecided(flowID, refusal)
+	if s.consentObserver != nil {
+		s.consentObserver.consentDecided(flowID, refusal)
 	}
 }

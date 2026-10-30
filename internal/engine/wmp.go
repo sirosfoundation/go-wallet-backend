@@ -454,6 +454,8 @@ func (a *WMPAdapter) create(ctx context.Context, sess *wmp.Session) error {
 		logger:        a.logger.With(zap.String("session", label[:min(8, len(label))])),
 		closeCh:       make(chan struct{}, 1),
 		notifications: newNotificationContextStore(),
+
+		consentObserver: tr,
 	}
 	ws := &wmpSession{id: sess.ID, session: session, tr: tr, release: release}
 
