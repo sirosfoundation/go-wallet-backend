@@ -424,34 +424,43 @@ func TestWMPBridge_CancelWhenNothingWaitsForTheSelectionEndsTheFlow(t *testing.T
 	})
 }
 
-// With a sign request pending, an oid4vp cancel refuses it: the engine tells the
-// verifier access_denied (the same refusal as every other sign refusal) and the
-// flow ends with the verifier's redirect; the presentation is not submitted. A
-// repeated cancel while the verifier is being told, after the pending request's
-// entry is gone, leaves the refusal running: it is not cut short and the verifier
-// is told once.
-func TestWMPBridge_CancelWithASignRequestPendingTellsTheVerifier(t *testing.T) {
-	type form struct{ errCode, vp string }
-	told := make(chan form, 2)
-	hit := make(chan struct{}, 1)
-	release := make(chan struct{})
-	var releaseOnce sync.Once
-	doRelease := func() { releaseOnce.Do(func() { close(release) }) }
-	delivered := make(chan bool, 1)
+// blockedRefusal is a flow that has a sign request pending, with a verifier that
+// holds back its answer until released: the window in which the pending request's
+// entry is gone and the verifier is still being told.
+type blockedRefusal struct {
+	e         *wmpEnv
+	tok, sid  string
+	st        *stream
+	told      chan struct{ errCode, vp string }
+	hit       chan struct{}
+	delivered chan bool
+	release   func()
+}
+
+func newBlockedRefusal(t *testing.T) *blockedRefusal {
+	t.Helper()
+	b := &blockedRefusal{
+		told:      make(chan struct{ errCode, vp string }, 4),
+		hit:       make(chan struct{}, 4),
+		delivered: make(chan bool, 4),
+	}
+	releaseCh := make(chan struct{})
+	var once sync.Once
+	b.release = func() { once.Do(func() { close(releaseCh) }) }
 	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
-		told <- form{errCode: r.PostForm.Get("error"), vp: r.PostForm.Get("vp_token")}
-		hit <- struct{}{}
-		<-release
-		delivered <- r.Context().Err() == nil
+		b.told <- struct{ errCode, vp string }{r.PostForm.Get("error"), r.PostForm.Get("vp_token")}
+		b.hit <- struct{}{}
+		<-releaseCh
+		b.delivered <- r.Context().Err() == nil
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"redirect_uri":"https://verifier.example/done"}`))
 	}))
-	defer verifier.Close()
-	defer doRelease() // a failing test must not leave the handler blocked
+	t.Cleanup(verifier.Close)
+	t.Cleanup(b.release) // a failing test must not leave the handler blocked
 
-	e := newWMPEnv(t)
-	registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
+	b.e = newWMPEnv(t)
+	registerScripted(b.e.m, ProtocolOID4VP, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
 		h := &OID4VPHandler{BaseHandler: BaseHandler{Logger: zap.NewNop(), Flow: f}, httpClient: verifier.Client()}
 		authReq := &AuthorizationRequest{ClientID: "https://v", ResponseMode: ResponseModeDirectPost, ResponseURI: verifier.URL, State: "st", Nonce: "n"}
 		f.mu.Lock()
@@ -461,40 +470,109 @@ func TestWMPBridge_CancelWithASignRequestPendingTellsTheVerifier(t *testing.T) {
 		h.failSign(ctx, authReq, err)
 		return err
 	})
-	tok := e.token("alice", "t1", "ir", "j1")
-	sid := e.create(tok, "oid4vp")
-	st, _ := e.openStream(tok, sid, "")
-	require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
-	st.nextMethod(t, wmp.MethodFlowStart) // the sign sub-flow is pending
+	b.tok = b.e.token("alice", "t1", "ir", "j1")
+	b.sid = b.e.create(b.tok, "oid4vp")
+	b.st, _ = b.e.openStream(b.tok, b.sid, "")
+	require.Equal(t, 0, b.e.post(b.tok, b.sid, startOID4VP(b.sid, "f1")).code())
+	b.st.nextMethod(t, wmp.MethodFlowStart) // the sign sub-flow is pending
+	return b
+}
 
-	cancel := req(wmp.MethodFlowAction, map[string]any{"wmp": meta(sid), "flow_id": "f1", "action": "cancel", "params": map[string]any{}})
-	assert.Equal(t, 0, e.post(tok, sid, cancel).code())
+func (b *blockedRefusal) cancel() int {
+	return b.e.post(b.tok, b.sid, req(wmp.MethodFlowAction, map[string]any{"wmp": meta(b.sid), "flow_id": "f1", "action": "cancel", "params": map[string]any{}})).code()
+}
+
+func (b *blockedRefusal) malformed() int {
+	return b.e.post(b.tok, b.sid, req(wmp.MethodFlowAction, map[string]any{"wmp": meta(b.sid), "flow_id": "f1", "action": "select_credentials",
+		"params": map[string]any{"consent": true, "selections": []any{map[string]any{"query_id": "q1", "selection_handle": testHandle, "credential_id": "c"}}}})).code()
+}
+
+func (b *blockedRefusal) awaitHit(t *testing.T) {
+	t.Helper()
 	select {
-	case <-hit: // the pending request is gone, the verifier is being told
+	case <-b.hit:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the verifier was not told")
 	}
-	assert.Equal(t, 0, e.post(tok, sid, cancel).code(), "a repeated cancel leaves the refusal running")
+}
+
+// finish releases the verifier and checks the refusal was carried out to its end:
+// the verifier was told access_denied once with no presentation, its answer was
+// delivered (the exchange was not cancelled), and its redirect reaches the client.
+func (b *blockedRefusal) finish(t *testing.T) {
+	t.Helper()
+	b.finishWith(t, "https://verifier.example/done")
+}
+
+// finishWith is finish for a refusal whose terminal message is wantInTerminal
+// (the verifier's redirect, or "" for the terminal -32602 of a malformed selection).
+func (b *blockedRefusal) finishWith(t *testing.T, wantInTerminal string) {
+	t.Helper()
 	select {
-	case ev := <-st.events:
+	case ev := <-b.st.events:
 		t.Fatalf("the flow ended before the verifier was told: %s", ev.Raw)
 	case <-time.After(300 * time.Millisecond):
 	}
-	doRelease()
+	b.release()
 	select {
-	case ok := <-delivered:
+	case ok := <-b.delivered:
 		assert.True(t, ok, "the verifier's notification was not cancelled")
 	case <-time.After(5 * time.Second):
 		t.Fatal("the verifier's answer was not delivered")
 	}
-	f := <-told
+	f := <-b.told
 	assert.Equal(t, "access_denied", f.errCode)
 	assert.Empty(t, f.vp, "no presentation is submitted")
-	ev := st.nextMethod(t, wmp.MethodFlowError)
-	assert.Contains(t, ev.Raw, "https://verifier.example/done", "the verifier's redirect reaches the client")
+	ev := b.st.nextMethod(t, wmp.MethodFlowError)
+	if wantInTerminal != "" {
+		assert.Contains(t, ev.Raw, wantInTerminal, "the verifier's redirect reaches the client")
+	} else {
+		assert.EqualValues(t, wmp.ErrInvalidParams, params(ev)["code"])
+	}
 	select {
-	case f := <-told:
+	case f := <-b.told:
 		t.Fatalf("the verifier was told twice: %+v", f)
 	case <-time.After(300 * time.Millisecond):
 	}
+}
+
+// With a sign request pending, an oid4vp cancel refuses it: the engine tells the
+// verifier access_denied (the same refusal as every other sign refusal) and the
+// flow ends with the verifier's redirect; the presentation is not submitted. A
+// repeated cancel while the verifier is being told, after the pending request's
+// entry is gone, leaves the refusal running: it is not cut short and the verifier
+// is told once.
+func TestWMPBridge_CancelWithASignRequestPendingTellsTheVerifier(t *testing.T) {
+	b := newBlockedRefusal(t)
+	assert.Equal(t, 0, b.cancel())
+	b.awaitHit(t) // the pending request is gone, the verifier is being told
+	assert.Equal(t, 0, b.cancel(), "a repeated cancel leaves the refusal running")
+	b.finish(t)
+}
+
+// Overlapping cancels decide once: whichever runs second never finds the pending
+// request gone and the refusal flag not yet set.
+func TestWMPBridge_OverlappingCancelsRefuseOnce(t *testing.T) {
+	for i := 0; i < 5; i++ {
+		b := newBlockedRefusal(t)
+		var wg sync.WaitGroup
+		for j := 0; j < 4; j++ {
+			wg.Add(1)
+			go func() { defer wg.Done(); _ = b.cancel() }()
+		}
+		wg.Wait()
+		b.awaitHit(t)
+		b.finish(t)
+	}
+}
+
+// A malformed select_credentials after a cancel refused the pending request does
+// not cut that refusal short either: it is answered -32602 as always, and the
+// verifier's exchange completes.
+func TestWMPBridge_MalformedSelectionAfterACancelLeavesTheRefusalRunning(t *testing.T) {
+	b := newBlockedRefusal(t)
+	assert.Equal(t, 0, b.cancel())
+	b.awaitHit(t)
+	assert.Equal(t, wmp.ErrInvalidParams, b.malformed())
+	b.finishWith(t, "") // the terminal message is the -32602 of the malformed selection
 }

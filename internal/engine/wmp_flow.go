@@ -273,14 +273,19 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 		// action would be acknowledged and the flow run on to submit the
 		// presentation. A pending sign request is refused (the verifier is told
 		// access_denied); without one it cancels the flow and its sub-flows.
-		if f.cancelRefused.Load() || f.malformed.Load() || ws.session.refuseSignRequests(params.FlowID) {
+		f.refuseMu.Lock()
+		refused := f.cancelRefused.Load() || f.malformed.Load() || ws.session.refuseSignRequests(params.FlowID)
+		if refused {
+			f.cancelRefused.Store(true)
+		}
+		f.refuseMu.Unlock()
+		if refused {
 			// The sign request that is pending is refused: the engine tells the
 			// verifier access_denied and the flow ends with its terminal message,
 			// as for any other refusal of a sign request. A refusal already being
 			// carried out (by an earlier cancel or malformed action, whose pending
 			// entry is gone while the verifier is being told) is left running: a
 			// repeated cancel must not cut it short.
-			f.cancelRefused.Store(true)
 			return &wmp.FlowActionResult{
 				WMP:    wmp.Metadata{Version: wmp.Version, SessionID: p.sessionID},
 				FlowID: params.FlowID, Action: params.Action, Status: "accepted",
@@ -402,7 +407,10 @@ func (p *wmpFlowProfile) refuseSelection(ws *wmpSession, f *wmpFlow, flowID stri
 		// run on. A pending sign request is refused, so the engine tells the
 		// verifier access_denied and the flow ends with the terminal -32602;
 		// without one the flow ends now, with the same terminal -32602.
-		if !ws.session.refuseSignRequests(flowID) {
+		f.refuseMu.Lock()
+		refused := f.cancelRefused.Load() || ws.session.refuseSignRequests(flowID)
+		f.refuseMu.Unlock()
+		if !refused {
 			f.endMalformed()
 		}
 	}
@@ -457,6 +465,12 @@ type wmpFlow struct {
 	// request: the refusal (the verifier being told access_denied) is being carried
 	// out, and a repeated cancel must leave it running.
 	cancelRefused atomic.Bool
+	// refuseMu makes the decision "is a refusal already running, else refuse the
+	// pending sign request, and say so" one step for a cancel and a malformed
+	// selection: the pending request's entry is removed as soon as the refusal is
+	// delivered, so a second decision that ran between the delivery and the flag
+	// would find neither and cut the verifier's notification short.
+	refuseMu sync.Mutex
 
 	// mu guards what the translation of the flow's steps records for its later
 	// actions: the configuration ids of the offer awaiting acceptance (the
