@@ -303,6 +303,65 @@ Server → Client:
 }
 ```
 
+#### Issuer entitlement
+
+After issuer trust, the engine checks that the issuer is registered to issue the
+offered configurations. With findings it sends a `trust_evaluated` progress that
+is separate from the trust report (it has no `issuer_trust_evaluated` member, so
+a client must not read `trusted` from it):
+
+```
+Server → Client:
+{
+  "type": "flow_progress",
+  "flow_id": "<uuid>",
+  "step": "trust_evaluated",
+  "payload": {
+    "issuer_entitlement_evaluated": true,
+    "issuer": "https://issuer.example",
+    "issuer_entitlement": {
+      "allowed": true,
+      "mode": "warn",
+      "evaluated": false,
+      "findings": [
+        {"code": "registrar_not_trusted", "message": "<fixed text per code>", "credential_type": "<optional, at most 128 bytes>"}
+      ],
+      "findings_truncated": false
+    }
+  }
+}
+```
+
+`mode` is `warn` or `fail`; at most 16 findings; `findings_truncated` is omitted
+when false; `message` is fixed text per `code` and contains no issuer text; codes
+are open-ended strings (`no_access_certificate`, `access_certificate_not_wrpac`,
+`access_certificate_not_trusted`, `no_registration_certificate`,
+`registration_certificate_unverified`, `registrar_not_trusted`,
+`registration_certificate_malformed`, `registration_certificate_expired`,
+`registration_certificate_validity_too_long`,
+`registration_certificate_not_bound`, `not_an_attestation_provider`,
+`attestation_type_not_registered`). In `fail` mode a refusal ends the flow:
+
+```
+Server → Client:
+{
+  "type": "flow_error",
+  "flow_id": "<uuid>",
+  "step": "evaluating_trust",
+  "error": {
+    "code": "ISSUER_NOT_ENTITLED",
+    "message": "Issuer is not registered to issue this credential",
+    "details": {
+      "issuer": "https://issuer.example",
+      "issuer_entitlement": {"allowed": false, "mode": "fail", "evaluated": false, "findings": [...]}
+    }
+  }
+}
+```
+
+`select_credential` and `authorization_details` in `flow_start` may only name
+configurations of the offer.
+
 #### User Selection
 
 Flow pauses for user to select credential configuration:
@@ -1311,6 +1370,7 @@ Server → Client:
 | `OFFER_FETCH_ERROR` | Could not fetch `credential_offer_uri` |
 | `METADATA_FETCH_ERROR` | Could not fetch issuer/verifier metadata |
 | `UNTRUSTED_ISSUER` | Issuer not trusted by any framework |
+| `ISSUER_NOT_ENTITLED` | Issuer is trusted but not registered (WRPAC/WRPRC, ARF 6.6.2.3) to issue what it offers, or that could not be established; only in `fail` mode. `error.details` carries `issuer` and `issuer_entitlement` (see [Issuer entitlement](#issuer-entitlement)) |
 | `UNTRUSTED_VERIFIER` | Verifier not trusted by any framework |
 | `AUTHORIZATION_FAILED` | OAuth authorization flow failed |
 | `TOKEN_ERROR` | Token endpoint returned error |

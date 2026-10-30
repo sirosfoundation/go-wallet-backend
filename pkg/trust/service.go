@@ -327,6 +327,30 @@ func (s *Service) EvaluateFIDO2Attestation(ctx context.Context, aaguid string, x
 // docs/adr/012-trust-evaluation-architecture.md.
 const StatusListSignerAction = "status-list-signer"
 
+// RegistrarAction is the AuthZEN action.name used to ask whether the key that
+// signed a registration certificate (WRPRC, ETSI TS 119 475) belongs to a
+// trusted Registrar. Issuing credentials and registering providers are
+// different trust decisions, so it is not folded into credential-issuer.
+//
+// The go-trust deployment must define a policy with exactly this name:
+// go-trust falls back to its DEFAULT policy for an unknown action.name. See
+// docs/adr/012-trust-evaluation-architecture.md.
+const RegistrarAction = "wrprc-registrar"
+
+// EvaluateRegistrar asks the issuer trust endpoint whether keyMaterial (the
+// x5c chain from a WRPRC header) is a trusted Registrar. The endpoint is
+// resolved like EvaluateIssuer's. It fails closed: no PDP, a failed evaluation
+// and a denial all return Trusted=false; EvaluationFailed tells the last two
+// apart. Subject and PDP reasons are not logged (they are issuer-controlled).
+func (s *Service) EvaluateRegistrar(ctx context.Context, subject string, trustEndpoint string, keyMaterial *KeyMaterial) (*TrustInfo, error) {
+	return s.evaluate(ctx, subject, s.resolveIssuerEndpoint(trustEndpoint), RoleAny, evaluateOptions{
+		action:      RegistrarAction,
+		keyMaterial: keyMaterial,
+		logLabel:    "registrar",
+		redact:      true,
+	})
+}
+
 // FrameworkNone is TrustInfo.Framework when no PDP endpoint is configured.
 const FrameworkNone = "none"
 

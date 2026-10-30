@@ -3,7 +3,6 @@ package api
 
 import (
 	"context"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -74,10 +73,13 @@ type resolveURLResponse struct {
 // AuthZENProxyHandler handles AuthZEN evaluation requests by proxying to a PDP.
 // It provides an authenticated endpoint for the frontend to make trust decisions.
 type AuthZENProxyHandler struct {
-	cfg              *config.AuthZENProxyConfig
-	authorizer       authz.Authorizer
-	tenantLookup     TenantLookup
-	issuerLookup     IssuerLookup
+	cfg          *config.AuthZENProxyConfig
+	authorizer   authz.Authorizer
+	tenantLookup TenantLookup
+	issuerLookup IssuerLookup
+	// entitlementMode is the resolved issuer entitlement mode, the same value
+	// the engine reads (config.Config.EffectiveIssuerEntitlementMode).
+	entitlementMode  string
 	metadataResolver IssuerMetadataResolver
 	clients          map[string]*authzenclient.Client
 	clientsMu        sync.RWMutex
@@ -100,6 +102,7 @@ type AuthZENProxyHandler struct {
 func NewAuthZENProxyHandler(cfg *config.AuthZENProxyConfig, authorizer authz.Authorizer, tenantLookup TenantLookup, issuerLookup IssuerLookup, metadataResolver IssuerMetadataResolver, httpClient *http.Client, pdpClient *http.Client, logger *zap.Logger) *AuthZENProxyHandler {
 	return &AuthZENProxyHandler{
 		cfg:              cfg,
+		entitlementMode:  cfg.IssuerEntitlementMode, //nolint:staticcheck // the alias is the only thing this constructor sees; NewAuthZENProxyHandlerFromConfig overrides it with the resolved value
 		authorizer:       authorizer,
 		tenantLookup:     tenantLookup,
 		issuerLookup:     issuerLookup,
@@ -182,6 +185,7 @@ func NewAuthZENProxyHandlerFromConfig(cfg *config.Config, tenantLookup TenantLoo
 	// Propagate the HTTP client's allow_http setting so that logo and
 	// jwks_uri fetches respect the same policy as metadata resolution.
 	handler.allowHTTP = cfg.HTTPClient.AllowsPlaintext()
+	handler.entitlementMode = cfg.EffectiveIssuerEntitlementMode()
 
 	logger.Info("AuthZEN proxy initialized",
 		zap.String("pdp_url", pdpURL),
@@ -771,13 +775,17 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	// offering. Distinct from the PDP decision above, which answers whether the
 	// issuer is trusted at all — a trusted issuer can still be unregistered for
 	// the credential type it is proposing.
-	entitlement := h.evaluateIssuerEntitlement(result, keyMaterial, credentialTypes)
+	entitlement := h.evaluateIssuerEntitlement(ctx, client, issuerURL, result, keyMaterial, trustResp.Decision, credentialTypes)
 	if entitlement != nil && !entitlement.Allowed {
 		h.logger.Warn("issuer is not entitled to issue the requested credential",
 			zap.String("issuer_url", issuerURL),
-			zap.Any("findings", entitlement.Findings))
+			zap.Strings("codes", entitlementCodes(entitlement)))
+		// 403 with an explicit result: the refusal carries the same code the
+		// engine sends on the WebSocket (ISSUER_NOT_ENTITLED) and the decision
+		// with allowed=false, so it cannot be read as "not checked".
 		c.JSON(http.StatusForbidden, gin.H{
 			"error":              "issuer is not registered to issue the requested credential",
+			"code":               "ISSUER_NOT_ENTITLED",
 			"issuer_entitlement": entitlement,
 		})
 		return
@@ -1337,108 +1345,82 @@ func getActionName(req *gotrust.EvaluationRequest) string {
 }
 
 // evaluateIssuerEntitlement applies the ARF §6.6.2.3 wallet-side checks to a
-// resolved provider: is the signing certificate a WRPAC, does the registration
-// certificate describe this provider, and is it registered for what it offers.
+// resolved provider through issuertrust.Assess, the same evaluation the engine
+// runs: is the signing certificate a trusted WRPAC, is the registration
+// certificate signed by a trusted registrar, does it describe this provider,
+// and is it registered for what it offers.
 //
-// Returns nil when there is nothing to say — mode off, or metadata that was
-// never signed, in which case the trust decision above has already dealt with it.
+// Returns nil only when the mode is off. Metadata that is not signed by a
+// certificate chain is a finding here exactly as in the engine (a refusal in
+// fail mode), and chainTrusted is the PDP's decision on the key material the
+// chain was taken from.
 func (h *AuthZENProxyHandler) evaluateIssuerEntitlement(
+	ctx context.Context,
+	pdp registrarPDP,
+	issuerURL string,
 	result *issuermetadata.ResolveResult,
 	keyMaterial *trust.KeyMaterial,
+	chainTrusted bool,
 	credentialTypes []string,
 ) *issuertrust.Decision {
-	mode := issuertrust.ParseMode(h.cfg.IssuerEntitlementMode)
-	if mode == issuertrust.ModeOff || result == nil {
+	mode := issuertrust.ParseMode(h.entitlementMode)
+	if result == nil {
 		return nil
 	}
-
-	chain := parseX5CChain(keyMaterial)
-	if len(chain) == 0 && !result.Signed {
-		// Unsigned metadata is not an entitlement problem, and reporting it as
-		// one would double up on a decision already made above.
-		return nil
-	}
-
-	return issuertrust.Evaluate(issuertrust.Input{
-		Chain:            chain,
-		RegistrationCert: issuermetadata.RegistrationCertificate(result.Metadata),
-		Offers:           offersFor(result.Metadata, credentialTypes),
+	chain := keyMaterialX5C(keyMaterial)
+	return issuertrust.Assess(ctx, issuertrust.Source{
+		Metadata:  result.Metadata,
+		SignerX5C: chain,
+		// keyMaterial is what the PDP decision was made on, and the chain is
+		// taken from it, so the decision covers the chain.
+		ChainAnchored: chainTrusted,
+		Registrar:     h.registrarTrust(pdp, issuerURL),
+		Configs:       issuertrust.ConfigsFromRaw(result.Metadata),
+		IDs:           credentialTypes,
 	}, mode)
 }
 
-// parseX5CChain decodes the base64 DER certificates the resolver extracted.
-// Certificates that do not parse are skipped rather than failing the request:
-// the leaf is what the checks need, and the resolver has already verified the
-// signature made with it.
-func parseX5CChain(km *trust.KeyMaterial) []*x509.Certificate {
+func entitlementCodes(d *issuertrust.Decision) []string {
+	codes := make([]string, 0, len(d.Findings))
+	for _, f := range d.Findings {
+		codes = append(codes, string(f.Code))
+	}
+	return codes
+}
+
+// registrarPDP is the slice of the AuthZEN client the registrar check needs.
+type registrarPDP interface {
+	Evaluate(ctx context.Context, req *gotrust.EvaluationRequest) (*gotrust.EvaluationResponse, error)
+}
+
+// registrarTrust asks the PDP whether a registration certificate's signer is a
+// trusted Registrar (action trust.RegistrarAction). Nil when there is no PDP.
+func (h *AuthZENProxyHandler) registrarTrust(pdp registrarPDP, issuerURL string) issuertrust.RegistrarTrust {
+	if pdp == nil {
+		return nil
+	}
+	return func(ctx context.Context, km *trust.KeyMaterial) (bool, error) {
+		keys := make([]interface{}, len(km.X5C))
+		for i, cert := range km.X5C {
+			keys[i] = cert
+		}
+		resp, err := pdp.Evaluate(ctx, &gotrust.EvaluationRequest{
+			Subject:  gotrust.Subject{Type: "key", ID: issuerURL},
+			Resource: gotrust.Resource{Type: "x5c", ID: issuerURL, Key: keys},
+			Action:   &gotrust.Action{Name: trust.RegistrarAction},
+		})
+		if err != nil {
+			return false, err
+		}
+		return resp != nil && resp.Decision, nil
+	}
+}
+
+// keyMaterialX5C returns the x5c entries of key material, or nil when it is not
+// an x5c chain.
+func keyMaterialX5C(km *trust.KeyMaterial) []string {
 	if km == nil || km.Type != "x5c" {
 		return nil
 	}
-	out := make([]*x509.Certificate, 0, len(km.X5C))
-	for _, encoded := range km.X5C {
-		der, err := decodeX5C(encoded)
-		if err != nil {
-			continue
-		}
-		cert, err := x509.ParseCertificate(der)
-		if err != nil {
-			continue
-		}
-		out = append(out, cert)
-	}
-	return out
-}
-
-// decodeX5C accepts both base64 alphabets, matching what the signature
-// verification path already tolerates.
-//
-// RFC 7515 specifies standard base64 for x5c, but
-// trust.VerifyJWTWithEmbeddedKey falls back to raw URL encoding, so a chain it
-// accepted could be dropped here - and a dropped chain does not surface as a
-// decoding problem, it surfaces as "no_access_certificate", which reads as an
-// issuer that published nothing rather than one this code failed to read.
-func decodeX5C(encoded string) ([]byte, error) {
-	if der, err := base64.StdEncoding.DecodeString(encoded); err == nil {
-		return der, nil
-	}
-	return base64.RawURLEncoding.DecodeString(strings.TrimRight(encoded, "="))
-}
-
-// offersFor turns the credential configurations the wallet is about to request
-// into the (format, type) pairs provides_attestations is expressed in.
-//
-// credentialTypes names configuration ids from the offer; the metadata says
-// what format and vct or doctype each one actually is. Guessing the format
-// would make the check meaningless, so a configuration that cannot be resolved
-// is skipped and simply not checked.
-func offersFor(metadata map[string]interface{}, credentialTypes []string) []issuertrust.Offer {
-	configs, _ := metadata["credential_configurations_supported"].(map[string]interface{})
-	if configs == nil {
-		return nil
-	}
-	var offers []issuertrust.Offer
-	for _, id := range credentialTypes {
-		cfg, ok := configs[id].(map[string]interface{})
-		if !ok {
-			continue
-		}
-		format, _ := cfg["format"].(string)
-		if format == "" {
-			continue
-		}
-		offers = append(offers, issuertrust.Offer{Format: format, Type: credentialTypeOf(cfg)})
-	}
-	return offers
-}
-
-// credentialTypeOf reads the type a configuration declares: vct for SD-JWT,
-// doctype for mdoc. An empty result means only the format is matched.
-func credentialTypeOf(cfg map[string]interface{}) string {
-	if vct, ok := cfg["vct"].(string); ok && vct != "" {
-		return vct
-	}
-	if doctype, ok := cfg["doctype"].(string); ok && doctype != "" {
-		return doctype
-	}
-	return ""
+	return km.X5C
 }

@@ -104,6 +104,11 @@ const (
 	ErrCodeRequestFetchError ErrorCode = "REQUEST_FETCH_ERROR"
 	ErrCodeMetadataFetchErr  ErrorCode = "METADATA_FETCH_ERROR"
 	ErrCodeUntrustedIssuer   ErrorCode = "UNTRUSTED_ISSUER"
+	// ErrCodeIssuerNotEntitled: the issuer is trusted but is not registered
+	// (WRPAC/WRPRC, ARF 6.6.2.3) to issue what it offers, or that could not be
+	// established, in `fail` mode. Distinct from UNTRUSTED_ISSUER, which is
+	// the trust decision. The error's details carry the bounded findings.
+	ErrCodeIssuerNotEntitled ErrorCode = "ISSUER_NOT_ENTITLED"
 	ErrCodeUntrustedVerifier ErrorCode = "UNTRUSTED_VERIFIER"
 	ErrCodeAuthorizationFail ErrorCode = "AUTHORIZATION_FAILED"
 	ErrCodeTokenError        ErrorCode = "TOKEN_ERROR"
@@ -158,6 +163,8 @@ func (c ErrorCode) UserFacingMessage() string {
 		return "Could not fetch issuer metadata"
 	case ErrCodeUntrustedIssuer:
 		return "Issuer is not trusted"
+	case ErrCodeIssuerNotEntitled:
+		return "Issuer is not registered to issue this credential"
 	case ErrCodeUntrustedVerifier:
 		return "Verifier is not trusted"
 	case ErrCodeAuthorizationFail:

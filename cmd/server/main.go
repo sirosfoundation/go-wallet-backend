@@ -102,6 +102,11 @@ func main() {
 	for _, w := range registryWarnings {
 		logger.Warn(w)
 	}
+	if backendCfg != nil && backendCfg != registryCfg {
+		for _, w := range backendCfg.Warnings() {
+			logger.Warn(w)
+		}
+	}
 	if registryCfg != nil {
 		for _, w := range registryCfg.Warnings() {
 			logger.Warn(w)
