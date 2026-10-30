@@ -1,0 +1,18 @@
+# Builds an integration branch ("bag of PRs") when integration/** is pushed - and only if it verifies against its plan
+# (.integration/plan.yaml). Publishes ghcr.io/<image-name>:<branch>-<sha7>.
+# See https://github.com/sirosfoundation/.github/blob/main/docs/integration-branches.md
+name: Integration
+
+on:
+  push:
+    branches: ['integration/**']
+
+jobs:
+  integration:
+    uses: sirosfoundation/.github/.github/workflows/integration-build.yml@main
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+    with:
+      image-name: sirosfoundation/integration/${{ github.event.repository.name }}
