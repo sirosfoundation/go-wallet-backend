@@ -114,9 +114,9 @@ func TestClientHeldNotification_AfterFlowEnded_ForwardsWithClientProof(t *testin
 	r := newHeldNotifRig(t, "n-1")
 	r.notify("n-1")
 	a := r.ack(t)
-	assert.Equal(t, "forwarded", a.Status)
-	assert.Equal(t, "client-proof", <-r.dpop, "issuer must receive the client-signed proof")
-	req := <-r.signs
+	require.Equal(t, "forwarded", a.Status)
+	assert.Equal(t, "client-proof", recvOrFail(t, r.dpop), "issuer must receive the client-signed proof")
+	req := recvOrFail(t, r.signs)
 	assert.Equal(t, SignActionSignClientAuth, req.Action)
 	assert.Equal(t, "key-1", req.Params.KeyID)
 	assert.Equal(t, accessTokenHash("at"), req.Params.ATH)
@@ -190,8 +190,8 @@ func TestEngineHeldNotification_AfterFlowEnded_Forwards(t *testing.T) {
 	nc.notificationID = "n-1"
 	r.session.notifications.put("flow-ended", nc)
 	r.notify("n-1")
-	assert.Equal(t, "forwarded", r.ack(t).Status)
-	assert.NotEmpty(t, <-r.dpop)
+	require.Equal(t, "forwarded", r.ack(t).Status)
+	assert.NotEmpty(t, recvOrFail(t, r.dpop))
 	assert.Empty(t, r.signs, "an engine-held key needs no client round trip")
 }
 
@@ -265,3 +265,15 @@ func TestClientHeldNotification_SigningFailureOnNonceRetry_ConsumesContext(t *te
 type dpopSignerFunc func() (string, error)
 
 func (f dpopSignerFunc) Proof(_ context.Context, _, _, _, _ string) (string, error) { return f() }
+
+// recvOrFail reads one value or fails the test instead of blocking forever.
+func recvOrFail[T any](t *testing.T, ch <-chan T) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(5 * time.Second):
+		require.FailNow(t, "timed out waiting for a value")
+		panic("unreachable")
+	}
+}
