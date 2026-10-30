@@ -120,6 +120,11 @@ type Session struct {
 	// without persisting anything.
 	notifications *notificationContextStore
 
+	// consentObserver, when set by the session's transport, is told when a
+	// flow awaits a consent and how it was decided (see consent.go). Nil over
+	// WebSocket.
+	consentObserver consentObserver
+
 	// stopPing signals the ping goroutine to exit.
 	stopPing chan struct{}
 
