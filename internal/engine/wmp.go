@@ -306,15 +306,21 @@ func (a *WMPAdapter) ServeAuthenticated(w http.ResponseWriter, r *http.Request, 
 // session was created with. It refuses only the owner whose token is too weak.
 // A session that is unknown, expired or owned by someone else passes: go-wmp
 // answers all three alike (-31000 or -31001), so this check is no existence
-// oracle. An in-process embedder that feeds responses to a Peer itself calls it
-// first.
+// oracle. A live session of the owner whose engine binding is already gone (it
+// is being ended) is refused: its TAC cannot be checked. An in-process embedder
+// that feeds responses to a Peer itself calls it first.
 func (a *WMPAdapter) CheckSessionAccess(p wmp.Principal, sessionID string) bool {
-	ws := a.session(sessionID)
-	if ws == nil {
-		return true
-	}
 	if rec, ok := a.svc.Store().Get(sessionID); !ok || rec.IsExpired() || !rec.OwnedBy(p.Key()) {
 		return true
+	}
+	ws := a.session(sessionID)
+	if ws == nil {
+		// A live session of this owner whose engine binding is gone: the session
+		// is being ended (endSession removes the binding before it drops the
+		// stored session and its streams), so its creation-time TAC cannot be
+		// checked. Fail closed: refuse, never let a token attach to, or answer a
+		// request of, a stream that is still live.
+		return false
 	}
 	cl, ok := p.Claims.(*wmpClaims)
 	return ok && cl != nil && ws.session.TAC.IsSubsetOf(cl.TAC)

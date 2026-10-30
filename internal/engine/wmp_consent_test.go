@@ -256,3 +256,113 @@ func TestWMPBridge_SecondSelectionIsRefused(t *testing.T) {
 	assert.Equal(t, 0, do())
 	assert.Equal(t, wmp.ErrFlowError, do())
 }
+
+// An oid4vp cancel is a decline while the flow waits for the selection and
+// nothing else can consume one. Once a selection was handed over (the flow is
+// signing, the step still the selection) and before the flow asks for one, a
+// cancel ends the flow: it is not acknowledged and ignored while the flow runs
+// on to submit the presentation.
+func TestWMPBridge_CancelWhenNothingWaitsForTheSelectionEndsTheFlow(t *testing.T) {
+	cancelAction := func(sid string) map[string]any {
+		return req(wmp.MethodFlowAction, map[string]any{"wmp": meta(sid), "flow_id": "f1", "action": "cancel", "params": map[string]any{"reason": "changed my mind"}})
+	}
+
+	t.Run("after the consent was handed over", func(t *testing.T) {
+		e := newWMPEnv(t)
+		ranOn := make(chan bool, 1)
+		registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
+			f.mu.Lock()
+			f.State = StepCredentialSelection
+			f.mu.Unlock()
+			_ = f.Session.SendProgress(f.ID, StepCredentialSelection, nil)
+			if _, err := f.Session.WaitForAction(ctx, f.ID, ActionConsent); err != nil {
+				return err
+			}
+			// Consumed, the sign request not registered yet: the window in which a
+			// decline has no consumer.
+			select {
+			case <-ctx.Done():
+				ranOn <- false
+				return ctx.Err()
+			case <-time.After(1500 * time.Millisecond):
+				ranOn <- true
+				return f.Session.SendFlowComplete(f.ID, nil, "")
+			}
+		})
+		tok := e.token("alice", "t1", "ir", "j1")
+		sid := e.create(tok, "oid4vp")
+		st, _ := e.openStream(tok, sid, "")
+		require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
+		st.nextMethod(t, wmp.MethodFlowProgress)
+		good := map[string]any{"consent": true, "selections": []any{map[string]any{"query_id": "q", "selection_handle": testHandle}}}
+		require.Equal(t, 0, e.post(tok, sid, req(wmp.MethodFlowAction, map[string]any{"wmp": meta(sid), "flow_id": "f1", "action": "select_credentials", "params": good})).code())
+
+		assert.Equal(t, 0, e.post(tok, sid, cancelAction(sid)).code())
+		ev := st.nextMethod(t, wmp.MethodFlowError)
+		assert.EqualValues(t, wmp.ErrFlowError, params(ev)["code"])
+		assert.Equal(t, map[string]any{"reason": "cancelled"}, params(ev)["data"])
+		assert.False(t, <-ranOn, "the flow was stopped, not left to sign and submit")
+	})
+
+	t.Run("malformed cancel params are refused, not read as empty", func(t *testing.T) {
+		e := newWMPEnv(t)
+		registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
+			_ = f.Session.SendProgress(f.ID, StepCredentialSelection, nil)
+			<-ctx.Done()
+			return ctx.Err()
+		})
+		tok := e.token("alice", "t1", "ir", "j1")
+		sid := e.create(tok, "oid4vp")
+		require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
+		waitFlows(t, e, sid, 1)
+		r := e.post(tok, sid, req(wmp.MethodFlowAction, map[string]any{"wmp": meta(sid), "flow_id": "f1", "action": "cancel", "params": map[string]any{"reason": 42}}))
+		assert.Equal(t, wmp.ErrInvalidParams, r.code())
+	})
+
+	t.Run("while the flow waits for the selection it is a decline", func(t *testing.T) {
+		e := newWMPEnv(t)
+		got := make(chan string, 1)
+		registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
+			f.mu.Lock()
+			f.State = StepCredentialSelection
+			f.mu.Unlock()
+			_ = f.Session.SendProgress(f.ID, StepCredentialSelection, nil)
+			act, err := f.Session.WaitForAction(ctx, f.ID, ActionConsent, ActionDecline)
+			if err != nil {
+				return err
+			}
+			got <- act.Action
+			return f.Session.SendFlowError(f.ID, StepCredentialSelection, ErrCodePresentationError, "declined")
+		})
+		tok := e.token("alice", "t1", "ir", "j1")
+		sid := e.create(tok, "oid4vp")
+		st, _ := e.openStream(tok, sid, "")
+		require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
+		st.nextMethod(t, wmp.MethodFlowProgress)
+		assert.Equal(t, 0, e.post(tok, sid, cancelAction(sid)).code())
+		assert.Equal(t, ActionDecline, <-got, "the verifier-refusal path is kept while the selection is awaited")
+	})
+
+	t.Run("before the flow asks for a selection", func(t *testing.T) {
+		e := newWMPEnv(t)
+		stopped := make(chan struct{})
+		registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, _ *Flow, _ *FlowStartMessage) error {
+			<-ctx.Done()
+			close(stopped)
+			return ctx.Err()
+		})
+		tok := e.token("alice", "t1", "ir", "j1")
+		sid := e.create(tok, "oid4vp")
+		st, _ := e.openStream(tok, sid, "")
+		require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
+		waitFlows(t, e, sid, 1)
+		assert.Equal(t, 0, e.post(tok, sid, cancelAction(sid)).code())
+		ev := st.nextMethod(t, wmp.MethodFlowError)
+		assert.Equal(t, map[string]any{"reason": "cancelled"}, params(ev)["data"])
+		select {
+		case <-stopped:
+		case <-time.After(5 * time.Second):
+			t.Fatal("the flow was not cancelled")
+		}
+	})
+}
