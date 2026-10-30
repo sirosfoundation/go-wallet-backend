@@ -222,3 +222,69 @@ func TestEntitlementDecision_TypedAndMapFormsAgree(t *testing.T) {
 	_, ok = entitlementDecision(map[string]interface{}{"allowed": "yes"})
 	assert.False(t, ok, "a member of the wrong type")
 }
+
+// The registration certificate's own content never reaches the wire, whatever
+// the case of its member name (Go's JSON decoding matches names without regard
+// to case), and the caller's decision is not modified.
+func TestEntitlementDecision_CaseVariantsOfStrippedMembersAreNotRelayed(t *testing.T) {
+	finding := []interface{}{map[string]interface{}{"code": "no_registration_certificate"}}
+	for _, key := range []string{"Entitlements", "ENTITLEMENTS", "entitlements", "Subject", "SUBJECT", "subject"} {
+		t.Run(key, func(t *testing.T) {
+			decision := map[string]interface{}{"allowed": false, "mode": "fail", "evaluated": true, "findings": finding,
+				key: []string{"SECRET-ENTITLEMENT"}}
+			details := map[string]interface{}{"issuer": "https://i", "issuer_entitlement": decision}
+			_, _, data, handled := issuerErrorWire(ErrCodeIssuerNotEntitled, "x", details)
+			require.True(t, handled)
+			raw, _ := json.Marshal(data)
+			assert.NotContains(t, string(raw), "SECRET")
+			assert.Contains(t, string(raw), "no_registration_certificate", "the refusal itself still goes out")
+			assert.Contains(t, decision, key, "the engine's decision is not modified")
+
+			prog, _ := json.Marshal(map[string]interface{}{"issuer_entitlement_evaluated": true, "issuer": "https://i",
+				"issuer_entitlement": map[string]interface{}{"allowed": true, "mode": "warn", "evaluated": true, "findings": finding, key: "SECRET"}})
+			p, isFindings := entitlementProgress(prog)
+			require.True(t, isFindings)
+			require.NotNil(t, p)
+			out, _ := json.Marshal(p)
+			assert.NotContains(t, string(out), "SECRET")
+		})
+	}
+}
+
+// allowed, mode and evaluated must be present with their types: a missing or
+// null boolean is not read as false (which would make a malformed decision a
+// refusal), in the refusal and in the progress alike.
+func TestEntitlementDecision_RequiresAllowedModeEvaluated(t *testing.T) {
+	finding := []interface{}{map[string]interface{}{"code": "no_registration_certificate"}}
+	full := func() map[string]interface{} {
+		return map[string]interface{}{"allowed": false, "mode": "fail", "evaluated": true, "findings": finding}
+	}
+	for _, member := range []string{"allowed", "mode", "evaluated"} {
+		for name, set := range map[string]func(m map[string]interface{}){
+			"missing":      func(m map[string]interface{}) { delete(m, member) },
+			"null":         func(m map[string]interface{}) { m[member] = nil },
+			"wrong type":   func(m map[string]interface{}) { m[member] = 7 },
+			"case variant": func(m map[string]interface{}) { v := m[member]; delete(m, member); m[strings.ToUpper(member)] = v },
+		} {
+			t.Run(member+" "+name, func(t *testing.T) {
+				d := full()
+				set(d)
+				_, ok := entitlementDecision(d)
+				assert.False(t, ok)
+
+				code, msg, data, handled := issuerErrorWire(ErrCodeIssuerNotEntitled, "the engine's text", map[string]interface{}{"issuer": "https://i", "issuer_entitlement": d})
+				assert.True(t, handled)
+				assert.Equal(t, wmp.ErrFlowError, code, "not -31020 for a decision that does not say it is a refusal")
+				assert.Equal(t, "the engine's text", msg)
+				assert.Nil(t, data)
+
+				raw, _ := json.Marshal(map[string]interface{}{"issuer_entitlement_evaluated": true, "issuer": "https://i", "issuer_entitlement": d})
+				p, isFindings := entitlementProgress(raw)
+				assert.Nil(t, p)
+				assert.True(t, isFindings, "a findings progress go-wmp cannot be given is dropped, not relayed")
+			})
+		}
+	}
+	_, ok := entitlementDecision(full())
+	assert.True(t, ok)
+}

@@ -70,17 +70,35 @@ func asJSONObject(v interface{}) map[string]interface{} {
 // entitlementDecision is the engine's decision {allowed, mode, evaluated,
 // findings, findings_truncated} (issuertrust.Decision.Summary) as go-wmp's
 // type, bounded by go-wmp (findings, lengths, characters, finding codes of the
-// defined form) whatever the engine sent. The registration certificate's own
-// content (entitlements, subject) is issuer-controlled and display-only: not
-// relayed. A decision that is not an object, or a member of the wrong type,
-// yields false.
+// defined form) whatever the engine sent. It is built from a fresh object that
+// holds only those five members, looked up by their exact names (Go's JSON
+// decoding matches member names case-insensitively, so a variant of
+// "entitlements" or "subject" must never reach it), and the caller's value is
+// not modified. The registration certificate's own content (entitlements,
+// subject) is issuer-controlled and display-only: not relayed.
+//
+// allowed, mode and evaluated must be present with their types: an absent or
+// null boolean would read as false, which for allowed would make a malformed
+// decision a refusal. A decision that is not an object or has a member of the
+// wrong type yields false.
 func entitlementDecision(v interface{}) (openid4x.IssuerEntitlement, bool) {
 	raw := asJSONObject(v)
 	if raw == nil {
 		return openid4x.IssuerEntitlement{}, false
 	}
-	delete(raw, "entitlements")
-	b, err := json.Marshal(raw)
+	allowed, okAllowed := raw["allowed"].(bool)
+	mode, okMode := raw["mode"].(string)
+	evaluated, okEvaluated := raw["evaluated"].(bool)
+	if !okAllowed || !okMode || !okEvaluated {
+		return openid4x.IssuerEntitlement{}, false
+	}
+	clean := map[string]interface{}{"allowed": allowed, "mode": mode, "evaluated": evaluated}
+	for _, k := range []string{"findings", "findings_truncated"} {
+		if m, ok := raw[k]; ok {
+			clean[k] = m
+		}
+	}
+	b, err := json.Marshal(clean)
 	if err != nil {
 		return openid4x.IssuerEntitlement{}, false
 	}
