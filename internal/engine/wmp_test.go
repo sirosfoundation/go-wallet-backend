@@ -1576,6 +1576,72 @@ func TestWMPBridge_FlowStartWithMalformedCredentialOffer(t *testing.T) {
 	}
 }
 
+// The engine flow is registered in the session asynchronously, after go-wmp has
+// accepted the start. In that window the guard must already gate a cancel,
+// complete or error about the flow as the flow it is: a token that lacks the
+// permission of the flow's protocol cannot end it. (The registration is held up
+// by taking the transport's lock, which the flow's goroutine needs first.)
+func TestWMPBridge_FlowIsGatedBeforeItIsRegisteredInTheSession(t *testing.T) {
+	e := newWMPEnv(t)
+	registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, _ *Flow, _ *FlowStartMessage) error {
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	full := e.token("alice", "t1", "ir", "j1")
+	noRead := e.token("alice", "t1", "i", "j2") // same user, fewer permissions
+	sid := e.create(full, "oid4vp")
+	ws := e.a.session(sid)
+	require.NotNil(t, ws)
+
+	ws.tr.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			ws.tr.mu.Unlock()
+		}
+	}()
+	require.Equal(t, 0, e.post(full, sid, startOID4VP(sid, "f1")).code())
+	ws.session.flowsMu.RLock()
+	_, registered := ws.session.flows["f1"]
+	ws.session.flowsMu.RUnlock()
+	require.False(t, registered, "the window is open: go-wmp accepted the start, the engine flow is not registered")
+
+	for name, msg := range map[string]map[string]any{
+		"cancel":   req(wmp.MethodFlowCancel, map[string]any{"wmp": meta(sid), "flow_id": "f1"}),
+		"complete": notification(wmp.MethodFlowComplete, map[string]any{"wmp": meta(sid), "flow_id": "f1", "result": map[string]any{}}),
+		"error":    notification(wmp.MethodFlowError, map[string]any{"wmp": meta(sid), "flow_id": "f1", "code": wmp.ErrFlowError, "message": "x"}),
+	} {
+		// A request that reaches the flow blocks on the lock held above: it is
+		// reported, not waited for.
+		res := make(chan reply, 1)
+		go func() { res <- e.post(noRead, sid, msg) }()
+		select {
+		case r := <-res:
+			if name == "cancel" {
+				assert.Equal(t, wmp.ErrNotAuthorized, r.code(), "%s by a token without the flow's permission", name)
+			}
+		case <-time.After(3 * time.Second):
+			ws.tr.mu.Unlock()
+			locked = false
+			t.Fatalf("%s by a token without the flow's permission reached the flow", name)
+		}
+	}
+	ws.tr.mu.Unlock()
+	locked = false
+	// The flow registers once the window closes and was not ended by the reduced token.
+	assert.Eventually(t, func() bool {
+		ws.session.flowsMu.RLock()
+		defer ws.session.flowsMu.RUnlock()
+		_, running := ws.session.flows["f1"]
+		return running
+	}, 3*time.Second, 10*time.Millisecond, "the flow was ended by a token that lacks its permission")
+	time.Sleep(200 * time.Millisecond)
+	ws.session.flowsMu.RLock()
+	_, running := ws.session.flows["f1"]
+	ws.session.flowsMu.RUnlock()
+	assert.True(t, running, "the flow was not ended by a token that lacks its permission")
+}
+
 // The shutdown deadline bounds ending the sessions, whatever a slow store does.
 func TestWMPAdapter_CloseContextIsBoundedBySlowStore(t *testing.T) {
 	e := newWMPEnv(t)
