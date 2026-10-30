@@ -52,10 +52,12 @@ func newHeldNotifRig(t *testing.T, issuedID string) *heldNotifRig {
 	}))
 	t.Cleanup(r.issuer.Close)
 
-	s, client := newRoutingSession(t)
+	// The real read loop (handleSession) receives the client's messages, so the
+	// routing of a reply for an ended flow is exercised, not bypassed.
+	r.mgr = notifTestManager()
+	client, s := unknownFlowHarnessOn(t, r.mgr)
 	s.notifications = newNotificationContextStore()
 	r.session, r.client = s, client
-	r.mgr = notifTestManager()
 	// "flow-ended" is deliberately NOT registered in s.flows.
 	s.notifications.put("flow-ended", &notificationContext{
 		endpoint:       r.issuer.URL,
@@ -91,7 +93,7 @@ func (r *heldNotifRig) ack(t *testing.T) NotificationAckMessage {
 			case heldClientSilent:
 				continue
 			}
-			r.session.dispatchSignResponse(resp)
+			require.NoError(t, r.client.WriteJSON(resp))
 		case TypeNotificationAck:
 			var a NotificationAckMessage
 			require.NoError(t, json.Unmarshal(data, &a))
@@ -101,7 +103,7 @@ func (r *heldNotifRig) ack(t *testing.T) NotificationAckMessage {
 }
 
 func (r *heldNotifRig) notify(id string) {
-	r.mgr.dispatchCredentialNotification(r.session, &CredentialNotificationMessage{
+	_ = r.client.WriteJSON(&CredentialNotificationMessage{
 		Message:        Message{Type: TypeCredentialNotification, FlowID: "flow-ended"},
 		NotificationID: id,
 		Event:          notificationEventAccepted,
