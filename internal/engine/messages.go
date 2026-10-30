@@ -124,8 +124,14 @@ const (
 	// wallet refuses rather than present without the transaction hashes or
 	// without showing the user what they are authorizing.
 	ErrCodeUnsupportedTransactionData ErrorCode = "UNSUPPORTED_TRANSACTION_DATA"
-	ErrCodeInternalError              ErrorCode = "INTERNAL_ERROR"
-	ErrCodeTooManyRequests            ErrorCode = "TOO_MANY_REQUESTS"
+	// ErrCodeSignRefused is the client's answer to a sign_request it will not
+	// fulfil on purpose: the user declined at the consent step, the wallet
+	// distrusts the verifier, or a value the signature must bind is missing.
+	// It rides in sign_response.error_code and ends the OID4VP flow at once
+	// with access_denied to the verifier; see OID4VPHandler.failSign.
+	ErrCodeSignRefused     ErrorCode = "SIGN_REFUSED"
+	ErrCodeInternalError   ErrorCode = "INTERNAL_ERROR"
+	ErrCodeTooManyRequests ErrorCode = "TOO_MANY_REQUESTS"
 	// ErrCodePSCConflict: the issuer already holds a different holder
 	// commitment (psc) for this subject. The message is the issuer's own text
 	// and tells the user what to do (operator-approved reset).
@@ -716,9 +722,11 @@ type SignResponseMessage struct {
 	// is client-controlled and might echo response content.
 	Error string `json:"error,omitempty"`
 	// ErrorCode classifies Error, and on its own (Error omitted) still marks the
-	// reply a failure. Only ErrCodeUnsupportedTransactionData is acted
-	// on: the client refused the request's transaction_data. Any other value is
-	// dropped (see allowedSignErrorCode).
+	// reply a failure. Two values are acted on:
+	// ErrCodeUnsupportedTransactionData (the client refused the request's
+	// transaction_data) and ErrCodeSignRefused (the client refuses to sign at
+	// all; Error is then optional and is never sent to the verifier). Any other
+	// value is dropped (see allowedSignErrorCode).
 	ErrorCode ErrorCode `json:"error_code,omitempty"`
 }
 

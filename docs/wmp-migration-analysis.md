@@ -101,8 +101,9 @@ client to evaluate trust) is the one additive action.
 A `select_credentials` the closed shape refuses is answered `-32602` without
 data and the flow ends with a terminal `-32602` without data. If the flow is
 waiting for the selection it is declined (the verifier is told `access_denied`);
-if it is already past that step nothing would consume a decline, so it is stopped
-at once and the verifier is not told.
+if it is already past that step nothing would consume a decline: a pending sign
+request is refused (`SIGN_REFUSED`, so the verifier is told `access_denied`), and
+without one the flow is stopped at once and the verifier is not told.
 
 A flow that ends without a result, or outlives the timeout the client named in
 `wmp.flow.start` (capped at 5 minutes), is reported as `-31006`.
@@ -188,6 +189,14 @@ A sign sub-flow that fails reaches the engine as a `SignError`; only the codes t
 engine acts on survive, and nothing of the wallet's text or data is relayed. A
 wallet that answers `-31005` with `data.unsupported == "transaction_data"` is
 refusing the request's transaction_data; any other failure is a plain sign error.
+
+A wallet that **rejects** the sign sub-flow (`-31006` with `data.reason:
+"rejected"`, Core 6.2; `SubFlowError.Rejected()`) is declining, not failing: the
+engine receives `SIGN_REFUSED`, tells the verifier `access_denied` with its `state`
+and no `error_description` (OpenID4x 3.2.6; the same shape as every other
+refusal), and ends the parent flow `-31006` ("User declined the request") with the
+verifier's `redirect_uri` when the response mode produced one. Nothing the wallet
+said is relayed.
 
 ### Replay
 

@@ -1250,6 +1250,34 @@ JWK, else the key type; `enc` defaults to `A128GCM`); when none can be resolved
 no `sign_request` is sent. Plain `direct_post`, `query` and `fragment` are
 unchanged: the client returns `vp_token`.
 
+#### Refusing the Sign Request
+
+A client that will not sign (the user declined, the wallet does not trust the
+verifier, a value the signature must bind is missing) answers the
+`sign_request` with the refusal code instead of waiting for the sign timeout:
+
+```
+Client → Server:
+{ "type": "sign_response", "flow_id": "<uuid>", "message_id": "<uuid>",
+  "error_code": "SIGN_REFUSED", "error": "<optional, wallet-private>" }
+```
+
+`RequestSign` returns at once. The engine answers the verifier `access_denied`
+with the request's `state` and **no** `error_description` (OpenID4x 3.2.6; the same
+shape as a consent decline or an empty credential match, so a verifier cannot tell the
+refusals apart),
+in the response mode of the request, and ends the flow with a `flow_error`
+`PRESENTATION_ERROR` ("User declined the request"), carrying `details.redirect_uri`
+when the response mode produced a verifier redirect. The client's `error` text
+is never sent to the verifier and the engine does not keep it. Any other `sign_response` with
+`error` (and no `SIGN_REFUSED`) stays a `SIGN_ERROR` and the verifier is not
+contacted, with one exception: when the request carries `transaction_data`,
+`error_code` `UNSUPPORTED_TRANSACTION_DATA` ends the flow with an
+`UNSUPPORTED_TRANSACTION_DATA` `flow_error` and the verifier is told
+`invalid_transaction_data` (except in `direct_post.jwt` mode, where no error
+response is sent). Over WMP the refusal is a `wmp.flow.error` on the `sign` child flow
+with `data.reason` `rejected` and the parent flow ends with `-31006`.
+
 #### Response Submission
 
 ```

@@ -3627,7 +3627,7 @@ func TestRequestCredentialSelection_NoMatchFailsFast(t *testing.T) {
 	case form := <-posted:
 		assert.Equal(t, "access_denied", form.Get("error"))
 		assert.Equal(t, "state-123", form.Get("state"))
-		assert.Equal(t, verifierRefusedDescription, form.Get("error_description"))
+		assert.False(t, form.Has("error_description"), "uniform refusal shape: no description")
 		assert.NotContains(t, form.Get("error_description"), "urn:eudi:pid:arf-1.8:1")
 	case <-time.After(5 * time.Second):
 		t.Fatal("verifier was never notified")
@@ -4253,4 +4253,20 @@ func cacheKeyForX509SANDNS(t *testing.T, authReq *AuthorizationRequest, requestJ
 	ctxHash := hashEvalContext(buildVerifierEvalContext(authReq, authCtx, zap.NewNop()))
 	require.NotEmpty(t, ctxHash)
 	return "x509_san_dns:" + authReq.ClientID + ":" + fp + "|ctx:" + ctxHash
+}
+
+func TestBuildErrorRedirect_DropsPreexistingErrorParams(t *testing.T) {
+	got := buildErrorRedirect("https://verifier.example/cb?error_description=old_reason&state=old&keep=1", "", "access_denied", "", false)
+	u, err := url.Parse(got)
+	require.NoError(t, err)
+	q := u.Query()
+	assert.Equal(t, "access_denied", q.Get("error"))
+	assert.False(t, q.Has("error_description"), "no description means none on the redirect")
+	assert.False(t, q.Has("state"), "a stale state is not this request's")
+	assert.Equal(t, "1", q.Get("keep"))
+
+	got = buildErrorRedirect("https://verifier.example/cb", "s1", "access_denied", "why", false)
+	u, _ = url.Parse(got)
+	assert.Equal(t, "why", u.Query().Get("error_description"))
+	assert.Equal(t, "s1", u.Query().Get("state"))
 }

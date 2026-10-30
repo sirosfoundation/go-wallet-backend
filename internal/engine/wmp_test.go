@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"reflect"
 	"strings"
 	"sync"
@@ -485,7 +486,8 @@ func TestWMPBridge_SignSubFlowFailures(t *testing.T) {
 		data     map[string]any
 		wantCode ErrorCode
 	}{
-		{"rejected", wmp.ErrFlowError, map[string]any{"reason": "rejected"}, ""},
+		{"rejected", wmp.ErrFlowError, map[string]any{"reason": "rejected"}, ErrCodeSignRefused},
+		{"another -31006 reason is a plain failure", wmp.ErrFlowError, map[string]any{"reason": "timeout"}, ""},
 		{"transaction_data unsupported", wmp.ErrCapabilityNotSupported, map[string]any{"unsupported": "transaction_data"}, ErrCodeUnsupportedTransactionData},
 		{"another unsupported is not transaction_data", wmp.ErrCapabilityNotSupported, map[string]any{"unsupported": "sign"}, ""},
 	}
@@ -519,6 +521,97 @@ func TestWMPBridge_SignSubFlowFailures(t *testing.T) {
 			}
 		})
 	}
+}
+
+// A wallet that rejects the sign sub-flow (-31006, data.reason "rejected", Core
+// 6.2) ends the OID4VP flow at once: the verifier gets access_denied with its
+// state and no error_description (OpenID4x 3.2.6), and the parent ends -31006
+// with the verifier's redirect. Nothing of what the wallet said is relayed.
+func TestWMPBridge_RejectedSignSubFlowRefusesTheVerifier(t *testing.T) {
+	var form url.Values
+	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		form = r.PostForm
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"redirect_uri":"https://verifier.example/done"}`))
+	}))
+	defer verifier.Close()
+
+	e := newWMPEnv(t)
+	registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
+		h := &OID4VPHandler{}
+		h.BaseHandler = BaseHandler{Logger: zap.NewNop(), Flow: f}
+		h.httpClient = verifier.Client()
+		authReq := &AuthorizationRequest{ClientID: "https://verifier.example.com", ResponseMode: ResponseModeDirectPost, ResponseURI: verifier.URL, State: "st-1", Nonce: "n"}
+		_, err := h.requestVPSignature(ctx, authReq, decisionOf(ConsentSelection{CredentialQueryID: "q1"}), "https://verifier.example.com")
+		h.failSign(ctx, authReq, err)
+		return err
+	})
+	tok := e.token("alice", "t1", "ir", "j1")
+	sid := e.create(tok, "oid4vp")
+	st, _ := e.openStream(tok, sid, "")
+	require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
+
+	start := st.nextMethod(t, wmp.MethodFlowStart)
+	sub := params(start)["flow_id"].(string)
+	e.post(tok, sid, map[string]any{"id": start.Data["id"], "result": map[string]any{"wmp": meta(sid), "flow_id": sub, "flow_type": "sign"}})
+	e.post(tok, sid, notification(wmp.MethodFlowError, map[string]any{
+		"wmp": meta(sid), "flow_id": sub, "code": wmp.ErrFlowError, "message": "wallet text: secret-123",
+		"data": map[string]any{"reason": "rejected"}}))
+
+	ev := st.nextMethod(t, wmp.MethodFlowError)
+	assert.EqualValues(t, wmp.ErrFlowError, params(ev)["code"])
+	data, _ := params(ev)["data"].(map[string]any)
+	assert.Equal(t, "https://verifier.example/done", data["redirect_uri"])
+	assert.Equal(t, "access_denied", form.Get("error"))
+	assert.Equal(t, "st-1", form.Get("state"))
+	assert.False(t, form.Has("error_description"), "OpenID4x 3.2.6: no error_description")
+	assert.NotContains(t, ev.Raw, "secret-123")
+	assert.NotContains(t, form.Encode(), "secret-123")
+}
+
+// A malformed select_credentials that arrives while the sign sub-flow is pending
+// refuses the sign request: the verifier is told access_denied (state, no
+// description) and the flow ends with the terminal -32602 (no data), not the
+// ordinary -31006 decline.
+func TestWMPBridge_MalformedSelectionDuringSigningRefusesTheVerifier(t *testing.T) {
+	var form url.Values
+	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		form = r.PostForm
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"redirect_uri":"https://verifier.example/done"}`))
+	}))
+	defer verifier.Close()
+
+	e := newWMPEnv(t)
+	registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
+		h := &OID4VPHandler{}
+		h.BaseHandler = BaseHandler{Logger: zap.NewNop(), Flow: f}
+		h.httpClient = verifier.Client()
+		authReq := &AuthorizationRequest{ClientID: "https://verifier.example.com", ResponseMode: ResponseModeDirectPost, ResponseURI: verifier.URL, State: "st-1", Nonce: "n"}
+		// The consent reports no progress, so while signing the step is still the selection.
+		_ = h.Progress(StepCredentialSelection, nil)
+		_, err := h.requestVPSignature(ctx, authReq, decisionOf(ConsentSelection{CredentialQueryID: "q1"}), "https://verifier.example.com")
+		h.failSign(ctx, authReq, err)
+		return err
+	})
+	tok := e.token("alice", "t1", "ir", "j1")
+	sid := e.create(tok, "oid4vp")
+	st, _ := e.openStream(tok, sid, "")
+	require.Equal(t, 0, e.post(tok, sid, startOID4VP(sid, "f1")).code())
+	st.nextMethod(t, wmp.MethodFlowProgress)
+	st.nextMethod(t, wmp.MethodFlowStart) // the sign sub-flow is pending
+
+	r := e.post(tok, sid, req(wmp.MethodFlowAction, map[string]any{"wmp": meta(sid), "flow_id": "f1", "action": "select_credentials",
+		"params": map[string]any{"consent": true, "selections": []any{map[string]any{"query_id": "q1", "selection_handle": "abcdefghijklmnopqrstuv", "credential_id": "c"}}}}))
+	assert.Equal(t, wmp.ErrInvalidParams, r.code())
+	ev := st.nextMethod(t, wmp.MethodFlowError)
+	assert.EqualValues(t, wmp.ErrInvalidParams, params(ev)["code"])
+	assert.Nil(t, params(ev)["data"])
+	assert.Equal(t, "access_denied", form.Get("error"))
+	assert.Equal(t, "st-1", form.Get("state"))
+	assert.False(t, form.Has("error_description"))
 }
 
 // A transaction_data refusal ends the flow with -31005
@@ -1620,4 +1713,59 @@ func TestWMPBridge_ActionCancelClearsRecoveryState(t *testing.T) {
 		assert.NotContains(t, ev.Raw, "awaiting_offer_acceptance", "no prompt for a flow that is gone")
 	case <-time.After(500 * time.Millisecond):
 	}
+}
+
+// refuseSignRequests refuses a pending sign request, but not one whose reply is
+// already buffered: that result is about to be submitted, so the caller must end
+// the flow another way.
+func TestRefuseSignRequests(t *testing.T) {
+	newSession := func() *Session {
+		return &Session{flows: map[string]*Flow{}, closeCh: make(chan struct{}), logger: zap.NewNop()}
+	}
+	t.Run("pending request is refused", func(t *testing.T) {
+		s := newSession()
+		reply, done := s.trackSign("m1", "f1")
+		defer done()
+		assert.True(t, s.refuseSignRequests("f1"))
+		assert.Equal(t, ErrCodeSignRefused, (<-reply).ErrorCode)
+	})
+	t.Run("a buffered result is not overridden", func(t *testing.T) {
+		s := newSession()
+		reply, done := s.trackSign("m1", "f1")
+		defer done()
+		s.dispatchSignResponse(&SignResponseMessage{Message: Message{FlowID: "f1", MessageID: "m1"}, VPToken: "vp"})
+		assert.False(t, s.refuseSignRequests("f1"), "the refusal did not take: the caller ends the flow")
+		assert.Equal(t, "vp", (<-reply).VPToken, "the wallet's result is untouched")
+	})
+	t.Run("a result the waiter has already taken is not overridden", func(t *testing.T) {
+		// RequestSign took the reply and is submitting; its cleanup (done) has not
+		// removed the request yet, so the channel is empty but the request is
+		// still registered.
+		s := newSession()
+		reply, done := s.trackSign("m1", "f1")
+		defer done()
+		s.dispatchSignResponse(&SignResponseMessage{Message: Message{FlowID: "f1", MessageID: "m1"}, VPToken: "vp"})
+		require.Equal(t, "vp", (<-reply).VPToken)
+		assert.False(t, s.refuseSignRequests("f1"), "the wallet answered first: the caller ends the flow")
+		assert.Empty(t, reply, "no refusal is queued for a waiter that has gone")
+	})
+	t.Run("a second refusal leaves the first to finish", func(t *testing.T) {
+		s := newSession()
+		reply, done := s.trackSign("m1", "f1")
+		defer done()
+		assert.True(t, s.refuseSignRequests("f1"))
+		assert.True(t, s.refuseSignRequests("f1"), "a repeated malformed action must not cancel the flow before the verifier is told")
+		assert.Equal(t, ErrCodeSignRefused, (<-reply).ErrorCode)
+		assert.Empty(t, reply, "one refusal is delivered")
+	})
+	t.Run("no pending request", func(t *testing.T) {
+		assert.False(t, newSession().refuseSignRequests("f1"))
+	})
+	t.Run("another flow's request is left alone", func(t *testing.T) {
+		s := newSession()
+		reply, done := s.trackSign("m1", "other")
+		defer done()
+		assert.False(t, s.refuseSignRequests("f1"))
+		assert.Empty(t, reply)
+	})
 }
