@@ -25,7 +25,7 @@ func policyFor(mode config.DCQLConsentCheckMode) (consentPolicy, *observer.Obser
 
 // The consent component decides for every transport: what it accepts, refuses
 // and hands to the sign request does not depend on the wire that carried the
-// answer. (consent_ws.go and wmp_consent_test.go only translate.)
+// answer. (consent_ws.go, and any other transport's translation, only translate.)
 func TestConsentPolicy_Decide(t *testing.T) {
 	query := json.RawMessage(consentTestQuery)
 

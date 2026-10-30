@@ -9,7 +9,8 @@ package engine
 // consentDecision or the *consentRefusal that comes back. Everything that
 // decides, in particular the vetting against the verifier's DCQL query and
 // what the sign request may carry afterwards, is here and only here. See
-// consent_ws.go and wmp_consent.go for the two wires.
+// consent_ws.go for the WebSocket wire; another transport translates its own
+// wire to a consentAnswer the same way.
 
 import (
 	"encoding/json"
