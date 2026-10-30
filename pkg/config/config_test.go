@@ -26,6 +26,42 @@ func validBaseConfig() *Config {
 	}
 }
 
+func TestLoad_DisableOpportunisticRequestEncryption(t *testing.T) {
+	const env = "WALLET_FEATURES_DISABLE_OPPORTUNISTIC_REQUEST_ENCRYPTION"
+	t.Setenv("WALLET_JWT_SECRET", "test-secret-that-is-at-least-32-bytes-long")
+	for _, tc := range []struct {
+		name string
+		yaml string
+		env  string
+		want bool
+	}{
+		{name: "enabled by default"},
+		{name: "disabled by YAML", yaml: "features:\n  disable_opportunistic_request_encryption: true\n", want: true},
+		{name: "disabled by environment", env: "true", want: true},
+		{name: "environment overrides YAML", yaml: "features:\n  disable_opportunistic_request_encryption: true\n", env: "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(env, tc.env)
+			if tc.env == "" {
+				if err := os.Unsetenv(env); err != nil {
+					t.Fatal(err)
+				}
+			}
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(tc.yaml), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.Features.DisableOpportunisticRequestEncryption; got != tc.want {
+				t.Errorf("DisableOpportunisticRequestEncryption = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestConfig_Validate(t *testing.T) {
 	cfg := &Config{
 		Server: ServerConfig{
