@@ -485,7 +485,6 @@ func TestRegisterNotificationContext_StoresWhenEndpointAndIDPresent(t *testing.T
 	h, session := newRegisterTestHandler("flow-reg")
 
 	h.registerNotificationContext(
-		context.Background(),
 		&IssuerMetadata{NotificationEndpoint: "https://issuer.example.com/notify"},
 		&TokenResponse{AccessToken: "tok", TokenType: "Bearer"},
 		&CredentialResponse{NotificationID: "notif-reg"},
@@ -524,7 +523,7 @@ func TestRegisterNotificationContext_NoOpCases(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			h, session := newRegisterTestHandler("flow-noop")
-			h.registerNotificationContext(context.Background(), tc.meta, tc.token, tc.resp)
+			h.registerNotificationContext(tc.meta, tc.token, tc.resp)
 			assert.Nil(t, session.notifications.take("flow-noop"),
 				"no context should be registered for a no-op case")
 		})
@@ -636,11 +635,11 @@ func TestRegisterNotificationContext_EncryptedRegistersOncePerIssuance(t *testin
 	meta := &IssuerMetadata{NotificationEndpoint: "https://issuer.example.com/notify"}
 	tok := &TokenResponse{AccessToken: "tok", TokenType: "Bearer"}
 
-	h.registerNotificationContext(context.Background(), meta, tok, &CredentialResponse{Encrypted: true})
+	h.registerNotificationContext(meta, tok, &CredentialResponse{Encrypted: true})
 	require.NotNil(t, session.notifications.take("flow-enc"), "registered before the client answers")
 
 	// Deferred polling and completion register again.
-	h.registerNotificationContext(context.Background(), meta, tok, &CredentialResponse{Encrypted: true})
-	h.registerNotificationContext(context.Background(), meta, tok, &CredentialResponse{Encrypted: true})
+	h.registerNotificationContext(meta, tok, &CredentialResponse{Encrypted: true})
+	h.registerNotificationContext(meta, tok, &CredentialResponse{Encrypted: true})
 	assert.Nil(t, session.notifications.take("flow-enc"), "a consumed context is not recreated")
 }
