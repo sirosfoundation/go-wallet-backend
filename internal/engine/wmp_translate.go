@@ -51,6 +51,16 @@ func translateVCIProgress(f *wmpFlow, step FlowStep, payload json.RawMessage) (w
 	case StepEvaluatingTrust:
 		return wmpStep{Step: openid4x.StepEvaluatingTrust, Payload: evaluatingTrustPayload(payload)}, true
 	case StepTrustEvaluated:
+		// The issuer-entitlement findings are a trust_evaluated progress of
+		// their own (typed payload, no trust_info, not a trust decision). A
+		// findings payload go-wmp refuses is dropped, never relayed unvalidated
+		// and never as the issuer's trust result.
+		if p, isFindings := entitlementProgress(payload); isFindings {
+			if p == nil {
+				return wmpStep{}, false
+			}
+			return wmpStep{Step: openid4x.StepTrustEvaluated, Payload: p}, true
+		}
 		return wmpStep{Step: openid4x.StepTrustEvaluated, Payload: trustEvaluatedPayload(payload)}, true
 	case StepAwaitingSelection:
 		return wmpStep{Step: openid4x.StepAwaitingOfferAcceptance, Payload: f.offerAcceptancePayload(payload)}, true
@@ -113,11 +123,9 @@ var trustEvaluatedMembers = []string{"trusted", "framework", "reason", "certific
 // 3.2.2) next to the engine's own members, which stay (Section 7.4 reads
 // verifier_trust_evaluated and context from them).
 //
-// SEAM(issuer entitlement): the findings progress of the issuer-entitlement
-// check (go-wallet-backend#522, issuer_entitlement_evaluated: true) is not a
-// trust decision and must not carry trust_info. #522 is not on main, so no
-// engine sends it yet; the entitlement mapping PR (pure functions over go-wmp's
-// types) adds the translation here when both are on main.
+// The issuer-entitlement findings progress (issuer_entitlement_evaluated: true)
+// is not a trust decision and never reaches this function: translateVCIProgress
+// maps it with entitlementProgress, without trust_info.
 func trustEvaluatedPayload(payload json.RawMessage) interface{} {
 	m := payloadObject(payload)
 	info := map[string]interface{}{}

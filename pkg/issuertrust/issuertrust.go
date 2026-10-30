@@ -8,18 +8,24 @@
 // puts both in its OpenID4VCI Issuer Metadata — the WRPAC as the signing
 // certificate, the WRPRC in issuer_info.
 //
-// This package is the third of the three steps go-trust's model splits apart:
-// verify the signature, extract the trust information, evaluate it. The first
-// two happen before this package is called — the metadata resolver verifies the
-// JWS, and go-trust's rpcert parses the WRPRC — so nothing here does I/O or
-// signature checking, and nothing here can be fooled into believing it did.
+// This package covers the three steps go-trust's model splits apart: verify the
+// signature, extract the trust information, evaluate it. The metadata JWS is
+// verified by the resolver before this package is called. The registration
+// certificate is a different signed object, issued by a Registrar rather than
+// by the provider: AuthenticateRegistrationCert verifies its signature and
+// defers the question "is that a trusted Registrar" to the caller's trust path
+// (the go-trust PDP). Evaluate reads the certificate's claims only when that
+// came back AuthVerified, so a provider cannot vouch for its own registration.
 package issuertrust
 
 import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/sirosfoundation/go-trust/pkg/registry/rpcert"
 )
@@ -69,13 +75,36 @@ const (
 	CodeBindingMismatch       Code = "registration_certificate_not_bound"
 	CodeNotProvider           Code = "not_an_attestation_provider"
 	CodeTypeNotRegistered     Code = "attestation_type_not_registered"
+	// CodeRegistrationUnverified means the registration certificate's signature
+	// could not be verified (or nobody checked). Its claims are then not used.
+	CodeRegistrationUnverified Code = "registration_certificate_unverified"
+	// CodeRegistrarNotTrusted means the signature is valid but the trust
+	// evaluation did not recognise the signer as a Registrar.
+	CodeRegistrarNotTrusted Code = "registrar_not_trusted"
+	// CodeAccessCertificateNotTrusted means nothing established that the
+	// certificate chain that signed the metadata (the WRPAC) is trusted.
+	CodeAccessCertificateNotTrusted Code = "access_certificate_not_trusted"
+)
+
+// Bounds on what a Decision carries. The values come from issuer-controlled
+// documents and the decision is reported to clients, so none of it is
+// unbounded and no finding message contains issuer text.
+const (
+	// MaxFindings caps Decision.Findings; the rest are counted, not listed.
+	MaxFindings = 16
+	// MaxCredentialTypeLen caps Finding.CredentialType, in bytes.
+	MaxCredentialTypeLen = 128
+	// MaxEntitlements and MaxEntitlementLen cap the display-only Entitlements.
+	MaxEntitlements   = 16
+	MaxEntitlementLen = 256
 )
 
 // Finding is one thing that did not check out.
 type Finding struct {
 	Code    Code   `json:"code"`
 	Message string `json:"message"`
-	// CredentialType names the offered type when the finding is about one.
+	// CredentialType names the offered type when the finding is about one. It
+	// is issuer-controlled: sanitised and at most MaxCredentialTypeLen bytes.
 	CredentialType string `json:"credential_type,omitempty"`
 }
 
@@ -92,6 +121,9 @@ type Decision struct {
 	// Allowed: "not checked" must never read as "checked and fine".
 	Evaluated bool      `json:"evaluated"`
 	Findings  []Finding `json:"findings,omitempty"`
+	// FindingsTruncated is true when more than MaxFindings findings arose.
+	// Allowed already reflects all of them.
+	FindingsTruncated bool `json:"findings_truncated,omitempty"`
 	// Entitlements is what the registration certificate claimed, for display.
 	Entitlements []string `json:"entitlements,omitempty"`
 	// Subject is the provider identifier from the registration certificate.
@@ -108,7 +140,9 @@ type Offer struct {
 	Type string
 }
 
-// Input is everything needed to evaluate, all of it already verified.
+// Input is everything needed to evaluate. The metadata signature must already
+// have been verified by the resolver; the registration certificate's own
+// signature is reported through RegistrationAuth.
 type Input struct {
 	// Chain is the certificate chain that signed the Issuer Metadata, leaf
 	// first. Its signature has already been checked by the resolver.
@@ -117,6 +151,17 @@ type Input struct {
 	RegistrationCert string
 	// Offers are the credentials the wallet is about to request.
 	Offers []Offer
+	// ChainAnchored says the trust path accepted Chain as a trusted issuer
+	// chain. The profile check below is about its shape, not who vouches for
+	// it, and a WRPRC is public: without this, anyone could mint a certificate
+	// carrying a victim's organisation identifier and present the victim's
+	// registration certificate beside it. The zero value is false.
+	ChainAnchored bool
+	// RegistrationAuth is the outcome of authenticating RegistrationCert's
+	// signer (see AuthenticateRegistrationCert). The zero value is
+	// AuthUnchecked, so a caller that forgets this step gets findings and no
+	// claims from an unauthenticated document, never a pass.
+	RegistrationAuth AuthResult
 }
 
 // Evaluate applies the wallet-side checks of ARF §6.6.2.3.
@@ -133,13 +178,20 @@ func Evaluate(in Input, mode Mode) *Decision {
 		})
 	}
 
+	if !in.ChainAnchored {
+		d.add(mode, Finding{
+			Code:    CodeAccessCertificateNotTrusted,
+			Message: "the certificate that signed the issuer metadata is not known to be trusted",
+		})
+	}
+
 	// The chain must actually be a WRPAC. Accepting any chain the trust
 	// registry happens to know would let a document-signing certificate stand
 	// in for an access certificate.
 	if err := rpcert.NewWRPACProfile().ValidateCredential(in.Chain[0]); err != nil {
 		d.add(mode, Finding{
 			Code:    CodeNotWRPAC,
-			Message: fmt.Sprintf("access certificate does not meet the WRPAC profile: %v", err),
+			Message: "access certificate does not meet the WRPAC profile",
 		})
 	}
 
@@ -152,24 +204,42 @@ func Evaluate(in Input, mode Mode) *Decision {
 		})
 	}
 
+	// Nothing below may read the document's claims until its signer has been
+	// authenticated: the metadata signature vouches for the metadata, not for
+	// the registration certificate inside it, so a provider with a valid WRPAC
+	// could otherwise write its own provides_attestations.
+	switch in.RegistrationAuth {
+	case AuthVerified:
+	case AuthUntrustedRegistrar:
+		return d.add(mode, Finding{
+			Code:    CodeRegistrarNotTrusted,
+			Message: "registration certificate was not issued by a trusted registrar",
+		})
+	default:
+		return d.add(mode, Finding{
+			Code:    CodeRegistrationUnverified,
+			Message: "registration certificate signature could not be verified",
+		})
+	}
+
 	payload, err := rpcert.ParseWRPRCJWTPayload(in.RegistrationCert)
 	if err != nil {
 		return d.add(mode, Finding{
 			Code:    CodeRegistrationMalformed,
-			Message: fmt.Sprintf("registration certificate is not a readable rc-wrp+jwt: %v", err),
+			Message: "registration certificate is not a readable rc-wrp+jwt",
 		})
 	}
 	ent, err := rpcert.ParseWRPRCClaims(payload)
 	if err != nil {
 		return d.add(mode, Finding{
 			Code:    CodeRegistrationMalformed,
-			Message: fmt.Sprintf("registration certificate claims could not be parsed: %v", err),
+			Message: "registration certificate claims could not be parsed",
 		})
 	}
 
 	d.Evaluated = true
-	d.Entitlements = ent.EntitlementURIs
-	d.Subject = ent.RPIdentifier
+	d.Entitlements = boundedList(ent.EntitlementURIs, MaxEntitlements, MaxEntitlementLen)
+	d.Subject = sanitizeText(ent.RPIdentifier, MaxEntitlementLen)
 
 	// Two different validity questions, and conflating them is how one of them
 	// stops being asked. CheckWRPRCValidityPeriod is a conformance check on the
@@ -178,7 +248,7 @@ func Evaluate(in Input, mode Mode) *Decision {
 	if err := rpcert.CheckWRPRCValidityPeriod(ent); err != nil {
 		d.add(mode, Finding{
 			Code:    CodeRegistrationOverlong,
-			Message: fmt.Sprintf("registration certificate is not conformant: %v", err),
+			Message: "registration certificate validity period is not conformant",
 		})
 	}
 	// Whether it is current has to be asked separately. RPEntitlements.IsValid
@@ -209,7 +279,7 @@ func Evaluate(in Input, mode Mode) *Decision {
 	if err := checkBinding(in.Chain[0], ent); err != nil {
 		d.add(mode, Finding{
 			Code:    CodeBindingMismatch,
-			Message: err.Error(),
+			Message: "registration certificate does not describe the provider that signed the metadata",
 		})
 	}
 
@@ -221,11 +291,13 @@ func Evaluate(in Input, mode Mode) *Decision {
 	}
 
 	for _, o := range in.Offers {
-		if !ent.ProvidesAttestation(o.Format, o.Type) {
+		// A known format with no type cannot be matched to a registration: an
+		// empty type would match any registered query of that format.
+		if o.Type == "" && requiresType(o.Format) || !ent.ProvidesAttestation(o.Format, o.Type) {
 			d.add(mode, Finding{
 				Code:           CodeTypeNotRegistered,
-				Message:        fmt.Sprintf("provider is not registered to issue %s of type %q", o.Format, o.Type),
-				CredentialType: o.Type,
+				Message:        "provider is not registered to issue this credential",
+				CredentialType: sanitizeText(o.Type, MaxCredentialTypeLen),
 			})
 		}
 	}
@@ -259,9 +331,59 @@ func checkBinding(leaf *x509.Certificate, ent *rpcert.RPEntitlements) error {
 
 // add records a finding and, in fail mode, withholds permission.
 func (d *Decision) add(mode Mode, f Finding) *Decision {
-	d.Findings = append(d.Findings, f)
 	if mode == ModeFail {
 		d.Allowed = false
 	}
+	if len(d.Findings) >= MaxFindings {
+		d.FindingsTruncated = true
+		return d
+	}
+	d.Findings = append(d.Findings, f)
 	return d
+}
+
+// Summary is the decision as it is sent in flow progress: the verdict and the
+// bounded findings, without the registration certificate's own content
+// (Entitlements, Subject), which is issuer-controlled and display-only.
+func (d *Decision) Summary() *Decision {
+	c := *d
+	c.Entitlements = nil
+	c.Subject = ""
+	return &c
+}
+
+// sanitizeText drops control and non-printable characters and cuts s to at
+// most max bytes on a rune boundary.
+func sanitizeText(s string, max int) string {
+	var b strings.Builder
+	for _, r := range s {
+		if r == utf8.RuneError || !unicode.IsPrint(r) {
+			continue
+		}
+		if b.Len()+utf8.RuneLen(r) > max {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func boundedList(in []string, maxN, maxLen int) []string {
+	if len(in) > maxN {
+		in = in[:maxN]
+	}
+	out := make([]string, 0, len(in))
+	for _, v := range in {
+		out = append(out, sanitizeText(v, maxLen))
+	}
+	return out
+}
+
+// requiresType reports formats whose configuration must name what it issues.
+func requiresType(format string) bool {
+	switch format {
+	case "mso_mdoc", "dc+sd-jwt", "vc+sd-jwt":
+		return true
+	}
+	return false
 }

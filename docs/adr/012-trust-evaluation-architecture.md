@@ -449,6 +449,88 @@ The trust evaluation system follows fail-closed principles:
 2. **SPOCP authorizer fails in production**: Server refuses to start
 3. **NoOpAuthorizer**: Cannot be used in production (GIN_MODE=release)
 
+### Issuer Entitlement (ARF §6.6.2.3)
+
+Whether an issuer is *trusted* and whether it is *registered to issue what it is
+offering* are separate questions. The first is the PDP's decision above. The
+second needs the issuer's registration certificate (WRPRC), which travels in the
+issuer metadata, so it is evaluated by the engine in `OID4VCIHandler`
+(`checkIssuerEntitlement`) right after the trust decision, using `pkg/issuertrust`.
+
+It is fail-closed in the same way: with `trust.issuer_entitlement_mode`
+(`WALLET_TRUST_ISSUER_ENTITLEMENT_MODE`; the former `authzen_proxy.issuer_entitlement_mode`
+still works, with a startup warning, and loses to the new key; an unrecognised
+value refuses to start)
+set to `fail`, a provider that cannot show it is registered (including metadata
+not signed by a certificate chain) blocks the flow. `warn` (the default) logs
+and reports the findings to the client and continues; `off` skips the check.
+The check runs whether trust was evaluated server-side or by the frontend, and
+the frontend takes no part in it.
+
+**The registration certificate is authenticated, not just parsed.** The metadata
+signature authenticates the metadata signer, who is the provider, so it cannot
+vouch for the provider's own registration. The engine (and `/v1/resolve`)
+therefore verifies the WRPRC's JWS against the x5c leaf in its own header
+(`typ` must be `rc-wrp+jwt`) and asks the PDP whether that chain is a trusted
+Registrar: AuthZEN `action.name` `wrprc-registrar`, `resource.type` `x5c`,
+subject the issuer identifier (`trust.Service.EvaluateRegistrar`). Trust stays
+in go-trust; the backend holds no registrar trust store. The go-trust
+deployment **must define a policy named `wrprc-registrar`** (an unknown action
+falls to the DEFAULT policy). Anything short of a verified signature plus a
+positive PDP answer — bad signature, PDP denial, PDP error, no PDP configured —
+yields a finding (`registration_certificate_unverified` or
+`registrar_not_trusted`) and the certificate's claims are not used, so in `fail`
+mode the flow is refused.
+
+**The WRPAC chain is anchored too.** A WRPRC is public, so a certificate that
+merely carries the right organisation identifier proves nothing. The chain that
+signed the metadata must be accepted by the trust path: either it is the chain
+the issuer trust decision was made on, or (the engine prefers `mdoc_iacas_uri`
+for that decision, so for mdoc issuers it is not) the engine asks the issuer PDP
+about it as a `credential-issuer`. Otherwise the finding is
+`access_certificate_not_trusted`. `/v1/resolve` uses its own PDP decision on the
+signer key material.
+
+**What is checked is what is issued.** The check covers the offer's
+`credential_configuration_ids`; `awaitCredentialSelection` accepts only those
+(every transport, including the WMP bridge, drives it through the flow's action
+channel), and `authorization_details` in `flow_start` may only name them.
+
+**One evaluation, two routes.** The engine and `/v1/resolve` both call
+`issuertrust.Assess`, so they cannot disagree: unsigned metadata is a finding
+(a refusal in `fail`) on both, and the mode is one resolved value
+(`Config.EffectiveIssuerEntitlementMode`).
+
+**What the client is told.** An entitlement refusal in `fail` mode is a flow
+error at step `evaluating_trust` with code `ISSUER_NOT_ENTITLED`
+(`UNTRUSTED_ISSUER` stays for trust-decision refusals), the fixed message
+"Issuer is not registered to issue this credential", and `details`:
+`{"issuer": "<issuer id>", "issuer_entitlement": <decision>}` with the decision
+below. In `warn` the same decision is sent as progress and the flow continues.
+Findings are sent as a `trust_evaluated` progress whose payload is additive to
+the issuer trust report and deliberately lacks `issuer_trust_evaluated` (the
+key SDKs use to recognise a trust report):
+
+```json
+{"issuer_entitlement_evaluated": true, "issuer": "<issuer id>",
+ "issuer_entitlement": {"allowed": true, "mode": "warn", "evaluated": false,
+   "findings": [{"code": "registrar_not_trusted", "message": "<fixed text per code>",
+                 "credential_type": "<optional, <=128 bytes, sanitised>"}],
+   "findings_truncated": false}}
+```
+
+At most 16 findings, so the payload stays under about 5 KB; messages are fixed
+per code and contain no issuer text; the registration certificate's own content
+(entitlements, subject) is omitted from the engine's messages (it is still in
+the `/v1/resolve` decision, where it is display-only and length-bounded). Codes
+are open-ended strings.
+
+`/v1/resolve` (the frontend's route to the same policy): mode `off` returns no
+`issuer_entitlement` member (absent means not checked); `warn` and `fail`
+always return it on success (HTTP 200, `allowed` true, findings listed); a
+`fail` refusal is HTTP 403 with
+`{"error": "...", "code": "ISSUER_NOT_ENTITLED", "issuer_entitlement": {"allowed": false, ...}}`.
+
 ### Concurrent Flow Limit
 
 Each WebSocket session is limited to `MaxPendingFlowsPerSession` (default: 3) concurrent

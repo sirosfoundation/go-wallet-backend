@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -67,6 +68,7 @@ type OID4VCIHandler struct {
 	clientJWK            *ecdsa.PrivateKey // client private key for private_key_jwt authentication (optional)
 	clientKID            string            // key ID from client JWK (for JWT kid header)
 	authServerIssuer     string            // AS issuer URL (for private_key_jwt aud claim)
+	trustEvaluatedX5C    []string          // x5c chain the issuer trust decision was made on (see evaluateTrust), if it was one
 
 	// Client attestation provider for OAuth-Client-Attestation-based auth
 	// (draft-ietf-oauth-attestation-based-client-auth-04).
@@ -996,6 +998,16 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	h.SetData("offer", offer)
 	h.SetData("credential_issuer", offer.CredentialIssuer)
 
+	// authorization_details name what the wallet asks the AS to grant. They may
+	// only name configurations the offer names: those are the ones the issuer
+	// entitlement check covers, so anything else would reach the AS unchecked.
+	for _, detail := range msg.AuthorizationDetails {
+		if detail.CredentialConfigurationID != "" && !slices.Contains(offer.CredentialConfigurationIDs, detail.CredentialConfigurationID) {
+			_ = h.Error(StepParsingOffer, ErrCodeInvalidMessage, "authorization_details name a credential configuration the offer does not")
+			return errors.New("authorization_details name a credential configuration outside the offer")
+		}
+	}
+
 	// Step 2: Fetch issuer metadata
 	metaResult, err := h.fetchMetadata(ctx, offer.CredentialIssuer)
 	if err != nil {
@@ -1085,6 +1097,14 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	if err != nil {
 		h.Logger.Debug("issuer trust evaluation failed", zap.Error(err))
 		_ = h.Error(StepEvaluatingTrust, ErrCodeUntrustedIssuer, ErrCodeUntrustedIssuer.UserFacingMessage())
+		return err
+	}
+
+	// Step 3b: Is this issuer registered to issue what it is offering? Trust
+	// above says who it is; this says what it may issue (ARF §6.6.2.3).
+	if d, err := h.checkIssuerEntitlement(ctx, offer.CredentialIssuer, metaResult, offer); err != nil {
+		h.Logger.Warn("Blocking issuer without entitlement", zap.Error(err))
+		h.failNotEntitled(offer.CredentialIssuer, d)
 		return err
 	}
 
@@ -1408,6 +1428,8 @@ func (h *OID4VCIHandler) fetchOfferFromURI(ctx context.Context, uri string) (*Cr
 type metadataResult struct {
 	Metadata         *IssuerMetadata
 	Validated        bool                     // true when the resolver verified a signed metadata JWT
+	Raw              map[string]interface{}   // the resolved metadata as published, including members IssuerMetadata does not model (issuer_info)
+	SignerX5C        []string                 // x5c chain that signed the metadata, leaf first; empty when it was not signed by a chain
 	RegisteredIssuer *domain.CredentialIssuer // non-nil when the issuer is registered in this tenant
 }
 
@@ -1427,6 +1449,15 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*met
 	var metadata IssuerMetadata
 	if err := json.Unmarshal(b, &metadata); err != nil {
 		return nil, fmt.Errorf("failed to parse metadata: %w", err)
+	}
+	// encoding/json matches member names case-insensitively, so an unsigned
+	// document with "Signed_Metadata" fills this field although the resolver
+	// never saw, verified or bound it to the issuer. Only a signed_metadata the
+	// resolver verified (exact name, document marked signed) may be used: the
+	// trust decision and the signer chain are both taken from it, and a replayed
+	// authentic JWT would otherwise stand in for them.
+	if exact, _ := result.Metadata["signed_metadata"].(string); !result.Signed || exact != metadata.SignedMetadata {
+		metadata.SignedMetadata = ""
 	}
 	h.logIgnoredCredentialConfigurations(result.Metadata, metadata.CredentialConfigurationsSupported)
 
@@ -1465,7 +1496,13 @@ func (h *OID4VCIHandler) fetchMetadata(ctx context.Context, issuer string) (*met
 		"validated":           result.Validated,
 	})
 
-	return &metadataResult{Metadata: &metadata, Validated: result.Validated, RegisteredIssuer: registeredIssuer}, nil
+	return &metadataResult{
+		Metadata:         &metadata,
+		Validated:        result.Validated,
+		Raw:              result.Metadata,
+		SignerX5C:        h.signerX5C(result, &metadata),
+		RegisteredIssuer: registeredIssuer,
+	}, nil
 }
 
 // logIgnoredCredentialConfigurations reports configurations that were present
@@ -1508,11 +1545,36 @@ func (h *OID4VCIHandler) logIgnoredCredentialConfigurations(source map[string]in
 	}
 }
 
+// signerX5C returns the certificate chain that signed the issuer metadata, or
+// nil when it was not signed by one. The resolver has already verified the
+// signature; this only recovers the chain that made it.
+func (h *OID4VCIHandler) signerX5C(result *issuermetadata.ResolveResult, metadata *IssuerMetadata) []string {
+	if km := result.SignerKeyMaterial; km != nil && km.Type == "x5c" {
+		return km.X5C
+	}
+	if metadata.SignedMetadata == "" {
+		return nil
+	}
+	km, err := trust.VerifyJWTWithEmbeddedKey(metadata.SignedMetadata)
+	if err != nil || km == nil || km.Type != "x5c" {
+		return nil
+	}
+	return km.X5C
+}
+
 func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metadata *IssuerMetadata, metadataValidated bool) (*TrustInfo, error) {
 	_ = h.ProgressMessage(StepEvaluatingTrust, "Evaluating issuer trust")
 
 	// Extract key material from issuer metadata for trust evaluation
 	keyMaterial := h.extractIssuerKeyMaterial(ctx, metadata)
+	// Remember which chain the decision below is about. The issuer entitlement
+	// check needs to know whether the chain that signed the metadata is that
+	// one (extractIssuerKeyMaterial prefers mdoc_iacas_uri to it), and only
+	// consults this after the decision came back trusted.
+	h.trustEvaluatedX5C = nil
+	if keyMaterial != nil && keyMaterial.Type == "x5c" {
+		h.trustEvaluatedX5C = keyMaterial.X5C
+	}
 
 	// Collect credential types from the offered configurations for trust policy
 	if keyMaterial != nil && keyMaterial.CredentialType == "" {
@@ -1857,7 +1919,15 @@ func (h *OID4VCIHandler) awaitCredentialSelection(ctx context.Context, offer *Cr
 		return "", nil, err
 	}
 
+	// Only what the offer named, which is what the issuer entitlement check
+	// covered. metadata.CredentialConfigurationsSupported lists everything the
+	// issuer supports, and a configuration outside the offer was never checked
+	// for registration; this is the one place a selection is accepted, for
+	// every transport.
 	config, ok := metadata.CredentialConfigurationsSupported[selection.CredentialConfigurationID]
+	if ok && !slices.Contains(offer.CredentialConfigurationIDs, selection.CredentialConfigurationID) {
+		ok = false
+	}
 	if !ok {
 		_ = h.Error(StepAwaitingSelection, ErrCodeInvalidMessage, "Invalid credential configuration")
 		return "", nil, errors.New("invalid credential configuration")

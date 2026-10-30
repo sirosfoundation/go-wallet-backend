@@ -63,6 +63,10 @@ func TestWrpacToolOutputSatisfiesIssuerTrust(t *testing.T) {
 	d := issuertrust.Evaluate(issuertrust.Input{
 		Chain:            chain,
 		RegistrationCert: registrationCert,
+		// The signature check and the trust path are other layers' jobs; this
+		// test asks only whether wrpac-tool's documents satisfy the evaluation.
+		ChainAnchored:    true,
+		RegistrationAuth: issuertrust.AuthVerified,
 		Offers: []issuertrust.Offer{
 			{Format: "dc+sd-jwt", Type: "urn:eudi:pid:1"},
 			{Format: "mso_mdoc", Type: "eu.europa.ec.eudi.pid.1"},
@@ -84,6 +88,8 @@ func TestWrpacToolOutputSatisfiesIssuerTrust(t *testing.T) {
 	d2 := issuertrust.Evaluate(issuertrust.Input{
 		Chain:            chain,
 		RegistrationCert: registrationCert,
+		ChainAnchored:    true,
+		RegistrationAuth: issuertrust.AuthVerified,
 		Offers:           []issuertrust.Offer{{Format: "dc+sd-jwt", Type: "urn:example:unregistered"}},
 	}, issuertrust.ModeFail)
 	if d2.Allowed {

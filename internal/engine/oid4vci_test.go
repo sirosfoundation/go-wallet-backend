@@ -3333,7 +3333,10 @@ func TestFetchMetadata_Success(t *testing.T) {
 	assert.Equal(t, "https://issuer.example.com", meta.Metadata.CredentialIssuer)
 	assert.Equal(t, "https://issuer.example.com/credential", meta.Metadata.CredentialEndpoint)
 	assert.Equal(t, "https://issuer.example.com/token", meta.Metadata.TokenEndpoint)
-	assert.Equal(t, "eyJ...", meta.Metadata.SignedMetadata)
+	// The resolver did not mark this document signed, so a signed_metadata
+	// member is data nobody verified and is not carried forward (see
+	// TestFetchMetadata_IgnoresSignedMetadataTheResolverDidNotVerify).
+	assert.Empty(t, meta.Metadata.SignedMetadata)
 	assert.False(t, meta.Validated, "unsigned metadata should not be validated")
 }
 

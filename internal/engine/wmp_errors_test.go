@@ -43,16 +43,15 @@ func mustJSON(t *testing.T, v any) json.RawMessage {
 // The verifier's refusal keeps its reason next to the engine's details, and the
 // reason wins over a member of the same name.
 func TestWMPBridge_UntrustedRefusalData(t *testing.T) {
-	assert.Equal(t, openid4x.NewUntrustedIssuerData(), untrustedRefusalData(ErrCodeUntrustedIssuer, map[string]interface{}{"x": 1}))
+	assert.Nil(t, untrustedVerifierData(ErrCodeUntrustedIssuer, map[string]interface{}{"x": 1}), "the issuer's refusal is issuerErrorWire's alone")
 	assert.Equal(t, map[string]interface{}{"reason": "untrusted_verifier", "other": 1},
-		untrustedRefusalData(ErrCodeUntrustedVerifier, map[string]interface{}{"reason": "from-the-engine", "other": 1}))
-	assert.Nil(t, untrustedRefusalData(ErrCodeSignError, nil))
+		untrustedVerifierData(ErrCodeUntrustedVerifier, map[string]interface{}{"reason": "from-the-engine", "other": 1}))
+	assert.Nil(t, untrustedVerifierData(ErrCodeSignError, nil))
 }
 
 // An engine error code the bridge does not know is a flow error (-31006), never
-// an internal error. That includes ISSUER_NOT_ENTITLED (go-wallet-backend#522)
-// until the entitlement mapping is wired in (see the SEAM in errorWire): a code
-// the engine on main does not send yet.
+// an internal error. mapErrorCode is the generic default; ISSUER_NOT_ENTITLED
+// is -31020 only through errorWire (see TestWMPBridge_ErrorWire_Entitlement...).
 func TestWMPBridge_UnknownEngineErrorCodeIsAFlowError(t *testing.T) {
 	assert.Equal(t, wmp.ErrFlowError, mapErrorCode("SOME_FUTURE_CODE"))
 	assert.Equal(t, wmp.ErrFlowError, mapErrorCode("ISSUER_NOT_ENTITLED"))
