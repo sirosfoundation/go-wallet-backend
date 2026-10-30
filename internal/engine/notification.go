@@ -56,6 +56,9 @@ type notificationContext struct {
 	// is validated against this value before any notification is forwarded.
 	notificationID string
 	expiresAt      time.Time
+	// seq identifies this registration within its store (set by put), so a
+	// restore can tell it apart from a newer one for the same flow ID.
+	seq uint64
 }
 
 // notificationContextStore is an in-memory, TTL-bounded registry of
@@ -64,10 +67,20 @@ type notificationContext struct {
 type notificationContextStore struct {
 	mu  sync.Mutex
 	ctx map[string]*notificationContext
+	// latest records the newest registration per flow ID, whether or not it is
+	// still in ctx (it may be in flight), so restore never revives a
+	// superseded one. Entries are pruned once older than the context TTL.
+	latest map[string]latestRegistration
+	seq    uint64
+}
+
+type latestRegistration struct {
+	seq uint64
+	at  time.Time
 }
 
 func newNotificationContextStore() *notificationContextStore {
-	return &notificationContextStore{ctx: make(map[string]*notificationContext)}
+	return &notificationContextStore{ctx: make(map[string]*notificationContext), latest: make(map[string]latestRegistration)}
 }
 
 // put registers a notification context for the given flow ID with a bounded TTL.
@@ -79,10 +92,15 @@ func (s *notificationContextStore) put(flowID string, nc *notificationContext) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pruneLocked()
+	s.seq++
+	nc.seq = s.seq
+	s.latest[flowID] = latestRegistration{seq: nc.seq, at: time.Now()}
 	s.ctx[flowID] = nc
 }
 
 // take returns and removes the notification context for the given flow ID.
+// The caller spends it by contacting the issuer; if the request never left
+// (see notificationNotSentError) it hands the context back with restore.
 // It returns nil if the context is absent or expired (one-shot semantics).
 func (s *notificationContextStore) take(flowID string) *notificationContext {
 	s.mu.Lock()
@@ -114,12 +132,48 @@ func (s *notificationContextStore) hasValid(flowID, notificationID string) bool 
 	return nc.notificationID == "" || nc.notificationID == notificationID
 }
 
+// restore puts back a context that take removed but whose notification never
+// reached the issuer, keeping its original expiry so a retry cannot extend the
+// context's life. It does nothing when the context has expired or the flow has
+// registered a newer one in the meantime.
+func (s *notificationContextStore) restore(flowID string, nc *notificationContext) {
+	if flowID == "" || nc == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if time.Now().After(nc.expiresAt) {
+		return
+	}
+	if _, taken := s.ctx[flowID]; taken {
+		return
+	}
+	if l, ok := s.latest[flowID]; !ok || l.seq != nc.seq {
+		return // superseded by a newer registration, which owns the flow ID now
+	}
+	s.ctx[flowID] = nc
+}
+
+// notificationNotSentError marks a notification that failed before anything was
+// sent to the issuer (the DPoP proof could not be obtained). The single-use
+// context is spent only when the issuer was contacted, so this is the one
+// failure after which the caller puts the context back for a retry.
+type notificationNotSentError struct{ err error }
+
+func (e *notificationNotSentError) Error() string { return e.err.Error() }
+func (e *notificationNotSentError) Unwrap() error { return e.err }
+
 // pruneLocked removes expired entries. Caller must hold s.mu.
 func (s *notificationContextStore) pruneLocked() {
 	now := time.Now()
 	for id, nc := range s.ctx {
 		if now.After(nc.expiresAt) {
 			delete(s.ctx, id)
+		}
+	}
+	for id, l := range s.latest {
+		if now.Sub(l.at) > notificationContextTTL {
+			delete(s.latest, id)
 		}
 	}
 }
@@ -169,7 +223,13 @@ func sendNotification(ctx context.Context, httpClient *http.Client, nc *notifica
 		if nc.dpopSigner != nil && strings.EqualFold(nc.tokenType, "DPoP") {
 			proof, err := nc.dpopSigner.Proof(ctx, req.Method, nc.endpoint, nc.accessToken, dpopNonce)
 			if err != nil {
-				return fmt.Errorf("failed to create DPoP proof for notification: %w", err)
+				err = fmt.Errorf("failed to create DPoP proof for notification: %w", err)
+				if attempt == 0 {
+					// Nothing has reached the issuer yet. On the nonce retry
+					// it has, so the context stays spent.
+					return &notificationNotSentError{err: err}
+				}
+				return err
 			}
 			req.Header.Set("DPoP", proof)
 		}
