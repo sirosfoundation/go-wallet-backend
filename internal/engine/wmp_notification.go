@@ -57,6 +57,7 @@ func (p *wmpFlowProfile) runNotification() wmp.FlowFunc {
 		}
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
+		defer p.guard.starting.Delete(fc.FlowID)
 		// The flow ends with the engine session: endSession cancels only flows
 		// that have a Handler (this one has none), and an in-process peer is not
 		// closed with the session, so without this an unanswered sign request or

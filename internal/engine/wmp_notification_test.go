@@ -575,6 +575,34 @@ func TestWMPNotification_EndsWithTheEngineSession(t *testing.T) {
 	assert.Equal(t, 0, e.iss.count())
 }
 
+// The notification flow is registered in the session asynchronously, after
+// go-wmp has accepted the start. From the moment the start is accepted the guard
+// authorizes a cancel, complete or error about it as oid4vci (OpenID4x 3.4.2): a
+// token without the issuance permission cannot end it in the window.
+func TestWMPNotification_GuardGatesAStartingFlowAsIssuance(t *testing.T) {
+	protocol, gated := guardProtocolOfFlowType(openid4x.FlowTypeCredentialNotification)
+	assert.True(t, gated)
+	assert.Equal(t, ProtocolOID4VCI, protocol, "never more broadly than oid4vci")
+
+	e := newWMPEnv(t)
+	registerScripted(e.m, ProtocolOID4VCI, func(ctx context.Context, _ *Flow, _ *FlowStartMessage) error { <-ctx.Done(); return ctx.Err() })
+	sid := e.create(e.token("alice", "t1", "ir", "j1"), "oid4vci")
+	ws := e.a.session(sid)
+	require.NotNil(t, ws)
+	g := &wmpGuard{a: e.a, sessionID: sid}
+
+	cancel, _ := json.Marshal(map[string]any{"wmp": meta(sid), "flow_id": "n1"})
+	_, gated = g.protocolOf(wmp.MethodFlowCancel, cancel)
+	assert.False(t, gated, "a flow that is neither registered nor starting is not gated: its handler reports it unknown")
+
+	g.starting.Store("n1", protocol)
+	for _, method := range []string{wmp.MethodFlowCancel, wmp.MethodFlowComplete, wmp.MethodFlowError} {
+		got, gated := g.protocolOf(method, cancel)
+		assert.True(t, gated, method)
+		assert.Equal(t, ProtocolOID4VCI, got, method)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Capability, authorization, validation
 // ---------------------------------------------------------------------------

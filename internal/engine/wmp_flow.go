@@ -154,9 +154,13 @@ func (p *wmpFlowProfile) StartFlow(ctx context.Context, params *wmp.FlowStartPar
 	if params.Timeout > 0 {
 		p.timeouts.Store(params.FlowID, capSeconds(params.Timeout, defaultFlowTimeout))
 	}
+	if protocol, ok := guardProtocolOfFlowType(params.FlowType); ok {
+		p.guard.starting.Store(params.FlowID, protocol)
+	}
 	res, err := p.AsyncFlowProfile.StartFlow(ctx, params)
 	if err != nil {
 		p.timeouts.Delete(params.FlowID)
+		p.guard.starting.Delete(params.FlowID)
 	}
 	return res, err
 }
@@ -201,6 +205,7 @@ func (p *wmpFlowProfile) run(protocol Protocol) wmp.FlowFunc {
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
 
+		defer p.guard.starting.Delete(fc.FlowID)
 		f := &wmpFlow{fc: fc, session: wmp.SessionFromContext(ctx)}
 		ws.tr.add(fc.FlowID, f)
 		defer ws.tr.remove(fc.FlowID)
@@ -1009,6 +1014,11 @@ func mapErrorCode(code ErrorCode) int {
 type wmpGuard struct {
 	a         *WMPAdapter
 	sessionID string
+	// starting holds the protocol of a flow that go-wmp has accepted (StartFlow
+	// answered) and whose engine flow is not registered in the session yet: the
+	// engine flow is reserved asynchronously, and until it is the guard would not
+	// know the flow and would not gate a cancel, complete or error about it.
+	starting sync.Map // flow ID -> Protocol
 }
 
 // Authorize implements wmp.Authorizer. It refuses a request that does not come
@@ -1066,8 +1076,8 @@ func (g *wmpGuard) middleware(ctx context.Context, method string, params json.Ra
 }
 
 // protocolOf is the engine protocol a request acts on, and whether it is gated
-// at all. A request about a flow the session does not know is not gated: its
-// handler reports it unknown.
+// at all. A request about a flow the session does not know (and that is not being
+// started) is not gated: its handler reports it unknown.
 func (g *wmpGuard) protocolOf(method string, params json.RawMessage) (Protocol, bool) {
 	var p struct {
 		FlowType string `json:"flow_type"`
@@ -1078,12 +1088,7 @@ func (g *wmpGuard) protocolOf(method string, params json.RawMessage) (Protocol, 
 		return ProtocolOID4VCI, true
 	case wmp.MethodFlowStart:
 		_ = json.Unmarshal(params, &p)
-		if p.FlowType == openid4x.FlowTypeCredentialNotification {
-			// Authorized exactly as oid4vci (OpenID4x 3.4.2): never more broadly.
-			return ProtocolOID4VCI, true
-		}
-		protocol, ok := wmpFlowTypes[p.FlowType]
-		return protocol, ok
+		return guardProtocolOfFlowType(p.FlowType)
 	case wmp.MethodFlowAction, wmp.MethodFlowCancel, wmp.MethodFlowProgress, wmp.MethodFlowComplete, wmp.MethodFlowError:
 		_ = json.Unmarshal(params, &p)
 		ws := g.a.session(g.sessionID)
@@ -1093,6 +1098,17 @@ func (g *wmpGuard) protocolOf(method string, params json.RawMessage) (Protocol, 
 		return g.flowProtocol(ws, p.FlowID)
 	}
 	return "", false
+}
+
+// guardProtocolOfFlowType is the engine protocol a flow type is authorized as, and
+// whether the type is gated at all.
+func guardProtocolOfFlowType(flowType string) (Protocol, bool) {
+	if flowType == openid4x.FlowTypeCredentialNotification {
+		// Authorized exactly as oid4vci (OpenID4x 3.4.2): never more broadly.
+		return ProtocolOID4VCI, true
+	}
+	protocol, ok := wmpFlowTypes[flowType]
+	return protocol, ok
 }
 
 // flowProtocol is the protocol of flow id: a flow of the session, or, for the
@@ -1105,6 +1121,13 @@ func (g *wmpGuard) flowProtocol(ws *wmpSession, id string) (Protocol, bool) {
 	ws.session.flowsMu.RUnlock()
 	if f != nil {
 		return f.Protocol, true
+	}
+	if protocol, ok := g.starting.Load(id); ok {
+		// Accepted by go-wmp, not yet registered in the session: gated as the flow
+		// it will be, so a reduced token cannot end it in that window.
+		if pr, isProtocol := protocol.(Protocol); isProtocol {
+			return pr, true
+		}
 	}
 	return ws.tr.parentProtocol(ws.session, id)
 }
