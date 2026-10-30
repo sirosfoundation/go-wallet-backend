@@ -10,16 +10,10 @@ package engine
 
 import (
 	"encoding/json"
-	"fmt"
-	"unicode/utf8"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 	"github.com/sirosfoundation/go-wmp/pkg/wmp/openid4x"
 )
-
-// maxNotificationEndpointLen is the bound of notification_endpoint in a completion
-// (OpenID4x 3.1.4), in characters.
-const maxNotificationEndpointLen = 2048
 
 // wmpStep is one progress message as a WMP client receives it.
 type wmpStep struct {
@@ -57,8 +51,7 @@ func translateVCIProgress(f *wmpFlow, step FlowStep, payload json.RawMessage) (w
 	case StepEvaluatingTrust:
 		return wmpStep{Step: openid4x.StepEvaluatingTrust, Payload: evaluatingTrustPayload(payload)}, true
 	case StepTrustEvaluated:
-		out, ok := trustEvaluatedPayload(payload)
-		return wmpStep{Step: openid4x.StepTrustEvaluated, Payload: out}, ok
+		return wmpStep{Step: openid4x.StepTrustEvaluated, Payload: trustEvaluatedPayload(payload)}, true
 	case StepAwaitingSelection:
 		return wmpStep{Step: openid4x.StepAwaitingOfferAcceptance, Payload: f.offerAcceptancePayload(payload)}, true
 	case StepAuthorizationReq:
@@ -80,8 +73,7 @@ func translateVPProgress(step FlowStep, payload json.RawMessage) (wmpStep, bool)
 	case StepEvaluatingVerifierTrust:
 		return wmpStep{Step: openid4x.StepVPEvaluatingTrust, Payload: evaluatingTrustPayload(payload)}, true
 	case StepTrustEvaluated:
-		out, ok := trustEvaluatedPayload(payload)
-		return wmpStep{Step: openid4x.StepVPTrustEvaluated, Payload: out}, ok
+		return wmpStep{Step: openid4x.StepVPTrustEvaluated, Payload: trustEvaluatedPayload(payload)}, true
 	case StepCredentialSelection:
 		return wmpStep{Step: openid4x.StepAwaitingConsent, Payload: awaitingConsentPayload(payload)}, true
 	}
@@ -119,15 +111,14 @@ var trustEvaluatedMembers = []string{"trusted", "framework", "reason", "certific
 
 // trustEvaluatedPayload is the payload of trust_evaluated: trust_info (3.1.2,
 // 3.2.2) next to the engine's own members, which stay (Section 7.4 reads
-// verifier_trust_evaluated and context from them). ok is false for a findings
-// progress go-wmp refuses (see entitlementPayload): it is not relayed.
-func trustEvaluatedPayload(payload json.RawMessage) (out interface{}, ok bool) {
-	if ent, isFindings := entitlementRaw(payload); isFindings {
-		if ent == nil {
-			return nil, false
-		}
-		return ent, true // the findings of the issuer-entitlement check, not a trust decision
-	}
+// verifier_trust_evaluated and context from them).
+//
+// SEAM(issuer entitlement): the findings progress of the issuer-entitlement
+// check (go-wallet-backend#522, issuer_entitlement_evaluated: true) is not a
+// trust decision and must not carry trust_info. #522 is not on main, so no
+// engine sends it yet; the entitlement mapping PR (pure functions over go-wmp's
+// types) adds the translation here when both are on main.
+func trustEvaluatedPayload(payload json.RawMessage) interface{} {
 	m := payloadObject(payload)
 	info := map[string]interface{}{}
 	for _, k := range trustEvaluatedMembers {
@@ -136,7 +127,7 @@ func trustEvaluatedPayload(payload json.RawMessage) (out interface{}, ok bool) {
 		}
 	}
 	m["trust_info"] = info
-	return m, true
+	return m
 }
 
 // awaitingConsentPayload is the payload of awaiting_consent (3.2.2). The engine
@@ -494,55 +485,18 @@ func consentFromSelectCredentials(raw json.RawMessage) (*consentAnswer, error) {
 
 // completionResult is the result of wmp.flow.complete: the engine's completion
 // without the members of its WebSocket envelope (type, flow_id, message_id,
-// timestamp), which WMP carries in the notification itself. For an oid4vci
-// completion that the engine retained a notification context for, it carries
-// notification_endpoint (OpenID4x 3.1.4); credentials[].notification_id (plain
-// responses only: the engine's results have none for an encrypted one) stays
-// when it is within the profile's bound (256 characters), else it is left out,
-// as the wallet could not start a flow with it.
-func completionResult(m *FlowCompleteMessage, notificationEndpoint string) (json.RawMessage, error) {
+// timestamp), which WMP carries in the notification itself.
+func completionResult(m *FlowCompleteMessage) (json.RawMessage, error) {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return nil, err
 	}
-	obj := map[string]json.RawMessage{}
+	var obj map[string]json.RawMessage
 	if err := json.Unmarshal(b, &obj); err != nil {
-		return nil, fmt.Errorf("completion is not an object: %w", err)
+		return nil, err
 	}
 	for _, k := range []string{"type", "flow_id", "message_id", "timestamp"} {
 		delete(obj, k)
 	}
-	if raw, ok := obj["credentials"]; ok {
-		obj["credentials"] = boundedNotificationIDs(raw)
-	}
-	if notificationEndpoint != "" && utf8.RuneCountInString(notificationEndpoint) <= maxNotificationEndpointLen {
-		endpoint, _ := json.Marshal(notificationEndpoint)
-		obj["notification_endpoint"] = endpoint
-	}
 	return json.Marshal(obj)
-}
-
-// boundedNotificationIDs leaves out a credentials[].notification_id longer than
-// the profile allows.
-func boundedNotificationIDs(raw json.RawMessage) json.RawMessage {
-	var entries []map[string]json.RawMessage
-	if json.Unmarshal(raw, &entries) != nil {
-		return raw
-	}
-	changed := false
-	for _, e := range entries {
-		var id string
-		if v, ok := e["notification_id"]; ok && (json.Unmarshal(v, &id) != nil || utf8.RuneCountInString(id) > openid4x.MaxNotificationIDLen) {
-			delete(e, "notification_id")
-			changed = true
-		}
-	}
-	if !changed {
-		return raw
-	}
-	out, err := json.Marshal(entries)
-	if err != nil {
-		return raw
-	}
-	return out
 }
