@@ -290,7 +290,7 @@ func (f *blindFixture) sign(t *testing.T) (*vpSubmission, error) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	return f.h.requestVPSignature(ctx, f.authReq, []ConsentSelection{{CredentialID: "c1", CredentialQueryID: "q"}}, "")
+	return f.h.requestVPSignature(ctx, f.authReq, decisionOf(ConsentSelection{CredentialID: "c1", CredentialQueryID: "q"}), "")
 }
 
 func TestRequestVPSignature_DirectPostJWT_ClientEncrypts(t *testing.T) {

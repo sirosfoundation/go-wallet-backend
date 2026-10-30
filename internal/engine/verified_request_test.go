@@ -135,7 +135,7 @@ func TestVerifiedRequestInputs_IdenticalAtAllEmissionPoints(t *testing.T) {
 
 	ctx3, cancel3 := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel3()
-	_, _ = h.requestVPSignature(ctx3, authReq, []ConsentSelection{{CredentialID: "c", CredentialQueryID: "q"}}, "admin-configured-audience")
+	_, _ = h.requestVPSignature(ctx3, authReq, decisionOf(ConsentSelection{CredentialID: "c", CredentialQueryID: "q"}), "admin-configured-audience")
 	sign := awaitMessage(t, received, "sign_request")
 	signParams, _ := sign["params"].(map[string]any)
 
