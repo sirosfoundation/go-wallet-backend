@@ -426,18 +426,29 @@ func TestWMPBridge_CancelWhenNothingWaitsForTheSelectionEndsTheFlow(t *testing.T
 
 // With a sign request pending, an oid4vp cancel refuses it: the engine tells the
 // verifier access_denied (the same refusal as every other sign refusal) and the
-// flow ends; the presentation is not submitted. A second cancel does not tell the
-// verifier again.
+// flow ends with the verifier's redirect; the presentation is not submitted. A
+// repeated cancel while the verifier is being told, after the pending request's
+// entry is gone, leaves the refusal running: it is not cut short and the verifier
+// is told once.
 func TestWMPBridge_CancelWithASignRequestPendingTellsTheVerifier(t *testing.T) {
 	type form struct{ errCode, vp string }
 	told := make(chan form, 2)
+	hit := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	doRelease := func() { releaseOnce.Do(func() { close(release) }) }
+	delivered := make(chan bool, 1)
 	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
 		told <- form{errCode: r.PostForm.Get("error"), vp: r.PostForm.Get("vp_token")}
+		hit <- struct{}{}
+		<-release
+		delivered <- r.Context().Err() == nil
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{}`))
+		_, _ = w.Write([]byte(`{"redirect_uri":"https://verifier.example/done"}`))
 	}))
 	defer verifier.Close()
+	defer doRelease() // a failing test must not leave the handler blocked
 
 	e := newWMPEnv(t)
 	registerScripted(e.m, ProtocolOID4VP, func(ctx context.Context, f *Flow, _ *FlowStartMessage) error {
@@ -459,14 +470,28 @@ func TestWMPBridge_CancelWithASignRequestPendingTellsTheVerifier(t *testing.T) {
 	cancel := req(wmp.MethodFlowAction, map[string]any{"wmp": meta(sid), "flow_id": "f1", "action": "cancel", "params": map[string]any{}})
 	assert.Equal(t, 0, e.post(tok, sid, cancel).code())
 	select {
-	case f := <-told:
-		assert.Equal(t, "access_denied", f.errCode)
-		assert.Empty(t, f.vp, "no presentation is submitted")
+	case <-hit: // the pending request is gone, the verifier is being told
 	case <-time.After(5 * time.Second):
 		t.Fatal("the verifier was not told")
 	}
-	_ = e.post(tok, sid, cancel) // accepted, or the flow has already ended: never a second refusal
-	st.nextMethod(t, wmp.MethodFlowError)
+	assert.Equal(t, 0, e.post(tok, sid, cancel).code(), "a repeated cancel leaves the refusal running")
+	select {
+	case ev := <-st.events:
+		t.Fatalf("the flow ended before the verifier was told: %s", ev.Raw)
+	case <-time.After(300 * time.Millisecond):
+	}
+	doRelease()
+	select {
+	case ok := <-delivered:
+		assert.True(t, ok, "the verifier's notification was not cancelled")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the verifier's answer was not delivered")
+	}
+	f := <-told
+	assert.Equal(t, "access_denied", f.errCode)
+	assert.Empty(t, f.vp, "no presentation is submitted")
+	ev := st.nextMethod(t, wmp.MethodFlowError)
+	assert.Contains(t, ev.Raw, "https://verifier.example/done", "the verifier's redirect reaches the client")
 	select {
 	case f := <-told:
 		t.Fatalf("the verifier was told twice: %+v", f)

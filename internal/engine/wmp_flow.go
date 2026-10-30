@@ -268,10 +268,14 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 		// action would be acknowledged and the flow run on to submit the
 		// presentation. A pending sign request is refused (the verifier is told
 		// access_denied); without one it cancels the flow and its sub-flows.
-		if ws.session.refuseSignRequests(params.FlowID) {
+		if f.cancelRefused.Load() || f.malformed.Load() || ws.session.refuseSignRequests(params.FlowID) {
 			// The sign request that is pending is refused: the engine tells the
 			// verifier access_denied and the flow ends with its terminal message,
-			// as for any other refusal of a sign request.
+			// as for any other refusal of a sign request. A refusal already being
+			// carried out (by an earlier cancel or malformed action, whose pending
+			// entry is gone while the verifier is being told) is left running: a
+			// repeated cancel must not cut it short.
+			f.cancelRefused.Store(true)
 			return &wmp.FlowActionResult{
 				WMP:    wmp.Metadata{Version: wmp.Version, SessionID: p.sessionID},
 				FlowID: params.FlowID, Action: params.Action, Status: "accepted",
@@ -444,6 +448,10 @@ type wmpFlow struct {
 	// refuses: the flow is declined, and ends -32602 with no data (OpenID4x
 	// 3.2.3.1), not as an ordinary decline.
 	malformed atomic.Bool
+	// cancelRefused is set when a cancel by action refused the pending sign
+	// request: the refusal (the verifier being told access_denied) is being carried
+	// out, and a repeated cancel must leave it running.
+	cancelRefused atomic.Bool
 
 	// mu guards what the translation of the flow's steps records for its later
 	// actions: the configuration ids of the offer awaiting acceptance (the
