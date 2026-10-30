@@ -3,7 +3,10 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -120,4 +123,97 @@ func TestConsentObserver_IsToldTheDecision(t *testing.T) {
 		require.Error(t, err)
 		assert.Equal(t, []string{"awaited:flow-1", "decided:flow-1:" + consentReasonNoSelection}, obs.got())
 	})
+}
+
+// signRequestOf runs requestVPSignature for decision and returns the params of
+// the sign_request the client was sent (the flow is then abandoned).
+func signRequestOf(t *testing.T, h *OID4VPHandler, received chan map[string]any, decision consentDecision) map[string]any {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = h.requestVPSignature(ctx, &AuthorizationRequest{ClientID: "verifier.example", Nonce: "n", State: "s"}, decision, "")
+	}()
+	msg := awaitMessage(t, received, "sign_request")
+	cancel()
+	<-done
+	params, _ := msg["params"].(map[string]any)
+	require.NotNil(t, params)
+	return params
+}
+
+// A transport that has already translated its wire hands the answer over as the
+// action's consent member and no payload at all: the flow decides it as it
+// decides a WebSocket answer, and the sign request that follows carries exactly
+// the credential references and the selection handle of that answer, unchanged.
+func TestPretranslatedConsent_ThroughTheFlowToTheSignRequest(t *testing.T) {
+	const handle = "abcdefghijklmnopqrstuv"
+	h, session, received, cleanup := newSelectionTestHandler(t)
+	defer cleanup()
+
+	session.dispatchAction(&FlowActionMessage{
+		Message: Message{Type: TypeFlowAction, FlowID: h.Flow.ID},
+		Action:  ActionConsent,
+		consent: &consentAnswer{Handle: handle, Selections: []ConsentSelection{{CredentialQueryID: "q1"}}},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	decision, err := h.requestCredentialSelection(ctx, &AuthorizationRequest{}, &VerifierInfo{})
+	require.NoError(t, err, "no WebSocket payload is parsed for a pretranslated answer")
+	assert.Equal(t, handle, decision.Handle)
+
+	params := signRequestOf(t, h, received, decision)
+	assert.Equal(t, handle, params["selection_handle"])
+	assert.Equal(t, []any{map[string]any{"credential_query_id": "q1", "credential_id": ""}}, params["credentials_to_include"])
+}
+
+// The same through the WebSocket wire: it has no handle, so the sign request
+// carries none, whatever the client sent, and carries the credential ids and
+// claims the client chose.
+func TestWebSocketConsent_SignRequestCarriesNoHandle(t *testing.T) {
+	h, session, received, cleanup := newSelectionTestHandler(t)
+	defer cleanup()
+
+	feedAction(t, session, h.Flow.ID, ActionConsent, map[string]any{
+		"selected_credentials": []any{map[string]any{"credential_query_id": "q1", "credential_id": "c1", "disclosed_claims": []any{"given_name"}}},
+		"selection_handle":     "abcdefghijklmnopqrstuv",
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	decision, err := h.requestCredentialSelection(ctx, &AuthorizationRequest{}, &VerifierInfo{})
+	require.NoError(t, err)
+
+	params := signRequestOf(t, h, received, decision)
+	assert.NotContains(t, params, "selection_handle")
+	assert.Equal(t, []any{map[string]any{"credential_query_id": "q1", "credential_id": "c1", "disclosed_claims": []any{"given_name"}}}, params["credentials_to_include"])
+}
+
+// A WebSocket consent that selects nothing is reported to the client as
+// PRESENTATION_ERROR "No credentials selected" and the verifier is NOT told
+// (the user was asked and chose nothing): not the generic refusal, and no
+// access_denied.
+func TestWebSocketConsent_EmptySelectionIsReportedToTheClientOnly(t *testing.T) {
+	h, session, received, cleanup := newSelectionTestHandler(t)
+	defer cleanup()
+	var told int32
+	verifier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&told, 1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer verifier.Close()
+
+	feedAction(t, session, h.Flow.ID, ActionConsent, map[string]any{"selected_credentials": []any{}})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := h.requestCredentialSelection(ctx, &AuthorizationRequest{ResponseURI: verifier.URL, State: "s"}, &VerifierInfo{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no credentials selected")
+
+	msg := awaitMessage(t, received, string(TypeFlowError))
+	flowErr := msg["error"].(map[string]any)
+	assert.Equal(t, string(ErrCodePresentationError), flowErr["code"])
+	assert.Equal(t, "No credentials selected", flowErr["message"])
+	assert.EqualValues(t, 0, atomic.LoadInt32(&told), "the verifier is not told")
 }

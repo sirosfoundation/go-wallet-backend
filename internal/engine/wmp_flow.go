@@ -109,7 +109,12 @@ func parseStart(params *wmp.FlowStartParams) (*FlowStartMessage, error) {
 		CredentialOffer string `json:"credential_offer"`
 	}
 	if len(params.Params) > 0 {
-		_ = json.Unmarshal(params.Params, &named)
+		// FlowStartMessage does not declare credential_offer, so the first decode
+		// did not look at it: a member of the wrong type is refused here, not
+		// discarded (the start would be acknowledged and fail later).
+		if err := json.Unmarshal(params.Params, &named); err != nil {
+			return nil, wmp.NewRPCError(wmp.ErrInvalidParams, map[string]string{"reason": "invalid flow params"})
+		}
 	}
 	if start.Offer == "" {
 		start.Offer = named.CredentialOffer
@@ -256,6 +261,24 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 		}
 		return nil, err
 	}
+	if p.declineCannotBeConsumed(ws, f, params, out) {
+		// An oid4vp cancel is a decline while the flow waits for the selection
+		// (the verifier is told access_denied). Once the selection was handed over,
+		// or before the flow asks for one, nothing would consume the decline: the
+		// action would be acknowledged and the flow run on to submit the
+		// presentation. A pending sign request is refused (the verifier is told
+		// access_denied); without one it cancels the flow and its sub-flows.
+		if ws.session.refuseSignRequests(params.FlowID) {
+			// The sign request that is pending is refused: the engine tells the
+			// verifier access_denied and the flow ends with its terminal message,
+			// as for any other refusal of a sign request.
+			return &wmp.FlowActionResult{
+				WMP:    wmp.Metadata{Version: wmp.Version, SessionID: p.sessionID},
+				FlowID: params.FlowID, Action: params.Action, Status: "accepted",
+			}, nil
+		}
+		out = &actionOutcome{Cancel: true}
+	}
 	if out.Cancel {
 		// The flow ends with a terminal message first, so go-wmp's recovery state
 		// forgets it (a resume would otherwise re-send its last progress for a flow
@@ -307,6 +330,17 @@ func (s *Session) refuseSignRequests(flowID string) bool {
 		refused = true
 	}
 	return refused
+}
+
+// declineCannotBeConsumed reports whether out is the decline an oid4vp cancel
+// translates to while the flow is not waiting for the selection (see
+// refuseSelection for the same test): the one thing that consumes a decline is
+// the flow's wait for the selection, and the first answer to it is claimed here.
+func (p *wmpFlowProfile) declineCannotBeConsumed(ws *wmpSession, f *wmpFlow, params *wmp.FlowActionParams, out *actionOutcome) bool {
+	if params.Action != openid4x.ActionCancel || out.Cancel || out.Msg == nil || out.Msg.Action != ActionDecline {
+		return false
+	}
+	return !f.claimSelection() || !ws.session.awaitsSelection(params.FlowID)
 }
 
 // consentVerdictWait bounds the wait for the engine's decision on a selection

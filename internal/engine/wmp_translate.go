@@ -399,7 +399,9 @@ func translateVPAction(params *wmp.FlowActionParams) (out *actionOutcome, err er
 		var in struct {
 			Reason string `json:"reason"`
 		}
-		_ = decodeActionParams(params.Params, &in)
+		if err = decodeActionParams(params.Params, &in); err != nil {
+			return nil, errInvalidParams("cancel params are malformed"), true
+		}
 		out, err = actionMessage(params, ActionDecline, map[string]string{"reason": in.Reason})
 		return out, err, true
 	}

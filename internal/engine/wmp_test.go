@@ -1394,6 +1394,42 @@ func TestWMPBridge_StreamAndResponsesNeedTheSessionsPermissions(t *testing.T) {
 	}
 }
 
+// While a session is being superseded or closed the engine binding is removed
+// before the stored session and its streams are dropped. In that window no token
+// of the owner may attach a stream or answer a request: the creation-time TAC
+// cannot be checked, so the check fails closed (a reduced token must not see the
+// live stream's credential events). Another user, and an owner once the stored
+// session is gone, get what an unknown session looks like.
+func TestWMPBridge_AccessIsRefusedWhileTheEngineBindingIsGone(t *testing.T) {
+	e := newWMPEnv(t)
+	registerScripted(e.m, ProtocolOID4VP, func(context.Context, *Flow, *FlowStartMessage) error { return nil })
+	full := e.token("alice", "t1", "ir", "j1")
+	weak := e.token("alice", "t1", "i", "j2")
+	other := e.token("bob", "t1", "ir", "j3")
+	sid := e.create(full, "oid4vp")
+
+	// The window of endSession: binding removed, stored session still live.
+	e.a.mu.Lock()
+	delete(e.a.sessions, sid)
+	e.a.mu.Unlock()
+	_, ok := e.a.svc.Store().Get(sid)
+	require.True(t, ok, "the stored session is still live")
+
+	_, status := e.openStream(weak, sid, "")
+	assert.Equal(t, http.StatusForbidden, status, "a reduced token may not attach to a live stream")
+	_, status = e.openStream(full, sid, "")
+	assert.Equal(t, http.StatusForbidden, status, "nor may any token, the TAC cannot be checked")
+	r := e.post(weak, sid, map[string]any{"id": "x", "error": map[string]any{"code": wmp.ErrFlowError, "message": "no"}})
+	assert.Equal(t, http.StatusForbidden, r.Status, "nor answer a request")
+	_, status = e.openStream(other, sid, "")
+	assert.Equal(t, http.StatusNotFound, status, "another user still sees an unknown session")
+
+	// Once the stored session is gone the owner sees an unknown session too.
+	require.NoError(t, e.a.svc.Store().Delete(sid))
+	_, status = e.openStream(full, sid, "")
+	assert.Equal(t, http.StatusNotFound, status)
+}
+
 // A Peer built for a session by an in-process caller serves only that session's
 // owner, and only messages that name that session.
 func TestWMPBridge_GuardChecksOwnershipWithoutHTTP(t *testing.T) {
@@ -1503,6 +1539,41 @@ func TestWMPBridge_FlowStartWithoutFlowID(t *testing.T) {
 	assert.Equal(t, wmp.ErrInvalidParams, e.post(tok, sid, msg).code())
 	delete(msg["params"].(map[string]any), "flow_id")
 	assert.Equal(t, wmp.ErrInvalidParams, e.post(tok, sid, msg).code())
+}
+
+// A start whose params carry a member of the wrong type is answered -32602 with
+// the start, not acknowledged and failed later: credential_offer is read by the
+// bridge itself (the engine's message calls it offer), so its type is checked
+// there. The flow is never started.
+func TestWMPBridge_FlowStartWithMalformedCredentialOffer(t *testing.T) {
+	e := newWMPEnv(t)
+	started := make(chan struct{}, 1)
+	registerScripted(e.m, ProtocolOID4VCI, func(ctx context.Context, _ *Flow, _ *FlowStartMessage) error {
+		started <- struct{}{}
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	tok := e.token("alice", "t1", "ir", "j1")
+	sid := e.create(tok, "oid4vci")
+	for name, offer := range map[string]any{"number": 42, "object": map[string]any{"a": 1}, "array": []any{"x"}, "bool": true} {
+		t.Run(name, func(t *testing.T) {
+			msg := req(wmp.MethodFlowStart, map[string]any{"wmp": meta(sid), "flow_type": "oid4vci", "flow_id": "f-" + name,
+				"params": map[string]any{"credential_offer": offer}})
+			assert.Equal(t, wmp.ErrInvalidParams, e.post(tok, sid, msg).code())
+		})
+	}
+	select {
+	case <-started:
+		t.Fatal("a flow with a malformed credential_offer was started")
+	case <-time.After(200 * time.Millisecond):
+	}
+	// The well-formed one starts.
+	assert.Equal(t, 0, e.post(tok, sid, startVCI(sid, "f-ok")).code())
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a well-formed start did not start the flow")
+	}
 }
 
 // The shutdown deadline bounds ending the sessions, whatever a slow store does.
