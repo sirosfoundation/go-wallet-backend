@@ -582,6 +582,18 @@ type BackendProvider struct {
 	logger           *zap.Logger
 }
 
+// warnIfMemoryStorage logs a warning when in-memory storage is in use. Each
+// process holds its own copy of the data, so running more than one replica
+// gives every request a different view of users and private data (and
+// therefore different ETags), which the frontend reports as sync failures.
+func warnIfMemoryStorage(cfg *config.Config, logger *zap.Logger) {
+	switch backend.Type(cfg.Storage.Type) {
+	case backend.TypeMemory, "":
+		logger.Warn("Using in-memory storage: data is not persisted or shared between instances; " +
+			"do not run more than one replica with this configuration")
+	}
+}
+
 // requireSessionAuthMechanism refuses to start a role serving protected routes when the AS is not
 // enabled: session tokens are the only authentication, so every request would return 401.
 func requireSessionAuthMechanism(cfg *config.Config, role string) error {
@@ -625,6 +637,7 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 	}
 
 	logger.Info("Storage backend initialized", zap.String("type", cfg.Storage.Type))
+	warnIfMemoryStorage(cfg, logger)
 
 	// Initialize AuthZEN proxy handler (for frontend trust evaluation)
 	httpClient := cfg.HTTPClient.NewHTTPClient(0)
@@ -915,6 +928,7 @@ func NewAdminProvider(cfg *config.Config, logger *zap.Logger) (*AdminProvider, e
 	}
 
 	logger.Info("Admin storage backend initialized", zap.String("type", cfg.Storage.Type))
+	warnIfMemoryStorage(cfg, logger)
 
 	return &AdminProvider{
 		store:   store,

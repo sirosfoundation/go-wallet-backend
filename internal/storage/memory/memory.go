@@ -261,57 +261,7 @@ type UserStore struct {
 // semantics, and the returned copy can never be mutated by a concurrent
 // writer underneath it.
 func deepCopyUser(user *domain.User) *domain.User {
-	cp := *user
-
-	if user.Username != nil {
-		username := *user.Username
-		cp.Username = &username
-	}
-	if user.DisplayName != nil {
-		displayName := *user.DisplayName
-		cp.DisplayName = &displayName
-	}
-
-	if user.PrivateData != nil {
-		cp.PrivateData = append([]byte(nil), user.PrivateData...)
-	}
-	if user.Keys != nil {
-		cp.Keys = append([]byte(nil), user.Keys...)
-	}
-
-	if user.WebauthnCredentials != nil {
-		creds := make([]domain.WebauthnCredential, len(user.WebauthnCredentials))
-		for i, c := range user.WebauthnCredentials {
-			creds[i] = c
-			if c.CredentialID != nil {
-				creds[i].CredentialID = append([]byte(nil), c.CredentialID...)
-			}
-			if c.PublicKey != nil {
-				creds[i].PublicKey = append([]byte(nil), c.PublicKey...)
-			}
-			if c.Transport != nil {
-				creds[i].Transport = append([]string(nil), c.Transport...)
-			}
-			if c.Authenticator.AAGUID != nil {
-				creds[i].Authenticator.AAGUID = append([]byte(nil), c.Authenticator.AAGUID...)
-			}
-			if c.Nickname != nil {
-				nickname := *c.Nickname
-				creds[i].Nickname = &nickname
-			}
-			if c.LastUseTime != nil {
-				lastUse := *c.LastUseTime
-				creds[i].LastUseTime = &lastUse
-			}
-		}
-		cp.WebauthnCredentials = creds
-	}
-
-	if user.EnterpriseIdentities != nil {
-		cp.EnterpriseIdentities = append([]domain.EnterpriseIdentity(nil), user.EnterpriseIdentities...)
-	}
-
-	return &cp
+	return user.Clone()
 }
 
 func (s *UserStore) Create(ctx context.Context, user *domain.User) error {
@@ -324,7 +274,8 @@ func (s *UserStore) Create(ctx context.Context, user *domain.User) error {
 
 	user.CreatedAt = time.Now()
 	user.UpdatedAt = time.Now()
-	s.data[user.UUID.String()] = user
+	// Store a private copy so callers cannot mutate shared state.
+	s.data[user.UUID.String()] = deepCopyUser(user)
 	return nil
 }
 
@@ -364,16 +315,44 @@ func (s *UserStore) GetByDID(ctx context.Context, did string) (*domain.User, err
 }
 
 func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
+	snapshot := deepCopyUser(user)
+	stored, err := s.Modify(ctx, user.UUID, func(u *domain.User) error {
+		version := u.Version
+		*u = *snapshot.Clone()
+		u.Version = version
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	user.UpdatedAt = stored.UpdatedAt
+	user.Version = stored.Version
+	return nil
+}
+
+// Modify atomically applies fn to the stored user while holding the write lock.
+func (s *UserStore) Modify(ctx context.Context, id domain.UserID, fn storage.UserModifier) (*domain.User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.data[user.UUID.String()]; !exists {
-		return storage.ErrNotFound
+	current, exists := s.data[id.String()]
+	if !exists {
+		return nil, storage.ErrNotFound
 	}
 
-	user.UpdatedAt = time.Now()
-	s.data[user.UUID.String()] = user
-	return nil
+	working := deepCopyUser(current)
+	if err := fn(working); err != nil {
+		return nil, err
+	}
+	working.UUID = current.UUID
+	working.Version = current.Version + 1
+	working.UpdatedAt = time.Now()
+	// fn may have attached caller-owned memory to working (for example
+	// UpdatePrivateData(data) keeps the slice it is given), so commit a private
+	// copy: later mutation of the caller's data must not change stored state.
+	stored := deepCopyUser(working)
+	s.data[id.String()] = stored
+	return deepCopyUser(stored), nil
 }
 
 func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
@@ -385,24 +364,6 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 	}
 
 	delete(s.data, id.String())
-	return nil
-}
-
-func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	user, exists := s.data[id.String()]
-	if !exists {
-		return storage.ErrNotFound
-	}
-
-	// Check ETag for optimistic locking
-	if ifMatch != "" && user.PrivateDataETag != ifMatch {
-		return storage.ErrInvalidInput
-	}
-
-	user.UpdatePrivateData(data)
 	return nil
 }
 
@@ -433,6 +394,9 @@ func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain
 				user.WebauthnCredentials[i].Authenticator.CloneWarning = true
 			}
 			user.UpdatedAt = time.Now()
+			// Same contract as the Mongo implementation: every write to the
+			// user document bumps its version.
+			user.Version++
 			return transitioned, nil
 		}
 	}

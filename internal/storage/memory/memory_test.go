@@ -2,11 +2,15 @@ package memory
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
@@ -331,7 +335,7 @@ func TestUserStore_Delete_NotFound(t *testing.T) {
 	}
 }
 
-func TestUserStore_UpdatePrivateData(t *testing.T) {
+func TestUserStore_Modify(t *testing.T) {
 	ctx := t.Context()
 	store := NewStore()
 	users := store.Users()
@@ -343,16 +347,140 @@ func TestUserStore_UpdatePrivateData(t *testing.T) {
 		DID:      "did:key:test",
 	}
 
-	err := users.Create(ctx, user)
-	if err != nil {
+	if err := users.Create(ctx, user); err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
 
-	// Update private data
 	newData := []byte("new private data")
-	err = users.UpdatePrivateData(ctx, user.UUID, newData, "")
+	stored, err := users.Modify(ctx, user.UUID, func(u *domain.User) error {
+		u.UpdatePrivateData(newData)
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("UpdatePrivateData() error = %v", err)
+		t.Fatalf("Modify() error = %v", err)
+	}
+	if string(stored.PrivateData) != string(newData) {
+		t.Errorf("Modify() returned private data %q, want %q", stored.PrivateData, newData)
+	}
+	if stored.Version != 1 {
+		t.Errorf("Modify() version = %d, want 1", stored.Version)
+	}
+
+	got, _ := users.GetByID(ctx, user.UUID)
+	if string(got.PrivateData) != string(newData) {
+		t.Errorf("GetByID() private data %q, want %q", got.PrivateData, newData)
+	}
+}
+
+func TestUserStore_Modify_AbortOnError(t *testing.T) {
+	ctx := t.Context()
+	users := NewStore().Users()
+
+	user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:abort", PrivateData: []byte("keep")}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	sentinel := errors.New("abort")
+	_, err := users.Modify(ctx, user.UUID, func(u *domain.User) error {
+		u.PrivateData = []byte("changed")
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Modify() error = %v, want sentinel", err)
+	}
+
+	got, _ := users.GetByID(ctx, user.UUID)
+	if string(got.PrivateData) != "keep" {
+		t.Errorf("aborted Modify() must not write; private data = %q", got.PrivateData)
+	}
+}
+
+func TestUserStore_Modify_NotFound(t *testing.T) {
+	_, err := NewStore().Users().Modify(t.Context(), domain.NewUserID(), func(*domain.User) error { return nil })
+	if !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("Modify() error = %v, want ErrNotFound", err)
+	}
+}
+
+// A Modify callback may attach caller-owned memory to the user (for example
+// UpdatePrivateData keeps the slice it is given). Mutating that memory after
+// Modify returns must not change what the store holds.
+func TestUserStore_Modify_DoesNotAliasCallerMemory(t *testing.T) {
+	ctx := t.Context()
+	users := NewStore().Users()
+
+	user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:alias"}
+	require.NoError(t, users.Create(ctx, user))
+
+	data := []byte("private")
+	nick := "nick"
+	stored, err := users.Modify(ctx, user.UUID, func(u *domain.User) error {
+		u.UpdatePrivateData(data)
+		u.WebauthnCredentials = append(u.WebauthnCredentials, domain.WebauthnCredential{ID: "c", Nickname: &nick})
+		return nil
+	})
+	require.NoError(t, err)
+
+	data[0] = 'X'
+	nick = "changed"
+
+	got, err := users.GetByID(ctx, user.UUID)
+	require.NoError(t, err)
+	assert.Equal(t, "private", string(got.PrivateData))
+	assert.Equal(t, domain.ComputePrivateDataETag([]byte("private")), got.PrivateDataETag)
+	assert.Equal(t, "nick", *got.WebauthnCredentials[0].Nickname)
+
+	// The returned snapshot is private to the caller too.
+	stored.PrivateData[0] = 'Y'
+	got, _ = users.GetByID(ctx, user.UUID)
+	assert.Equal(t, "private", string(got.PrivateData))
+}
+
+// UpdateCredentialAuthenticator is a user write: it must bump the version so
+// version-conditional writers (Modify on Mongo) can detect it.
+func TestUserStore_UpdateCredentialAuthenticator_BumpsVersion(t *testing.T) {
+	ctx := t.Context()
+	users := NewStore().Users()
+
+	user := &domain.User{UUID: domain.NewUserID(), WebauthnCredentials: []domain.WebauthnCredential{{ID: "c1"}}}
+	require.NoError(t, users.Create(ctx, user))
+	before, _ := users.GetByID(ctx, user.UUID)
+
+	_, err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "c1", 5, true)
+	require.NoError(t, err)
+
+	after, _ := users.GetByID(ctx, user.UUID)
+	assert.Greater(t, after.Version, before.Version)
+}
+
+func TestUserStore_GetByID_ReturnsCopy(t *testing.T) {
+	ctx := t.Context()
+	users := NewStore().Users()
+
+	user := &domain.User{
+		UUID:                domain.NewUserID(),
+		DID:                 "did:key:copy",
+		PrivateData:         []byte("orig"),
+		WebauthnCredentials: []domain.WebauthnCredential{{ID: "c1"}},
+	}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// Mutating the caller's object after Create must not affect the store.
+	user.PrivateData[0] = 'X'
+
+	got, _ := users.GetByID(ctx, user.UUID)
+	got.PrivateData = []byte("mutated")
+	got.WebauthnCredentials[0].ID = "mutated"
+
+	again, _ := users.GetByID(ctx, user.UUID)
+	if string(again.PrivateData) != "orig" {
+		t.Errorf("store private data leaked mutation: %q", again.PrivateData)
+	}
+	if again.WebauthnCredentials[0].ID != "c1" {
+		t.Errorf("store credentials leaked mutation: %q", again.WebauthnCredentials[0].ID)
 	}
 }
 

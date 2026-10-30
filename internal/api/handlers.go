@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -537,7 +539,9 @@ func (h *Handlers) GetPrivateData(c *gin.Context) {
 		ifNoneMatch = c.GetHeader("X-Private-Data-If-None-Match")
 	}
 
-	if ifNoneMatch == etag {
+	// etag is never empty (the service computes it for legacy records), but
+	// guard anyway so a missing header can never yield a body-less 304.
+	if etag != "" && ifNoneMatch == etag {
 		c.Header("X-Private-Data-ETag", etag)
 		c.Status(304)
 		return
@@ -769,22 +773,16 @@ func (h *Handlers) UpdateSettings(c *gin.Context) {
 		return
 	}
 
-	user, err := h.services.User.GetUserByID(c.Request.Context(), domain.UserIDFromString(userID))
+	user, err := h.services.User.UpdateSettings(
+		c.Request.Context(),
+		domain.UserIDFromString(userID),
+		req.OpenIDRefreshTokenMaxAgeInSeconds,
+	)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(403, gin.H{})
 			return
 		}
-		h.logger.Error("Failed to get user", zap.Error(err))
-		c.JSON(500, gin.H{"error": "Failed to get user"})
-		return
-	}
-
-	if req.OpenIDRefreshTokenMaxAgeInSeconds != nil {
-		user.OpenIDRefreshTokenMaxAge = *req.OpenIDRefreshTokenMaxAgeInSeconds
-	}
-
-	if err := h.services.User.UpdateUser(c.Request.Context(), user); err != nil {
 		h.logger.Error("Failed to update user settings", zap.Error(err))
 		c.JSON(500, gin.H{"error": "Failed to update settings"})
 		return
@@ -897,12 +895,26 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 		return
 	}
 
+	// An empty body is allowed and means "do not change private data".
+	// A non-empty body that fails to parse is rejected rather than treated
+	// as empty, so malformed input can never wipe private data.
 	var req struct {
-		PrivateData taggedbinary.TaggedBytes `json:"privateData"`
+		PrivateData *taggedbinary.TaggedBytes `json:"privateData"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		// Allow empty body
-		req.PrivateData = nil
+	rawBody, err := c.GetRawData()
+	if err != nil {
+		c.JSON(400, gin.H{"error": "Failed to read request body"})
+		return
+	}
+	if len(bytes.TrimSpace(rawBody)) > 0 {
+		if err := json.Unmarshal(rawBody, &req); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid request body"})
+			return
+		}
+	}
+	var privateData []byte
+	if req.PrivateData != nil && *req.PrivateData != nil {
+		privateData = []byte(*req.PrivateData)
 	}
 
 	ifMatch := c.GetHeader("X-Private-Data-If-Match")
@@ -911,7 +923,7 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 		c.Request.Context(),
 		domain.UserIDFromString(userID),
 		credentialID,
-		[]byte(req.PrivateData),
+		privateData,
 		ifMatch,
 	)
 	if err != nil {

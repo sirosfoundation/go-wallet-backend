@@ -1271,6 +1271,37 @@ func (c *ServerConfig) GetRPOrigins() []string {
 	return result
 }
 
+// RequiredCORSAllowedHeaders are request headers the wallet frontend needs for
+// private-data sync. They are always allowed, even when allowed_headers is
+// overridden, because omitting them silently breaks optimistic locking.
+var RequiredCORSAllowedHeaders = []string{"If-None-Match", "X-Private-Data-If-Match", "X-Private-Data-If-None-Match"}
+
+// RequiredCORSExposedHeaders are response headers the wallet frontend must be
+// able to read for private-data sync. They are always exposed, even when
+// exposed_headers is overridden.
+var RequiredCORSExposedHeaders = []string{"X-Private-Data-ETag"}
+
+// appendMissingHeaders appends each required header not already present
+// (case-insensitive, as HTTP header names are). A "*" entry does not count as
+// presence: under credentialed CORS a "*" in Access-Control-Allow-Headers or
+// Access-Control-Expose-Headers is a literal header name, not a wildcard, so
+// the required names must be listed explicitly.
+func appendMissingHeaders(headers []string, required []string) []string {
+	for _, r := range required {
+		found := false
+		for _, h := range headers {
+			if strings.EqualFold(strings.TrimSpace(h), r) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			headers = append(headers, r)
+		}
+	}
+	return headers
+}
+
 // SetDefaults sets default values for CORS configuration
 func (c *CORSConfig) SetDefaults() {
 	if len(c.AllowedOrigins) == 0 {
@@ -1290,6 +1321,8 @@ func (c *CORSConfig) SetDefaults() {
 	if len(c.ExposedHeaders) == 0 {
 		c.ExposedHeaders = []string{"X-Private-Data-ETag", "Retry-After"}
 	}
+	c.AllowedHeaders = appendMissingHeaders(c.AllowedHeaders, RequiredCORSAllowedHeaders)
+	c.ExposedHeaders = appendMissingHeaders(c.ExposedHeaders, RequiredCORSExposedHeaders)
 	if c.MaxAge == 0 {
 		c.MaxAge = 43200 // 12 hours
 	}

@@ -145,30 +145,35 @@ func (s *UserService) GetPrivateData(ctx context.Context, userID domain.UserID) 
 	if err != nil {
 		return nil, "", err
 	}
-	return user.PrivateData, user.PrivateDataETag, nil
+	return user.PrivateData, user.EffectivePrivateDataETag(), nil
 }
 
-// UpdatePrivateData updates user's private data with optimistic locking
+// UpdatePrivateData updates user's private data with optimistic locking.
+// The ETag comparison and the write happen atomically in the store, so two
+// concurrent requests with the same If-Match cannot both succeed.
+// On conflict the current ETag is returned together with ErrPrivateDataConflict.
 func (s *UserService) UpdatePrivateData(ctx context.Context, userID domain.UserID, data []byte, ifMatch string) (string, error) {
-	user, err := s.store.Users().GetByID(ctx, userID)
+	var conflictETag string
+	stored, err := s.store.Users().Modify(ctx, userID, func(u *domain.User) error {
+		if ifMatch != "" && ifMatch != u.EffectivePrivateDataETag() {
+			conflictETag = u.EffectivePrivateDataETag()
+			return ErrPrivateDataConflict
+		}
+		u.UpdatePrivateData(data)
+		return nil
+	})
 	if err != nil {
-		return "", err
-	}
-
-	// Check ETag for optimistic locking
-	if ifMatch != "" && ifMatch != user.PrivateDataETag {
-		return user.PrivateDataETag, ErrPrivateDataConflict
-	}
-
-	// Update private data
-	user.UpdatePrivateData(data)
-
-	if err := s.store.Users().Update(ctx, user); err != nil {
+		if errors.Is(err, ErrPrivateDataConflict) {
+			return conflictETag, err
+		}
+		if errors.Is(err, storage.ErrNotFound) {
+			return "", err
+		}
 		return "", fmt.Errorf("failed to update user: %w", err)
 	}
 
 	s.logger.Debug("Private data updated", zap.String("user_id", userID.String()))
-	return user.PrivateDataETag, nil
+	return stored.PrivateDataETag, nil
 }
 
 // DeleteUser deletes a user and all associated data across ALL tenants.
@@ -274,42 +279,50 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	return nil
 }
 
-// DeleteWebAuthnCredential deletes a WebAuthn credential
+// DeleteWebAuthnCredential deletes a WebAuthn credential.
+// If privateData is nil, the stored private data is left untouched;
+// otherwise it is replaced (subject to ifMatch) in the same atomic write.
 func (s *UserService) DeleteWebAuthnCredential(ctx context.Context, userID domain.UserID, credentialID string, privateData []byte, ifMatch string) (string, error) {
-	user, err := s.store.Users().GetByID(ctx, userID)
-	if err != nil {
-		return "", err
-	}
-
-	// Check that there's more than one credential
-	if len(user.WebauthnCredentials) <= 1 {
-		return "", ErrLastWebAuthnCredential
-	}
-
-	// Check ETag for optimistic locking
-	if ifMatch != "" && ifMatch != user.PrivateDataETag {
-		return user.PrivateDataETag, ErrPrivateDataConflict
-	}
-
-	// Find and remove the credential
-	found := false
-	newCredentials := make([]domain.WebauthnCredential, 0, len(user.WebauthnCredentials)-1)
-	for _, cred := range user.WebauthnCredentials {
-		if cred.ID == credentialID {
-			found = true
-			continue
+	var conflictETag string
+	stored, err := s.store.Users().Modify(ctx, userID, func(u *domain.User) error {
+		// Check that there's more than one credential
+		if len(u.WebauthnCredentials) <= 1 {
+			return ErrLastWebAuthnCredential
 		}
-		newCredentials = append(newCredentials, cred)
-	}
 
-	if !found {
-		return "", storage.ErrNotFound
-	}
+		// Check ETag for optimistic locking
+		if ifMatch != "" && ifMatch != u.EffectivePrivateDataETag() {
+			conflictETag = u.EffectivePrivateDataETag()
+			return ErrPrivateDataConflict
+		}
 
-	user.WebauthnCredentials = newCredentials
-	user.UpdatePrivateData(privateData)
+		// Find and remove the credential
+		found := false
+		newCredentials := make([]domain.WebauthnCredential, 0, len(u.WebauthnCredentials)-1)
+		for _, cred := range u.WebauthnCredentials {
+			if cred.ID == credentialID {
+				found = true
+				continue
+			}
+			newCredentials = append(newCredentials, cred)
+		}
+		if !found {
+			return storage.ErrNotFound
+		}
 
-	if err := s.store.Users().Update(ctx, user); err != nil {
+		u.WebauthnCredentials = newCredentials
+		if privateData != nil {
+			u.UpdatePrivateData(privateData)
+		}
+		return nil
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrPrivateDataConflict):
+			return conflictETag, err
+		case errors.Is(err, ErrLastWebAuthnCredential), errors.Is(err, storage.ErrNotFound):
+			return "", err
+		}
 		return "", fmt.Errorf("failed to update user: %w", err)
 	}
 
@@ -317,31 +330,24 @@ func (s *UserService) DeleteWebAuthnCredential(ctx context.Context, userID domai
 		zap.String("user_id", userID.String()),
 		zap.String("credential_id", credentialID))
 
-	return user.PrivateDataETag, nil
+	return stored.EffectivePrivateDataETag(), nil
 }
 
 // RenameWebAuthnCredential renames a WebAuthn credential
 func (s *UserService) RenameWebAuthnCredential(ctx context.Context, userID domain.UserID, credentialID string, nickname string) error {
-	user, err := s.store.Users().GetByID(ctx, userID)
-	if err != nil {
-		return err
-	}
-
-	// Find and update the credential
-	found := false
-	for i := range user.WebauthnCredentials {
-		if user.WebauthnCredentials[i].ID == credentialID {
-			user.WebauthnCredentials[i].Nickname = &nickname
-			found = true
-			break
+	_, err := s.store.Users().Modify(ctx, userID, func(u *domain.User) error {
+		for i := range u.WebauthnCredentials {
+			if u.WebauthnCredentials[i].ID == credentialID {
+				u.WebauthnCredentials[i].Nickname = &nickname
+				return nil
+			}
 		}
-	}
-
-	if !found {
 		return storage.ErrNotFound
-	}
-
-	if err := s.store.Users().Update(ctx, user); err != nil {
+	})
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return err
+		}
 		return fmt.Errorf("failed to update user: %w", err)
 	}
 
@@ -352,7 +358,27 @@ func (s *UserService) RenameWebAuthnCredential(ctx context.Context, userID domai
 	return nil
 }
 
-// UpdateUser updates a user
+// UpdateSettings atomically updates user settings without touching other
+// fields (in particular private data). Nil fields are left unchanged.
+func (s *UserService) UpdateSettings(ctx context.Context, userID domain.UserID, openIDRefreshTokenMaxAge *int64) (*domain.User, error) {
+	stored, err := s.store.Users().Modify(ctx, userID, func(u *domain.User) error {
+		if openIDRefreshTokenMaxAge != nil {
+			u.OpenIDRefreshTokenMaxAge = *openIDRefreshTokenMaxAge
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("failed to update user: %w", err)
+	}
+	return stored, nil
+}
+
+// UpdateUser unconditionally overwrites a user with the given snapshot.
+// Prefer the targeted methods (UpdatePrivateData, UpdateSettings, ...) for
+// request handling: a stale snapshot will roll back concurrent changes.
 func (s *UserService) UpdateUser(ctx context.Context, user *domain.User) error {
 	user.UpdatedAt = time.Now()
 	if err := s.store.Users().Update(ctx, user); err != nil {

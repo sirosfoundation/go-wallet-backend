@@ -2,6 +2,8 @@ package mongodb
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -192,6 +194,170 @@ func TestUserStore_CRUD(t *testing.T) {
 
 	_, err = store.Users().GetByID(ctx, user.UUID)
 	assert.Error(t, err)
+}
+
+func TestUserStore_Modify_ConcurrentConditionalWrites(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	initial := []byte("initial")
+	user := &domain.User{
+		UUID:            domain.NewUserID(),
+		DID:             "did:key:modify-concurrent",
+		PrivateData:     initial,
+		PrivateDataETag: domain.ComputePrivateDataETag(initial),
+	}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	ifMatch := user.PrivateDataETag
+	conflict := errors.New("conflict")
+
+	const n = 10
+	results := make([]error, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, results[i] = store.Users().Modify(ctx, user.UUID, func(u *domain.User) error {
+				if u.PrivateDataETag != ifMatch {
+					return conflict
+				}
+				u.UpdatePrivateData([]byte{byte('a' + i)})
+				return nil
+			})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	ok := 0
+	for _, err := range results {
+		if err == nil {
+			ok++
+		} else {
+			assert.ErrorIs(t, err, conflict)
+		}
+	}
+	assert.Equal(t, 1, ok, "exactly one conditional write must succeed")
+}
+
+func TestUserStore_Modify_PreservesConcurrentFieldChanges(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:modify-fields"}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	// Writers touching different fields must not lose each other's updates.
+	const n = 20
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			_, err := store.Users().Modify(ctx, user.UUID, func(u *domain.User) error {
+				u.WebauthnCredentials = append(u.WebauthnCredentials, domain.WebauthnCredential{ID: fmt.Sprintf("c%d", i)})
+				return nil
+			})
+			assert.NoError(t, err)
+		}(i)
+		go func() {
+			defer wg.Done()
+			_, err := store.Users().Modify(ctx, user.UUID, func(u *domain.User) error {
+				u.OpenIDRefreshTokenMaxAge++
+				return nil
+			})
+			assert.NoError(t, err)
+		}()
+	}
+	wg.Wait()
+
+	got, err := store.Users().GetByID(ctx, user.UUID)
+	require.NoError(t, err)
+	assert.Len(t, got.WebauthnCredentials, n)
+	assert.Equal(t, int64(n), got.OpenIDRefreshTokenMaxAge)
+	assert.Equal(t, int64(2*n), got.Version)
+}
+
+func TestUserStore_Modify_LegacyDocumentWithoutVersion(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	id := domain.NewUserID()
+	// Insert a document the way older releases stored it: no "version" key.
+	_, err := store.users.collection.InsertOne(ctx, bson.M{
+		"_id":          bson.M{"id": id.String()},
+		"did":          "did:key:legacy",
+		"private_data": []byte("legacy"),
+	})
+	require.NoError(t, err)
+
+	stored, err := store.Users().Modify(ctx, id, func(u *domain.User) error {
+		u.UpdatePrivateData([]byte("new"))
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), stored.Version)
+
+	got, err := store.Users().GetByID(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("new"), got.PrivateData)
+	assert.Equal(t, domain.ComputePrivateDataETag([]byte("new")), got.PrivateDataETag)
+}
+
+// TestUserStore_Modify_InterleavedWithCredentialAuthenticatorUpdate proves
+// that a login's sign-count / clone-warning write bumps the document version:
+// a Modify that read the user before the login must retry on fresh data
+// instead of restoring the pre-login counter and clearing the clone warning.
+func TestUserStore_Modify_InterleavedWithCredentialAuthenticatorUpdate(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy_without_version=%v", legacy), func(t *testing.T) {
+			store := skipIfNoMongo(t)
+			ctx := context.Background()
+
+			user := &domain.User{
+				UUID: domain.NewUserID(),
+				WebauthnCredentials: []domain.WebauthnCredential{
+					{ID: "cred-1", Authenticator: domain.Authenticator{SignCount: 1}},
+				},
+			}
+			require.NoError(t, store.Users().Create(ctx, user))
+			if legacy {
+				_, err := store.users.collection.UpdateOne(ctx, bson.M{"_id.id": user.UUID.String()},
+					bson.M{"$unset": bson.M{"version": ""}})
+				require.NoError(t, err)
+			}
+
+			calls := 0
+			_, err := store.Users().Modify(ctx, user.UUID, func(u *domain.User) error {
+				calls++
+				if calls == 1 {
+					// A login lands after Modify read the user but before its write.
+					_, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 10, true)
+					require.NoError(t, err)
+				}
+				u.UpdatePrivateData([]byte("data"))
+				return nil
+			})
+			require.NoError(t, err)
+			assert.Equal(t, 2, calls, "Modify must detect the concurrent login and retry")
+
+			got, err := store.Users().GetByID(ctx, user.UUID)
+			require.NoError(t, err)
+			assert.Equal(t, uint32(10), got.WebauthnCredentials[0].Authenticator.SignCount, "login sign count must not be rolled back")
+			assert.True(t, got.WebauthnCredentials[0].Authenticator.CloneWarning, "clone warning must not be cleared")
+			assert.Equal(t, []byte("data"), got.PrivateData)
+		})
+	}
+}
+
+func TestUserStore_Modify_NotFound(t *testing.T) {
+	store := skipIfNoMongo(t)
+	_, err := store.Users().Modify(context.Background(), domain.NewUserID(), func(*domain.User) error { return nil })
+	assert.ErrorIs(t, err, storage.ErrNotFound)
 }
 
 // TestUserStore_UpdateCredentialAuthenticator_SetsFields covers the basic
