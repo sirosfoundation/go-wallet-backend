@@ -57,6 +57,17 @@ func (p *wmpFlowProfile) runNotification() wmp.FlowFunc {
 		}
 		ctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
+		// The flow ends with the engine session: endSession cancels only flows
+		// that have a Handler (this one has none), and an in-process peer is not
+		// closed with the session, so without this an unanswered sign request or
+		// a slow issuer would hold the forwarding slot until the timeout.
+		go func() {
+			select {
+			case <-ws.session.closeCh:
+				cancel()
+			case <-ctx.Done():
+			}
+		}()
 		// The flow takes a slot of the session's concurrent-flow limit, like every
 		// flow (an unanswered sign request holds it until the flow's timeout), and
 		// is registered as an oid4vci flow: that is what makes the guard require the

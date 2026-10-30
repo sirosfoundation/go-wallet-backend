@@ -558,6 +558,23 @@ func TestWMPNotification_Timeout(t *testing.T) {
 	assert.Equal(t, 0, e.iss.count())
 }
 
+// A notification flow ends with the engine session: when the session is ended
+// (superseded, revoked, closed) an unanswered sign request does not keep the
+// flow, and with it the global forwarding slot, until the flow's timeout.
+func TestWMPNotification_EndsWithTheEngineSession(t *testing.T) {
+	e := newChanEnv(t, "DPoP", false)
+	w := e.wallet("alice", fullTAC, "oid4vci", "credential_notification")
+	w.issue("f1")
+	w.notify("n1", "f1", "nid-1", "credential_accepted") // no timeout of its own: one minute
+	w.method(wmp.MethodFlowStart)                        // the sign request, left unanswered
+	require.Equal(t, 1, len(e.m.notificationSem), "the flow holds the forwarding slot")
+
+	e.a.endSession(w.sid, true)
+	require.Eventually(t, func() bool { return len(e.m.notificationSem) == 0 }, 5*time.Second, 10*time.Millisecond,
+		"the slot is released when the session ends, not at the flow's timeout")
+	assert.Equal(t, 0, e.iss.count())
+}
+
 // ---------------------------------------------------------------------------
 // Capability, authorization, validation
 // ---------------------------------------------------------------------------
