@@ -699,17 +699,13 @@ func (t *wmpTransport) errorWire(m *FlowErrorMessage) (code int, message string,
 	case ErrCodeUnsupportedTransactionData:
 		redirect, _ := m.Error.Details["redirect_uri"].(string)
 		return code, message, openid4x.TransactionDataUnsupportedData(redirect)
-	case errCodeIssuerNotEntitled:
-		// -31020 with go-wmp's typed {issuer, issuer_entitlement}, bounded by
-		// go-wmp (see wmp_entitlement.go). A refusal go-wmp does not accept as
-		// one (no issuer, a decision that is not a refusal) is a plain flow
-		// error with no data, never a made-up decision.
-		if d := notEntitledData(m.Error.Details); d != nil {
-			return wmp.ErrIssuerNotEntitled, openid4x.IssuerNotEntitledMessage, d
-		}
-		t.a.logger.Warn("ISSUER_NOT_ENTITLED without a usable decision; ending the flow with a plain flow error")
-		return wmp.ErrFlowError, message, nil
 	}
+	// SEAM(issuer entitlement): ISSUER_NOT_ENTITLED (go-wallet-backend#522) is
+	// -31020 with go-wmp's typed {issuer, issuer_entitlement}; the entitlement
+	// mapping PR provides that as pure functions and a follow-up wires them here
+	// once #522 and that PR are on main. Until then it falls to the generic
+	// mapping below, like any engine code the profile does not name: -31006 with
+	// the engine's details.
 	// A trust-decision refusal carries its reason.
 	if d := untrustedRefusalData(m.Error.Code, m.Error.Details); d != nil {
 		data = d
@@ -936,11 +932,32 @@ func convertCredentialsToInclude(in []CredentialRef) []openid4x.CredentialQueryR
 	return out
 }
 
+// reasonUntrustedVerifier is the reason of the -31006 data of a verifier trust
+// refusal (the issuer's is openid4x.ReasonUntrustedIssuer).
+const reasonUntrustedVerifier = "untrusted_verifier"
+
+// untrustedRefusalData is the data of a trust-decision refusal (-31006), or nil
+// for any other error. The issuer's is go-wmp's closed shape (the engine
+// attaches no details to the refusal); the verifier's keeps its reason next to
+// the engine's details, the reason winning over a member of the same name.
+func untrustedRefusalData(code ErrorCode, details map[string]interface{}) interface{} {
+	switch code {
+	case ErrCodeUntrustedIssuer:
+		return openid4x.NewUntrustedIssuerData()
+	case ErrCodeUntrustedVerifier:
+		out := make(map[string]interface{}, len(details)+1)
+		for k, v := range details {
+			out[k] = v
+		}
+		out["reason"] = reasonUntrustedVerifier
+		return out
+	}
+	return nil
+}
+
 // mapErrorCode converts engine string error codes to WMP integer codes.
 func mapErrorCode(code ErrorCode) int {
 	switch code {
-	case errCodeIssuerNotEntitled:
-		return wmp.ErrIssuerNotEntitled
 	case ErrCodeAuthFailed, ErrCodeAuthorizationFail, ErrCodeForbidden:
 		return wmp.ErrNotAuthorized
 	case ErrCodeInvalidMessage:

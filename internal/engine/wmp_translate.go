@@ -57,8 +57,7 @@ func translateVCIProgress(f *wmpFlow, step FlowStep, payload json.RawMessage) (w
 	case StepEvaluatingTrust:
 		return wmpStep{Step: openid4x.StepEvaluatingTrust, Payload: evaluatingTrustPayload(payload)}, true
 	case StepTrustEvaluated:
-		out, ok := trustEvaluatedPayload(payload)
-		return wmpStep{Step: openid4x.StepTrustEvaluated, Payload: out}, ok
+		return wmpStep{Step: openid4x.StepTrustEvaluated, Payload: trustEvaluatedPayload(payload)}, true
 	case StepAwaitingSelection:
 		return wmpStep{Step: openid4x.StepAwaitingOfferAcceptance, Payload: f.offerAcceptancePayload(payload)}, true
 	case StepAuthorizationReq:
@@ -80,8 +79,7 @@ func translateVPProgress(step FlowStep, payload json.RawMessage) (wmpStep, bool)
 	case StepEvaluatingVerifierTrust:
 		return wmpStep{Step: openid4x.StepVPEvaluatingTrust, Payload: evaluatingTrustPayload(payload)}, true
 	case StepTrustEvaluated:
-		out, ok := trustEvaluatedPayload(payload)
-		return wmpStep{Step: openid4x.StepVPTrustEvaluated, Payload: out}, ok
+		return wmpStep{Step: openid4x.StepVPTrustEvaluated, Payload: trustEvaluatedPayload(payload)}, true
 	case StepCredentialSelection:
 		return wmpStep{Step: openid4x.StepAwaitingConsent, Payload: awaitingConsentPayload(payload)}, true
 	}
@@ -119,15 +117,14 @@ var trustEvaluatedMembers = []string{"trusted", "framework", "reason", "certific
 
 // trustEvaluatedPayload is the payload of trust_evaluated: trust_info (3.1.2,
 // 3.2.2) next to the engine's own members, which stay (Section 7.4 reads
-// verifier_trust_evaluated and context from them). ok is false for a findings
-// progress go-wmp refuses (see entitlementPayload): it is not relayed.
-func trustEvaluatedPayload(payload json.RawMessage) (out interface{}, ok bool) {
-	if ent, isFindings := entitlementRaw(payload); isFindings {
-		if ent == nil {
-			return nil, false
-		}
-		return ent, true // the findings of the issuer-entitlement check, not a trust decision
-	}
+// verifier_trust_evaluated and context from them).
+//
+// SEAM(issuer entitlement): the findings progress of the issuer-entitlement
+// check (go-wallet-backend#522, issuer_entitlement_evaluated: true) is not a
+// trust decision and must not carry trust_info. #522 is not on main, so no
+// engine sends it yet; the entitlement mapping PR (pure functions over go-wmp's
+// types) adds the translation here when both are on main.
+func trustEvaluatedPayload(payload json.RawMessage) interface{} {
 	m := payloadObject(payload)
 	info := map[string]interface{}{}
 	for _, k := range trustEvaluatedMembers {
@@ -136,7 +133,7 @@ func trustEvaluatedPayload(payload json.RawMessage) (out interface{}, ok bool) {
 		}
 	}
 	m["trust_info"] = info
-	return m, true
+	return m
 }
 
 // awaitingConsentPayload is the payload of awaiting_consent (3.2.2). The engine

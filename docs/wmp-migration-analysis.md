@@ -149,25 +149,15 @@ query id that is not in the verifier's request, or repeated, is the terminal
 ### Issuer entitlement
 
 The enforcement of go-wallet-backend#522 is in the engine core and applies to every
-transport. The bridge (`wmp_entitlement.go`) maps its outcomes with go-wmp v0.13.0's
-types: the refusal `ISSUER_NOT_ENTITLED` is `wmp.ErrIssuerNotEntitled` (`-31020`,
-`openid4x.IssuerNotEntitledMessage`) with `openid4x.NewIssuerNotEntitledData`, the
-decision bounded by `IssuerEntitlement.Bounded()`; a trust-decision refusal
-`UNTRUSTED_ISSUER` stays `-31006` with `openid4x.NewUntrustedIssuerData()`
-(`{reason: "untrusted_issuer", retryable: false}`); never both for one flow. The
-findings progress (`trust_evaluated` with `issuer_entitlement_evaluated`) is relayed
-as `openid4x.NewIssuerEntitlementPayload`, without `trust_info`, bounded by go-wmp
-(at most 16 findings, a finding whose code is not of the defined form dropped, an
-over-long or non-printable `message` / `credential_type` left out, the
-certificate's own `entitlements` not relayed). A progress go-wmp refuses is not
-relayed; a refusal go-wmp does not accept as one (no issuer, not `allowed:false`,
-`mode:fail` with a finding) ends the flow with a plain `-31006` without data, never a
-made-up decision. An engine error code the bridge does not know is `-31006`. The
-shapes are those of #522 (`ISSUER_NOT_ENTITLED` details `{issuer,
-issuer_entitlement}` where the decision is `issuertrust.Decision.Summary()`); the
-engine constant is declared locally until #522 lands. A client cannot select a
-configuration outside the offer over WMP: `accept_offer` names an index of the
-credentials the engine listed.
+transport. The mapping of its outcomes to go-wmp v0.13.0's types (`-31020` with
+`NewIssuerNotEntitledData`, the findings progress as `NewIssuerEntitlementPayload`,
+`UNTRUSTED_ISSUER` staying `-31006` with `NewUntrustedIssuerData()`) is a separate
+change on top of #522 (pure functions, no dependency on the bridge); this bridge calls
+it once both are on main. Until then `ISSUER_NOT_ENTITLED`, which an engine without
+#522 does not send, is an engine code the bridge does not name and ends the flow with
+`-31006` (marked `SEAM(issuer entitlement)` in `wmp_flow.go` and `wmp_translate.go`).
+A client cannot select a configuration outside the offer over WMP: `accept_offer`
+names an index of the credentials the engine listed.
 
 ### Resolve
 
