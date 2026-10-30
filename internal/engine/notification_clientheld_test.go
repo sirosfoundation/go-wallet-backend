@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -215,3 +216,50 @@ func TestNotificationContextStore_Restore(t *testing.T) {
 	s.restore("f", old)
 	assert.Equal(t, "https://new.example.com/n", s.take("f").endpoint)
 }
+
+func TestNotificationContextStore_Restore_SupersededRegistrationIsNotRevived(t *testing.T) {
+	s := newNotificationContextStore()
+	s.put("f", &notificationContext{endpoint: "https://old.example.com/n"})
+	old := s.take("f")
+	s.put("f", &notificationContext{endpoint: "https://new.example.com/n"}) // reused flow ID
+	newer := s.take("f")                                                    // in flight: not in the map
+	s.restore("f", old)                                                     // the superseded one must not come back
+	assert.Nil(t, s.take("f"))
+	s.restore("f", newer) // the newer one's own failure may be retried
+	require.NotNil(t, s.take("f"))
+}
+
+func TestClientHeldNotification_SigningFailureOnNonceRetry_ConsumesContext(t *testing.T) {
+	r := newHeldNotifRig(t, "n-1")
+	r.issuer.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if atomic.AddInt32(r.calls, 1) > 1 {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.Header().Set("DPoP-Nonce", "nonce-1")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":"use_dpop_nonce"}`))
+	})
+	// First proof is signed, the retry's is refused: the issuer was contacted.
+	r.session.notifications.take("flow-ended")
+	var n atomic.Int32
+	r.session.notifications.put("flow-ended", &notificationContext{
+		endpoint: r.issuer.URL, accessToken: "at", tokenType: "DPoP", notificationID: "n-1",
+		dpopSigner: dpopSignerFunc(func() (string, error) {
+			if n.Add(1) == 2 {
+				return "", assert.AnError // the nonce retry's proof
+			}
+			return "p", nil
+		}),
+	})
+	r.notify("n-1")
+	assert.Equal(t, "rejected", r.ack(t).Status)
+	assert.Equal(t, int32(1), atomic.LoadInt32(r.calls))
+	r.notify("n-1")
+	assert.Equal(t, "rejected", r.ack(t).Status)
+	assert.Equal(t, int32(1), atomic.LoadInt32(r.calls), "context must stay spent once the issuer was contacted")
+}
+
+type dpopSignerFunc func() (string, error)
+
+func (f dpopSignerFunc) Proof(_ context.Context, _, _, _, _ string) (string, error) { return f() }
