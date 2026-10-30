@@ -10,10 +10,16 @@ package engine
 
 import (
 	"encoding/json"
+	"fmt"
+	"unicode/utf8"
 
 	"github.com/sirosfoundation/go-wmp/pkg/wmp"
 	"github.com/sirosfoundation/go-wmp/pkg/wmp/openid4x"
 )
+
+// maxNotificationEndpointLen is the bound of notification_endpoint in a completion
+// (OpenID4x 3.1.4), in characters.
+const maxNotificationEndpointLen = 2048
 
 // wmpStep is one progress message as a WMP client receives it.
 type wmpStep struct {
@@ -485,18 +491,55 @@ func consentFromSelectCredentials(raw json.RawMessage) (*consentAnswer, error) {
 
 // completionResult is the result of wmp.flow.complete: the engine's completion
 // without the members of its WebSocket envelope (type, flow_id, message_id,
-// timestamp), which WMP carries in the notification itself.
-func completionResult(m *FlowCompleteMessage) (json.RawMessage, error) {
+// timestamp), which WMP carries in the notification itself. For an oid4vci
+// completion that the engine retained a notification context for, it carries
+// notification_endpoint (OpenID4x 3.1.4); credentials[].notification_id (plain
+// responses only: the engine's results have none for an encrypted one) stays
+// when it is within the profile's bound (256 characters), else it is left out,
+// as the wallet could not start a flow with it.
+func completionResult(m *FlowCompleteMessage, notificationEndpoint string) (json.RawMessage, error) {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return nil, err
 	}
-	var obj map[string]json.RawMessage
+	obj := map[string]json.RawMessage{}
 	if err := json.Unmarshal(b, &obj); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("completion is not an object: %w", err)
 	}
 	for _, k := range []string{"type", "flow_id", "message_id", "timestamp"} {
 		delete(obj, k)
 	}
+	if raw, ok := obj["credentials"]; ok {
+		obj["credentials"] = boundedNotificationIDs(raw)
+	}
+	if notificationEndpoint != "" && utf8.RuneCountInString(notificationEndpoint) <= maxNotificationEndpointLen {
+		endpoint, _ := json.Marshal(notificationEndpoint)
+		obj["notification_endpoint"] = endpoint
+	}
 	return json.Marshal(obj)
+}
+
+// boundedNotificationIDs leaves out a credentials[].notification_id longer than
+// the profile allows.
+func boundedNotificationIDs(raw json.RawMessage) json.RawMessage {
+	var entries []map[string]json.RawMessage
+	if json.Unmarshal(raw, &entries) != nil {
+		return raw
+	}
+	changed := false
+	for _, e := range entries {
+		var id string
+		if v, ok := e["notification_id"]; ok && (json.Unmarshal(v, &id) != nil || utf8.RuneCountInString(id) > openid4x.MaxNotificationIDLen) {
+			delete(e, "notification_id")
+			changed = true
+		}
+	}
+	if !changed {
+		return raw
+	}
+	out, err := json.Marshal(entries)
+	if err != nil {
+		return raw
+	}
+	return out
 }

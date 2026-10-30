@@ -90,7 +90,8 @@ options of a session) and `WMPAdapter.Service()` drive the same engine over any
 | sign request | sign sub-flow (`openid4x.RequestSign`); the result becomes the engine's `sign_response` |
 | match request | match sub-flow (`openid4x.RequestMatch`); only satisfiability is relayed |
 | `wmp.resolve` type `vctm` (capability `resolve`) | the VCTM lookup of the engine's VCTM handler (see "Resolve"); `vctm` is not a flow type |
-| `wmp.credential.notification` | `dispatchCredentialNotification` (the engine's notification forwarding, as over WebSocket). The out-of-band `credential_notification` flow (OpenID4x 3.4) is a separate change (PR "credential_notification flow over WMP"), which supersedes this method |
+| `wmp.flow.start` `credential_notification` (capability of the same name) | go-wmp's `NotificationFlow` over the engine's notification context (see "Credential notification") |
+| `wmp.credential.notification` | `dispatchCredentialNotification`. **Superseded** by the `credential_notification` flow (it is not in the profile, has no result and cannot ask for a DPoP proof); kept as it was, no removal. It finds a context only in a session that negotiated `credential_notification` (nothing is retained otherwise) |
 | `wmp.message.deliver` (request) | `-31008`; `ack` and `status` are logged and dropped |
 
 Only the actions of the profile are accepted: the engine's own action names
@@ -174,6 +175,49 @@ private, link-local and metadata addresses and non-HTTPS are refused, redirects
 included, unless the deployment is configured for local development; the document is
 read up to 1 MiB.
 
+### Credential notification
+
+After an issuance completes the wallet reports an OID4VCI notification with a new
+`credential_notification` flow (OpenID4x 3.4; go-wmp's `NotificationFlow`,
+`NotificationStartMiddleware`, `ParseCredentialNotificationStart`; the engine
+implements `NotificationForwarder` in `wmp_notification.go`). The engine advertises
+the `credential_notification` capability (events `credential_accepted`,
+`credential_failure`, `context_ttl_seconds` the engine's 5 minutes) and registers the
+flow on the profile and the start middleware on the Peer (a start in a session that did
+not negotiate it is `-31005`, invalid params `-32602 {"member"}`, both as the response
+to the start; the flow type is authorized exactly as `oid4vci`).
+
+- The notification context (`notificationContextStore`) is kept only when the session
+  negotiated the capability, bound to the issuance session and the principal that ran
+  it (a WebSocket session keeps it as before). Each `notification_id` is single use
+  (`claim`); an encrypted issuer response, whose ids the engine never saw, accepts the
+  wallet's ids once each, up to 256. The context lives until its TTL. The legacy
+  `wmp.credential.notification` method reads and writes the same per-id record for a
+  WMP context, so an id forwarded by one cannot be forwarded by the other.
+- The flow takes a slot of the session's concurrent-flow limit (`reserveFlow`, the same
+  atomic check as every flow; at the limit it ends `busy`, retryable) and is registered
+  as an `oid4vci` flow, so the guard requires the issuance permission for every
+  message about it and its sign sub-flow. It has no actions.
+- The completion gains `notification_endpoint` (when a context was retained) and keeps
+  `credentials[].notification_id` for plain responses only, each within the profile's
+  bounds (256 and 2048 characters).
+- Forwarding: the forwarding limit is checked first (`busy`, retryable, the context
+  and id are kept), then the id is claimed (`context_unavailable` for an absent,
+  expired, other-session, other-principal, unknown or spent context, not
+  distinguished). A token bound to a key the wallet holds gets its proof from a
+  `sign_client_auth` sub-flow of the notification flow (`htu` = the endpoint without
+  query and fragment, `openid4x.NotificationHTU`; the request goes to the full
+  endpoint; no `key_id`; each proof bounded by go-wmp's 20 s); a wallet that
+  fails or answers without a proof is `signing_failed`; the issuer's refusal is
+  `forward_failed`; the flow's own timeout (the client's, default 1 minute) is
+  `timeout`. Only the reason and `retryable` reach the wallet. The engine-held key
+  needs no sub-flow.
+- The DPoP `htu` of a notification is now the endpoint without query and fragment on
+  every transport (RFC 9449 4.2); the request goes to the full endpoint.
+
+The older `wmp.credential.notification` method is not in the profile; it is
+superseded by this flow and kept unchanged.
+
 ### Errors
 
 Engine error codes map to `wmp.flow.error` codes: `AUTH_FAILED`, `FORBIDDEN` to
@@ -201,7 +245,7 @@ engine).
 
 Advertised from the flow handlers registered on the manager, with go-wmp's
 descriptors: `oid4vci` (grants, formats), `oid4vp` (response modes, formats),
-`transaction_data` (versions), `flows` (`max_concurrent`) and
+`transaction_data` (versions), `credential_notification`, `flows` (`max_concurrent`) and
 `resolve` (`supported_types: ["vctm"]`). The session negotiates the offered capabilities
 that the engine serves; offering none negotiates none. `transaction_data` needs a
 version the client offered.
