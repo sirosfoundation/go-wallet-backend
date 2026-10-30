@@ -1602,6 +1602,14 @@ func (m *Manager) forwardCredentialNotification(session *Session, msg *Credentia
 	httpClient := m.cfg.HTTPClient.NewHTTPClient(0)
 	if err := sendNotification(ctx, httpClient, nc, msg.NotificationID, msg.Event, msg.EventDescription, logger); err != nil {
 		logger.Warn("failed to forward credential notification to issuer", zap.Error(err))
+		// The context is single-use once the issuer was contacted. A failure to
+		// obtain the DPoP proof (client refused, timed out, unreachable) sent
+		// nothing, so the context goes back, with its original expiry, and the
+		// client may retry the same notification.
+		var notSent *notificationNotSentError
+		if errors.As(err, &notSent) {
+			session.notifications.restore(msg.FlowID, nc)
+		}
 		_ = session.SendNotificationAck(msg.FlowID, msg.NotificationID, "rejected", "forwarding failed")
 		return
 	}

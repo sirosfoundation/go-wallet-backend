@@ -83,6 +83,8 @@ func (s *notificationContextStore) put(flowID string, nc *notificationContext) {
 }
 
 // take returns and removes the notification context for the given flow ID.
+// The caller spends it by contacting the issuer; if the request never left
+// (see notificationNotSentError) it hands the context back with restore.
 // It returns nil if the context is absent or expired (one-shot semantics).
 func (s *notificationContextStore) take(flowID string) *notificationContext {
 	s.mu.Lock()
@@ -113,6 +115,34 @@ func (s *notificationContextStore) hasValid(flowID, notificationID string) bool 
 	}
 	return nc.notificationID == "" || nc.notificationID == notificationID
 }
+
+// restore puts back a context that take removed but whose notification never
+// reached the issuer, keeping its original expiry so a retry cannot extend the
+// context's life. It does nothing when the context has expired or the flow has
+// registered a newer one in the meantime.
+func (s *notificationContextStore) restore(flowID string, nc *notificationContext) {
+	if flowID == "" || nc == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if time.Now().After(nc.expiresAt) {
+		return
+	}
+	if _, taken := s.ctx[flowID]; taken {
+		return
+	}
+	s.ctx[flowID] = nc
+}
+
+// notificationNotSentError marks a notification that failed before anything was
+// sent to the issuer (the DPoP proof could not be obtained). The single-use
+// context is spent only when the issuer was contacted, so this is the one
+// failure after which the caller puts the context back for a retry.
+type notificationNotSentError struct{ err error }
+
+func (e *notificationNotSentError) Error() string { return e.err.Error() }
+func (e *notificationNotSentError) Unwrap() error { return e.err }
 
 // pruneLocked removes expired entries. Caller must hold s.mu.
 func (s *notificationContextStore) pruneLocked() {
@@ -169,7 +199,7 @@ func sendNotification(ctx context.Context, httpClient *http.Client, nc *notifica
 		if nc.dpopSigner != nil && strings.EqualFold(nc.tokenType, "DPoP") {
 			proof, err := nc.dpopSigner.Proof(ctx, req.Method, nc.endpoint, nc.accessToken, dpopNonce)
 			if err != nil {
-				return fmt.Errorf("failed to create DPoP proof for notification: %w", err)
+				return &notificationNotSentError{err: fmt.Errorf("failed to create DPoP proof for notification: %w", err)}
 			}
 			req.Header.Set("DPoP", proof)
 		}
