@@ -741,7 +741,7 @@ func signRequestFor(t *testing.T, authReq *AuthorizationRequest) SignRequestMess
 	done := make(chan error, 1)
 	go func() {
 		_, err := h.requestVPSignature(context.Background(), authReq,
-			[]ConsentSelection{{CredentialID: "cred-1", CredentialQueryID: "pay"}}, "verifier.example.com")
+			decisionOf(ConsentSelection{CredentialID: "cred-1", CredentialQueryID: "pay"}), "verifier.example.com")
 		done <- err
 	}()
 

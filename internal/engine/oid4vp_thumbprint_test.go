@@ -72,7 +72,7 @@ func TestRequestVPSignature_ThumbprintMatchesResponseEncryptionKey(t *testing.T)
 			defer cancel()
 			tc.req.ResponseMode = ResponseModeDirectPostJWT
 			tc.req.ClientID = "x"
-			_, _ = h.requestVPSignature(ctx, tc.req, []ConsentSelection{{CredentialID: "c", CredentialQueryID: "q"}}, "")
+			_, _ = h.requestVPSignature(ctx, tc.req, decisionOf(ConsentSelection{CredentialID: "c", CredentialQueryID: "q"}), "")
 
 			msg := awaitMessage(t, received, "sign_request")
 			params, _ := msg["params"].(map[string]any)

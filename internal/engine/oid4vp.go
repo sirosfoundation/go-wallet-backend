@@ -217,7 +217,8 @@ type CredentialsMatchedPayload struct {
 	NoMatchReason string            `json:"no_match_reason,omitempty"`
 }
 
-// ConsentPayload is the payload for consent action
+// ConsentPayload is the WebSocket payload of the consent action. The
+// transport-neutral form is consentAnswer (see consent.go).
 type ConsentPayload struct {
 	SelectedCredentials []ConsentSelection `json:"selected_credentials"`
 }
@@ -285,13 +286,13 @@ func (h *OID4VPHandler) Execute(ctx context.Context, msg *FlowStartMessage) erro
 	}
 
 	// Step 3: Send credential_selection with dcql_query + verifier; wait for consent or decline
-	selectedCredentials, err := h.requestCredentialSelection(ctx, authReq, verifier)
+	decision, err := h.requestCredentialSelection(ctx, authReq, verifier)
 	if err != nil {
 		return err
 	}
 
 	// Step 4: Request VP signing from client (use configured ClientID for audience if set)
-	submission, err := h.requestVPSignature(ctx, authReq, selectedCredentials, verifier.ClientID)
+	submission, err := h.requestVPSignature(ctx, authReq, decision, verifier.ClientID)
 	if err != nil {
 		h.Logger.Debug("VP signature failed", zap.Error(err))
 		h.failSign(ctx, authReq, err)
@@ -1773,7 +1774,7 @@ func extractRawClientMetadata(requestObject []byte) (json.RawMessage, error) {
 // the only ways out were a decline - untrue, the user was never asked - or
 // silence until the user-interaction timeout, which is what a wallet missing
 // the PID an issuer demands used to hit.
-func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq *AuthorizationRequest, verifier *VerifierInfo) ([]ConsentSelection, error) {
+func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq *AuthorizationRequest, verifier *VerifierInfo) (consentDecision, error) {
 	selection := map[string]interface{}{
 		"dcql_query": authReq.DCQLQuery,
 		"verifier":   verifier,
@@ -1782,19 +1783,29 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 		selection["client_metadata"] = authReq.ClientMetadataRaw
 	}
 	selection["verified_request"] = verifiedInputs(authReq)
+	h.Flow.Session.noteConsentAwaited(h.Flow.ID)
 	_ = h.Progress(StepCredentialSelection, selection)
 
 	action, err := h.waitForSelectionAction(ctx, authReq)
 	if err != nil {
-		return nil, err
+		return consentDecision{}, err
 	}
 
-	if action.Action == ActionDecline {
-		var decline struct {
-			Reason string `json:"reason"`
-		}
-		_ = json.Unmarshal(action.Payload, &decline)
-		h.Logger.Info("user declined presentation", zap.String("reason", decline.Reason))
+	answer, err := consentAnswerFrom(action)
+	if err != nil {
+		_ = h.Error(StepCredentialSelection, ErrCodeInvalidMessage, "Invalid consent payload")
+		return consentDecision{}, err
+	}
+
+	// The client is not trusted to have honoured the query it was sent: the
+	// policy compares the answer with it before anything is signed.
+	decision, err := newConsentPolicy(h.Config, h.Logger).Decide(authReq.DCQLQuery, answer)
+	if err != nil {
+		return consentDecision{}, h.refuseConsent(ctx, authReq, err)
+	}
+	h.Flow.Session.noteConsentDecided(h.Flow.ID, "")
+	if decision.Declined {
+		h.Logger.Info("user declined presentation", zap.String("reason", decision.Reason))
 		redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)
 		if redirectURI != "" {
 			_ = h.ErrorWithDetails(StepCredentialSelection, ErrCodePresentationError, "User declined the request",
@@ -1802,34 +1813,34 @@ func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq 
 		} else {
 			_ = h.Error(StepCredentialSelection, ErrCodePresentationError, "User declined the request")
 		}
-		return nil, errors.New("user declined presentation")
+		return consentDecision{}, errors.New("user declined presentation")
 	}
 
-	var payload ConsentPayload
-	if err := json.Unmarshal(action.Payload, &payload); err != nil {
-		_ = h.Error(StepCredentialSelection, ErrCodeInvalidMessage, "Invalid consent payload")
-		return nil, fmt.Errorf("invalid consent payload: %w", err)
-	}
+	return decision, nil
+}
 
-	if len(payload.SelectedCredentials) == 0 {
+// refuseConsent ends the flow for a consent the policy refused. An answer that
+// selects nothing is reported to the client only (the user was asked and chose
+// nothing); one that does not fit the query is also refused to the verifier,
+// access_denied, as a decline is. The transport is told it was a refusal of the
+// answer, not a decline, so it can report that in its own terms.
+func (h *OID4VPHandler) refuseConsent(ctx context.Context, authReq *AuthorizationRequest, refusal error) error {
+	var r *consentRefusal
+	if errors.As(refusal, &r) {
+		h.Flow.Session.noteConsentDecided(h.Flow.ID, r.Reason)
+	}
+	if r != nil && r.Reason == consentReasonNoSelection {
 		_ = h.Error(StepCredentialSelection, ErrCodePresentationError, "No credentials selected")
-		return nil, errors.New("no credentials selected")
+		return errors.New("no credentials selected")
 	}
-
-	// The client is not trusted to have honoured the query it was sent: compare
-	// the consent with it before anything is signed.
-	if err := h.vetConsent(authReq, payload.SelectedCredentials); err != nil {
-		redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)
-		if redirectURI != "" {
-			_ = h.ErrorWithDetails(StepCredentialSelection, ErrCodePresentationError, ErrCodePresentationError.UserFacingMessage(),
-				map[string]interface{}{"redirect_uri": redirectURI})
-		} else {
-			_ = h.Error(StepCredentialSelection, ErrCodePresentationError, ErrCodePresentationError.UserFacingMessage())
-		}
-		return nil, err
+	redirectURI := h.submitErrorResponse(ctx, authReq, "access_denied", verifierRefusedDescription)
+	if redirectURI != "" {
+		_ = h.ErrorWithDetails(StepCredentialSelection, ErrCodePresentationError, ErrCodePresentationError.UserFacingMessage(),
+			map[string]interface{}{"redirect_uri": redirectURI})
+	} else {
+		_ = h.Error(StepCredentialSelection, ErrCodePresentationError, ErrCodePresentationError.UserFacingMessage())
 	}
-
-	return payload.SelectedCredentials, nil
+	return refusal
 }
 
 // waitForSelectionAction waits for the client's answer to a
@@ -1987,11 +1998,8 @@ type responseEncryptionError struct{ err error }
 func (e *responseEncryptionError) Error() string { return e.err.Error() }
 func (e *responseEncryptionError) Unwrap() error { return e.err }
 
-func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *AuthorizationRequest, selected []ConsentSelection, audience string) (*vpSubmission, error) {
-	credRefs := make([]CredentialRef, len(selected))
-	for i, s := range selected {
-		credRefs[i] = CredentialRef(s)
-	}
+func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *AuthorizationRequest, decision consentDecision, audience string) (*vpSubmission, error) {
+	credRefs, selectionHandle := decision.signInclusion()
 
 	if audience == "" {
 		audience = authReq.ClientID
@@ -2011,6 +2019,7 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 		Audience:              audience,
 		Nonce:                 authReq.Nonce,
 		CredentialsToInclude:  credRefs,
+		SelectionHandle:       selectionHandle,
 		ResponseURI:           responseURI,
 		VerifierJwkThumbprint: verifierJwkThumbprint,
 		VerifierSessionID:     authReq.VerifierSessionID,
@@ -2062,7 +2071,7 @@ func (h *OID4VPHandler) requestVPSignature(ctx context.Context, authReq *Authori
 	}
 
 	if len(authReq.DCQLQuery) > 0 {
-		vpToken, err := buildDCQLVPToken(resp.VPToken, selected)
+		vpToken, err := buildDCQLVPToken(resp.VPToken, decision.Selected)
 		if err != nil {
 			return nil, err
 		}

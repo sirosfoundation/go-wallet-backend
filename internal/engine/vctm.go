@@ -3,9 +3,11 @@ package engine
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"time"
 
 	"go.uber.org/zap"
@@ -91,33 +93,81 @@ func (h *VCTMHandler) Execute(ctx context.Context, msg *FlowStartMessage) error 
 	return h.Flow.Session.Send(&completeMsg)
 }
 
+// maxVCTMBytes bounds the type metadata document a lookup reads.
+const maxVCTMBytes = 1 << 20
+
+// errVCTMUnknown is returned by lookupVCTDocument when the registry answered
+// that it has no entry for the vct and the vct is not a URL to try instead: the
+// lookup knows the type is unknown (as opposed to unreachable or failing).
+var errVCTMUnknown = errors.New("vctm: unknown type")
+
+// lookupVCT is the type metadata of a vct, as the VCTM flow delivers it.
 func (h *VCTMHandler) lookupVCT(ctx context.Context, vct string) (*TypeMetadata, error) {
+	doc, err := h.lookupVCTDocument(ctx, vct)
+	if err != nil {
+		return nil, err
+	}
+	var metadata TypeMetadata
+	if err := json.Unmarshal(doc, &metadata); err != nil {
+		return nil, fmt.Errorf("failed to parse metadata: %w", err)
+	}
+	// Ensure VCT is set
+	if metadata.VCT == "" {
+		metadata.VCT = vct
+	}
+	return &metadata, nil
+}
+
+// lookupVCTDocument is the type metadata document of a vct, unparsed: the
+// registry first; when it has no entry or cannot be reached and the vct is an
+// absolute URL, that URL (WMP Core 5.8.1). Any other outcome of the registry
+// lookup is a failure that does not fall through to the URL. The fetch of a URL
+// goes through httpClient, whose address and scheme policy (loopback, private,
+// link-local and metadata addresses and non-HTTPS refused unless configured for
+// local development, redirects included) is the engine's for every fetch of a
+// counterparty's URL. The result is at most maxVCTMBytes. errVCTMUnknown means
+// the registry has no entry and there is no URL to try.
+func (h *VCTMHandler) lookupVCTDocument(ctx context.Context, vct string) ([]byte, error) {
 	resp, err := h.Registry.GetVCTM(ctx, vct)
 	if err != nil {
-		// Try direct VCT URL as fallback
+		// The registry cannot be reached: try the vct as a URL.
 		return h.lookupVCTDirect(ctx, vct)
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
-	if resp.StatusCode == http.StatusNotFound {
-		// Try direct VCT URL
+	switch resp.StatusCode {
+	case http.StatusNotFound:
+		if !isAbsoluteURL(vct) {
+			return nil, errVCTMUnknown
+		}
 		return h.lookupVCTDirect(ctx, vct)
+	case http.StatusOK:
+		return readVCTMDocument(resp.Body)
 	}
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
-		return nil, fmt.Errorf("registry returned status %d: %s", resp.StatusCode, string(body))
-	}
-
-	var metadata TypeMetadata
-	if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
-		return nil, fmt.Errorf("failed to parse metadata: %w", err)
-	}
-
-	return &metadata, nil
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
+	return nil, fmt.Errorf("registry returned status %d: %s", resp.StatusCode, string(body))
 }
 
-func (h *VCTMHandler) lookupVCTDirect(ctx context.Context, vct string) (*TypeMetadata, error) {
+// isAbsoluteURL reports whether s is a URL with a scheme and a host: something
+// that can be fetched (a urn: identifier is not).
+func isAbsoluteURL(s string) bool {
+	u, err := url.Parse(s)
+	return err == nil && u.Scheme != "" && u.Host != ""
+}
+
+// readVCTMDocument reads a type metadata document, at most maxVCTMBytes.
+func readVCTMDocument(r io.Reader) ([]byte, error) {
+	doc, err := io.ReadAll(io.LimitReader(r, maxVCTMBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read metadata: %w", err)
+	}
+	if len(doc) > maxVCTMBytes {
+		return nil, fmt.Errorf("metadata exceeds %d bytes", maxVCTMBytes)
+	}
+	return doc, nil
+}
+
+func (h *VCTMHandler) lookupVCTDirect(ctx context.Context, vct string) ([]byte, error) {
 	// VCT is a URL - try fetching directly
 	req, err := http.NewRequestWithContext(ctx, "GET", vct, nil)
 	if err != nil {
@@ -135,16 +185,5 @@ func (h *VCTMHandler) lookupVCTDirect(ctx context.Context, vct string) (*TypeMet
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, MaxErrorBodyBytes))
 		return nil, fmt.Errorf("VCT fetch returned status %d: %s", resp.StatusCode, string(body))
 	}
-
-	var metadata TypeMetadata
-	if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
-		return nil, fmt.Errorf("failed to parse VCT metadata: %w", err)
-	}
-
-	// Ensure VCT is set
-	if metadata.VCT == "" {
-		metadata.VCT = vct
-	}
-
-	return &metadata, nil
+	return readVCTMDocument(resp.Body)
 }

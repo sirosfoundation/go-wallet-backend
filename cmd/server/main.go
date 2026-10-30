@@ -422,6 +422,12 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer shutdownCancel()
 
+	// WMP first: it refuses new requests (503) and ends its sessions and event
+	// streams, which http.Server.Shutdown does not.
+	if engineProvider != nil {
+		engineProvider.CloseWMP(shutdownCtx)
+	}
+
 	if err := mgr.Shutdown(shutdownCtx); err != nil {
 		logger.Error("Server shutdown error", zap.Error(err))
 	}

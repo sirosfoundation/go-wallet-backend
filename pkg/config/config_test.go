@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1365,6 +1366,23 @@ func TestCORSConfig_SetDefaults(t *testing.T) {
 	}
 	if len(cfg.AllowedHeaders) == 0 {
 		t.Error("AllowedHeaders should have default value")
+	}
+}
+
+// WMP over HTTP+SSE needs a browser to send its session header and the SSE
+// resume cursor cross-origin, so they are allowed by default.
+func TestCORSConfig_DefaultAllowedHeadersIncludeWMP(t *testing.T) {
+	cfg := CORSConfig{}
+	cfg.SetDefaults()
+	for _, h := range []string{"Wmp-Session-Id", "Last-Event-ID"} {
+		if !slices.Contains(cfg.AllowedHeaders, h) {
+			t.Errorf("default AllowedHeaders lacks %s: %v", h, cfg.AllowedHeaders)
+		}
+	}
+	explicit := CORSConfig{AllowedHeaders: []string{"X-Only"}}
+	explicit.SetDefaults()
+	if slices.Contains(explicit.AllowedHeaders, "Wmp-Session-Id") {
+		t.Error("an explicit AllowedHeaders must not be extended")
 	}
 }
 
