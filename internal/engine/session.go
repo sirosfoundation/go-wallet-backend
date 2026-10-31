@@ -206,6 +206,26 @@ type Flow struct {
 // answered with TOO_MANY_REQUESTS rather than dropped silently.
 const flowActionBuffer = 50
 
+// cancelHandler cancels the flow's handler, if it has one yet.
+func (f *Flow) cancelHandler() {
+	f.mu.RLock()
+	h := f.Handler
+	f.mu.RUnlock()
+	if h != nil {
+		h.Cancel()
+	}
+}
+
+// releaseFlowIfOwner gives the flow's slot back unless a newer flow has taken
+// the ID since: a superseded flow must not delete its successor's slot.
+func (s *Session) releaseFlowIfOwner(flowID string, flow *Flow) {
+	s.flowsMu.Lock()
+	if s.flows[flowID] == flow {
+		delete(s.flows, flowID)
+	}
+	s.flowsMu.Unlock()
+}
+
 // newFlow creates a flow that can receive client actions.
 func newFlow(id string, protocol Protocol, session *Session) *Flow {
 	return &Flow{
@@ -832,9 +852,7 @@ func (m *Manager) handleSession(session *Session) {
 		// Cancel all active flows
 		session.flowsMu.Lock()
 		for _, flow := range session.flows {
-			if flow.Handler != nil {
-				flow.Handler.Cancel()
-			}
+			flow.cancelHandler()
 		}
 		session.flowsMu.Unlock()
 	}()
@@ -1003,21 +1021,21 @@ func (m *Manager) admitFlowStart(session *Session, msg *FlowStartMessage) (adm *
 		return
 	}
 
-	// A flow ID that is live is not a new flow: replacing it would orphan the
-	// live flow's handler and let this flow's cleanup delete its slot.
-	if _, live := session.flows[flowID]; live {
-		session.flowsMu.Unlock()
-		_ = session.SendFlowError(flowID, "", ErrCodeInvalidMessage, "Flow ID already in use")
-		logger.Warn("Rejected flow start - flow ID already live")
-		return
-	}
-
 	// Create flow while still holding lock
 	flow := newFlow(flowID, msg.Protocol, session)
 
-	// Register flow immediately to reserve slot
+	// Register flow immediately to reserve slot. A flow that still holds the ID
+	// (a client that restarts under the same ID, possibly just after the
+	// completion of the previous flow, whose slot is released a moment later) is
+	// superseded: it is cancelled below so it cannot go on under an ID that now
+	// belongs to this flow, and its own cleanup leaves this flow's slot alone.
+	superseded := session.flows[flowID]
 	session.flows[flowID] = flow
 	session.flowsMu.Unlock()
+	if superseded != nil {
+		logger.Warn("Flow ID reused while the earlier flow still holds it, cancelling the earlier flow")
+		superseded.cancelHandler()
+	}
 
 	// The flow ID is the client's choice and may have been used before. A
 	// notification context registered under it belongs to that earlier
@@ -1037,12 +1055,8 @@ func (m *Manager) runAdmittedFlow(session *Session, msg *FlowStartMessage, a *ad
 			logger.Error("Panic in flow handler", zap.Any("panic", r))
 			_ = session.SendFlowError(flowID, "", ErrCodeInternalError, "Internal error in flow handler")
 			// A panic in the factory, before the handler's own release is deferred,
-			// must not leak the slot; a newer flow that took the ID since is not touched.
-			session.flowsMu.Lock()
-			if session.flows[flowID] == flow {
-				delete(session.flows, flowID)
-			}
-			session.flowsMu.Unlock()
+			// must not leak the slot.
+			session.releaseFlowIfOwner(flowID, flow)
 		}
 	}()
 
@@ -1050,20 +1064,16 @@ func (m *Manager) runAdmittedFlow(session *Session, msg *FlowStartMessage, a *ad
 	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient, m.verifierStore, m.trustCache)
 	if err != nil {
 		// Remove the reserved flow slot on error
-		session.flowsMu.Lock()
-		delete(session.flows, flowID)
-		session.flowsMu.Unlock()
+		session.releaseFlowIfOwner(flowID, flow)
 		_ = session.SendFlowError(flowID, "", ErrCodeInternalError, "Failed to create flow handler")
 		logger.Error("Failed to create handler", zap.Error(err))
 		return
 	}
+	flow.mu.Lock()
 	flow.Handler = handler
+	flow.mu.Unlock()
 
-	defer func() {
-		session.flowsMu.Lock()
-		delete(session.flows, flowID)
-		session.flowsMu.Unlock()
-	}()
+	defer session.releaseFlowIfOwner(flowID, flow)
 
 	// Execute flow
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
