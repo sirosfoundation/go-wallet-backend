@@ -861,7 +861,11 @@ func (m *Manager) handleSession(session *Session) {
 				_ = session.SendFlowError(msg.FlowID, "", ErrCodeInvalidMessage, "Invalid flow_start format")
 				continue
 			}
-			go m.handleFlowStart(session, &startMsg)
+			// Admission (who owns the flow ID) is decided here, in message order;
+			// only the flow itself runs concurrently.
+			if adm := m.admitFlowStart(session, &startMsg); adm != nil {
+				go m.runAdmittedFlow(session, &startMsg, adm)
+			}
 
 		case TypeFlowAction:
 			var actionMsg FlowActionMessage
@@ -916,7 +920,30 @@ var requiredTACForProtocol = map[Protocol]string{
 	ProtocolOID4VCI: "i",
 }
 
+// handleFlowStart admits a flow and runs it to completion.
 func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
+	if a := m.admitFlowStart(session, msg); a != nil {
+		m.runAdmittedFlow(session, msg, a)
+	}
+}
+
+// admittedFlow is a flow that holds its flow ID and slot and has not yet run.
+type admittedFlow struct {
+	flowID  string
+	flow    *Flow
+	factory FlowHandlerFactory
+	logger  *zap.Logger
+}
+
+// admitFlowStart performs everything that decides who owns the flow ID: the
+// protocol and permission checks, the concurrent-flow limit, the refusal of a
+// live ID, the reservation of the slot, and the drop of the notification
+// context an earlier flow left under the ID. The session's read loop runs it
+// synchronously, in message order, before it launches the flow, so a
+// credential_notification that follows the flow_start on the wire is always
+// handled after the ID changed hands. It returns nil when the flow was refused
+// (the client has been told).
+func (m *Manager) admitFlowStart(session *Session, msg *FlowStartMessage) (adm *admittedFlow) {
 	flowID := msg.FlowID
 	if flowID == "" {
 		flowID = uuid.New().String()
@@ -928,8 +955,9 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	logger := session.logger
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Error("Panic in flow handler", zap.Any("panic", r))
+			logger.Error("Panic in flow admission", zap.Any("panic", r))
 			_ = session.SendFlowError(flowID, "", ErrCodeInternalError, "Internal error in flow handler")
+			adm = nil
 		}
 	}()
 
@@ -998,6 +1026,25 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	if session.notifications != nil {
 		session.notifications.invalidate(flowID)
 	}
+	return &admittedFlow{flowID: flowID, flow: flow, factory: factory, logger: logger}
+}
+
+// runAdmittedFlow creates the handler of an admitted flow and executes it.
+func (m *Manager) runAdmittedFlow(session *Session, msg *FlowStartMessage, a *admittedFlow) {
+	flowID, flow, factory, logger := a.flowID, a.flow, a.factory, a.logger
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Panic in flow handler", zap.Any("panic", r))
+			_ = session.SendFlowError(flowID, "", ErrCodeInternalError, "Internal error in flow handler")
+			// A panic in the factory, before the handler's own release is deferred,
+			// must not leak the slot; a newer flow that took the ID since is not touched.
+			session.flowsMu.Lock()
+			if session.flows[flowID] == flow {
+				delete(session.flows, flowID)
+			}
+			session.flowsMu.Unlock()
+		}
+	}()
 
 	// Create handler (after releasing lock to avoid holding it during potentially slow operations)
 	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient, m.verifierStore, m.trustCache)

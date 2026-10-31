@@ -122,6 +122,10 @@ func (s *notificationContextStore) invalidate(flowID string) {
 	if s.closed {
 		return
 	}
+	// Every accepted flow records a generation, with or without a context, so
+	// the history is pruned here as well as in put: a long session that never
+	// registers a context must not keep every flow ID it ever used.
+	s.pruneLocked()
 	s.seq++
 	s.latest[flowID] = latestRegistration{seq: s.seq, at: time.Now()}
 }

@@ -262,3 +262,47 @@ func TestNotificationContext_ClearedWhenSessionEnds(t *testing.T) {
 	r.session.notifications.put("late", &notificationContext{endpoint: "https://issuer.example/notify"})
 	assert.Nil(t, r.session.notifications.take("late"), "a late registration must not outlive the session")
 }
+
+// The read loop admits a flow_start before it handles the next message, so a
+// credential_notification that follows a flow_start on the wire is always
+// handled after the flow ID changed hands. Over the real socket, many times:
+// admission used to race with the notification (the flow was launched
+// asynchronously) and could let it take the previous issuer's context.
+func TestNotificationContext_WireStartThenNotify_NeverReachesPreviousIssuer(t *testing.T) {
+	r := newReuseRig(t, stubFactory(stubFlowHandler{}), "")
+	for i := 0; i < 200; i++ {
+		id := "wire-" + time.Now().Format("150405.000000000") + string(rune('a'+i%26)) + string(rune('A'+i/26))
+		r.session.notifications.put(id, &notificationContext{
+			endpoint: r.issuer1.URL, accessToken: "token-of-issuer-1", tokenType: "Bearer",
+		})
+		require.NoError(t, r.client.WriteJSON(&FlowStartMessage{
+			Message: Message{Type: TypeFlowStart, FlowID: id}, Protocol: ProtocolOID4VCI,
+		}))
+		require.NoError(t, r.client.WriteJSON(&CredentialNotificationMessage{
+			Message: Message{Type: TypeCredentialNotification, FlowID: id}, NotificationID: "id-two",
+			Event: notificationEventFailure,
+		}))
+		select {
+		case a := <-r.acks:
+			require.Equal(t, "rejected", a.Status, "iteration %d", i)
+		case <-time.After(5 * time.Second):
+			t.Fatal("no notification_ack")
+		}
+	}
+	assert.Equal(t, int32(0), atomic.LoadInt32(r.calls1))
+}
+
+// Every accepted flow records a generation; the history is pruned by it, so a
+// session that never registers a context does not keep every flow ID it used.
+func TestNotificationContextStore_Invalidate_PrunesExpiredHistory(t *testing.T) {
+	s := newNotificationContextStore()
+	s.latest["old"] = latestRegistration{seq: 1, at: time.Now().Add(-2 * notificationContextTTL)}
+	s.invalidate("new")
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, oldKept := s.latest["old"]
+	_, newKept := s.latest["new"]
+	assert.False(t, oldKept, "an expired generation must be pruned")
+	assert.True(t, newKept)
+}
