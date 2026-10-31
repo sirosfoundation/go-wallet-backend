@@ -257,6 +257,49 @@ func (s *notificationContextStore) restore(flowID string, nc *notificationContex
 	s.ctx[flowID] = nc
 }
 
+// unspend takes back the use of notificationID of nc, a context that take,
+// claim or takeForNotification handed out and whose notification never reached
+// the issuer (see notificationNotSentError). nc must be the copy as it was handed
+// out, not one the caller has changed. The original expiry is kept, nothing is
+// revived once the context expired or the flow registered a newer one, and the
+// id is spent for good once the issuer was contacted (the caller does not call
+// this then).
+//
+//   - A WebSocket context (no principal) is consumed whole: it is put back (restore).
+//   - A context retained for a WMP principal is used per id: a context that knows
+//     its one id was deleted when the id was claimed and is put back; a context
+//     that knows no id (an encrypted response) is still there, and the id leaves
+//     its notified set, which frees its slot of the 256 as well.
+func (s *notificationContextStore) unspend(flowID string, nc *notificationContext, notificationID string) {
+	if nc == nil || flowID == "" {
+		return
+	}
+	if nc.principal == "" {
+		s.restore(flowID, nc)
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if time.Now().After(nc.expiresAt) {
+		return
+	}
+	if l, ok := s.latest[flowID]; !ok || l.seq != nc.seq {
+		return // superseded by a newer registration, which owns the flow ID now
+	}
+	cur, ok := s.ctx[flowID]
+	if !ok {
+		if nc.notificationID != "" {
+			back := *nc
+			back.notified = nil
+			s.ctx[flowID] = &back
+		}
+		return
+	}
+	if cur.seq == nc.seq {
+		delete(cur.notified, notificationID)
+	}
+}
+
 // notificationNotSentError marks a notification that failed before anything was
 // sent to the issuer (the DPoP proof could not be obtained). The single-use
 // context is spent only when the issuer was contacted, so this is the one

@@ -40,6 +40,9 @@ type notifIssuer struct {
 	mu       sync.Mutex
 	requests []notifRequest
 	status   int // the answer; 204 when zero
+	// challenge is the number of next requests answered with a DPoP nonce
+	// challenge (401 and a DPoP-Nonce), before the normal answer.
+	challenge int
 }
 
 type notifRequest struct {
@@ -59,7 +62,16 @@ func newNotifIssuer(t *testing.T) *notifIssuer {
 		ni.mu.Lock()
 		ni.requests = append(ni.requests, notifRequest{URI: r.URL.RequestURI(), Authorization: r.Header.Get("Authorization"), DPoP: r.Header.Get("DPoP"), Body: body})
 		status := ni.status
+		challenged := ni.challenge > 0
+		if challenged {
+			ni.challenge--
+		}
 		ni.mu.Unlock()
+		if challenged {
+			w.Header().Set("DPoP-Nonce", "nonce-1")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
 		if status == 0 {
 			status = http.StatusNoContent
 		}

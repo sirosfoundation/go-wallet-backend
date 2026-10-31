@@ -121,6 +121,7 @@ func (f *wmpNotificationForwarder) ForwardNotification(ctx context.Context, req 
 	if nc == nil {
 		return openid4x.ErrNotificationContextUnavailable
 	}
+	handedOut := *nc // as claimed: what unspend puts back, not the copy changed below
 	if _, clientHeld := nc.dpopSigner.(*clientHeldDPoPSigner); clientHeld {
 		// The key is the wallet's: ask for each proof with a nested sign flow
 		// of this notification flow (the legacy signer addresses the issuance
@@ -131,6 +132,14 @@ func (f *wmpNotificationForwarder) ForwardNotification(ctx context.Context, req 
 	logger := f.a.logger.With(zap.String("flow", req.FlowID))
 	if err := sendNotification(ctx, httpClient, nc, req.NotificationID, req.Event, req.EventDescription, logger); err != nil {
 		logger.Warn("failed to forward credential notification to issuer", zap.Error(err))
+		// The id is spent once the issuer was contacted. A failure to obtain the
+		// DPoP proof (the wallet refused, timed out or answered without one) sent
+		// nothing: the id and the context go back, with the original expiry, so the
+		// wallet may retry the same notification.
+		var notSent *notificationNotSentError
+		if errors.As(err, &notSent) {
+			ws.session.notifications.unspend(req.IssuanceFlowID, &handedOut, req.NotificationID)
+		}
 		return err
 	}
 	logger.Debug("credential notification forwarded to issuer")

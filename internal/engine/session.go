@@ -1722,6 +1722,7 @@ func (m *Manager) forwardCredentialNotification(session *Session, msg *Credentia
 	defer cancel()
 
 	httpClient := m.cfg.HTTPClient.NewHTTPClient(0)
+	handedOut := *nc
 	if err := sendNotification(ctx, httpClient, nc, msg.NotificationID, msg.Event, msg.EventDescription, logger); err != nil {
 		logger.Warn("failed to forward credential notification to issuer", zap.Error(err))
 		// The context is single-use once the issuer was contacted. A failure to
@@ -1730,7 +1731,7 @@ func (m *Manager) forwardCredentialNotification(session *Session, msg *Credentia
 		// client may retry the same notification.
 		var notSent *notificationNotSentError
 		if errors.As(err, &notSent) {
-			session.notifications.restore(msg.FlowID, nc)
+			session.notifications.unspend(msg.FlowID, &handedOut, msg.NotificationID)
 		}
 		_ = session.SendNotificationAck(msg.FlowID, msg.NotificationID, "rejected", "forwarding failed")
 		return
