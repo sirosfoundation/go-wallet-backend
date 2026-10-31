@@ -72,6 +72,9 @@ type notificationContextStore struct {
 	// superseded one. Entries are pruned once older than the context TTL.
 	latest map[string]latestRegistration
 	seq    uint64
+	// closed is set when the session ends: nothing is registered or restored
+	// afterwards.
+	closed bool
 }
 
 type latestRegistration struct {
@@ -91,11 +94,50 @@ func (s *notificationContextStore) put(flowID string, nc *notificationContext) {
 	nc.expiresAt = time.Now().Add(notificationContextTTL)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
 	s.pruneLocked()
 	s.seq++
 	nc.seq = s.seq
 	s.latest[flowID] = latestRegistration{seq: nc.seq, at: time.Now()}
 	s.ctx[flowID] = nc
+}
+
+// invalidate drops whatever context the flow ID holds and makes it the newest
+// generation, so a context of an earlier issuance that is in flight cannot be
+// restored under it. The flow ID is the client's choice and may be reused: a
+// flow that takes the ID starts with no context, and only its own registration
+// can create one. Without this, a second issuance that registers nothing (no
+// notification endpoint, a failure, another issuer) would leave the first
+// issuance's context reachable, and a notification for the second would be sent
+// to the first issuer with the first issuer's token.
+func (s *notificationContextStore) invalidate(flowID string) {
+	if flowID == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.ctx, flowID)
+	if s.closed {
+		return
+	}
+	// Every accepted flow records a generation, with or without a context, so
+	// the history is pruned here as well as in put: a long session that never
+	// registers a context must not keep every flow ID it ever used.
+	s.pruneLocked()
+	s.seq++
+	s.latest[flowID] = latestRegistration{seq: s.seq, at: time.Now()}
+}
+
+// clear drops every context, with the token and signer each holds, when the
+// session ends, and refuses any later registration.
+func (s *notificationContextStore) clear() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.closed = true
+	clear(s.ctx)
+	clear(s.latest)
 }
 
 // take returns and removes the notification context for the given flow ID.
@@ -123,13 +165,43 @@ func (s *notificationContextStore) take(flowID string) *notificationContext {
 // engine cannot read the notification_id, registers the context with an empty
 // id and the client supplies the real one (see registerNotificationContext).
 func (s *notificationContextStore) hasValid(flowID, notificationID string) bool {
+	_, ok := s.validGeneration(flowID, notificationID)
+	return ok
+}
+
+// validGeneration is hasValid that also returns the registration the check was
+// made against, so the worker that forwards the notification later takes that
+// registration and no other (see takeGeneration).
+func (s *notificationContextStore) validGeneration(flowID, notificationID string) (uint64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	nc, ok := s.ctx[flowID]
 	if !ok || time.Now().After(nc.expiresAt) {
-		return false
+		return 0, false
 	}
-	return nc.notificationID == "" || nc.notificationID == notificationID
+	if nc.notificationID != "" && nc.notificationID != notificationID {
+		return 0, false
+	}
+	return nc.seq, true
+}
+
+// takeGeneration is take for one registration: it removes and returns the
+// context of flowID only while it is still the registration with this seq. The
+// check of a notification and its forwarding are separate steps (the worker
+// runs later), and the flow ID may have been reused in between; a newer
+// registration is neither used for the old notification nor consumed by it.
+func (s *notificationContextStore) takeGeneration(flowID string, seq uint64) *notificationContext {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nc, ok := s.ctx[flowID]
+	if !ok || nc.seq != seq {
+		return nil
+	}
+	delete(s.ctx, flowID)
+	if time.Now().After(nc.expiresAt) {
+		return nil
+	}
+	return nc
 }
 
 // restore puts back a context that take removed but whose notification never
@@ -142,7 +214,7 @@ func (s *notificationContextStore) restore(flowID string, nc *notificationContex
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if time.Now().After(nc.expiresAt) {
+	if s.closed || time.Now().After(nc.expiresAt) {
 		return
 	}
 	if _, taken := s.ctx[flowID]; taken {

@@ -825,6 +825,10 @@ func (m *Manager) handleSession(session *Session) {
 		session.logClosed(closeReasonReadError)
 		close(session.stopPing) // stop the ping goroutine
 		close(session.closeCh)
+		// The issuance tokens held for notifications end with the session.
+		if session.notifications != nil {
+			session.notifications.clear()
+		}
 		// Cancel all active flows
 		session.flowsMu.Lock()
 		for _, flow := range session.flows {
@@ -857,7 +861,11 @@ func (m *Manager) handleSession(session *Session) {
 				_ = session.SendFlowError(msg.FlowID, "", ErrCodeInvalidMessage, "Invalid flow_start format")
 				continue
 			}
-			go m.handleFlowStart(session, &startMsg)
+			// Admission (who owns the flow ID) is decided here, in message order;
+			// only the flow itself runs concurrently.
+			if adm := m.admitFlowStart(session, &startMsg); adm != nil {
+				go m.runAdmittedFlow(session, &startMsg, adm)
+			}
 
 		case TypeFlowAction:
 			var actionMsg FlowActionMessage
@@ -912,7 +920,30 @@ var requiredTACForProtocol = map[Protocol]string{
 	ProtocolOID4VCI: "i",
 }
 
+// handleFlowStart admits a flow and runs it to completion.
 func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
+	if a := m.admitFlowStart(session, msg); a != nil {
+		m.runAdmittedFlow(session, msg, a)
+	}
+}
+
+// admittedFlow is a flow that holds its flow ID and slot and has not yet run.
+type admittedFlow struct {
+	flowID  string
+	flow    *Flow
+	factory FlowHandlerFactory
+	logger  *zap.Logger
+}
+
+// admitFlowStart performs everything that decides who owns the flow ID: the
+// protocol and permission checks, the concurrent-flow limit, the refusal of a
+// live ID, the reservation of the slot, and the drop of the notification
+// context an earlier flow left under the ID. The session's read loop runs it
+// synchronously, in message order, before it launches the flow, so a
+// credential_notification that follows the flow_start on the wire is always
+// handled after the ID changed hands. It returns nil when the flow was refused
+// (the client has been told).
+func (m *Manager) admitFlowStart(session *Session, msg *FlowStartMessage) (adm *admittedFlow) {
 	flowID := msg.FlowID
 	if flowID == "" {
 		flowID = uuid.New().String()
@@ -924,8 +955,9 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	logger := session.logger
 	defer func() {
 		if r := recover(); r != nil {
-			logger.Error("Panic in flow handler", zap.Any("panic", r))
+			logger.Error("Panic in flow admission", zap.Any("panic", r))
 			_ = session.SendFlowError(flowID, "", ErrCodeInternalError, "Internal error in flow handler")
+			adm = nil
 		}
 	}()
 
@@ -971,12 +1003,48 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		return
 	}
 
+	// A flow ID that is live is not a new flow: replacing it would orphan the
+	// live flow's handler and let this flow's cleanup delete its slot.
+	if _, live := session.flows[flowID]; live {
+		session.flowsMu.Unlock()
+		_ = session.SendFlowError(flowID, "", ErrCodeInvalidMessage, "Flow ID already in use")
+		logger.Warn("Rejected flow start - flow ID already live")
+		return
+	}
+
 	// Create flow while still holding lock
 	flow := newFlow(flowID, msg.Protocol, session)
 
 	// Register flow immediately to reserve slot
 	session.flows[flowID] = flow
 	session.flowsMu.Unlock()
+
+	// The flow ID is the client's choice and may have been used before. A
+	// notification context registered under it belongs to that earlier
+	// issuance, not to this flow: drop it, so this flow's notifications can
+	// only ever use a context this flow registers.
+	if session.notifications != nil {
+		session.notifications.invalidate(flowID)
+	}
+	return &admittedFlow{flowID: flowID, flow: flow, factory: factory, logger: logger}
+}
+
+// runAdmittedFlow creates the handler of an admitted flow and executes it.
+func (m *Manager) runAdmittedFlow(session *Session, msg *FlowStartMessage, a *admittedFlow) {
+	flowID, flow, factory, logger := a.flowID, a.flow, a.factory, a.logger
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Error("Panic in flow handler", zap.Any("panic", r))
+			_ = session.SendFlowError(flowID, "", ErrCodeInternalError, "Internal error in flow handler")
+			// A panic in the factory, before the handler's own release is deferred,
+			// must not leak the slot; a newer flow that took the ID since is not touched.
+			session.flowsMu.Lock()
+			if session.flows[flowID] == flow {
+				delete(session.flows, flowID)
+			}
+			session.flowsMu.Unlock()
+		}
+	}()
 
 	// Create handler (after releasing lock to avoid holding it during potentially slow operations)
 	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient, m.verifierStore, m.trustCache)
@@ -1544,7 +1612,8 @@ func (m *Manager) dispatchCredentialNotification(session *Session, msg *Credenti
 	// Reject (without consuming) when there is no live context for the flow or
 	// the supplied notification_id does not match the issued one. This keeps
 	// invalid requests out of the bounded async path.
-	if !session.notifications.hasValid(msg.FlowID, msg.NotificationID) {
+	seq, valid := session.notifications.validGeneration(msg.FlowID, msg.NotificationID)
+	if !valid {
 		logger.Debug("no matching notification context for flow (absent, expired, or id mismatch)")
 		_ = session.SendNotificationAck(msg.FlowID, msg.NotificationID, "rejected", "notification context unavailable")
 		return
@@ -1564,7 +1633,7 @@ func (m *Manager) dispatchCredentialNotification(session *Session, msg *Credenti
 
 	go func() {
 		defer func() { <-m.notificationSem }()
-		m.forwardCredentialNotification(session, msg, logger)
+		m.forwardCredentialNotification(session, msg, seq, logger)
 	}()
 }
 
@@ -1573,14 +1642,14 @@ func (m *Manager) dispatchCredentialNotification(session *Session, msg *Credenti
 // invoked only after dispatchCredentialNotification has validated the request.
 // No credential data is stored or looked up; the backend remains zero-knowledge
 // about credential contents.
-func (m *Manager) forwardCredentialNotification(session *Session, msg *CredentialNotificationMessage, logger *zap.Logger) {
+func (m *Manager) forwardCredentialNotification(session *Session, msg *CredentialNotificationMessage, seq uint64, logger *zap.Logger) {
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("Panic in credential notification handler", zap.Any("panic", r))
 		}
 	}()
 
-	nc := session.notifications.take(msg.FlowID)
+	nc := session.notifications.takeGeneration(msg.FlowID, seq)
 	if nc == nil {
 		// Raced with TTL expiry or another in-flight notification for the same
 		// flow consumed the one-shot context.
