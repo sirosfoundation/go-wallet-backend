@@ -825,6 +825,10 @@ func (m *Manager) handleSession(session *Session) {
 		session.logClosed(closeReasonReadError)
 		close(session.stopPing) // stop the ping goroutine
 		close(session.closeCh)
+		// The issuance tokens held for notifications end with the session.
+		if session.notifications != nil {
+			session.notifications.clear()
+		}
 		// Cancel all active flows
 		session.flowsMu.Lock()
 		for _, flow := range session.flows {
@@ -971,12 +975,29 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		return
 	}
 
+	// A flow ID that is live is not a new flow: replacing it would orphan the
+	// live flow's handler and let this flow's cleanup delete its slot.
+	if _, live := session.flows[flowID]; live {
+		session.flowsMu.Unlock()
+		_ = session.SendFlowError(flowID, "", ErrCodeInvalidMessage, "Flow ID already in use")
+		logger.Warn("Rejected flow start - flow ID already live")
+		return
+	}
+
 	// Create flow while still holding lock
 	flow := newFlow(flowID, msg.Protocol, session)
 
 	// Register flow immediately to reserve slot
 	session.flows[flowID] = flow
 	session.flowsMu.Unlock()
+
+	// The flow ID is the client's choice and may have been used before. A
+	// notification context registered under it belongs to that earlier
+	// issuance, not to this flow: drop it, so this flow's notifications can
+	// only ever use a context this flow registers.
+	if session.notifications != nil {
+		session.notifications.invalidate(flowID)
+	}
 
 	// Create handler (after releasing lock to avoid holding it during potentially slow operations)
 	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient, m.verifierStore, m.trustCache)

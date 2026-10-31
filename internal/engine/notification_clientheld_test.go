@@ -56,7 +56,6 @@ func newHeldNotifRig(t *testing.T, issuedID string) *heldNotifRig {
 	// routing of a reply for an ended flow is exercised, not bypassed.
 	r.mgr = notifTestManager()
 	client, s := unknownFlowHarnessOn(t, r.mgr)
-	s.notifications = newNotificationContextStore()
 	r.session, r.client = s, client
 	// "flow-ended" is deliberately NOT registered in s.flows.
 	s.notifications.put("flow-ended", &notificationContext{

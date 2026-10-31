@@ -44,6 +44,8 @@ func testSession(conn *websocket.Conn) *Session {
 		logger:   zap.NewNop(),
 		closeCh:  make(chan struct{}, 1),
 		stopPing: make(chan struct{}),
+		// Initialized up front: the read loop clears it when the session ends.
+		notifications: newNotificationContextStore(),
 		// Deliberately much faster than production's real (already-fast)
 		// defaults, so tests exercising pingLoop don't have to wait out a
 		// real production interval to observe a tick.
