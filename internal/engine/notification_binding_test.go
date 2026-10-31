@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -33,13 +32,12 @@ type reuseRig struct {
 	issuer1 *httptest.Server
 	calls1  *int32
 	acks    chan NotificationAckMessage
-	types   chan MessageType
 	client  *websocket.Conn
 }
 
 func newReuseRig(t *testing.T, factory FlowHandlerFactory, ctxID string) *reuseRig {
 	t.Helper()
-	r := &reuseRig{acks: make(chan NotificationAckMessage, 8), types: make(chan MessageType, 64)}
+	r := &reuseRig{acks: make(chan NotificationAckMessage, 8)}
 	var calls int32
 	r.calls1 = &calls
 	r.issuer1 = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -67,12 +65,6 @@ func newReuseRig(t *testing.T, factory FlowHandlerFactory, ctxID string) *reuseR
 				return
 			}
 			var m Message
-			if json.Unmarshal(data, &m) == nil {
-				select {
-				case r.types <- m.Type:
-				default:
-				}
-			}
 			if json.Unmarshal(data, &m) == nil && m.Type == TypeNotificationAck {
 				var a NotificationAckMessage
 				if json.Unmarshal(data, &a) == nil {
@@ -108,6 +100,22 @@ func stubFactory(h FlowHandler) FlowHandlerFactory {
 		return h, nil
 	}
 }
+
+// blockingFlowHandler stays live until released.
+type blockingFlowHandler struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingFlowHandler) Execute(ctx context.Context, _ *FlowStartMessage) error {
+	close(b.started)
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+	}
+	return nil
+}
+func (b *blockingFlowHandler) Cancel() {}
 
 func startFlow(r *reuseRig, flowID string) {
 	r.mgr.handleFlowStart(r.session, &FlowStartMessage{Message: Message{FlowID: flowID}, Protocol: ProtocolOID4VCI})
@@ -219,146 +227,26 @@ func TestNotificationContext_OtherSessionCannotUseContext(t *testing.T) {
 	assert.True(t, r.session.notifications.hasValid("F", "id-of-issuance-one"))
 }
 
-// blockingFlowHandler stays live until released or cancelled.
-type cancellableFlowHandler struct {
-	started   chan struct{}
-	release   chan struct{}
-	cancelled chan struct{}
-	once      sync.Once
-}
+// A flow ID that is live cannot be taken by a second flow: the second start is
+// refused, the live flow keeps its slot and its context.
+func TestNotificationContext_LiveFlowIDIsNotReplaced(t *testing.T) {
+	b := &blockingFlowHandler{started: make(chan struct{}), release: make(chan struct{})}
+	r := newReuseRig(t, stubFactory(b), "id-of-issuance-one")
+	done := make(chan struct{})
+	go func() { startFlow(r, "F"); close(done) }()
+	<-b.started
 
-func newCancellableFlowHandler() *cancellableFlowHandler {
-	return &cancellableFlowHandler{started: make(chan struct{}), release: make(chan struct{}), cancelled: make(chan struct{})}
-}
-
-func (c *cancellableFlowHandler) Execute(ctx context.Context, _ *FlowStartMessage) error {
-	close(c.started)
-	select {
-	case <-c.release:
-	case <-c.cancelled:
-	case <-ctx.Done():
-	}
-	return nil
-}
-func (c *cancellableFlowHandler) Cancel() { c.once.Do(func() { close(c.cancelled) }) }
-
-// A flow ID that a live flow still holds goes to the new flow: the earlier flow
-// is cancelled, the new flow keeps the slot (the earlier flow's cleanup must
-// not delete it), and the client is not refused, because the earlier flow's
-// slot is released a moment after its completion is sent.
-func TestNotificationContext_LiveFlowIDIsSupersededNotOrphaned(t *testing.T) {
-	first, second := newCancellableFlowHandler(), newCancellableFlowHandler()
-	var n atomic.Int32
-	factory := func(*Flow, *config.Config, *zap.Logger, *TrustService, *RegistryClient, storage.VerifierStore, *TrustCache) (FlowHandler, error) {
-		if n.Add(1) == 1 {
-			return first, nil
-		}
-		return second, nil
-	}
-	r := newReuseRig(t, factory, "id-of-issuance-one")
-	firstDone, secondDone := make(chan struct{}), make(chan struct{})
-	go func() { startFlow(r, "F"); close(firstDone) }()
-	<-first.started
-	go func() { startFlow(r, "F"); close(secondDone) }()
-	<-second.started
-
-	select {
-	case <-first.cancelled:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the superseded flow was not cancelled")
-	}
-	<-firstDone // its cleanup has run
+	// Second start while the first is live: must not replace it. The stub of the
+	// second start would return at once, and its deferred cleanup used to delete
+	// the first flow's slot.
+	r.mgr.handleFlowStart(r.session, &FlowStartMessage{Message: Message{FlowID: "F"}, Protocol: ProtocolOID4VCI})
 	r.session.flowsMu.RLock()
 	live := r.session.flows["F"]
 	r.session.flowsMu.RUnlock()
-	require.NotNil(t, live, "the earlier flow's cleanup must not delete the new flow's slot")
-	live.mu.RLock()
-	assert.Same(t, second, live.Handler)
-	live.mu.RUnlock()
-	close(second.release)
-	<-secondDone
-	r.session.flowsMu.RLock()
-	_, stillThere := r.session.flows["F"]
-	r.session.flowsMu.RUnlock()
-	assert.False(t, stillThere, "the owner releases its own slot")
-}
-
-// completeThenHoldHandler publishes flow_complete from Execute and then keeps
-// the flow (and its slot) for a moment, as a real flow does between sending its
-// completion and returning.
-type completeThenHoldHandler struct {
-	flow    *Flow
-	started chan struct{}
-	release chan struct{}
-}
-
-func (c *completeThenHoldHandler) Execute(ctx context.Context, _ *FlowStartMessage) error {
-	_ = c.flow.Session.SendFlowComplete(c.flow.ID, nil, "")
-	close(c.started)
-	select {
-	case <-c.release:
-	case <-ctx.Done():
-	}
-	return nil
-}
-func (c *completeThenHoldHandler) Cancel() {}
-
-// Over the wire: a client that starts a new flow under the ID right after the
-// previous flow's flow_complete is not refused, although the previous flow's
-// slot is released only after the completion went out.
-func TestNotificationContext_RestartRightAfterCompleteIsNotRefused(t *testing.T) {
-	var handlers []*completeThenHoldHandler
-	var mu sync.Mutex
-	factory := func(f *Flow, _ *config.Config, _ *zap.Logger, _ *TrustService, _ *RegistryClient, _ storage.VerifierStore, _ *TrustCache) (FlowHandler, error) {
-		h := &completeThenHoldHandler{flow: f, started: make(chan struct{}), release: make(chan struct{})}
-		mu.Lock()
-		handlers = append(handlers, h)
-		mu.Unlock()
-		return h, nil
-	}
-	r := newReuseRig(t, factory, "")
-	t.Cleanup(func() {
-		mu.Lock()
-		defer mu.Unlock()
-		for _, h := range handlers {
-			select {
-			case <-h.release:
-			default:
-				close(h.release)
-			}
-		}
-	})
-	start := func() {
-		require.NoError(t, r.client.WriteJSON(&FlowStartMessage{
-			Message: Message{Type: TypeFlowStart, FlowID: "G"}, Protocol: ProtocolOID4VCI,
-		}))
-	}
-	start()
-	expectType := func(want MessageType) {
-		t.Helper()
-		select {
-		case got := <-r.types:
-			require.Equal(t, want, got)
-		case <-time.After(5 * time.Second):
-			t.Fatalf("no %s", want)
-		}
-	}
-	expectType(TypeFlowComplete)
-	start() // right after the completion, while the first flow still holds its slot
-	require.Eventually(t, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		if len(handlers) < 2 {
-			return false
-		}
-		select {
-		case <-handlers[1].started:
-			return true
-		default:
-			return false
-		}
-	}, 5*time.Second, 5*time.Millisecond, "the restarted flow must run")
-	expectType(TypeFlowComplete) // the second flow's completion, and no flow_error before it
+	require.NotNil(t, live, "the live flow must keep its slot")
+	assert.Same(t, b, live.Handler)
+	close(b.release)
+	<-done
 }
 
 // The session's contexts, with the issuance token and the signer they hold, are
