@@ -194,13 +194,22 @@ func (s *notificationContextStore) useLocked(flowID string, nc *notificationCont
 // forwarded again by the legacy method, and the unused ids stay usable.
 func (s *notificationContextStore) takeForNotification(flowID, notificationID string) *notificationContext {
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	nc, ok := s.ctx[flowID]
-	if ok && nc.principal != "" {
-		defer s.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	if nc.principal != "" {
 		return s.useLocked(flowID, nc, notificationID)
 	}
-	s.mu.Unlock()
-	return s.take(flowID)
+	// A WebSocket context is consumed whole, under the same lock as the lookup: a
+	// context registered between the two (the flow id is reused) is never taken
+	// with it.
+	delete(s.ctx, flowID)
+	if time.Now().After(nc.expiresAt) {
+		return nil
+	}
+	return nc
 }
 
 // wmpEndpointFor is the notification endpoint of the live context of flowID, when

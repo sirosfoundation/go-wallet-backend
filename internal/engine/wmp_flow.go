@@ -643,7 +643,13 @@ func (t *wmpTransport) sendComplete(m *FlowCompleteMessage) error {
 	if !f.terminal.CompareAndSwap(false, true) {
 		return nil // the flow already ended (a malformed selection): one terminal message
 	}
-	result, err := completionResult(m, t.notificationEndpoint(m.FlowID))
+	// Only an issuance completion carries the notification endpoint: a flow id is
+	// reusable, and the retained context is looked up by id alone.
+	endpoint := ""
+	if f.fc.FlowType == openid4x.FlowTypeOID4VCI {
+		endpoint = t.notificationEndpoint(m.FlowID)
+	}
+	result, err := completionResult(m, endpoint)
 	if err != nil {
 		return err
 	}

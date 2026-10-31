@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -244,4 +245,74 @@ func TestNotificationContextStore_Unspend(t *testing.T) {
 		s.unspend("f1", &handed, "n1")
 		assert.NotNil(t, s.take("f1"))
 	})
+}
+
+// A flow id is reusable. A presentation that reuses the flow id of a completed
+// issuance within the context's TTL must not inherit the issuer's notification
+// endpoint: only an issuance completion carries it.
+func TestWMPNotification_OnlyAnIssuanceCompletionCarriesTheEndpoint(t *testing.T) {
+	e := newChanEnv(t, "Bearer", false)
+	registerScripted(e.m, ProtocolOID4VP, func(_ context.Context, f *Flow, _ *FlowStartMessage) error {
+		return f.Session.SendFlowComplete(f.ID, nil, "")
+	})
+	w := e.wallet("alice", fullTAC, "oid4vci", "oid4vp", "credential_notification")
+	done := w.issue("f1")
+	result, _ := rpcParams(done)["result"].(map[string]any)
+	assert.Equal(t, e.iss.endpoint(), result["notification_endpoint"], "the issuance completion carries it")
+
+	r := w.start("oid4vp", "f1", map[string]any{"request_uri": "openid4vp://x"})
+	require.Nil(t, r["error"], "%v", r)
+	vp := w.method(wmp.MethodFlowComplete)
+	result, _ = rpcParams(vp)["result"].(map[string]any)
+	assert.NotContains(t, result, "notification_endpoint", "a presentation does not inherit the issuer's endpoint")
+}
+
+// Looking a context up and consuming it is one step: while another goroutine
+// registers a context for the same flow id, a notification for an absent or WMP
+// context never removes the context that was registered meanwhile. (A race
+// guard: the interleaving of the old two-step code is too narrow to hit on every
+// run, so this does not fail reliably without the change.)
+func TestNotificationContextStore_TakeForNotificationIsAtomic(t *testing.T) {
+	for i := 0; i < 20000; i++ {
+		s := newNotificationContextStore()
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			s.put("f1", &notificationContext{endpoint: "https://i/n", principal: "p"}) // a WMP context that knows no id
+		}()
+		nc := s.takeForNotification("f1", "id-a")
+		<-done
+		s.mu.Lock()
+		_, still := s.ctx["f1"]
+		s.mu.Unlock()
+		if nc != nil {
+			require.True(t, still, "a WMP context is used per id, never removed wholesale (iteration %d)", i)
+		}
+	}
+}
+
+// takeForNotification: absent is nil, a WebSocket context is consumed once and
+// whole, an expired one is consumed and refused, a WMP context is used per id.
+func TestNotificationContextStore_TakeForNotificationCases(t *testing.T) {
+	s := newNotificationContextStore()
+	assert.Nil(t, s.takeForNotification("f1", "n"), "absent")
+
+	s.put("f1", &notificationContext{endpoint: "https://i/n"})
+	require.NotNil(t, s.takeForNotification("f1", "n"))
+	assert.Nil(t, s.takeForNotification("f1", "n"), "a WebSocket context is consumed whole, once")
+
+	s.put("f1", &notificationContext{endpoint: "https://i/n"})
+	s.mu.Lock()
+	s.ctx["f1"].expiresAt = time.Now().Add(-time.Second)
+	s.mu.Unlock()
+	assert.Nil(t, s.takeForNotification("f1", "n"), "expired")
+	s.mu.Lock()
+	_, left := s.ctx["f1"]
+	s.mu.Unlock()
+	assert.False(t, left, "and consumed")
+
+	s.put("f1", &notificationContext{endpoint: "https://i/n", principal: "p"})
+	require.NotNil(t, s.takeForNotification("f1", "id-a"))
+	assert.Nil(t, s.takeForNotification("f1", "id-a"), "per id")
+	assert.NotNil(t, s.takeForNotification("f1", "id-b"), "the context stays for other ids")
 }
