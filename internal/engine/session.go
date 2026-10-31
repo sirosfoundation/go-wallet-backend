@@ -169,7 +169,21 @@ type pendingRequest struct {
 	flowID string
 	sign   chan *SignResponseMessage
 	match  chan *MatchResponseMessage
+	// reply is decided once, by compare-and-swap from replyNone, by whoever
+	// delivers the first reply of a sign request: the wallet (replyWallet) or the
+	// engine's own refusal (replyRefused, see refuseSignRequests). It is decided
+	// whether or not the waiter has taken the reply from the channel yet, and
+	// the winner is readable at once, so overlapping refusals see a refusal
+	// already under way, not a half-set pair of flags.
+	reply atomic.Int32
 }
+
+// Who delivered the first reply of a sign request (pendingRequest.reply).
+const (
+	replyNone int32 = iota
+	replyWallet
+	replyRefused
+)
 
 // trackRequest registers p under messageID until the returned func is called.
 // The func removes the entry, so a reply arriving after completion, timeout or
@@ -792,11 +806,11 @@ func (s *Session) dispatchSignResponse(msg *SignResponseMessage) {
 	if p := s.outstandingRequests[msg.MessageID]; p != nil && p.sign != nil &&
 		(msg.FlowID == "" || msg.FlowID == p.flowID) {
 		owned = true
-		// Cap 1: a duplicate reply finds it full and is dropped silently; the
-		// request has an owner, so UNKNOWN_FLOW (terminal) would be untrue.
-		select {
-		case p.sign <- msg:
-		default:
+		// Only the first reply is delivered (cap 1: it never blocks); a duplicate is
+		// dropped silently, since the request has an owner and UNKNOWN_FLOW
+		// (terminal) would be untrue.
+		if p.reply.CompareAndSwap(replyNone, replyWallet) {
+			p.sign <- msg
 		}
 	}
 	_, flowExists := s.flows[msg.FlowID]
@@ -1738,7 +1752,7 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 	}
 
 	// Wait for response
-	timer := time.NewTimer(3 * time.Minute)
+	timer := time.NewTimer(signResponseTimeout)
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
@@ -1751,6 +1765,10 @@ func (s *Session) RequestSign(ctx context.Context, flowID string, action SignAct
 		return signResult(resp)
 	}
 }
+
+// signResponseTimeout is how long RequestSign waits for the client's
+// sign_response. A variable so a test can shorten it.
+var signResponseTimeout = 3 * time.Minute
 
 // SignError is a sign failure reported by the client, with the client's
 // classification of it. The client's own error text is client-controlled and
@@ -1771,7 +1789,7 @@ func (e *SignError) Error() string {
 // Anything else is client-controlled text that could end up in logs (Error()
 // prints the code), so it is dropped.
 func allowedSignErrorCode(c ErrorCode) ErrorCode {
-	if c == ErrCodeUnsupportedTransactionData {
+	if c == ErrCodeUnsupportedTransactionData || c == ErrCodeSignRefused {
 		return c
 	}
 	return ""

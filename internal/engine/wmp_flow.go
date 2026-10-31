@@ -204,6 +204,12 @@ func (p *wmpFlowProfile) run(protocol Protocol) wmp.FlowFunc {
 		// its first step: ctx is the engine's.
 		p.a.manager.handleFlowStartContext(ctx, ws.session, start)
 
+		if !f.terminal.Load() && parent.Err() == nil && f.malformed.Load() {
+			// A refused sign request ended the flow without an engine message of
+			// its own: it ends with the terminal -32602 all the same.
+			f.endMalformed()
+			return nil
+		}
 		if !f.terminal.Load() && parent.Err() == nil {
 			// The engine ended the flow without a result (it timed out, or ended
 			// silently); the client was not cancelled, so go-wmp tells it.
@@ -265,7 +271,26 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 		// (the verifier is told access_denied). Once the selection was handed over,
 		// or before the flow asks for one, nothing would consume the decline: the
 		// action would be acknowledged and the flow run on to submit the
-		// presentation. It cancels the flow and its sub-flows instead.
+		// presentation. A pending sign request is refused (the verifier is told
+		// access_denied); without one it cancels the flow and its sub-flows.
+		f.refuseMu.Lock()
+		refused := f.cancelRefused.Load() || f.malformed.Load() || ws.session.refuseSignRequests(params.FlowID)
+		if refused {
+			f.cancelRefused.Store(true)
+		}
+		f.refuseMu.Unlock()
+		if refused {
+			// The sign request that is pending is refused: the engine tells the
+			// verifier access_denied and the flow ends with its terminal message,
+			// as for any other refusal of a sign request. A refusal already being
+			// carried out (by an earlier cancel or malformed action, whose pending
+			// entry is gone while the verifier is being told) is left running: a
+			// repeated cancel must not cut it short.
+			return &wmp.FlowActionResult{
+				WMP:    wmp.Metadata{Version: wmp.Version, SessionID: p.sessionID},
+				FlowID: params.FlowID, Action: params.Action, Status: "accepted",
+			}, nil
+		}
 		out = &actionOutcome{Cancel: true}
 	}
 	if out.Cancel {
@@ -287,6 +312,38 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 		Action: params.Action,
 		Status: "accepted",
 	}, nil
+}
+
+// refuseSignRequests answers every sign request pending for flowID with
+// SIGN_REFUSED and reports whether it did: true only if every pending request
+// took the refusal. A request the wallet has already answered (its result is
+// buffered, or the waiter has taken it and is submitting) is not refused: the
+// first reply wins, decided once by the request's reply state, so the caller has to
+// end the flow another way.
+func (s *Session) refuseSignRequests(flowID string) bool {
+	s.flowsMu.RLock()
+	defer s.flowsMu.RUnlock()
+	refused := false
+	for id, p := range s.outstandingRequests {
+		if p.flowID != flowID || p.sign == nil {
+			continue
+		}
+		if !p.reply.CompareAndSwap(replyNone, replyRefused) {
+			if p.reply.Load() == replyRefused {
+				// Already refused by an earlier (or overlapping) malformed action:
+				// that refusal is being carried out, not cut short.
+				refused = true
+				continue
+			}
+			return false // the wallet's result came first
+		}
+		p.sign <- &SignResponseMessage{
+			Message:   Message{Type: TypeSignResponse, FlowID: flowID, MessageID: id},
+			ErrorCode: ErrCodeSignRefused,
+		}
+		refused = true
+	}
+	return refused
 }
 
 // declineCannotBeConsumed reports whether out is the decline an oid4vp cancel
@@ -347,8 +404,15 @@ func (p *wmpFlowProfile) refuseSelection(ws *wmpSession, f *wmpFlow, flowID stri
 	if !awaiting {
 		// The flow is not waiting for the selection (it is signing, or
 		// submitting): nothing would consume the decline and the flow would
-		// run on. It ends now, with the same terminal -32602.
-		f.endMalformed()
+		// run on. A pending sign request is refused, so the engine tells the
+		// verifier access_denied and the flow ends with the terminal -32602;
+		// without one the flow ends now, with the same terminal -32602.
+		f.refuseMu.Lock()
+		refused := f.cancelRefused.Load() || ws.session.refuseSignRequests(flowID)
+		f.refuseMu.Unlock()
+		if !refused {
+			f.endMalformed()
+		}
 	}
 }
 
@@ -397,6 +461,16 @@ type wmpFlow struct {
 	// refuses: the flow is declined, and ends -32602 with no data (OpenID4x
 	// 3.2.3.1), not as an ordinary decline.
 	malformed atomic.Bool
+	// cancelRefused is set when a cancel by action refused the pending sign
+	// request: the refusal (the verifier being told access_denied) is being carried
+	// out, and a repeated cancel must leave it running.
+	cancelRefused atomic.Bool
+	// refuseMu makes the decision "is a refusal already running, else refuse the
+	// pending sign request, and say so" one step for a cancel and a malformed
+	// selection: the pending request's entry is removed as soon as the refusal is
+	// delivered, so a second decision that ran between the delivery and the flag
+	// would find neither and cut the verifier's notification short.
+	refuseMu sync.Mutex
 
 	// mu guards what the translation of the flow's steps records for its later
 	// actions: the configuration ids of the offer awaiting acceptance (the
@@ -769,7 +843,8 @@ func normalizeSignResult(raw json.RawMessage) json.RawMessage {
 }
 
 // signFailure is the engine's view of a failed sign sub-flow. Wallet text and
-// data never travel on: the engine keeps only the allowlisted code. A wallet
+// data never travel on: the engine keeps only the allowlisted code
+// (SIGN_REFUSED for a rejection, UNSUPPORTED_TRANSACTION_DATA below). A wallet
 // that cannot process the request's transaction_data answers -31005
 // {"unsupported":"transaction_data"}; the OID4VP flow uses it to tell the
 // verifier.
@@ -779,6 +854,13 @@ func signFailure(m *SignRequestMessage, err error) *SignResponseMessage {
 		Error:   "sign sub-flow failed",
 	}
 	var sfe *wmp.SubFlowError
+	if errors.As(err, &sfe) && sfe.Rejected() {
+		// The wallet declined (Core 6.2, data.reason "rejected"): not a failure,
+		// so the OID4VP flow answers the verifier access_denied with no
+		// description and ends -31006 (OpenID4x 3.2.6).
+		resp.Error, resp.ErrorCode = "", ErrCodeSignRefused
+		return resp
+	}
 	if errors.As(err, &sfe) && sfe.Code == wmp.ErrCapabilityNotSupported {
 		var d struct {
 			Unsupported string `json:"unsupported"`
