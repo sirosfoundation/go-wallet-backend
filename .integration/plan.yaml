@@ -1,0 +1,26 @@
+version: 2
+base:
+  repo: sirosfoundation/go-wallet-backend
+  ref: 373e79597787c2e42a2dab2b65e6301bb312d90f
+steps:
+- merge: sirosfoundation/go-wallet-backend#163
+- merge: sirosfoundation/go-wallet-backend#472
+- pick:
+    from: sirosfoundation/go-wallet-backend:ci/integration-workflow
+    commits:
+    - 2ad1d4ff44fb856267227ba280e894e119c6ad9e
+builds:
+- name: engine
+  kind: docker
+  image: sirosfoundation/integration/go-wallet-backend
+  dockerfile: ./Dockerfile
+  build_args:
+  - VERSION=0.24.0-wmp-integration
+locked:
+  base_sha: 373e79597787c2e42a2dab2b65e6301bb312d90f
+  steps:
+  - head: 1d2b1da7fe8e8dc21a842d38221f976c004ede42
+  - head: a370eaad517311032975a2ebb119e0d6fd3261d6
+  - head: 2ad1d4ff44fb856267227ba280e894e119c6ad9e
+    commits:
+    - 2ad1d4ff44fb856267227ba280e894e119c6ad9e
