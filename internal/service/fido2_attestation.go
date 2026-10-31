@@ -26,12 +26,17 @@ var (
 )
 
 // FIDO2AttestationRequest contains the raw evidence captured by the
-// WSCD FIDO2 (previewSign) plugin at key-creation time (see
-// siros-wscd-manager's AttestationChain: certificates[0] is the raw CTAP2
-// makeCredential attestation object, client_data_hash is the value its
-// signature was computed over — there is no browser in this flow, so it's
-// not a real WebAuthn clientDataJSON, just the raw 32-byte hash CTAP2's
-// authenticatorMakeCredential itself takes as an argument).
+// WSCD "fido2" plugin (formerly named "previewSign") at key-creation time.
+// In siros-wscd-manager's AttestationChain this plugin reports
+// format: Opaque, with the raw CTAP2 makeCredential attestation object in
+// opaque_attestation (certificates is empty — it used to be stuffed into
+// certificates under a false X509Chain label; that was fixed at the
+// wscd-manager/SDK level, not here: this service never sees that Rust
+// struct, only the bytes the SDK already extracts and forwards over this
+// package's own stable HTTP API). client_data_hash is the value the
+// attestation signature was computed over — there is no browser in this
+// flow, so it's not a real WebAuthn clientDataJSON, just the raw 32-byte
+// hash CTAP2's authenticatorMakeCredential itself takes as an argument.
 type FIDO2AttestationRequest struct {
 	// WalletInstanceID is the JWK Thumbprint of the instance this key
 	// belongs to (see domain.WalletInstance.ID).

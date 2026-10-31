@@ -786,7 +786,7 @@ func TestSendNotification_DPoPHTUHasNoQuery(t *testing.T) {
 	}))
 	defer issuer.Close()
 	nc := &notificationContext{endpoint: issuer.URL + "/n?x=1#frag", accessToken: "t", tokenType: "DPoP",
-		dpopSigner: dpopSignerFunc(func(_ context.Context, htm, htu, _, _ string) (string, error) {
+		dpopSigner: htuSignerFunc(func(_ context.Context, htm, htu, _, _ string) (string, error) {
 			gotHTU.Store(htu)
 			return "proof", nil
 		})}
@@ -794,9 +794,9 @@ func TestSendNotification_DPoPHTUHasNoQuery(t *testing.T) {
 	assert.Equal(t, issuer.URL+"/n", gotHTU.Load())
 }
 
-type dpopSignerFunc func(ctx context.Context, htm, htu, accessToken, nonce string) (string, error)
+type htuSignerFunc func(ctx context.Context, htm, htu, accessToken, nonce string) (string, error)
 
-func (f dpopSignerFunc) Proof(ctx context.Context, htm, htu, accessToken, nonce string) (string, error) {
+func (f htuSignerFunc) Proof(ctx context.Context, htm, htu, accessToken, nonce string) (string, error) {
 	return f(ctx, htm, htu, accessToken, nonce)
 }
 
