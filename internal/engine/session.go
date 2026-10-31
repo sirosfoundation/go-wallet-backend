@@ -1612,7 +1612,8 @@ func (m *Manager) dispatchCredentialNotification(session *Session, msg *Credenti
 	// Reject (without consuming) when there is no live context for the flow or
 	// the supplied notification_id does not match the issued one. This keeps
 	// invalid requests out of the bounded async path.
-	if !session.notifications.hasValid(msg.FlowID, msg.NotificationID) {
+	seq, valid := session.notifications.validGeneration(msg.FlowID, msg.NotificationID)
+	if !valid {
 		logger.Debug("no matching notification context for flow (absent, expired, or id mismatch)")
 		_ = session.SendNotificationAck(msg.FlowID, msg.NotificationID, "rejected", "notification context unavailable")
 		return
@@ -1632,7 +1633,7 @@ func (m *Manager) dispatchCredentialNotification(session *Session, msg *Credenti
 
 	go func() {
 		defer func() { <-m.notificationSem }()
-		m.forwardCredentialNotification(session, msg, logger)
+		m.forwardCredentialNotification(session, msg, seq, logger)
 	}()
 }
 
@@ -1641,14 +1642,14 @@ func (m *Manager) dispatchCredentialNotification(session *Session, msg *Credenti
 // invoked only after dispatchCredentialNotification has validated the request.
 // No credential data is stored or looked up; the backend remains zero-knowledge
 // about credential contents.
-func (m *Manager) forwardCredentialNotification(session *Session, msg *CredentialNotificationMessage, logger *zap.Logger) {
+func (m *Manager) forwardCredentialNotification(session *Session, msg *CredentialNotificationMessage, seq uint64, logger *zap.Logger) {
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Error("Panic in credential notification handler", zap.Any("panic", r))
 		}
 	}()
 
-	nc := session.notifications.take(msg.FlowID)
+	nc := session.notifications.takeGeneration(msg.FlowID, seq)
 	if nc == nil {
 		// Raced with TTL expiry or another in-flight notification for the same
 		// flow consumed the one-shot context.

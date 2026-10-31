@@ -165,13 +165,43 @@ func (s *notificationContextStore) take(flowID string) *notificationContext {
 // engine cannot read the notification_id, registers the context with an empty
 // id and the client supplies the real one (see registerNotificationContext).
 func (s *notificationContextStore) hasValid(flowID, notificationID string) bool {
+	_, ok := s.validGeneration(flowID, notificationID)
+	return ok
+}
+
+// validGeneration is hasValid that also returns the registration the check was
+// made against, so the worker that forwards the notification later takes that
+// registration and no other (see takeGeneration).
+func (s *notificationContextStore) validGeneration(flowID, notificationID string) (uint64, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	nc, ok := s.ctx[flowID]
 	if !ok || time.Now().After(nc.expiresAt) {
-		return false
+		return 0, false
 	}
-	return nc.notificationID == "" || nc.notificationID == notificationID
+	if nc.notificationID != "" && nc.notificationID != notificationID {
+		return 0, false
+	}
+	return nc.seq, true
+}
+
+// takeGeneration is take for one registration: it removes and returns the
+// context of flowID only while it is still the registration with this seq. The
+// check of a notification and its forwarding are separate steps (the worker
+// runs later), and the flow ID may have been reused in between; a newer
+// registration is neither used for the old notification nor consumed by it.
+func (s *notificationContextStore) takeGeneration(flowID string, seq uint64) *notificationContext {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	nc, ok := s.ctx[flowID]
+	if !ok || nc.seq != seq {
+		return nil
+	}
+	delete(s.ctx, flowID)
+	if time.Now().After(nc.expiresAt) {
+		return nil
+	}
+	return nc
 }
 
 // restore puts back a context that take removed but whose notification never

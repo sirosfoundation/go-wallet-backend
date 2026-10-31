@@ -306,3 +306,36 @@ func TestNotificationContextStore_Invalidate_PrunesExpiredHistory(t *testing.T) 
 	assert.False(t, oldKept, "an expired generation must be pruned")
 	assert.True(t, newKept)
 }
+
+// A notification is checked on the read loop and forwarded by a worker that
+// runs later. If the flow ID is reused in between and the new issuance
+// registers a context, the worker must neither send the old notification with
+// the new issuance's token nor consume the new context.
+func TestNotificationContext_DelayedWorker_DoesNotUseOrConsumeReplacement(t *testing.T) {
+	r := newReuseRig(t, stubFactory(stubFlowHandler{}), "")
+	issuer2, calls2 := newCountingIssuer(t)
+	msg := &CredentialNotificationMessage{
+		Message:        Message{Type: TypeCredentialNotification, FlowID: "F"},
+		NotificationID: "id-of-issuance-one",
+		Event:          notificationEventAccepted,
+	}
+	seq, ok := r.session.notifications.validGeneration("F", msg.NotificationID)
+	require.True(t, ok) // the check the read loop made
+
+	// The flow ID changes hands and the new issuance registers a blind context.
+	startFlow(r, "F")
+	r.session.notifications.put("F", &notificationContext{
+		endpoint: issuer2.URL, accessToken: "token-of-issuer-2", tokenType: "Bearer",
+	})
+
+	r.mgr.forwardCredentialNotification(r.session, msg, seq, zap.NewNop()) // the delayed worker
+	select {
+	case a := <-r.acks:
+		assert.Equal(t, "rejected", a.Status)
+	case <-time.After(5 * time.Second):
+		t.Fatal("no notification_ack")
+	}
+	assert.Equal(t, int32(0), atomic.LoadInt32(r.calls1))
+	assert.Equal(t, int32(0), atomic.LoadInt32(calls2), "the replacement's issuer must not receive the old notification")
+	assert.True(t, r.session.notifications.hasValid("F", "the-new-issuances-id"), "the replacement context must survive")
+}
