@@ -7,10 +7,6 @@ import (
 	"math"
 	"strconv"
 	"strings"
-
-	"go.uber.org/zap"
-
-	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
 // Reason classes for a consent that does not fit the DCQL query. These are
@@ -290,35 +286,6 @@ func allAllowed(m claimPathMatcher, disclosed []string) bool {
 		}
 	}
 	return true
-}
-
-// vetConsent applies the configured dcql_consent_check to a consent. It
-// returns a non-nil error only when the presentation must be refused; in warn
-// mode a violation is logged and nil returned. The log carries the reason
-// class and query id only.
-func (h *OID4VPHandler) vetConsent(authReq *AuthorizationRequest, selected []ConsentSelection) error {
-	mode := config.DCQLConsentCheckWarn
-	if h.Config != nil {
-		mode = h.Config.Presentation.DCQLConsentCheck.Effective()
-	}
-	if mode == config.DCQLConsentCheckOff || len(authReq.DCQLQuery) == 0 {
-		return nil
-	}
-	v, err := checkConsentAgainstDCQL(authReq.DCQLQuery, selected)
-	if err != nil {
-		v = &consentViolation{Reason: consentReasonUnparseable}
-	}
-	if v == nil {
-		return nil
-	}
-	if mode == config.DCQLConsentCheckEnforce {
-		h.Logger.Warn("consent refused: does not fit the DCQL query",
-			zap.String("reason", v.Reason), zap.String("credential_query_id", loggableID(v.QueryID)))
-		return v
-	}
-	h.Logger.Warn("consent does not fit the DCQL query (warn mode, proceeding)",
-		zap.String("reason", v.Reason), zap.String("credential_query_id", loggableID(v.QueryID)))
-	return nil
 }
 
 // loggableID bounds a query id taken from the verifier's DCQL query before it

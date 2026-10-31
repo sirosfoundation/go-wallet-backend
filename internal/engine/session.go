@@ -101,12 +101,23 @@ type Session struct {
 	// TAC is the token's TAC claim. Empty means no permissions: handleFlowStart
 	// refuses any protocol with a required permission (fail closed), exactly as
 	// the HTTP routes' MustHaveTAC does.
-	TAC     claims.TAC
-	conn    *websocket.Conn
-	sendMu  sync.Mutex
-	flows   map[string]*Flow
-	flowsMu sync.RWMutex
-	logger  *zap.Logger
+	TAC  claims.TAC
+	conn *websocket.Conn
+	// transport, when set, carries the session instead of conn: the session is
+	// driven by an in-process or non-WebSocket transport (WMP, see wmp.go) and
+	// conn is nil. Send writes to it and closeConn closes it.
+	transport SessionTransport
+	sendMu    sync.Mutex
+	flows     map[string]*Flow
+	flowsMu   sync.RWMutex
+	logger    *zap.Logger
+
+	// ended is set by endSession under flowsMu before it scans flows; a path
+	// that publishes a flow checks it under the same lock, so a flow is either
+	// seen by the cancellation scan or refused. endOnce makes endSession
+	// idempotent (a read loop and a transport adapter can both end the session).
+	ended   bool
+	endOnce sync.Once
 
 	// closeCh is closed when the session ends and releases every waiter.
 	// Client messages are routed by the read loop straight to their owner (a
@@ -119,6 +130,11 @@ type Session struct {
 	// credential lifecycle event to the issuer using the issuance access token,
 	// without persisting anything.
 	notifications *notificationContextStore
+
+	// consentObserver, when set by the session's transport, is told when a
+	// flow awaits a consent and how it was decided (see consent.go). Nil over
+	// WebSocket.
+	consentObserver consentObserver
 
 	// stopPing signals the ping goroutine to exit.
 	stopPing chan struct{}
@@ -820,19 +836,44 @@ func truncateForLog(s string, n int) string {
 	return s
 }
 
-func (m *Manager) handleSession(session *Session) {
-	defer func() {
-		session.logClosed(closeReasonReadError)
-		close(session.stopPing) // stop the ping goroutine
-		close(session.closeCh)
-		// Cancel all active flows
-		session.flowsMu.Lock()
-		for _, flow := range session.flows {
+// endSession ends the session: it stops the ping goroutine (when there is
+// one), releases every waiter on closeCh and cancels all active flows.
+// Idempotent, and shared by every transport.
+func (s *Session) endSession() {
+	s.endOnce.Do(func() {
+		if s.stopPing != nil {
+			close(s.stopPing)
+		}
+		if s.closeCh != nil {
+			close(s.closeCh)
+		}
+		s.flowsMu.Lock()
+		s.ended = true
+		for _, flow := range s.flows {
 			if flow.Handler != nil {
 				flow.Handler.Cancel()
 			}
 		}
-		session.flowsMu.Unlock()
+		s.flowsMu.Unlock()
+	})
+}
+
+// closeConn closes whatever carries the session: its transport, or the
+// WebSocket connection.
+func (s *Session) closeConn() {
+	if s.transport != nil {
+		_ = s.transport.Close()
+		return
+	}
+	if s.conn != nil {
+		_ = s.conn.Close()
+	}
+}
+
+func (m *Manager) handleSession(session *Session) {
+	defer func() {
+		session.logClosed(closeReasonReadError)
+		session.endSession()
 	}()
 
 	for {
@@ -913,6 +954,13 @@ var requiredTACForProtocol = map[Protocol]string{
 }
 
 func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
+	m.handleFlowStartContext(context.Background(), session, msg)
+}
+
+// handleFlowStartContext is handleFlowStart whose flow ends with parent: a
+// transport that can cancel a flow (WMP) cancels it from the first step on,
+// not only once the flow's handler exists.
+func (m *Manager) handleFlowStartContext(parent context.Context, session *Session, msg *FlowStartMessage) {
 	flowID := msg.FlowID
 	if flowID == "" {
 		flowID = uuid.New().String()
@@ -959,24 +1007,17 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	}
 
 	// Check concurrent flow limit and register atomically to prevent race condition.
-	// We hold the lock from check through registration to ensure atomic check-and-add.
-	session.flowsMu.Lock()
-	pendingFlows := len(session.flows)
-	if pendingFlows >= MaxPendingFlowsPerSession {
-		session.flowsMu.Unlock()
+	flow, err := session.reserveFlow(flowID, msg.Protocol, false)
+	switch {
+	case errors.Is(err, errSessionEnded):
+		logger.Debug("Rejected flow start - session ended")
+		return
+	case err != nil:
 		_ = session.SendFlowError(flowID, "", ErrCodeTooManyRequests, "Too many pending flows. Complete or cancel existing flows before starting new ones.")
 		logger.Warn("Rejected flow start - too many pending flows",
-			zap.Int("pending_flows", pendingFlows),
 			zap.Int("limit", MaxPendingFlowsPerSession))
 		return
 	}
-
-	// Create flow while still holding lock
-	flow := newFlow(flowID, msg.Protocol, session)
-
-	// Register flow immediately to reserve slot
-	session.flows[flowID] = flow
-	session.flowsMu.Unlock()
 
 	// Create handler (after releasing lock to avoid holding it during potentially slow operations)
 	handler, err := factory(flow, m.cfg, logger, m.trustService, m.registryClient, m.verifierStore, m.trustCache)
@@ -989,7 +1030,10 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		logger.Error("Failed to create handler", zap.Error(err))
 		return
 	}
+	// Under flowsMu: endSession and cancelFlow read Handler under it.
+	session.flowsMu.Lock()
 	flow.Handler = handler
+	session.flowsMu.Unlock()
 
 	defer func() {
 		session.flowsMu.Lock()
@@ -998,7 +1042,7 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 	}()
 
 	// Execute flow
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(parent, 5*time.Minute)
 	defer cancel()
 
 	logger.Info("Starting flow")
@@ -1008,6 +1052,41 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 		return
 	}
 	logger.Info("Flow completed")
+}
+
+var (
+	errSessionEnded = errors.New("session ended")
+	errTooManyFlows = errors.New("too many pending flows")
+	errFlowIDInUse  = errors.New("flow id in use")
+)
+
+// reserveFlow checks the per-session limit of concurrent flows and registers the
+// flow in one step under the lock, so the check and the slot cannot be split by a
+// race; the caller releases the slot with releaseFlow. With rejectDuplicate a
+// flow_id that is already registered is refused (errFlowIDInUse) instead of
+// replaced.
+func (s *Session) reserveFlow(flowID string, protocol Protocol, rejectDuplicate bool) (*Flow, error) {
+	s.flowsMu.Lock()
+	defer s.flowsMu.Unlock()
+	if s.ended {
+		return nil, errSessionEnded
+	}
+	if len(s.flows) >= MaxPendingFlowsPerSession {
+		return nil, errTooManyFlows
+	}
+	if _, taken := s.flows[flowID]; taken && rejectDuplicate {
+		return nil, errFlowIDInUse
+	}
+	flow := newFlow(flowID, protocol, s)
+	s.flows[flowID] = flow
+	return flow, nil
+}
+
+// releaseFlow gives a flow's slot back.
+func (s *Session) releaseFlow(flowID string) {
+	s.flowsMu.Lock()
+	delete(s.flows, flowID)
+	s.flowsMu.Unlock()
 }
 
 // checkSharedRevocation consults the shared revocation store before
@@ -1091,7 +1170,7 @@ func (m *Manager) registerSession(session *Session) bool {
 		if existing, ok := m.userIndex[session.userKey()]; ok {
 			m.logSuperseding(existing, session)
 			existing.markClosing(closeReasonSuperseded, session.ID)
-			_ = existing.conn.Close()
+			existing.closeConn()
 			delete(m.sessions, existing.ID)
 			// Also remove from persistent store
 			if m.sessionStore != nil {
@@ -1155,19 +1234,38 @@ func (m *Manager) unregisterSession(session *Session) {
 // revocation check that could not be run to completion must never read as
 // "not revoked").
 func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID, tenantID string, tac claims.TAC, err error) {
-	if err := ctx.Err(); err != nil {
-		return "", "", "", fmt.Errorf("token validation aborted: %w", err)
-	}
-	if m.tokenValidator == nil {
-		return "", "", "", errors.New("no token validator configured")
-	}
-	result, err := m.tokenValidator.Validate(ctx, tokenString)
+	id, err := m.validateTokenAuth(ctx, tokenString)
 	if err != nil {
 		return "", "", "", err
 	}
+	return id.UserID, id.TenantID, id.TAC, nil
+}
+
+// tokenIdentity is what a validated token says about its holder.
+type tokenIdentity struct {
+	UserID   string
+	TenantID string
+	// TAC is the token's authorized capabilities; empty means none.
+	TAC claims.TAC
+	// JTI tells anonymous tokens (empty UserID) apart; may be empty.
+	JTI string
+}
+
+// validateTokenAuth is validateToken that also returns the token's jti.
+func (m *Manager) validateTokenAuth(ctx context.Context, tokenString string) (tokenIdentity, error) {
+	if err := ctx.Err(); err != nil {
+		return tokenIdentity{}, fmt.Errorf("token validation aborted: %w", err)
+	}
+	if m.tokenValidator == nil {
+		return tokenIdentity{}, errors.New("no token validator configured")
+	}
+	result, err := m.tokenValidator.Validate(ctx, tokenString)
+	if err != nil {
+		return tokenIdentity{}, err
+	}
 	// The engine transport needs a wallet-registry or wallet-backend audience, nothing broader.
 	if !result.HasAudience("wallet-registry", "wallet-backend") {
-		return "", "", "", errors.New("token audience not permitted for engine transport")
+		return tokenIdentity{}, errors.New("token audience not permitted for engine transport")
 	}
 	// Per-jti revocation happens inside Validate; user-level revocation does not (the checker only
 	// sees a jti), so check the optional TokenBlacklist and the engine's own revokedUsers (#403).
@@ -1175,18 +1273,18 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 		revoked, err := m.blacklist.IsUserRevoked(ctx, result.UserID)
 		if err != nil {
 			m.logger.Error("Handshake refused: revocation check failed", zap.Error(err))
-			return "", "", "", errRevocationUnavailable
+			return tokenIdentity{}, errRevocationUnavailable
 		}
 		if revoked {
-			return "", "", "", errors.New("token has been revoked")
+			return tokenIdentity{}, errors.New("token has been revoked")
 		}
 	}
 	if m.isUserRevoked(result.UserID) {
-		return "", "", "", errors.New("token has been revoked")
+		return tokenIdentity{}, errors.New("token has been revoked")
 	}
 	// UserID may be empty for anonymous tokens — that is acceptable. A token
 	// without a tenant_id claim belongs to the default tenant (see normalizeTenant).
-	return result.UserID, normalizeTenant(result.TenantID), result.TAC, nil
+	return tokenIdentity{UserID: result.UserID, TenantID: normalizeTenant(result.TenantID), TAC: result.TAC, JTI: result.JTI}, nil
 }
 
 func (m *Manager) getCapabilities() []string {
@@ -1368,12 +1466,15 @@ func (m *Manager) CloseUserSessions(userID string, reason string) int {
 // this call regardless of whether it succeeds, and Close is unconditional.
 func (s *Session) closeWithReason(reason string) {
 	s.markClosing(closeReasonFromText(reason), "")
-	_ = s.conn.WriteControl(
-		websocket.CloseMessage,
-		websocket.FormatCloseMessage(websocket.ClosePolicyViolation, reason),
-		time.Now().Add(time.Second),
-	)
-	_ = s.conn.Close()
+	if s.conn != nil && s.transport == nil {
+		_ = s.conn.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.ClosePolicyViolation, reason),
+			time.Now().Add(time.Second),
+		)
+	}
+	// A transport session has no close frame; closing it ends the session.
+	s.closeConn()
 }
 
 // Close closes all sessions
@@ -1383,7 +1484,7 @@ func (m *Manager) Close() {
 
 	for _, session := range m.sessions {
 		session.markClosing(closeReasonServerShutdown, "")
-		_ = session.conn.Close()
+		session.closeConn()
 	}
 	m.sessions = make(map[string]*Session)
 	m.userIndex = make(map[userKey]*Session)
@@ -1406,6 +1507,9 @@ func (m *Manager) IsHealthy() bool {
 
 // Send sends a message to the client
 func (s *Session) Send(msg interface{}) error {
+	if s.transport != nil {
+		return s.transport.SendJSON(msg)
+	}
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
 	return s.conn.WriteJSON(msg)

@@ -1285,6 +1285,8 @@ func (c *CORSConfig) SetDefaults() {
 			"If-None-Match", "X-Private-Data-If-Match", "X-Private-Data-If-None-Match",
 			"Upgrade", "Connection", "Sec-WebSocket-Key",
 			"Sec-WebSocket-Version", "Sec-WebSocket-Protocol",
+			// WMP over HTTP+SSE: the session header and the SSE resume cursor.
+			"Wmp-Session-Id", "Last-Event-ID",
 		}
 	}
 	if len(c.ExposedHeaders) == 0 {
@@ -1301,7 +1303,7 @@ type ExternalURLsConfig struct {
 	// BackendURL is the external URL for the backend service (for engine → backend calls)
 	BackendURL string `yaml:"backend_url" envconfig:"BACKEND_URL"`
 
-	// EngineURL is the external URL for the engine service (for WebSocket connections)
+	// EngineURL is the external URL for the engine service (for WebSocket connections). WMP discovery requires wss:// (or https://); ws:// and http:// are accepted only for loopback hosts. WMP session state is process-local: with more than one engine replica the load balancer must keep each client on one replica (see docs/DEPLOYMENT.md, "WMP session affinity")
 	EngineURL string `yaml:"engine_url" envconfig:"ENGINE_URL"`
 
 	// RegistryURL is the external URL for the registry service (for VCTM lookups)
