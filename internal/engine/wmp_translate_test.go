@@ -167,7 +167,7 @@ func TestWMPTranslate_ProgressPayloads(t *testing.T) {
 func TestWMPTranslate_CompletionHasNoEnvelope(t *testing.T) {
 	m := &FlowCompleteMessage{Message: Message{Type: TypeFlowComplete, FlowID: "f1", MessageID: "m", Timestamp: Now()},
 		RedirectURI: "https://v/done", Credentials: []CredentialResult{{Format: "dc+sd-jwt", Credential: "c"}}}
-	raw, err := completionResult(m)
+	raw, err := completionResult(m, "")
 	require.NoError(t, err)
 	res := map[string]interface{}{}
 	require.NoError(t, json.Unmarshal(raw, &res))

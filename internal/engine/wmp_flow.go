@@ -55,6 +55,9 @@ func newWMPFlowProfile(a *WMPAdapter, sessionID string) *wmpFlowProfile {
 			p.Handle(flowType, p.run(protocol))
 		}
 	}
+	if _, ok := a.manager.flowHandlers[ProtocolOID4VCI]; ok {
+		p.Handle(openid4x.FlowTypeCredentialNotification, p.runNotification())
+	}
 	return p
 }
 
@@ -66,6 +69,10 @@ func (p *wmpFlowProfile) Init(pc wmp.PeerContext) error {
 	}
 	if mw, ok := pc.(interface{ UseMiddleware(wmp.Middleware) }); ok {
 		mw.UseMiddleware(p.guard.middleware)
+		// A credential_notification start the session did not negotiate is -31005
+		// and invalid params are -32602, as the response to the start (an
+		// AsyncFlowProfile does not consult RequiredCapability).
+		mw.UseMiddleware(openid4x.NotificationStartMiddleware(notificationEvents))
 	}
 	if ws := p.a.session(p.sessionID); ws != nil {
 		ws.tr.setPeer(pc)
@@ -78,6 +85,9 @@ func (p *wmpFlowProfile) Init(pc wmp.PeerContext) error {
 func (p *wmpFlowProfile) RequiredCapability(flowType string) string {
 	if _, ok := wmpFlowTypes[flowType]; ok {
 		return flowType
+	}
+	if flowType == openid4x.FlowTypeCredentialNotification {
+		return openid4x.CapabilityCredentialNotification
 	}
 	return ""
 }
@@ -242,6 +252,10 @@ func (p *wmpFlowProfile) HandleAction(_ context.Context, params *wmp.FlowActionP
 		return nil, wmp.NewRPCError(wmp.ErrFlowError, map[string]string{"reason": "flow not found or already completed"})
 	}
 
+	if nf := ws.tr.flow(params.FlowID); nf != nil && nf.fc.FlowType == openid4x.FlowTypeCredentialNotification {
+		// The credential_notification flow has no actions (OpenID4x 3.4).
+		return nil, errInvalidParams("unknown action for flow type")
+	}
 	flowType := wmpFlowTypeOf(ws, params.FlowID)
 	if err := openid4x.ValidateAction(flowType, params.Action); err != nil {
 		return nil, err
@@ -509,6 +523,33 @@ func (t *wmpTransport) peerContext() wmp.PeerContext {
 	return t.peer
 }
 
+// bindNotification implements notificationBinder. The issuance context
+// is kept only when the session negotiated credential_notification (WMP
+// OpenID4x 2.4, 3.4: nothing is retained for a wallet that will not use it),
+// bound to the principal that ran the issuance. A flow without a principal in
+// its context retains nothing (fail closed).
+func (t *wmpTransport) bindNotification(ctx context.Context) (string, bool) {
+	p, ok := wmp.PrincipalFromContext(ctx)
+	if !ok || p.Key() == "" {
+		return "", false
+	}
+	sess, found := t.a.svc.Store().Get(t.id)
+	if !found || sess.IsExpired() || !sess.HasCapability(openid4x.CapabilityCredentialNotification) {
+		return "", false
+	}
+	return p.Key(), true
+}
+
+// notificationEndpoint is the issuer's notification endpoint of the context the
+// engine retained for the issuance flow, or "".
+func (t *wmpTransport) notificationEndpoint(flowID string) string {
+	ws := t.a.session(t.id)
+	if ws == nil || ws.session.notifications == nil {
+		return ""
+	}
+	return ws.session.notifications.wmpEndpointFor(flowID)
+}
+
 // consentAwaited implements consentObserver.
 func (t *wmpTransport) consentAwaited(flowID string) {
 	if f := t.flow(flowID); f != nil {
@@ -602,7 +643,13 @@ func (t *wmpTransport) sendComplete(m *FlowCompleteMessage) error {
 	if !f.terminal.CompareAndSwap(false, true) {
 		return nil // the flow already ended (a malformed selection): one terminal message
 	}
-	result, err := completionResult(m)
+	// Only an issuance completion carries the notification endpoint: a flow id is
+	// reusable, and the retained context is looked up by id alone.
+	endpoint := ""
+	if f.fc.FlowType == openid4x.FlowTypeOID4VCI {
+		endpoint = t.notificationEndpoint(m.FlowID)
+	}
+	result, err := completionResult(m, endpoint)
 	if err != nil {
 		return err
 	}
@@ -1062,6 +1109,10 @@ func (g *wmpGuard) protocolOf(method string, params json.RawMessage) (Protocol, 
 // guardProtocolOfFlowType is the engine protocol a flow type is authorized as, and
 // whether the type is gated at all.
 func guardProtocolOfFlowType(flowType string) (Protocol, bool) {
+	if flowType == openid4x.FlowTypeCredentialNotification {
+		// Authorized exactly as oid4vci (OpenID4x 3.4.2): never more broadly.
+		return ProtocolOID4VCI, true
+	}
 	protocol, ok := wmpFlowTypes[flowType]
 	return protocol, ok
 }

@@ -1620,6 +1620,24 @@ func (s *Session) SendNotificationAck(flowID, notificationID, status, errMsg str
 	return s.Send(&msg)
 }
 
+// notificationBinder is implemented by a transport that decides whether
+// the issuance context of a notification is retained and for whom (the WMP
+// transport: only for a session that negotiated credential_notification, bound
+// to the principal that ran the issuance).
+type notificationBinder interface {
+	bindNotification(ctx context.Context) (principal string, retain bool)
+}
+
+// bindNotification is the principal a notification context is retained for
+// and whether it is retained at all. A WebSocket connection retains it (the
+// connection is the binding, principal ""), as it always has.
+func (s *Session) bindNotification(ctx context.Context) (string, bool) {
+	if p, ok := s.transport.(notificationBinder); ok {
+		return p.bindNotification(ctx)
+	}
+	return "", true
+}
+
 // dispatchCredentialNotification validates a client-reported OID4VCI §10
 // credential lifecycle event synchronously, then forwards it to the issuer on a
 // bounded background worker. Validation (missing notification_id, unsupported
@@ -1684,7 +1702,7 @@ func (m *Manager) forwardCredentialNotification(session *Session, msg *Credentia
 		}
 	}()
 
-	nc := session.notifications.take(msg.FlowID)
+	nc := session.notifications.takeForNotification(msg.FlowID, msg.NotificationID)
 	if nc == nil {
 		// Raced with TTL expiry or another in-flight notification for the same
 		// flow consumed the one-shot context.
@@ -1704,8 +1722,17 @@ func (m *Manager) forwardCredentialNotification(session *Session, msg *Credentia
 	defer cancel()
 
 	httpClient := m.cfg.HTTPClient.NewHTTPClient(0)
+	handedOut := *nc
 	if err := sendNotification(ctx, httpClient, nc, msg.NotificationID, msg.Event, msg.EventDescription, logger); err != nil {
 		logger.Warn("failed to forward credential notification to issuer", zap.Error(err))
+		// The context is single-use once the issuer was contacted. A failure to
+		// obtain the DPoP proof (client refused, timed out, unreachable) sent
+		// nothing, so the context goes back, with its original expiry, and the
+		// client may retry the same notification.
+		var notSent *notificationNotSentError
+		if errors.As(err, &notSent) {
+			session.notifications.unspend(msg.FlowID, &handedOut, msg.NotificationID)
+		}
 		_ = session.SendNotificationAck(msg.FlowID, msg.NotificationID, "rejected", "forwarding failed")
 		return
 	}

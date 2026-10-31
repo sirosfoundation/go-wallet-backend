@@ -1247,7 +1247,7 @@ func (h *OID4VCIHandler) finishIssuance(ctx context.Context, resp *CredentialRes
 		return err
 	}
 	results := h.buildCredentialResults(ctx, resp, config, trust)
-	h.registerNotificationContext(metadata, token, resp)
+	h.registerNotificationContext(ctx, metadata, token, resp)
 	return h.Flow.Session.sendFlowComplete(h.Flow.ID, results, "", token.RefreshToken, h.dpopJWKForRefreshToken(token), h.dpopKeyIDForRefreshToken(token), resp.Encrypted, displayMetadata(resp))
 }
 
@@ -1278,7 +1278,7 @@ func (h *OID4VCIHandler) dpopJWKForRefreshToken(token *TokenResponse) string {
 // whatever id the client then supplies in credential_notification (the client
 // read it from the decrypted response). The stored context is short-lived,
 // in-memory, and one-shot; no credential data is retained.
-func (h *OID4VCIHandler) registerNotificationContext(metadata *IssuerMetadata, token *TokenResponse, resp *CredentialResponse) {
+func (h *OID4VCIHandler) registerNotificationContext(ctx context.Context, metadata *IssuerMetadata, token *TokenResponse, resp *CredentialResponse) {
 	if metadata == nil || token == nil || resp == nil {
 		return
 	}
@@ -1286,6 +1286,10 @@ func (h *OID4VCIHandler) registerNotificationContext(metadata *IssuerMetadata, t
 		return
 	}
 	if h.Flow == nil || h.Flow.Session == nil || h.Flow.Session.notifications == nil {
+		return
+	}
+	principal, retain := h.Flow.Session.bindNotification(ctx)
+	if !retain {
 		return
 	}
 	if resp.Encrypted {
@@ -1305,6 +1309,8 @@ func (h *OID4VCIHandler) registerNotificationContext(metadata *IssuerMetadata, t
 		dpopSigner:     h.dpopSigner(),
 		dpopNonce:      h.dpopNonce,
 		notificationID: resp.NotificationID,
+		issuer:         metadata.CredentialIssuer,
+		principal:      principal,
 	})
 }
 
@@ -2867,11 +2873,12 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 
 	// Credential request encryption (OID4VCI 1.0 §8.2, §10). An issuer may
 	// refuse a request carrying credential_response_encryption unless the
-	// request itself is encrypted, so encrypt whenever the issuer requires it
-	// or we are asking for an encrypted response. Seed delivery and
+	// request itself is encrypted, so encrypt whenever the issuer requires it,
+	// we are asking for an encrypted response, or opportunistic encryption is
+	// enabled and compatible issuer metadata is available. Seed delivery and
 	// encryption_required fail closed: never downgrade to a plain request.
 	if reqEnc := metadata.CredentialRequestEncryption; reqEnc != nil {
-		if reqEnc.EncryptionRequired || respEnc != nil {
+		if reqEnc.EncryptionRequired || respEnc != nil || h.opportunisticRequestEncryptionEnabled() {
 			jwe, err := reqEnc.encryptRequest(bodyBytes)
 			switch {
 			case err == nil:
@@ -2981,7 +2988,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 			// reject what it decrypts (a seed that fails its checks) and then
 			// owes the issuer a credential_failure notification, so the
 			// notification context must exist before the client answers.
-			h.registerNotificationContext(metadata, token, &CredentialResponse{Encrypted: true})
+			h.registerNotificationContext(ctx, metadata, token, &CredentialResponse{Encrypted: true})
 			answer, relayErr := h.relayEncryptedResponse(ctx, string(body), false, respEnc)
 			if relayErr != nil {
 				// A malformed JWE, a client that could not decrypt or
@@ -3068,15 +3075,18 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 		bodyBytes, _ := json.Marshal(reqBody)
 		contentType := "application/json"
 		// OID4VCI 1.0 §9.1: the deferred request is encrypted like the
-		// credential request when the issuer requires it, or when it asks for
-		// an encrypted response (an issuer may refuse that in a plain request).
-		if reqEnc := metadata.CredentialRequestEncryption; reqEnc != nil && (reqEnc.EncryptionRequired || respEnc != nil) {
+		// credential request, including opportunistically when enabled.
+		if reqEnc := metadata.CredentialRequestEncryption; reqEnc != nil && (reqEnc.EncryptionRequired || respEnc != nil || h.opportunisticRequestEncryptionEnabled()) {
 			jwe, err := reqEnc.encryptRequest(bodyBytes)
-			if err != nil {
+			switch {
+			case err == nil:
+				bodyBytes = []byte(jwe)
+				contentType = "application/jwt"
+			case reqEnc.EncryptionRequired || respEnc != nil:
 				return nil, fmt.Errorf("cannot encrypt deferred credential request: %w", err)
+			default:
+				h.Logger.Warn("sending deferred credential request without encryption", zap.Error(err))
 			}
-			bodyBytes = []byte(jwe)
-			contentType = "application/jwt"
 		}
 
 		req, err := http.NewRequestWithContext(ctx, "POST", deferredEndpoint, strings.NewReader(string(bodyBytes)))
@@ -3122,7 +3132,7 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 				// and the client may reject what it decrypts and then owes the
 				// issuer a credential_failure notification, so the context
 				// must exist before the client answers.
-				h.registerNotificationContext(metadata, token, &CredentialResponse{Encrypted: true})
+				h.registerNotificationContext(ctx, metadata, token, &CredentialResponse{Encrypted: true})
 				answer, err := h.relayEncryptedResponse(ctx, string(body), true, respEnc)
 				if err != nil {
 					return nil, err

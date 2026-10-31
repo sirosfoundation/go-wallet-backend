@@ -24,6 +24,10 @@ var (
 	requestEncs    = []jose.ContentEncryption{jose.A256GCM, jose.A128GCM, jose.A256CBC_HS512, jose.A128CBC_HS256}
 )
 
+func (h *OID4VCIHandler) opportunisticRequestEncryptionEnabled() bool {
+	return h.Config == nil || !h.Config.Features.DisableOpportunisticRequestEncryption
+}
+
 // selectKey picks an issuer key usable for ECDH-based key agreement: it needs
 // a kid and an alg (§10: the JWE alg MUST match the JWK alg), use "enc" or
 // unset, and must be a public EC key.

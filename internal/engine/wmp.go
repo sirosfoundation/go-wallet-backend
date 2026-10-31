@@ -400,6 +400,13 @@ func (a *WMPAdapter) serverCapabilities() wmp.Capabilities {
 			SupportedGrants:  []string{"authorization_code", "pre-authorized_code"},
 			SupportedFormats: openid4x.AllFormats(),
 		}
+		// The engine retains the issuance context for a notification after the
+		// completion (OpenID4x 2.4, 3.4); a session that offers the capability
+		// gets it.
+		cfg.CredentialNotification = &openid4x.CredentialNotificationCap{
+			Events:            notificationEvents(),
+			ContextTTLSeconds: int(notificationContextTTL / time.Second),
+		}
 	}
 	if hasVP {
 		cfg.OID4VP = &openid4x.OID4VPCapability{
