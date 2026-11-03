@@ -17,6 +17,7 @@ import (
 const (
 	credentialIssuerWellKnown    = "openid-credential-issuer"
 	authorizationServerWellKnown = "oauth-authorization-server"
+	openIDConfigurationWellKnown = "openid-configuration"
 )
 
 // CredentialIssuerMetadataURLs returns the ordered candidate URLs at which the
@@ -61,17 +62,35 @@ func CredentialIssuerMetadataURLs(identifier string) ([]string, error) {
 }
 
 // AuthorizationServerMetadataURLs returns the ordered candidate URLs for the
-// OAuth 2.0 Authorization Server Metadata of an issuer identifier. RFC 8414
-// section 3.1 removes a terminating "/" (exactly one) from the issuer before
-// inserting "/.well-known/oauth-authorization-server" between host and path.
-// Today that is the only candidate; the slice shape lets AS discovery add
-// further forms (see issue 510) without changing callers.
+// metadata of the authorization server identified by issuer. Callers try the
+// first and fall back to the next ONLY on HTTP 404 (see
+// FetchAuthorizationServerMetadata).
+//
+//  1. RFC 8414 section 3.1: "/.well-known/oauth-authorization-server" is
+//     inserted between the host and the path, after any terminating "/" of the
+//     identifier has been removed:
+//     https://h/tenant/ -> https://h/.well-known/oauth-authorization-server/tenant
+//
+//  2. OpenID Connect Discovery 1.0 section 4: "/.well-known/openid-configuration"
+//     is APPENDED to the issuer, with a terminating "/" removed first:
+//     https://h/tenant/ -> https://h/tenant/.well-known/openid-configuration
+//
+// Exactly one terminating "/" is removed in each form. Identity is not part of
+// this: whichever URL served the document, its issuer must equal the
+// identifier as received, byte for byte (RFC 8414 section 3.3, OIDC Discovery
+// section 4.3).
 func AuthorizationServerMetadataURLs(issuer string) ([]string, error) {
-	u, err := insertWellKnown(issuer, authorizationServerWellKnown, true)
+	rfc8414, err := insertWellKnown(issuer, authorizationServerWellKnown, true)
 	if err != nil {
 		return nil, err
 	}
-	return []string{u}, nil
+	parsed, err := url.Parse(issuer)
+	if err != nil {
+		return nil, fmt.Errorf("parsing identifier: %w", err)
+	}
+	openIDConfig := fmt.Sprintf("%s://%s%s/.well-known/%s", parsed.Scheme, parsed.Host,
+		strings.TrimSuffix(parsed.EscapedPath(), "/"), openIDConfigurationWellKnown)
+	return []string{rfc8414, openIDConfig}, nil
 }
 
 func insertWellKnown(identifier, suffix string, stripTerminatingSlash bool) (string, error) {

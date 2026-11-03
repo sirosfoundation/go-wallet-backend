@@ -43,7 +43,7 @@ func NewHandlers(services *service.Services, cfg *config.Config, logger *zap.Log
 		cfg:           cfg,
 		logger:        logger.Named("handlers"),
 		roles:         roles,
-		metadataCache: newIssuerMetadataCache(),
+		metadataCache: newIssuerMetadataCache(cfg.HTTPClient.MetadataCacheDisabled),
 		httpClient:    cfg.HTTPClient.NewHTTPClient(0),
 		imageEmbedder: newIssuerMetadataImageEmbedder(cfg, logger),
 	}
@@ -57,7 +57,7 @@ func NewHandlersWithStore(services *service.Services, store storage.Store, cfg *
 		cfg:           cfg,
 		logger:        logger.Named("handlers"),
 		roles:         roles,
-		metadataCache: newIssuerMetadataCache(),
+		metadataCache: newIssuerMetadataCache(cfg.HTTPClient.MetadataCacheDisabled),
 		httpClient:    cfg.HTTPClient.NewHTTPClient(0),
 		imageEmbedder: newIssuerMetadataImageEmbedder(cfg, logger),
 	}

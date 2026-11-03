@@ -197,6 +197,7 @@ Unlike the generic proxy, the engine:
 1. **Validates URLs** - Only fetches from protocol-defined paths:
    - `/.well-known/openid-credential-issuer`
    - `/.well-known/oauth-authorization-server`
+   - `/.well-known/openid-configuration` (authorization server discovery, tried second and only after a 404; the document `issuer` must equal the AS identifier exactly)
    - Endpoints declared in fetched metadata
 
 2. **Blocks SSRF** - Rejects requests to:

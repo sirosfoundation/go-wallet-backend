@@ -238,6 +238,40 @@ Apply:
 kubectl apply -f k8s/deployment.yaml
 ```
 
+### Rolling Upgrades and the Redis Session Store
+
+Earlier releases kept the per-user session pointer at `<prefix>user:<userID>`.
+This release scopes it by tenant at `<prefix>usert:<b64url(tenant)>:<b64url(userID)>`
+(unpadded base64url, so the `:` separator is unambiguous) and adds a
+`<prefix>userall:<userID>` index used for account deletion. The per-tenant
+index moves from the TTL-less set `<prefix>tenant:<tenantID>` to the sorted set
+`<prefix>tenantx:<tenantID>`; both indexes are scored by expiry, pruned on every
+add and expire with their longest-lived member, so neither grows without bound.
+The legacy `tenant:` sets are no longer written; `List`, `Delete` and
+`DeleteByUser` drain them. The new pointer
+deliberately does not reuse the `user:` namespace: the legacy key is the raw
+user ID, so with `:` in IDs a legacy user `default:u` and the new
+(tenant `default`, user `u`) would otherwise share one key and could overwrite
+each other's pointer during a rolling upgrade. New writes use only the new keys. To keep sessions created by not-yet-upgraded replicas reachable
+during a rolling upgrade, the store falls back to the legacy pointer:
+
+- `GetByUser` uses the legacy pointer when the new one is absent, returns the
+  session only if its user and (normalised) tenant match the request, and
+  lazily backfills the new pointer and index.
+  If the new pointer names a session that no longer exists (an old replica
+  deleted it and wrote a replacement under the legacy pointer only), the stale
+  pointer is dropped and the lookup resolves through the legacy pointer.
+- Listing the `default` tenant also includes sessions that old replicas wrote
+  with no tenant claim (the raw empty-tenant set).
+- `DeleteByUser` and `Delete` also remove the legacy pointer, and delete the
+  session it names only if that session belongs to the target user.
+
+The fallback is bounded by the maximum session lifetime (`DefaultTTL`, 24h
+unless configured): legacy keys carry the session TTL and disappear on their
+own, after which the fallback finds nothing. Sessions still written by old
+replicas during the rollout stay covered for the same window; complete the
+rollout within it and no migration step is needed.
+
 ### Horizontal Pod Autoscaler
 
 Create `k8s/hpa.yaml`:
