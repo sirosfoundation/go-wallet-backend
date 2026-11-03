@@ -276,8 +276,9 @@ Same schema and slot order as above (schema version unchanged).
   earlier request.
 * `fido2` is filled from the verified key-evidence record stored for the
   **instance key** (the thumbprint of the PoP key), when there is one and its
-  kind is `fido2`; otherwise `none` (a WIA request itself carries no FIDO2
-  evidence). This is KEY evidence about the instance key: K and S stay
+  kind is `fido2`; otherwise `none`. A WIA request can carry that evidence
+  itself (`key_attestation` type `fido2`, see "FIDO2 attestation of the
+  instance key"): it is verified and stored before this slot is read. This is KEY evidence about the instance key: K and S stay
   orthogonal, no shipped rule derives a credential key's KA level from it, and
   key attestation for credential keys only counts `fido2` records (never
   records of another kind). Caveat (ARKG): if the attested credential public
@@ -493,9 +494,10 @@ object, evidence about the **instance (PoP) key** itself:
  "key_attestation": {"type": "android_key", "x5c": ["<base64 DER leaf>", "<intermediate>", "<root>"]}}
 ```
 
-`type` selects a verifier from a registry (`android_key`, and `app_attest_assertion`
-when Apple App Attest native attestation is configured; see the App Attest
-section above). Both use the same envelope and the same error codes. The request is classified as follows:
+`type` selects a verifier from a registry (`android_key`; `app_attest_assertion`
+when Apple App Attest native attestation is configured, see the App Attest
+section above; `fido2` when FIDO2 attestation is enabled, see the next
+section). All use the same envelope and the same error codes. The request is classified as follows:
 
 | Situation | Result |
 |---|---|
@@ -691,6 +693,43 @@ Tests build synthetic chains (a test root, an intermediate and a hand-encoded
 `KeyDescription`). `TestAndroidKeyAttestation_RealPixelChains` verifies real
 chains from `internal/service/testdata/android/` when they are captured (see its
 README); it is skipped until then.
+
+### FIDO2 attestation of the instance key
+
+Under a policy that requires verified `fido2` evidence, a new wallet has to
+present that evidence with its very first WIA: `POST
+/wallet-provider/fido2-attestation/register` refuses a wallet instance that does
+not exist or is not yet bound to the caller, and the first WIA is what creates
+it. `POST /wallet-provider/wia/generate` therefore accepts, when
+`wallet_provider.attestation.fido2_attestation.enabled` is set:
+
+```json
+{"pop": "...", "challenge": "<C>",
+ "key_attestation": {"type": "fido2", "attestation_object": "<base64url>", "client_data_hash": "<base64url>"}}
+```
+
+Both fields are unpadded base64url, the CTAP2 `makeCredential` attestation object
+and the 32-byte client data hash it was made over, exactly as for the register
+route. They are verified by the same code (CBOR, attestation signature, x5c chain
+against the FIDO MDS3 registry through go-trust).
+
+* **The attested key must be the PoP key.** The attested credential key's RFC 7638
+  thumbprint has to equal the thumbprint of the WIA PoP key, otherwise the WIA is
+  refused with `KEY_ATTESTATION_INVALID`. The PoP proves possession of the
+  attested private key. The attestation cannot carry the WIA challenge (its hash
+  is fixed when the key is created), so freshness is the PoP and the single-use
+  challenge of the request.
+* **Same gates, same order as any WIA.** A foreign instance, a revoked instance
+  and a deleted or deactivated account are refused before the evidence is
+  verified. Nothing is written before the request has passed the PoP and the
+  challenge; the verified record is stored under the PoP key's thumbprint with
+  the request's tenant and user, never replaces stronger evidence, and is undone
+  if the request is then refused for a lifecycle reason.
+* **Errors** are the envelope's: `KEY_ATTESTATION_INVALID` (malformed, not
+  trusted, wrong key), `KEY_ATTESTATION_TYPE_UNSUPPORTED` when FIDO2 attestation
+  is not enabled.
+* `/fido2-attestation/register` is unchanged and stays the way to add FIDO2
+  evidence to an instance that already exists.
 
 ## Preview endpoint
 

@@ -65,7 +65,7 @@ type WIAGenerateRequest struct {
 	// instance logs in with; revoking the instance refuses that passkey (SID-AUTH-06). Optional.
 	CredentialID string `json:"credential_id,omitempty"`
 	// KeyAttestation is optional evidence about the instance (PoP) key:
-	// {"type": "android_key" | "app_attest_assertion", ...}. See
+	// {"type": "android_key" | "app_attest_assertion" | "fido2", ...}. See
 	// service.KeyAttestation.
 	KeyAttestation *service.KeyAttestation `json:"key_attestation,omitempty"`
 }

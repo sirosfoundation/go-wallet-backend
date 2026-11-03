@@ -731,8 +731,9 @@ func fido2VerifiedFromRecord(rec *domain.KeyAttestationRecord) *assurance.Fido2V
 // wiaFacts builds the evidence of a WIA decision. The platform slot is the
 // native attestation source verified in this request (not stored instance
 // state); the FIDO2 slot is the verified FIDO2 record stored for the instance
-// key (none when there is none: a WIA request itself carries no FIDO2
-// evidence); there are no client claims. This is KEY evidence about the
+// key (none when there is none: a request may carry FIDO2 evidence, key_attestation
+// type fido2, which is verified and stored before this reads it); there are no
+// client claims. This is KEY evidence about the
 // instance key: no shipped rule derives a credential key's KA level from it.
 func wiaFacts(att wiaAttestation) assurance.Facts {
 	return assurance.Facts{

@@ -1558,8 +1558,9 @@ type StatusListConfig struct {
 // verification.
 type FIDO2AttestationConfig struct {
 	// Enabled controls whether the FIDO2 key-attestation registration
-	// endpoint accepts and verifies attestation objects. Off by default —
-	// like NativeAttestation, this is an explicit opt-in trust decision.
+	// endpoint, and key_attestation type fido2 on the WIA request, accept
+	// and verify attestation objects. Off by default — like
+	// NativeAttestation, this is an explicit opt-in trust decision.
 	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
 }
 
