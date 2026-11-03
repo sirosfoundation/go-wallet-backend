@@ -591,7 +591,10 @@ func (s *CredentialStore) Create(ctx context.Context, credential *domain.Verifia
 	credential.CreatedAt = time.Now()
 	credential.UpdatedAt = time.Now()
 	credential.WriteToken = storage.NewWriteToken()
-	s.data[credential.ID] = credential
+	// Store a copy: the caller keeps its own record, so a later write (which
+	// replaces the token) cannot change what the caller captured for its rollback.
+	stored := *credential
+	s.data[credential.ID] = &stored
 	return nil
 }
 
@@ -607,7 +610,8 @@ func (s *CredentialStore) GetByID(ctx context.Context, tenantID domain.TenantID,
 	if credential.TenantID != tenantID {
 		return nil, storage.ErrNotFound
 	}
-	return credential, nil
+	out := *credential
+	return &out, nil
 }
 
 func (s *CredentialStore) GetByIdentifier(ctx context.Context, tenantID domain.TenantID, holderDID, credentialIdentifier string) (*domain.VerifiableCredential, error) {
@@ -616,7 +620,8 @@ func (s *CredentialStore) GetByIdentifier(ctx context.Context, tenantID domain.T
 
 	for _, cred := range s.data {
 		if cred.TenantID == tenantID && cred.HolderDID == holderDID && cred.CredentialIdentifier == credentialIdentifier {
-			return cred, nil
+			out := *cred
+			return &out, nil
 		}
 	}
 	return nil, storage.ErrNotFound
@@ -629,7 +634,8 @@ func (s *CredentialStore) GetAllByHolder(ctx context.Context, tenantID domain.Te
 	credentials := make([]*domain.VerifiableCredential, 0)
 	for _, cred := range s.data {
 		if cred.TenantID == tenantID && cred.HolderDID == holderDID {
-			credentials = append(credentials, cred)
+			out := *cred
+			credentials = append(credentials, &out)
 		}
 	}
 	return credentials, nil
@@ -645,7 +651,8 @@ func (s *CredentialStore) Update(ctx context.Context, credential *domain.Verifia
 
 	credential.UpdatedAt = time.Now()
 	credential.WriteToken = storage.NewWriteToken()
-	s.data[credential.ID] = credential
+	stored := *credential // a copy, as in Create
+	s.data[credential.ID] = &stored
 	return nil
 }
 
