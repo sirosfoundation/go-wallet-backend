@@ -94,7 +94,7 @@ func (h *Handlers) AssurancePreview(c *gin.Context) {
 	// wallet instance can lend platform evidence.
 	tenantID, _ := h.getTenantID(c)
 	callerUser, _ := contextUserID(c)
-	ctx := service.WithKeyAttestationCaller(c.Request.Context(), service.KeyAttestationCaller{
+	ctx := service.WithKeyAttestationCaller(service.WithKeyAttestationTenant(c.Request.Context(), tenantID), service.KeyAttestationCaller{
 		TenantID: tenantID,
 		UserID:   callerUser,
 	})

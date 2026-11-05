@@ -259,7 +259,7 @@ func expectedThumbprint(t *testing.T, pub *ecdsa.PublicKey) string {
 func TestFIDO2AttestationService_TrustedByPDP(t *testing.T) {
 	cfg := testFIDO2AttestationConfig(true)
 	store := memory.NewStore()
-	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{ID: "test-instance"}); err != nil {
+	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{ID: "test-instance", Status: domain.InstanceStatusActive}); err != nil {
 		t.Fatalf("seed instance: %v", err)
 	}
 
@@ -310,7 +310,7 @@ func TestFIDO2AttestationService_TrustedByPDP(t *testing.T) {
 func TestFIDO2AttestationService_NotTrustedByPDP(t *testing.T) {
 	cfg := testFIDO2AttestationConfig(true)
 	store := memory.NewStore()
-	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{ID: "test-instance"}); err != nil {
+	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{ID: "test-instance", Status: domain.InstanceStatusActive}); err != nil {
 		t.Fatalf("seed instance: %v", err)
 	}
 
@@ -342,7 +342,7 @@ func TestFIDO2AttestationService_NotTrustedByPDP(t *testing.T) {
 func verifyWithFlags(t *testing.T, flags byte) *domain.KeyAttestationRecord {
 	t.Helper()
 	store := memory.NewStore()
-	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{ID: "test-instance"}); err != nil {
+	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{ID: "test-instance", Status: domain.InstanceStatusActive}); err != nil {
 		t.Fatal(err)
 	}
 	svc := NewFIDO2AttestationService(testFIDO2AttestationConfig(true), store.WalletInstances(), store.KeyAttestations(), newTestTrustService(t, &stubEvaluator{decision: true}), zap.NewNop())
@@ -398,6 +398,23 @@ func TestFIDO2AttestationService_VerifyEvidenceRefusesUntrusted(t *testing.T) {
 	attObj, _ := buildTestAttestationObjectFlags(t, uuid.New(), hash, 0x40|0x04)
 	if _, err := svc.VerifyEvidence(context.Background(), &FIDO2AttestationRequest{AttestationObject: attObj, ClientDataHash: hash}); !errors.Is(err, ErrFIDO2AttestationInvalid) {
 		t.Fatalf("err = %v, want ErrFIDO2AttestationInvalid", err)
+	}
+}
+
+// An unknown instance is refused before the expensive verification: the trust
+// evaluator is never consulted.
+func TestFIDO2AttestationService_VerifyRefusesUnknownInstanceBeforeVerifying(t *testing.T) {
+	store := memory.NewStore()
+	eval := &stubEvaluator{decision: true}
+	svc := NewFIDO2AttestationService(testFIDO2AttestationConfig(true), store.WalletInstances(), store.KeyAttestations(), newTestTrustService(t, eval), zap.NewNop())
+	hash := make([]byte, 32)
+	attObj, _ := buildTestAttestationObjectFlags(t, uuid.New(), hash, 0x40|0x04)
+	err := svc.Verify(context.Background(), &FIDO2AttestationRequest{WalletInstanceID: "no-such-instance", AttestationObject: attObj, ClientDataHash: hash})
+	if !errors.Is(err, ErrKeyAttestationInstanceRefused) {
+		t.Fatalf("err = %v, want ErrKeyAttestationInstanceRefused", err)
+	}
+	if eval.gotSubjectID != "" || eval.gotResourceID != "" {
+		t.Errorf("trust evaluation ran for a refused instance (subject %q)", eval.gotSubjectID)
 	}
 }
 

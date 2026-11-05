@@ -68,7 +68,7 @@ func TestTokenAuthMiddleware_StoreErrorRefuses(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			w := httptest.NewRecorder()
 			_, r := gin.CreateTestContext(w)
-			r.Use(TokenAuthMiddleware(v, tenants, bl, zap.NewNop()))
+			r.Use(TokenAuthMiddleware(v, tenants, bl, emptyUsers(), zap.NewNop()))
 			r.GET("/test", func(c *gin.Context) { c.Status(200) })
 			req := httptest.NewRequest("GET", "/test", nil)
 			req.Header.Set("Authorization", "Bearer "+token)

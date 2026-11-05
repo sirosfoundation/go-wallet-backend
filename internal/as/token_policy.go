@@ -2,8 +2,11 @@ package as
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
 // Token issuance policy, separated from the HTTP handlers.
@@ -16,6 +19,11 @@ import (
 // *gin.Context. The rules live here as pure functions over a Session or a
 // parent token's claims, and the handlers keep only the I/O: reading the
 // session, consulting the blacklist, and writing the response.
+//
+// The wallet-lifecycle cut-off (SID-AUTH-06) lives here too, next to the
+// revocation checks it is independent of: see sessionPredatesCutoff,
+// parentPredatesCutoff and issuedAfterCutoff. Every /auth/token path applies
+// the cut-off and the shared revocation store; neither relaxes the other.
 //
 // Revocation checks deliberately stay in the handlers. They are I/O against
 // the revocation store with their own failure mode (503, not a policy
@@ -53,6 +61,14 @@ var (
 	errInvalidParent  = &tokenError{http.StatusUnauthorized, oauthErrInvalidGrant, "invalid delegating token"}
 	errParentRevoked  = &tokenError{http.StatusUnauthorized, oauthErrInvalidGrant, "delegating token has been revoked"}
 	errParentUserGone = &tokenError{http.StatusUnauthorized, oauthErrInvalidGrant, "delegating token's user has been revoked"}
+
+	// Lifecycle cut-off (SID-AUTH-06) refusals. errCutoffUnavailable is the
+	// answer when the cut-off store cannot say (distinct from the revocation
+	// store's 503, which is what the shared blacklist answers).
+	errSessionPredatesCutoff = &tokenError{http.StatusUnauthorized, oauthErrInvalidGrant, "session predates a wallet lifecycle change"}
+	errParentPredatesCutoff  = &tokenError{http.StatusUnauthorized, oauthErrInvalidGrant, "delegating token has been revoked"}
+	errRevokedWhileIssuing   = &tokenError{http.StatusUnauthorized, oauthErrInvalidGrant, "authorization revoked while the token was being issued"}
+	errCutoffUnavailable     = &tokenError{http.StatusInternalServerError, "server_error", "internal error"}
 
 	errTenantMismatch    = &tokenError{http.StatusForbidden, oauthErrInvalidRequest, "cannot issue token for a different tenant"}
 	errNoGrantedPerms    = &tokenError{http.StatusForbidden, oauthErrInvalidScope, "session has no granted permissions"}
@@ -151,6 +167,71 @@ func authorizeDelegationToken(parent *AccessTokenClaims, req *TokenRequest) (str
 		return "", "", errTACExceedsParent
 	}
 	return tenantID, tac, nil
+}
+
+// cutoffSubject is the issuing instant of the session or token that asked, so
+// the cut-off can be re-checked after minting: the new token's own iat is
+// always fresh, so only the credential behind it can be judged. Minting after
+// a lifecycle change requires a new login.
+type cutoffSubject struct {
+	userID   string
+	issuedAt time.Time
+}
+
+// sessionSubject identifies a session for the cut-off check.
+func sessionSubject(s *Session) cutoffSubject {
+	return cutoffSubject{userID: s.UserID, issuedAt: s.authInstant()}
+}
+
+// parentSubject identifies a delegating token for the cut-off check. The
+// parent is judged, not the child (which would carry a fresh iat).
+func parentSubject(parent *AccessTokenClaims, bearer string) cutoffSubject {
+	return cutoffSubject{userID: parent.Subject, issuedAt: tokengate.IssuedAt(bearer)}
+}
+
+// cutoffRefusal maps the gate's answer to a refusal: nil when the subject
+// passes, revoked when it predates the user's cut-off, and a cutoffCheckError
+// (rendered 500 and logged by the handler) when the gate cannot say. A nil
+// gate means no lifecycle gating and always passes.
+func cutoffRefusal(ctx context.Context, gate *tokengate.Gate, subj cutoffSubject, revoked *tokenError) error {
+	err := gate.Check(ctx, subj.userID, subj.issuedAt)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, tokengate.ErrRevoked):
+		return revoked
+	default:
+		return &cutoffCheckError{err}
+	}
+}
+
+// cutoffCheckError is a cut-off store failure, as opposed to a refusal.
+type cutoffCheckError struct{ err error }
+
+func (e *cutoffCheckError) Error() string { return "token cut-off check failed: " + e.err.Error() }
+func (e *cutoffCheckError) Unwrap() error { return e.err }
+
+// sessionPredatesCutoff refuses a session that predates the user's SID-AUTH-06
+// cut-off, so a session that outlived a revocation (the cascade can fail to
+// drop it) cannot mint a fresh token. It applies on both session-cookie paths
+// before the revocation-store check; a revoked owner's deletion-only
+// exemption does not lift it.
+func sessionPredatesCutoff(ctx context.Context, gate *tokengate.Gate, s *Session) error {
+	return cutoffRefusal(ctx, gate, sessionSubject(s), errSessionPredatesCutoff)
+}
+
+// parentPredatesCutoff is the delegation path's cut-off check: a delegating
+// token issued before the revocation must not mint a fresh one. It runs after
+// the parent's revocation checks and before its permissions are examined.
+func parentPredatesCutoff(ctx context.Context, gate *tokengate.Gate, subj cutoffSubject) error {
+	return cutoffRefusal(ctx, gate, subj, errParentPredatesCutoff)
+}
+
+// issuedAfterCutoff re-checks the cut-off once the token is ready to be
+// handed out, so a revocation landing since the first check is not given a
+// token with a fresh iat.
+func issuedAfterCutoff(ctx context.Context, gate *tokengate.Gate, subj cutoffSubject) error {
+	return cutoffRefusal(ctx, gate, subj, errRevokedWhileIssuing)
 }
 
 // noopBlacklist is the TokenBlacklistChecker used when none is configured, so

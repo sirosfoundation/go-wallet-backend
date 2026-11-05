@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
@@ -92,7 +93,7 @@ func TestNewASModule_NoCleanupGoroutineLeak(t *testing.T) {
 	waitCleanupGoroutines(t, base)
 
 	// Normal shutdown.
-	m, err := NewASModule(context.Background(), mk(""), jwtCfg, nil, nil, nil, nil, zap.NewNop())
+	m, err := NewASModule(context.Background(), mk(""), jwtCfg, nil, memory.NewStore(), nil, nil, zap.NewNop())
 	require.NoError(t, err)
 	assert.Equal(t, base+1, sessionCleanupGoroutines())
 	require.NoError(t, m.Close())

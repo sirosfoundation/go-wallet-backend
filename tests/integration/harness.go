@@ -202,7 +202,7 @@ func setupRoutes(r *gin.Engine, h *api.Handlers, th *TestHarness, logger *zap.Lo
 
 	// Auth middleware: AS session tokens only
 	auth := gin.HandlersChain{
-		middleware.TokenAuthMiddleware(th.validator, store.Tenants(), th.Services.TokenBlacklist, logger),
+		middleware.TokenAuthMiddleware(th.validator, store.Tenants(), th.Services.TokenBlacklist, store.Users(), logger),
 		middleware.RequireAudience(harnessAudience),
 	}
 
