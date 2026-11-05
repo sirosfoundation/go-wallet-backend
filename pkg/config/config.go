@@ -2305,12 +2305,17 @@ type ErasureReconcilerConfig struct {
 
 	// GracePeriodSeconds is how long after a user's latest revocation the
 	// reconciler leaves the user alone, so a request in flight on another
-	// replica can finish. Keep it above the WIA lifetime.
+	// replica can finish. Keep it above the WIA lifetime. A user whose latest
+	// revoked instance has no recorded revocation time stays in grace (never
+	// erased). The age is measured on the reconciler host's clock against the
+	// revocation time written by the replica that revoked, so keep replica
+	// clocks within a small fraction of this period.
 	// Default: 900 (15 minutes)
 	GracePeriodSeconds int `yaml:"grace_period_seconds" envconfig:"GRACE_PERIOD_SECONDS"`
 
 	// BatchSize is the most users examined per run; a cursor walks all users
-	// with a revoked instance over successive runs.
+	// with a revoked instance over successive runs. Between 0 and
+	// MaxReconcilerBatchSize (10000); 0 selects the default.
 	// Default: 50
 	BatchSize int `yaml:"batch_size" envconfig:"BATCH_SIZE"`
 }
@@ -2319,7 +2324,15 @@ type ErasureReconcilerConfig struct {
 // year): larger values would overflow the time.Duration conversion.
 const MaxReconcilerSeconds = 365 * 24 * 3600
 
+// MaxReconcilerBatchSize bounds the reconciler's batch size: each user in a
+// batch is probed under that user's lifecycle lock, and a page is read in one
+// store call.
+const MaxReconcilerBatchSize = 10000
+
 func (c ErasureReconcilerConfig) validate() error {
+	if c.BatchSize < 0 || c.BatchSize > MaxReconcilerBatchSize {
+		return fmt.Errorf("lifecycle.reconciler.batch_size must be between 0 and %d", MaxReconcilerBatchSize)
+	}
 	if c.IntervalSeconds < 0 || c.IntervalSeconds > MaxReconcilerSeconds {
 		return fmt.Errorf("lifecycle.reconciler.interval_seconds must be between 0 and %d", MaxReconcilerSeconds)
 	}

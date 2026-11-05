@@ -385,6 +385,9 @@ func (s *WalletInstanceStore) ListUsersWithRevokedInstances(_ context.Context, a
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	if limit <= 0 {
+		return nil, nil // as the MongoDB store: a non-positive limit lists nothing
+	}
 	seen := map[string]bool{}
 	for _, instance := range s.data {
 		if instance.Status == domain.InstanceStatusRevoked && instance.UserID != nil && instance.UserID.ID > after.ID {
@@ -396,7 +399,7 @@ func (s *WalletInstanceStore) ListUsersWithRevokedInstances(_ context.Context, a
 		ids = append(ids, id)
 	}
 	sort.Strings(ids)
-	if limit >= 0 && len(ids) > limit {
+	if len(ids) > limit {
 		ids = ids[:limit]
 	}
 	out := make([]domain.UserID, len(ids))

@@ -66,6 +66,9 @@ type ErasureReconciler struct {
 	// run cut short never moves it past a user it did not examine.
 	runMu  sync.Mutex
 	cursor domain.UserID
+	// wouldErase counts, by leftover category, the users the last dry-run pass
+	// would have erased (guarded by runMu).
+	wouldErase map[string]int
 	// window is the page size actually requested (0: batch). A page the store
 	// cannot return, or leave time to examine one user, within the run deadline halves it, so the cursor can move
 	// on a slow store instead of retrying the same oversized page forever; a
@@ -80,6 +83,7 @@ type ErasureReconciler struct {
 // NewErasureReconciler creates a reconciler over the store's wallet instances.
 func NewErasureReconciler(cfg config.ErasureReconcilerConfig, lifecycle *WalletLifecycleService, store storage.Store, logger *zap.Logger) *ErasureReconciler {
 	cfg.SetDefaults()
+	cfg.BatchSize = min(cfg.BatchSize, config.MaxReconcilerBatchSize)
 	return &ErasureReconciler{
 		lifecycle: lifecycle,
 		store:     store,
@@ -168,8 +172,21 @@ func (r *ErasureReconciler) reconcile(ctx context.Context) {
 	if stats.Erased > 0 || stats.WouldErase > 0 || stats.Failed > 0 {
 		r.logger.Info("Erasure reconciler run finished", zap.Bool("dry_run", r.dryRun),
 			zap.Int("scanned", stats.Scanned), zap.Int("erased", stats.Erased), zap.Int("would_erase", stats.WouldErase), zap.Int("failed", stats.Failed),
-			zap.Int("live", stats.Live), zap.Int("in_grace", stats.Grace), zap.Int("clean", stats.Clean))
+			zap.Int("live", stats.Live), zap.Int("in_grace", stats.Grace), zap.Int("clean", stats.Clean),
+			zap.Any("would_erase_by_category", r.wouldEraseCategories()))
 	}
+}
+
+// wouldEraseCategories returns a copy of the leftover-category counts of the
+// last pass (empty outside dry run).
+func (r *ErasureReconciler) wouldEraseCategories() map[string]int {
+	r.runMu.Lock()
+	defer r.runMu.Unlock()
+	out := make(map[string]int, len(r.wouldErase))
+	for k, v := range r.wouldErase {
+		out[k] = v
+	}
+	return out
 }
 
 // pageSize is the page requested from the store (see window).
@@ -197,6 +214,7 @@ func (r *ErasureReconciler) RunOnce(ctx context.Context) (ReconcileStats, error)
 	defer r.runMu.Unlock()
 
 	var stats ReconcileStats
+	r.wouldErase = map[string]int{}
 	page := r.pageSize()
 	list := func() ([]domain.UserID, error) {
 		ids, err := r.store.WalletInstances().ListUsersWithRevokedInstances(ctx, r.cursor, page)
@@ -230,7 +248,11 @@ func (r *ErasureReconciler) RunOnce(ctx context.Context) (ReconcileStats, error)
 			var leftover []string
 			outcome, leftover, err = r.lifecycle.ReconcileUserDryRun(uctx, id, revokedBefore)
 			if outcome == ReconcileWouldErase {
-				r.logger.Info("Erasure reconciler dry run: would erase", zap.String("user_id", id.String()), zap.Strings("leftover", leftover))
+				// One summary line per pass (reconcile); the per-user detail is Debug.
+				for _, c := range leftover {
+					r.wouldErase[c]++
+				}
+				r.logger.Debug("Erasure reconciler dry run: would erase", zap.String("user_id", id.String()), zap.Strings("leftover", leftover))
 			}
 		} else {
 			outcome, err = r.lifecycle.ReconcileUser(uctx, id, revokedBefore)

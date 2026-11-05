@@ -42,7 +42,13 @@ const (
 // instances are all non-live, at least one revoked, the latest revoked at or
 // before revokedBefore, and who still has key material, private data or holder
 // data, gets the normal cascade. It takes the same per-user lock as the
-// cascade and re-checks liveness inside it. Errors are
+// cascade and re-checks liveness inside it. A revoked instance always wins:
+// "non-live" covers revoked and legacy suspended, so a user with a revoked
+// instance in one tenant is erased in every tenant even if another tenant has
+// only a legacy suspended instance (fail closed; a wallet that is suspended
+// and never revoked anywhere is left alone). A revoked instance without a
+// recorded revocation time keeps the user in grace, and the age is measured on
+// the caller's clock. Errors are
 // ErrErasureIncomplete from the cascade or a failed probe; both are retryable
 // and nothing is erased on a probe failure.
 func (s *WalletLifecycleService) ReconcileUser(ctx context.Context, userID domain.UserID, revokedBefore time.Time) (ReconcileOutcome, error) {

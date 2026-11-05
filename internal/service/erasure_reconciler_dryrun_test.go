@@ -126,7 +126,7 @@ func TestReconcileUserDryRun_DoesNotCountGraceLiveOrClean(t *testing.T) {
 func TestErasureReconciler_DryRunCountsLogsAndLeavesTheStoreAlone(t *testing.T) {
 	svc, store, userID, holder, _ := dryRunFixture(t)
 	before := snapshotUser(t, store, userID, holder, tenantA, tenantB)
-	core, logs := observer.New(zap.InfoLevel)
+	core, logs := observer.New(zap.DebugLevel)
 	r := NewErasureReconciler(config.ErasureReconcilerConfig{DryRun: true, GracePeriodSeconds: 1, BatchSize: 10}, svc, store, zap.New(core))
 	r.cursor = domain.UserID{}
 	r.now = inTheFuture
@@ -142,6 +142,7 @@ func TestErasureReconciler_DryRunCountsLogsAndLeavesTheStoreAlone(t *testing.T) 
 
 	entries := logs.FilterMessage("Erasure reconciler dry run: would erase").All()
 	require.Len(t, entries, 1)
+	assert.Equal(t, zap.DebugLevel, entries[0].Level, "the per-user line is Debug: Info carries one summary per pass")
 	f := entries[0].ContextMap()
 	assert.Equal(t, userID.String(), f["user_id"])
 	assert.Equal(t, []any{"private_data", "credentials", "presentations"}, f["leftover"])
@@ -178,4 +179,22 @@ func TestErasureReconciler_DryRunStartupWarningAndGauge(t *testing.T) {
 	real.Start()
 	assert.Equal(t, 0.0, testutil.ToFloat64(reconcilerDryRun))
 	real.Stop()
+}
+
+// Dry run logs one Info summary per pass, however many users it would erase.
+func TestErasureReconciler_DryRunLogsOneInfoSummaryPerPass(t *testing.T) {
+	store := memory.NewStore()
+	seedRevokedUsers(t, store, 3)
+	core, logs := observer.New(zap.InfoLevel)
+	r := NewErasureReconciler(config.ErasureReconcilerConfig{DryRun: true, GracePeriodSeconds: 1, BatchSize: 10}, NewWalletLifecycleService(store, zap.NewNop(), nil), store, zap.New(core))
+	r.cursor = domain.UserID{}
+	r.now = inTheFuture
+	r.reconcile(context.Background())
+
+	all := logs.All()
+	require.Len(t, all, 1, "one Info line for three would-erase users")
+	f := all[0].ContextMap()
+	assert.EqualValues(t, 3, f["would_erase"])
+	assert.Equal(t, true, f["dry_run"])
+	assert.Equal(t, map[string]int{"private_data": 3, "credentials": 3, "presentations": 3}, f["would_erase_by_category"])
 }

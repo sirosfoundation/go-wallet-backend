@@ -3365,6 +3365,23 @@ func TestErasureReconcilerConfig(t *testing.T) {
 	}
 }
 
+func TestErasureReconcilerBatchSizeIsBounded(t *testing.T) {
+	for _, tc := range []struct {
+		batch int
+		ok    bool
+	}{{0, true}, {1, true}, {MaxReconcilerBatchSize, true}, {MaxReconcilerBatchSize + 1, false}, {-1, false}} {
+		cfg := validBaseConfig()
+		cfg.Lifecycle.Reconciler.BatchSize = tc.batch
+		err := cfg.Validate()
+		if tc.ok && err != nil {
+			t.Errorf("batch_size %d: unexpected error %v", tc.batch, err)
+		}
+		if !tc.ok && (err == nil || !strings.Contains(err.Error(), "lifecycle.reconciler.batch_size")) {
+			t.Errorf("batch_size %d: want a batch_size error, got %v", tc.batch, err)
+		}
+	}
+}
+
 func TestErasureReconcilerDryRunConfig(t *testing.T) {
 	if defaultConfig().Lifecycle.Reconciler.DryRun {
 		t.Error("dry_run must default to false")

@@ -48,4 +48,5 @@ func TestWalletInstanceStore_ListUsersWithRevokedInstances(t *testing.T) {
 	require.Equal(t, []string{"u4"}, ids("u3", 2), "the cursor is exclusive")
 	require.Empty(t, ids("u4", 2))
 	require.Empty(t, ids("", 0))
+	require.Empty(t, ids("", -1), "a negative limit lists nothing, as in the MongoDB store")
 }

@@ -1134,3 +1134,58 @@ func TestErasureReconciler_SuccessfulButSlowPageShrinksToo(t *testing.T) {
 	}
 	assert.Equal(t, len(ids), countErased(t, base, ids))
 }
+
+// A page shorter than requested is the end of the list: the cursor is reset
+// within that run rather than left on the last user.
+func TestErasureReconciler_ShortPageResetsTheCursor(t *testing.T) {
+	store := memory.NewStore()
+	seedRevokedUsers(t, store, 3)
+	r := reconcilerFor(store, 2)
+
+	_, err := r.RunOnce(context.Background())
+	require.NoError(t, err)
+	assert.NotEqual(t, domain.UserID{}, r.cursor, "a full page leaves the cursor on its last user")
+	_, err = r.RunOnce(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, domain.UserID{}, r.cursor, "a short page ends the pass")
+}
+
+// noEraseStore reports success from EraseWalletData without erasing anything,
+// as a store whose erase silently did nothing.
+type noEraseStore struct{ storage.Store }
+
+func (s noEraseStore) Users() storage.UserStore { return noEraseUsers{s.Store.Users()} }
+
+type noEraseUsers struct{ storage.UserStore }
+
+func (noEraseUsers) EraseWalletData(context.Context, domain.UserID, time.Time) error { return nil }
+
+// The cascade returning nil is not proof of erasure: data still present after
+// it is an incomplete erasure, never reported as erased.
+func TestReconcileUser_DataStillPresentAfterANilCascadeIsNotReportedErased(t *testing.T) {
+	_, mem, userID, _ := twoTenantFixture(t)
+	revokeSilently(t, mem, userID)
+	svc := NewWalletLifecycleService(noEraseStore{mem}, zap.NewNop(), nil)
+
+	out, err := svc.ReconcileUser(context.Background(), userID, inTheFuture())
+	require.ErrorIs(t, err, ErrErasureIncomplete)
+	assert.NotEqual(t, ReconcileErased, out)
+	assert.NotNil(t, userData(t, mem, userID).PrivateData, "the fake erase left the vault")
+}
+
+// A revoked instance always wins: a user revoked in one tenant and only
+// legacy-suspended in another is erased everywhere (documented, fail closed).
+func TestReconcileUser_RevokedInOneTenantWinsOverSuspendedInAnother(t *testing.T) {
+	svc, store, userID, holder := twoTenantFixture(t)
+	ctx := context.Background()
+	revokeSilently(t, store, userID)
+	// tenant B also holds a legacy suspended instance
+	seedRawInstance(t, store, tenantB, "inst-suspended", userID, "", domain.InstanceStatusLegacySuspended)
+
+	out, err := svc.ReconcileUser(ctx, userID, inTheFuture())
+	require.NoError(t, err)
+	assert.Equal(t, ReconcileErased, out)
+	assert.Zero(t, holderDataCount(t, store, tenantA, holder))
+	assert.Zero(t, holderDataCount(t, store, tenantB, holder))
+	assert.Nil(t, userData(t, store, userID).PrivateData)
+}

@@ -457,7 +457,8 @@ type WalletInstanceStore interface {
 
 	// ListUsersWithRevokedInstances returns up to limit distinct owners of
 	// revoked instances, in ascending id order, starting after the given id
-	// (zero value for the start); it is the cursor of the erasure reconciler.
+	// (zero value for the start); it is the cursor of the erasure reconciler. A
+	// limit of zero or less lists nothing.
 	ListUsersWithRevokedInstances(ctx context.Context, after domain.UserID, limit int) ([]domain.UserID, error)
 
 	// IncrementAttestation atomically increments the attestation count and updates last_attested_at.
