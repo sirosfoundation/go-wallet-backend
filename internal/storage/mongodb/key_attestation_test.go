@@ -59,7 +59,11 @@ func TestKeyAttestationStore_DeleteIfUnchanged(t *testing.T) {
 	second := &domain.KeyAttestationRecord{KeyThumbprint: "thumb-mongo-del", VerifiedAt: time.Now().UTC()}
 	require.NoError(t, kas.MarkKeyAttested(ctx, second))
 
-	require.ErrorIs(t, kas.DeleteIfUnchanged(ctx, "thumb-mongo-del", stale), storage.ErrNotFound)
+	require.ErrorIs(t, kas.DeleteIfUnchanged(ctx, "thumb-mongo-del", "never-written"), storage.ErrNotFound)
+	// The first write's rollback is spliced out: the newer write stays.
+	require.NoError(t, kas.DeleteIfUnchanged(ctx, "thumb-mongo-del", stale))
+	_, err0 := kas.GetByKeyThumbprint(ctx, "thumb-mongo-del")
+	require.NoError(t, err0)
 	require.NoError(t, kas.DeleteIfUnchanged(ctx, "thumb-mongo-del", second.WriteToken))
 	_, err := kas.GetByKeyThumbprint(ctx, "thumb-mongo-del")
 	require.ErrorIs(t, err, storage.ErrNotFound)
@@ -78,8 +82,9 @@ func TestKeyAttestationStore_RestoreIfUnchanged(t *testing.T) {
 	require.NotNil(t, second.Previous)
 	require.Equal(t, "old", second.Previous.AAGUID)
 
-	stale := *first
-	require.ErrorIs(t, kas.RestoreIfUnchanged(ctx, &stale, second.Previous), storage.ErrNotFound)
+	unknown := *first
+	unknown.WriteToken = "never-written"
+	require.ErrorIs(t, kas.RestoreIfUnchanged(ctx, &unknown, second.Previous), storage.ErrNotFound)
 	written := *second
 	require.NoError(t, kas.RestoreIfUnchanged(ctx, &written, second.Previous))
 	got, err := kas.GetByKeyThumbprint(ctx, "thumb-mongo-restore")
@@ -377,8 +382,7 @@ func TestKeyAttestationStore_RevokeAndReplaceRotateTheWriteToken(t *testing.T) {
 	marked, err := kas.MarkKeyRevoked(ctx, "thumb-mongo-rot", "fp1", "revoked", time.Now())
 	require.NoError(t, err)
 	require.Equal(t, true, marked)
-	requireNotFound(t, kas.DeleteIfUnchanged(ctx, "thumb-mongo-rot", written.WriteToken))
-	requireNotFound(t, kas.RestoreIfUnchanged(ctx, &written, &domain.KeyAttestationRecord{KeyThumbprint: "thumb-mongo-rot", Home: domain.KeyHomeTEE}))
+	require.NoError(t, kas.DeleteIfUnchanged(ctx, "thumb-mongo-rot", written.WriteToken)) // spliced out below the revocation
 	got, err := kas.GetByKeyThumbprint(ctx, "thumb-mongo-rot")
 	require.NoError(t, err)
 	require.Equal(t, true, got.Revoked())
