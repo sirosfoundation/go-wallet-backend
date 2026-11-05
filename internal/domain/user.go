@@ -107,6 +107,50 @@ type User struct {
 
 	CreatedAt time.Time `json:"created_at" bson:"created_at"`
 	UpdatedAt time.Time `json:"updated_at" bson:"updated_at"`
+
+	// Version is incremented by the storage layer on every write and is used
+	// for optimistic concurrency control. Documents created before this field
+	// existed are treated as version 0.
+	Version int64 `json:"-" bson:"version"`
+}
+
+// Clone returns a deep copy of the user so that callers can mutate it without
+// affecting shared state (e.g. the in-memory store).
+func (u *User) Clone() *User {
+	if u == nil {
+		return nil
+	}
+	c := *u
+	c.Username = cloneStringPtr(u.Username)
+	c.DisplayName = cloneStringPtr(u.DisplayName)
+	c.PrivateData = cloneBytes(u.PrivateData)
+	c.Keys = cloneBytes(u.Keys)
+	if u.WebauthnCredentials != nil {
+		c.WebauthnCredentials = make([]WebauthnCredential, len(u.WebauthnCredentials))
+		for i := range u.WebauthnCredentials {
+			c.WebauthnCredentials[i] = u.WebauthnCredentials[i].clone()
+		}
+	}
+	if u.EnterpriseIdentities != nil {
+		c.EnterpriseIdentities = make([]EnterpriseIdentity, len(u.EnterpriseIdentities))
+		copy(c.EnterpriseIdentities, u.EnterpriseIdentities)
+	}
+	return &c
+}
+
+func cloneStringPtr(s *string) *string {
+	if s == nil {
+		return nil
+	}
+	v := *s
+	return &v
+}
+
+func cloneBytes(b []byte) []byte {
+	if b == nil {
+		return nil
+	}
+	return append([]byte(nil), b...)
 }
 
 // GetEnterpriseIdentityForTenant returns the enterprise identity for the given tenant, if any
@@ -154,6 +198,22 @@ type WebauthnCredential struct {
 	LastUseTime     *time.Time    `json:"lastUseTime,omitempty" bson:"last_use_time,omitempty"`
 }
 
+func (w WebauthnCredential) clone() WebauthnCredential {
+	c := w
+	c.CredentialID = cloneBytes(w.CredentialID)
+	c.PublicKey = cloneBytes(w.PublicKey)
+	if w.Transport != nil {
+		c.Transport = append([]string(nil), w.Transport...)
+	}
+	c.Authenticator.AAGUID = cloneBytes(w.Authenticator.AAGUID)
+	c.Nickname = cloneStringPtr(w.Nickname)
+	if w.LastUseTime != nil {
+		t := *w.LastUseTime
+		c.LastUseTime = &t
+	}
+	return c
+}
+
 // Authenticator represents the authenticator data
 type Authenticator struct {
 	AAGUID       []byte `json:"aaguid" bson:"aaguid"`
@@ -166,6 +226,16 @@ type Authenticator struct {
 func ComputePrivateDataETag(privateData []byte) string {
 	hash := sha256.Sum256(privateData)
 	return `"` + base64.StdEncoding.EncodeToString(hash[:]) + `"`
+}
+
+// EffectivePrivateDataETag returns the stored private data ETag, or computes
+// it from the data when none is stored (e.g. imported or legacy records).
+// It never returns an empty string.
+func (u *User) EffectivePrivateDataETag() string {
+	if u.PrivateDataETag != "" {
+		return u.PrivateDataETag
+	}
+	return ComputePrivateDataETag(u.PrivateData)
 }
 
 // UpdatePrivateData updates the private data and its ETag

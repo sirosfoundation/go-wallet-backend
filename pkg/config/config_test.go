@@ -1368,6 +1368,59 @@ func TestCORSConfig_SetDefaults(t *testing.T) {
 	}
 }
 
+func TestCORSConfig_SetDefaults_KeepsPrivateDataHeadersWhenOverridden(t *testing.T) {
+	cfg := CORSConfig{
+		AllowedHeaders: []string{"Authorization", "content-type", "x-private-data-if-match"},
+		ExposedHeaders: []string{"X-Custom"},
+	}
+	cfg.SetDefaults()
+
+	count := func(list []string, name string) int {
+		n := 0
+		for _, h := range list {
+			if strings.EqualFold(h, name) {
+				n++
+			}
+		}
+		return n
+	}
+
+	for _, h := range RequiredCORSAllowedHeaders {
+		if count(cfg.AllowedHeaders, h) != 1 {
+			t.Errorf("AllowedHeaders = %v: want exactly one %q", cfg.AllowedHeaders, h)
+		}
+	}
+	for _, h := range RequiredCORSExposedHeaders {
+		if count(cfg.ExposedHeaders, h) != 1 {
+			t.Errorf("ExposedHeaders = %v: want exactly one %q", cfg.ExposedHeaders, h)
+		}
+	}
+	if count(cfg.AllowedHeaders, "Authorization") != 1 || count(cfg.ExposedHeaders, "X-Custom") != 1 {
+		t.Errorf("custom headers must be preserved: allowed=%v exposed=%v", cfg.AllowedHeaders, cfg.ExposedHeaders)
+	}
+}
+
+func TestCORSConfig_SetDefaults_WildcardAllowedHeaders(t *testing.T) {
+	cfg := CORSConfig{AllowedHeaders: []string{"*"}}
+	cfg.SetDefaults()
+	for _, h := range RequiredCORSAllowedHeaders {
+		found := false
+		for _, g := range cfg.AllowedHeaders {
+			if strings.EqualFold(g, h) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("wildcard AllowedHeaders must still list %q explicitly, got %v", h, cfg.AllowedHeaders)
+		}
+	}
+	exp := CORSConfig{ExposedHeaders: []string{"*"}}
+	exp.SetDefaults()
+	if !reflect.DeepEqual(exp.ExposedHeaders, []string{"*", "X-Private-Data-ETag"}) {
+		t.Errorf("wildcard ExposedHeaders must still list X-Private-Data-ETag explicitly, got %v", exp.ExposedHeaders)
+	}
+}
+
 func TestCORSConfig_DefaultExposedHeadersIncludeRetryAfter(t *testing.T) {
 	cfg := CORSConfig{}
 	cfg.SetDefaults()
@@ -1378,8 +1431,8 @@ func TestCORSConfig_DefaultExposedHeadersIncludeRetryAfter(t *testing.T) {
 
 	explicit := CORSConfig{ExposedHeaders: []string{"X-Only"}}
 	explicit.SetDefaults()
-	if !reflect.DeepEqual(explicit.ExposedHeaders, []string{"X-Only"}) {
-		t.Fatalf("explicit list must be kept as is, got %v", explicit.ExposedHeaders)
+	if !reflect.DeepEqual(explicit.ExposedHeaders, []string{"X-Only", "X-Private-Data-ETag"}) {
+		t.Fatalf("explicit list must be kept plus required headers, got %v", explicit.ExposedHeaders)
 	}
 }
 
