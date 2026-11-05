@@ -1289,7 +1289,7 @@ var RequiredCORSExposedHeaders = []string{"X-Private-Data-ETag"}
 // presence: under credentialed CORS a "*" in Access-Control-Allow-Headers or
 // Access-Control-Expose-Headers is a literal header name, not a wildcard, so
 // the required names must be listed explicitly.
-func appendMissingHeaders(headers []string, required []string) []string {
+func appendMissingHeaders(headers, required []string) []string {
 	for _, r := range required {
 		found := false
 		for _, h := range headers {
