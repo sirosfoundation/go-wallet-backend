@@ -268,6 +268,8 @@ Error codes are HTTP status codes that match the reference implementation:
 - 410: Gone (expired challenge, deprecated endpoints)
 - 412: Precondition failed (ETag mismatch)
 - 500: Internal server error
+- 503: Temporarily unavailable; user writes that keep losing a concurrent-modification race answer 503 with `Retry-After` and can be retried
+- 504: Gateway timeout (request deadline exceeded while writing user data)
 
 ### 7. Prepared Future Extensions
 

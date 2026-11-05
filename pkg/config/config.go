@@ -1235,13 +1235,16 @@ type CORSConfig struct {
 
 	// AllowedHeaders is a list of request headers allowed in cross-origin requests.
 	// An explicit list replaces the defaults, so it must include X-Token-Mode
-	// (mandatory on /auth/passkey/*) and the other headers clients send.
+	// (mandatory on /auth/passkey/*) and the other headers clients send. The
+	// private-data sync headers (If-None-Match, X-Private-Data-If-Match,
+	// X-Private-Data-If-None-Match) are always added when missing.
 	AllowedHeaders []string `yaml:"allowed_headers" envconfig:"ALLOWED_HEADERS"`
 
 	// ExposedHeaders is a list of headers that browsers are allowed to access.
 	// Default: X-Private-Data-ETag and Retry-After (sent with every 429). An
 	// explicit list replaces the defaults, so it must keep Retry-After for
-	// cross-origin clients to read it.
+	// cross-origin clients to read it. X-Private-Data-ETag is always added
+	// when missing.
 	ExposedHeaders []string `yaml:"exposed_headers" envconfig:"EXPOSED_HEADERS"`
 
 	// AllowCredentials indicates whether the request can include credentials.

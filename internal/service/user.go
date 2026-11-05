@@ -375,14 +375,3 @@ func (s *UserService) UpdateSettings(ctx context.Context, userID domain.UserID, 
 	}
 	return stored, nil
 }
-
-// UpdateUser unconditionally overwrites a user with the given snapshot.
-// Prefer the targeted methods (UpdatePrivateData, UpdateSettings, ...) for
-// request handling: a stale snapshot will roll back concurrent changes.
-func (s *UserService) UpdateUser(ctx context.Context, user *domain.User) error {
-	user.UpdatedAt = time.Now()
-	if err := s.store.Users().Update(ctx, user); err != nil {
-		return fmt.Errorf("failed to update user: %w", err)
-	}
-	return nil
-}

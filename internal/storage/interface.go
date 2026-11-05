@@ -85,11 +85,6 @@ type UserStore interface {
 	// GetByDID retrieves a user by DID
 	GetByDID(ctx context.Context, did string) (*domain.User, error)
 
-	// Update unconditionally overwrites a user with the given snapshot.
-	// Prefer Modify for any read-modify-write: Update can roll back fields
-	// (e.g. private data) that were changed concurrently.
-	Update(ctx context.Context, user *domain.User) error
-
 	// Modify atomically reads the user, applies fn and writes the result.
 	// Concurrent writes are detected via User.Version and fn is re-applied
 	// to the fresh record. Errors returned by fn are passed through unchanged.

@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"errors"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -259,11 +260,12 @@ func TestUserStore_Update(t *testing.T) {
 	}
 
 	// Update user
-	user.DID = "did:key:updated"
-
-	err = users.Update(ctx, user)
+	_, err = users.Modify(ctx, user.UUID, func(u *domain.User) error {
+		u.DID = "did:key:updated"
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("Update() error = %v", err)
+		t.Fatalf("Modify() error = %v", err)
 	}
 
 	// Verify update
@@ -274,24 +276,6 @@ func TestUserStore_Update(t *testing.T) {
 
 	if retrieved.DID != "did:key:updated" {
 		t.Errorf("DID not updated, got %q", retrieved.DID)
-	}
-}
-
-func TestUserStore_Update_NotFound(t *testing.T) {
-	ctx := t.Context()
-	store := NewStore()
-	users := store.Users()
-
-	username := "ghost"
-	user := &domain.User{
-		UUID:     domain.NewUserID(),
-		Username: &username,
-		DID:      "did:key:test",
-	}
-
-	err := users.Update(ctx, user)
-	if err != storage.ErrNotFound {
-		t.Errorf("Update() for nonexistent user should return ErrNotFound, got %v", err)
 	}
 }
 
@@ -2583,5 +2567,46 @@ func TestInviteStore_ClearUsedBy(t *testing.T) {
 	got3, _ := invites.GetByID(ctx, "inv3")
 	if got3.UsedBy != nil {
 		t.Error("inv3.UsedBy should still be nil")
+	}
+}
+
+// TestUserStore_Modify_IsAtomic: concurrent read-modify-write increments must
+// all be applied. A Modify that does not hold the lock across fn loses updates.
+func TestUserStore_Modify_IsAtomic(t *testing.T) {
+	ctx := t.Context()
+	users := NewStore().Users()
+	user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:atomic"}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatal(err)
+	}
+
+	const workers = 50
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := users.Modify(ctx, user.UUID, func(u *domain.User) error {
+				v := u.OpenIDRefreshTokenMaxAge
+				runtime.Gosched() // widen the read-modify-write window
+				u.OpenIDRefreshTokenMaxAge = v + 1
+				return nil
+			})
+			if err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	got, err := users.GetByID(ctx, user.UUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OpenIDRefreshTokenMaxAge != workers {
+		t.Errorf("counter = %d, want %d (lost updates)", got.OpenIDRefreshTokenMaxAge, workers)
+	}
+	if got.Version != workers {
+		t.Errorf("version = %d, want %d", got.Version, workers)
 	}
 }

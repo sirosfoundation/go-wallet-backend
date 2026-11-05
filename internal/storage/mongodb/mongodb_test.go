@@ -180,8 +180,10 @@ func TestUserStore_CRUD(t *testing.T) {
 
 	// Update
 	updatedName := "Updated User"
-	user.DisplayName = &updatedName
-	err = store.Users().Update(ctx, user)
+	_, err = store.Users().Modify(ctx, user.UUID, func(u *domain.User) error {
+		u.DisplayName = &updatedName
+		return nil
+	})
 	require.NoError(t, err)
 
 	retrieved, err = store.Users().GetByID(ctx, user.UUID)
@@ -1246,5 +1248,62 @@ func TestNextSequence_FreshDatabaseIsMonotonic(t *testing.T) {
 		got, err := nextSequence(ctx, counters, "test_seq")
 		require.NoError(t, err)
 		assert.Equal(t, want, got)
+	}
+}
+
+// TestUserStore_Modify_ConflictExhaustion: when every attempt loses the race,
+// Modify applies fn exactly maxModifyAttempts times and returns ErrConflict.
+func TestUserStore_Modify_ConflictExhaustion(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:exhaust"}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	sleeps := 0
+	orig := modifySleep
+	modifySleep = func(context.Context, time.Duration) error { sleeps++; return nil }
+	t.Cleanup(func() { modifySleep = orig })
+
+	calls := 0
+	_, err := store.Users().Modify(ctx, user.UUID, func(u *domain.User) error {
+		calls++
+		// A competing writer bumps the version after our read.
+		_, e := store.users.collection.UpdateOne(ctx, bson.M{"_id.id": user.UUID.String()}, bson.M{"$inc": bson.M{"version": int64(1)}})
+		require.NoError(t, e)
+		return nil
+	})
+	require.ErrorIs(t, err, storage.ErrConflict)
+	assert.Equal(t, maxModifyAttempts, calls)
+	// Sleeps happen between attempts only, never after the final one.
+	assert.Equal(t, maxModifyAttempts-1, sleeps)
+}
+
+// TestUserStore_Modify_ContextCancelled: a cancelled context ends the retry
+// loop promptly with a context error instead of ErrConflict.
+func TestUserStore_Modify_ContextCancelled(t *testing.T) {
+	store := skipIfNoMongo(t)
+	user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:cancel"}
+	require.NoError(t, store.Users().Create(context.Background(), user))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	_, err := store.Users().Modify(ctx, user.UUID, func(u *domain.User) error {
+		calls++
+		_, e := store.users.collection.UpdateOne(context.Background(), bson.M{"_id.id": user.UUID.String()}, bson.M{"$inc": bson.M{"version": int64(1)}})
+		require.NoError(t, e)
+		cancel()
+		return nil
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 1, calls)
+}
+
+func TestModifyBackoffBounds(t *testing.T) {
+	for attempt := 0; attempt < 30; attempt++ {
+		for i := 0; i < 50; i++ {
+			d := modifyBackoff(attempt)
+			require.Greater(t, d, time.Duration(0))
+			require.LessOrEqual(t, d, modifyMaxBackoff)
+		}
 	}
 }

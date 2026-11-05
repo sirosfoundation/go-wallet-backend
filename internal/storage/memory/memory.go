@@ -314,22 +314,6 @@ func (s *UserStore) GetByDID(ctx context.Context, did string) (*domain.User, err
 	return nil, storage.ErrNotFound
 }
 
-func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
-	snapshot := deepCopyUser(user)
-	stored, err := s.Modify(ctx, user.UUID, func(u *domain.User) error {
-		version := u.Version
-		*u = *snapshot.Clone()
-		u.Version = version
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	user.UpdatedAt = stored.UpdatedAt
-	user.Version = stored.Version
-	return nil
-}
-
 // Modify atomically applies fn to the stored user while holding the write lock.
 func (s *UserStore) Modify(ctx context.Context, id domain.UserID, fn storage.UserModifier) (*domain.User, error) {
 	s.mu.Lock()

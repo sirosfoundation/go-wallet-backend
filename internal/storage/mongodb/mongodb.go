@@ -368,22 +368,6 @@ func (s *UserStore) GetByDID(ctx context.Context, did string) (*domain.User, err
 	return &user, nil
 }
 
-func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
-	snapshot := user.Clone()
-	stored, err := s.Modify(ctx, user.UUID, func(u *domain.User) error {
-		version := u.Version
-		*u = *snapshot.Clone()
-		u.Version = version
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	user.UpdatedAt = stored.UpdatedAt
-	user.Version = stored.Version
-	return nil
-}
-
 // Optimistic-concurrency retry tuning for Modify. Contention on a single user
 // document is normally low (one user, a few tabs/devices), so these limits
 // are generous; backoff with jitter keeps competing writers from retrying in
@@ -401,6 +385,18 @@ func modifyBackoff(attempt int) time.Duration {
 		d = modifyMaxBackoff
 	}
 	return time.Duration(rand.Int64N(int64(d)) + 1)
+}
+
+// modifySleep waits d or until ctx ends (a variable so tests can count sleeps).
+var modifySleep = func(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // Modify performs an optimistic read-modify-write on a user document.
@@ -437,12 +433,11 @@ func (s *UserStore) Modify(ctx context.Context, id domain.UserID, fn storage.Use
 		}
 		// Either the user was deleted or another writer won the race.
 		// Loop: GetByID distinguishes the two cases.
-		timer := time.NewTimer(modifyBackoff(attempt))
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return nil, ctx.Err()
-		case <-timer.C:
+		if attempt == maxModifyAttempts-1 {
+			break // out of attempts: report the conflict without a pointless sleep
+		}
+		if err := modifySleep(ctx, modifyBackoff(attempt)); err != nil {
+			return nil, err
 		}
 	}
 	return nil, storage.ErrConflict
