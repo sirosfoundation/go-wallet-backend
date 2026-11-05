@@ -366,10 +366,12 @@ enrollment, letting every passkey log in again. Revoke it instead
 record with no user behind it (a stray attestation record) can be deleted.
 
 The passkey link is recorded when the wallet passes its passkey's base64url
-credential id as `credential_id` to `POST /wallet-provider/wia/generate`. It
-must be one of the caller's own registered passkeys, or the request is refused
-with `403 CREDENTIAL_NOT_OWNED`: the first link recorded for an instance wins,
-so an unchecked one could keep the real passkey out of the per-instance login
+credential id as `credential_id` to `POST /wallet-provider/wia/generate`. The
+value is supplied by the client. It must be one of the authenticated user's own
+registered passkeys in the same tenant, or the request is refused with
+`403 CREDENTIAL_NOT_OWNED`; it is not checked to be the passkey that
+authenticated the current session (issue 333). The check exists because the
+first link recorded for an instance wins, so an unchecked one could keep the real passkey out of the per-instance login
 gate for good.
 
 ##### GET /user/session/instances

@@ -61,8 +61,12 @@ type WIAGenerateRequest struct {
 	ClientID string `json:"client_id,omitempty"`
 	// NativeAttestation is optional platform attestation evidence (App Attest / Play Integrity)
 	NativeAttestation *service.NativeAttestationRequest `json:"native_attestation,omitempty"`
-	// CredentialID is the base64url WebAuthn credential id of the passkey this
-	// instance logs in with; revoking the instance refuses that passkey (SID-AUTH-06). Optional.
+	// CredentialID is a client-supplied base64url WebAuthn credential id that the
+	// instance claims as its login passkey; revoking the instance refuses that
+	// passkey (SID-AUTH-06). Optional. The backend checks only that it is one of
+	// the authenticated user's own passkeys in the same tenant (403
+	// CREDENTIAL_NOT_OWNED otherwise); it does not check that it is the passkey
+	// that authenticated this session (issue 333).
 	CredentialID string `json:"credential_id,omitempty"`
 	// KeyAttestation is optional evidence about the instance (PoP) key:
 	// {"type": "android_key" | "app_attest_assertion", ...}. See

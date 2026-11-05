@@ -365,8 +365,10 @@ type WIARequest struct {
 	ClientID string `json:"client_id,omitempty"`
 	// NativeAttestation is optional platform attestation evidence
 	NativeAttestation *NativeAttestationRequest `json:"native_attestation,omitempty"`
-	// CredentialID is the optional base64url credential id of the instance's
-	// login passkey (SID-AUTH-06).
+	// CredentialID is the optional, client-supplied base64url credential id the
+	// instance claims as its login passkey (SID-AUTH-06). It is checked to be one
+	// of the caller's own passkeys in this tenant, not to be the passkey that
+	// authenticated the session (issue 333).
 	CredentialID string `json:"credential_id,omitempty"`
 	// KeyAttestation is optional evidence about the instance (PoP) key
 	// itself; see instance_key_evidence.go. Absent: the home stays unknown.
@@ -1398,8 +1400,9 @@ func (s *WIAService) revokeIfWalletDeactivatedMeanwhile(ctx context.Context, ten
 	return fmt.Errorf("%w: wallet deactivated during attestation", ErrWIAInstanceDeactivated)
 }
 
-// checkCredentialOwnership refuses a credential_id the caller cannot prove is
-// theirs (empty is fine). The credential must belong to this tenant; legacy
+// checkCredentialOwnership refuses a credential_id that is not one of the
+// caller's own passkeys (empty is fine). It does not tie the id to the passkey
+// that authenticated the session (issue 333). The credential must belong to this tenant; legacy
 // credentials count as the default tenant, as in the login path.
 func (s *WIAService) checkCredentialOwnership(ctx context.Context, tenantID domain.TenantID, userID *domain.UserID, credentialID string) error {
 	if credentialID == "" {
