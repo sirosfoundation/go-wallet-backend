@@ -41,6 +41,15 @@ func TestValidatePrivateDataOwnership_Container(t *testing.T) {
 		{"JSON array", []byte(`[]`), true},
 		{"JSON string", []byte(`"x"`), true},
 		{"missing prfKeys", []byte(`{"mainKey":{},"jwe":"a.b.c.d.e"}`), true},
+		{"jwe missing", []byte(`{"mainKey":{},"prfKeys":[{"credentialId":{"$b64u":"` + testCredID("a") + `"}}]}`), true},
+		{"jwe null", []byte(`{"mainKey":{},"jwe":null,"prfKeys":[{"credentialId":{"$b64u":"` + testCredID("a") + `"}}]}`), true},
+		{"jwe wrong type", []byte(`{"mainKey":{},"jwe":{},"prfKeys":[{"credentialId":{"$b64u":"` + testCredID("a") + `"}}]}`), true},
+		{"jwe empty", []byte(`{"mainKey":{},"jwe":"","prfKeys":[{"credentialId":{"$b64u":"` + testCredID("a") + `"}}]}`), true},
+		{"jwe not compact", []byte(`{"mainKey":{},"jwe":"abc","prfKeys":[{"credentialId":{"$b64u":"` + testCredID("a") + `"}}]}`), true},
+		{"jwe empty ciphertext", []byte(`{"jwe":"a.b.c..e","prfKeys":[{"credentialId":{"$b64u":"` + testCredID("a") + `"}}]}`), true},
+		{"mainKey null", []byte(`{"mainKey":null,"jwe":"a.b.c.d.e","prfKeys":[{"credentialId":{"$b64u":"` + testCredID("a") + `"}}]}`), true},
+		{"mainKey wrong type", []byte(`{"mainKey":"x","jwe":"a.b.c.d.e","prfKeys":[{"credentialId":{"$b64u":"` + testCredID("a") + `"}}]}`), true},
+		{"mainKey absent accepted (older containers)", []byte(`{"jwe":"a..c.d.e","prfKeys":[{"credentialId":{"$b64u":"` + testCredID("a") + `"}}]}`), false},
 		{"prfKeys null", []byte(`{"prfKeys":null}`), true},
 		{"prfKeys not array", []byte(`{"prfKeys":{}}`), true},
 		{"entry null", []byte(`{"prfKeys":[null]}`), true},
@@ -65,6 +74,44 @@ func TestValidatePrivateDataOwnership_Container(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestValidatePrivateDataOwnership_CredentialEncodings(t *testing.T) {
+	raw := []byte{0xfb, 0xff, 0xfe, 0x01, 0x02} // base64url and std alphabets differ for these bytes
+	forms := map[string]string{
+		"base64url no pad": base64.RawURLEncoding.EncodeToString(raw),
+		"base64url padded": base64.URLEncoding.EncodeToString(raw),
+		"std no pad":       base64.RawStdEncoding.EncodeToString(raw),
+		"std padded":       base64.StdEncoding.EncodeToString(raw),
+	}
+	container := func(idText string) []byte {
+		return testPrivateDataContainer(idText)
+	}
+	for storedName, stored := range forms {
+		for _, withBytes := range []bool{true, false} {
+			cred := domain.WebauthnCredential{ID: stored}
+			if withBytes {
+				cred.CredentialID = raw
+			}
+			// the container always carries url-safe forms of the same bytes
+			for _, cname := range []string{"base64url no pad", "base64url padded"} {
+				name := storedName + "/bytes=" + map[bool]string{true: "yes", false: "no"}[withBytes] + "/container " + cname
+				t.Run(name, func(t *testing.T) {
+					err := validatePrivateDataOwnership(zap.NewNop(), domain.NewUserID(), []domain.WebauthnCredential{cred}, container(forms[cname]))
+					require.NoError(t, err)
+				})
+			}
+		}
+	}
+	t.Run("raw bytes match despite unrelated stored ID text", func(t *testing.T) {
+		cred := domain.WebauthnCredential{ID: "legacy-opaque-id", CredentialID: raw}
+		require.NoError(t, validatePrivateDataOwnership(zap.NewNop(), domain.NewUserID(), []domain.WebauthnCredential{cred}, container(forms["base64url no pad"])))
+	})
+	t.Run("different bytes still refused", func(t *testing.T) {
+		cred := domain.WebauthnCredential{ID: forms["std padded"], CredentialID: raw}
+		err := validatePrivateDataOwnership(zap.NewNop(), domain.NewUserID(), []domain.WebauthnCredential{cred}, container(testCredID("other")))
+		require.ErrorIs(t, err, ErrPrivateDataOwnership)
+	})
 }
 
 func TestValidatePrivateDataOwnership_DoesNotLogContainer(t *testing.T) {
@@ -345,4 +392,76 @@ func TestFinishAddCredential_PrivateDataOwnership(t *testing.T) {
 
 func bytesReplace(b []byte, old, new string) []byte {
 	return []byte(strings.ReplaceAll(string(b), old, new))
+}
+
+func TestPrivateDataWritePaths_RefuseBrokenEnvelope(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("UpdatePrivateData", func(t *testing.T) {
+		for name, d := range testBrokenEnvelopes(testCredID("a")) {
+			svc, store, user := newPrivateDataUserService(t)
+			before, _ := store.Users().GetByID(ctx, user.UUID)
+			_, err := svc.UpdatePrivateData(ctx, user.UUID, d, "")
+			require.ErrorIs(t, err, ErrPrivateDataOwnership, name)
+			after, _ := store.Users().GetByID(ctx, user.UUID)
+			assert.Equal(t, before.PrivateData, after.PrivateData, name)
+			assert.Equal(t, before.PrivateDataETag, after.PrivateDataETag, name)
+		}
+	})
+
+	t.Run("DeleteWebAuthnCredential", func(t *testing.T) {
+		for name, d := range testBrokenEnvelopes(testCredID("b")) {
+			svc, store, user := newPrivateDataUserService(t)
+			_, err := svc.DeleteWebAuthnCredential(ctx, user.UUID, testCredID("a"), d, "")
+			require.ErrorIs(t, err, ErrPrivateDataOwnership, name)
+			after, _ := store.Users().GetByID(ctx, user.UUID)
+			assert.Len(t, after.WebauthnCredentials, 2, name)
+		}
+	})
+
+	t.Run("Register", func(t *testing.T) {
+		// no credentials: refused regardless, but the broken envelope must not change that
+		svc := NewUserService(memory.NewStore(), testConfig(), testLogger())
+		for name, d := range testBrokenEnvelopes(testCredID("a")) {
+			_, err := svc.Register(ctx, &domain.RegisterRequest{DisplayName: "x", PrivateData: d})
+			require.ErrorIs(t, err, ErrPrivateDataOwnership, name)
+		}
+	})
+
+	t.Run("FinishAddCredential", func(t *testing.T) {
+		setup := newTestVirtualWebAuthnSetup(t)
+		for name, d := range testBrokenEnvelopes(testCredID("a")) {
+			user := &domain.User{
+				UUID:                domain.NewUserID(),
+				WebauthnCredentials: []domain.WebauthnCredential{{ID: testCredID("a"), CredentialID: []byte("cred-a")}},
+			}
+			user.UpdatePrivateData(testPrivateDataContainer(testCredID("a")))
+			require.NoError(t, setup.store.Users().Create(ctx, user))
+			begin, err := setup.service.BeginAddCredential(ctx, user.UUID)
+			require.NoError(t, err)
+			opts := vwaOptions(t, begin.CreateOptions)
+			resp := virtualwebauthn.CreateAttestationResponse(setup.rp, setup.authenticator, virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2), opts)
+			_, err = setup.service.FinishAddCredential(ctx, user.UUID, &FinishAddCredentialRequest{
+				ChallengeID: begin.ChallengeID, Credential: json.RawMessage(resp), PrivateData: d,
+			}, "")
+			require.ErrorIs(t, err, ErrPrivateDataOwnership, name)
+			after, _ := setup.store.Users().GetByID(ctx, user.UUID)
+			assert.Len(t, after.WebauthnCredentials, 1, name)
+		}
+	})
+
+	t.Run("FinishRegistration", func(t *testing.T) {
+		for name, d := range testBrokenEnvelopes("SELF") {
+			setup := newTestVirtualWebAuthnSetup(t)
+			begin, err := setup.service.BeginRegistration(ctx, &BeginRegistrationRequest{DisplayName: "PD"})
+			require.NoError(t, err)
+			opts := vwaOptions(t, begin.CreateOptions)
+			resp := virtualwebauthn.CreateAttestationResponse(setup.rp, setup.authenticator, setup.credential, opts)
+			d = bytesReplace(d, "SELF", storedID(setup.credential))
+			_, err = setup.service.FinishRegistration(ctx, &FinishRegistrationRequest{
+				ChallengeID: begin.ChallengeID, Credential: json.RawMessage(resp), DisplayName: "PD", PrivateData: d,
+			})
+			require.ErrorIs(t, err, ErrPrivateDataOwnership, name)
+		}
+	})
 }

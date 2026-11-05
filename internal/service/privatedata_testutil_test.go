@@ -32,3 +32,17 @@ func testPrivateDataContainer(credentialIDs ...string) []byte {
 	}
 	return b
 }
+
+// testBrokenEnvelopes returns containers that carry a matching credentialId but
+// whose jwe or mainKey is missing or of the wrong type.
+func testBrokenEnvelopes(credID string) map[string][]byte {
+	entry := `"prfKeys":[{"credentialId":{"$b64u":"` + credID + `"}}]`
+	return map[string][]byte{
+		"jwe missing":    []byte(`{"mainKey":{},` + entry + `}`),
+		"jwe null":       []byte(`{"mainKey":{},"jwe":null,` + entry + `}`),
+		"jwe wrong type": []byte(`{"mainKey":{},"jwe":1,` + entry + `}`),
+		"jwe empty":      []byte(`{"mainKey":{},"jwe":"",` + entry + `}`),
+		"mainKey null":   []byte(`{"mainKey":null,"jwe":"a.b.c.d.e",` + entry + `}`),
+		"mainKey wrong":  []byte(`{"mainKey":[],"jwe":"a.b.c.d.e",` + entry + `}`),
+	}
+}

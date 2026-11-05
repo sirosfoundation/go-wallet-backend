@@ -85,13 +85,18 @@ Every endpoint that writes a user's private data validates the container before 
 `POST /auth/passkey/register/finish`.
 
 The container is the privatedata-spec JSON `{mainKey, prfKeys[], jwe}` in which every
-`prfKeys[].credentialId` is tagged binary (`{"$b64u": "..."}`, the same base64url encoding the
-backend stores credential IDs in). The write is accepted when at least one `credentialId` is
-among the user's registered WebAuthn credentials (for credential deletion: among the credentials
+`prfKeys[].credentialId` is tagged binary (`{"$b64u": "..."}`). Credential IDs are compared as
+raw bytes: the container's value (base64url, padded or not) is matched against each stored
+credential's `CredentialID` bytes and against its stored ID text decoded as url-safe or standard
+base64, padded or not, so accounts that stored the ID in another encoding still match. The
+write is accepted when at least one `credentialId` is among the user's registered WebAuthn credentials (for credential deletion: among the credentials
 that remain). It is refused when:
 
 - no `credentialId` matches a registered credential;
 - `prfKeys` is empty;
+- `jwe` is missing, null, not a string, or not a compact JWE (five dot-separated parts with a
+  non-empty header and ciphertext); nothing is decrypted;
+- `mainKey` is present but not an object (an absent `mainKey` is accepted, as older containers omit it);
 - the data is not a valid container (not JSON, JSON `null`, `prfKeys` missing, null or not an
   array, an entry that is not an object, or a `credentialId` that is not valid tagged base64url).
 

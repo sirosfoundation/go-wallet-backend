@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"go.uber.org/zap"
 
@@ -31,12 +32,45 @@ func ownershipError(reason string) error {
 	return fmt.Errorf("%w: %s", ErrPrivateDataOwnership, reason)
 }
 
-// containerCredentialIDs extracts the prfKeys[].credentialId values (as
-// base64url without padding, the encoding user credentials are stored with)
-// from a privatedata container {mainKey, prfKeys[], jwe}. It fails closed: any
+// looksLikeCompactJWE reports whether s has the shape of a compact JWE:
+// five dot-separated parts with a non-empty protected header and ciphertext.
+func looksLikeCompactJWE(s string) bool {
+	parts := strings.Split(s, ".")
+	return len(parts) == 5 && parts[0] != "" && parts[3] != ""
+}
+
+// decodeBase64Any decodes s with the first encoding that accepts it.
+func decodeBase64Any(s string, encs ...*base64.Encoding) ([]byte, bool) {
+	for _, enc := range encs {
+		if b, err := enc.DecodeString(s); err == nil {
+			return b, true
+		}
+	}
+	return nil, false
+}
+
+// storedCredentialIDs returns the raw credential ID bytes of a stored
+// credential: its CredentialID bytes when set, plus the ID text decoded under
+// every base64 variant (url/std, padded or not), so accounts that store the
+// ID in another encoding, or without CredentialID bytes, are still recognised.
+func storedCredentialIDs(c domain.WebauthnCredential) [][]byte {
+	var out [][]byte
+	if len(c.CredentialID) > 0 {
+		out = append(out, c.CredentialID)
+	}
+	for _, enc := range []*base64.Encoding{base64.RawURLEncoding, base64.URLEncoding, base64.RawStdEncoding, base64.StdEncoding} {
+		if b, err := enc.DecodeString(c.ID); err == nil && len(b) > 0 {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// containerCredentialIDs extracts the prfKeys[].credentialId values (as raw
+// bytes) from a privatedata container {mainKey, prfKeys[], jwe}. It fails closed: any
 // deviation from the expected shape is an error. The error text never
 // contains container contents.
-func containerCredentialIDs(data []byte) ([]string, error) {
+func containerCredentialIDs(data []byte) ([][]byte, error) {
 	var root any
 	if err := json.Unmarshal(data, &root); err != nil {
 		return nil, ownershipError("not valid JSON")
@@ -44,6 +78,20 @@ func containerCredentialIDs(data []byte) ([]string, error) {
 	obj, ok := root.(map[string]any)
 	if !ok {
 		return nil, ownershipError("container is not a JSON object")
+	}
+	// mainKey is only checked when present: older wallet-frontend containers
+	// omit it. When present it must be an object.
+	if mk, present := obj["mainKey"]; present {
+		if _, ok := mk.(map[string]any); !ok {
+			return nil, ownershipError("mainKey is not an object")
+		}
+	}
+	// jwe MUST be present and MUST be a compact JWE (five dot-separated
+	// parts; for A256GCMKW the encrypted-key part is empty). Nothing is
+	// decrypted; this only refuses blobs that can never be unlocked.
+	jwe, ok := obj["jwe"].(string)
+	if !ok || !looksLikeCompactJWE(jwe) {
+		return nil, ownershipError("jwe missing or not a compact JWE")
 	}
 	prfKeys, ok := obj["prfKeys"].([]any)
 	if !ok {
@@ -53,7 +101,7 @@ func containerCredentialIDs(data []byte) ([]string, error) {
 		return nil, ownershipError("prfKeys is empty")
 	}
 
-	ids := make([]string, 0, len(prfKeys))
+	ids := make([][]byte, 0, len(prfKeys))
 	for _, entry := range prfKeys {
 		entryObj, ok := entry.(map[string]any)
 		if !ok {
@@ -67,11 +115,11 @@ func containerCredentialIDs(data []byte) ([]string, error) {
 		if !ok {
 			return nil, ownershipError("credentialId is not tagged binary")
 		}
-		raw, err := base64.RawURLEncoding.DecodeString(str)
-		if err != nil || len(raw) == 0 {
+		raw, ok := decodeBase64Any(str, base64.RawURLEncoding, base64.URLEncoding)
+		if !ok || len(raw) == 0 {
 			return nil, ownershipError("credentialId is not valid base64url")
 		}
-		ids = append(ids, base64.RawURLEncoding.EncodeToString(raw))
+		ids = append(ids, raw)
 	}
 	return ids, nil
 }
@@ -90,10 +138,12 @@ func validatePrivateDataOwnership(logger *zap.Logger, userID domain.UserID, cred
 	if err == nil {
 		registered := make(map[string]struct{}, len(creds))
 		for _, c := range creds {
-			registered[c.ID] = struct{}{}
+			for _, b := range storedCredentialIDs(c) {
+				registered[string(b)] = struct{}{}
+			}
 		}
 		for _, id := range ids {
-			if _, ok := registered[id]; ok {
+			if _, ok := registered[string(id)]; ok {
 				return nil
 			}
 		}
