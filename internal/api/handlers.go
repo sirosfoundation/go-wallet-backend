@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -914,9 +916,18 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 	var req struct {
 		PrivateData taggedbinary.TaggedBytes `json:"privateData"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		// Allow empty body
-		req.PrivateData = nil
+	// An empty body is read as "no privateData" and refused below with 422;
+	// a body that does not parse is a 400, never treated as empty.
+	rawBody, err := c.GetRawData()
+	if err != nil {
+		c.JSON(400, gin.H{"error": "Failed to read request body"})
+		return
+	}
+	if len(bytes.TrimSpace(rawBody)) > 0 {
+		if err := json.Unmarshal(rawBody, &req); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid request body"})
+			return
+		}
 	}
 
 	ifMatch := c.GetHeader("X-Private-Data-If-Match")

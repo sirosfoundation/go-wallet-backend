@@ -133,6 +133,30 @@ func TestHandlers_DeleteWebAuthnCredential_Ownership(t *testing.T) {
 		w := postJSON(router, path, []byte(`{}`), nil)
 		assertOwnership422(t, w)
 	})
+
+	t.Run("empty body is 422, nothing changes", func(t *testing.T) {
+		h, router, user := setup(t)
+		beforeData, beforeEtag := storedPrivateData(t, h, user)
+		w := postJSON(router, path, nil, nil)
+		assertOwnership422(t, w)
+		afterData, afterEtag := storedPrivateData(t, h, user)
+		assert.Equal(t, beforeData, afterData)
+		assert.Equal(t, beforeEtag, afterEtag)
+		u, _ := h.services.User.GetUserByID(context.Background(), user.UUID)
+		assert.Len(t, u.WebauthnCredentials, 2)
+	})
+
+	t.Run("malformed body is 400, nothing changes", func(t *testing.T) {
+		h, router, user := setup(t)
+		beforeData, beforeEtag := storedPrivateData(t, h, user)
+		w := postJSON(router, path, []byte(`{"privateData":`), nil)
+		assert.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+		afterData, afterEtag := storedPrivateData(t, h, user)
+		assert.Equal(t, beforeData, afterData)
+		assert.Equal(t, beforeEtag, afterEtag)
+		u, _ := h.services.User.GetUserByID(context.Background(), user.UUID)
+		assert.Len(t, u.WebauthnCredentials, 2)
+	})
 }
 
 func TestHandlers_FinishAddCredential_Ownership(t *testing.T) {
