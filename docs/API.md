@@ -242,8 +242,8 @@ Two kinds of token need separate handling, because the cut-off is recorded
 against a user. An **anonymous** AS token names no user, so there is nothing to
 look up: instead it is refused (`403`) on every wallet-scoped route (account,
 configuration, wallet-provider, credential storage, and `oid4vp`/`oid4vci`
-engine flows) and is only accepted for registry lookups (`/v1/evaluate`,
-`/v1/resolve`, the registry routes, `vctm` flows). A token naming a user whose
+engine flows) and is only accepted for trust evaluation, resolution and registry/metadata
+lookups (`/v1/evaluate`, `/v1/resolve`, the registry routes, `vctm` flows). A token naming a user whose
 **account has been removed** is refused with `401` as well: deleting the
 account writes a deletion tombstone, kept until every token that could name the
 user has expired (see DEPLOYMENT.md, "Account Deletion Tombstones"), and the

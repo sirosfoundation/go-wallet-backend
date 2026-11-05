@@ -91,7 +91,7 @@ or session cookie as appropriate for the route group.
 | POST | `/v1/evaluate` | `r` | **`aud`: `"wallet-registry"` or `"wallet-backend"`** - this is the intended anonymous-token call. |
 | POST | `/v1/resolve` | `r` | Same `aud` as `/v1/evaluate`. |
 
-**Anonymous tokens are for registry lookups only.** A token that names no
+**Anonymous tokens are for trust evaluation, resolution and registry/metadata lookups only.** A token that names no
 user (the AS `anonymous` shape above, or a legacy token with an empty
 `user_id`) is accepted on `/v1/evaluate` and `/v1/resolve`, on the registry
 routes and on `vctm` engine flows, and refused with `403` (`anonymous tokens
