@@ -97,8 +97,15 @@ func TestKeyAttestationStore_DeleteIfUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := kas.DeleteIfUnchanged(ctx, "t", staleToken); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("a superseded write token must not delete, got %v", err)
+	if err := kas.DeleteIfUnchanged(ctx, "t", "never-written"); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("an unknown write token must not delete, got %v", err)
+	}
+	// The first write's rollback is spliced out: the newer write stays.
+	if err := kas.DeleteIfUnchanged(ctx, "t", staleToken); err != nil {
+		t.Fatalf("a superseded write token is spliced out, got %v", err)
+	}
+	if _, err := kas.GetByKeyThumbprint(ctx, "t"); err != nil {
+		t.Fatalf("the newer write must survive: %v", err)
 	}
 	if err := kas.DeleteIfUnchanged(ctx, "t", ""); !errors.Is(err, storage.ErrNotFound) {
 		t.Fatalf("an empty token must not delete, got %v", err)
@@ -131,9 +138,10 @@ func TestKeyAttestationStore_RestoreIfUnchanged(t *testing.T) {
 	}
 	written := *second
 
-	stale := *first
-	if err := kas.RestoreIfUnchanged(ctx, &stale, second.Previous); !errors.Is(err, storage.ErrNotFound) {
-		t.Fatalf("a superseded write must not restore, got %v", err)
+	unknown := *first
+	unknown.WriteToken = "never-written"
+	if err := kas.RestoreIfUnchanged(ctx, &unknown, second.Previous); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("an unknown write must not restore, got %v", err)
 	}
 	if err := kas.RestoreIfUnchanged(ctx, &written, second.Previous); err != nil {
 		t.Fatal(err)
@@ -358,8 +366,7 @@ func TestKeyAttestationStore_RevokeAndReplaceRotateTheWriteToken(t *testing.T) {
 	marked, err := kas.MarkKeyRevoked(ctx, "tp-rot", "fp1", "revoked", time.Now())
 	must(t, err)
 	eq(t, true, marked)
-	isNotFound(t, kas.DeleteIfUnchanged(ctx, "tp-rot", written.WriteToken))
-	isNotFound(t, kas.RestoreIfUnchanged(ctx, &written, &domain.KeyAttestationRecord{KeyThumbprint: "tp-rot", Home: domain.KeyHomeTEE}))
+	must(t, kas.DeleteIfUnchanged(ctx, "tp-rot", written.WriteToken)) // spliced out below the revocation
 	got, err := kas.GetByKeyThumbprint(ctx, "tp-rot")
 	must(t, err)
 	eq(t, true, got.Revoked())

@@ -18,7 +18,11 @@ import (
 // WalletInstanceStore implements storage.WalletInstanceStore using MongoDB.
 type WalletInstanceStore struct {
 	collection *mongo.Collection
+	// now is the clock the undo log ages by; nil means time.Now.
+	now func() time.Time
 }
+
+func lit(v any) bson.M { return bson.M{"$literal": v} }
 
 func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.WalletInstance) error {
 	// Tenant-scoped: a mismatch inserts a duplicate _id, and that duplicate-key
@@ -26,34 +30,44 @@ func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.Walle
 	filter := bson.M{"_id": instance.ID, "tenant_id": instance.TenantID}
 	newGeneration := uuid.NewString()
 	writeToken := uuid.NewString()
+	now := undoClock(s.now)
+	// One atomic pipeline update: the write and its undo-log entry (the
+	// attestation fields as they were, null for an insert) land together. On an
+	// insert the document holds only the filter's fields, so no created_at means
+	// "this call inserts".
+	isNew := bson.M{"$eq": bson.A{bson.M{"$type": "$created_at"}, "missing"}}
 	set := bson.M{
-		"write_token":        writeToken,
-		"attestation_source": instance.AttestationSource,
-		"verified_app_id":    instance.VerifiedAppID,
-		"last_attested_at":   instance.LastAttestedAt,
-		"updated_at":         instance.UpdatedAt,
-	}
-	update := bson.M{
-		"$set": set,
+		"write_token":        lit(writeToken),
+		"attestation_source": lit(instance.AttestationSource),
+		"verified_app_id":    lit(instance.VerifiedAppID),
+		"last_attested_at":   lit(instance.LastAttestedAt),
+		"updated_at":         lit(instance.UpdatedAt),
 		// Status and tenant are fixed at insert: re-attestation must not reactivate
-		// a revoked instance or move it to another tenant.
-		"$setOnInsert": bson.M{
-			"created_at": instance.CreatedAt,
-			// Fresh generation per insert (domain.InstanceBinding).
-			"generation": newGeneration,
-			"status":     instance.Status,
-			"tenant_id":  instance.TenantID,
-		},
-		"$inc": bson.M{
-			"attestation_count": 1,
-		},
+		// a revoked instance or move it to another tenant. Fresh generation per
+		// insert (domain.InstanceBinding).
+		"created_at":        bson.M{"$ifNull": bson.A{"$created_at", lit(instance.CreatedAt)}},
+		"generation":        bson.M{"$cond": bson.A{isNew, lit(newGeneration), "$generation"}},
+		"status":            bson.M{"$cond": bson.A{isNew, lit(instance.Status), "$status"}},
+		"attestation_count": bson.M{"$add": bson.A{bson.M{"$ifNull": bson.A{"$attestation_count", 0}}, 1}},
+		undoField: pushedLogExpr(now, writeToken, bson.M{"$cond": bson.A{isNew, nil, bson.M{
+			"attestation_source": "$attestation_source",
+			"verified_app_id":    "$verified_app_id",
+			"wscd_type":          "$wscd_type",
+			"last_attested_at":   "$last_attested_at",
+			"updated_at":         "$updated_at",
+			"device_info":        "$device_info",
+			"write_token":        "$write_token",
+			"user_id":            "$user_id",
+			"credential_id":      "$credential_id",
+		}}}),
 	}
 	if instance.WSCDType != "" {
-		set["wscd_type"] = instance.WSCDType
+		set["wscd_type"] = lit(instance.WSCDType)
 	}
 	if instance.DeviceInfo != nil {
-		set["device_info"] = instance.DeviceInfo
+		set["device_info"] = lit(instance.DeviceInfo)
 	}
+	update := mongo.Pipeline{{{Key: "$set", Value: set}}}
 
 	// Bind and link are scoped to the generation this upsert wrote or matched.
 	var written struct {
@@ -396,15 +410,99 @@ func (s *WalletInstanceStore) DeleteIfRemovable(ctx context.Context, id string, 
 	return nil
 }
 
-// RestoreAttestation undoes an Upsert that matched an existing record. Every
-// step is conditional on the Upsert's write token, so a newer attestation (which
-// replaces the token) makes the rest a no-op instead of being clobbered.
+// RestoreAttestation undoes the Upsert that set written.WriteToken and matched an
+// existing record (see storage.UndoLog), in one atomic pipeline update: when it
+// is the newest attestation the fields go back to the record it replaced,
+// including that record's write token and clearing the owner or passkey link it
+// set when the record had none and the stored value is still the one written;
+// when newer attestations sit on top it is spliced out of the log, their values
+// stay (a newer attestation may rely on the owner or link), and only the
+// attestation counter is undone. The caller's before is ignored for a record
+// that has an undo log; it is used only for a record written before the log
+// existed. An Upsert that inserted the record has nothing to restore
+// (ErrBindingChanged). Status is never touched.
 func (s *WalletInstanceStore) RestoreAttestation(ctx context.Context, before, written *domain.WalletInstance) error {
 	if written.WriteToken == "" {
 		return storage.ErrBindingChanged
 	}
+	for try := 0; try < rollbackMaxTries; try++ {
+		now := undoClock(s.now)
+		base := bson.A{
+			bson.M{"_id": written.ID}, bson.M{"tenant_id": written.TenantID}, generationCond(written.Generation),
+		}
+		// The write is in the log and replaced a record (it was not the insert).
+		logged := bson.M{undoField: bson.M{"$elemMatch": bson.M{
+			"token": written.WriteToken, "at": bson.M{"$gte": undoCutoff(now)}, "before": bson.M{"$ne": nil},
+		}}}
+		filter := bson.M{"$and": append(base, logged)}
+
+		unsetUser := bson.M{"$literal": false}
+		if written.UserID != nil {
+			unsetUser = bson.M{"$and": bson.A{
+				bson.M{"$eq": bson.A{bson.M{"$ifNull": bson.A{"$_rb.b.user_id", nil}}, nil}},
+				bson.M{"$eq": bson.A{"$user_id", lit(*written.UserID)}},
+			}}
+		}
+		unsetLink := bson.M{"$literal": false}
+		if written.CredentialID != "" {
+			unsetLink = bson.M{"$and": bson.A{
+				bson.M{"$in": bson.A{bson.M{"$ifNull": bson.A{"$_rb.b.credential_id", ""}}, bson.A{"", nil}}},
+				bson.M{"$eq": bson.A{"$credential_id", lit(written.CredentialID)}},
+			}}
+		}
+		// Only the newest attestation restores fields and unbinds; an older one
+		// spliced out of the log changes the counter and the log only.
+		fromBefore := func(field string) bson.M {
+			return bson.M{"$cond": bson.A{"$_rb.head", bson.M{"$ifNull": bson.A{"$_rb.b." + field, "$$REMOVE"}}, "$" + field}}
+		}
+		res, err := s.collection.UpdateOne(ctx, filter, mongo.Pipeline{
+			{{Key: "$set", Value: bson.M{"_rb": rollbackLet(now, written.WriteToken, bson.M{
+				"head": "$$isHead",
+				"b":    "$$entry.before",
+				"log":  bson.M{"$cond": bson.A{"$$isHead", "$$below", "$$spliced"}},
+			})}}},
+			{{Key: "$set", Value: bson.M{
+				"attestation_source": fromBefore("attestation_source"),
+				"verified_app_id":    fromBefore("verified_app_id"),
+				"wscd_type":          fromBefore("wscd_type"),
+				"last_attested_at":   fromBefore("last_attested_at"),
+				"updated_at":         fromBefore("updated_at"),
+				"device_info":        fromBefore("device_info"),
+				"write_token":        fromBefore("write_token"),
+				"user_id":            bson.M{"$cond": bson.A{bson.M{"$and": bson.A{"$_rb.head", unsetUser}}, "$$REMOVE", "$user_id"}},
+				"credential_id":      bson.M{"$cond": bson.A{bson.M{"$and": bson.A{"$_rb.head", unsetLink}}, "$$REMOVE", "$credential_id"}},
+				"attestation_count":  bson.M{"$subtract": bson.A{bson.M{"$ifNull": bson.A{"$attestation_count", 1}}, 1}},
+				undoField:            "$_rb.log",
+			}}},
+			{{Key: "$unset", Value: "_rb"}},
+		})
+		if err != nil {
+			return fmt.Errorf("%w: restore wallet instance attestation: %v", storage.ErrDatabase, err)
+		}
+		if res.MatchedCount == 1 {
+			return nil
+		}
+		// The write is still in the log: the state moved under us, try again.
+		n, err := s.collection.CountDocuments(ctx, filter)
+		if err != nil {
+			return fmt.Errorf("%w: restore wallet instance attestation: %v", storage.ErrDatabase, err)
+		}
+		if n > 0 {
+			continue
+		}
+		return s.restoreAttestationNoLog(ctx, before, written)
+	}
+	return fmt.Errorf("%w: restore wallet instance attestation: too much contention", storage.ErrDatabase)
+}
+
+// restoreAttestationNoLog is RestoreAttestation for a record that has no undo
+// log (written before it existed), and the classification of every miss: every
+// step is conditional on the Upsert's write token, so a newer attestation (which
+// replaced the token) makes the rest a no-op instead of being clobbered.
+func (s *WalletInstanceStore) restoreAttestationNoLog(ctx context.Context, before, written *domain.WalletInstance) error {
 	filter := bson.M{"$and": []bson.M{
 		{"_id": written.ID}, {"tenant_id": written.TenantID}, generationCond(written.Generation), {"write_token": written.WriteToken},
+		{undoField: bson.M{"$exists": false}},
 	}}
 	// Clear the owner and link first, only while still the values this request wrote.
 	if before.UserID == nil && written.UserID != nil {

@@ -115,7 +115,7 @@ type KeyAttestationRecord struct {
 	WriteToken string `json:"-" bson:"write_token,omitempty"`
 
 	// Previous is the record MarkKeyAttested overwrote (nil on first insert),
-	// kept so a rollback can restore it. Never persisted.
+	// informational: rollbacks use the store's undo log, not this. Never persisted.
 	Previous *KeyAttestationRecord `json:"-" bson:"-"`
 
 	// CreatedAt is when this record was first stored.

@@ -849,7 +849,7 @@ paths:
       tags:
         - Wallet Instances
       summary: Delete a wallet instance
-      description: |
+      description: >
         Hard-deletes a wallet instance and emits an audit event. An instance
         that belongs to a user and is no longer live is retained as a
         lifecycle record - it is what keeps the login gate and WIA issuance
@@ -869,7 +869,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: |
+          description: >
             A user's instance that is no longer live is retained as a
             lifecycle record (`error` is `INSTANCE_RETAINED`), and a live
             instance of a user must be revoked instead of deleted (`error`
@@ -947,7 +947,7 @@ paths:
                   status:
                     type: string
         '400':
-          description: |
+          description: >
             The body did not carry `"status": "revoked"`. Anything else,
             `"active"` included, is refused here rather than as a transition
             conflict: revocation is the only status change there is.
@@ -960,7 +960,7 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          description: |
+          description: >
             The revocation was recorded but the lifecycle cascade did not
             complete (`error` is `ERASURE_INCOMPLETE`; repeat the request to
             finish it).
@@ -978,7 +978,7 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
         '503':
-          description: |
+          description: >
             `LIFECYCLE_NOT_SUPPORTED` - no lifecycle service is wired, so the
             revocation did not happen. It is never applied partially: a status
             written without the token cut-off, the session drop and the
@@ -1080,7 +1080,7 @@ paths:
                   message:
                     type: string
         '503':
-          description: |
+          description: >
             `LIFECYCLE_NOT_SUPPORTED` - no lifecycle service is wired, so the
             revocation did not happen. It is never applied partially: a status
             written without the token cut-off, the session drop and the

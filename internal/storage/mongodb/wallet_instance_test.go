@@ -391,13 +391,13 @@ func TestWalletInstanceStore_RestoreAttestation_NewerAttestationIsNotClobbered(t
 	// A second attestation lands after this request's write.
 	require.NoError(t, store.Upsert(ctx, &domain.WalletInstance{ID: "rn-mongodb", TenantID: "acme", UserID: &uid, CredentialID: "cred", Status: domain.InstanceStatusActive, AttestationSource: "c", LastAttestedAt: time.Unix(300, 0), UpdatedAt: time.Unix(300, 0)}))
 
-	require.ErrorIs(t, store.RestoreAttestation(ctx, before, mine), storage.ErrBindingChanged, "a newer attestation makes the rollback a no-op")
+	require.NoError(t, store.RestoreAttestation(ctx, before, mine), "this write is spliced out; the newer attestation's values stay")
 	got, err := store.GetByID(ctx, "rn-mongodb")
 	require.NoError(t, err)
 	require.NotNil(t, got.UserID, "the newer attestation's owner is kept")
 	require.Equal(t, "cred", got.CredentialID, "the newer attestation's link is kept")
 	require.Equal(t, "c", got.AttestationSource)
-	require.Equal(t, before.AttestationCount+2, got.AttestationCount, "the newer attestation's count is kept")
+	require.Equal(t, before.AttestationCount+1, got.AttestationCount, "only the spliced-out write's count is undone")
 }
 
 func TestWalletInstanceStore_Upsert_PersistsWSCDTypeAndVerifiedAppID(t *testing.T) {

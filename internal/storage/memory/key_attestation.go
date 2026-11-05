@@ -13,6 +13,29 @@ import (
 type KeyAttestationStore struct {
 	mu   sync.RWMutex
 	data map[string]*domain.KeyAttestationRecord
+	undo map[string]*storage.UndoLog[domain.KeyAttestationRecord]
+	// now is the clock the undo log ages by; nil means time.Now.
+	now func() time.Time
+}
+
+func (s *KeyAttestationStore) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+// logFor returns the undo log of a record, creating it. Caller holds s.mu.
+func (s *KeyAttestationStore) logFor(thumbprint string) *storage.UndoLog[domain.KeyAttestationRecord] {
+	if s.undo == nil {
+		s.undo = make(map[string]*storage.UndoLog[domain.KeyAttestationRecord])
+	}
+	l, ok := s.undo[thumbprint]
+	if !ok {
+		l = &storage.UndoLog[domain.KeyAttestationRecord]{}
+		s.undo[thumbprint] = l
+	}
+	return l
 }
 
 func (s *KeyAttestationStore) MarkKeyAttested(_ context.Context, rec *domain.KeyAttestationRecord) error {
@@ -37,38 +60,53 @@ func (s *KeyAttestationStore) MarkKeyAttested(_ context.Context, rec *domain.Key
 		stored.CreatedAt = time.Now().UTC()
 	}
 	stored.WriteToken = storage.NewWriteToken()
+	var before *domain.KeyAttestationRecord
+	if rec.Previous != nil {
+		before = s.data[rec.KeyThumbprint].Clone()
+	}
 	s.data[rec.KeyThumbprint] = &stored
+	s.logFor(rec.KeyThumbprint).Push(s.clock(), stored.WriteToken, before)
 	rec.CreatedAt = stored.CreatedAt
 	rec.WriteToken = stored.WriteToken
 	return nil
 }
 
+// DeleteIfUnchanged undoes the write that set writeToken (see undoLog): a first
+// insert is deleted, an overwrite goes back to the record it replaced. Writes
+// made on top of it since are not undone. ErrNotFound if the token is not one of
+// the record's recent writes.
 func (s *KeyAttestationStore) DeleteIfUnchanged(_ context.Context, thumbprint, writeToken string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	rec, ok := s.data[thumbprint]
-	if !ok || writeToken == "" || rec.WriteToken != writeToken {
-		return storage.ErrNotFound
-	}
-	delete(s.data, thumbprint)
-	return nil
+	return s.rollback(thumbprint, writeToken)
 }
 
+// RestoreIfUnchanged undoes the write that set written.WriteToken, exactly as
+// DeleteIfUnchanged does; previous is ignored: the record's own undo log, not
+// what the caller read, says what the write replaced.
 func (s *KeyAttestationStore) RestoreIfUnchanged(_ context.Context, written, previous *domain.KeyAttestationRecord) error {
+	return s.rollback(written.KeyThumbprint, written.WriteToken)
+}
+
+func (s *KeyAttestationStore) rollback(thumbprint, writeToken string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cur, ok := s.data[written.KeyThumbprint]
-	if !ok || written.WriteToken == "" || cur.WriteToken != written.WriteToken || previous == nil {
+	if _, ok := s.data[thumbprint]; !ok {
 		return storage.ErrNotFound
 	}
-	restored := *previous.Clone()
-	restored.KeyThumbprint = written.KeyThumbprint
-	restored.Previous = nil
-	restored.WriteToken = storage.NewWriteToken() // a restore is itself a new write
-	s.data[written.KeyThumbprint] = &restored
-	return nil
+	kind, before := s.logFor(thumbprint).Take(s.clock(), writeToken)
+	switch kind {
+	case storage.UndoHead:
+		if before == nil {
+			delete(s.data, thumbprint)
+			delete(s.undo, thumbprint)
+			return nil
+		}
+		s.data[thumbprint] = before.Clone()
+		return nil
+	case storage.UndoSpliced:
+		return nil
+	}
+	return storage.ErrNotFound
 }
 
 func (s *KeyAttestationStore) GetByKeyThumbprint(_ context.Context, thumbprint string) (*domain.KeyAttestationRecord, error) {
@@ -94,9 +132,11 @@ func (s *KeyAttestationStore) MarkKeyRevoked(_ context.Context, thumbprint, chai
 	}
 	rec.RevokedAt = at.UTC()
 	rec.RevokedReason = reason
-	// A new write token: a rollback of the write that stored this record must
-	// not undo the revocation.
+	// A new write: the revocation is on top of the log, so a rollback of the
+	// write that stored this record is spliced out below it and cannot undo it.
+	before := rec.Clone()
 	rec.WriteToken = storage.NewWriteToken()
+	s.logFor(thumbprint).Push(s.clock(), rec.WriteToken, before)
 	return true, nil
 }
 
@@ -116,8 +156,10 @@ func (s *KeyAttestationStore) ReplaceKeyEvidence(_ context.Context, rec *domain.
 	prev := *existing.Clone()
 	prev.Previous = nil
 	rec.Previous = &prev
-	stored.WriteToken = storage.NewWriteToken() // a replacement is a new write: no earlier rollback may undo it
+	stored.WriteToken = storage.NewWriteToken() // a replacement is a new write, on top of the undo log
+	before := existing.Clone()
 	s.data[rec.KeyThumbprint] = &stored
+	s.logFor(rec.KeyThumbprint).Push(s.clock(), stored.WriteToken, before)
 	rec.CreatedAt = stored.CreatedAt
 	rec.WriteToken = stored.WriteToken
 	return true, nil

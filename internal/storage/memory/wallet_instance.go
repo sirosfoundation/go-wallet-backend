@@ -17,6 +17,29 @@ import (
 type WalletInstanceStore struct {
 	mu   sync.RWMutex
 	data map[string]*domain.WalletInstance
+	undo map[string]*storage.UndoLog[domain.WalletInstance]
+	// now is the clock the undo log ages by; nil means time.Now.
+	now func() time.Time
+}
+
+func (s *WalletInstanceStore) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+// logFor returns the undo log of a record, creating it. Caller holds s.mu.
+func (s *WalletInstanceStore) logFor(id string) *storage.UndoLog[domain.WalletInstance] {
+	if s.undo == nil {
+		s.undo = make(map[string]*storage.UndoLog[domain.WalletInstance])
+	}
+	l, ok := s.undo[id]
+	if !ok {
+		l = &storage.UndoLog[domain.WalletInstance]{}
+		s.undo[id] = l
+	}
+	return l
 }
 
 func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletInstance) error {
@@ -31,8 +54,10 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 		}
 		// Status and tenant are left untouched: lifecycle changes go through
 		// UpdateStatus, so re-attestation cannot reactivate or re-parent an instance.
+		before := cloneInstance(existing)
 		existing.WriteToken = uuid.NewString()
 		instance.WriteToken = existing.WriteToken
+		s.logFor(instance.ID).Push(s.clock(), existing.WriteToken, before)
 		existing.AttestationSource = instance.AttestationSource
 		existing.VerifiedAppID = instance.VerifiedAppID
 		if instance.WSCDType != "" {
@@ -68,6 +93,7 @@ func (s *WalletInstanceStore) Upsert(_ context.Context, instance *domain.WalletI
 	} else {
 		instance.AttestationCount = 1
 		instance.WriteToken = uuid.NewString()
+		s.logFor(instance.ID).Push(s.clock(), instance.WriteToken, nil)
 		instance.Inserted = true
 		// Fresh generation per insert: a re-attested record is a different record to a conditional write.
 		instance.Generation = uuid.NewString()
@@ -198,6 +224,7 @@ func (s *WalletInstanceStore) DeleteIfUnchanged(_ context.Context, id string, te
 		return storage.ErrBindingChanged
 	}
 	delete(s.data, id)
+	delete(s.undo, id)
 	return nil
 }
 
@@ -271,11 +298,19 @@ func (s *WalletInstanceStore) DeleteIfRemovable(_ context.Context, id string, te
 		return domain.ErrInvalidStatusTransition
 	}
 	delete(s.data, id)
+	delete(s.undo, id)
 	return nil
 }
 
-// RestoreAttestation undoes an Upsert that matched an existing record.
-func (s *WalletInstanceStore) RestoreAttestation(_ context.Context, before, written *domain.WalletInstance) error {
+// RestoreAttestation undoes the Upsert that set written.WriteToken and matched
+// an existing record (see undoLog): when it is the newest attestation the fields
+// go back to the record it replaced, including that record's write token; when
+// newer attestations sit on top it is spliced out and their values stay, only
+// the attestation counter is undone (a newer attestation may rely on the owner
+// or passkey link this one set, so those stay). The
+// caller's before is ignored: the record's own undo log says what was replaced.
+// An Upsert that inserted the record has nothing to restore (ErrBindingChanged).
+func (s *WalletInstanceStore) RestoreAttestation(_ context.Context, _, written *domain.WalletInstance) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -286,29 +321,36 @@ func (s *WalletInstanceStore) RestoreAttestation(_ context.Context, before, writ
 	if inst.Generation != written.Generation {
 		return storage.ErrBindingChanged
 	}
-	if written.WriteToken == "" || inst.WriteToken != written.WriteToken {
-		// A newer attestation (or none of ours) wrote last: nothing to undo.
+	log := s.logFor(written.ID)
+	before, found := log.Peek(s.clock(), written.WriteToken)
+	if !found || before == nil {
+		// A write that is no longer on the record (or none of ours): nothing to undo.
 		return storage.ErrBindingChanged
 	}
-	inst.WriteToken = before.WriteToken
+	kind, _ := log.Take(s.clock(), written.WriteToken)
+	if kind == storage.UndoHead {
+		inst.WriteToken = before.WriteToken
+		inst.AttestationSource = before.AttestationSource
+		inst.VerifiedAppID = before.VerifiedAppID
+		inst.WSCDType = before.WSCDType
+		inst.LastAttestedAt = before.LastAttestedAt
+		inst.UpdatedAt = before.UpdatedAt
+		if before.DeviceInfo != nil {
+			d := *before.DeviceInfo
+			inst.DeviceInfo = &d
+		} else {
+			inst.DeviceInfo = nil
+		}
+		// Only the newest attestation unbinds: a newer one that found the owner or
+		// link already set may rely on it, so a spliced-out write leaves them.
+		if before.UserID == nil && inst.UserID != nil && written.UserID != nil && *inst.UserID == *written.UserID {
+			inst.UserID = nil
+		}
+		if before.CredentialID == "" && written.CredentialID != "" && inst.CredentialID == written.CredentialID {
+			inst.CredentialID = ""
+		}
+	}
 	inst.AttestationCount--
-	inst.AttestationSource = before.AttestationSource
-	inst.VerifiedAppID = before.VerifiedAppID
-	inst.WSCDType = before.WSCDType
-	inst.LastAttestedAt = before.LastAttestedAt
-	inst.UpdatedAt = before.UpdatedAt
-	if before.DeviceInfo != nil {
-		d := *before.DeviceInfo
-		inst.DeviceInfo = &d
-	} else {
-		inst.DeviceInfo = nil
-	}
-	if before.UserID == nil && inst.UserID != nil && written.UserID != nil && *inst.UserID == *written.UserID {
-		inst.UserID = nil
-	}
-	if before.CredentialID == "" && written.CredentialID != "" && inst.CredentialID == written.CredentialID {
-		inst.CredentialID = ""
-	}
 	return nil
 }
 
@@ -320,6 +362,7 @@ func (s *WalletInstanceStore) Delete(_ context.Context, id string) error {
 		return storage.ErrNotFound
 	}
 	delete(s.data, id)
+	delete(s.undo, id)
 	return nil
 }
 
@@ -333,6 +376,7 @@ func (s *WalletInstanceStore) DeleteForUser(_ context.Context, id string, tenant
 		return storage.ErrNotFound
 	}
 	delete(s.data, id)
+	delete(s.undo, id)
 	return nil
 }
 

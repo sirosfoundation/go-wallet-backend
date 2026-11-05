@@ -1209,13 +1209,14 @@ func TestResolve_UnknownResourceTypeURL_Rejected(t *testing.T) {
 // real issuer's pushed_authorization_request_endpoint - the wallet fell
 // back to an un-PARed authorize redirect even against a PAR-only AS.
 func TestResolve_URLSubject_OAuthAuthorizationServer_Success(t *testing.T) {
-	asServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var asServer *httptest.Server
+	asServer = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/.well-known/oauth-authorization-server" {
 			t.Errorf("unexpected well-known path: %s", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"issuer":                                "https://as.example.com",
+			"issuer":                                asServer.URL,
 			"token_endpoint":                        "https://as.example.com/token",
 			"pushed_authorization_request_endpoint": "https://as.example.com/par",
 			"require_pushed_authorization_requests": true,
@@ -1266,6 +1267,96 @@ func TestResolve_URLSubject_OAuthAuthorizationServer_Success(t *testing.T) {
 	}
 	if resp.Context.TrustMetadata["pushed_authorization_request_endpoint"] != "https://as.example.com/par" {
 		t.Errorf("expected pushed_authorization_request_endpoint in trust_metadata, got: %v", resp.Context.TrustMetadata)
+	}
+}
+
+// resolveASMetadata drives resource_type=oauth-authorization-server against a
+// TLS test AS whose handler is given; it returns the HTTP recorder and the
+// request paths the AS saw.
+func resolveASMetadata(t *testing.T, subjectSuffix string, handle func(as *httptest.Server, w http.ResponseWriter, r *http.Request)) (*httptest.ResponseRecorder, []string, string) {
+	t.Helper()
+	var paths []string
+	var asServer *httptest.Server
+	asServer = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.EscapedPath())
+		handle(asServer, w, r)
+	}))
+	t.Cleanup(asServer.Close)
+
+	cfg := &config.AuthZENProxyConfig{Enabled: true, Timeout: 30, AllowResolution: true}
+	resolver := &mockMetadataResolver{result: &issuermetadata.ResolveResult{Metadata: map[string]interface{}{}}}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, asServer.Client(), asServer.Client(), zap.NewNop())
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    asServer.URL + subjectSuffix,
+		"subject_type":  "url",
+		"resource_type": "oauth-authorization-server",
+	})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+	return w, paths, asServer.URL + subjectSuffix
+}
+
+func TestResolve_OAuthAuthorizationServer_Candidates(t *testing.T) {
+	const rfc = "/.well-known/oauth-authorization-server"
+	const oidcPath = "/.well-known/openid-configuration"
+	serveAt := func(want string, issuer func(base string) string) func(*httptest.Server, http.ResponseWriter, *http.Request) {
+		return func(as *httptest.Server, w http.ResponseWriter, r *http.Request) {
+			if r.URL.EscapedPath() != want {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"issuer": issuer(as.URL), "token_endpoint": "https://as.example.com/token"})
+		}
+	}
+	self := func(b string) string { return b }
+
+	t.Run("only openid-configuration", func(t *testing.T) {
+		w, paths, _ := resolveASMetadata(t, "", serveAt(oidcPath, self))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", w.Code, w.Body.String())
+		}
+		if strings.Join(paths, ",") != rfc+","+oidcPath {
+			t.Errorf("paths %q", paths)
+		}
+	})
+	t.Run("path identifier with terminating slash", func(t *testing.T) {
+		w, paths, _ := resolveASMetadata(t, "/tenant/1/", func(as *httptest.Server, w http.ResponseWriter, r *http.Request) {
+			serveAt(rfc+"/tenant/1", func(string) string { return as.URL + "/tenant/1/" })(as, w, r)
+		})
+		if w.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", w.Code, w.Body.String())
+		}
+		if strings.Join(paths, ",") != rfc+"/tenant/1" {
+			t.Errorf("paths %q", paths)
+		}
+	})
+	t.Run("5xx is a 502 with no fallback", func(t *testing.T) {
+		w, paths, _ := resolveASMetadata(t, "", func(as *httptest.Server, w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		})
+		if w.Code != http.StatusBadGateway || len(paths) != 1 {
+			t.Errorf("status %d paths %q", w.Code, paths)
+		}
+	})
+	for name, want := range map[string]string{"RFC 8414 form": rfc, "OIDC form": oidcPath} {
+		t.Run("issuer mismatch refused, "+name, func(t *testing.T) {
+			w, _, _ := resolveASMetadata(t, "", serveAt(want, func(string) string { return "https://evil.example.com" }))
+			if w.Code != http.StatusBadGateway {
+				t.Fatalf("status %d: %s", w.Code, w.Body.String())
+			}
+			if strings.Contains(w.Body.String(), "evil") || strings.Contains(w.Body.String(), "token_endpoint") {
+				t.Errorf("response leaks document or issuer: %s", w.Body.String())
+			}
+		})
 	}
 }
 
