@@ -88,6 +88,8 @@ func (v *FIDO2InstanceKeyVerifier) Verify(ctx context.Context, in *InstanceKeyEv
 	switch {
 	case errors.Is(err, ErrFIDO2AttestationDisabled):
 		return nil, fmt.Errorf("%w: fido2 attestation is not enabled", ErrWIAKeyAttestationUnavailable)
+	case errors.Is(err, ErrFIDO2AttestationUnavailable):
+		return nil, fmt.Errorf("%w: fido2: %w", ErrWIAKeyAttestationUnavailable, err)
 	case err != nil:
 		return nil, fmt.Errorf("%w: fido2: %w", ErrWIAKeyAttestationInvalid, err)
 	}

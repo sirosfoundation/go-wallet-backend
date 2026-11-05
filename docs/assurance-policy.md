@@ -726,10 +726,13 @@ against the FIDO MDS3 registry through go-trust).
   the request's tenant and user, never replaces stronger evidence, and is undone
   if the request is then refused for a lifecycle reason.
 * **Errors** are the envelope's: `KEY_ATTESTATION_INVALID` (malformed, not
-  trusted, wrong key), `KEY_ATTESTATION_TYPE_UNSUPPORTED` when FIDO2 attestation
-  is not enabled.
-* `/fido2-attestation/register` is unchanged and stays the way to add FIDO2
-  evidence to an instance that already exists.
+  trusted by the PDP, wrong key), `KEY_ATTESTATION_UNAVAILABLE` (HTTP 503,
+  retryable) when the PDP could not give a decision, and
+  `KEY_ATTESTATION_TYPE_UNSUPPORTED` when FIDO2 attestation is not enabled.
+* `/fido2-attestation/register` stays the way to add FIDO2 evidence to an
+  instance that already exists. A trust decision that could not be had is `503`
+  `ATTESTATION_UNAVAILABLE` there (and in the preview), a PDP refusal `400`
+  `ATTESTATION_INVALID`.
 
 ## Preview endpoint
 
@@ -768,7 +771,8 @@ Response:
 ```
 
 * `fido2_attestation` is verified by `FIDO2AttestationService` exactly as at
-  registration (a failure is `400` `ATTESTATION_INVALID`) but never stored.
+  registration (a failure is `400` `ATTESTATION_INVALID`, an unavailable trust
+  decision `503` `ATTESTATION_UNAVAILABLE`) but never stored.
   When it is the only key information the attested key is the batch; with
   `jwks`, stored records cover the other keys. If FIDO2 verification is not
   enabled on this backend, the submission cannot be verified and counts for

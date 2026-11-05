@@ -17,6 +17,8 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
 // fido2WIAEnv is a WIA service whose policy issues only to a wallet with
@@ -241,4 +243,84 @@ func TestWIAFIDO2InstanceKey_NotRegisteredWhenFIDO2Disabled(t *testing.T) {
 	if !errors.Is(err, ErrWIAKeyAttestationTypeUnsupported) {
 		t.Fatalf("err = %v, want ErrWIAKeyAttestationTypeUnsupported", err)
 	}
+}
+
+// outagePDP answers every evaluation with an error or an in-band failure, as a
+// PDP that is down or broken does.
+type outagePDP struct {
+	stubEvaluator
+	err    error
+	failed bool
+}
+
+func (o *outagePDP) Evaluate(context.Context, *trust.EvaluationRequest) (*trust.EvaluationResponse, error) {
+	if o.err != nil {
+		return nil, o.err
+	}
+	return &trust.EvaluationResponse{Decision: false, Failed: o.failed, Reason: "pdp broken"}, nil
+}
+
+// A trust decision that could not be had is retryable (503 class), never a
+// refusal of the evidence (400 class); a real denial stays invalid.
+func TestWIAFIDO2InstanceKey_PDPOutageIsUnavailableNotInvalid(t *testing.T) {
+	cases := map[string]*outagePDP{
+		"transport error": {err: errors.New("connection refused")},
+		"in-band failure": {failed: true},
+	}
+	for name, pdp := range cases {
+		t.Run(name, func(t *testing.T) {
+			e := newFIDO2WIAEnv(t, true)
+			fido2 := NewFIDO2AttestationService(testFIDO2AttestationConfig(true), e.instances, e.keys, newOutageTrustService(t, pdp), zap.NewNop())
+			registerFIDO2InstanceKeyVerifier(fido2, e.svc, zap.NewNop())
+			pop := newPoPKey(t)
+			_, err := e.generate(t, domain.DefaultTenantID, nil, pop, e.fido2KeyAttestation(t, pop))
+			if !errors.Is(err, ErrWIAKeyAttestationUnavailable) || errors.Is(err, ErrWIAKeyAttestationInvalid) {
+				t.Fatalf("err = %v, want ErrWIAKeyAttestationUnavailable only", err)
+			}
+			e.nothingLeftBehind(t, pop)
+		})
+	}
+	// A PDP that answers "no" is a denial.
+	e := newFIDO2WIAEnv(t, false)
+	pop := newPoPKey(t)
+	if _, err := e.generate(t, domain.DefaultTenantID, nil, pop, e.fido2KeyAttestation(t, pop)); !errors.Is(err, ErrWIAKeyAttestationInvalid) || errors.Is(err, ErrWIAKeyAttestationUnavailable) {
+		t.Fatalf("denial: err = %v, want ErrWIAKeyAttestationInvalid only", err)
+	}
+}
+
+// Every caller of VerifyEvidence sees the same distinction: the registration
+// route (Verify) and the dry run.
+func TestFIDO2AttestationService_PDPOutageIsUnavailableNotInvalid(t *testing.T) {
+	store := memory.NewStore()
+	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{ID: "test-instance", Status: domain.InstanceStatusActive}); err != nil {
+		t.Fatal(err)
+	}
+	hash := make([]byte, 32)
+	obj, _ := buildTestAttestationObject(t, uuid.New(), hash)
+	req := &FIDO2AttestationRequest{WalletInstanceID: "test-instance", AttestationObject: obj, ClientDataHash: hash}
+	for name, pdp := range map[string]*outagePDP{
+		"transport error": {err: errors.New("connection refused")},
+		"in-band failure": {failed: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc := NewFIDO2AttestationService(testFIDO2AttestationConfig(true), store.WalletInstances(), store.KeyAttestations(), newOutageTrustService(t, pdp), zap.NewNop())
+			if err := svc.Verify(context.Background(), req); !errors.Is(err, ErrFIDO2AttestationUnavailable) || errors.Is(err, ErrFIDO2AttestationInvalid) {
+				t.Fatalf("Verify: err = %v, want ErrFIDO2AttestationUnavailable only", err)
+			}
+			if _, err := svc.VerifyEvidence(context.Background(), req); !errors.Is(err, ErrFIDO2AttestationUnavailable) {
+				t.Fatalf("VerifyEvidence: err = %v", err)
+			}
+		})
+	}
+	svc := NewFIDO2AttestationService(testFIDO2AttestationConfig(true), store.WalletInstances(), store.KeyAttestations(), newTestTrustService(t, &stubEvaluator{decision: false}), zap.NewNop())
+	if err := svc.Verify(context.Background(), req); !errors.Is(err, ErrFIDO2AttestationInvalid) || errors.Is(err, ErrFIDO2AttestationUnavailable) {
+		t.Fatalf("denial: err = %v, want ErrFIDO2AttestationInvalid only", err)
+	}
+}
+
+func newOutageTrustService(t *testing.T, pdp *outagePDP) *trust.Service {
+	t.Helper()
+	cfg := &config.Config{}
+	cfg.Trust.PDPURL = "http://pdp.invalid"
+	return trust.NewService(cfg, zap.NewNop(), func(string, time.Duration) (trust.TrustEvaluator, error) { return pdp, nil })
 }
