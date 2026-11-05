@@ -73,6 +73,32 @@ Passwordless WebAuthn registration. Send `X-Token-Mode: session` (and `X-Tenant-
 `begin` returns `{"challengeId", "createOptions": {"publicKey": {...}}}`; `finish` takes
 `{"challengeId", "credential": {...}, "displayName", "privateData"}` and, on success, creates an
 AS session (cookie) and returns `{"uuid", "displayName", "tenantId", "tenantDisplayName"}`.
+A non-empty `privateData` is subject to the ownership check described under
+[Private data ownership](#private-data-ownership); a refusal is HTTP 422 and creates no account.
+
+#### Private data ownership
+
+Every endpoint that writes a user's private data validates the container before storing it:
+`POST /user/session/private-data`, `POST /user/session/webauthn/credential/:id/delete` (the
+`privateData` in the body), `POST /user/session/webauthn/register-finish` (the optional
+`privateData`, checked against the credential list including the newly added credential) and
+`POST /auth/passkey/register/finish`.
+
+The container is the privatedata-spec JSON `{mainKey, prfKeys[], jwe}` in which every
+`prfKeys[].credentialId` is tagged binary (`{"$b64u": "..."}`, the same base64url encoding the
+backend stores credential IDs in). The write is accepted when at least one `credentialId` is
+among the user's registered WebAuthn credentials (for credential deletion: among the credentials
+that remain). It is refused when:
+
+- no `credentialId` matches a registered credential;
+- `prfKeys` is empty;
+- the data is not a valid container (not JSON, JSON `null`, `prfKeys` missing, null or not an
+  array, an entry that is not an object, or a `credentialId` that is not valid tagged base64url).
+
+A refusal is **HTTP 422** with body `{"error": "private_data_ownership"}`, distinct from the 412
+ETag conflict, and leaves the stored private data, its ETag and the credential list unchanged.
+The server never logs container contents, only the user id and a reason. `If-Match` is not
+required by this check.
 
 #### POST /auth/passkey/login/begin and POST /auth/passkey/login/finish
 

@@ -122,6 +122,11 @@ func (s *UserService) Register(ctx context.Context, req *domain.RegisterRequest)
 
 	// Compute private data ETag
 	if len(user.PrivateData) > 0 {
+		// A user created here has no registered credentials, so a container
+		// cannot belong to it.
+		if err := validatePrivateDataOwnership(s.logger, user.UUID, user.WebauthnCredentials, user.PrivateData); err != nil {
+			return nil, err
+		}
 		user.PrivateDataETag = domain.ComputePrivateDataETag(user.PrivateData)
 	}
 
@@ -158,6 +163,11 @@ func (s *UserService) UpdatePrivateData(ctx context.Context, userID domain.UserI
 	// Check ETag for optimistic locking
 	if ifMatch != "" && ifMatch != user.PrivateDataETag {
 		return user.PrivateDataETag, ErrPrivateDataConflict
+	}
+
+	// The container must belong to this user
+	if err := validatePrivateDataOwnership(s.logger, userID, user.WebauthnCredentials, data); err != nil {
+		return "", err
 	}
 
 	// Update private data
@@ -304,6 +314,12 @@ func (s *UserService) DeleteWebAuthnCredential(ctx context.Context, userID domai
 
 	if !found {
 		return "", storage.ErrNotFound
+	}
+
+	// The container must belong to this user, judged against the credentials
+	// that remain after the deletion.
+	if err := validatePrivateDataOwnership(s.logger, userID, newCredentials, privateData); err != nil {
+		return "", err
 	}
 
 	user.WebauthnCredentials = newCredentials

@@ -805,6 +805,10 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 	}
 
 	if len(user.PrivateData) > 0 {
+		// Refuse before the invite is claimed or the user is created.
+		if err := validatePrivateDataOwnership(s.logger, userID, user.WebauthnCredentials, user.PrivateData); err != nil {
+			return nil, err
+		}
 		user.PrivateDataETag = domain.ComputePrivateDataETag(user.PrivateData)
 	}
 
@@ -1767,8 +1771,12 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 
 	user.WebauthnCredentials = append(user.WebauthnCredentials, newCred)
 
-	// Update private data if provided
+	// Update private data if provided. The container legitimately carries
+	// the new credential, so validate against the list that includes it.
 	if len(req.PrivateData) > 0 {
+		if err := validatePrivateDataOwnership(s.logger, userID, user.WebauthnCredentials, req.PrivateData); err != nil {
+			return nil, err
+		}
 		user.PrivateData = req.PrivateData
 		user.PrivateDataETag = domain.ComputePrivateDataETag(req.PrivateData)
 	}

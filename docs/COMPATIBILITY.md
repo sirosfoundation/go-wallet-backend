@@ -267,6 +267,7 @@ Error codes are HTTP status codes that match the reference implementation:
 - 409: Conflict (e.g., last WebAuthn credential)
 - 410: Gone (expired challenge, deprecated endpoints)
 - 412: Precondition failed (ETag mismatch)
+- 422: Unprocessable: the private-data container does not belong to the user (`{"error": "private_data_ownership"}`, see API.md)
 - 500: Internal server error
 
 ### 7. Prepared Future Extensions

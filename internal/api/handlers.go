@@ -584,6 +584,10 @@ func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 			c.JSON(404, gin.H{"error": "User not found"})
 			return
 		}
+		if errors.Is(err, service.ErrPrivateDataOwnership) {
+			c.JSON(422, gin.H{"error": service.PrivateDataOwnershipErrorCode})
+			return
+		}
 		if errors.Is(err, service.ErrPrivateDataConflict) {
 			c.Header("X-Private-Data-ETag", newEtag)
 			c.Status(412)
@@ -855,6 +859,8 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 	if err != nil {
 		h.logger.Error("Failed to finish adding credential", zap.Error(err))
 		switch {
+		case errors.Is(err, service.ErrPrivateDataOwnership):
+			c.JSON(422, gin.H{"error": service.PrivateDataOwnershipErrorCode})
 		case errors.Is(err, service.ErrChallengeNotFound):
 			c.JSON(404, gin.H{})
 		case errors.Is(err, service.ErrChallengeExpired):
@@ -921,6 +927,10 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 		}
 		if errors.Is(err, service.ErrLastWebAuthnCredential) {
 			c.JSON(409, gin.H{"error": "Cannot delete last credential"})
+			return
+		}
+		if errors.Is(err, service.ErrPrivateDataOwnership) {
+			c.JSON(422, gin.H{"error": service.PrivateDataOwnershipErrorCode})
 			return
 		}
 		if errors.Is(err, service.ErrPrivateDataConflict) {
