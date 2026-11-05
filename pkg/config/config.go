@@ -37,6 +37,7 @@ type Config struct {
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
 	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
 	Presentation   PresentationConfig   `yaml:"presentation" envconfig:"PRESENTATION"`
+	Lifecycle      LifecycleConfig      `yaml:"lifecycle" envconfig:"LIFECYCLE"`
 	StatusCheck    StatusCheckConfig    `yaml:"status_check" envconfig:"STATUS_CHECK"`
 
 	// Registry configures the VCTM registry role (--mode=registry). It
@@ -2277,6 +2278,83 @@ const (
 	MaxDeletionTombstoneRetentionMarginDays    = 36500           // 100 years
 )
 
+// LifecycleConfig configures wallet instance lifecycle background work.
+type LifecycleConfig struct {
+	// Reconciler finishes erasures that a revocation left incomplete.
+	Reconciler ErasureReconcilerConfig `yaml:"reconciler" envconfig:"RECONCILER"`
+}
+
+// ErasureReconcilerConfig configures the job that finds users whose wallet
+// is deactivated (every instance non-live, at least one revoked) but whose
+// data is still present, and runs the erasure cascade for them. It is safe on
+// several replicas at once.
+type ErasureReconcilerConfig struct {
+	// Enabled controls whether the reconciler runs. On by default: it only
+	// completes erasures that revocation already decided on.
+	Enabled bool `yaml:"enabled" envconfig:"ENABLED"`
+
+	// DryRun runs the full decision (liveness, grace period, leftover-data
+	// probe) but writes nothing: the reconciler only logs and counts the users
+	// it would erase. Recommended for the first run on an existing deployment.
+	// Default: false
+	DryRun bool `yaml:"dry_run" envconfig:"DRY_RUN"`
+
+	// IntervalSeconds is the time between runs, jittered by up to 10%.
+	// Default: 600 (10 minutes)
+	IntervalSeconds int `yaml:"interval_seconds" envconfig:"INTERVAL_SECONDS"`
+
+	// GracePeriodSeconds is how long after a user's latest revocation the
+	// reconciler leaves the user alone, so a request in flight on another
+	// replica can finish. Keep it above the WIA lifetime. A user whose latest
+	// revoked instance has no recorded revocation time stays in grace (never
+	// erased). The age is measured on the reconciler host's clock against the
+	// revocation time written by the replica that revoked, so keep replica
+	// clocks within a small fraction of this period.
+	// Default: 900 (15 minutes)
+	GracePeriodSeconds int `yaml:"grace_period_seconds" envconfig:"GRACE_PERIOD_SECONDS"`
+
+	// BatchSize is the most users examined per run; a cursor walks all users
+	// with a revoked instance over successive runs. Between 0 and
+	// MaxReconcilerBatchSize (10000); 0 selects the default.
+	// Default: 50
+	BatchSize int `yaml:"batch_size" envconfig:"BATCH_SIZE"`
+}
+
+// MaxReconcilerSeconds bounds the reconciler's interval and grace period (one
+// year): larger values would overflow the time.Duration conversion.
+const MaxReconcilerSeconds = 365 * 24 * 3600
+
+// MaxReconcilerBatchSize bounds the reconciler's batch size: each user in a
+// batch is probed under that user's lifecycle lock, and a page is read in one
+// store call.
+const MaxReconcilerBatchSize = 10000
+
+func (c ErasureReconcilerConfig) validate() error {
+	if c.BatchSize < 0 || c.BatchSize > MaxReconcilerBatchSize {
+		return fmt.Errorf("lifecycle.reconciler.batch_size must be between 0 and %d", MaxReconcilerBatchSize)
+	}
+	if c.IntervalSeconds < 0 || c.IntervalSeconds > MaxReconcilerSeconds {
+		return fmt.Errorf("lifecycle.reconciler.interval_seconds must be between 0 and %d", MaxReconcilerSeconds)
+	}
+	if c.GracePeriodSeconds < 0 || c.GracePeriodSeconds > MaxReconcilerSeconds {
+		return fmt.Errorf("lifecycle.reconciler.grace_period_seconds must be between 0 and %d", MaxReconcilerSeconds)
+	}
+	return nil
+}
+
+// SetDefaults sets default values for the erasure reconciler (Enabled is not defaulted here).
+func (c *ErasureReconcilerConfig) SetDefaults() {
+	if c.IntervalSeconds <= 0 {
+		c.IntervalSeconds = 600
+	}
+	if c.GracePeriodSeconds <= 0 {
+		c.GracePeriodSeconds = 900
+	}
+	if c.BatchSize <= 0 {
+		c.BatchSize = 50
+	}
+}
+
 // DeletionTombstoneConfig configures the tombstones DeleteUser leaves so that
 // a deleted user's earlier tokens stay refused until they have all expired.
 type DeletionTombstoneConfig struct {
@@ -2757,6 +2835,14 @@ func defaultConfig() *Config {
 			Timeout:         30,
 		},
 		Presentation: PresentationConfig{DCQLConsentCheck: DCQLConsentCheckWarn},
+		Lifecycle: LifecycleConfig{
+			Reconciler: ErasureReconcilerConfig{
+				Enabled:            true,
+				IntervalSeconds:    600,
+				GracePeriodSeconds: 900,
+				BatchSize:          50,
+			},
+		},
 		StatusCheck: StatusCheckConfig{
 			Enabled:                  true,
 			StatusListSignerFallback: true,
@@ -2848,6 +2934,9 @@ func (c *Config) Validate() error {
 	}
 	if n := c.Security.DeletionTombstone.RetentionMarginDays; n < 0 || n > MaxDeletionTombstoneRetentionMarginDays {
 		return fmt.Errorf("security.deletion_tombstone.retention_margin_days must be between 0 and %d", MaxDeletionTombstoneRetentionMarginDays)
+	}
+	if err := c.Lifecycle.Reconciler.validate(); err != nil {
+		return err
 	}
 
 	// Validate wallet-provider port when explicitly configured

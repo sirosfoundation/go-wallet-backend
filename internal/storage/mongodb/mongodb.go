@@ -242,6 +242,8 @@ func (s *Store) createIndexes(ctx context.Context) error {
 		// user_id alone, for cross-tenant lookups (GetAllByUser): the compound
 		// index above is led by tenant_id and cannot serve them.
 		{Keys: bson.D{{Key: "user_id", Value: 1}}},
+		// Serves the reconciler's seek over revoked instances' owners.
+		{Keys: bson.D{{Key: "status", Value: 1}, {Key: "user_id", Value: 1}}},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create wallet instance indexes: %w", err)
