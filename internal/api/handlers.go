@@ -546,7 +546,7 @@ func (h *Handlers) GetPrivateData(c *gin.Context) {
 	data, etag, err := h.services.User.GetPrivateData(c.Request.Context(), domain.UserIDFromString(userID))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			c.JSON(404, gin.H{"error": "User not found"})
+			c.JSON(404, gin.H{"error": msgUserNotFound})
 			return
 		}
 		h.logger.Error("Failed to get private data", zap.Error(err))
@@ -607,7 +607,7 @@ func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 			return
 		}
 		if errors.Is(err, storage.ErrNotFound) {
-			c.JSON(404, gin.H{"error": "User not found"})
+			c.JSON(404, gin.H{"error": msgUserNotFound})
 			return
 		}
 		if errors.Is(err, service.ErrPrivateDataConflict) {
@@ -677,6 +677,12 @@ func (h *Handlers) Logout(c *gin.Context) {
 	c.JSON(200, gin.H{"message": "Logged out successfully"})
 }
 
+// Error texts shared by several handlers.
+const (
+	msgUserNotFound        = "User not found"
+	msgWebAuthnUnavailable = "WebAuthn not available"
+)
+
 // deleteAccountConfirmation is the text the caller must send in `confirm`.
 const deleteAccountConfirmation = "DELETE"
 
@@ -706,7 +712,7 @@ type deleteAccountRequest struct {
 // caller's own passkeys, whose assertion authorises DELETE /user/session.
 func (h *Handlers) BeginDeleteAccount(c *gin.Context) {
 	if h.services.WebAuthn == nil {
-		c.JSON(503, gin.H{"error": "WebAuthn not available"})
+		c.JSON(503, gin.H{"error": msgWebAuthnUnavailable})
 		return
 	}
 	userID, ok := contextUserID(c)
@@ -722,7 +728,7 @@ func (h *Handlers) BeginDeleteAccount(c *gin.Context) {
 		}
 		switch {
 		case errors.Is(err, storage.ErrNotFound):
-			c.JSON(404, gin.H{"error": "User not found"})
+			c.JSON(404, gin.H{"error": msgUserNotFound})
 		case errors.Is(err, service.ErrCredentialNotFound):
 			c.JSON(400, gin.H{"error": errCodeNoPasskey, "message": "the account has no passkey to confirm the deletion with"})
 		default:
@@ -767,7 +773,7 @@ func (h *Handlers) requireDeleteStepUp(c *gin.Context, userID domain.UserID) boo
 		return false
 	}
 	if h.services.WebAuthn == nil {
-		c.JSON(503, gin.H{"error": "WebAuthn not available"})
+		c.JSON(503, gin.H{"error": msgWebAuthnUnavailable})
 		return false
 	}
 
@@ -815,7 +821,7 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 			return
 		}
 		if errors.Is(err, service.ErrUserNotFound) {
-			c.JSON(404, gin.H{"error": "User not found"})
+			c.JSON(404, gin.H{"error": msgUserNotFound})
 			return
 		}
 		if errors.Is(err, service.ErrDeletionCleanupPending) {
@@ -986,7 +992,7 @@ func (h *Handlers) UpdateSettings(c *gin.Context) {
 // StartAddWebAuthnCredential begins adding a new credential to an existing user
 func (h *Handlers) StartAddWebAuthnCredential(c *gin.Context) {
 	if h.services.WebAuthn == nil {
-		c.JSON(503, gin.H{"error": "WebAuthn not available"})
+		c.JSON(503, gin.H{"error": msgWebAuthnUnavailable})
 		return
 	}
 
@@ -1013,7 +1019,7 @@ func (h *Handlers) StartAddWebAuthnCredential(c *gin.Context) {
 // FinishAddWebAuthnCredential completes adding a new credential to an existing user
 func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 	if h.services.WebAuthn == nil {
-		c.JSON(503, gin.H{"error": "WebAuthn not available"})
+		c.JSON(503, gin.H{"error": msgWebAuthnUnavailable})
 		return
 	}
 

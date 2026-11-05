@@ -38,11 +38,17 @@ type deleteTACEnv struct {
 
 func newDeleteTACEnv(t *testing.T, requireStepUp bool, tac string) *deleteTACEnv {
 	t.Helper()
+	return newDeleteTACEnvWith(t, requireStepUp, tac, false)
+}
+
+func newDeleteTACEnvWith(t *testing.T, requireStepUp bool, tac string, requireEnrollmentAuth bool) *deleteTACEnv {
+	t.Helper()
 	gin.SetMode(gin.TestMode)
 	v, key, issuer := setupServerTokenValidatorTest(t)
 	cfg := minimalTestConfig()
 	cfg.Server.RPName = "Test Wallet"
 	cfg.User.Delete.RequireStepUp = requireStepUp
+	cfg.Security.WebAuthn.RequireEnrollmentAuthorization = requireEnrollmentAuth
 
 	mem := memory.NewStore()
 	store := &memoryBackend{store: mem}
@@ -184,7 +190,7 @@ func TestDeleteAccount_TAC_OversizedBodyUsesStepUpErrorShape(t *testing.T) {
 // A token holding `i` and `w` can reach enrolment, but with only the token the
 // enrolment is refused, so the attacker's passkey cannot sign the deletion.
 func TestDeleteAccount_TAC_StolenTokenCannotEnrolPasskeyThenDelete(t *testing.T) {
-	e := newDeleteTACEnv(t, true, "rwli")
+	e := newDeleteTACEnvWith(t, true, "rwli", true)
 
 	w := e.do(http.MethodPost, "/user/session/webauthn/register-begin", nil)
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
@@ -224,4 +230,33 @@ func TestDeleteAccount_TAC_StolenTokenCannotEnrolPasskeyThenDelete(t *testing.T)
 	w = e.do(http.MethodDelete, "/user/session", body)
 	assert.Equal(t, http.StatusUnauthorized, w.Code)
 	assert.True(t, e.exists(t))
+}
+
+// With security.webauthn.require_enrollment_authorization off (the default)
+// the enrolment endpoints behave as before: no authorisation options are
+// offered and register-finish needs none.
+func TestRegisterFinish_EnrollmentAuthorizationFlagOffNeedsNoAuthorization(t *testing.T) {
+	e := newDeleteTACEnvWith(t, false, "rwli", false)
+
+	w := e.do(http.MethodPost, "/user/session/webauthn/register-begin", nil)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var begin struct {
+		ChallengeID   string          `json:"challengeId"`
+		CreateOptions json.RawMessage `json:"createOptions"`
+		Authorization json.RawMessage `json:"authorization"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &begin))
+	assert.Empty(t, begin.Authorization)
+	opts, err := virtualwebauthn.ParseAttestationOptions(string(begin.CreateOptions))
+	require.NoError(t, err)
+
+	cred := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
+	auth := virtualwebauthn.NewAuthenticatorWithOptions(virtualwebauthn.AuthenticatorOptions{UserHandle: e.user.AsUserHandle()})
+	attestation := virtualwebauthn.CreateAttestationResponse(e.rp, auth, cred, *opts)
+	body, err := json.Marshal(map[string]any{"challengeId": begin.ChallengeID, "credential": json.RawMessage(attestation)})
+	require.NoError(t, err)
+
+	w = e.do(http.MethodPost, "/user/session/webauthn/register-finish", body)
+	assert.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.NotContains(t, w.Body.String(), "ENROLLMENT_AUTHORIZATION")
 }

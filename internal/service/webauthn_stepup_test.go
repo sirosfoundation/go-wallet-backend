@@ -335,6 +335,7 @@ func credentialCount(t *testing.T, setup *testVirtualWebAuthnSetup, u *stepUpUse
 // attacker has no passkey to sign a deletion step-up with.
 func TestEnrollment_StolenTokenCannotEnrolThenDeleteAccount(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	requireEnrollmentAuthorization(setup)
 	alice := registerStepUpUser(t, setup, "Alice")
 
 	e := beginEnrol(t, setup, alice)
@@ -359,6 +360,7 @@ func TestEnrollment_StolenTokenCannotEnrolThenDeleteAccount(t *testing.T) {
 
 func TestEnrollment_AuthorisedByExistingPasskeySucceeds(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	requireEnrollmentAuthorization(setup)
 	alice := registerStepUpUser(t, setup, "Alice")
 	_ = enrollPasskey(t, setup, alice)
 	assert.Equal(t, 2, credentialCount(t, setup, alice))
@@ -368,6 +370,7 @@ func TestEnrollment_AuthorisedByExistingPasskeySucceeds(t *testing.T) {
 // authorise an enrolment, and the authorisation is single use with it.
 func TestEnrollment_AssertionForAnotherChallengeRefused(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	requireEnrollmentAuthorization(setup)
 	alice := registerStepUpUser(t, setup, "Alice")
 
 	e := beginEnrol(t, setup, alice)
@@ -389,6 +392,7 @@ func TestEnrollment_AssertionForAnotherChallengeRefused(t *testing.T) {
 
 func TestEnrollment_OtherUsersPasskeyCannotAuthorise(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	requireEnrollmentAuthorization(setup)
 	alice := registerStepUpUser(t, setup, "Alice")
 	bob := registerStepUpUser(t, setup, "Bob")
 
@@ -402,6 +406,7 @@ func TestEnrollment_OtherUsersPasskeyCannotAuthorise(t *testing.T) {
 // An account with no passkey has nothing to authorise with.
 func TestEnrollment_AccountWithoutPasskeyNeedsNoAuthorization(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	requireEnrollmentAuthorization(setup)
 	alice := registerStepUpUser(t, setup, "Alice")
 	user, err := setup.store.Users().GetByID(setup.ctx, alice.id)
 	require.NoError(t, err)
@@ -417,6 +422,7 @@ func TestEnrollment_AccountWithoutPasskeyNeedsNoAuthorization(t *testing.T) {
 // A passkey whose enrolment an existing passkey authorised can authorise a deletion.
 func TestStepUp_AuthorisedPasskeyAcceptedForDeletion(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	requireEnrollmentAuthorization(setup)
 	alice := registerStepUpUser(t, setup, "Alice")
 	added := enrollPasskey(t, setup, alice)
 
@@ -431,6 +437,7 @@ func TestStepUp_AuthorisedPasskeyAcceptedForDeletion(t *testing.T) {
 // own write of the user record.
 func TestEnrollment_KeepsTheAuthorisingPasskeysCounterAndCloneWarning(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
+	requireEnrollmentAuthorization(setup)
 	alice := registerStepUpUser(t, setup, "Alice")
 
 	// A prior use leaves a high stored counter, so the next assertion (lower)
@@ -452,4 +459,56 @@ func TestEnrollment_KeepsTheAuthorisingPasskeysCounterAndCloneWarning(t *testing
 	first := user.WebauthnCredentials[0].Authenticator
 	assert.True(t, first.CloneWarning, "the clone warning latched by the authorising assertion must survive the enrolment")
 	assert.Greater(t, first.SignCount, uint32(0), "the authorising passkey's counter must survive the enrolment")
+}
+
+// requireEnrollmentAuthorization turns on
+// security.webauthn.require_enrollment_authorization for the test.
+func requireEnrollmentAuthorization(setup *testVirtualWebAuthnSetup) {
+	setup.service.cfg.Security.WebAuthn.RequireEnrollmentAuthorization = true
+}
+
+// With the flag off (the default) enrolment behaves as before: no
+// authorisation options are offered, none is required, and one that is sent
+// is ignored.
+func TestEnrollment_FlagOffBehavesAsBefore(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+	alice := registerStepUpUser(t, setup, "Alice")
+
+	e := beginEnrol(t, setup, alice)
+	assert.Nil(t, e.begin.Authorization, "no authorisation options with the flag off")
+	_, err := setup.service.FinishAddCredential(setup.ctx, alice.id, e.finish, "")
+	require.NoError(t, err)
+	assert.Equal(t, 2, credentialCount(t, setup, alice))
+
+	// A garbage authorisation is ignored, not refused.
+	e = beginEnrol(t, setup, alice)
+	e.finish.Authorization = json.RawMessage(`{"garbage":true}`)
+	_, err = setup.service.FinishAddCredential(setup.ctx, alice.id, e.finish, "")
+	require.NoError(t, err)
+	assert.Equal(t, 3, credentialCount(t, setup, alice))
+}
+
+func TestEnrollment_FlagDefaultsOff(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+	assert.False(t, setup.service.enrollmentAuthorizationRequired())
+}
+
+// The step-up demands user verification: an assertion whose authenticator did
+// not verify the user (UV flag clear) is refused even though it is otherwise
+// valid.
+func TestVerifyDeleteAccountStepUp_UserVerificationRequired(t *testing.T) {
+	setup := newTestVirtualWebAuthnSetup(t)
+	alice := registerStepUpUser(t, setup, "Alice")
+
+	resp, err := setup.service.BeginDeleteAccountStepUp(setup.ctx, alice.id)
+	require.NoError(t, err)
+	alice.auth.Options.UserNotVerified = true
+	err = setup.service.VerifyDeleteAccountStepUp(setup.ctx, alice.id, resp.ChallengeID, alice.assertFor(t, setup, resp))
+	assert.ErrorIs(t, err, ErrStepUpFailed)
+
+	// The same passkey with user verification passes.
+	resp, err = setup.service.BeginDeleteAccountStepUp(setup.ctx, alice.id)
+	require.NoError(t, err)
+	alice.auth.Options.UserNotVerified = false
+	require.NoError(t, setup.service.VerifyDeleteAccountStepUp(setup.ctx, alice.id, resp.ChallengeID, alice.assertFor(t, setup, resp)))
 }

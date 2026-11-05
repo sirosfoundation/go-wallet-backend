@@ -1550,11 +1550,12 @@ func (s *WebAuthnService) BeginAddCredential(ctx context.Context, userID domain.
 		return nil, err
 	}
 
-	// An account that has a passkey needs one of them to authorise adding
-	// another, so a bearer token alone cannot enrol a passkey of its own.
+	// With security.webauthn.require_enrollment_authorization, an account that
+	// has a passkey needs one of them to authorise adding another, so a bearer
+	// token alone cannot enrol a passkey of its own.
 	var authorization *EnrollmentAuthorization
 	var assertionChallenge string
-	if len(user.WebauthnCredentials) > 0 {
+	if s.enrollmentAuthorizationRequired() && len(user.WebauthnCredentials) > 0 {
 		ch, options, err := s.ownAssertionOptions(user)
 		if err != nil {
 			return nil, err
@@ -1673,6 +1674,41 @@ type FinishAddCredentialResponse struct {
 	PrivateDataETag string `json:"privateDataETag"`
 }
 
+// authorizeEnrollment enforces security.webauthn.require_enrollment_authorization.
+// With the flag off it returns user unchanged. With it on and a passkey on the
+// account, no assertion from one of them over this enrolment's own challenge
+// means no enrolment (fail closed). It returns the user to continue with.
+func (s *WebAuthnService) authorizeEnrollment(ctx context.Context, user *domain.User, userID domain.UserID, challenge *domain.WebauthnChallenge, authorization json.RawMessage) (*domain.User, error) {
+	if !s.enrollmentAuthorizationRequired() || len(user.WebauthnCredentials) == 0 {
+		return user, nil
+	}
+	if len(authorization) == 0 {
+		return nil, ErrEnrollmentAuthorizationRequired
+	}
+	if challenge.AssertionChallenge == "" ||
+		!s.verifyOwnAssertion(ctx, user, userID, challenge.AssertionChallenge, authorization) {
+		return nil, ErrEnrollmentAuthorizationFailed
+	}
+	// verifyOwnAssertion persisted the authorising passkey's counter and any
+	// clone warning; the snapshot loaded by the caller predates that, and the
+	// full Update later would write it back over them. Continue from the stored
+	// record (cut-off judged again against it).
+	user, err := s.store.Users().GetByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if err := refuseIfCutOff(ctx, user); err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
+// enrollmentAuthorizationRequired reports whether adding a passkey to an
+// account that has one needs an assertion from an existing passkey.
+func (s *WebAuthnService) enrollmentAuthorizationRequired() bool {
+	return s.cfg != nil && s.cfg.Security.WebAuthn.RequireEnrollmentAuthorization
+}
+
 // FinishAddCredential completes adding a new credential to an existing user
 func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain.UserID, req *FinishAddCredentialRequest, ifMatch string) (*FinishAddCredentialResponse, error) {
 	// Get the user
@@ -1712,27 +1748,9 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 		return nil, errors.New("invalid challenge action")
 	}
 
-	// Fail closed: with a passkey on the account, no assertion from one of
-	// them over this enrolment's own challenge means no enrolment.
-	if len(user.WebauthnCredentials) > 0 {
-		if len(req.Authorization) == 0 {
-			return nil, ErrEnrollmentAuthorizationRequired
-		}
-		if challenge.AssertionChallenge == "" ||
-			!s.verifyOwnAssertion(ctx, user, userID, challenge.AssertionChallenge, req.Authorization) {
-			return nil, ErrEnrollmentAuthorizationFailed
-		}
-		// verifyOwnAssertion persisted the authorising passkey's counter and any
-		// clone warning; the snapshot loaded above predates that, and the full
-		// Update below would write it back over them. Continue from the stored
-		// record (cut-off judged again against it).
-		user, err = s.store.Users().GetByID(ctx, userID)
-		if err != nil {
-			return nil, err
-		}
-		if err := refuseIfCutOff(ctx, user); err != nil {
-			return nil, err
-		}
+	user, err = s.authorizeEnrollment(ctx, user, userID, challenge, req.Authorization)
+	if err != nil {
+		return nil, err
 	}
 
 	waUser := &WebAuthnUser{user: user}

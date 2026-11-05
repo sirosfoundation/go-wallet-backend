@@ -2113,6 +2113,17 @@ type WebAuthnSecurityConfig struct {
 	// Default: "none" (recommended for most deployments - avoids certificate validation issues)
 	// Use "direct" only if you need to verify authenticator makes/models.
 	AttestationConveyance string `yaml:"attestation_conveyance" envconfig:"ATTESTATION_CONVEYANCE"`
+
+	// RequireEnrollmentAuthorization makes adding a passkey to an account that
+	// already has one (POST /user/session/webauthn/register-begin and
+	// register-finish) need an assertion from one of the existing passkeys, so a
+	// bearer token alone cannot enrol a passkey of its own. Missing or invalid
+	// assertions are refused with 401 ENROLLMENT_AUTHORIZATION_REQUIRED /
+	// ENROLLMENT_AUTHORIZATION_FAILED. Default: false (the endpoints behave as
+	// before) for one release so that clients can move first; the default will
+	// then become true.
+	// Env: WALLET_SECURITY_WEBAUTHN_REQUIRE_ENROLLMENT_AUTHORIZATION
+	RequireEnrollmentAuthorization bool `yaml:"require_enrollment_authorization" envconfig:"REQUIRE_ENROLLMENT_AUTHORIZATION"`
 }
 
 // GetAttestationConveyance returns the attestation conveyance preference
