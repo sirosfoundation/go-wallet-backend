@@ -195,12 +195,22 @@ type CredentialStore interface {
 	// Delete deletes a credential
 	Delete(ctx context.Context, tenantID domain.TenantID, holderDID, credentialIdentifier string) error
 
-	// DeleteIfUnchanged deletes the credential with this record id only if its
-	// WriteToken is unchanged; ErrNotFound otherwise. A compensating rollback.
+	// DeleteIfUnchanged undoes the Create or Update that set writeToken: a
+	// compensating rollback driven by the record's undo log (see UndoLog), which
+	// the store keeps of each record's recent writes (UndoLogMaxAge,
+	// UndoLogMaxLen). Undoing the newest write puts back the record as it was
+	// before it (a create is deleted) with that record's own write token, so the
+	// write below becomes the newest again and can still be undone. Undoing a
+	// write that newer writes sit on top of removes it from the log and leaves
+	// their values in place; the next write then inherits what this one replaced.
+	// ErrNotFound if the record is gone, belongs to another tenant, or writeToken
+	// is not one of its recent writes (empty, confirmed long ago, expired).
 	DeleteIfUnchanged(ctx context.Context, tenantID domain.TenantID, id int64, writeToken string) error
 
-	// RestoreIfUnchanged replaces the credential (matched by record id and
-	// WriteToken) with previous; ErrNotFound if gone or rewritten.
+	// RestoreIfUnchanged undoes the write that set written.WriteToken exactly as
+	// DeleteIfUnchanged does. previous is ignored in favour of the undo log (what
+	// the caller read may be another request's unconfirmed write); stores use it
+	// only for a record written before the log existed.
 	RestoreIfUnchanged(ctx context.Context, written, previous *domain.VerifiableCredential) error
 }
 
@@ -449,13 +459,19 @@ type WalletInstanceStore interface {
 	// another tenant's.
 	DeleteIfRemovable(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding) error
 
-	// RestoreAttestation undoes an Upsert that matched an existing record (the
-	// caller was fenced out after it): the attestation counter and fields go back
-	// to before, and the owner or passkey link the Upsert set is cleared when
-	// before had none and the stored value is still the one written. Scoped to
-	// written's tenant, generation and write token: a newer attestation since
-	// (which replaced the token) is left alone, ErrBindingChanged; ErrNotFound if
-	// gone. Status is never touched.
+	// RestoreAttestation undoes the Upsert that set written.WriteToken and matched
+	// an existing record (the caller was fenced out after it), driven by the
+	// record's undo log (see UndoLog). When it is the newest attestation the
+	// attestation fields and counter go back to the record it replaced, including
+	// that record's write token, and the owner or passkey link the Upsert set is
+	// cleared when that record had none and the stored value is still the one
+	// written. When newer attestations sit on top it is removed from the log, their
+	// values and any owner or link stay (they may rely on them) and only the
+	// counter is undone. before is ignored in favour of the log; stores use it only
+	// for a record written before the log existed. Scoped to written's tenant and
+	// generation (ErrBindingChanged if another record now); ErrBindingChanged
+	// also when the write is not in the log or was an insert; ErrNotFound if gone.
+	// Status is never touched.
 	RestoreAttestation(ctx context.Context, before, written *domain.WalletInstance) error
 }
 
@@ -467,15 +483,26 @@ type KeyAttestationStore interface {
 	// object was verified for the credential key identified by
 	// rec.KeyThumbprint.
 	// It sets rec.WriteToken to a fresh value and rec.Previous to the evidence it
-	// replaced (nil if there was none).
+	// replaced (nil if there was none; informational, rollbacks use the undo log).
 	MarkKeyAttested(ctx context.Context, rec *domain.KeyAttestationRecord) error
 
-	// DeleteIfUnchanged deletes the record for thumbprint only if its
-	// WriteToken is unchanged; ErrNotFound otherwise. A compensating rollback.
+	// DeleteIfUnchanged undoes the write (MarkKeyAttested, ReplaceKeyEvidence or
+	// MarkKeyRevoked) that set writeToken: a compensating rollback driven by the
+	// record's undo log (see UndoLog). Undoing the newest write puts back the
+	// record as it was before it (a first insert is deleted) with that record's
+	// own write token, so the write below becomes the newest again and can still
+	// be undone; undoing a write that newer writes sit on top of removes it from
+	// the log and leaves their values in place (a revocation on top is therefore
+	// never undone by the rollback of the write below it). ErrNotFound if the
+	// record is gone or writeToken is not one of its recent writes (empty, a write
+	// that did not land, confirmed long ago, expired).
 	DeleteIfUnchanged(ctx context.Context, thumbprint, writeToken string) error
 
-	// RestoreIfUnchanged replaces the record (matched by thumbprint and
-	// written.WriteToken) with previous; ErrNotFound if gone or rewritten.
+	// RestoreIfUnchanged undoes the write that set written.WriteToken exactly as
+	// DeleteIfUnchanged does. previous (the Previous a write returned) is ignored
+	// in favour of the undo log, since the record it replaced may have been another
+	// request's unconfirmed write; stores use it only for a record written before
+	// the log existed.
 	RestoreIfUnchanged(ctx context.Context, written, previous *domain.KeyAttestationRecord) error
 
 	// GetByKeyThumbprint retrieves a key attestation record by its JWK

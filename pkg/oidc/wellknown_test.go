@@ -41,20 +41,23 @@ func TestCredentialIssuerMetadataURLs(t *testing.T) {
 	}
 }
 
-// RFC 8414 section 3.1: terminating slash removed, no fallback.
+// RFC 8414 section 3.1 insertion first, OIDC Discovery section 4 append second;
+// one terminating slash removed in each.
 func TestAuthorizationServerMetadataURLs(t *testing.T) {
 	const w = "/.well-known/oauth-authorization-server"
+	const o = "/.well-known/openid-configuration"
 	for _, tt := range []struct {
-		name, in, want string
-		wantErr        bool
+		name, in string
+		want     []string
+		wantErr  bool
 	}{
-		{"path", "https://as.example.com/tenant/1", "https://as.example.com" + w + "/tenant/1", false},
-		{"path with terminating slash", "https://as.example.com/tenant/", "https://as.example.com" + w + "/tenant", false},
-		{"host only", "https://as.example.com", "https://as.example.com" + w, false},
-		{"root slash", "https://as.example.com/", "https://as.example.com" + w, false},
-		{"percent-encoded", "https://as.example.com/a%2Fb", "https://as.example.com" + w + "/a%2Fb", false},
-		{"repeated slash strips one", "https://as.example.com/t//", "https://as.example.com" + w + "/t/", false},
-		{"invalid", "://not-a-url", "", true},
+		{"path", "https://as.example.com/tenant/1", []string{"https://as.example.com" + w + "/tenant/1", "https://as.example.com/tenant/1" + o}, false},
+		{"path with terminating slash", "https://as.example.com/tenant/", []string{"https://as.example.com" + w + "/tenant", "https://as.example.com/tenant" + o}, false},
+		{"host only", "https://as.example.com", []string{"https://as.example.com" + w, "https://as.example.com" + o}, false},
+		{"root slash", "https://as.example.com/", []string{"https://as.example.com" + w, "https://as.example.com" + o}, false},
+		{"percent-encoded", "https://as.example.com/a%2Fb", []string{"https://as.example.com" + w + "/a%2Fb", "https://as.example.com/a%2Fb" + o}, false},
+		{"repeated slash strips one", "https://as.example.com/t//", []string{"https://as.example.com" + w + "/t/", "https://as.example.com/t/" + o}, false},
+		{"invalid", "://not-a-url", nil, true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := AuthorizationServerMetadataURLs(tt.in)
@@ -64,8 +67,8 @@ func TestAuthorizationServerMetadataURLs(t *testing.T) {
 			if tt.wantErr {
 				return
 			}
-			if len(got) != 1 || got[0] != tt.want {
-				t.Errorf("got %q, want [%q]", got, tt.want)
+			if len(got) != 2 || got[0] != tt.want[0] || got[1] != tt.want[1] {
+				t.Errorf("got %q, want %q", got, tt.want)
 			}
 		})
 	}

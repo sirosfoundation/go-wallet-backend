@@ -579,7 +579,30 @@ func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain
 type CredentialStore struct {
 	mu     sync.RWMutex
 	data   map[int64]*domain.VerifiableCredential
+	undo   map[int64]*storage.UndoLog[domain.VerifiableCredential]
 	nextID int64
+	// now is the clock the undo log ages by; nil means time.Now.
+	now func() time.Time
+}
+
+func (s *CredentialStore) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+// logFor returns the undo log of record id, creating it. Caller holds s.mu.
+func (s *CredentialStore) logFor(id int64) *storage.UndoLog[domain.VerifiableCredential] {
+	if s.undo == nil {
+		s.undo = make(map[int64]*storage.UndoLog[domain.VerifiableCredential])
+	}
+	l, ok := s.undo[id]
+	if !ok {
+		l = &storage.UndoLog[domain.VerifiableCredential]{}
+		s.undo[id] = l
+	}
+	return l
 }
 
 func (s *CredentialStore) Create(ctx context.Context, credential *domain.VerifiableCredential) error {
@@ -591,7 +614,11 @@ func (s *CredentialStore) Create(ctx context.Context, credential *domain.Verifia
 	credential.CreatedAt = time.Now()
 	credential.UpdatedAt = time.Now()
 	credential.WriteToken = storage.NewWriteToken()
-	s.data[credential.ID] = credential
+	// Store a copy: the caller keeps its own record, so a later write (which
+	// replaces the token) cannot change what the caller captured for its rollback.
+	stored := *credential
+	s.data[credential.ID] = &stored
+	s.logFor(credential.ID).Push(s.clock(), credential.WriteToken, nil)
 	return nil
 }
 
@@ -607,7 +634,8 @@ func (s *CredentialStore) GetByID(ctx context.Context, tenantID domain.TenantID,
 	if credential.TenantID != tenantID {
 		return nil, storage.ErrNotFound
 	}
-	return credential, nil
+	out := *credential
+	return &out, nil
 }
 
 func (s *CredentialStore) GetByIdentifier(ctx context.Context, tenantID domain.TenantID, holderDID, credentialIdentifier string) (*domain.VerifiableCredential, error) {
@@ -616,7 +644,8 @@ func (s *CredentialStore) GetByIdentifier(ctx context.Context, tenantID domain.T
 
 	for _, cred := range s.data {
 		if cred.TenantID == tenantID && cred.HolderDID == holderDID && cred.CredentialIdentifier == credentialIdentifier {
-			return cred, nil
+			out := *cred
+			return &out, nil
 		}
 	}
 	return nil, storage.ErrNotFound
@@ -629,7 +658,8 @@ func (s *CredentialStore) GetAllByHolder(ctx context.Context, tenantID domain.Te
 	credentials := make([]*domain.VerifiableCredential, 0)
 	for _, cred := range s.data {
 		if cred.TenantID == tenantID && cred.HolderDID == holderDID {
-			credentials = append(credentials, cred)
+			out := *cred
+			credentials = append(credentials, &out)
 		}
 	}
 	return credentials, nil
@@ -639,41 +669,58 @@ func (s *CredentialStore) Update(ctx context.Context, credential *domain.Verifia
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.data[credential.ID]; !exists {
+	current, exists := s.data[credential.ID]
+	if !exists {
 		return storage.ErrNotFound
 	}
+	before := *current
 
 	credential.UpdatedAt = time.Now()
 	credential.WriteToken = storage.NewWriteToken()
-	s.data[credential.ID] = credential
+	stored := *credential // a copy, as in Create
+	s.data[credential.ID] = &stored
+	s.logFor(credential.ID).Push(s.clock(), credential.WriteToken, &before)
 	return nil
 }
 
+// DeleteIfUnchanged undoes the write that set writeToken (see undoLog): a
+// create is deleted, an update goes back to the record it replaced. Writes made
+// on top of it since are not undone. ErrNotFound if the token is not one of the
+// record's recent writes.
 func (s *CredentialStore) DeleteIfUnchanged(ctx context.Context, tenantID domain.TenantID, id int64, writeToken string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	cred, exists := s.data[id]
-	if !exists || cred.TenantID != tenantID || writeToken == "" || cred.WriteToken != writeToken {
-		return storage.ErrNotFound
-	}
-	delete(s.data, id)
-	return nil
+	return s.rollback(tenantID, id, writeToken)
 }
 
+// RestoreIfUnchanged undoes the write that set written.WriteToken, exactly as
+// DeleteIfUnchanged does; previous is ignored: the record's own undo log, not
+// what the caller read, says what the write replaced.
 func (s *CredentialStore) RestoreIfUnchanged(ctx context.Context, written, previous *domain.VerifiableCredential) error {
+	return s.rollback(written.TenantID, written.ID, written.WriteToken)
+}
+
+func (s *CredentialStore) rollback(tenantID domain.TenantID, id int64, writeToken string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cur, exists := s.data[written.ID]
-	if !exists || cur.TenantID != written.TenantID || written.WriteToken == "" || cur.WriteToken != written.WriteToken {
+	cur, exists := s.data[id]
+	if !exists || cur.TenantID != tenantID {
 		return storage.ErrNotFound
 	}
-	restored := *previous
-	restored.ID = written.ID
-	restored.WriteToken = storage.NewWriteToken() // a restore is itself a new write
-	s.data[written.ID] = &restored
-	return nil
+	kind, before := s.logFor(id).Take(s.clock(), writeToken)
+	switch kind {
+	case storage.UndoHead:
+		if before == nil {
+			delete(s.data, id)
+			delete(s.undo, id)
+			return nil
+		}
+		restored := *before
+		s.data[id] = &restored
+		return nil
+	case storage.UndoSpliced:
+		return nil
+	}
+	return storage.ErrNotFound
 }
 
 func (s *CredentialStore) Delete(ctx context.Context, tenantID domain.TenantID, holderDID, credentialIdentifier string) error {
@@ -683,6 +730,7 @@ func (s *CredentialStore) Delete(ctx context.Context, tenantID domain.TenantID, 
 	for id, cred := range s.data {
 		if cred.TenantID == tenantID && cred.HolderDID == holderDID && cred.CredentialIdentifier == credentialIdentifier {
 			delete(s.data, id)
+			delete(s.undo, id)
 			return nil
 		}
 	}

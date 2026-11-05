@@ -9,6 +9,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -18,6 +19,8 @@ import (
 	"github.com/go-jose/go-jose/v4"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
 const seedMetadata = `{"org.siros.secret_seed":{"namespaces":["ns1"]}}`
@@ -88,6 +91,93 @@ func respEnc() *CredentialResponseEncryptionConfig {
 	}
 }
 
+func TestCredentialRequest_EncryptionPolicy(t *testing.T) {
+	fastDeferredPolling(t)
+	priv, jwks := issuerEncKey(t, "ECDH-ES+A256KW", "enc")
+	_, unsupportedAlg := issuerEncKey(t, "RSA-OAEP", "enc")
+	_, missingAlg := issuerEncKey(t, "", "enc")
+	_, signingKey := issuerEncKey(t, "ECDH-ES+A256KW", "sig")
+	cases := []struct {
+		name   string
+		jwks   json.RawMessage
+		encs   []string
+		usable bool
+	}{
+		{"compatible", jwks, []string{"A256GCM"}, true},
+		{"unsupported key algorithm", unsupportedAlg, []string{"A256GCM"}, false},
+		{"missing key algorithm", missingAlg, []string{"A256GCM"}, false},
+		{"signing key", signingKey, []string{"A256GCM"}, false},
+		{"missing keys", nil, []string{"A256GCM"}, false},
+		{"empty keys", json.RawMessage(`{"keys":[]}`), []string{"A256GCM"}, false},
+		{"malformed keys", json.RawMessage(`{"keys":[{}]}`), []string{"A256GCM"}, false},
+		{"unsupported content algorithm", jwks, []string{"unsupported"}, false},
+		{"missing content algorithm", jwks, nil, false},
+	}
+	for _, tc := range cases {
+		for _, disabled := range []bool{false, true} {
+			for _, required := range []bool{false, true} {
+				for _, deferred := range []bool{false, true} {
+					t.Run(fmt.Sprintf("%s/disabled=%t/required=%t/deferred=%t", tc.name, disabled, required, deferred), func(t *testing.T) {
+						var ct string
+						var body map[string]any
+						srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+							ct = r.Header.Get("Content-Type")
+							raw, err := io.ReadAll(r.Body)
+							require.NoError(t, err)
+							if ct == "application/jwt" {
+								jwe, err := jose.ParseEncrypted(string(raw), []jose.KeyAlgorithm{jose.ECDH_ES_A256KW}, []jose.ContentEncryption{jose.A256GCM})
+								require.NoError(t, err)
+								assert.NotEmpty(t, jwe.Header.KeyID)
+								raw, err = jwe.Decrypt(priv)
+								require.NoError(t, err)
+							}
+							require.NoError(t, json.Unmarshal(raw, &body))
+							w.Header().Set("Content-Type", "application/json")
+							_, _ = w.Write([]byte(`{"credential":"c"}`))
+						}))
+						defer srv.Close()
+						h, cleanup := testOID4VCIHandler(t, srv.Client())
+						defer cleanup()
+						h.Config = &config.Config{Features: config.FeaturesConfig{DisableOpportunisticRequestEncryption: disabled}}
+						md := &IssuerMetadata{
+							CredentialEndpoint: srv.URL,
+							CredentialIssuer:   srv.URL,
+							CredentialRequestEncryption: &CredentialRequestEncryptionConfig{
+								JWKS: tc.jwks, EncValuesSupported: tc.encs, EncryptionRequired: required,
+							},
+						}
+						var resp *CredentialResponse
+						var err error
+						if deferred {
+							resp, err = h.pollDeferredCredential(context.Background(), md, tokenBearer(), "tx1", 0, nil)
+						} else {
+							resp, err = h.requestCredential(context.Background(), md, tokenBearer(), "cfg", &CredentialConfig{Format: "vc+sd-jwt"}, nil, nil)
+						}
+						if required && !tc.usable {
+							require.ErrorContains(t, err, "cannot encrypt")
+							assert.Empty(t, ct, "required encryption must fail before sending any request")
+							return
+						}
+						require.NoError(t, err)
+						require.NotNil(t, resp)
+						if tc.usable && (!disabled || required) {
+							assert.Equal(t, "application/jwt", ct)
+						} else {
+							assert.Equal(t, "application/json", ct)
+						}
+						if deferred {
+							assert.Equal(t, "tx1", body["transaction_id"])
+						} else {
+							assert.Equal(t, "cfg", body["credential_configuration_id"])
+						}
+						assert.NotContains(t, body, "credential_response_encryption")
+					})
+				}
+			}
+		}
+	}
+}
+
 func TestRequestCredential_EncryptedRequestRoundTrip(t *testing.T) {
 	priv, jwks := issuerEncKey(t, "ECDH-ES+A256KW", "enc")
 	var got map[string]any
@@ -97,6 +187,7 @@ func TestRequestCredential_EncryptedRequestRoundTrip(t *testing.T) {
 	fc := &fakeClient{t: t}
 	h, _, cleanup := newBlindHandler(t, fc, srv.Client())
 	defer cleanup()
+	h.Config = &config.Config{Features: config.FeaturesConfig{DisableOpportunisticRequestEncryption: true}}
 
 	md := &IssuerMetadata{
 		CredentialEndpoint:           srv.URL,

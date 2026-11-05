@@ -24,6 +24,10 @@ type issuerMetadataCache struct {
 	mu      sync.Mutex
 	entries map[string]*metadataCacheEntry
 	ttl     time.Duration
+
+	// disabled makes get always miss and put a no-op
+	// (http_client.metadata_cache_disabled).
+	disabled bool
 }
 
 type metadataCacheEntry struct {
@@ -33,14 +37,18 @@ type metadataCacheEntry struct {
 
 const defaultMetadataCacheTTL = 5 * time.Minute
 
-func newIssuerMetadataCache() *issuerMetadataCache {
+func newIssuerMetadataCache(disabled bool) *issuerMetadataCache {
 	return &issuerMetadataCache{
-		entries: make(map[string]*metadataCacheEntry),
-		ttl:     defaultMetadataCacheTTL,
+		entries:  make(map[string]*metadataCacheEntry),
+		ttl:      defaultMetadataCacheTTL,
+		disabled: disabled,
 	}
 }
 
 func (c *issuerMetadataCache) get(issuerURL string) (*metadata.IssuerMetadata, bool) {
+	if c.disabled {
+		return nil, false
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -56,6 +64,9 @@ func (c *issuerMetadataCache) get(issuerURL string) (*metadata.IssuerMetadata, b
 }
 
 func (c *issuerMetadataCache) put(issuerURL string, m *metadata.IssuerMetadata) {
+	if c.disabled {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 

@@ -148,7 +148,7 @@ func TestCloseReason_Superseded_LogsBothSessions(t *testing.T) {
 	ws1 := dialAndHandshakeAsUser(t, m, wsURL, user)
 	defer func() { _ = ws1.Close() }()
 	m.sessionsMu.RLock()
-	oldID := m.userIndex[user].ID
+	oldID := m.userIndex[userKey{TenantID: "test-tenant", UserID: user}].ID
 	m.sessionsMu.RUnlock()
 
 	ws2 := dialAndHandshakeAsUser(t, m, wsURL, user)
@@ -158,7 +158,7 @@ func TestCloseReason_Superseded_LogsBothSessions(t *testing.T) {
 	require.Eventually(t, func() bool {
 		m.sessionsMu.RLock()
 		defer m.sessionsMu.RUnlock()
-		newID = m.userIndex[user].ID
+		newID = m.userIndex[userKey{TenantID: "test-tenant", UserID: user}].ID
 		return newID != oldID
 	}, time.Second, 10*time.Millisecond)
 
@@ -214,4 +214,41 @@ func TestMarkClosing_DoesNotOverrideRecordedReadError(t *testing.T) {
 	reason, code := classifyClose(s.closeInfo.pending, s.closeInfo.readErr)
 	assert.Equal(t, closeReasonPeerClose, reason)
 	assert.Equal(t, 4001, code)
+}
+
+// Under the tenant-scoped index a session is superseded only by a later
+// session of the same (tenant, user); the reason attribution follows that key.
+func TestCloseReason_Superseded_TenantScopedKey(t *testing.T) {
+	core, logs := observer.New(zap.DebugLevel)
+	m := NewManager(testCfg(), zap.New(core))
+	defer m.Close()
+	mk := func(id, tenant string) *Session {
+		s := newMultiTenantTestSession(t, id, tenant, "user-1")
+		s.closeInfo = newCloseBookkeeping(s.conn)
+		return s
+	}
+
+	a1, b1 := mk("a1", "tenant-a"), mk("b1", "tenant-b")
+	require.True(t, m.registerSession(a1))
+	require.True(t, m.registerSession(b1))
+	// Same user in another tenant is not a supersession.
+	assert.Equal(t, 0, logs.FilterMessage("Closing existing session").Len())
+	assert.Empty(t, a1.closeInfo.pending)
+	assert.Empty(t, b1.supersededID())
+
+	a2 := mk("a2", "tenant-a")
+	require.True(t, m.registerSession(a2))
+
+	assert.Equal(t, closeReasonSuperseded, a1.closeInfo.pending)
+	assert.Equal(t, "a2", a1.closeInfo.supersededBy)
+	assert.Equal(t, "a1", a2.supersededID())
+	assert.Empty(t, b1.closeInfo.pending, "tenant B session must not be attributed a close")
+
+	es := logs.FilterMessage("Closing existing session").All()
+	require.Len(t, es, 1)
+	f := es[0].ContextMap()
+	assert.Equal(t, zap.InfoLevel, es[0].Level)
+	assert.Equal(t, "tenant-a", f["tenant_id"])
+	assert.Equal(t, "a1", f["old_session_id"])
+	assert.Equal(t, "a2", f["new_session_id"])
 }
