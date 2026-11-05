@@ -547,6 +547,16 @@ func (h *Handlers) GetPrivateData(c *gin.Context) {
 	c.JSON(200, gin.H{"privateData": taggedbinary.TaggedBytes(data)})
 }
 
+// respondPrivateDataOwnership writes the HTTP 422 response for a refused
+// private-data container and reports whether err was such a refusal.
+func respondPrivateDataOwnership(c *gin.Context, err error) bool {
+	if !errors.Is(err, service.ErrPrivateDataOwnership) {
+		return false
+	}
+	c.JSON(http.StatusUnprocessableEntity, gin.H{"error": service.PrivateDataOwnershipErrorCode})
+	return true
+}
+
 // UpdatePrivateData updates the user's private data
 func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 	userID, ok := contextUserID(c)
@@ -584,8 +594,7 @@ func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 			c.JSON(404, gin.H{"error": "User not found"})
 			return
 		}
-		if errors.Is(err, service.ErrPrivateDataOwnership) {
-			c.JSON(422, gin.H{"error": service.PrivateDataOwnershipErrorCode})
+		if respondPrivateDataOwnership(c, err) {
 			return
 		}
 		if errors.Is(err, service.ErrPrivateDataConflict) {
@@ -859,8 +868,7 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 	if err != nil {
 		h.logger.Error("Failed to finish adding credential", zap.Error(err))
 		switch {
-		case errors.Is(err, service.ErrPrivateDataOwnership):
-			c.JSON(422, gin.H{"error": service.PrivateDataOwnershipErrorCode})
+		case respondPrivateDataOwnership(c, err):
 		case errors.Is(err, service.ErrChallengeNotFound):
 			c.JSON(404, gin.H{})
 		case errors.Is(err, service.ErrChallengeExpired):
@@ -929,8 +937,7 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 			c.JSON(409, gin.H{"error": "Cannot delete last credential"})
 			return
 		}
-		if errors.Is(err, service.ErrPrivateDataOwnership) {
-			c.JSON(422, gin.H{"error": service.PrivateDataOwnershipErrorCode})
+		if respondPrivateDataOwnership(c, err) {
 			return
 		}
 		if errors.Is(err, service.ErrPrivateDataConflict) {
