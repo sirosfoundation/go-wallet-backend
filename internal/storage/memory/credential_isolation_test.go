@@ -30,8 +30,8 @@ func TestCredentialStore_DoesNotAliasCallerRecords(t *testing.T) {
 	assert.Equal(t, createdToken, c.WriteToken, "caller's record must not see a later write's token")
 	assert.Equal(t, 0, c.SigCount)
 
-	// The Create's rollback must now be a no-op: the newer write survives.
-	assert.Error(t, s.DeleteIfUnchanged(ctx, domain.DefaultTenantID, c.ID, createdToken))
+	// The Create's rollback must not remove the newer write.
+	require.NoError(t, s.DeleteIfUnchanged(ctx, domain.DefaultTenantID, c.ID, createdToken))
 	cur, err := s.GetByIdentifier(ctx, domain.DefaultTenantID, "did:h", "alias")
 	require.NoError(t, err)
 	assert.Equal(t, 7, cur.SigCount)

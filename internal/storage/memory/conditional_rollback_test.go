@@ -45,9 +45,13 @@ func TestCredentialStore_ConditionalRollback(t *testing.T) {
 		oldToken := c.WriteToken
 		require.NoError(t, s.Update(ctx, c))
 		assert.NotEqual(t, oldToken, c.WriteToken)
-		assert.ErrorIs(t, s.DeleteIfUnchanged(ctx, domain.DefaultTenantID, c.ID, oldToken), storage.ErrNotFound)
 		assert.ErrorIs(t, s.DeleteIfUnchanged(ctx, "other", c.ID, c.WriteToken), storage.ErrNotFound)
 		assert.ErrorIs(t, s.DeleteIfUnchanged(ctx, domain.DefaultTenantID, c.ID, ""), storage.ErrNotFound)
+		assert.ErrorIs(t, s.DeleteIfUnchanged(ctx, domain.DefaultTenantID, c.ID, "never-written"), storage.ErrNotFound)
+		// The create's rollback is spliced out of the log; the newer write stays.
+		require.NoError(t, s.DeleteIfUnchanged(ctx, domain.DefaultTenantID, c.ID, oldToken))
+		_, err := s.GetByIdentifier(ctx, domain.DefaultTenantID, "did:h", "c")
+		assert.NoError(t, err)
 	})
 	t.Run("RestoreIfUnchanged restores only the write it undoes", func(t *testing.T) {
 		c := newCred("d")
@@ -57,16 +61,16 @@ func TestCredentialStore_ConditionalRollback(t *testing.T) {
 		require.NoError(t, s.Update(ctx, c))
 		written := *c
 
-		// A later write makes the restore a no-op.
+		// A later write keeps its own values when this one is undone.
 		later := *c
 		later.SigCount = 9
 		require.NoError(t, s.Update(ctx, &later))
-		assert.ErrorIs(t, s.RestoreIfUnchanged(ctx, &written, &previous), storage.ErrNotFound)
+		require.NoError(t, s.RestoreIfUnchanged(ctx, &written, &previous))
 		got, err := s.GetByIdentifier(ctx, domain.DefaultTenantID, "did:h", "d")
 		require.NoError(t, err)
 		assert.Equal(t, 9, got.SigCount)
 
-		// Without a later write it restores.
+		// Undoing the later write too leaves the state before both.
 		require.NoError(t, s.RestoreIfUnchanged(ctx, &later, &previous))
 		got, err = s.GetByIdentifier(ctx, domain.DefaultTenantID, "did:h", "d")
 		require.NoError(t, err)
