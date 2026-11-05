@@ -3739,3 +3739,12 @@ func TestAndroidKeyAttestationConfig_ValidateEnforcement(t *testing.T) {
 		t.Fatal("Config.Validate accepted reject with nothing pinned")
 	}
 }
+
+func TestWebAuthnSecurityConfig_RequireEnrollmentAuthorizationDefaultsOff(t *testing.T) {
+	if (Config{}).Security.WebAuthn.RequireEnrollmentAuthorization {
+		t.Error("require_enrollment_authorization must default to false")
+	}
+	if defaultConfig().Security.WebAuthn.RequireEnrollmentAuthorization {
+		t.Error("the default configuration must not require enrolment authorisation")
+	}
+}

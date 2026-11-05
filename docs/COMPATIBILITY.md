@@ -153,8 +153,8 @@ The reference implementation's `/user/{register,login}-webauthn-*` endpoints and
 | `/user/session/private-data` | POST | Update private data with ETag support |
 | `/user/session/` | DELETE | Delete user account and all data (passkey step-up body; bodyless form behind `user.delete.require_step_up`) |
 | `/user/session/delete-begin` | POST | Begin the passkey step-up for account deletion |
-| `/user/session/webauthn/register-begin` | POST | Begin adding WebAuthn credential |
-| `/user/session/webauthn/register-finish` | POST | Complete adding WebAuthn credential |
+| `/user/session/webauthn/register-begin` | POST | Begin adding WebAuthn credential (offers an existing-passkey authorisation when `security.webauthn.require_enrollment_authorization` is on) |
+| `/user/session/webauthn/register-finish` | POST | Complete adding WebAuthn credential (needs the `authorization` assertion when the flag above is on) |
 | `/user/session/webauthn/credential/:id/rename` | POST | Rename WebAuthn credential |
 | `/user/session/webauthn/credential/:id/delete` | POST | Delete WebAuthn credential |
 

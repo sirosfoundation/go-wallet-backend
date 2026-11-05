@@ -477,7 +477,10 @@ qualifies, including one restricted to `rwl`.
 sign. The challenge is bound to the caller and to this action, expires after
 120 seconds and is single use: the first `DELETE` that presents it consumes
 it, whatever the outcome, except that a `confirm` other than `DELETE` is
-refused before the challenge is touched. `400 NO_PASSKEY` when the account has no
+refused before the challenge is touched. Like `DELETE /user/session` itself,
+`delete-begin` stays reachable to a user whose tokens were revoked by an
+interrupted deletion, so the deletion can be retried (the token cut-off and
+every other token check still apply). `400 NO_PASSKEY` when the account has no
 passkey (an OIDC-only account cannot confirm this way yet); `401` when
 unauthenticated; `404` when the user no longer exists.
 
@@ -548,7 +551,16 @@ All credential endpoints require authentication.
 
 `POST /user/session/webauthn/register-begin` and
 `POST /user/session/webauthn/register-finish` (token TAC `i`) add a passkey to
-the caller's account. An account that already has a passkey needs one of them to
+the caller's account.
+
+**Rollout.** With `security.webauthn.require_enrollment_authorization` off (the
+default, `WALLET_SECURITY_WEBAUTHN_REQUIRE_ENROLLMENT_AUTHORIZATION`), both
+endpoints behave as they always did: `register-begin` offers no `authorization`,
+`register-finish` needs none and ignores one that is sent. For one release the
+default stays off so that clients can move first; it will then flip to true.
+Everything below describes the behaviour with the flag on.
+
+With the flag on, an account that already has a passkey needs one of them to
 authorise the addition, so a bearer token alone cannot enrol a passkey of its
 own. Two WebAuthn ceremonies take place, both answered in the one `finish`
 request; the authorising assertion is made first or second, in either order.
@@ -585,7 +597,7 @@ options, serialised like the login `credential`. Required unless
 
 | Status | `error` | Meaning |
 |--------|---------|---------|
-| 401 | `ENROLLMENT_AUTHORIZATION_REQUIRED` | the account has a passkey and `authorization` is missing |
+| 401 | `ENROLLMENT_AUTHORIZATION_REQUIRED` | the flag is on, the account has a passkey and `authorization` is missing |
 | 401 | `ENROLLMENT_AUTHORIZATION_FAILED` | the assertion is not from one of the caller's passkeys, is over another challenge, or does not verify |
 
 The check comes before the registration is verified, and a refused attempt
