@@ -18,6 +18,13 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 )
 
+// envWith wraps a raw prfKeys JSON value in an otherwise valid container
+// envelope, so a case exercises the prfKeys/credentialId checks and not the
+// envelope checks that run first.
+func envWith(prfKeys string) []byte {
+	return []byte(`{"mainKey":{},"jwe":"a.b.c.d.e","prfKeys":` + prfKeys + `}`)
+}
+
 func TestValidatePrivateDataOwnership_Container(t *testing.T) {
 	creds := []domain.WebauthnCredential{{ID: testCredID("a")}, {ID: testCredID("b")}}
 	uid := domain.NewUserID()
@@ -50,19 +57,21 @@ func TestValidatePrivateDataOwnership_Container(t *testing.T) {
 		{"mainKey null", []byte(`{"mainKey":null,"jwe":"a.b.c.d.e","prfKeys":[{"credentialId":{"$b64u":"` + testCredID("a") + `"}}]}`), true},
 		{"mainKey wrong type", []byte(`{"mainKey":"x","jwe":"a.b.c.d.e","prfKeys":[{"credentialId":{"$b64u":"` + testCredID("a") + `"}}]}`), true},
 		{"mainKey absent accepted (older containers)", []byte(`{"jwe":"a..c.d.e","prfKeys":[{"credentialId":{"$b64u":"` + testCredID("a") + `"}}]}`), false},
-		{"prfKeys null", []byte(`{"prfKeys":null}`), true},
-		{"prfKeys not array", []byte(`{"prfKeys":{}}`), true},
-		{"entry null", []byte(`{"prfKeys":[null]}`), true},
-		{"entry not object", []byte(`{"prfKeys":["x"]}`), true},
-		{"credentialId missing", []byte(`{"prfKeys":[{}]}`), true},
-		{"credentialId null", []byte(`{"prfKeys":[{"credentialId":null}]}`), true},
-		{"credentialId plain string", []byte(`{"prfKeys":[{"credentialId":"` + testCredID("a") + `"}]}`), true},
-		{"credentialId tagged non-string", []byte(`{"prfKeys":[{"credentialId":{"$b64u":1}}]}`), true},
-		{"credentialId tagged null", []byte(`{"prfKeys":[{"credentialId":{"$b64u":null}}]}`), true},
-		{"credentialId extra key", []byte(`{"prfKeys":[{"credentialId":{"$b64u":"` + testCredID("a") + `","x":"y"}}]}`), true},
-		{"credentialId invalid base64", []byte(`{"prfKeys":[{"credentialId":{"$b64u":"!!!"}}]}`), true},
-		{"credentialId empty", []byte(`{"prfKeys":[{"credentialId":{"$b64u":""}}]}`), true},
-		{"valid entry plus malformed entry", []byte(`{"prfKeys":[{"credentialId":{"$b64u":"` + testCredID("a") + `"}},{"credentialId":null}]}`), true},
+		{"prfKeys null", envWith(`null`), true},
+		{"prfKeys not array", envWith(`{}`), true},
+		{"entry null", envWith(`[null]`), true},
+		{"entry not object", envWith(`["x"]`), true},
+		{"credentialId missing", envWith(`[{}]`), true},
+		{"credentialId null", envWith(`[{"credentialId":null}]`), true},
+		{"credentialId plain string", envWith(`[{"credentialId":"` + testCredID("a") + `"}]`), true},
+		{"credentialId tagged non-string", envWith(`[{"credentialId":{"$b64u":1}}]`), true},
+		{"credentialId tagged null", envWith(`[{"credentialId":{"$b64u":null}}]`), true},
+		{"credentialId extra key", envWith(`[{"credentialId":{"$b64u":"` + testCredID("a") + `","x":"y"}}]`), true},
+		{"credentialId invalid base64", envWith(`[{"credentialId":{"$b64u":"!!!"}}]`), true},
+		{"credentialId empty", envWith(`[{"credentialId":{"$b64u":""}}]`), true},
+		{"valid entry plus null entry", envWith(`[{"credentialId":{"$b64u":"` + testCredID("a") + `"}},null]`), true},
+		{"valid entry plus non-object entry", envWith(`[{"credentialId":{"$b64u":"` + testCredID("a") + `"}},"x"]`), true},
+		{"valid entry plus malformed entry", envWith(`[{"credentialId":{"$b64u":"` + testCredID("a") + `"}},{"credentialId":null}]`), true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
