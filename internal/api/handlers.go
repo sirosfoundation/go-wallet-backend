@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -547,6 +549,16 @@ func (h *Handlers) GetPrivateData(c *gin.Context) {
 	c.JSON(200, gin.H{"privateData": taggedbinary.TaggedBytes(data)})
 }
 
+// respondPrivateDataOwnership writes the HTTP 422 response for a refused
+// private-data container and reports whether err was such a refusal.
+func respondPrivateDataOwnership(c *gin.Context, err error) bool {
+	if !errors.Is(err, service.ErrPrivateDataOwnership) {
+		return false
+	}
+	c.JSON(http.StatusUnprocessableEntity, gin.H{"error": service.PrivateDataOwnershipErrorCode})
+	return true
+}
+
 // UpdatePrivateData updates the user's private data
 func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 	userID, ok := contextUserID(c)
@@ -582,6 +594,9 @@ func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "User not found"})
+			return
+		}
+		if respondPrivateDataOwnership(c, err) {
 			return
 		}
 		if errors.Is(err, service.ErrPrivateDataConflict) {
@@ -855,6 +870,7 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 	if err != nil {
 		h.logger.Error("Failed to finish adding credential", zap.Error(err))
 		switch {
+		case respondPrivateDataOwnership(c, err):
 		case errors.Is(err, service.ErrChallengeNotFound):
 			c.JSON(404, gin.H{})
 		case errors.Is(err, service.ErrChallengeExpired):
@@ -900,9 +916,18 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 	var req struct {
 		PrivateData taggedbinary.TaggedBytes `json:"privateData"`
 	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		// Allow empty body
-		req.PrivateData = nil
+	// An empty body is read as "no privateData" and refused below with 422;
+	// a body that does not parse is a 400, never treated as empty.
+	rawBody, err := c.GetRawData()
+	if err != nil {
+		c.JSON(400, gin.H{"error": "Failed to read request body"})
+		return
+	}
+	if len(bytes.TrimSpace(rawBody)) > 0 {
+		if err := json.Unmarshal(rawBody, &req); err != nil {
+			c.JSON(400, gin.H{"error": "Invalid request body"})
+			return
+		}
 	}
 
 	ifMatch := c.GetHeader("X-Private-Data-If-Match")
@@ -921,6 +946,9 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 		}
 		if errors.Is(err, service.ErrLastWebAuthnCredential) {
 			c.JSON(409, gin.H{"error": "Cannot delete last credential"})
+			return
+		}
+		if respondPrivateDataOwnership(c, err) {
 			return
 		}
 		if errors.Is(err, service.ErrPrivateDataConflict) {
