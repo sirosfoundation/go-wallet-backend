@@ -22,6 +22,13 @@ import (
 // that route uses. A FIDO2-requiring WIA policy needs it here: the route
 // refuses an instance that does not exist, and the first WIA is what creates it.
 //
+// The instance key is a raw-signing key: the WSCD "fido2" plugin (CTAP2
+// previewSign / rawSign) credential signs the PoP JWT's signing input itself.
+// A standard WebAuthn passkey signs authenticatorData || clientDataHash instead,
+// cannot produce the PoP, and so is not an instance key; there is no
+// assertion-based possession path. Its attestation would verify, but the PoP
+// key then differs from the attested key and the request is refused below.
+//
 // The attested credential key MUST be the PoP key (RFC 7638 thumbprints equal).
 // The stored FIDO2 record is looked up by the PoP key's thumbprint, so evidence
 // about another key would never count; refusing it here also stops a client

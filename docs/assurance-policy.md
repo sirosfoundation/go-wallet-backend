@@ -719,6 +719,17 @@ against the FIDO MDS3 registry through go-trust).
   attested private key. The attestation cannot carry the WIA challenge (its hash
   is fixed when the key is created), so freshness is the PoP and the single-use
   challenge of the request.
+* **The instance key is a raw-signing key, not a passkey.** The credential is
+  one the WSCD `fido2` plugin (the CTAP2 `previewSign` / rawSign extension)
+  created, which signs arbitrary bytes, so the PoP JWT's signing input is signed
+  by the attested key itself. A standard WebAuthn passkey cannot do that: its
+  `getAssertion` signs `authenticatorData || clientDataHash`, so it cannot be the
+  PoP key and is not a wallet instance key here (passkeys authenticate the user,
+  a separate flow). The attestation object alone does not say which of the two a
+  credential is, so such a key's evidence passes verification, but the request is
+  then refused because the PoP is signed by some other key
+  (`KEY_ATTESTATION_INVALID`, "the attested key is not the instance key"). There
+  is no assertion-based possession path.
 * **Same gates, same order as any WIA.** A foreign instance, a revoked instance
   and a deleted or deactivated account are refused before the evidence is
   verified. Nothing is written before the request has passed the PoP and the

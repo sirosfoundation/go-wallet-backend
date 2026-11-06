@@ -135,7 +135,10 @@ func TestWIAFIDO2InstanceKey_FirstWIAUnderFIDO2Policy(t *testing.T) {
 }
 
 // Evidence about another key is not evidence about the PoP key: the request is
-// refused and neither an instance nor a record exists afterwards.
+// refused and neither an instance nor a record exists afterwards. This is also
+// the outcome for a standard passkey: it cannot sign the PoP JWT, so a client
+// holding one can only sign the PoP with a different key, whose thumbprint then
+// differs from the attested credential's.
 func TestWIAFIDO2InstanceKey_AttestedKeyMustBeThePoPKey(t *testing.T) {
 	e := newFIDO2WIAEnv(t, true)
 	pop, other := newPoPKey(t), newPoPKey(t)
