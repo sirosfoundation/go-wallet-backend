@@ -88,6 +88,12 @@ func (h *Handlers) FIDO2AttestationRegister(c *gin.Context) {
 				"error":   "FIDO2_ATTESTATION_NOT_SUPPORTED",
 				"message": "FIDO2 hardware-key attestation is not configured",
 			})
+		case errors.Is(err, service.ErrFIDO2AttestationUnavailable):
+			h.logger.Warn("FIDO2 attestation cannot be verified right now", zap.Error(err))
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":   "ATTESTATION_UNAVAILABLE",
+				"message": "FIDO2 attestation cannot be verified right now, retry later",
+			})
 		case errors.Is(err, service.ErrFIDO2AttestationInvalid):
 			h.logger.Debug("FIDO2 attestation verification failed", zap.Error(err))
 			c.JSON(http.StatusBadRequest, gin.H{
