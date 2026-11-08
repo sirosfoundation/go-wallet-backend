@@ -13,6 +13,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,9 +23,19 @@ import (
 
 func setupTokenEndpoint(t *testing.T) (*gin.Engine, *MemorySessionStore, *TokenIssuer) {
 	t.Helper()
-	gin.SetMode(gin.TestMode)
+	issuer := newTestTokenIssuer(t)
+	router, store := setupRouterWithIssuer(t, issuer, nil, nil)
+	return router, store, issuer
+}
 
-	// Generate signing key.
+// newTestTokenIssuer builds a TokenIssuer backed by a freshly generated
+// signing key, independent of any particular router - so a test can mint a
+// token with one TokenIssuer and then verify a blacklist/audience check
+// against it using a second, separately configured router that still trusts
+// the same key (see TestTokenEndpoint_Delegation_RevokedParentDenied).
+func newTestTokenIssuer(t *testing.T) *TokenIssuer {
+	t.Helper()
+
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		t.Fatal(err)
@@ -47,17 +58,43 @@ func setupTokenEndpoint(t *testing.T) (*gin.Engine, *MemorySessionStore, *TokenI
 		t.Fatal(err)
 	}
 
-	issuer := NewTokenIssuer(km, "test-issuer", func(aud string) time.Duration {
+	return NewTokenIssuer(km, "test-issuer", func(aud string) time.Duration {
 		return 2 * time.Minute
 	})
+}
+
+// setupRouterWithIssuer wires the /auth/token endpoint using the given
+// issuer, accepted audiences and blacklist.
+func setupRouterWithIssuer(t *testing.T, issuer *TokenIssuer, audiences []string, blacklist TokenBlacklistChecker) (*gin.Engine, *MemorySessionStore) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
 
 	store := NewMemorySessionStore()
 	logger := zap.NewNop()
 
 	router := gin.New()
 	group := router.Group("/auth")
-	RegisterTokenEndpoint(group, store, issuer, AllowAllPolicy{}, func(aud string) time.Duration { return 2 * time.Minute }, true, logger)
+	RegisterTokenEndpoint(group, TokenEndpointConfig{
+		Store:           store,
+		Issuer:          issuer,
+		Policy:          AllowAllPolicy{},
+		TTLFunc:         func(aud string) time.Duration { return 2 * time.Minute },
+		Audiences:       audiences,
+		Blacklist:       blacklist,
+		InsecureCookies: true,
+		Logger:          logger,
+	})
 
+	return router, store
+}
+
+// setupTokenEndpointWithDeps is setupTokenEndpoint but lets a test supply
+// the accepted audiences and a blacklist for delegation-exchange checks
+// (#381), rather than always skipping them the way setupTokenEndpoint does.
+func setupTokenEndpointWithDeps(t *testing.T, audiences []string, blacklist TokenBlacklistChecker) (*gin.Engine, *MemorySessionStore, *TokenIssuer) {
+	t.Helper()
+	issuer := newTestTokenIssuer(t)
+	router, store := setupRouterWithIssuer(t, issuer, audiences, blacklist)
 	return router, store, issuer
 }
 
@@ -182,7 +219,14 @@ func TestTokenEndpoint_PolicyDenied(t *testing.T) {
 
 	router := gin.New()
 	group := router.Group("/auth")
-	RegisterTokenEndpoint(group, store, issuer, denyAll, func(aud string) time.Duration { return 2 * time.Minute }, true, logger)
+	RegisterTokenEndpoint(group, TokenEndpointConfig{
+		Store:           store,
+		Issuer:          issuer,
+		Policy:          denyAll,
+		TTLFunc:         func(aud string) time.Duration { return 2 * time.Minute },
+		InsecureCookies: true,
+		Logger:          logger,
+	})
 
 	sess := &Session{
 		JTI:       "sess-deny",
@@ -511,6 +555,177 @@ func TestTokenEndpoint_Delegation_ReDelegation(t *testing.T) {
 	}
 	if !claims.TAC.Has(TACDelegate) {
 		t.Error("re-delegated token should have 'k' permission")
+	}
+}
+
+// fakeBlacklist is a minimal TokenBlacklistChecker test double: a fixed set
+// of jtis considered revoked, and a fixed set of revoked user IDs. Add
+// records what was added, for tests that need to assert on it.
+type fakeBlacklist struct {
+	revoked      map[string]bool
+	revokedUsers map[string]bool
+	added        map[string]time.Time
+}
+
+func (f *fakeBlacklist) IsBlacklisted(ctx context.Context, jti string) bool {
+	return f.revoked[jti]
+}
+
+func (f *fakeBlacklist) IsUserRevoked(ctx context.Context, userID string) bool {
+	return f.revokedUsers[userID]
+}
+
+func (f *fakeBlacklist) Add(ctx context.Context, jti string, expiry time.Time) error {
+	if f.added == nil {
+		f.added = make(map[string]time.Time)
+	}
+	f.added[jti] = expiry
+	if f.revoked == nil {
+		f.revoked = make(map[string]bool)
+	}
+	f.revoked[jti] = true
+	return nil
+}
+
+func TestTokenEndpoint_Delegation_WrongAudienceDenied(t *testing.T) {
+	// Only "wallet-backend" is an accepted audience for this AS - matches
+	// how cfg.AS.Audiences restricts every other token operation (see
+	// NewBackendProvider).
+	router, _, issuer := setupTokenEndpointWithDeps(t, []string{"wallet-backend"}, nil)
+
+	// Parent token was minted for a different audience entirely.
+	parentToken, err := issuer.Issue("user-1", "some-other-service", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(TokenRequest{Audience: "downstream-api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for wrong-audience parent token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_Delegation_MatchingAudienceAllowed(t *testing.T) {
+	// Sanity check for the test above: the same restricted-audiences setup
+	// still allows delegation when the parent token's audience is accepted.
+	router, _, issuer := setupTokenEndpointWithDeps(t, []string{"wallet-backend"}, nil)
+
+	parentToken, err := issuer.Issue("user-1", "wallet-backend", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, _ := json.Marshal(TokenRequest{Audience: "downstream-api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for matching-audience parent token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_Delegation_RevokedParentDenied(t *testing.T) {
+	// Same issuer/signing key used for both the token that gets minted and
+	// the router that verifies it - only the blacklist differs - so the
+	// rejection below is actually caused by the revocation check, not a
+	// signature mismatch from using two unrelated keys.
+	issuer := newTestTokenIssuer(t)
+
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parentClaims, err := issuer.ParseAndVerify(parentToken, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The parent token's own jti is already revoked (mirrors a
+	// Logout/DeleteUser having blacklisted it - #382/#383).
+	router, _ := setupRouterWithIssuer(t, issuer, nil, &fakeBlacklist{
+		revoked: map[string]bool{parentClaims.ID: true},
+	})
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for revoked parent token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+func TestTokenEndpoint_Delegation_NonRevokedParentAllowed(t *testing.T) {
+	// Sanity check for the test above: the same blacklist wiring still
+	// allows delegation when the parent token's jti isn't on it.
+	issuer := newTestTokenIssuer(t)
+
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	router, _ := setupRouterWithIssuer(t, issuer, nil, &fakeBlacklist{
+		revoked: map[string]bool{"some-other-jti": true},
+	})
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for non-revoked parent token, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Delegation_RevokedUserDenied proves the #391 review
+// fix: a delegation-capable token whose OWN jti was never individually
+// blacklisted is still rejected once its subject (user) has been revoked
+// in bulk (see service.TokenBlacklist.RevokeUser / UserService.DeleteUser)
+// - checking the parent's jti alone missed this.
+func TestTokenEndpoint_Delegation_RevokedUserDenied(t *testing.T) {
+	issuer := newTestTokenIssuer(t)
+
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The parent token's jti is NOT individually blacklisted, but its
+	// subject ("user-1") has been bulk-revoked.
+	router, _ := setupRouterWithIssuer(t, issuer, nil, &fakeBlacklist{
+		revokedUsers: map[string]bool{"user-1": true},
+	})
+
+	body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+parentToken)
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for a revoked user's parent token, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -860,5 +1075,154 @@ func TestTokenEndpoint_Anonymous_ExceedsSessionMaxTACDenied(t *testing.T) {
 
 	if w.Code != http.StatusForbidden {
 		t.Errorf("expected 403 for a session whose MaxTAC (l) doesn't include the default anonymous tac (r), got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_PseudonymousMintsARotatingPseudonym: the engine-transport
+// kind (engine-parity.md §8 G3) - a real, authenticated session behind the
+// mint, a fresh random pseudonym in the token. Two mints from the same
+// session carry DIFFERENT subjects: the pseudonym rotates per mint, so it
+// identifies nothing and cannot be correlated across tokens. The tenant is
+// the session's own; the tac defaults to the engine's two flow gates (read
+// for OID4VP, insert for OID4VCI).
+func TestTokenEndpoint_PseudonymousMintsARotatingPseudonym(t *testing.T) {
+	router, store, issuer := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-pseudonym",
+		UserID:    "user-1",
+		TenantID:  "tenant-acme",
+		MaxTAC:    TAC("rwil"),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	mint := func() *AccessTokenClaims {
+		t.Helper()
+		body, _ := json.Marshal(TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
+		req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-pseudonym"})
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 for a session-backed pseudonymous mint, got %d: %s", w.Code, w.Body.String())
+		}
+		var resp TokenResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		claims, err := issuer.ParseAndVerify(resp.AccessToken, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return claims
+	}
+
+	first := mint()
+	second := mint()
+
+	for _, claims := range []*AccessTokenClaims{first, second} {
+		if claims.Subject == "" {
+			t.Errorf("the pseudonymous kind carries a non-empty sub (the engine's authenticated gate requires one): %q", claims.Subject)
+		}
+		if claims.Subject == "user-1" {
+			t.Errorf("the pseudonym must not be the session's real user id: %q", claims.Subject)
+		}
+		if !strings.HasPrefix(claims.Subject, "p-") {
+			t.Errorf("the minted subject is the pseudonym form: %q", claims.Subject)
+		}
+		if claims.TenantID != "tenant-acme" {
+			t.Errorf("tenant claimed as today (the session's own): %q", claims.TenantID)
+		}
+		if claims.TAC != TAC("ri") {
+			t.Errorf("tac defaults to the engine's two flow gates (read, insert): %q", claims.TAC)
+		}
+	}
+	if first.Subject == second.Subject {
+		t.Errorf("the pseudonym rotates per mint: two mints carried the same subject %q", first.Subject)
+	}
+}
+
+// TestTokenEndpoint_Pseudonymous_NoSessionDenied: there is deliberately no
+// session-less pseudonymous path - the kind removes the identity from the
+// TOKEN, not the authentication from the MINT (the same shape as the
+// anonymous kind).
+func TestTokenEndpoint_Pseudonymous_NoSessionDenied(t *testing.T) {
+	router, _, _ := setupTokenEndpoint(t)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 without a session cookie, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Pseudonymous_WriteTACDenied: the kind is engine-shaped -
+// capped to read+insert regardless of the session's own MaxTAC, not
+// "everything my session can do, minus my name".
+func TestTokenEndpoint_Pseudonymous_WriteTACDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-pseudonym-write",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rwil"),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "wallet-engine", Pseudonymous: true, TAC: "rw"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-pseudonym-write"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for a write-scoped pseudonymous request, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Pseudonymous_ExceedsSessionMaxTACDenied: a session
+// without insert cannot mint the engine's default - the session's grants
+// still bound the pseudonymous kind exactly as they bound the others.
+func TestTokenEndpoint_Pseudonymous_ExceedsSessionMaxTACDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-pseudonym-read-only",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("r"),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-pseudonym-read-only"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for a read-only session minting the engine default (ri), got %d: %s", w.Code, w.Body.String())
 	}
 }
