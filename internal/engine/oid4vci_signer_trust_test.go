@@ -113,13 +113,31 @@ func TestEvaluateTrust_MetadataKeyMaterialWinsOverSigner(t *testing.T) {
 	assert.Equal(t, "jwk", string(ev.requests[0].GetKeyType()))
 }
 
-func TestKeyMaterialFromSigner(t *testing.T) {
-	assert.Nil(t, trust.KeyMaterialFromSigner(nil))
-	km := trust.KeyMaterialFromSigner(&issuermetadata.SignerKeyMaterial{Type: "x5c", X5C: []string{"a", "b"}})
-	require.NotNil(t, km)
-	assert.Equal(t, "x5c", km.Type)
-	assert.Equal(t, []string{"a", "b"}, km.X5C)
-	jwk := map[string]any{"kty": "EC"}
-	km = trust.KeyMaterialFromSigner(&issuermetadata.SignerKeyMaterial{Type: "jwk", JWK: jwk})
-	assert.Equal(t, jwk, km.JWK)
+// The resolver reports the verified signer of an application/jwt document next
+// to its payload; fetchMetadata must hand it on, or evaluateTrust never sees it.
+func TestFetchMetadata_CarriesTheResolversSigner(t *testing.T) {
+	conn, cleanup := wsTestServer(t, func(srvConn *websocket.Conn) {
+		defer srvConn.Close()
+		for {
+			if _, _, err := srvConn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	})
+	defer cleanup()
+	flow := registerTestFlow(testSession(conn), "test-flow")
+
+	signer := &issuermetadata.SignerKeyMaterial{Type: "x5c", X5C: []string{"MIIleaf", "MIIca"}}
+	h := &OID4VCIHandler{metadataResolver: &mockMetadataResolver{
+		result: map[string]interface{}{
+			"credential_issuer":   "https://issuer.example.com",
+			"credential_endpoint": "https://issuer.example.com/credential",
+		},
+		signer: signer,
+	}}
+	h.BaseHandler = BaseHandler{Flow: flow, Logger: zap.NewNop()}
+
+	meta, err := h.fetchMetadata(context.Background(), "https://issuer.example.com")
+	require.NoError(t, err)
+	assert.Same(t, signer, meta.SignerKeyMaterial)
 }

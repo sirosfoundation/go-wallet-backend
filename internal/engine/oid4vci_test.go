@@ -3288,6 +3288,7 @@ func TestTxCodeDescriptionExtraction(t *testing.T) {
 type mockMetadataResolver struct {
 	result    map[string]interface{}
 	validated bool
+	signer    *issuermetadata.SignerKeyMaterial
 	err       error
 }
 
@@ -3296,8 +3297,9 @@ func (m *mockMetadataResolver) ResolveWithInfo(_ context.Context, _ string) (*is
 		return nil, m.err
 	}
 	return &issuermetadata.ResolveResult{
-		Metadata:  m.result,
-		Validated: m.validated,
+		Metadata:          m.result,
+		Validated:         m.validated,
+		SignerKeyMaterial: m.signer,
 	}, nil
 }
 
