@@ -645,42 +645,14 @@ func TestUserService_DeleteUser_CleansUpCredentialsAndPresentations(t *testing.T
 	}
 }
 
-func TestUserService_UpdateUser(t *testing.T) {
-	ctx := t.Context()
-	store := memory.NewStore()
-	cfg := testConfig()
-	logger := testLogger()
-	service := NewUserService(store, cfg, logger)
-
-	// Register user
-	username := "updateuser"
-	req := &domain.RegisterRequest{
-		Username:    &username,
-		DisplayName: "Original Name",
-		WalletType:  domain.WalletTypeDB,
-	}
-
-	user, err := service.Register(ctx, req)
-	if err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
-
-	// Update user
-	newName := "Updated Name"
-	user.DisplayName = &newName
-	err = service.UpdateUser(ctx, user)
-	if err != nil {
-		t.Fatalf("UpdateUser() error = %v", err)
-	}
-
-	// Verify update
-	updated, err := service.GetUserByID(ctx, user.UUID)
-	if err != nil {
-		t.Fatalf("GetUserByID() error = %v", err)
-	}
-
-	if updated.DisplayName == nil || *updated.DisplayName != newName {
-		t.Errorf("UpdateUser() DisplayName = %v, want %s", updated.DisplayName, newName)
+// setCredentials replaces a user's WebAuthn credentials through Modify.
+func setCredentials(t *testing.T, store storage.Store, id domain.UserID, creds ...domain.WebauthnCredential) {
+	t.Helper()
+	if _, err := store.Users().Modify(context.Background(), id, func(u *domain.User) error {
+		u.WebauthnCredentials = creds
+		return nil
+	}); err != nil {
+		t.Fatalf("Modify() error = %v", err)
 	}
 }
 
@@ -705,13 +677,10 @@ func TestUserService_DeleteWebAuthnCredential(t *testing.T) {
 	}
 
 	// Add multiple WebAuthn credentials to the user
-	user.WebauthnCredentials = []domain.WebauthnCredential{
-		{ID: "cred1", PublicKey: []byte("key1")},
-		{ID: "cred2", PublicKey: []byte("key2")},
-	}
-	if err := service.UpdateUser(ctx, user); err != nil {
-		t.Fatalf("UpdateUser() error = %v", err)
-	}
+	setCredentials(t, store, user.UUID,
+		domain.WebauthnCredential{ID: "cred1", PublicKey: []byte("key1")},
+		domain.WebauthnCredential{ID: "cred2", PublicKey: []byte("key2")},
+	)
 
 	t.Run("deletes credential successfully", func(t *testing.T) {
 		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, "cred1", []byte("{}"), "")
@@ -736,10 +705,9 @@ func TestUserService_DeleteWebAuthnCredential(t *testing.T) {
 	t.Run("fails on non-existent credential", func(t *testing.T) {
 		// Add another credential first
 		u, _ := service.GetUserByID(ctx, user.UUID)
-		u.WebauthnCredentials = append(u.WebauthnCredentials, domain.WebauthnCredential{
+		setCredentials(t, store, user.UUID, append(u.WebauthnCredentials, domain.WebauthnCredential{
 			ID: "cred3", PublicKey: []byte("key3"),
-		})
-		_ = service.UpdateUser(ctx, u)
+		})...)
 
 		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, "nonexistent", []byte("{}"), "")
 		if err == nil {
@@ -778,12 +746,7 @@ func TestUserService_RenameWebAuthnCredential(t *testing.T) {
 	}
 
 	// Add a WebAuthn credential
-	user.WebauthnCredentials = []domain.WebauthnCredential{
-		{ID: "cred1", PublicKey: []byte("key1")},
-	}
-	if err := service.UpdateUser(ctx, user); err != nil {
-		t.Fatalf("UpdateUser() error = %v", err)
-	}
+	setCredentials(t, store, user.UUID, domain.WebauthnCredential{ID: "cred1", PublicKey: []byte("key1")})
 
 	t.Run("renames credential successfully", func(t *testing.T) {
 		err := service.RenameWebAuthnCredential(ctx, user.UUID, "cred1", "My Key")

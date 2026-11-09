@@ -331,57 +331,7 @@ func (s *UserStore) DeleteExpiredDeletionTombstones(_ context.Context, now time.
 // semantics, and the returned copy can never be mutated by a concurrent
 // writer underneath it.
 func deepCopyUser(user *domain.User) *domain.User {
-	cp := *user
-
-	if user.Username != nil {
-		username := *user.Username
-		cp.Username = &username
-	}
-	if user.DisplayName != nil {
-		displayName := *user.DisplayName
-		cp.DisplayName = &displayName
-	}
-
-	if user.PrivateData != nil {
-		cp.PrivateData = append([]byte(nil), user.PrivateData...)
-	}
-	if user.Keys != nil {
-		cp.Keys = append([]byte(nil), user.Keys...)
-	}
-
-	if user.WebauthnCredentials != nil {
-		creds := make([]domain.WebauthnCredential, len(user.WebauthnCredentials))
-		for i, c := range user.WebauthnCredentials {
-			creds[i] = c
-			if c.CredentialID != nil {
-				creds[i].CredentialID = append([]byte(nil), c.CredentialID...)
-			}
-			if c.PublicKey != nil {
-				creds[i].PublicKey = append([]byte(nil), c.PublicKey...)
-			}
-			if c.Transport != nil {
-				creds[i].Transport = append([]string(nil), c.Transport...)
-			}
-			if c.Authenticator.AAGUID != nil {
-				creds[i].Authenticator.AAGUID = append([]byte(nil), c.Authenticator.AAGUID...)
-			}
-			if c.Nickname != nil {
-				nickname := *c.Nickname
-				creds[i].Nickname = &nickname
-			}
-			if c.LastUseTime != nil {
-				lastUse := *c.LastUseTime
-				creds[i].LastUseTime = &lastUse
-			}
-		}
-		cp.WebauthnCredentials = creds
-	}
-
-	if user.EnterpriseIdentities != nil {
-		cp.EnterpriseIdentities = append([]domain.EnterpriseIdentity(nil), user.EnterpriseIdentities...)
-	}
-
-	return &cp
+	return user.Clone()
 }
 
 func (s *UserStore) Create(ctx context.Context, user *domain.User) error {
@@ -394,6 +344,7 @@ func (s *UserStore) Create(ctx context.Context, user *domain.User) error {
 
 	user.CreatedAt = time.Now()
 	user.UpdatedAt = time.Now()
+	// Store a private copy so callers cannot mutate shared state.
 	s.data[user.UUID.String()] = deepCopyUser(user)
 	return nil
 }
@@ -433,21 +384,29 @@ func (s *UserStore) GetByDID(ctx context.Context, did string) (*domain.User, err
 	return nil, storage.ErrNotFound
 }
 
-func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
+// Modify atomically applies fn to the stored user while holding the write lock.
+func (s *UserStore) Modify(ctx context.Context, id domain.UserID, fn storage.UserModifier) (*domain.User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	existing, exists := s.data[user.UUID.String()]
+	current, exists := s.data[id.String()]
 	if !exists {
-		return storage.ErrNotFound
-	}
-	if existing.AuthFence > user.AuthFence {
-		return storage.ErrStaleWrite
+		return nil, storage.ErrNotFound
 	}
 
-	user.UpdatedAt = time.Now()
-	s.data[user.UUID.String()] = deepCopyUser(user)
-	return nil
+	working := deepCopyUser(current)
+	if err := fn(working); err != nil {
+		return nil, err
+	}
+	working.UUID = current.UUID
+	working.Version = current.Version + 1
+	working.UpdatedAt = time.Now()
+	// fn may have attached caller-owned memory to working (for example
+	// UpdatePrivateData(data) keeps the slice it is given), so commit a private
+	// copy: later mutation of the caller's data must not change stored state.
+	stored := deepCopyUser(working)
+	s.data[id.String()] = stored
+	return deepCopyUser(stored), nil
 }
 
 func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
@@ -488,10 +447,12 @@ func (s *UserStore) InvalidateAuthBeforeForToken(ctx context.Context, id domain.
 }
 
 // advanceCutoff moves the cut-off forward, ignoring a delayed older event so
-// it cannot roll one back. The fence counter always advances, so every
-// lifecycle write invalidates records loaded before it.
+// it cannot roll one back. The fence counter always advances, and so does
+// Version, so a Modify that read the record before this write is not mistaken
+// for current (the store's optimistic concurrency, as the Mongo pipeline does).
 func advanceCutoff(user *domain.User, t time.Time) {
 	user.AuthFence++
+	user.Version++
 	if t.After(user.AuthInvalidBefore) {
 		user.AuthInvalidBefore = t
 	}
@@ -522,24 +483,6 @@ func (s *UserStore) GetAuthCutoff(ctx context.Context, id domain.UserID) (time.T
 	return user.AuthInvalidBefore, nil
 }
 
-func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	user, exists := s.data[id.String()]
-	if !exists {
-		return storage.ErrNotFound
-	}
-
-	// Check ETag for optimistic locking
-	if ifMatch != "" && user.PrivateDataETag != ifMatch {
-		return storage.ErrInvalidInput
-	}
-
-	user.UpdatePrivateData(data)
-	return nil
-}
-
 func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -567,6 +510,9 @@ func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain
 				user.WebauthnCredentials[i].Authenticator.CloneWarning = true
 			}
 			user.UpdatedAt = time.Now()
+			// Same contract as the Mongo implementation: every write to the
+			// user document bumps its version.
+			user.Version++
 			return transitioned, nil
 		}
 	}

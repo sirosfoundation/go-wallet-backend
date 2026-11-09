@@ -333,7 +333,11 @@ What is **not** guaranteed:
   something the erasure is removing anyway.
 - Writes that do not go through the credential/presentation services (the
   user record's own fields, passkeys, private data) are covered by the user
-  store's write fence (`ErrStaleWrite`), not by this post-write check.
+  store, not by this post-write check: each runs in `UserStore.Modify`, which
+  re-reads the record and writes only if its `version` is unchanged, the
+  token cut-off is judged inside that same callback, and every lifecycle write
+  (cut-off, erasure) advances `version`, so a write that read the record before
+  one retries instead of putting the old cut-off or erased data back.
 - The check relies on the store returning a record's write to a later read by
   the same process (true of the memory store and of MongoDB reading from the
   primary). A deployment reading from lagging secondaries can miss it.

@@ -18,6 +18,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 )
 
 // Context keys for tenant propagation across trust evaluation boundaries.
@@ -75,6 +76,16 @@ type KeyMaterial struct {
 	// CredentialType is the type of credential (e.g., "PID", "mDL", vct value).
 	// Optional; used for fine-grained trust policy decisions.
 	CredentialType string
+}
+
+// KeyMaterialFromSigner converts the verified signer material the issuer
+// metadata resolver reports for a signed metadata document into PDP key
+// material. It returns nil for a nil signer.
+func KeyMaterialFromSigner(s *issuermetadata.SignerKeyMaterial) *KeyMaterial {
+	if s == nil {
+		return nil
+	}
+	return &KeyMaterial{Type: s.Type, X5C: s.X5C, JWK: s.JWK}
 }
 
 // NormalizeJWKS takes JWK data in various formats and returns a slice of individual
