@@ -148,9 +148,8 @@ func newPrivateDataUserService(t *testing.T) (*UserService, *memory.Store, *doma
 	ctx := context.Background()
 	user, err := svc.Register(ctx, &domain.RegisterRequest{DisplayName: "PD User", WalletType: domain.WalletTypeClient})
 	require.NoError(t, err)
-	user.WebauthnCredentials = []domain.WebauthnCredential{{ID: testCredID("a")}, {ID: testCredID("b")}}
-	user.UpdatePrivateData(testPrivateDataContainer(testCredID("a")))
-	require.NoError(t, svc.UpdateUser(ctx, user))
+	setCredentialsAndPrivateData(t, store, user.UUID, testPrivateDataContainer(testCredID("a")),
+		domain.WebauthnCredential{ID: testCredID("a")}, domain.WebauthnCredential{ID: testCredID("b")})
 	return svc, store, user
 }
 

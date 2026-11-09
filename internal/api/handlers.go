@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -539,7 +540,9 @@ func (h *Handlers) GetPrivateData(c *gin.Context) {
 		ifNoneMatch = c.GetHeader("X-Private-Data-If-None-Match")
 	}
 
-	if ifNoneMatch == etag {
+	// etag is never empty (the service computes it for legacy records), but
+	// guard anyway so a missing header can never yield a body-less 304.
+	if etag != "" && ifNoneMatch == etag {
 		c.Header("X-Private-Data-ETag", etag)
 		c.Status(304)
 		return
@@ -556,6 +559,26 @@ func respondPrivateDataOwnership(c *gin.Context, err error) bool {
 		return false
 	}
 	c.JSON(http.StatusUnprocessableEntity, gin.H{"error": service.PrivateDataOwnershipErrorCode})
+	return true
+}
+
+// respondStorageUnavailable maps transient user-store failures to non-500
+// responses and reports whether err was one: storage.ErrConflict (the record
+// kept changing under optimistic concurrency) becomes 503 with Retry-After so
+// clients retry, a deadline becomes 504, and a cancelled request 503. 409 is
+// deliberately not used: it already means "cannot delete last credential".
+func respondStorageUnavailable(c *gin.Context, err error) bool {
+	switch {
+	case errors.Is(err, storage.ErrConflict):
+		c.Header("Retry-After", "1")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Concurrent modification, please retry"})
+	case errors.Is(err, context.DeadlineExceeded):
+		c.JSON(http.StatusGatewayTimeout, gin.H{"error": "Request timed out"})
+	case errors.Is(err, context.Canceled):
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Request cancelled"})
+	default:
+		return false
+	}
 	return true
 }
 
@@ -602,6 +625,9 @@ func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 		if errors.Is(err, service.ErrPrivateDataConflict) {
 			c.Header("X-Private-Data-ETag", newEtag)
 			c.Status(412)
+			return
+		}
+		if respondStorageUnavailable(c, err) {
 			return
 		}
 		h.logger.Error("Failed to update private data", zap.Error(err))
@@ -784,22 +810,19 @@ func (h *Handlers) UpdateSettings(c *gin.Context) {
 		return
 	}
 
-	user, err := h.services.User.GetUserByID(c.Request.Context(), domain.UserIDFromString(userID))
+	user, err := h.services.User.UpdateSettings(
+		c.Request.Context(),
+		domain.UserIDFromString(userID),
+		req.OpenIDRefreshTokenMaxAgeInSeconds,
+	)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(403, gin.H{})
 			return
 		}
-		h.logger.Error("Failed to get user", zap.Error(err))
-		c.JSON(500, gin.H{"error": "Failed to get user"})
-		return
-	}
-
-	if req.OpenIDRefreshTokenMaxAgeInSeconds != nil {
-		user.OpenIDRefreshTokenMaxAge = *req.OpenIDRefreshTokenMaxAgeInSeconds
-	}
-
-	if err := h.services.User.UpdateUser(c.Request.Context(), user); err != nil {
+		if respondStorageUnavailable(c, err) {
+			return
+		}
 		h.logger.Error("Failed to update user settings", zap.Error(err))
 		c.JSON(500, gin.H{"error": "Failed to update settings"})
 		return
@@ -871,6 +894,7 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 		h.logger.Error("Failed to finish adding credential", zap.Error(err))
 		switch {
 		case respondPrivateDataOwnership(c, err):
+		case respondStorageUnavailable(c, err):
 		case errors.Is(err, service.ErrChallengeNotFound):
 			c.JSON(404, gin.H{})
 		case errors.Is(err, service.ErrChallengeExpired):
@@ -913,11 +937,13 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 		return
 	}
 
+	// A deleted passkey's prfKeys entry must leave the container, so a request
+	// without privateData is refused (422) rather than keeping the old one. An
+	// empty body is read as "no privateData"; a non-empty body that does not
+	// parse is a 400, never treated as empty.
 	var req struct {
-		PrivateData taggedbinary.TaggedBytes `json:"privateData"`
+		PrivateData *taggedbinary.TaggedBytes `json:"privateData"`
 	}
-	// An empty body is read as "no privateData" and refused below with 422;
-	// a body that does not parse is a 400, never treated as empty.
 	rawBody, err := c.GetRawData()
 	if err != nil {
 		c.JSON(400, gin.H{"error": "Failed to read request body"})
@@ -929,6 +955,11 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 			return
 		}
 	}
+	var privateData []byte
+	// null, absent and an empty value ({"$b64u":""}) all mean "no privateData".
+	if req.PrivateData != nil && len(*req.PrivateData) > 0 {
+		privateData = []byte(*req.PrivateData)
+	}
 
 	ifMatch := c.GetHeader("X-Private-Data-If-Match")
 
@@ -936,7 +967,7 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 		c.Request.Context(),
 		domain.UserIDFromString(userID),
 		credentialID,
-		[]byte(req.PrivateData),
+		privateData,
 		ifMatch,
 	)
 	if err != nil {
@@ -948,7 +979,7 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 			c.JSON(409, gin.H{"error": "Cannot delete last credential"})
 			return
 		}
-		if respondPrivateDataOwnership(c, err) {
+		if respondPrivateDataOwnership(c, err) || respondStorageUnavailable(c, err) {
 			return
 		}
 		if errors.Is(err, service.ErrPrivateDataConflict) {
@@ -995,6 +1026,9 @@ func (h *Handlers) RenameWebAuthnCredential(c *gin.Context) {
 	); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "Credential not found"})
+			return
+		}
+		if respondStorageUnavailable(c, err) {
 			return
 		}
 		h.logger.Error("Failed to rename WebAuthn credential", zap.Error(err))

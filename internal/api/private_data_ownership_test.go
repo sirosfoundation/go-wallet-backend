@@ -99,8 +99,11 @@ func TestHandlers_UpdatePrivateData_Ownership(t *testing.T) {
 func TestHandlers_DeleteWebAuthnCredential_Ownership(t *testing.T) {
 	setup := func(t *testing.T) (*Handlers, *gin.Engine, *domain.User) {
 		h, router, user := setupTestHandlersWithUser(t)
-		user.WebauthnCredentials = append(user.WebauthnCredentials, domain.WebauthnCredential{ID: testCredID("2"), CredentialID: []byte("cred-2")})
-		require.NoError(t, h.services.User.UpdateUser(context.Background(), user))
+		_, err := h.store.Users().Modify(context.Background(), user.UUID, func(u *domain.User) error {
+			u.WebauthnCredentials = append(u.WebauthnCredentials, domain.WebauthnCredential{ID: testCredID("2"), CredentialID: []byte("cred-2")})
+			return nil
+		})
+		require.NoError(t, err)
 		router.POST("/webauthn/credential/:id/delete", authMiddlewareForUser(user), h.DeleteWebAuthnCredential)
 		return h, router, user
 	}

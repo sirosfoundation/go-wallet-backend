@@ -238,6 +238,24 @@ Apply:
 kubectl apply -f k8s/deployment.yaml
 ```
 
+### Rolling Upgrades and the User Document Version
+
+User documents carry a `version` field that the backend uses for optimistic
+concurrency (`UserStore.Modify`): a write is applied only if the document still
+has the version that was read. Releases before this one do not know the field:
+an old replica writes the whole user document and thereby drops `version`
+(a document without `version` counts as version 0), and it writes from a
+snapshot without any version check. While old and new replicas both serve
+traffic, an old replica's write can therefore land between a new replica's read
+and its conditional write without being detected, and the new replica then
+overwrites it.
+
+For the upgrade, run a single replica or drain the old replicas before the new
+ones take traffic (scale to one, upgrade, scale back up). With MongoDB no
+migration step is needed: documents without `version` are upgraded on their
+next write. Once every replica runs this release, normal rolling updates are
+safe again.
+
 ### Rolling Upgrades and the Redis Session Store
 
 Earlier releases kept the per-user session pointer at `<prefix>user:<userID>`.

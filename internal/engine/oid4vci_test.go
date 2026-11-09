@@ -3288,6 +3288,7 @@ func TestTxCodeDescriptionExtraction(t *testing.T) {
 type mockMetadataResolver struct {
 	result    map[string]interface{}
 	validated bool
+	signer    *issuermetadata.SignerKeyMaterial
 	err       error
 }
 
@@ -3296,8 +3297,9 @@ func (m *mockMetadataResolver) ResolveWithInfo(_ context.Context, _ string) (*is
 		return nil, m.err
 	}
 	return &issuermetadata.ResolveResult{
-		Metadata:  m.result,
-		Validated: m.validated,
+		Metadata:          m.result,
+		Validated:         m.validated,
+		SignerKeyMaterial: m.signer,
 	}, nil
 }
 
@@ -3812,7 +3814,7 @@ func TestEvaluateTrust_PDPConfigured_EvaluatorError_FailsClosed(t *testing.T) {
 	defer cancel()
 
 	metadata := &IssuerMetadata{CredentialIssuer: "https://issuer.example.com"}
-	info, err := h.evaluateTrust(ctx, "https://issuer.example.com", metadata, false)
+	info, err := h.evaluateTrust(ctx, "https://issuer.example.com", metadata, false, nil)
 
 	require.Error(t, err)
 	require.NotNil(t, info)
@@ -3882,7 +3884,7 @@ func TestEvaluateTrust_NoPDPConfigured_FrontendFlowUnchanged(t *testing.T) {
 	}}
 
 	metadata := &IssuerMetadata{CredentialIssuer: "https://issuer.example.com"}
-	info, err := h.evaluateTrust(context.Background(), "https://issuer.example.com", metadata, false)
+	info, err := h.evaluateTrust(context.Background(), "https://issuer.example.com", metadata, false, nil)
 
 	require.NoError(t, err)
 	require.NotNil(t, info)
@@ -3963,7 +3965,7 @@ func TestEvaluateTrustViaFrontend_DIDIssuer_PopulatesResolutionSubjectID(t *test
 	}}
 
 	metadata := &IssuerMetadata{CredentialIssuer: issuer}
-	info, err := h.evaluateTrust(context.Background(), issuer, metadata, false)
+	info, err := h.evaluateTrust(context.Background(), issuer, metadata, false, nil)
 	require.NoError(t, err)
 	require.NotNil(t, info)
 	assert.True(t, info.Trusted)
