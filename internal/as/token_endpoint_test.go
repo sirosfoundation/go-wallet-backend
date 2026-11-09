@@ -1263,6 +1263,36 @@ func TestRespondTokenError(t *testing.T) {
 	}
 }
 
+// serveTokenRequest posts one /auth/token request under the session cookie
+// and answers the recorder - the pseudonymous tests' shared boilerplate.
+func serveTokenRequest(t *testing.T, router *gin.Engine, sessionID string, req TokenRequest) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(req)
+	httpReq := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/json")
+	if sessionID != "" {
+		httpReq.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: sessionID})
+	}
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httpReq)
+	return w
+}
+
+// parseMintedToken reads the recorder's token response and answers its
+// verified claims.
+func parseMintedToken(t *testing.T, issuer *TokenIssuer, w *httptest.ResponseRecorder) *AccessTokenClaims {
+	t.Helper()
+	var resp TokenResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := issuer.ParseAndVerify(resp.AccessToken, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return claims
+}
+
 // TestTokenEndpoint_PseudonymousMintsARotatingPseudonym: the engine-transport
 // kind (engine-parity.md §8 G3) - a real, authenticated session behind the
 // mint, a fresh random pseudonym in the token. Two mints from the same
@@ -1286,26 +1316,11 @@ func TestTokenEndpoint_PseudonymousMintsARotatingPseudonym(t *testing.T) {
 
 	mint := func() *AccessTokenClaims {
 		t.Helper()
-		body, _ := json.Marshal(TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
-		req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-pseudonym"})
-
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, req)
-
+		w := serveTokenRequest(t, router, "sess-pseudonym", TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200 for a session-backed pseudonymous mint, got %d: %s", w.Code, w.Body.String())
 		}
-		var resp TokenResponse
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatal(err)
-		}
-		claims, err := issuer.ParseAndVerify(resp.AccessToken, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return claims
+		return parseMintedToken(t, issuer, w)
 	}
 
 	first := mint()
@@ -1340,12 +1355,7 @@ func TestTokenEndpoint_PseudonymousMintsARotatingPseudonym(t *testing.T) {
 func TestTokenEndpoint_Pseudonymous_NoSessionDenied(t *testing.T) {
 	router, _, _ := setupTokenEndpoint(t)
 
-	body, _ := json.Marshal(TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
-	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
+	w := serveTokenRequest(t, router, "", TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 without a session cookie, got %d: %s", w.Code, w.Body.String())
@@ -1369,13 +1379,7 @@ func TestTokenEndpoint_Pseudonymous_WriteTACDenied(t *testing.T) {
 	}
 	_ = store.Create(context.Background(), sess)
 
-	body, _ := json.Marshal(TokenRequest{Audience: "wallet-engine", Pseudonymous: true, TAC: "rw"})
-	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-pseudonym-write"})
-
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
+	w := serveTokenRequest(t, router, "sess-pseudonym-write", TokenRequest{Audience: "wallet-engine", Pseudonymous: true, TAC: "rw"})
 
 	if w.Code != http.StatusForbidden {
 		t.Errorf("expected 403 for a write-scoped pseudonymous request, got %d: %s", w.Code, w.Body.String())
@@ -1399,13 +1403,7 @@ func TestTokenEndpoint_Pseudonymous_ExceedsSessionMaxTACDenied(t *testing.T) {
 	}
 	_ = store.Create(context.Background(), sess)
 
-	body, _ := json.Marshal(TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
-	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-pseudonym-read-only"})
-
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
+	w := serveTokenRequest(t, router, "sess-pseudonym-read-only", TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
 
 	if w.Code != http.StatusForbidden {
 		t.Errorf("expected 403 for a read-only session minting the engine default (ri), got %d: %s", w.Code, w.Body.String())
@@ -1430,13 +1428,7 @@ func TestTokenEndpoint_Pseudonymous_RevokedOwnerDenied(t *testing.T) {
 	}
 	_ = store.Create(context.Background(), sess)
 
-	body, _ := json.Marshal(TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
-	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-pseudonym-revoked"})
-
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
+	w := serveTokenRequest(t, router, "sess-pseudonym-revoked", TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 for a revoked owner, got %d: %s", w.Code, w.Body.String())
