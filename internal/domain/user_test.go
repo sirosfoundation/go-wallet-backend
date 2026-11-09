@@ -393,3 +393,92 @@ func TestUser_BSONDecodeIgnoresLegacyPasswordHash(t *testing.T) {
 		t.Errorf("unexpected decoded user: %+v", u)
 	}
 }
+
+func TestUser_Clone(t *testing.T) {
+	var nilUser *User
+	if nilUser.Clone() != nil {
+		t.Fatal("Clone of nil must be nil")
+	}
+
+	name, nick := "alice", "laptop"
+	used := time.Now()
+	u := &User{
+		Username:    &name,
+		DisplayName: &name,
+		PrivateData: []byte("pd"),
+		Keys:        []byte("keys"),
+		Version:     7,
+		WebauthnCredentials: []WebauthnCredential{{
+			ID:           "c1",
+			CredentialID: []byte("cid"),
+			PublicKey:    []byte("pk"),
+			Transport:    []string{"usb"},
+			Authenticator: Authenticator{
+				AAGUID: []byte("aaguid"),
+			},
+			Nickname:    &nick,
+			LastUseTime: &used,
+		}},
+		EnterpriseIdentities: []EnterpriseIdentity{{}},
+	}
+
+	c := u.Clone()
+	if c == u || c.Version != 7 {
+		t.Fatalf("Clone must return a distinct copy keeping Version, got %+v", c)
+	}
+
+	// Mutating the clone must not reach the original.
+	*c.Username = "bob"
+	*c.DisplayName = "bob"
+	c.PrivateData[0] = 'X'
+	c.Keys[0] = 'X'
+	cc := &c.WebauthnCredentials[0]
+	cc.CredentialID[0] = 'X'
+	cc.PublicKey[0] = 'X'
+	cc.Transport[0] = "ble"
+	cc.Authenticator.AAGUID[0] = 'X'
+	*cc.Nickname = "other"
+	*cc.LastUseTime = used.Add(time.Hour)
+	c.EnterpriseIdentities[0].TenantID = "t"
+
+	oc := u.WebauthnCredentials[0]
+	switch {
+	case *u.Username != "alice", *u.DisplayName != "alice":
+		t.Error("string pointers are shared")
+	case string(u.PrivateData) != "pd", string(u.Keys) != "keys":
+		t.Error("byte slices are shared")
+	case string(oc.CredentialID) != "cid", string(oc.PublicKey) != "pk",
+		oc.Transport[0] != "usb", string(oc.Authenticator.AAGUID) != "aaguid":
+		t.Error("credential slices are shared")
+	case *oc.Nickname != "laptop" || !oc.LastUseTime.Equal(used):
+		t.Error("credential pointers are shared")
+	case u.EnterpriseIdentities[0].TenantID != "":
+		t.Error("enterprise identities are shared")
+	}
+}
+
+func TestUser_Clone_NilFields(t *testing.T) {
+	c := (&User{}).Clone()
+	if c.Username != nil || c.PrivateData != nil || c.Keys != nil ||
+		c.WebauthnCredentials != nil || c.EnterpriseIdentities != nil {
+		t.Fatalf("nil fields must stay nil, got %+v", c)
+	}
+	cred := (WebauthnCredential{}).clone()
+	if cred.Transport != nil || cred.LastUseTime != nil || cred.Nickname != nil {
+		t.Fatalf("nil credential fields must stay nil, got %+v", cred)
+	}
+}
+
+func TestUser_EffectivePrivateDataETag(t *testing.T) {
+	stored := &User{PrivateData: []byte("a"), PrivateDataETag: `"stored"`}
+	if got := stored.EffectivePrivateDataETag(); got != `"stored"` {
+		t.Errorf("stored ETag must win, got %s", got)
+	}
+	legacy := &User{PrivateData: []byte("a")}
+	if got, want := legacy.EffectivePrivateDataETag(), ComputePrivateDataETag([]byte("a")); got != want {
+		t.Errorf("legacy ETag = %s, want %s", got, want)
+	}
+	if (&User{}).EffectivePrivateDataETag() == "" {
+		t.Error("must never return an empty ETag")
+	}
+}

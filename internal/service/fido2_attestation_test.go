@@ -170,6 +170,12 @@ func buildTestAttestationObjectFlags(t *testing.T, aaguid uuid.UUID, clientDataH
 	if err != nil {
 		t.Fatalf("generate key: %v", err)
 	}
+	return buildTestAttestationObjectForKey(t, key, aaguid, clientDataHash, flags), &key.PublicKey
+}
+
+// buildTestAttestationObjectForKey attests the given credential key.
+func buildTestAttestationObjectForKey(t *testing.T, key *ecdsa.PrivateKey, aaguid uuid.UUID, clientDataHash []byte, flags byte) []byte {
+	t.Helper()
 
 	// Per WebAuthn §8.2.1 (Packed Attestation Certificate Requirements),
 	// the attestation cert must have Country/Organization set, an
@@ -235,7 +241,7 @@ func buildTestAttestationObjectFlags(t *testing.T, aaguid uuid.UUID, clientDataH
 	if err != nil {
 		t.Fatalf("marshal attestation object: %v", err)
 	}
-	return attObjBytes, &key.PublicKey
+	return attObjBytes
 }
 
 // expectedThumbprint computes the same RFC 7638 JWK Thumbprint

@@ -24,6 +24,10 @@ import (
 var (
 	ErrFIDO2AttestationDisabled = errors.New("FIDO2 attestation verification is not enabled")
 	ErrFIDO2AttestationInvalid  = errors.New("FIDO2 attestation verification failed")
+	// ErrFIDO2AttestationUnavailable means the trust decision could not be had
+	// (the PDP is down or failed), as opposed to the PDP refusing the chain.
+	// Retryable; nothing is recorded.
+	ErrFIDO2AttestationUnavailable = errors.New("FIDO2 attestation cannot be verified right now")
 )
 
 // FIDO2AttestationRequest contains the raw evidence captured by the
@@ -241,7 +245,11 @@ func (s *FIDO2AttestationService) VerifyEvidence(ctx context.Context, req *FIDO2
 
 	trustInfo, err := s.trust.EvaluateFIDO2Attestation(ctx, aaguid.String(), x5cChain)
 	if err != nil {
-		return nil, fmt.Errorf("%w: trust evaluation: %v", ErrFIDO2AttestationInvalid, err)
+		return nil, fmt.Errorf("%w: trust evaluation: %v", ErrFIDO2AttestationUnavailable, err)
+	}
+	if trustInfo.EvaluationFailed {
+		// No decision, not a denial: the caller may retry.
+		return nil, fmt.Errorf("%w: trust evaluation: %s", ErrFIDO2AttestationUnavailable, trustInfo.Reason)
 	}
 	if !trustInfo.Trusted {
 		return nil, fmt.Errorf("%w: not trusted by FIDO MDS3 registry: %s", ErrFIDO2AttestationInvalid, trustInfo.Reason)

@@ -69,7 +69,7 @@ type WIAGenerateRequest struct {
 	// that authenticated this session (issue 333).
 	CredentialID string `json:"credential_id,omitempty"`
 	// KeyAttestation is optional evidence about the instance (PoP) key:
-	// {"type": "android_key" | "app_attest_assertion", ...}. See
+	// {"type": "android_key" | "app_attest_assertion" | "fido2", ...}. See
 	// service.KeyAttestation.
 	KeyAttestation *service.KeyAttestation `json:"key_attestation,omitempty"`
 }

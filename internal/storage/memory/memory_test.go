@@ -3,11 +3,15 @@ package memory
 import (
 	"context"
 	"errors"
+	"runtime"
 	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
@@ -256,11 +260,12 @@ func TestUserStore_Update(t *testing.T) {
 	}
 
 	// Update user
-	user.DID = "did:key:updated"
-
-	err = users.Update(ctx, user)
+	_, err = users.Modify(ctx, user.UUID, func(u *domain.User) error {
+		u.DID = "did:key:updated"
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("Update() error = %v", err)
+		t.Fatalf("Modify() error = %v", err)
 	}
 
 	// Verify update
@@ -271,24 +276,6 @@ func TestUserStore_Update(t *testing.T) {
 
 	if retrieved.DID != "did:key:updated" {
 		t.Errorf("DID not updated, got %q", retrieved.DID)
-	}
-}
-
-func TestUserStore_Update_NotFound(t *testing.T) {
-	ctx := t.Context()
-	store := NewStore()
-	users := store.Users()
-
-	username := "ghost"
-	user := &domain.User{
-		UUID:     domain.NewUserID(),
-		Username: &username,
-		DID:      "did:key:test",
-	}
-
-	err := users.Update(ctx, user)
-	if err != storage.ErrNotFound {
-		t.Errorf("Update() for nonexistent user should return ErrNotFound, got %v", err)
 	}
 }
 
@@ -332,7 +319,7 @@ func TestUserStore_Delete_NotFound(t *testing.T) {
 	}
 }
 
-func TestUserStore_UpdatePrivateData(t *testing.T) {
+func TestUserStore_Modify(t *testing.T) {
 	ctx := t.Context()
 	store := NewStore()
 	users := store.Users()
@@ -344,16 +331,140 @@ func TestUserStore_UpdatePrivateData(t *testing.T) {
 		DID:      "did:key:test",
 	}
 
-	err := users.Create(ctx, user)
-	if err != nil {
+	if err := users.Create(ctx, user); err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
 
-	// Update private data
 	newData := []byte("new private data")
-	err = users.UpdatePrivateData(ctx, user.UUID, newData, "")
+	stored, err := users.Modify(ctx, user.UUID, func(u *domain.User) error {
+		u.UpdatePrivateData(newData)
+		return nil
+	})
 	if err != nil {
-		t.Fatalf("UpdatePrivateData() error = %v", err)
+		t.Fatalf("Modify() error = %v", err)
+	}
+	if string(stored.PrivateData) != string(newData) {
+		t.Errorf("Modify() returned private data %q, want %q", stored.PrivateData, newData)
+	}
+	if stored.Version != 1 {
+		t.Errorf("Modify() version = %d, want 1", stored.Version)
+	}
+
+	got, _ := users.GetByID(ctx, user.UUID)
+	if string(got.PrivateData) != string(newData) {
+		t.Errorf("GetByID() private data %q, want %q", got.PrivateData, newData)
+	}
+}
+
+func TestUserStore_Modify_AbortOnError(t *testing.T) {
+	ctx := t.Context()
+	users := NewStore().Users()
+
+	user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:abort", PrivateData: []byte("keep")}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	sentinel := errors.New("abort")
+	_, err := users.Modify(ctx, user.UUID, func(u *domain.User) error {
+		u.PrivateData = []byte("changed")
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("Modify() error = %v, want sentinel", err)
+	}
+
+	got, _ := users.GetByID(ctx, user.UUID)
+	if string(got.PrivateData) != "keep" {
+		t.Errorf("aborted Modify() must not write; private data = %q", got.PrivateData)
+	}
+}
+
+func TestUserStore_Modify_NotFound(t *testing.T) {
+	_, err := NewStore().Users().Modify(t.Context(), domain.NewUserID(), func(*domain.User) error { return nil })
+	if !errors.Is(err, storage.ErrNotFound) {
+		t.Errorf("Modify() error = %v, want ErrNotFound", err)
+	}
+}
+
+// A Modify callback may attach caller-owned memory to the user (for example
+// UpdatePrivateData keeps the slice it is given). Mutating that memory after
+// Modify returns must not change what the store holds.
+func TestUserStore_Modify_DoesNotAliasCallerMemory(t *testing.T) {
+	ctx := t.Context()
+	users := NewStore().Users()
+
+	user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:alias"}
+	require.NoError(t, users.Create(ctx, user))
+
+	data := []byte("private")
+	nick := "nick"
+	stored, err := users.Modify(ctx, user.UUID, func(u *domain.User) error {
+		u.UpdatePrivateData(data)
+		u.WebauthnCredentials = append(u.WebauthnCredentials, domain.WebauthnCredential{ID: "c", Nickname: &nick})
+		return nil
+	})
+	require.NoError(t, err)
+
+	data[0] = 'X'
+	nick = "changed"
+
+	got, err := users.GetByID(ctx, user.UUID)
+	require.NoError(t, err)
+	assert.Equal(t, "private", string(got.PrivateData))
+	assert.Equal(t, domain.ComputePrivateDataETag([]byte("private")), got.PrivateDataETag)
+	assert.Equal(t, "nick", *got.WebauthnCredentials[0].Nickname)
+
+	// The returned snapshot is private to the caller too.
+	stored.PrivateData[0] = 'Y'
+	got, _ = users.GetByID(ctx, user.UUID)
+	assert.Equal(t, "private", string(got.PrivateData))
+}
+
+// UpdateCredentialAuthenticator is a user write: it must bump the version so
+// version-conditional writers (Modify on Mongo) can detect it.
+func TestUserStore_UpdateCredentialAuthenticator_BumpsVersion(t *testing.T) {
+	ctx := t.Context()
+	users := NewStore().Users()
+
+	user := &domain.User{UUID: domain.NewUserID(), WebauthnCredentials: []domain.WebauthnCredential{{ID: "c1"}}}
+	require.NoError(t, users.Create(ctx, user))
+	before, _ := users.GetByID(ctx, user.UUID)
+
+	_, err := users.UpdateCredentialAuthenticator(ctx, user.UUID, "c1", 5, true)
+	require.NoError(t, err)
+
+	after, _ := users.GetByID(ctx, user.UUID)
+	assert.Greater(t, after.Version, before.Version)
+}
+
+func TestUserStore_GetByID_ReturnsCopy(t *testing.T) {
+	ctx := t.Context()
+	users := NewStore().Users()
+
+	user := &domain.User{
+		UUID:                domain.NewUserID(),
+		DID:                 "did:key:copy",
+		PrivateData:         []byte("orig"),
+		WebauthnCredentials: []domain.WebauthnCredential{{ID: "c1"}},
+	}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	// Mutating the caller's object after Create must not affect the store.
+	user.PrivateData[0] = 'X'
+
+	got, _ := users.GetByID(ctx, user.UUID)
+	got.PrivateData = []byte("mutated")
+	got.WebauthnCredentials[0].ID = "mutated"
+
+	again, _ := users.GetByID(ctx, user.UUID)
+	if string(again.PrivateData) != "orig" {
+		t.Errorf("store private data leaked mutation: %q", again.PrivateData)
+	}
+	if again.WebauthnCredentials[0].ID != "c1" {
+		t.Errorf("store credentials leaked mutation: %q", again.WebauthnCredentials[0].ID)
 	}
 }
 
@@ -2459,6 +2570,122 @@ func TestInviteStore_ClearUsedBy(t *testing.T) {
 	}
 }
 
+// TestUserStore_Modify_IsAtomic: concurrent read-modify-write increments must
+// all be applied. A Modify that does not hold the lock across fn loses updates.
+func TestUserStore_Modify_IsAtomic(t *testing.T) {
+	ctx := t.Context()
+	users := NewStore().Users()
+	user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:atomic"}
+	if err := users.Create(ctx, user); err != nil {
+		t.Fatal(err)
+	}
+
+	const workers = 50
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := users.Modify(ctx, user.UUID, func(u *domain.User) error {
+				v := u.OpenIDRefreshTokenMaxAge
+				runtime.Gosched() // widen the read-modify-write window
+				u.OpenIDRefreshTokenMaxAge = v + 1
+				return nil
+			})
+			if err != nil {
+				t.Error(err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	got, err := users.GetByID(ctx, user.UUID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OpenIDRefreshTokenMaxAge != workers {
+		t.Errorf("counter = %d, want %d (lost updates)", got.OpenIDRefreshTokenMaxAge, workers)
+	}
+	if got.Version != workers {
+		t.Errorf("version = %d, want %d", got.Version, workers)
+	}
+}
+
+// The lifecycle writes advance Version like Modify does, so a Modify (or any
+// optimistic writer) that read the record before them is never taken as current.
+func TestUserStore_LifecycleWritesAdvanceVersion(t *testing.T) {
+	store := NewStore()
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid, PrivateData: []byte("v"), Keys: []byte("k")}); err != nil {
+		t.Fatal(err)
+	}
+	version := func() int64 {
+		u, err := store.Users().GetByID(ctx, uid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u.Version
+	}
+
+	v0 := version()
+	if err := store.Users().InvalidateAuthBefore(ctx, uid, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	v1 := version()
+	if v1 <= v0 {
+		t.Fatalf("InvalidateAuthBefore: version %d -> %d, must advance", v0, v1)
+	}
+	if err := store.Users().InvalidateAuthBeforeForToken(ctx, uid, time.Now().Add(time.Second), time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	v2 := version()
+	if v2 <= v1 {
+		t.Fatalf("InvalidateAuthBeforeForToken: version %d -> %d, must advance", v1, v2)
+	}
+	if err := store.Users().EraseWalletData(ctx, uid, time.Now().Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if v3 := version(); v3 <= v2 {
+		t.Fatalf("EraseWalletData: version %d -> %d, must advance", v2, v3)
+	}
+}
+
+// Modify reads the record under the lock, so it sees a cut-off and an erasure
+// that landed before it: nothing can write them back.
+func TestUserStore_ModifySeesLifecycleWrites(t *testing.T) {
+	store := NewStore()
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid, PrivateData: []byte("vault"), Keys: []byte("k")}); err != nil {
+		t.Fatal(err)
+	}
+	ts := time.Now()
+	if err := store.Users().InvalidateAuthBefore(ctx, uid, ts); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Users().EraseWalletData(ctx, uid, ts); err != nil {
+		t.Fatal(err)
+	}
+
+	var seenCutoff time.Time
+	var seenData []byte
+	if _, err := store.Users().Modify(ctx, uid, func(u *domain.User) error {
+		seenCutoff, seenData = u.AuthInvalidBefore, u.PrivateData
+		u.DID = "did:new"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !seenCutoff.Equal(ts) || seenData != nil {
+		t.Fatalf("Modify must read the post-lifecycle record: cut-off %v data %q", seenCutoff, seenData)
+	}
+	u, _ := store.Users().GetByID(ctx, uid)
+	if u.PrivateData != nil || u.Keys != nil || !u.AuthInvalidBefore.Equal(ts) || u.DID != "did:new" {
+		t.Fatalf("the erasure and cut-off must stand: %+v", u)
+	}
+}
+
 func TestUserStore_InvalidateAuthBeforeAndClearWalletData(t *testing.T) {
 	store := NewStore()
 	ctx := context.Background()
@@ -2493,80 +2720,6 @@ func TestUserStore_InvalidateAuthBeforeAndClearWalletData(t *testing.T) {
 	}
 	if err := store.Users().InvalidateAuthBefore(ctx, domain.NewUserID(), t2); err != storage.ErrNotFound {
 		t.Fatalf("expected ErrNotFound, got %v", err)
-	}
-}
-
-// A record loaded before a lifecycle cut-off must not be written back: it
-// would roll back the cut-off and could restore erased wallet data.
-func TestUserStore_UpdateRefusesStaleRecordAfterAuthCutoff(t *testing.T) {
-	store := NewStore()
-	ctx := context.Background()
-	uid := domain.NewUserID()
-	if err := store.Users().Create(ctx, &domain.User{UUID: uid, PrivateData: []byte("v")}); err != nil {
-		t.Fatal(err)
-	}
-	stale, _ := store.Users().GetByID(ctx, uid)
-	staleCopy := *stale
-
-	if err := store.Users().InvalidateAuthBefore(ctx, uid, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Users().EraseWalletData(ctx, uid, time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Users().Update(ctx, &staleCopy); err != storage.ErrStaleWrite {
-		t.Fatalf("expected ErrStaleWrite, got %v", err)
-	}
-	u, _ := store.Users().GetByID(ctx, uid)
-	if u.PrivateData != nil || u.AuthInvalidBefore.IsZero() {
-		t.Fatalf("the stale copy must not have been written: %+v", u)
-	}
-
-	fresh, _ := store.Users().GetByID(ctx, uid)
-	freshCopy := *fresh
-	freshCopy.DID = "did:new"
-	if err := store.Users().Update(ctx, &freshCopy); err != nil {
-		t.Fatalf("a fresh copy updates fine: %v", err)
-	}
-}
-
-// The stale-write fence is a counter, not a timestamp: a copy loaded before a
-// lifecycle write is refused even with an equal cut-off instant. Getters hand
-// out snapshots, so the copy does not observe the write through a pointer.
-func TestUserStore_FenceRefusesStaleCopyAtEqualCutoff(t *testing.T) {
-	store := NewStore()
-	ctx := context.Background()
-	uid := domain.NewUserID()
-	if err := store.Users().Create(ctx, &domain.User{UUID: uid, PrivateData: []byte("vault"), Keys: []byte("k")}); err != nil {
-		t.Fatal(err)
-	}
-	stale, err := store.Users().GetByID(ctx, uid)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ts := time.Now()
-	if err := store.Users().InvalidateAuthBefore(ctx, uid, ts); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Users().EraseWalletData(ctx, uid, ts); err != nil {
-		t.Fatal(err)
-	}
-	if !stale.AuthInvalidBefore.IsZero() || stale.PrivateData == nil {
-		t.Fatalf("GetByID must return a snapshot, not the stored pointer: %+v", stale)
-	}
-	if err := store.Users().Update(ctx, stale); err != storage.ErrStaleWrite {
-		t.Fatalf("equal cut-off, later fence: expected ErrStaleWrite, got %v", err)
-	}
-	u, _ := store.Users().GetByID(ctx, uid)
-	if u.PrivateData != nil || u.Keys != nil {
-		t.Fatalf("the erasure must stand: %+v", u)
-	}
-
-	fresh, _ := store.Users().GetByID(ctx, uid)
-	fresh.DID = "did:new"
-	if err := store.Users().Update(ctx, fresh); err != nil {
-		t.Fatalf("a record loaded after the writes updates fine: %v", err)
 	}
 }
 

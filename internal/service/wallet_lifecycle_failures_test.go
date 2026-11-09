@@ -477,7 +477,15 @@ func TestWalletLifecycle_CopyLoadedDuringErasureIsFenced(t *testing.T) {
 	require.NotNil(t, fs.captured, "the copy was taken inside the window")
 	require.NotNil(t, fs.captured.PrivateData, "and it still holds the vault")
 
-	assert.ErrorIs(t, fs.Store.Users().Update(ctx, fs.captured), storage.ErrStaleWrite)
+	// A write goes through Modify, which re-reads the record, so the copy taken
+	// inside the window cannot put the vault back.
+	var sawVault []byte
+	_, err = fs.Store.Users().Modify(ctx, uid, func(u *domain.User) error {
+		sawVault = u.PrivateData
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Nil(t, sawVault, "Modify reads the erased record")
 	u, _ := fs.Store.Users().GetByID(ctx, uid)
 	assert.Nil(t, u.PrivateData, "the erasure stands")
 }

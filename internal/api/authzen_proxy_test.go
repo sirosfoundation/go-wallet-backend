@@ -1941,6 +1941,62 @@ func TestResolve_URLSubject_LocalResolution(t *testing.T) {
 	}
 }
 
+// An application/jwt issuer's payload carries no jwks or signed_metadata, so the
+// verified signer chain the resolver reports is what the PDP is asked about.
+func TestResolve_URLSubject_SignerChainReachesThePDP(t *testing.T) {
+	var got gotrust.EvaluationRequest
+	pdpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(gotrust.EvaluationResponse{Decision: true})
+	}))
+	defer pdpServer.Close()
+
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{
+				"credential_issuer":   "https://issuer.example.com",
+				"credential_endpoint": "https://issuer.example.com/credential",
+			},
+			Signed: true,
+			SignerKeyMaterial: &issuermetadata.SignerKeyMaterial{
+				Type: "x5c",
+				X5C:  []string{"MIIleaf", "MIIca"},
+			},
+		},
+	}
+
+	cfg := &config.AuthZENProxyConfig{Enabled: true, PDPURL: pdpServer.URL, Timeout: 30, AllowResolution: true}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, http.DefaultClient, zap.NewNop())
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Set("user_id", "test-user")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{"subject_id": "https://issuer.example.com", "subject_type": "url"})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+	if got.Resource.Type != "x5c" {
+		t.Errorf("expected resource.type='x5c', got %q", got.Resource.Type)
+	}
+	if len(got.Resource.Key) == 0 {
+		t.Error("expected the signer chain in resource.key")
+	}
+}
+
 func TestResolve_URLSubject_Untrusted(t *testing.T) {
 	// Unsigned metadata that is untrusted: should still return metadata with decision=false.
 	// Logos are inlined because metadata is unsigned (display-only, no trust claim).

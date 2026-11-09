@@ -6,12 +6,14 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
@@ -109,8 +111,15 @@ func newStore(ctx context.Context, cfg *config.MongoDBConfig, initialize bool) (
 		cfg:      cfg,
 	}
 
-	// Initialize sub-stores
-	s.users = &UserStore{collection: database.Collection("users"), tombstones: database.Collection("user_deletion_tombstones")}
+	// Initialize sub-stores.
+	// Users always read from the primary, regardless of any readPreference in
+	// the connection URI: a secondary read right after a private-data write
+	// would return a stale ETag and make the client report a sync failure.
+	s.users = &UserStore{
+		collection: database.Collection("users",
+			options.Collection().SetReadPreference(readpref.Primary())),
+		tombstones: database.Collection("user_deletion_tombstones"),
+	}
 	s.tenants = &TenantStore{collection: database.Collection("tenants")}
 	s.userTenants = &UserTenantStore{collection: database.Collection("user_tenants")}
 	s.credentials = &CredentialStore{collection: database.Collection("credentials"), counter: counters}
@@ -444,30 +453,79 @@ func (s *UserStore) GetByDID(ctx context.Context, did string) (*domain.User, err
 	return &user, nil
 }
 
-func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
-	user.UpdatedAt = time.Now()
-	// Whole-document replace, matching only while the stored fence has not
-	// advanced past the caller's copy, so a copy loaded before a lifecycle write
-	// cannot write the old cut-off or erased data back.
-	filter := bson.M{
-		"_id.id":     user.UUID.String(),
-		"auth_fence": bson.M{"$not": bson.M{"$gt": user.AuthFence}},
+// Optimistic-concurrency retry tuning for Modify. Contention on a single user
+// document is normally low (one user, a few tabs/devices), so these limits
+// are generous; backoff with jitter keeps competing writers from retrying in
+// lockstep.
+const (
+	maxModifyAttempts = 20
+	modifyBaseBackoff = 2 * time.Millisecond
+	modifyMaxBackoff  = 100 * time.Millisecond
+)
+
+// modifyBackoff returns a full-jitter exponential backoff for the given attempt.
+func modifyBackoff(attempt int) time.Duration {
+	d := modifyBaseBackoff << min(attempt, 6)
+	if d > modifyMaxBackoff {
+		d = modifyMaxBackoff
 	}
-	result, err := s.collection.ReplaceOne(ctx, filter, user)
-	if err != nil {
-		return fmt.Errorf("failed to update user: %w", err)
+	return time.Duration(rand.Int64N(int64(d)) + 1)
+}
+
+// modifySleep waits d or until ctx ends (a variable so tests can count sleeps).
+var modifySleep = func(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
-	if result.MatchedCount == 0 {
-		n, err := s.collection.CountDocuments(ctx, bson.M{"_id.id": user.UUID.String()})
+}
+
+// Modify performs an optimistic read-modify-write on a user document.
+// The write is conditional on the version read, so a concurrent write causes
+// a retry with fresh data instead of silently overwriting it.
+func (s *UserStore) Modify(ctx context.Context, id domain.UserID, fn storage.UserModifier) (*domain.User, error) {
+	for attempt := 0; attempt < maxModifyAttempts; attempt++ {
+		current, err := s.GetByID(ctx, id)
 		if err != nil {
-			return fmt.Errorf("failed to update user: %w", err)
+			return nil, err
 		}
-		if n == 0 {
-			return storage.ErrNotFound
+
+		readVersion := current.Version
+		if err := fn(current); err != nil {
+			return nil, err
 		}
-		return storage.ErrStaleWrite
+		current.UUID = id
+		current.Version = readVersion + 1
+		current.UpdatedAt = time.Now()
+
+		filter := bson.M{"_id.id": id.String(), "version": readVersion}
+		if readVersion == 0 {
+			// Documents written before the version field existed have no
+			// "version" key; {version: null} matches missing fields.
+			filter["version"] = bson.M{"$in": bson.A{int64(0), nil}}
+		}
+
+		result, err := s.collection.ReplaceOne(ctx, filter, current)
+		if err != nil {
+			return nil, fmt.Errorf("failed to update user: %w", err)
+		}
+		if result.MatchedCount == 1 {
+			return current, nil
+		}
+		// Either the user was deleted or another writer won the race.
+		// Loop: GetByID distinguishes the two cases.
+		if attempt == maxModifyAttempts-1 {
+			break // out of attempts: report the conflict without a pointless sleep
+		}
+		if err := modifySleep(ctx, modifyBackoff(attempt)); err != nil {
+			return nil, err
+		}
 	}
-	return nil
+	return nil, storage.ErrConflict
 }
 
 func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
@@ -483,11 +541,14 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 
 // cutoffStage is the update-pipeline stage behind both lifecycle writes: it
 // advances auth_invalid_before to t ($max, so a delayed older event cannot roll
-// it back) and always advances auth_fence, so UserStore.Update refuses any
-// record loaded before this write.
+// it back) and always advances auth_fence and version. The version advance is
+// what makes UserStore.Modify (a conditional replace on the version it read)
+// retry instead of writing back a cut-off or erased data it read before this
+// write.
 func cutoffStage(t time.Time, extra bson.D) bson.D {
 	set := bson.D{
 		{Key: "auth_fence", Value: bson.D{{Key: "$add", Value: bson.A{bson.D{{Key: "$ifNull", Value: bson.A{"$auth_fence", 0}}}, 1}}}},
+		{Key: "version", Value: bson.D{{Key: "$add", Value: bson.A{bson.D{{Key: "$ifNull", Value: bson.A{"$version", 0}}}, 1}}}},
 		{Key: "auth_invalid_before", Value: bson.D{{Key: "$max", Value: bson.A{t, "$auth_invalid_before"}}}},
 	}
 	set = append(set, extra...)
@@ -571,42 +632,6 @@ func (s *UserStore) GetAuthCutoff(ctx context.Context, id domain.UserID) (time.T
 	return doc.Cutoff, nil
 }
 
-func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error {
-	filter := bson.M{"id.id": id.String()}
-	if ifMatch != "" {
-		filter["private_data_etag"] = ifMatch
-	}
-
-	// Generate new ETag
-	newETag := fmt.Sprintf("%d", time.Now().UnixNano())
-
-	update := bson.M{
-		"$set": bson.M{
-			"private_data":      data,
-			"private_data_etag": newETag,
-			"updated_at":        time.Now(),
-		},
-	}
-
-	result, err := s.collection.UpdateOne(ctx, filter, update)
-	if err != nil {
-		return fmt.Errorf("failed to update private data: %w", err)
-	}
-	if result.MatchedCount == 0 {
-		// Could be not found or ETag mismatch
-		var user domain.User
-		err := s.collection.FindOne(ctx, bson.M{"id.id": id.String()}).Decode(&user)
-		if err != nil {
-			if err == mongo.ErrNoDocuments {
-				return storage.ErrNotFound
-			}
-			return fmt.Errorf("failed to check user: %w", err)
-		}
-		return storage.ErrInvalidInput // ETag mismatch
-	}
-	return nil
-}
-
 func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) (bool, error) {
 	setFields := bson.M{
 		"updated_at": time.Now(),
@@ -631,11 +656,18 @@ func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain
 	// baseline. $max is MongoDB's atomic "only update if greater" operator:
 	// combined with $set in the same update document, this whole operation
 	// is still a single atomic write.
+	//
+	// $inc bumps the document version in the same atomic write. Modify's
+	// ReplaceOne is conditional on the version it read, so without this a
+	// concurrent Modify holding a pre-login snapshot would still match and
+	// restore the old sign count / clear a freshly latched clone warning.
+	// $inc on a missing field (legacy document) sets it to 1.
 	update := bson.M{
 		"$set": setFields,
 		"$max": bson.M{
 			"webauthn_credentials.$[cred].authenticator.sign_count": signCount,
 		},
+		"$inc": bson.M{"version": int64(1)},
 	}
 
 	opts := options.FindOneAndUpdate().
