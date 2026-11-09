@@ -40,7 +40,7 @@ func setupTestHandlersWithUser(t *testing.T) (*Handlers, *gin.Engine, *domain.Us
 
 	store := memory.NewStore()
 	services := service.NewServices(store, cfg, logger)
-	handlers := NewHandlers(services, cfg, logger, []string{"test"})
+	handlers := NewHandlersWithStore(services, store, cfg, logger, []string{"test"})
 
 	// Create a test user
 	ctx := context.Background()
