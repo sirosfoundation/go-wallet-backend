@@ -1293,6 +1293,24 @@ func parseMintedToken(t *testing.T, issuer *TokenIssuer, w *httptest.ResponseRec
 	return claims
 }
 
+// pseudonymousTestSession creates the session the pseudonymous tests mint
+// from - passkey ACR, tenant-1, the granted permissions the test needs.
+func pseudonymousTestSession(t *testing.T, store *MemorySessionStore, jti string, maxTAC TAC) {
+	t.Helper()
+	sess := &Session{
+		JTI:       jti,
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    maxTAC,
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	if err := store.Create(context.Background(), sess); err != nil {
+		t.Fatalf("create %s: %v", jti, err)
+	}
+}
+
 // TestTokenEndpoint_PseudonymousMintsARotatingPseudonym: the engine-transport
 // kind (engine-parity.md §8 G3) - a real, authenticated session behind the
 // mint, a fresh random pseudonym in the token. Two mints from the same
@@ -1368,16 +1386,7 @@ func TestTokenEndpoint_Pseudonymous_NoSessionDenied(t *testing.T) {
 func TestTokenEndpoint_Pseudonymous_WriteTACDenied(t *testing.T) {
 	router, store, _ := setupTokenEndpoint(t)
 
-	sess := &Session{
-		JTI:       "sess-pseudonym-write",
-		UserID:    "user-1",
-		TenantID:  "tenant-1",
-		MaxTAC:    TAC("rwil"),
-		ACR:       "urn:siros:acr:passkey",
-		CreatedAt: time.Now(),
-		ExpiresAt: time.Now().Add(time.Hour),
-	}
-	_ = store.Create(context.Background(), sess)
+	pseudonymousTestSession(t, store, "sess-pseudonym-write", TAC("rwil"))
 
 	w := serveTokenRequest(t, router, "sess-pseudonym-write", TokenRequest{Audience: "wallet-engine", Pseudonymous: true, TAC: "rw"})
 
@@ -1392,16 +1401,7 @@ func TestTokenEndpoint_Pseudonymous_WriteTACDenied(t *testing.T) {
 func TestTokenEndpoint_Pseudonymous_ExceedsSessionMaxTACDenied(t *testing.T) {
 	router, store, _ := setupTokenEndpoint(t)
 
-	sess := &Session{
-		JTI:       "sess-pseudonym-read-only",
-		UserID:    "user-1",
-		TenantID:  "tenant-1",
-		MaxTAC:    TAC("r"),
-		ACR:       "urn:siros:acr:passkey",
-		CreatedAt: time.Now(),
-		ExpiresAt: time.Now().Add(time.Hour),
-	}
-	_ = store.Create(context.Background(), sess)
+	pseudonymousTestSession(t, store, "sess-pseudonym-read-only", TAC("r"))
 
 	w := serveTokenRequest(t, router, "sess-pseudonym-read-only", TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
 
@@ -1417,16 +1417,7 @@ func TestTokenEndpoint_Pseudonymous_ExceedsSessionMaxTACDenied(t *testing.T) {
 func TestTokenEndpoint_Pseudonymous_RevokedOwnerDenied(t *testing.T) {
 	router, store, _ := setupTokenEndpointWithDeps(t, nil, &fakeBlacklist{revokedUsers: map[string]bool{"user-1": true}})
 
-	sess := &Session{
-		JTI:       "sess-pseudonym-revoked",
-		UserID:    "user-1",
-		TenantID:  "tenant-1",
-		MaxTAC:    TAC("rwil"),
-		ACR:       "urn:siros:acr:passkey",
-		CreatedAt: time.Now(),
-		ExpiresAt: time.Now().Add(time.Hour),
-	}
-	_ = store.Create(context.Background(), sess)
+	pseudonymousTestSession(t, store, "sess-pseudonym-revoked", TAC("rwil"))
 
 	w := serveTokenRequest(t, router, "sess-pseudonym-revoked", TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
 

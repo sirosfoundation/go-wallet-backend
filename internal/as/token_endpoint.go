@@ -233,22 +233,61 @@ func handleSessionTokenRequest(
 	issueToken(c, deps, session.UserID, session.UserID, req.Audience, tenantID, tac, session.ACR)
 }
 
-// handleAnonymousTokenRequest issues a token that omits the caller's
-// identity ("sub"). Despite the name, this is NOT an unauthenticated path:
-// the caller must have a valid, already-authenticated session, resolved and
-// validated exactly like handleSessionTokenRequest. "Anonymous" means "omit
-// my identity from this specific token" - e.g. for a privacy-preserving
-// trust-evaluation or engine-transport call the caller doesn't want tied to
-// their identity - not "no authentication required at all". A caller with
-// no session never reaches this function (see TokenEndpointHandler).
+// handleIdentityKindToken is the shared shape of the session-backed
+// identity kinds - the anonymous kind (the token omits "sub") and the
+// pseudonymous engine kind (the token carries a fresh per-mint pseudonym,
+// engine-parity.md §8 G3). Neither is an unauthenticated path: the caller
+// must hold a valid, already-authenticated session, resolved and validated
+// exactly like handleSessionTokenRequest's.
 //
-// tenant_id and acr are threaded through from the real session exactly as
-// handleSessionTokenRequest does: the "default" tenant gets no special
-// treatment anywhere in this file, it is just whichever tenant the caller's
-// own session happens to belong to. tac is additionally capped to read-only
-// regardless of the session's own MaxTAC - the point of this path is a
-// narrowly-scoped, identity-free token, not "everything my session can do,
-// minus my name".
+// The kind supplies its policy (the authorize function: the tenant scoping,
+// the kind's own TAC ceiling, the session's grants) and its two subjects:
+// the subject the POLICY sees (none at all for the anonymous kind; the
+// session's real subject for the pseudonymous one - the question it answers
+// is "may this authenticated user mint an engine token", which the pseudonym
+// would not carry) and the subject the MINT carries.
+//
+// The revocation check runs before the policy, with the deletion-only
+// exemption off and no TAC: a revoked owner gets no identity-kind token at
+// all - the anonymous kind's missing "sub" would bypass the user revocation,
+// and the pseudonymous kind's fresh sub would name nobody the revocation
+// lists.
+func handleIdentityKindToken(
+	c *gin.Context,
+	store SessionStore,
+	deps *tokenDeps,
+	sessionID string,
+	req *TokenRequest,
+	authorize func(*Session, *TokenRequest) (string, TAC, error),
+	subs func(*Session) (policy, minted string),
+) {
+	session, err := store.Get(c.Request.Context(), sessionID)
+	if err != nil || session == nil || !session.IsValid() {
+		respondTokenError(c, errInvalidSession)
+		return
+	}
+	if err := sessionOwnerRevoked(c.Request.Context(), deps.blacklist, session, false, ""); err != nil {
+		respondRevocation(c, deps, err)
+		return
+	}
+
+	tenantID, tac, err := authorize(session, req)
+	if err != nil {
+		respondTokenError(c, err)
+		return
+	}
+
+	policySub, mintedSub := subs(session)
+	issueToken(c, deps, policySub, mintedSub, req.Audience, tenantID, tac, session.ACR)
+}
+
+// handleAnonymousTokenRequest issues a token that omits the caller's
+// identity ("sub"): a privacy-preserving, narrowly-scoped, identity-free
+// token - tac capped to read-only regardless of the session's own MaxTAC -
+// not "everything my session can do, minus my name". The policy sees no
+// subject at all; tenant_id and acr thread through from the real session
+// exactly as handleSessionTokenRequest's, the "default" tenant getting no
+// special treatment anywhere in this file.
 func handleAnonymousTokenRequest(
 	c *gin.Context,
 	store SessionStore,
@@ -256,42 +295,25 @@ func handleAnonymousTokenRequest(
 	sessionID string,
 	req *TokenRequest,
 ) {
-	session, err := store.Get(c.Request.Context(), sessionID)
-	if err != nil || session == nil || !session.IsValid() {
-		respondTokenError(c, errInvalidSession)
-		return
-	}
-	// Before the policy, and with no TAC: a revoked owner gets no anonymous
-	// token at all, since a missing "sub" would bypass the user revocation.
-	if err := sessionOwnerRevoked(c.Request.Context(), deps.blacklist, session, false, ""); err != nil {
-		respondRevocation(c, deps, err)
-		return
-	}
-
-	tenantID, tac, err := authorizeAnonymousToken(session, req)
-	if err != nil {
-		respondTokenError(c, err)
-		return
-	}
-
-	issueToken(c, deps, "", "", req.Audience, tenantID, tac, session.ACR)
+	handleIdentityKindToken(c, store, deps, sessionID, req,
+		authorizeAnonymousToken,
+		func(*Session) (string, string) { return "", "" },
+	)
 }
 
 // handlePseudonymousTokenRequest issues the engine-transport token kind
 // (engine-parity.md §8 G3): the caller's real, authenticated session stands
-// behind the mint exactly as the session path's does, but the token's `sub`
-// is a fresh random pseudonym - per mint, so it identifies nothing and
-// cannot be correlated across mints. The privacy point: the remote engine
-// consumes this kind and attributes its traffic to the TENANT, never to a
-// person (its session store, its logs, its KV flow registry all key the
-// tenant's pseudonym, which rotates with the token's TTL).
+// behind the mint, but the token's `sub` is a fresh random pseudonym - per
+// mint, so it identifies nothing and cannot be correlated across mints. The
+// privacy point: the remote engine consumes this kind and attributes its
+// traffic to the TENANT, never to a person (its session store, its logs, its
+// KV flow registry all key the tenant's pseudonym, which rotates with the
+// token's TTL).
 //
 // The token is engine-shaped: `tac` defaults to and is capped at "ri" - the
 // two flow gates the WMP engine enforces (read for OID4VP sharing an
 // existing credential, insert for OID4VCI receiving a new one); the tenant
-// claimed as today. The revocation check runs BEFORE the policy and with
-// the deletion-only exemption OFF: a revoked owner gets no engine token,
-// the same rule as the anonymous kind's.
+// claimed as today.
 func handlePseudonymousTokenRequest(
 	c *gin.Context,
 	store SessionStore,
@@ -299,30 +321,14 @@ func handlePseudonymousTokenRequest(
 	sessionID string,
 	req *TokenRequest,
 ) {
-	session, err := store.Get(c.Request.Context(), sessionID)
-	if err != nil || session == nil || !session.IsValid() {
-		respondTokenError(c, errInvalidSession)
-		return
-	}
-	if err := sessionOwnerRevoked(c.Request.Context(), deps.blacklist, session, false, ""); err != nil {
-		respondRevocation(c, deps, err)
-		return
-	}
-
-	tenantID, tac, err := authorizePseudonymousToken(session, req)
-	if err != nil {
-		respondTokenError(c, err)
-		return
-	}
-
-	// The minted subject: a fresh pseudonym per mint. It is NOT the
-	// session's user id - the tenant-mode engine deployments key the tenant,
-	// never a person.
-	pseudonym := "p-" + uuid.New().String()
-
-	// The policy sees the session's REAL subject (issueToken's first sub
-	// argument); the minted subject (the second) is what the token carries.
-	issueToken(c, deps, session.UserID, pseudonym, req.Audience, tenantID, tac, session.ACR)
+	handleIdentityKindToken(c, store, deps, sessionID, req,
+		authorizePseudonymousToken,
+		// The policy sees the session's REAL subject; the mint carries a
+		// fresh pseudonym - NOT the user id.
+		func(session *Session) (string, string) {
+			return session.UserID, "p-" + uuid.New().String()
+		},
+	)
 }
 
 // handleDelegationTokenRequest issues a downscoped token from a Bearer token
