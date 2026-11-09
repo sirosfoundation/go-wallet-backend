@@ -197,20 +197,24 @@ func TestReconcileUser_ErasedUserIsLeftAlone(t *testing.T) {
 
 // Holder data alone (a write that landed after the last sweep) is enough, and
 // a user's vault alone is too.
+// modifyUser applies fn to the stored user through the store's atomic Modify.
+func modifyUser(t *testing.T, store storage.Store, id domain.UserID, fn func(u *domain.User)) {
+	t.Helper()
+	_, err := store.Users().Modify(context.Background(), id, func(u *domain.User) error {
+		fn(u)
+		return nil
+	})
+	require.NoError(t, err)
+}
+
 func TestReconcileUser_DetectsEachKindOfLeftoverData(t *testing.T) {
 	ctx := context.Background()
 	for name, leave := range map[string]func(t *testing.T, store storage.Store, userID domain.UserID, holder string){
 		"private data": func(t *testing.T, store storage.Store, userID domain.UserID, _ string) {
-			require.NoError(t, store.Users().Update(ctx, func() *domain.User {
-				u := userData(t, store, userID)
-				u.PrivateData = []byte("late")
-				return u
-			}()))
+			modifyUser(t, store, userID, func(u *domain.User) { u.PrivateData = []byte("late") })
 		},
 		"key material": func(t *testing.T, store storage.Store, userID domain.UserID, _ string) {
-			u := userData(t, store, userID)
-			u.Keys = []byte("late")
-			require.NoError(t, store.Users().Update(ctx, u))
+			modifyUser(t, store, userID, func(u *domain.User) { u.Keys = []byte("late") })
 		},
 		"credential": func(t *testing.T, store storage.Store, _ domain.UserID, holder string) {
 			require.NoError(t, store.Credentials().Create(ctx, &domain.VerifiableCredential{
@@ -252,9 +256,7 @@ func TestReconcileUser_FailsClosed(t *testing.T) {
 			revokeSilently(t, f, userID)
 			// Probe the vault-less case too, so the holder listing is reached.
 			if op == "credentials.GetAllByHolder" {
-				u := userData(t, f, userID)
-				u.PrivateData = nil
-				require.NoError(t, f.Users().Update(context.Background(), u))
+				modifyUser(t, f, userID, func(u *domain.User) { u.PrivateData = nil })
 			}
 			f.fail[op] = true
 

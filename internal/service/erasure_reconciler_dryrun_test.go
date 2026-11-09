@@ -66,9 +66,7 @@ func dryRunFixture(t *testing.T) (*WalletLifecycleService, *memory.Store, domain
 func TestReconcileUserDryRun_ReportsAndChangesNothing(t *testing.T) {
 	svc, store, userID, holder, sc := dryRunFixture(t)
 	ctx := context.Background()
-	u := userData(t, store, userID)
-	u.Keys = []byte("legacy")
-	require.NoError(t, store.Users().Update(ctx, u))
+	modifyUser(t, store, userID, func(u *domain.User) { u.Keys = []byte("legacy") })
 	before := snapshotUser(t, store, userID, holder, tenantA, tenantB)
 
 	out, cats, err := svc.ReconcileUserDryRun(ctx, userID, inTheFuture())
