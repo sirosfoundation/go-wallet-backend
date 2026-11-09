@@ -4,6 +4,49 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.25.0:start -->
+## [v0.25.0] - 2026-11-09
+
+### Added
+
+- **Instance key attestation**: Added support for Android key attestation and Apple App Attest assertion as evidence for wallet instance keys, with per-tenant/user scoping and automatic evidence refresh (#487, #484, #483)
+- **Transaction data support**: Added structural validation and relay of `transaction_data` to declaring clients in authorization flows, with DCQL credential ID binding enforcement (#438, #439)
+- **AS metadata discovery**: Implemented ordered candidate discovery for Authorization Server metadata with exact issuer validation and redirect guards (#518)
+- **Credential request encryption**: Added opportunistic encryption of credential requests with a compatibility toggle for issuers that don't support it (#520)
+- **Status list verification**: Added HTTP-based status list fetching with cache budget enforcement and proper age calculation from Cache-Control/Age headers (#423)
+- **Revocation enforcement**: Implemented fail-closed revocation checks in token issuance, refusing session-cookie tokens for revoked users while allowing deletion-only tokens (#454, #452)
+
+### Changed
+
+- **Assurance policy engine**: Reworked evidence evaluation to use per-key instance evidence that is never downgraded, with schema version 2 introducing a verified `instance_key` evidence slot (#481, #482, #491)
+- **Session management**: Scoped per-user session pointers to (tenant, user) tuples with atomic Redis operations, legacy pointer reconciliation during rolling upgrades, and bounded tenant session indexes (#496, #499)
+- **Response routing**: Replaced response parking with direct routing to flow owners, preventing concurrent flows from consuming each other's actions and replies (#498, #504)
+- **Issuer metadata**: Changed to exact issuer identifier comparison without normalization, trying literal 1.0 URLs before 1.1 well-known forms (#495)
+- **WebSocket close logging**: Added stable close-reason logging for every WebSocket session to improve observability (#509)
+- Dependency updates in go-deps group (#532, #541)
+
+### Fixed
+
+- **WSCD type classification**: Fixed development attestations being incorrectly classified as native WSCD; `wscd_type` is now recorded as unknown when derived from platform attestation alone and for secure_enclave_asserted keys (#487)
+- **Assurance validation**: Fixed rejection of multiple values and list-valued members in leaf slots; explicit null assurance sections now preserve defaults (#481)
+- **Platform evidence expiry**: Corrected platform evidence to expire with WIA lifetime and include response delay in freshness calculations (#481)
+- **Token endpoint**: Fixed credential request retry on `invalid_nonce` errors and prevented replay of spent legacy attestations (#515, #508)
+- **Authorization flow**: Fixed enforcement of empty TAC requirement on WebSocket sessions and proper client refusal signaling for transaction data (#499, #494)
+- **Response encryption**: Fixed direct ECDH-ES to require empty encrypted key field and bounded compact-JWE segment splitting (#471)
+- **Metadata fetching**: Fixed to never fall back to `http.DefaultClient`, preventing SSRF risks (#497)
+- **OIDC issuer handling**: Fixed issuer URL normalization to only remove root slash after scheme authority, with exact comparison for `credential_issuer` and `sub` claims (#495)
+- **Redis operations**: Fixed session Put to atomically insert and index while rejecting duplicate IDs; made DeleteByUser safe against concurrent creation (#496)
+- **PDP integration**: Fixed signed-metadata signer's x5c chain to be sent to the PDP for trust evaluation (#541)
+
+### Security
+
+- **Certification catalogue validation**: Added URL validation for certification catalogue references to prevent malformed configurations (#481)
+- **Request bounds**: Bounded `client_metadata` at 64 KB and raw request objects to prevent resource exhaustion (#471)
+- **Attestation trust**: Fixed to never trust TPM attestation flags as user verification and reject unauthenticated evidence as verified (#481)
+- **Status list security**: Enforced `http_client` policy for status list fetches and charged all host-supplied retained values to cache budget (#423)
+- **AS metadata security**: Added validation of AS identifier and redirect guards in metadata discovery to prevent open redirects (#518)
+<!-- release-notes:v0.25.0:end -->
+
 <!-- release-notes:v0.24.0:start -->
 ## [v0.24.0] - 2026-10-19
 
