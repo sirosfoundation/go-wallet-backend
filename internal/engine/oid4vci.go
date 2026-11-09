@@ -1513,21 +1513,26 @@ func (h *OID4VCIHandler) logIgnoredCredentialConfigurations(source map[string]in
 	}
 }
 
-func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metadata *IssuerMetadata, metadataValidated bool, signer *issuermetadata.SignerKeyMaterial) (*TrustInfo, error) {
-	_ = h.ProgressMessage(StepEvaluatingTrust, "Evaluating issuer trust")
-
-	// Extract key material from issuer metadata for trust evaluation
+// issuerTrustKeyMaterial returns the key material the PDP is asked about: what
+// the metadata body yields, else the verified signer of a signed document
+// (application/jwt, whose payload carries no jwks or signed_metadata; the
+// AuthZEN proxy does the same). The credential types of the offered
+// configurations are attached for trust policy.
+func (h *OID4VCIHandler) issuerTrustKeyMaterial(ctx context.Context, metadata *IssuerMetadata, signer *issuermetadata.SignerKeyMaterial) *KeyMaterial {
 	keyMaterial := h.extractIssuerKeyMaterial(ctx, metadata)
-	// A signed document whose payload carries no key material (application/jwt)
-	// is identified by its verified signer, as the AuthZEN proxy does.
 	if keyMaterial == nil {
 		keyMaterial = trust.KeyMaterialFromSigner(signer)
 	}
-
-	// Collect credential types from the offered configurations for trust policy
 	if keyMaterial != nil && keyMaterial.CredentialType == "" {
 		keyMaterial.CredentialType = h.collectCredentialTypes(metadata)
 	}
+	return keyMaterial
+}
+
+func (h *OID4VCIHandler) evaluateTrust(ctx context.Context, issuer string, metadata *IssuerMetadata, metadataValidated bool, signer *issuermetadata.SignerKeyMaterial) (*TrustInfo, error) {
+	_ = h.ProgressMessage(StepEvaluatingTrust, "Evaluating issuer trust")
+
+	keyMaterial := h.issuerTrustKeyMaterial(ctx, metadata, signer)
 
 	// Try server-side direct evaluation first (preferred path).
 	// The backend calls go-trust PDP directly — no frontend round-trip needed.
