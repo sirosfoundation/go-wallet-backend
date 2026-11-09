@@ -70,6 +70,15 @@ const (
 	anonymousMaxTAC     = TAC("rl")
 )
 
+// The pseudonymous engine kind (engine-parity.md §8 G3) is engine-shaped by
+// the same design: the WMP engine's two flow gates - read (present an
+// existing credential, OID4VP) and insert (receive a new one, OID4VCI) -
+// not "everything my session can do, minus my name".
+const (
+	pseudonymousDefaultTAC = TAC("ri")
+	pseudonymousMaxTAC     = TAC("ri")
+)
+
 // authorizeSessionToken applies the policy for a token minted from a session
 // cookie, returning the tenant and TAC to issue it with.
 func authorizeSessionToken(s *Session, req *TokenRequest) (string, TAC, error) {
@@ -95,6 +104,23 @@ func authorizeAnonymousToken(s *Session, req *TokenRequest) (string, TAC, error)
 		tac = anonymousDefaultTAC
 	}
 	return authorizeSessionScoped(s, req, tac, anonymousMaxTAC)
+}
+
+// authorizePseudonymousToken applies the policy for the engine-transport
+// kind (engine-parity.md §8 G3): the caller's real, authenticated session
+// stands behind the mint exactly as the session path's does - the policy
+// sees the session's REAL subject, never the pseudonym the mint will carry -
+// with the kind's own ceiling, `tac ⊆ "ri"` (the WMP engine's two flow
+// gates), applied before the session's own MaxTAC.
+func authorizePseudonymousToken(s *Session, req *TokenRequest) (string, TAC, error) {
+	if s.ACR == "" {
+		return "", "", errNoAuthContext
+	}
+	tac := TAC(req.TAC)
+	if tac == "" {
+		tac = pseudonymousDefaultTAC
+	}
+	return authorizeSessionScoped(s, req, tac, pseudonymousMaxTAC)
 }
 
 // authorizeSessionScoped is the policy both session-cookie paths share. cap,

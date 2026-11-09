@@ -1262,3 +1262,183 @@ func TestRespondTokenError(t *testing.T) {
 		})
 	}
 }
+
+// TestTokenEndpoint_PseudonymousMintsARotatingPseudonym: the engine-transport
+// kind (engine-parity.md §8 G3) - a real, authenticated session behind the
+// mint, a fresh random pseudonym in the token. Two mints from the same
+// session carry DIFFERENT subjects: the pseudonym rotates per mint, so it
+// identifies nothing and cannot be correlated across tokens. The tenant is
+// the session's own; the tac defaults to the engine's two flow gates (read
+// for OID4VP, insert for OID4VCI).
+func TestTokenEndpoint_PseudonymousMintsARotatingPseudonym(t *testing.T) {
+	router, store, issuer := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-pseudonym",
+		UserID:    "user-1",
+		TenantID:  "tenant-acme",
+		MaxTAC:    TAC("rwil"),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	mint := func() *AccessTokenClaims {
+		t.Helper()
+		body, _ := json.Marshal(TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
+		req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-pseudonym"})
+
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 for a session-backed pseudonymous mint, got %d: %s", w.Code, w.Body.String())
+		}
+		var resp TokenResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		claims, err := issuer.ParseAndVerify(resp.AccessToken, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return claims
+	}
+
+	first := mint()
+	second := mint()
+
+	for _, claims := range []*AccessTokenClaims{first, second} {
+		if claims.Subject == "" {
+			t.Errorf("the pseudonymous kind carries a non-empty sub (the engine's authenticated gate requires one): %q", claims.Subject)
+		}
+		if claims.Subject == "user-1" {
+			t.Errorf("the pseudonym must not be the session's real user id: %q", claims.Subject)
+		}
+		if !strings.HasPrefix(claims.Subject, "p-") {
+			t.Errorf("the minted subject is the pseudonym form: %q", claims.Subject)
+		}
+		if claims.TenantID != "tenant-acme" {
+			t.Errorf("tenant claimed as today (the session's own): %q", claims.TenantID)
+		}
+		if claims.TAC != TAC("ri") {
+			t.Errorf("tac defaults to the engine's two flow gates (read, insert): %q", claims.TAC)
+		}
+	}
+	if first.Subject == second.Subject {
+		t.Errorf("the pseudonym rotates per mint: two mints carried the same subject %q", first.Subject)
+	}
+}
+
+// TestTokenEndpoint_Pseudonymous_NoSessionDenied: there is deliberately no
+// session-less pseudonymous path - the kind removes the identity from the
+// TOKEN, not the authentication from the MINT (the same shape as the
+// anonymous kind).
+func TestTokenEndpoint_Pseudonymous_NoSessionDenied(t *testing.T) {
+	router, _, _ := setupTokenEndpoint(t)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 without a session cookie, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Pseudonymous_WriteTACDenied: the kind is engine-shaped -
+// capped to read+insert regardless of the session's own MaxTAC, not
+// "everything my session can do, minus my name".
+func TestTokenEndpoint_Pseudonymous_WriteTACDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-pseudonym-write",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rwil"),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "wallet-engine", Pseudonymous: true, TAC: "rw"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-pseudonym-write"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for a write-scoped pseudonymous request, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Pseudonymous_ExceedsSessionMaxTACDenied: a session
+// without insert cannot mint the engine's default - the session's grants
+// still bound the pseudonymous kind exactly as they bound the others.
+func TestTokenEndpoint_Pseudonymous_ExceedsSessionMaxTACDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+
+	sess := &Session{
+		JTI:       "sess-pseudonym-read-only",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("r"),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-pseudonym-read-only"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusForbidden {
+		t.Errorf("expected 403 for a read-only session minting the engine default (ri), got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Pseudonymous_RevokedOwnerDenied: the user-revocation
+// check runs before the policy with the deletion-only exemption OFF - a
+// revoked owner gets no engine token, the same rule as the anonymous kind's
+// (the fresh sub would otherwise name nobody the revocation lists).
+func TestTokenEndpoint_Pseudonymous_RevokedOwnerDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpointWithDeps(t, nil, &fakeBlacklist{revokedUsers: map[string]bool{"user-1": true}})
+
+	sess := &Session{
+		JTI:       "sess-pseudonym-revoked",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rwil"),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	_ = store.Create(context.Background(), sess)
+
+	body, _ := json.Marshal(TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
+	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-pseudonym-revoked"})
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for a revoked owner, got %d: %s", w.Code, w.Body.String())
+	}
+}

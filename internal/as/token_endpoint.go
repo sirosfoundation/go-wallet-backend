@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 )
 
@@ -180,6 +181,20 @@ func TokenEndpointHandler(cfg TokenEndpointConfig) gin.HandlerFunc {
 			return
 		}
 
+		// The pseudonymous engine kind: a real session behind the mint, a
+		// random pseudonym in the token (engine-parity.md §8 G3). Like the
+		// anonymous branch it has no session-less form - checked before the
+		// delegation fallthrough for the same clear-error reason.
+		if req.Pseudonymous {
+			sessionID := GetSessionCookie(c, opts)
+			if sessionID == "" {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+				return
+			}
+			handlePseudonymousTokenRequest(c, store, deps, sessionID, &req)
+			return
+		}
+
 		if sessionID := GetSessionCookie(c, opts); sessionID != "" {
 			handleSessionTokenRequest(c, store, deps, sessionID, &req)
 		} else {
@@ -215,7 +230,7 @@ func handleSessionTokenRequest(
 		return
 	}
 
-	issueToken(c, deps, session.UserID, req.Audience, tenantID, tac, session.ACR)
+	issueToken(c, deps, session.UserID, session.UserID, req.Audience, tenantID, tac, session.ACR)
 }
 
 // handleAnonymousTokenRequest issues a token that omits the caller's
@@ -259,7 +274,55 @@ func handleAnonymousTokenRequest(
 		return
 	}
 
-	issueToken(c, deps, "", req.Audience, tenantID, tac, session.ACR)
+	issueToken(c, deps, "", "", req.Audience, tenantID, tac, session.ACR)
+}
+
+// handlePseudonymousTokenRequest issues the engine-transport token kind
+// (engine-parity.md §8 G3): the caller's real, authenticated session stands
+// behind the mint exactly as the session path's does, but the token's `sub`
+// is a fresh random pseudonym - per mint, so it identifies nothing and
+// cannot be correlated across mints. The privacy point: the remote engine
+// consumes this kind and attributes its traffic to the TENANT, never to a
+// person (its session store, its logs, its KV flow registry all key the
+// tenant's pseudonym, which rotates with the token's TTL).
+//
+// The token is engine-shaped: `tac` defaults to and is capped at "ri" - the
+// two flow gates the WMP engine enforces (read for OID4VP sharing an
+// existing credential, insert for OID4VCI receiving a new one); the tenant
+// claimed as today. The revocation check runs BEFORE the policy and with
+// the deletion-only exemption OFF: a revoked owner gets no engine token,
+// the same rule as the anonymous kind's.
+func handlePseudonymousTokenRequest(
+	c *gin.Context,
+	store SessionStore,
+	deps *tokenDeps,
+	sessionID string,
+	req *TokenRequest,
+) {
+	session, err := store.Get(c.Request.Context(), sessionID)
+	if err != nil || session == nil || !session.IsValid() {
+		respondTokenError(c, errInvalidSession)
+		return
+	}
+	if err := sessionOwnerRevoked(c.Request.Context(), deps.blacklist, session, false, ""); err != nil {
+		respondRevocation(c, deps, err)
+		return
+	}
+
+	tenantID, tac, err := authorizePseudonymousToken(session, req)
+	if err != nil {
+		respondTokenError(c, err)
+		return
+	}
+
+	// The minted subject: a fresh pseudonym per mint. It is NOT the
+	// session's user id - the tenant-mode engine deployments key the tenant,
+	// never a person.
+	pseudonym := "p-" + uuid.New().String()
+
+	// The policy sees the session's REAL subject (issueToken's first sub
+	// argument); the minted subject (the second) is what the token carries.
+	issueToken(c, deps, session.UserID, pseudonym, req.Audience, tenantID, tac, session.ACR)
 }
 
 // handleDelegationTokenRequest issues a downscoped token from a Bearer token
@@ -300,7 +363,7 @@ func handleDelegationTokenRequest(
 		return
 	}
 
-	issueToken(c, deps, parentClaims.Subject, req.Audience, tenantID, tac, parentClaims.ACR)
+	issueToken(c, deps, parentClaims.Subject, parentClaims.Subject, req.Audience, tenantID, tac, parentClaims.ACR)
 }
 
 // parentTokenRevoked returns the refusal when the delegating token may no
@@ -356,7 +419,7 @@ func parentUserRevoked(ctx context.Context, bl TokenBlacklistChecker, subject st
 func issueToken(
 	c *gin.Context,
 	deps *tokenDeps,
-	sub, audience, tenantID string,
+	policySub, mintSub, audience, tenantID string,
 	tac TAC,
 	acr string,
 ) {
@@ -367,7 +430,7 @@ func issueToken(
 	}
 
 	// Build SPOCP query and evaluate.
-	query := BuildTokenQuery(sub, audience, tenantID, tac, acr)
+	query := BuildTokenQuery(policySub, audience, tenantID, tac, acr)
 
 	allowed, err := deps.policy.Evaluate(query)
 	if err != nil {
@@ -381,7 +444,7 @@ func issueToken(
 
 	if !allowed {
 		deps.logger.Info("token request denied by policy",
-			zap.String("user_id", sub),
+			zap.String("user_id", policySub),
 			zap.String("audience", audience),
 			zap.String("tenant_id", tenantID),
 			zap.String("tac", string(tac)),
@@ -391,7 +454,7 @@ func issueToken(
 	}
 
 	// Issue signed access token.
-	tokenStr, err := deps.issuer.Issue(sub, audience, tenantID, tac, acr)
+	tokenStr, err := deps.issuer.Issue(mintSub, audience, tenantID, tac, acr)
 	if err != nil {
 		deps.logger.Error("token issuance failed", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "token issuance failed"})
