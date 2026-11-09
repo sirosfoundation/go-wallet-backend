@@ -937,10 +937,10 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 		return
 	}
 
-	// A deleted passkey's prfKeys entry must leave the container, so a request
-	// without privateData is refused (422) rather than keeping the old one. An
-	// empty body is read as "no privateData"; a non-empty body that does not
-	// parse is a 400, never treated as empty.
+	// A request without privateData is refused (422) rather than keeping the
+	// old container, which still lists the deleted passkey. An empty body is
+	// read as "no privateData"; a non-empty body that does not parse is a 400,
+	// never treated as empty.
 	var req struct {
 		PrivateData *taggedbinary.TaggedBytes `json:"privateData"`
 	}
