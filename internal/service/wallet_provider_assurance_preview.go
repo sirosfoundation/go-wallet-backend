@@ -61,7 +61,8 @@ type AssurancePreview struct {
 // stored, no WIA or KA is issued, no decision metric is recorded.
 //
 // Evidence discipline is the real path's: the FIDO2 attestation is verified
-// here by FIDO2AttestationService (a failure is ErrFIDO2AttestationInvalid);
+// here by FIDO2AttestationService (a failure is ErrFIDO2AttestationInvalid, or
+// ErrFIDO2AttestationUnavailable when the trust decision could not be had);
 // the platform source is the caller's own wallet instance's; everything the
 // caller merely states is claimed evidence.
 func (s *WalletProviderService) PreviewAssurance(ctx context.Context, req *AssurancePreviewRequest) (*AssurancePreview, error) {

@@ -55,6 +55,21 @@ func registerAppAttestAssertionVerifier(cfg *config.Config, store storage.Store,
 	keyChecker.register(v)
 }
 
+// registerFIDO2InstanceKeyVerifier registers the FIDO2 instance-key verifier.
+// A first WIA under a FIDO2-requiring policy has to carry its own FIDO2
+// evidence, so it exists only where FIDO2 attestation does.
+func registerFIDO2InstanceKeyVerifier(fido2Svc *FIDO2AttestationService, wiaSvc *WIAService, logger *zap.Logger) {
+	if !fido2Svc.IsEnabled() {
+		return
+	}
+	v, err := NewFIDO2InstanceKeyVerifier(fido2Svc, logger)
+	if err != nil {
+		logger.Warn("fido2 key attestation is not available", zap.Error(err))
+		return
+	}
+	wiaSvc.RegisterInstanceKeyVerifier(v)
+}
+
 // NewServices creates a new Services instance
 func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *Services {
 	// Create AAGUID validator first since WebAuthn service needs it
@@ -127,6 +142,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		registerAppAttestAssertionVerifier(cfg, store, wiaSvc, keyChecker, logger)
 		// Instance-key evidence verifiers, one line per key_attestation type.
 		wiaSvc.RegisterInstanceKeyVerifier(androidVerifier)
+		registerFIDO2InstanceKeyVerifier(fido2Svc, wiaSvc, logger)
 		wiaSvc.SetInstanceKeyChecker(keyChecker)
 		// A signing key alone is enough to construct WIAService, but "etsi"
 		// mode additionally requires a certificate chain (see IsSupported).

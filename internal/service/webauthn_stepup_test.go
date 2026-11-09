@@ -408,10 +408,11 @@ func TestEnrollment_AccountWithoutPasskeyNeedsNoAuthorization(t *testing.T) {
 	setup := newTestVirtualWebAuthnSetup(t)
 	requireEnrollmentAuthorization(setup)
 	alice := registerStepUpUser(t, setup, "Alice")
-	user, err := setup.store.Users().GetByID(setup.ctx, alice.id)
+	_, err := setup.store.Users().Modify(setup.ctx, alice.id, func(u *domain.User) error {
+		u.WebauthnCredentials = nil
+		return nil
+	})
 	require.NoError(t, err)
-	user.WebauthnCredentials = nil
-	require.NoError(t, setup.store.Users().Update(setup.ctx, user))
 
 	e := beginEnrol(t, setup, alice)
 	assert.Nil(t, e.begin.Authorization)

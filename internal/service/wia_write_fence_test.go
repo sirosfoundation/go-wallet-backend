@@ -45,13 +45,7 @@ func deleteAccount(t *testing.T, store storage.Store, uid domain.UserID) func() 
 func advanceCutoff(t *testing.T, store storage.Store, uid domain.UserID) func() {
 	return func() {
 		ctx := context.Background()
-		u, err := store.Users().GetByID(ctx, uid)
-		if err != nil {
-			t.Errorf("get user: %v", err)
-			return
-		}
-		u.AuthInvalidBefore = time.Now().Add(time.Minute)
-		if err := store.Users().Update(ctx, u); err != nil {
+		if err := store.Users().InvalidateAuthBefore(ctx, uid, time.Now().Add(time.Minute)); err != nil {
 			t.Errorf("advance cut-off: %v", err)
 		}
 	}

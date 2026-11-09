@@ -83,7 +83,7 @@ func TestUserWrites_RefuseATokenTheLoadedRecordCutsOff(t *testing.T) {
 }
 
 // Every token-authenticated write that changes wallet state judges the token at
-// the mutation: settings (UpdateUser), credentials and presentations (which
+// the mutation: settings (UpdateSettings), credentials and presentations (which
 // read the cut-off themselves).
 func TestOtherWrites_RefuseATokenTheCutoffPredates(t *testing.T) {
 	store := memory.NewStore()
@@ -95,12 +95,24 @@ func TestOtherWrites_RefuseATokenTheCutoffPredates(t *testing.T) {
 	before := tokengate.WithSubject(base, uid.String(), cutoff.Add(-time.Minute))
 	after := tokengate.WithSubject(base, uid.String(), cutoff.Add(time.Minute))
 
-	t.Run("UpdateUser", func(t *testing.T) {
+	t.Run("UpdateSettings", func(t *testing.T) {
 		svc := NewUserService(store, testConfig(), testLogger())
-		u, err := store.Users().GetByID(base, uid)
+		v := int64(77)
+		prev, err := store.Users().GetByID(base, uid)
 		require.NoError(t, err)
-		assert.ErrorIs(t, svc.UpdateUser(before, u), tokengate.ErrRevoked)
-		assert.NoError(t, svc.UpdateUser(after, u))
+
+		_, err = svc.UpdateSettings(before, uid, &v)
+		assert.ErrorIs(t, err, tokengate.ErrRevoked)
+		// The refusal comes from inside the store's Modify callback, so
+		// nothing was written (not even a version bump).
+		cur, err := store.Users().GetByID(base, uid)
+		require.NoError(t, err)
+		assert.Equal(t, prev.Version, cur.Version, "a refused write must not touch the record")
+		assert.NotEqual(t, v, cur.OpenIDRefreshTokenMaxAge)
+
+		got, err := svc.UpdateSettings(after, uid, &v)
+		require.NoError(t, err)
+		assert.Equal(t, v, got.OpenIDRefreshTokenMaxAge)
 	})
 	t.Run("credential store and update", func(t *testing.T) {
 		svc := NewCredentialService(store, testConfig(), testLogger())

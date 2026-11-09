@@ -655,8 +655,7 @@ func (h *AuthZENProxyHandler) resolveURLSubject(c *gin.Context, ctx context.Cont
 	// For application/jwt responses the JWT payload claims don't carry
 	// signed_metadata/jwks fields, so key material is surfaced via the resolver result.
 	if keyMaterial == nil && !signedButFailed && result.SignerKeyMaterial != nil {
-		km := result.SignerKeyMaterial
-		keyMaterial = &trust.KeyMaterial{Type: km.Type, X5C: km.X5C, JWK: km.JWK}
+		keyMaterial = trust.KeyMaterialFromSigner(result.SignerKeyMaterial)
 	}
 
 	// If signed_metadata was present but JWT verification failed, reject immediately.
