@@ -70,6 +70,15 @@ const (
 	anonymousMaxTAC     = TAC("rl")
 )
 
+// The pseudonymous engine kind (engine-parity.md §8 G3) is engine-shaped by
+// the same design: the WMP engine's two flow gates - read (present an
+// existing credential, OID4VP) and insert (receive a new one, OID4VCI) -
+// not "everything my session can do, minus my name".
+const (
+	pseudonymousDefaultTAC = TAC("ri")
+	pseudonymousMaxTAC     = TAC("ri")
+)
+
 // authorizeSessionToken applies the policy for a token minted from a session
 // cookie, returning the tenant and TAC to issue it with.
 func authorizeSessionToken(s *Session, req *TokenRequest) (string, TAC, error) {
@@ -80,21 +89,40 @@ func authorizeSessionToken(s *Session, req *TokenRequest) (string, TAC, error) {
 	return authorizeSessionScoped(s, req, tac, "")
 }
 
-// authorizeAnonymousToken applies the policy for a token that omits "sub".
-// Despite the name this is not an unauthenticated path: the caller still
-// holds a valid session, and that session must carry an ACR, so a token is
-// never minted with no authentication event behind it.
-func authorizeAnonymousToken(s *Session, req *TokenRequest) (string, TAC, error) {
-	// Every login flow sets ACR, so this should be unreachable; fail closed
-	// rather than mint a token with no authentication context at all.
+// authorizeIdentityKind applies the policy both session-backed identity
+// kinds share: the ACR the mint requires (every login flow sets it, so the
+// empty case is unreachable; fail closed rather than mint a token with no
+// authentication event behind it), the kind's default TAC when the request
+// names none, and the kind's ceiling through authorizeSessionScoped - the
+// tenant scoping and the session's own grants bound the identity kinds
+// exactly as they bound the session path.
+func authorizeIdentityKind(s *Session, req *TokenRequest, defaultTAC, maxTAC TAC) (string, TAC, error) {
 	if s.ACR == "" {
 		return "", "", errNoAuthContext
 	}
 	tac := TAC(req.TAC)
 	if tac == "" {
-		tac = anonymousDefaultTAC
+		tac = defaultTAC
 	}
-	return authorizeSessionScoped(s, req, tac, anonymousMaxTAC)
+	return authorizeSessionScoped(s, req, tac, maxTAC)
+}
+
+// authorizeAnonymousToken applies the policy for a token that omits "sub".
+// Despite the name this is not an unauthenticated path: the caller still
+// holds a valid session, and that session must carry an ACR, so a token is
+// never minted with no authentication event behind it.
+func authorizeAnonymousToken(s *Session, req *TokenRequest) (string, TAC, error) {
+	return authorizeIdentityKind(s, req, anonymousDefaultTAC, anonymousMaxTAC)
+}
+
+// authorizePseudonymousToken applies the policy for the engine-transport
+// kind (engine-parity.md §8 G3): the caller's real, authenticated session
+// stands behind the mint exactly as the session path's does - the policy
+// sees the session's REAL subject, never the pseudonym the mint will carry -
+// with the kind's own ceiling, `tac ⊆ "ri"` (the WMP engine's two flow
+// gates), applied before the session's own MaxTAC.
+func authorizePseudonymousToken(s *Session, req *TokenRequest) (string, TAC, error) {
+	return authorizeIdentityKind(s, req, pseudonymousDefaultTAC, pseudonymousMaxTAC)
 }
 
 // authorizeSessionScoped is the policy both session-cookie paths share. cap,
