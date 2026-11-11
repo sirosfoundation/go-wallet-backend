@@ -523,7 +523,7 @@ func (r *Resolver) fetchOnce(ctx context.Context, issuerURL, metadataURL, accept
 //   - Key resolved from JOSE header (currently only x5c is supported; kid and
 //     trust_chain resolution are not yet implemented)
 func (r *Resolver) handleJWTResponse(ctx context.Context, issuerURL, jwtString string) (*fetchResult, error) {
-	jws, err := jose.ParseSigned(jwtString, supportedSignatureAlgorithms)
+	jws, err := jose.ParseSignedCompact(jwtString, supportedSignatureAlgorithms)
 	if err != nil {
 		return nil, fmt.Errorf("parsing JWT response: %w", err)
 	}
@@ -664,7 +664,7 @@ func validateSignedMetadataIdentity(claims map[string]interface{}, issuerURL str
 // are tried first. If none match the kid or no kid is present, all JWKS keys
 // are tried in order.
 func (r *Resolver) validateSignedMetadata(ctx context.Context, issuerURL string, raw map[string]interface{}, signedMetadata string) (map[string]interface{}, error) {
-	jws, err := jose.ParseSigned(signedMetadata, supportedSignatureAlgorithms)
+	jws, err := jose.ParseSignedCompact(signedMetadata, supportedSignatureAlgorithms)
 	if err != nil {
 		return nil, fmt.Errorf("parsing signed_metadata JWT: %w", err)
 	}
