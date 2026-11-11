@@ -1349,62 +1349,7 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 	// detected" and both emit the security event — a duplicate. Gating the
 	// emission on the atomic transition result instead means only the one
 	// call that actually won the race reports it.
-	transitioned, err := s.store.Users().UpdateCredentialAuthenticator(ctx, userID, credentialID, newSignCount, credential.Authenticator.CloneWarning)
-	if err != nil {
-		s.logger.Error("Failed to update credential authenticator", zap.Error(err))
-		// Don't fail login for this — but if a clone was genuinely detected
-		// on THIS assertion, the persistence failure must not also silently
-		// swallow the security signal itself. transitioned is unreliable
-		// here (the atomic call never got to compare-and-set), so this is a
-		// distinct, separately-greppable event from the normal
-		// "webauthn_clone_warning" line below — it says "detected, but we
-		// don't know if this made it into storage", not "confirmed newly
-		// latched". See go-wallet-backend#411.
-		if credential.Authenticator.CloneWarning {
-			s.logger.Error("possible cloned authenticator detected but the warning failed to persist",
-				zap.String("security_event", "webauthn_clone_warning_persist_failed"),
-				zap.String("user_id", userID.String()),
-				zap.String("tenant_id", string(tenantID)),
-				zap.String("credential_id", credentialID),
-				zap.Uint32("sign_count", newSignCount),
-				zap.Error(err),
-			)
-			s.audit.EmitWithSubject(EventWebAuthnCloneWarning, credentialID, map[string]any{
-				"user_id":    userID.String(),
-				"tenant_id":  string(tenantID),
-				"sign_count": newSignCount,
-				"persisted":  false,
-			})
-		}
-	}
-
-	// SECURITY: go-webauthn sets CloneWarning when the authenticator's
-	// signature counter regressed relative to what we have stored — the
-	// standard signal that this credential's private key has been cloned
-	// onto a second authenticator. We deliberately still let the login
-	// through (a single stateful counter is a weak signal in isolation, and
-	// some legitimate authenticators never increment it), but the warning
-	// must never be silently swallowed: log it as a distinct, greppable
-	// security-event line and, when audit is enabled, record it in the
-	// shared SET audit trail so it can be alerted on and investigated
-	// (issue #380). Gated on the atomic false-to-true transition reported by
-	// UpdateCredentialAuthenticator above, not the raw flag, so this fires
-	// exactly once per actual detection — even under concurrent logins —
-	// rather than on every subsequent login or being duplicated by a race.
-	if transitioned {
-		s.logger.Warn("possible cloned authenticator detected",
-			zap.String("security_event", "webauthn_clone_warning"),
-			zap.String("user_id", userID.String()),
-			zap.String("tenant_id", string(tenantID)),
-			zap.String("credential_id", credentialID),
-			zap.Uint32("sign_count", newSignCount),
-		)
-		s.audit.EmitWithSubject(EventWebAuthnCloneWarning, credentialID, map[string]any{
-			"user_id":    userID.String(),
-			"tenant_id":  string(tenantID),
-			"sign_count": newSignCount,
-		})
-	}
+	s.recordAuthenticatorUse(ctx, userID, tenantID, credentialID, newSignCount, credential.Authenticator.CloneWarning)
 
 	// SECURITY: Enforce OIDC gate based on the credential's tenant (not header tenant)
 	// This prevents bypass via X-Tenant-ID header spoofing
@@ -1587,6 +1532,15 @@ type BeginAddCredentialResponse struct {
 	Username      string                `json:"username,omitempty"`
 	ChallengeID   string                `json:"challengeId"`
 	CreateOptions CreateOptionsResponse `json:"createOptions"`
+
+	// Authorization asks an existing passkey to sign off the enrolment. It is
+	// absent only for an account that has no passkey yet.
+	Authorization *EnrollmentAuthorization `json:"authorization,omitempty"`
+}
+
+// EnrollmentAuthorization carries the assertion options for an existing passkey.
+type EnrollmentAuthorization struct {
+	PublicKey PublicKeyCredentialRequestOptions `json:"publicKey"`
 }
 
 // BeginAddCredential starts the process of adding a new credential to an existing user
@@ -1598,6 +1552,20 @@ func (s *WebAuthnService) BeginAddCredential(ctx context.Context, userID domain.
 	}
 	if err := refuseIfCutOff(ctx, user); err != nil {
 		return nil, err
+	}
+
+	// With security.webauthn.require_enrollment_authorization, an account that
+	// has a passkey needs one of them to authorise adding another, so a bearer
+	// token alone cannot enrol a passkey of its own.
+	var authorization *EnrollmentAuthorization
+	var assertionChallenge string
+	if s.enrollmentAuthorizationRequired() && len(user.WebauthnCredentials) > 0 {
+		ch, options, err := s.ownAssertionOptions(user)
+		if err != nil {
+			return nil, err
+		}
+		assertionChallenge = ch
+		authorization = &EnrollmentAuthorization{PublicKey: options}
 	}
 
 	waUser := &WebAuthnUser{user: user}
@@ -1623,6 +1591,8 @@ func (s *WebAuthnService) BeginAddCredential(ctx context.Context, userID domain.
 		UserID:    userID.String(),
 		Action:    "add_credential",
 		ExpiresAt: time.Now().Add(5 * time.Minute),
+
+		AssertionChallenge: assertionChallenge,
 	}
 
 	if err := s.store.Challenges().Create(ctx, challenge); err != nil {
@@ -1685,6 +1655,7 @@ func (s *WebAuthnService) BeginAddCredential(ctx context.Context, userID domain.
 		Username:      username,
 		ChallengeID:   challengeID,
 		CreateOptions: createOptions,
+		Authorization: authorization,
 	}, nil
 }
 
@@ -1694,12 +1665,52 @@ type FinishAddCredentialRequest struct {
 	Credential  json.RawMessage          `json:"credential"`
 	Nickname    string                   `json:"nickname,omitempty"`
 	PrivateData taggedbinary.TaggedBytes `json:"privateData,omitempty"`
+
+	// Authorization is the assertion by an existing passkey over the
+	// Authorization options of the begin response. Required unless the
+	// account has no passkey.
+	Authorization json.RawMessage `json:"authorization,omitempty"`
 }
 
 // FinishAddCredentialResponse contains the response for finishing adding a credential
 type FinishAddCredentialResponse struct {
 	CredentialID    string `json:"credentialId"`
 	PrivateDataETag string `json:"privateDataETag"`
+}
+
+// authorizeEnrollment enforces security.webauthn.require_enrollment_authorization.
+// With the flag off it returns user unchanged. With it on and a passkey on the
+// account, no assertion from one of them over this enrolment's own challenge
+// means no enrolment (fail closed). It returns the user to continue with.
+func (s *WebAuthnService) authorizeEnrollment(ctx context.Context, user *domain.User, userID domain.UserID, challenge *domain.WebauthnChallenge, authorization json.RawMessage) (*domain.User, error) {
+	if !s.enrollmentAuthorizationRequired() || len(user.WebauthnCredentials) == 0 {
+		return user, nil
+	}
+	if len(authorization) == 0 {
+		return nil, ErrEnrollmentAuthorizationRequired
+	}
+	if challenge.AssertionChallenge == "" ||
+		!s.verifyOwnAssertion(ctx, user, userID, challenge.AssertionChallenge, authorization) {
+		return nil, ErrEnrollmentAuthorizationFailed
+	}
+	// verifyOwnAssertion persisted the authorising passkey's counter and any
+	// clone warning; the snapshot loaded by the caller predates that, and the
+	// full Update later would write it back over them. Continue from the stored
+	// record (cut-off judged again against it).
+	user, err := s.store.Users().GetByID(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	if err := refuseIfCutOff(ctx, user); err != nil {
+		return nil, err
+	}
+	return user, nil
+}
+
+// enrollmentAuthorizationRequired reports whether adding a passkey to an
+// account that has one needs an assertion from an existing passkey.
+func (s *WebAuthnService) enrollmentAuthorizationRequired() bool {
+	return s.cfg != nil && s.cfg.Security.WebAuthn.RequireEnrollmentAuthorization
 }
 
 // FinishAddCredential completes adding a new credential to an existing user
@@ -1739,6 +1750,11 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 
 	if challenge.Action != "add_credential" {
 		return nil, errors.New("invalid challenge action")
+	}
+
+	user, err = s.authorizeEnrollment(ctx, user, userID, challenge, req.Authorization)
+	if err != nil {
+		return nil, err
 	}
 
 	waUser := &WebAuthnUser{user: user}
@@ -2049,4 +2065,66 @@ func (s *WebAuthnService) checkWalletLifecycle(ctx context.Context, tenantID dom
 		return ErrWalletInstanceRevoked
 	}
 	return nil
+}
+
+// recordAuthenticatorUse persists the sign counter and clone flag of an
+// accepted assertion and surfaces a clone warning as a security event. It never
+// fails the caller: a clone signal is weak on its own, but it must not vanish.
+func (s *WebAuthnService) recordAuthenticatorUse(ctx context.Context, userID domain.UserID, tenantID domain.TenantID, credentialID string, newSignCount uint32, cloneWarning bool) {
+	transitioned, err := s.store.Users().UpdateCredentialAuthenticator(ctx, userID, credentialID, newSignCount, cloneWarning)
+	if err != nil {
+		s.logger.Error("Failed to update credential authenticator", zap.Error(err))
+		// Don't fail login for this — but if a clone was genuinely detected
+		// on THIS assertion, the persistence failure must not also silently
+		// swallow the security signal itself. transitioned is unreliable
+		// here (the atomic call never got to compare-and-set), so this is a
+		// distinct, separately-greppable event from the normal
+		// "webauthn_clone_warning" line below — it says "detected, but we
+		// don't know if this made it into storage", not "confirmed newly
+		// latched". See go-wallet-backend#411.
+		if cloneWarning {
+			s.logger.Error("possible cloned authenticator detected but the warning failed to persist",
+				zap.String("security_event", "webauthn_clone_warning_persist_failed"),
+				zap.String("user_id", userID.String()),
+				zap.String("tenant_id", string(tenantID)),
+				zap.String("credential_id", credentialID),
+				zap.Uint32("sign_count", newSignCount),
+				zap.Error(err),
+			)
+			s.audit.EmitWithSubject(EventWebAuthnCloneWarning, credentialID, map[string]any{
+				"user_id":    userID.String(),
+				"tenant_id":  string(tenantID),
+				"sign_count": newSignCount,
+				"persisted":  false,
+			})
+		}
+	}
+
+	// SECURITY: go-webauthn sets CloneWarning when the authenticator's
+	// signature counter regressed relative to what we have stored — the
+	// standard signal that this credential's private key has been cloned
+	// onto a second authenticator. We deliberately still let the login
+	// through (a single stateful counter is a weak signal in isolation, and
+	// some legitimate authenticators never increment it), but the warning
+	// must never be silently swallowed: log it as a distinct, greppable
+	// security-event line and, when audit is enabled, record it in the
+	// shared SET audit trail so it can be alerted on and investigated
+	// (issue #380). Gated on the atomic false-to-true transition reported by
+	// UpdateCredentialAuthenticator above, not the raw flag, so this fires
+	// exactly once per actual detection — even under concurrent logins —
+	// rather than on every subsequent login or being duplicated by a race.
+	if transitioned {
+		s.logger.Warn("possible cloned authenticator detected",
+			zap.String("security_event", "webauthn_clone_warning"),
+			zap.String("user_id", userID.String()),
+			zap.String("tenant_id", string(tenantID)),
+			zap.String("credential_id", credentialID),
+			zap.Uint32("sign_count", newSignCount),
+		)
+		s.audit.EmitWithSubject(EventWebAuthnCloneWarning, credentialID, map[string]any{
+			"user_id":    userID.String(),
+			"tenant_id":  string(tenantID),
+			"sign_count": newSignCount,
+		})
+	}
 }

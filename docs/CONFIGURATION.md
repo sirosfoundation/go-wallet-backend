@@ -23,6 +23,7 @@ Environment variables use the prefix `WALLET_` (the registry role's settings are
 - [authzen_proxy](#authzen_proxy)
 - [audit](#audit)
 - [presentation](#presentation)
+- [user](#user)
 - [status_check](#status_check)
 - [registry](#registry)
 
@@ -278,6 +279,7 @@ Environment prefix: `WALLET_SECURITY`
 | `security.deletion_tombstone.cleanup_interval_seconds` | `WALLET_SECURITY_DELETION_TOMBSTONE_CLEANUP_INTERVAL_SECONDS` | integer | CleanupIntervalSeconds is how often expired tombstones are swept. The sweeper is what expires tombstones on backends without a TTL index (memory) and a backstop on MongoDB. Must be between 0 and 31536000 (one year); 0 means the default. Default: 3600 (1 hour) |
 | `security.deletion_tombstone.retention_margin_days` | `WALLET_SECURITY_DELETION_TOMBSTONE_RETENTION_MARGIN_DAYS` | integer | RetentionMarginDays is the safety margin added to the longest token lifetime (access token, refresh token, AS session; itself floored at one year, see MinTokenRetention) when a tombstone's expiry is computed. Must be between 0 and 36500; 0 means the default. Default: 30 |
 | `security.webauthn.attestation_conveyance` | `WALLET_SECURITY_WEBAUTHN_ATTESTATION_CONVEYANCE` | string | AttestationConveyance controls how the RP requests attestation from authenticators. Valid values: "none", "indirect", "direct", "enterprise" Default: "none" (recommended for most deployments - avoids certificate validation issues) Use "direct" only if you need to verify authenticator makes/models. |
+| `security.webauthn.require_enrollment_authorization` | `WALLET_SECURITY_WEBAUTHN_REQUIRE_ENROLLMENT_AUTHORIZATION` | boolean | RequireEnrollmentAuthorization makes adding a passkey to an account that already has one (POST /user/session/webauthn/register-begin and register-finish) need an assertion from one of the existing passkeys, so a bearer token alone cannot enrol a passkey of its own. Missing or invalid assertions are refused with 401 ENROLLMENT_AUTHORIZATION_REQUIRED / ENROLLMENT_AUTHORIZATION_FAILED. Default: false (the endpoints behave as before) for one release so that clients can move first; the default will then become true. Env: WALLET_SECURITY_WEBAUTHN_REQUIRE_ENROLLMENT_AUTHORIZATION |
 
 ## http_client
 
@@ -319,6 +321,7 @@ Environment prefix: `WALLET_AUDIT`
 | `audit.key_path` | `WALLET_AUDIT_KEY_PATH` | string | KeyPath is the path to a PEM-encoded EC private key for signing SET records. |
 | `audit.key_id` | `WALLET_AUDIT_KEY_ID` | string | KeyID is the kid used in SET JWS headers. |
 | `audit.identity_events` | `WALLET_AUDIT_IDENTITY_EVENTS` | string list | IdentityEvents selects which enterprise-identity (OIDC gate) audit events are emitted, by short name: bound, verified, mismatch, gate_bypass. Default: none. Requires enabled. The subject is only ever emitted as a hash. Unknown names are rejected at startup. Env: WALLET_AUDIT_IDENTITY_EVENTS (comma-separated) |
+| `audit.account_events` | `WALLET_AUDIT_ACCOUNT_EVENTS` | string list | AccountEvents selects which account-deletion audit events are emitted, by short name: requested, succeeded, cleanup_pending. Default: none. Requires enabled. The subject is only ever emitted as a hash; no credential content is recorded. Unknown names are rejected at startup. Env: WALLET_AUDIT_ACCOUNT_EVENTS (comma-separated) |
 
 ## presentation
 
@@ -327,6 +330,14 @@ Environment prefix: `WALLET_PRESENTATION`
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
 | `presentation.dcql_consent_check` | `WALLET_PRESENTATION_DCQL_CONSENT_CHECK` | DCQLConsentCheckMode | DCQLConsentCheck compares the user's consent (selected credential query ids and disclosed claims) with the DCQL query the backend sent to the client, before any signing. The frontend is not trusted to have honoured the query. Values: `off` (no check); `warn` (default: log a warning with the reason class and query id, never refuse; claim-path matching can disagree with a real verifier's notion of a path, so a deployer opts into enforcement); `enforce` (refuse with PRESENTATION_ERROR and answer the verifier access_denied, without signing). Nothing about claim names or values is logged. Not enforced: credential_sets satisfaction (only that no query outside every option is selected), `values` constraints, and the contents of the resulting vp_token. Unknown values fail at startup. Env: WALLET_PRESENTATION_DCQL_CONSENT_CHECK |
+
+## user
+
+Environment prefix: `WALLET_USER`
+
+| YAML Key | Env Variable | Type | Description |
+|----------|-------------|------|-------------|
+| `user.delete.require_step_up` | `WALLET_USER_DELETE_REQUIRE_STEP_UP` | boolean | RequireStepUp refuses the bodyless DELETE /user/session with 401 STEP_UP_REQUIRED, so that every deletion carries a fresh passkey assertion minted by POST /user/session/delete-begin. Default: false (the bodyless request still works) for one release so that clients can move first; the default will then become true. Env: WALLET_USER_DELETE_REQUIRE_STEP_UP |
 
 ## status_check
 
