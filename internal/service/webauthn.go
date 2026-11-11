@@ -805,6 +805,10 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 	}
 
 	if len(user.PrivateData) > 0 {
+		// Refuse before the invite is claimed or the user is created.
+		if err := validatePrivateDataOwnership(s.logger, userID, user.WebauthnCredentials, user.PrivateData); err != nil {
+			return nil, err
+		}
 		user.PrivateDataETag = domain.ComputePrivateDataETag(user.PrivateData)
 	}
 
@@ -1766,12 +1770,18 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 		}
 		u.WebauthnCredentials = append(u.WebauthnCredentials, newCred)
 		if len(req.PrivateData) > 0 {
+			// The container legitimately carries the new credential, so it is
+			// judged against the list that includes it, inside the callback so
+			// the check and the write see the same record.
+			if err := validatePrivateDataOwnership(s.logger, userID, u.WebauthnCredentials, req.PrivateData); err != nil {
+				return err
+			}
 			u.UpdatePrivateData(req.PrivateData)
 		}
 		return nil
 	})
 	if err != nil {
-		if errors.Is(err, ErrPrivateDataConflict) || errors.Is(err, storage.ErrNotFound) {
+		if errors.Is(err, ErrPrivateDataConflict) || errors.Is(err, storage.ErrNotFound) || errors.Is(err, ErrPrivateDataOwnership) {
 			return nil, err
 		}
 		return nil, fmt.Errorf("failed to update user: %w", err)

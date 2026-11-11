@@ -552,6 +552,16 @@ func (h *Handlers) GetPrivateData(c *gin.Context) {
 	c.JSON(200, gin.H{"privateData": taggedbinary.TaggedBytes(data)})
 }
 
+// respondPrivateDataOwnership writes the HTTP 422 response for a refused
+// private-data container and reports whether err was such a refusal.
+func respondPrivateDataOwnership(c *gin.Context, err error) bool {
+	if !errors.Is(err, service.ErrPrivateDataOwnership) {
+		return false
+	}
+	c.JSON(http.StatusUnprocessableEntity, gin.H{"error": service.PrivateDataOwnershipErrorCode})
+	return true
+}
+
 // respondStorageUnavailable maps transient user-store failures to non-500
 // responses and reports whether err was one: storage.ErrConflict (the record
 // kept changing under optimistic concurrency) becomes 503 with Retry-After so
@@ -607,6 +617,9 @@ func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			c.JSON(404, gin.H{"error": "User not found"})
+			return
+		}
+		if respondPrivateDataOwnership(c, err) {
 			return
 		}
 		if errors.Is(err, service.ErrPrivateDataConflict) {
@@ -880,6 +893,7 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 	if err != nil {
 		h.logger.Error("Failed to finish adding credential", zap.Error(err))
 		switch {
+		case respondPrivateDataOwnership(c, err):
 		case respondStorageUnavailable(c, err):
 		case errors.Is(err, service.ErrChallengeNotFound):
 			c.JSON(404, gin.H{})
@@ -923,9 +937,10 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 		return
 	}
 
-	// An empty body is allowed and means "do not change private data".
-	// A non-empty body that fails to parse is rejected rather than treated
-	// as empty, so malformed input can never wipe private data.
+	// A request without privateData is refused (422) rather than keeping the
+	// old container, which still lists the deleted passkey. An empty body is
+	// read as "no privateData"; a non-empty body that does not parse is a 400,
+	// never treated as empty.
 	var req struct {
 		PrivateData *taggedbinary.TaggedBytes `json:"privateData"`
 	}
@@ -941,7 +956,7 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 		}
 	}
 	var privateData []byte
-	// null, absent and an empty value ({"$b64u":""}) all mean "keep".
+	// null, absent and an empty value ({"$b64u":""}) all mean "no privateData".
 	if req.PrivateData != nil && len(*req.PrivateData) > 0 {
 		privateData = []byte(*req.PrivateData)
 	}
@@ -964,7 +979,7 @@ func (h *Handlers) DeleteWebAuthnCredential(c *gin.Context) {
 			c.JSON(409, gin.H{"error": "Cannot delete last credential"})
 			return
 		}
-		if respondStorageUnavailable(c, err) {
+		if respondPrivateDataOwnership(c, err) || respondStorageUnavailable(c, err) {
 			return
 		}
 		if errors.Is(err, service.ErrPrivateDataConflict) {

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -35,8 +36,8 @@ func addSecondCredential(t *testing.T, h *Handlers, user *domain.User) {
 	t.Helper()
 	mutateUser(t, h, user.UUID, func(u *domain.User) {
 		u.WebauthnCredentials = append(u.WebauthnCredentials, domain.WebauthnCredential{
-			ID:           "cred-2",
-			CredentialID: []byte("credential-id-bytes-2"),
+			ID:           testCredID("2"),
+			CredentialID: []byte("cred-2"),
 			PublicKey:    []byte("public-key-bytes-2"),
 			CreatedAt:    time.Now(),
 		})
@@ -73,7 +74,7 @@ func TestPrivateData_ConcurrentPostsSameIfMatch(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			w := postPrivateData(router, []byte{byte('a' + i)}, etag)
+			w := postPrivateData(router, testPrivateDataContainer(testCredID("1"), testCredID(strconv.Itoa(i))), etag)
 			codes[i] = w.Code
 		}(i)
 	}
@@ -142,7 +143,7 @@ func TestPrivateData_NotRolledBackByConcurrentWriters(t *testing.T) {
 			router.ServeHTTP(w, req)
 
 			w = httptest.NewRecorder()
-			req = httptest.NewRequest(http.MethodPost, "/webauthn/credential/cred-1/rename", strings.NewReader(`{"nickname":"n"}`))
+			req = httptest.NewRequest(http.MethodPost, "/webauthn/credential/"+testCredID("1")+"/rename", strings.NewReader(`{"nickname":"n"}`))
 			req.Header.Set("Content-Type", "application/json")
 			router.ServeHTTP(w, req)
 		}
@@ -150,7 +151,7 @@ func TestPrivateData_NotRolledBackByConcurrentWriters(t *testing.T) {
 
 	var last []byte
 	for i := 0; i < iterations; i++ {
-		last = []byte{byte(i), byte(i >> 8), 'p'}
+		last = testPrivateDataContainer(testCredID("1"), testCredID(strconv.Itoa(i)))
 		w := postPrivateData(router, last, etag)
 		if w.Code != http.StatusNoContent {
 			close(done)
@@ -192,33 +193,6 @@ func TestUpdateSettings_PreservesPrivateData(t *testing.T) {
 	}
 }
 
-func TestDeleteWebAuthnCredential_EmptyBodyPreservesPrivateData(t *testing.T) {
-	handlers, router, user := setupTestHandlersWithUser(t)
-	addSecondCredential(t, handlers, user)
-	router.POST("/webauthn/credential/:id/delete", authMiddlewareForUser(user), handlers.DeleteWebAuthnCredential)
-
-	before, beforeETag, _ := handlers.services.User.GetPrivateData(context.Background(), user.UUID)
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/webauthn/credential/cred-2/delete", nil)
-	router.ServeHTTP(w, req)
-	if w.Code != http.StatusNoContent {
-		t.Fatalf("expected 204, got %d: %s", w.Code, w.Body.String())
-	}
-	if got := w.Header().Get("X-Private-Data-ETag"); got != beforeETag {
-		t.Errorf("response ETag = %q, want unchanged %q", got, beforeETag)
-	}
-
-	after, afterETag, _ := handlers.services.User.GetPrivateData(context.Background(), user.UUID)
-	if !bytes.Equal(before, after) || beforeETag != afterETag {
-		t.Error("deleting a passkey without privateData must not modify private data")
-	}
-	u, _ := handlers.services.User.GetUserByID(context.Background(), user.UUID)
-	if len(u.WebauthnCredentials) != 1 {
-		t.Errorf("expected 1 credential left, got %d", len(u.WebauthnCredentials))
-	}
-}
-
 func TestDeleteWebAuthnCredential_MalformedBodyRejected(t *testing.T) {
 	handlers, router, user := setupTestHandlersWithUser(t)
 	addSecondCredential(t, handlers, user)
@@ -227,7 +201,7 @@ func TestDeleteWebAuthnCredential_MalformedBodyRejected(t *testing.T) {
 	before, _, _ := handlers.services.User.GetPrivateData(context.Background(), user.UUID)
 
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/webauthn/credential/cred-2/delete", strings.NewReader(`{not json`))
+	req := httptest.NewRequest(http.MethodPost, "/webauthn/credential/"+testCredID("2")+"/delete", strings.NewReader(`{not json`))
 	req.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(w, req)
 	if w.Code != http.StatusBadRequest {
@@ -250,11 +224,11 @@ func TestDeleteWebAuthnCredential_WithPrivateDataUpdatesIt(t *testing.T) {
 	router.POST("/webauthn/credential/:id/delete", authMiddlewareForUser(user), handlers.DeleteWebAuthnCredential)
 
 	_, etag, _ := handlers.services.User.GetPrivateData(context.Background(), user.UUID)
-	newData := []byte(`{"after":"delete"}`)
+	newData := testPrivateDataContainer(testCredID("1"))
 	body, _ := json.Marshal(map[string]any{"privateData": taggedbinary.TaggedBytes(newData)})
 
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/webauthn/credential/cred-2/delete", bytes.NewReader(body))
+	req := httptest.NewRequest(http.MethodPost, "/webauthn/credential/"+testCredID("2")+"/delete", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Private-Data-If-Match", etag)
 	router.ServeHTTP(w, req)
@@ -294,7 +268,7 @@ func TestGetPrivateData_EmptyStoredETag(t *testing.T) {
 	}
 
 	// The computed ETag must be usable for a conditional POST.
-	if w := postPrivateData(router, []byte("next"), wantETag); w.Code != http.StatusNoContent {
+	if w := postPrivateData(router, testPrivateDataContainer(testCredID("1"), testCredID("next")), wantETag); w.Code != http.StatusNoContent {
 		t.Errorf("conditional POST with computed ETag: expected 204, got %d", w.Code)
 	}
 }

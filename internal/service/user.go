@@ -122,6 +122,11 @@ func (s *UserService) Register(ctx context.Context, req *domain.RegisterRequest)
 
 	// Compute private data ETag
 	if len(user.PrivateData) > 0 {
+		// A user created here has no registered credentials, so a container
+		// cannot belong to it.
+		if err := validatePrivateDataOwnership(s.logger, user.UUID, user.WebauthnCredentials, user.PrivateData); err != nil {
+			return nil, err
+		}
 		user.PrivateDataETag = domain.ComputePrivateDataETag(user.PrivateData)
 	}
 
@@ -159,6 +164,11 @@ func (s *UserService) UpdatePrivateData(ctx context.Context, userID domain.UserI
 			conflictETag = u.EffectivePrivateDataETag()
 			return ErrPrivateDataConflict
 		}
+		// The container must belong to this user. Checked inside the callback
+		// so it and the write see the same record.
+		if err := validatePrivateDataOwnership(s.logger, userID, u.WebauthnCredentials, data); err != nil {
+			return err
+		}
 		u.UpdatePrivateData(data)
 		return nil
 	})
@@ -166,7 +176,7 @@ func (s *UserService) UpdatePrivateData(ctx context.Context, userID domain.UserI
 		if errors.Is(err, ErrPrivateDataConflict) {
 			return conflictETag, err
 		}
-		if errors.Is(err, storage.ErrNotFound) {
+		if errors.Is(err, storage.ErrNotFound) || errors.Is(err, ErrPrivateDataOwnership) {
 			return "", err
 		}
 		return "", fmt.Errorf("failed to update user: %w", err)
@@ -279,9 +289,13 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	return nil
 }
 
-// DeleteWebAuthnCredential deletes a WebAuthn credential.
-// If privateData is nil, the stored private data is left untouched;
-// otherwise it is replaced (subject to ifMatch) in the same atomic write.
+// DeleteWebAuthnCredential deletes a WebAuthn credential and replaces the
+// private data (subject to ifMatch) in the same atomic write. privateData is
+// required: it must be a valid container in which at least one prfKeys entry
+// matches a credential that remains after the deletion, otherwise
+// ErrPrivateDataOwnership is returned. Other entries are tolerated, so a
+// container that still lists the deleted credential is accepted; removing that
+// entry is the client's job, not checked here.
 func (s *UserService) DeleteWebAuthnCredential(ctx context.Context, userID domain.UserID, credentialID string, privateData []byte, ifMatch string) (string, error) {
 	var conflictETag string
 	stored, err := s.store.Users().Modify(ctx, userID, func(u *domain.User) error {
@@ -310,17 +324,24 @@ func (s *UserService) DeleteWebAuthnCredential(ctx context.Context, userID domai
 			return storage.ErrNotFound
 		}
 
-		u.WebauthnCredentials = newCredentials
-		if privateData != nil {
-			u.UpdatePrivateData(privateData)
+		// The container must belong to this user: at least one prfKeys entry
+		// has to match a credential that remains after the deletion. A missing
+		// container is refused rather than keeping the old one, which always
+		// lists the deleted passkey. The check runs inside the callback so it
+		// and the write see the same record.
+		if err := validatePrivateDataOwnership(s.logger, userID, newCredentials, privateData); err != nil {
+			return err
 		}
+
+		u.WebauthnCredentials = newCredentials
+		u.UpdatePrivateData(privateData)
 		return nil
 	})
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrPrivateDataConflict):
 			return conflictETag, err
-		case errors.Is(err, ErrLastWebAuthnCredential), errors.Is(err, storage.ErrNotFound):
+		case errors.Is(err, ErrLastWebAuthnCredential), errors.Is(err, storage.ErrNotFound), errors.Is(err, ErrPrivateDataOwnership):
 			return "", err
 		}
 		return "", fmt.Errorf("failed to update user: %w", err)
