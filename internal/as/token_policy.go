@@ -62,6 +62,10 @@ var (
 	errParentRevoked  = &tokenError{http.StatusUnauthorized, oauthErrInvalidGrant, "delegating token has been revoked"}
 	errParentUserGone = &tokenError{http.StatusUnauthorized, oauthErrInvalidGrant, "delegating token's user has been revoked"}
 
+	// A real subject may not look like a pseudonym: the engine and the middleware
+	// treat the pseudonym prefix as "names no user" and skip the per-user checks.
+	errReservedSubject = &tokenError{http.StatusForbidden, oauthErrInvalidGrant, "subject is reserved for pseudonymous tokens"}
+
 	// Lifecycle cut-off (SID-AUTH-06) refusals. errCutoffUnavailable is the
 	// answer when the cut-off store cannot say (distinct from the revocation
 	// store's 503, which is what the shared blacklist answers).

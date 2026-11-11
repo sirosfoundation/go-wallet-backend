@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -470,6 +471,14 @@ func issueToken(
 	tac TAC,
 	acr string,
 ) {
+	// policySub is the real subject for every kind (the pseudonymous kind mints a
+	// different one), so a real subject in the pseudonym form is refused for all.
+	if strings.HasPrefix(policySub, tokengate.PseudonymPrefix) {
+		deps.logger.Warn("token request refused: subject uses the pseudonym prefix", zap.String("user_id", policySub))
+		respondTokenError(c, errReservedSubject)
+		return
+	}
+
 	// Validate TAC characters.
 	if err := tac.Validate(); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})

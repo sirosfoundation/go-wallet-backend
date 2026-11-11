@@ -180,6 +180,10 @@ unlinkable, no `jti` maps back to a user), the same trade the anonymous kind
 makes. Backend routes that act on a wallet refuse it with `403`, like an
 anonymous token (`RequireUser`; the token has no `user_id`).
 
+Because the `p-` prefix is what marks the kind, the AS refuses to mint any token
+for a session or delegating token whose own subject starts with `p-` (`403`),
+so a real identity can never be taken for a pseudonym.
+
 The session sweep on a revocation (`DeleteByUser`) reaches this backend's own
 engine sessions only. A remote, tenant-mode engine keys its sessions by tenant,
 not by user, so it is not swept; it is covered by the mint refusal and by its
