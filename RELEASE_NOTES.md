@@ -4,6 +4,18 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.25.1:start -->
+## [v0.25.1] - 2026-11-11
+
+### Fixed
+- Prevented private-data sync conflicts by properly mapping user-store conflicts to retryable statuses and dropping stale-snapshot writers (#479)
+- Ensured registered `redirect_uri` is used instead of potentially unregistered values (#479)
+- Stopped serializing the private JWK for `private_key_jwt` client authentication, preventing accidental exposure of client secrets (#544)
+
+### Security
+- Updated to Go 1.27.4 to address CVE GO-2026-6859 in net/http (#545)
+<!-- release-notes:v0.25.1:end -->
+
 <!-- release-notes:v0.24.0:start -->
 ## [v0.24.0] - 2026-10-19
 
