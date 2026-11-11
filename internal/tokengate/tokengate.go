@@ -20,6 +20,22 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
 
+// PseudonymPrefix starts the subject of the AS's pseudonymous engine-transport
+// token (a fresh `p-<uuid>` per mint).
+const PseudonymPrefix = "p-"
+
+// NamesUser reports whether a token subject names a wallet user, i.e. whether
+// the per-user checks (cut-off, deletion tombstone, user-level revocation) mean
+// anything for it. An empty subject (anonymous token) and a pseudonym name
+// nobody: no store holds a record under them, so the checks are skipped here
+// rather than left to miss. For both kinds the revocation is enforced at the
+// mint (the AS refuses a revoked or cut-off owner), and an outstanding token
+// lives at most one TTL; routes that act on a wallet refuse them with
+// pkg/middleware's RequireUser.
+func NamesUser(subject string) bool {
+	return subject != "" && !strings.HasPrefix(subject, PseudonymPrefix)
+}
+
 // ErrRevoked is returned for a token issued before the user's authorization was cut off.
 var ErrRevoked = errors.New("token issued before the user's authorization was revoked")
 
@@ -62,11 +78,11 @@ func New(users UserLookup) *Gate {
 // Check refuses a token for userID issued at or before the user's
 // AuthInvalidBefore; no token is exempt. A user with no record is refused only
 // if DeleteUser left a tombstone: the AS also issues tokens for external
-// identities (an OIDC-authenticated admin) with no wallet user record. An empty
-// userID is not judged (pkg/middleware's RequireUser handles it). A token
+// identities (an OIDC-authenticated admin) with no wallet user record. A
+// subject that names no user (NamesUser) is not judged. A token
 // without a readable iat is refused once a cut-off exists.
 func (g *Gate) Check(ctx context.Context, userID string, issuedAt time.Time) error {
-	if g == nil || userID == "" {
+	if g == nil || !NamesUser(userID) {
 		return nil
 	}
 	cutoff, err := g.users.GetAuthCutoff(ctx, domain.UserIDFromString(userID))

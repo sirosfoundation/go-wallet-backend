@@ -167,6 +167,24 @@ on the session and in the token, with the cut-off recorded per instance - at
 which point revoking one device would leave the others' sessions alone. That
 is a design change, not a bug fix, and it is open.
 
+##### The engine-transport token
+
+The AS's pseudonymous engine token (`sub` = `p-<uuid>`, fresh per mint, `tac`
+capped at `ri`, two-minute TTL) names no user, so none of the per-user checks
+above are made for it: not the cut-off, the deletion tombstone, nor the
+user-level revocation. The cut-off applies at the **mint** instead - the AS
+judges the session behind the request, and a revoked or cut-off owner gets no
+token - so a revoked user's engine access closes within one token TTL.
+Outstanding tokens of this kind cannot be revoked individually (the pseudonym is
+unlinkable, no `jti` maps back to a user), the same trade the anonymous kind
+makes. Backend routes that act on a wallet refuse it with `403`, like an
+anonymous token (`RequireUser`; the token has no `user_id`).
+
+The session sweep on a revocation (`DeleteByUser`) reaches this backend's own
+engine sessions only. A remote, tenant-mode engine keys its sessions by tenant,
+not by user, so it is not swept; it is covered by the mint refusal and by its
+own tenant-keyed cut-off gate.
+
 Wallet instances are per tenant. Revoking the last non-revoked instance of a
 user in a tenant deactivates the wallet in that tenant: the credentials and
 presentations held there are erased, every passkey of the user is refused at

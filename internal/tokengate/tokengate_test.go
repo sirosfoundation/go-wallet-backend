@@ -149,3 +149,36 @@ func TestNoUserRecords_NeverRefuses(t *testing.T) {
 	assert.ErrorIs(t, err, storage.ErrNotFound)
 	assert.NoError(t, RefuseIfDeleted(context.Background(), NoUserRecords{}, "u"))
 }
+
+// A subject that names no user is not judged, and no store is consulted for it:
+// the pseudonymous engine kind is refused at the mint, not at each acceptance.
+type countingUsers struct{ reads int }
+
+func (c *countingUsers) GetAuthCutoff(context.Context, domain.UserID) (time.Time, error) {
+	c.reads++
+	return time.Time{}, storage.ErrNotFound
+}
+
+func (c *countingUsers) GetDeletionTombstone(context.Context, string) (*domain.DeletionTombstone, error) {
+	c.reads++
+	return nil, storage.ErrNotFound
+}
+
+func TestNamesUser(t *testing.T) {
+	assert.False(t, NamesUser(""), "anonymous")
+	assert.False(t, NamesUser(PseudonymPrefix+"6f1c2d3e-0000-4000-8000-000000000000"), "pseudonym")
+	assert.True(t, NamesUser(domain.NewUserID().String()), "a user id")
+	assert.True(t, NamesUser("external-idp-sub"), "an external identity")
+}
+
+func TestGate_SubjectsThatNameNoUserAreNotJudgedAndCostNoReads(t *testing.T) {
+	users := &countingUsers{}
+	gate := New(users)
+	for _, sub := range []string{"", PseudonymPrefix + "6f1c2d3e-0000-4000-8000-000000000000"} {
+		assert.NoError(t, gate.Check(context.Background(), sub, time.Now()))
+	}
+	assert.Zero(t, users.reads)
+
+	require.NoError(t, gate.Check(context.Background(), "external-idp-sub", time.Now()))
+	assert.Positive(t, users.reads, "a named subject is still looked up")
+}

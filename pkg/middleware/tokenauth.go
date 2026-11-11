@@ -94,7 +94,7 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist
 		// deleted user, even one whose own jti was never individually
 		// blacklisted. A no-op for anonymous tokens (empty UserID - see
 		// TokenBlacklist.IsUserRevoked).
-		if blacklist != nil {
+		if blacklist != nil && tokengate.NamesUser(result.UserID) {
 			userRevoked, err := blacklist.IsUserRevoked(c.Request.Context(), result.UserID)
 			if err != nil {
 				RefuseRevocationUnavailable(c, logger, err)
@@ -135,7 +135,9 @@ func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist
 		// than "no identity at all". Handlers must be able to tell the two
 		// apart via the exists boolean alone, without also remembering to
 		// check for an empty string every time.
-		if result.UserID != "" {
+		// A pseudonymous engine token names no user either: it gets no user_id,
+		// so RequireUser refuses it on wallet routes like an anonymous one.
+		if tokengate.NamesUser(result.UserID) {
 			c.Set("user_id", result.UserID)
 		}
 		if result.DID != "" {

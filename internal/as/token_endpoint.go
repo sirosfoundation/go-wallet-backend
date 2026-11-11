@@ -357,7 +357,7 @@ func handlePseudonymousTokenRequest(
 		// The policy sees the session's REAL subject; the mint carries a
 		// fresh pseudonym - NOT the user id.
 		func(session *Session) (string, string) {
-			return session.UserID, "p-" + uuid.New().String()
+			return session.UserID, tokengate.PseudonymPrefix + uuid.New().String()
 		},
 	)
 }

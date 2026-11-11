@@ -1099,7 +1099,7 @@ func (m *Manager) handleFlowStart(session *Session, msg *FlowStartMessage) {
 // registerSession takes sessionsMu. It closes the session and returns false
 // when the user is revoked or the store cannot answer (fail closed).
 func (m *Manager) checkSharedRevocation(session *Session) bool {
-	if session.UserID == "" || m.blacklist == nil {
+	if !tokengate.NamesUser(session.UserID) || m.blacklist == nil {
 		return true
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), revocationCheckTimeout)
@@ -1162,7 +1162,7 @@ func (m *Manager) registerSession(session *Session) bool {
 
 	m.sessionsMu.Lock()
 
-	if session.UserID != "" && m.isUserRevoked(session.UserID) {
+	if tokengate.NamesUser(session.UserID) && m.isUserRevoked(session.UserID) {
 		m.sessionsMu.Unlock()
 		session.closeWithReason("account deleted")
 		return false
@@ -1256,7 +1256,9 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 	}
 	// Per-jti revocation happens inside Validate; user-level revocation does not (the checker only
 	// sees a jti), so check the optional TokenBlacklist and the engine's own revokedUsers (#403).
-	if m.blacklist != nil {
+	// Only for a token that names a user: the pseudonymous engine kind is refused
+	// at the mint, and no store holds a record under its subject.
+	if m.blacklist != nil && tokengate.NamesUser(result.UserID) {
 		revoked, err := m.blacklist.IsUserRevoked(ctx, result.UserID)
 		if err != nil {
 			m.logger.Error("Handshake refused: revocation check failed", zap.Error(err))
@@ -1266,7 +1268,7 @@ func (m *Manager) validateToken(ctx context.Context, tokenString string) (userID
 			return "", "", "", errors.New("token has been revoked")
 		}
 	}
-	if m.isUserRevoked(result.UserID) {
+	if tokengate.NamesUser(result.UserID) && m.isUserRevoked(result.UserID) {
 		return "", "", "", errors.New("token has been revoked")
 	}
 	// SID-AUTH-06: a token issued before the user's cut-off cannot open a session.
