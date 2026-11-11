@@ -10,6 +10,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 )
 
 // Rule: a WIA is only issued when the instance key has verified FIDO2 evidence.
@@ -169,14 +170,19 @@ func TestWIAInstanceKey_NonFIDO2RecordIsNotFIDO2Evidence(t *testing.T) {
 // Key attestation for credential keys must not read instance-key evidence of
 // another kind as FIDO2 evidence.
 func TestKeyAttestation_IgnoresNonFIDO2Records(t *testing.T) {
-	svc, _, keys := assuranceSvc(t, nil, uvRules)
+	svc, instances, keys := assuranceSvc(t, nil, uvRules)
+	ctx := context.Background()
+	const inst = "inst-ka"
+	if err := instances.Upsert(ctx, &domain.WalletInstance{ID: inst, Status: domain.InstanceStatusActive}); err != nil {
+		t.Fatal(err)
+	}
 	tp := "t1"
-	putRecord(t, keys, domain.KeyAttestationRecord{KeyThumbprint: tp, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox, AAGUID: "aa1", UV: true})
-	if got := svc.fido2EvidenceFor(context.Background(), []string{tp}, nil); got != nil {
+	putRecord(t, keys, domain.KeyAttestationRecord{KeyThumbprint: tp, WalletInstanceID: inst, Kind: domain.KeyEvidenceAndroidKey, Home: domain.KeyHomeStrongBox, AAGUID: "aa1", UV: true})
+	if got := svc.fido2EvidenceFor(ctx, inst, []string{tp}, nil); got != nil {
 		t.Fatalf("android_key record rendered as fido2 evidence: %+v", got)
 	}
-	putRecord(t, keys, domain.KeyAttestationRecord{KeyThumbprint: "t2", Kind: domain.KeyEvidenceFIDO2, AAGUID: "aa1", UV: true})
-	got := svc.fido2EvidenceFor(context.Background(), []string{"t2"}, nil)
+	putRecord(t, keys, domain.KeyAttestationRecord{KeyThumbprint: "t2", WalletInstanceID: inst, Kind: domain.KeyEvidenceFIDO2, AAGUID: "aa1", UV: true})
+	got := svc.fido2EvidenceFor(ctx, inst, []string{"t2"}, nil)
 	if got == nil || got.AAGUID != "aa1" || got.UV != assurance.UVPresent {
 		t.Fatalf("fido2 record not rendered: %+v", got)
 	}
@@ -264,8 +270,15 @@ func (testAndroidBuilder) Build(r *domain.KeyAttestationRecord) *assurance.Insta
 func TestKeyAttestation_EvidenceNeverCarriesInstanceKey(t *testing.T) {
 	svc, instances, keys := assuranceSvc(t, nil, uvRules)
 	jwks := []map[string]interface{}{{"kty": "EC", "crv": "P-256", "x": "a", "y": "b"}}
-	markAttestedUV(t, keys, jwks[0], "aa1", true) // credential-key evidence under the real thumbprint
 	const instanceID = "instance-key-jkt-ka"
+	ctp, err := jwk.Thumbprint(jwks[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	// credential-key evidence under the real thumbprint, recorded for this instance
+	if err := keys.MarkKeyAttested(context.Background(), &domain.KeyAttestationRecord{KeyThumbprint: ctp, WalletInstanceID: instanceID, AAGUID: "aa1", UV: true, VerifiedAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
 	if err := instances.Upsert(context.Background(), &domain.WalletInstance{ID: instanceID, Status: domain.InstanceStatusActive, AttestationSource: "platform_attested", LastAttestedAt: time.Now().UTC()}); err != nil {
 		t.Fatal(err)
 	}

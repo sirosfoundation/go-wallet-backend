@@ -94,7 +94,7 @@ func (h *Handlers) AssurancePreview(c *gin.Context) {
 	// wallet instance can lend platform evidence.
 	tenantID, _ := h.getTenantID(c)
 	callerUser, _ := contextUserID(c)
-	ctx := service.WithKeyAttestationCaller(c.Request.Context(), service.KeyAttestationCaller{
+	ctx := service.WithKeyAttestationCaller(service.WithKeyAttestationTenant(c.Request.Context(), tenantID), service.KeyAttestationCaller{
 		TenantID: tenantID,
 		UserID:   callerUser,
 	})
@@ -104,6 +104,9 @@ func (h *Handlers) AssurancePreview(c *gin.Context) {
 		switch {
 		case errors.Is(err, storage.ErrNotFound):
 			c.JSON(http.StatusNotFound, gin.H{"error": "WALLET_INSTANCE_NOT_FOUND", "message": "wallet instance not found"})
+		case errors.Is(err, service.ErrFIDO2AttestationUnavailable):
+			h.logger.Warn("assurance preview: FIDO2 attestation cannot be verified right now", zap.Error(err))
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "ATTESTATION_UNAVAILABLE", "message": "FIDO2 attestation cannot be verified right now, retry later"})
 		case errors.Is(err, service.ErrFIDO2AttestationInvalid):
 			h.logger.Debug("assurance preview: FIDO2 attestation verification failed", zap.Error(err))
 			c.JSON(http.StatusBadRequest, gin.H{"error": "ATTESTATION_INVALID", "message": "FIDO2 attestation verification failed"})

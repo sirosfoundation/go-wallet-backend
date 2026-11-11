@@ -29,8 +29,10 @@ type Services struct {
 	WIA              *WIAService
 	Status           *StatusService // verified Token Status List API; nil when status_check.enabled is false
 	FIDO2Attestation *FIDO2AttestationService
+	WalletLifecycle  *WalletLifecycleService
 	TokenBlacklist   *TokenBlacklist
 	ChallengeCleanup *ChallengeCleanupWorker
+	TombstoneSweeper *DeletionTombstoneSweeper
 	AAGUIDValidator  *AAGUIDValidator
 }
 
@@ -53,6 +55,21 @@ func registerAppAttestAssertionVerifier(cfg *config.Config, store storage.Store,
 	keyChecker.register(v)
 }
 
+// registerFIDO2InstanceKeyVerifier registers the FIDO2 instance-key verifier.
+// A first WIA under a FIDO2-requiring policy has to carry its own FIDO2
+// evidence, so it exists only where FIDO2 attestation does.
+func registerFIDO2InstanceKeyVerifier(fido2Svc *FIDO2AttestationService, wiaSvc *WIAService, logger *zap.Logger) {
+	if !fido2Svc.IsEnabled() {
+		return
+	}
+	v, err := NewFIDO2InstanceKeyVerifier(fido2Svc, logger)
+	if err != nil {
+		logger.Warn("fido2 key attestation is not available", zap.Error(err))
+		return
+	}
+	wiaSvc.RegisterInstanceKeyVerifier(v)
+}
+
 // NewServices creates a new Services instance
 func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *Services {
 	// Create AAGUID validator first since WebAuthn service needs it
@@ -72,6 +89,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	}
 
 	wpSvc := NewWalletProviderService(cfg, logger, store.WalletInstances(), store.KeyAttestations())
+	wpSvc.SetUsers(store.Users())
 	fido2Svc := NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), engine.NewTrustService(cfg, logger), logger)
 	// The assurance preview runs the same FIDO2 verifier in dry-run.
 	wpSvc.SetFIDO2Verifier(fido2Svc)
@@ -117,13 +135,14 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		// Use the shared SET audit emitter constructor so WIA issuance events are
 		// audited whenever cfg.Audit is enabled, consistent with admin-API auditing.
 		wiaAuditor := audit.NewFromConfig(cfg, logger)
-		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain, store.WalletInstances(), wiaAuditor, challengeStore)
+		wiaSvc = NewWIAService(cfg, logger, wpSvc.jwtSigner, wpSvc.certChain, store.WalletInstances(), store.Users(), wiaAuditor, challengeStore)
 		wiaSvc.SetAssessor(assessor)
 		wiaSvc.SetKeyAttestations(store.KeyAttestations())
 		wiaSvc.SetAppAttestKeys(store.AppAttestKeys())
 		registerAppAttestAssertionVerifier(cfg, store, wiaSvc, keyChecker, logger)
 		// Instance-key evidence verifiers, one line per key_attestation type.
 		wiaSvc.RegisterInstanceKeyVerifier(androidVerifier)
+		registerFIDO2InstanceKeyVerifier(fido2Svc, wiaSvc, logger)
 		wiaSvc.SetInstanceKeyChecker(keyChecker)
 		// A signing key alone is enough to construct WIAService, but "etsi"
 		// mode additionally requires a certificate chain (see IsSupported).
@@ -152,8 +171,15 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	// external caller like cmd/server/main.go does for SetSessionCleaner,
 	// since both objects are already owned by this constructor.
 	userSvc.SetTokenBlacklist(tokenBlacklist)
+	lifecycle := NewWalletLifecycleService(store, logger, audit.NewFromConfig(cfg, logger))
+	userSvc.SetUserLocker(lifecycle)
+	if wiaSvc != nil {
+		wiaSvc.SetLifecycle(lifecycle)
+	}
+	proxySvc := NewProxyService(cfg, logger)
+	proxySvc.SetUsers(store.Users())
+	fido2Svc.SetUsers(store.Users())
 	trustSvc := engine.NewTrustService(cfg, logger)
-
 	return &Services{
 		User:             userSvc,
 		Tenant:           NewTenantService(store, logger),
@@ -163,14 +189,16 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		Issuer:           NewIssuerService(store, logger),
 		Verifier:         NewVerifierService(store, logger),
 		Keystore:         NewKeystoreService(store, cfg, logger),
-		Proxy:            NewProxyService(cfg, logger),
+		Proxy:            proxySvc,
 		Helper:           NewHelperService(logger, cfg.HTTPClient),
 		WalletProvider:   wpSvc,
 		WIA:              wiaSvc,
 		Status:           NewStatusService(cfg, trustSvc, logger.Named("status")),
 		FIDO2Attestation: fido2Svc,
+		WalletLifecycle:  lifecycle,
 		TokenBlacklist:   tokenBlacklist,
 		ChallengeCleanup: NewChallengeCleanupWorker(cfg.Security.ChallengeCleanup, store, logger),
+		TombstoneSweeper: NewDeletionTombstoneSweeper(cfg.Security.DeletionTombstone, store, logger),
 		AAGUIDValidator:  aaguidValidator,
 	}
 }
@@ -183,6 +211,9 @@ func (s *Services) Start() {
 	if s.ChallengeCleanup != nil {
 		s.ChallengeCleanup.Start()
 	}
+	if s.TombstoneSweeper != nil {
+		s.TombstoneSweeper.Start()
+	}
 	if s.WIA != nil {
 		s.WIA.Start()
 	}
@@ -192,6 +223,9 @@ func (s *Services) Start() {
 func (s *Services) Stop() {
 	if s.WIA != nil {
 		s.WIA.Stop()
+	}
+	if s.TombstoneSweeper != nil {
+		s.TombstoneSweeper.Stop()
 	}
 	if s.ChallengeCleanup != nil {
 		s.ChallengeCleanup.Stop()

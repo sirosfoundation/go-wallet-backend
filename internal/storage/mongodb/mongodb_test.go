@@ -970,6 +970,33 @@ func TestNewStore_TLSErrors(t *testing.T) {
 	})
 }
 
+func TestUserStore_InvalidateAuthBeforeAndClearWalletData(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:x", PrivateData: []byte("v"), PrivateDataETag: "e", Keys: []byte("k")}))
+
+	t2 := time.Now().Truncate(time.Millisecond)
+	t1 := t2.Add(-time.Hour)
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, t2))
+	require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, t1), "an older cut-off is a no-op ($max)")
+	u, err := store.Users().GetByID(ctx, uid)
+	require.NoError(t, err)
+	assert.True(t, u.AuthInvalidBefore.Equal(t2), "cut-off only moves forward: %v vs %v", u.AuthInvalidBefore, t2)
+
+	require.NoError(t, store.Users().EraseWalletData(ctx, uid, t2))
+	u, err = store.Users().GetByID(ctx, uid)
+	require.NoError(t, err)
+	assert.Nil(t, u.PrivateData)
+	assert.Empty(t, u.PrivateDataETag)
+	assert.Nil(t, u.Keys)
+	assert.Equal(t, "did:x", u.DID, "other fields untouched")
+	assert.True(t, u.AuthInvalidBefore.Equal(t2))
+
+	assert.ErrorIs(t, store.Users().EraseWalletData(ctx, domain.NewUserID(), time.Now()), storage.ErrNotFound)
+	assert.ErrorIs(t, store.Users().InvalidateAuthBefore(ctx, domain.NewUserID(), t2), storage.ErrNotFound)
+}
+
 // TestChallengeStore_ConsumeByID verifies the atomic FindOneAndDelete
 // primitive that fixes issue #379 (non-atomic WebAuthn challenge
 // consumption): a single ConsumeByID call both returns and deletes the
@@ -1249,6 +1276,144 @@ func TestNextSequence_FreshDatabaseIsMonotonic(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, want, got)
 	}
+}
+
+func TestUserStore_DeletionTombstones(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	users := store.Users()
+	id := "tomb-" + domain.NewUserID().String()
+	t0 := time.Now().UTC().Truncate(time.Millisecond)
+
+	_, err := users.GetDeletionTombstone(ctx, id)
+	require.ErrorIs(t, err, storage.ErrNotFound)
+
+	require.NoError(t, users.PutDeletionTombstone(ctx, &domain.DeletionTombstone{
+		UserID: id, TenantIDs: []domain.TenantID{"a"}, DeletedAt: t0, ExpiresAt: t0.Add(time.Hour),
+	}))
+	// A retry is idempotent: earliest DeletedAt, latest ExpiresAt, merged tenants.
+	require.NoError(t, users.PutDeletionTombstone(ctx, &domain.DeletionTombstone{
+		UserID: id, TenantIDs: []domain.TenantID{"a", "b"}, DeletedAt: t0.Add(time.Minute), ExpiresAt: t0.Add(2 * time.Hour),
+	}))
+	got, err := users.GetDeletionTombstone(ctx, id)
+	require.NoError(t, err)
+	require.WithinDuration(t, t0, got.DeletedAt, time.Second)
+	require.WithinDuration(t, t0.Add(2*time.Hour), got.ExpiresAt, time.Second)
+	require.ElementsMatch(t, []domain.TenantID{"a", "b"}, got.TenantIDs)
+
+	n, err := users.DeleteExpiredDeletionTombstones(ctx, t0.Add(time.Hour))
+	require.NoError(t, err)
+	_ = n
+	_, err = users.GetDeletionTombstone(ctx, id)
+	require.NoError(t, err, "not expired yet")
+	_, err = users.DeleteExpiredDeletionTombstones(ctx, t0.Add(3*time.Hour))
+	require.NoError(t, err)
+	_, err = users.GetDeletionTombstone(ctx, id)
+	require.ErrorIs(t, err, storage.ErrNotFound)
+}
+
+// The filter is what makes the compare-and-set atomic, so its shape is tested
+// without a database: whole-second comparison against the token's iat, unset
+// cut-off matches, and no iat adds no condition.
+func TestCutoffNotRefusingFilter(t *testing.T) {
+	uid := domain.NewUserID()
+	iat := time.Unix(1_700_000_000, 700_000_000)
+
+	f := cutoffNotRefusingFilter(uid, iat)
+	assert.Equal(t, uid.String(), f["_id.id"])
+	or, ok := f["$or"].(bson.A)
+	require.True(t, ok)
+	require.Len(t, or, 2)
+	assert.Equal(t, bson.M{"auth_invalid_before": bson.M{"$lt": time.Unix(1_700_000_000, 0)}}, or[0])
+	assert.Equal(t, bson.M{"auth_invalid_before": nil}, or[1])
+
+	assert.NotContains(t, cutoffNotRefusingFilter(uid, time.Time{}), "$or")
+}
+
+func TestUserStore_InvalidateAuthBeforeForToken(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:x"}))
+	base := time.Now().Truncate(time.Second)
+	tokenIat := base.Add(-time.Minute)
+
+	require.NoError(t, store.Users().InvalidateAuthBeforeForToken(ctx, uid, base, tokenIat), "no cut-off yet (field unset)")
+	u, err := store.Users().GetByID(ctx, uid)
+	require.NoError(t, err)
+	assert.True(t, u.AuthInvalidBefore.Equal(base))
+	assert.EqualValues(t, 1, u.AuthFence)
+
+	later := base.Add(time.Hour)
+	assert.ErrorIs(t, store.Users().InvalidateAuthBeforeForToken(ctx, uid, later, tokenIat), storage.ErrStaleWrite)
+	assert.ErrorIs(t, store.Users().InvalidateAuthBeforeForToken(ctx, uid, later, base.Add(300*time.Millisecond)), storage.ErrStaleWrite, "same second")
+	u, err = store.Users().GetByID(ctx, uid)
+	require.NoError(t, err)
+	assert.True(t, u.AuthInvalidBefore.Equal(base), "a refused call writes nothing")
+	assert.EqualValues(t, 1, u.AuthFence)
+
+	require.NoError(t, store.Users().InvalidateAuthBeforeForToken(ctx, uid, later, base.Add(time.Second)), "fresh token")
+	require.NoError(t, store.Users().InvalidateAuthBeforeForToken(ctx, uid, later.Add(time.Hour), time.Time{}), "no token: unconditional")
+	assert.ErrorIs(t, store.Users().InvalidateAuthBeforeForToken(ctx, domain.NewUserID(), later, tokenIat), storage.ErrNotFound)
+}
+
+func TestUserStore_TombstoneHolderDIDKeptUntilCleared(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	users := store.Users()
+	id := "tomb-did-" + domain.NewUserID().String()
+	now := time.Now().UTC()
+	put := func(did string) {
+		require.NoError(t, users.PutDeletionTombstone(ctx, &domain.DeletionTombstone{UserID: id, HolderDID: did, DeletedAt: now, ExpiresAt: now.Add(time.Hour)}))
+	}
+	put("did:example:a")
+	put("") // a retry without a DID must not erase the stored one
+	got, err := users.GetDeletionTombstone(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, "did:example:a", got.HolderDID)
+
+	require.NoError(t, users.ClearDeletionTombstoneHolderDID(ctx, id))
+	got, err = users.GetDeletionTombstone(ctx, id)
+	require.NoError(t, err)
+	require.Empty(t, got.HolderDID)
+	require.NoError(t, users.ClearDeletionTombstoneHolderDID(ctx, "missing-"+id))
+}
+
+// A lifecycle write (cut-off, erasure) that lands between Modify's read and its
+// write advances the version, so the conditional replace misses, Modify
+// re-reads and the erasure and cut-off survive; without the version advance the
+// stale copy would be written back over them.
+func TestUserStore_Modify_RetriesAfterLifecycleWrite(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	require.NoError(t, store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:x", PrivateData: []byte("vault"), Keys: []byte("k")}))
+
+	ts := time.Now().Truncate(time.Millisecond)
+	calls := 0
+	var secondSawData []byte
+	_, err := store.Users().Modify(ctx, uid, func(u *domain.User) error {
+		calls++
+		if calls == 1 {
+			// A competing lifecycle writer lands after this read.
+			require.NoError(t, store.Users().InvalidateAuthBefore(ctx, uid, ts))
+			require.NoError(t, store.Users().EraseWalletData(ctx, uid, ts))
+		} else {
+			secondSawData = u.PrivateData
+		}
+		u.DID = "did:z"
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 2, calls, "the first attempt must lose to the lifecycle writes and retry")
+	assert.Nil(t, secondSawData, "the retry reads the erased record")
+
+	u, err := store.Users().GetByID(ctx, uid)
+	require.NoError(t, err)
+	assert.Nil(t, u.PrivateData, "the erasure stands")
+	assert.Nil(t, u.Keys)
+	assert.True(t, u.AuthInvalidBefore.Equal(ts), "the cut-off stands")
+	assert.Equal(t, "did:z", u.DID)
 }
 
 // TestUserStore_Modify_ConflictExhaustion: when every attempt loses the race,

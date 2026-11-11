@@ -14,6 +14,12 @@ var (
 	ErrAlreadyExists = errors.New("already exists")
 	ErrInvalidInput  = errors.New("invalid input")
 	ErrDatabase      = errors.New("database error")
+	// ErrBindingChanged is returned by conditional instance writes when the
+	// record is no longer the one the caller read. Nothing was written.
+	ErrBindingChanged = errors.New("wallet instance binding changed")
+	// ErrStaleWrite is returned by InvalidateAuthBeforeForToken when the stored
+	// cut-off already refuses the caller's token; nothing was written.
+	ErrStaleWrite = errors.New("stale write: the user's authorization changed since the record was loaded")
 	// ErrConflict is returned when an optimistic-concurrency write could not
 	// be applied after retrying because the record kept changing.
 	ErrConflict = errors.New("concurrent modification")
@@ -71,8 +77,31 @@ type UserTenantStore interface {
 	GetMembership(ctx context.Context, userID domain.UserID, tenantID domain.TenantID) (*domain.UserTenantMembership, error)
 }
 
+// DeletionTombstoneStore keeps the record DeleteUser leaves so the deleted
+// user's tokens stay refused.
+type DeletionTombstoneStore interface {
+	// PutDeletionTombstone records a deletion idempotently: earliest DeletedAt
+	// kept, expiry only moves later, tenant ids merged, and a non-empty holder DID
+	// recorded (an empty one never erases a stored one).
+	PutDeletionTombstone(ctx context.Context, t *domain.DeletionTombstone) error
+
+	// ClearDeletionTombstoneHolderDID drops the stored holder DID once cleanup
+	// is complete (data minimisation). A missing tombstone is not an error.
+	ClearDeletionTombstoneHolderDID(ctx context.Context, userID string) error
+
+	// GetDeletionTombstone returns the tombstone or ErrNotFound; an expired but
+	// unswept one is still returned.
+	GetDeletionTombstone(ctx context.Context, userID string) (*domain.DeletionTombstone, error)
+
+	// DeleteExpiredDeletionTombstones removes tombstones expired by now and
+	// returns the count, for backends without a TTL index.
+	DeleteExpiredDeletionTombstones(ctx context.Context, now time.Time) (int, error)
+}
+
 // UserStore defines the interface for user storage operations
 type UserStore interface {
+	DeletionTombstoneStore
+
 	// Create creates a new user
 	Create(ctx context.Context, user *domain.User) error
 
@@ -93,6 +122,24 @@ type UserStore interface {
 
 	// Delete deletes a user
 	Delete(ctx context.Context, id domain.UserID) error
+
+	// InvalidateAuthBefore records that tokens issued before t are refused (see
+	// internal/tokengate). The cut-off only moves forward.
+	InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error
+
+	// InvalidateAuthBeforeForToken is an atomic compare-and-set: it advances the
+	// cut-off only while the stored one does not already refuse a token issued
+	// at tokenIssuedAt (whole seconds, tokengate.IssuedBeforeCutoff); otherwise
+	// it returns ErrStaleWrite. Zero tokenIssuedAt is unconditional.
+	InvalidateAuthBeforeForToken(ctx context.Context, id domain.UserID, t time.Time, tokenIssuedAt time.Time) error
+
+	// EraseWalletData erases the wallet key material and, in the same atomic
+	// write, advances the cut-off to fence.
+	EraseWalletData(ctx context.Context, id domain.UserID, fence time.Time) error
+
+	// GetAuthCutoff returns only the user's token cut-off, for the per-request
+	// gate.
+	GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, error)
 
 	// UpdateCredentialAuthenticator atomically persists a single WebAuthn
 	// credential's SignCount and CloneWarning, identified by the
@@ -155,6 +202,24 @@ type CredentialStore interface {
 
 	// Delete deletes a credential
 	Delete(ctx context.Context, tenantID domain.TenantID, holderDID, credentialIdentifier string) error
+
+	// DeleteIfUnchanged undoes the Create or Update that set writeToken: a
+	// compensating rollback driven by the record's undo log (see UndoLog), which
+	// the store keeps of each record's recent writes (UndoLogMaxAge,
+	// UndoLogMaxLen). Undoing the newest write puts back the record as it was
+	// before it (a create is deleted) with that record's own write token, so the
+	// write below becomes the newest again and can still be undone. Undoing a
+	// write that newer writes sit on top of removes it from the log and leaves
+	// their values in place; the next write then inherits what this one replaced.
+	// ErrNotFound if the record is gone, belongs to another tenant, or writeToken
+	// is not one of its recent writes (empty, confirmed long ago, expired).
+	DeleteIfUnchanged(ctx context.Context, tenantID domain.TenantID, id int64, writeToken string) error
+
+	// RestoreIfUnchanged undoes the write that set written.WriteToken exactly as
+	// DeleteIfUnchanged does. previous is ignored in favour of the undo log (what
+	// the caller read may be another request's unconfirmed write); stores use it
+	// only for a record written before the log existed.
+	RestoreIfUnchanged(ctx context.Context, written, previous *domain.VerifiableCredential) error
 }
 
 // PresentationStore defines the interface for presentation storage operations
@@ -176,6 +241,10 @@ type PresentationStore interface {
 
 	// Delete deletes a presentation
 	Delete(ctx context.Context, tenantID domain.TenantID, holderDID, presentationIdentifier string) error
+
+	// DeleteByID deletes the presentation with this record id; ErrNotFound if
+	// gone or replaced. A compensating rollback.
+	DeleteByID(ctx context.Context, tenantID domain.TenantID, id int64) error
 }
 
 // ChallengeStore defines the interface for WebAuthn challenge storage
@@ -342,6 +411,11 @@ type InviteStore interface {
 // WalletInstanceStore defines the interface for wallet instance storage
 type WalletInstanceStore interface {
 	// Upsert creates a new instance or updates an existing one (idempotent on first attestation).
+	// An existing instance keeps its Status and first non-empty CredentialID. On
+	// success instance.Generation is that of the record written; the bind and
+	// link are conditional on it, so a record re-created mid-call yields
+	// ErrBindingChanged. instance.Inserted reports whether this call created the
+	// record (false when it matched one, however recently another writer made it).
 	Upsert(ctx context.Context, instance *domain.WalletInstance) error
 
 	// GetByID retrieves a wallet instance by its JWK Thumbprint ID.
@@ -353,14 +427,60 @@ type WalletInstanceStore interface {
 	// GetByUser retrieves all wallet instances belonging to a specific user.
 	GetByUser(ctx context.Context, tenantID domain.TenantID, userID domain.UserID) ([]*domain.WalletInstance, error)
 
-	// UpdateStatus updates the status of a wallet instance (activate, suspend, revoke).
-	UpdateStatus(ctx context.Context, id string, status domain.InstanceStatus, reason string) error
+	// GetAllByUser returns the user's instances in every tenant, so account
+	// deletion misses none.
+	GetAllByUser(ctx context.Context, userID domain.UserID) ([]*domain.WalletInstance, error)
+
+	// UpdateStatus revokes an instance (terminal, see
+	// domain.ValidateStatusTransition). The tenant is in the filter because the
+	// id is a global key; another tenant's record answers ErrNotFound.
+	UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, status domain.InstanceStatus, reason string) error
+
+	// UpdateStatusForUser is UpdateStatus with the owner in the filter too;
+	// another user's record answers ErrNotFound.
+	UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, userID domain.UserID, status domain.InstanceStatus, reason string) error
+
+	// UpdateStatusIfUnchanged is UpdateStatus conditional on tenantID,
+	// expected.Owner (nil meaning unowned) and expected.Generation.
+	// ErrBindingChanged if the record differs, ErrNotFound if gone or another
+	// tenant's, ErrInvalidStatusTransition if already revoked.
+	UpdateStatusIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding, status domain.InstanceStatus, reason string) error
+
+	// DeleteIfUnchanged hard-deletes atomically while the record matches
+	// expected (owner and generation); errors as UpdateStatusIfUnchanged minus
+	// the transition one.
+	DeleteIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding) error
 
 	// IncrementAttestation atomically increments the attestation count and updates last_attested_at.
 	IncrementAttestation(ctx context.Context, id string) error
 
 	// Delete hard-deletes a wallet instance.
 	Delete(ctx context.Context, id string) error
+
+	// DeleteForUser hard-deletes an instance only while it is in tenantID and
+	// bound to userID; otherwise ErrNotFound.
+	DeleteForUser(ctx context.Context, id string, tenantID domain.TenantID, userID domain.UserID) error
+
+	// DeleteIfRemovable hard-deletes an active instance still matching the one
+	// the caller read. ErrBindingChanged if replaced; ErrInvalidStatusTransition
+	// if it became a tombstone (which must survive); ErrNotFound if gone or
+	// another tenant's.
+	DeleteIfRemovable(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding) error
+
+	// RestoreAttestation undoes the Upsert that set written.WriteToken and matched
+	// an existing record (the caller was fenced out after it), driven by the
+	// record's undo log (see UndoLog). When it is the newest attestation the
+	// attestation fields and counter go back to the record it replaced, including
+	// that record's write token, and the owner or passkey link the Upsert set is
+	// cleared when that record had none and the stored value is still the one
+	// written. When newer attestations sit on top it is removed from the log, their
+	// values and any owner or link stay (they may rely on them) and only the
+	// counter is undone. before is ignored in favour of the log; stores use it only
+	// for a record written before the log existed. Scoped to written's tenant and
+	// generation (ErrBindingChanged if another record now); ErrBindingChanged
+	// also when the write is not in the log or was an insert; ErrNotFound if gone.
+	// Status is never touched.
+	RestoreAttestation(ctx context.Context, before, written *domain.WalletInstance) error
 }
 
 // KeyAttestationStore defines the interface for per-credential-key FIDO2
@@ -370,7 +490,28 @@ type KeyAttestationStore interface {
 	// MarkKeyAttested durably records that a real FIDO2/CTAP2 attestation
 	// object was verified for the credential key identified by
 	// rec.KeyThumbprint.
+	// It sets rec.WriteToken to a fresh value and rec.Previous to the evidence it
+	// replaced (nil if there was none; informational, rollbacks use the undo log).
 	MarkKeyAttested(ctx context.Context, rec *domain.KeyAttestationRecord) error
+
+	// DeleteIfUnchanged undoes the write (MarkKeyAttested, ReplaceKeyEvidence or
+	// MarkKeyRevoked) that set writeToken: a compensating rollback driven by the
+	// record's undo log (see UndoLog). Undoing the newest write puts back the
+	// record as it was before it (a first insert is deleted) with that record's
+	// own write token, so the write below becomes the newest again and can still
+	// be undone; undoing a write that newer writes sit on top of removes it from
+	// the log and leaves their values in place (a revocation on top is therefore
+	// never undone by the rollback of the write below it). ErrNotFound if the
+	// record is gone or writeToken is not one of its recent writes (empty, a write
+	// that did not land, confirmed long ago, expired).
+	DeleteIfUnchanged(ctx context.Context, thumbprint, writeToken string) error
+
+	// RestoreIfUnchanged undoes the write that set written.WriteToken exactly as
+	// DeleteIfUnchanged does. previous (the Previous a write returned) is ignored
+	// in favour of the undo log, since the record it replaced may have been another
+	// request's unconfirmed write; stores use it only for a record written before
+	// the log existed.
+	RestoreIfUnchanged(ctx context.Context, written, previous *domain.KeyAttestationRecord) error
 
 	// GetByKeyThumbprint retrieves a key attestation record by its JWK
 	// Thumbprint. Returns ErrNotFound if no evidence is on file for that key.
@@ -390,6 +531,8 @@ type KeyAttestationStore interface {
 	// caller found that record no longer good). It reports whether it replaced
 	// it; false (no error) means the stored record is another one now, or none,
 	// and nothing was written.
+	// Like MarkKeyAttested it sets rec.WriteToken and rec.Previous (the record
+	// it replaced) when it replaces, for a conditional rollback.
 	ReplaceKeyEvidence(ctx context.Context, rec *domain.KeyAttestationRecord, staleChainFingerprint string) (bool, error)
 }
 

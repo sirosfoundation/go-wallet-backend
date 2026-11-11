@@ -837,12 +837,19 @@ func TestAppAttestAssertion_CachedEvidenceIsScopedToTheVerifiedCaller(t *testing
 		tenant domain.TenantID
 		user   *domain.UserID
 	}{
-		"other user": {domain.DefaultTenantID, userPtr("thief")},
-		"no user":    {domain.DefaultTenantID, nil},
+		"no user": {domain.DefaultTenantID, nil},
 	} {
 		if err := renew(c.tenant, c.user); !errors.Is(err, ErrWIARefusedByPolicy) {
 			t.Errorf("%s: cached evidence was lent (err=%v)", name, err)
 		}
+	}
+	// Another user cannot even reach the evidence: the instance is owned.
+	if err := renew(domain.DefaultTenantID, userPtr("thief")); !errors.Is(err, ErrWIAInstanceNotOwned) {
+		t.Errorf("other user: renewal = %v, want ErrWIAInstanceNotOwned", err)
+	}
+	// And the store-level scoping holds on its own.
+	if got, _ := e.svc.instanceKeyEvidence(ctx, domain.DefaultTenantID, "thief", jkt); got != nil {
+		t.Error("cached evidence was lent to another user")
 	}
 	if got, _ := e.svc.instanceKeyEvidence(ctx, "other-tenant", "owner", jkt); got != nil {
 		t.Error("cached evidence was lent to another tenant")
@@ -893,8 +900,12 @@ func TestAppAttestAssertion_RenewalSelectsS1ThroughTheShippedTemplate(t *testing
 // instance-key kind for a key submitted as a credential key does not vouch for
 // it, only a FIDO2 record does.
 func TestKeyAttestationTrustsBatch_InstanceKeyEvidenceIsNotKeyStorageEvidence(t *testing.T) {
-	svc, _, keys := newTestWalletProviderServiceWithInstances(t)
+	svc, instances, keys := newTestWalletProviderServiceWithInstances(t)
 	ctx := context.Background()
+	// Per-key evidence is only ever lent to a live instance: the batch names one.
+	if err := instances.Upsert(ctx, &domain.WalletInstance{ID: "inst-batch", Status: domain.InstanceStatusActive}); err != nil {
+		t.Fatal(err)
+	}
 	// One fresh key per case: a stored record is never replaced by a different kind.
 	freshKey := func() (map[string]interface{}, string) {
 		ck, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -917,11 +928,11 @@ func TestKeyAttestationTrustsBatch_InstanceKeyEvidenceIsNotKeyStorageEvidence(t 
 	} {
 		j, tp := freshKey()
 		rec := c.rec
-		rec.KeyThumbprint, rec.VerifiedAt = tp, time.Now()
+		rec.KeyThumbprint, rec.VerifiedAt, rec.WalletInstanceID = tp, time.Now(), "inst-batch"
 		if err := keys.MarkKeyAttested(ctx, &rec); err != nil {
 			t.Fatal(err)
 		}
-		if got := svc.keyAttestationTrustsBatch(ctx, "", []map[string]interface{}{j}); got != c.want {
+		if got := svc.keyAttestationTrustsBatch(ctx, "inst-batch", []map[string]interface{}{j}); got != c.want {
 			t.Errorf("%s evidence: batch trusted = %v, want %v", name, got, c.want)
 		}
 	}
@@ -1085,7 +1096,7 @@ func TestRestoreChallenge_SurvivesRequestCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	svc.restoreChallenge(ctx, domain.DefaultTenantID, "chal-x")
-	if ok, err := svc.challenges.Consume(context.Background(), "chal-x"); err != nil || !ok {
+	if ok, err := svc.challenges.Consume(context.Background(), domain.DefaultTenantID, "chal-x"); err != nil || !ok {
 		t.Fatalf("challenge not restored: ok=%v err=%v", ok, err)
 	}
 }

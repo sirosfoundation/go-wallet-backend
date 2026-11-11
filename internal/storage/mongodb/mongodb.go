@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"os"
@@ -82,8 +83,20 @@ func Connect(ctx context.Context, cfg *config.MongoDBConfig) (*mongo.Client, err
 	return client, nil
 }
 
-// NewStore creates a new MongoDB store
+// NewStore creates a MongoDB store and runs startup initialization (default tenant, indexes).
 func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
+	return newStore(ctx, cfg, true)
+}
+
+// NewReadOnlyStore connects like NewStore but performs no startup writes, for
+// a process that only reads (e.g. a standalone engine checking a token cut-off).
+// Its principal needs read rights on users and user_deletion_tombstones; the
+// gate fails closed if the tombstone read is denied.
+func NewReadOnlyStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
+	return newStore(ctx, cfg, false)
+}
+
+func newStore(ctx context.Context, cfg *config.MongoDBConfig, initialize bool) (*Store, error) {
 	client, err := Connect(ctx, cfg)
 	if err != nil {
 		return nil, err
@@ -102,8 +115,11 @@ func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
 	// Users always read from the primary, regardless of any readPreference in
 	// the connection URI: a secondary read right after a private-data write
 	// would return a stale ETag and make the client report a sync failure.
-	s.users = &UserStore{collection: database.Collection("users",
-		options.Collection().SetReadPreference(readpref.Primary()))}
+	s.users = &UserStore{
+		collection: database.Collection("users",
+			options.Collection().SetReadPreference(readpref.Primary())),
+		tombstones: database.Collection("user_deletion_tombstones"),
+	}
 	s.tenants = &TenantStore{collection: database.Collection("tenants")}
 	s.userTenants = &UserTenantStore{collection: database.Collection("user_tenants")}
 	s.credentials = &CredentialStore{collection: database.Collection("credentials"), counter: counters}
@@ -115,6 +131,10 @@ func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
 	s.walletInstances = &WalletInstanceStore{collection: database.Collection("wallet_instances")}
 	s.keyAttestations = &KeyAttestationStore{collection: database.Collection("key_attestations")}
 	s.appAttestKeys = &AppAttestKeyStore{collection: database.Collection("app_attest_keys")}
+
+	if !initialize {
+		return s, nil
+	}
 
 	// Initialize default tenant
 	if err := s.initializeDefaultTenant(ctx); err != nil {
@@ -228,9 +248,22 @@ func (s *Store) createIndexes(ctx context.Context) error {
 	_, err = s.walletInstances.collection.Indexes().CreateMany(ctx, []mongo.IndexModel{
 		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "status", Value: 1}}},
 		{Keys: bson.D{{Key: "tenant_id", Value: 1}, {Key: "user_id", Value: 1}}},
+		// user_id alone, for cross-tenant lookups (GetAllByUser): the compound
+		// index above is led by tenant_id and cannot serve them.
+		{Keys: bson.D{{Key: "user_id", Value: 1}}},
 	})
 	if err != nil {
 		return fmt.Errorf("failed to create wallet instance indexes: %w", err)
+	}
+
+	// Deletion tombstones expire at their own expires_at; the service sweeper
+	// does the same, so a lagging TTL monitor is harmless.
+	_, err = s.users.tombstones.Indexes().CreateOne(ctx, mongo.IndexModel{
+		Keys:    bson.D{{Key: "expires_at", Value: 1}},
+		Options: options.Index().SetExpireAfterSeconds(0),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create deletion tombstone indexes: %w", err)
 	}
 
 	// Key attestations collection indexes
@@ -310,6 +343,56 @@ func (s *Store) Ping(ctx context.Context) error {
 // UserStore implements MongoDB user storage
 type UserStore struct {
 	collection *mongo.Collection
+	// tombstones holds domain.DeletionTombstone documents, _id = user id.
+	tombstones *mongo.Collection
+}
+
+func (s *UserStore) PutDeletionTombstone(ctx context.Context, t *domain.DeletionTombstone) error {
+	if t == nil || t.UserID == "" {
+		return storage.ErrInvalidInput
+	}
+	update := bson.M{
+		// A retry keeps the earliest deleted_at and only moves expires_at later.
+		"$min": bson.M{"deleted_at": t.DeletedAt},
+		"$max": bson.M{"expires_at": t.ExpiresAt},
+	}
+	if len(t.TenantIDs) > 0 {
+		update["$addToSet"] = bson.M{"tenant_ids": bson.M{"$each": t.TenantIDs}}
+	}
+	if t.HolderDID != "" {
+		update["$set"] = bson.M{"holder_did": t.HolderDID}
+	}
+	_, err := s.tombstones.UpdateOne(ctx, bson.M{"_id": t.UserID}, update, options.Update().SetUpsert(true))
+	if err != nil {
+		return fmt.Errorf("%w: put deletion tombstone: %v", storage.ErrDatabase, err)
+	}
+	return nil
+}
+
+func (s *UserStore) ClearDeletionTombstoneHolderDID(ctx context.Context, userID string) error {
+	if _, err := s.tombstones.UpdateOne(ctx, bson.M{"_id": userID}, bson.M{"$unset": bson.M{"holder_did": ""}}); err != nil {
+		return fmt.Errorf("%w: clear deletion tombstone holder did: %v", storage.ErrDatabase, err)
+	}
+	return nil
+}
+
+func (s *UserStore) GetDeletionTombstone(ctx context.Context, userID string) (*domain.DeletionTombstone, error) {
+	var t domain.DeletionTombstone
+	if err := s.tombstones.FindOne(ctx, bson.M{"_id": userID}).Decode(&t); err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, storage.ErrNotFound
+		}
+		return nil, fmt.Errorf("%w: get deletion tombstone: %v", storage.ErrDatabase, err)
+	}
+	return &t, nil
+}
+
+func (s *UserStore) DeleteExpiredDeletionTombstones(ctx context.Context, now time.Time) (int, error) {
+	res, err := s.tombstones.DeleteMany(ctx, bson.M{"expires_at": bson.M{"$lte": now}})
+	if err != nil {
+		return 0, fmt.Errorf("%w: delete expired deletion tombstones: %v", storage.ErrDatabase, err)
+	}
+	return int(res.DeletedCount), nil
 }
 
 func (s *UserStore) Create(ctx context.Context, user *domain.User) error {
@@ -452,6 +535,99 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 		return storage.ErrNotFound
 	}
 	return nil
+}
+
+// cutoffStage is the update-pipeline stage behind both lifecycle writes: it
+// advances auth_invalid_before to t ($max, so a delayed older event cannot roll
+// it back) and always advances auth_fence and version. The version advance is
+// what makes UserStore.Modify (a conditional replace on the version it read)
+// retry instead of writing back a cut-off or erased data it read before this
+// write.
+func cutoffStage(t time.Time, extra bson.D) bson.D {
+	set := bson.D{
+		{Key: "auth_fence", Value: bson.D{{Key: "$add", Value: bson.A{bson.D{{Key: "$ifNull", Value: bson.A{"$auth_fence", 0}}}, 1}}}},
+		{Key: "version", Value: bson.D{{Key: "$add", Value: bson.A{bson.D{{Key: "$ifNull", Value: bson.A{"$version", 0}}}, 1}}}},
+		{Key: "auth_invalid_before", Value: bson.D{{Key: "$max", Value: bson.A{t, "$auth_invalid_before"}}}},
+	}
+	set = append(set, extra...)
+	return bson.D{{Key: "$set", Value: set}}
+}
+
+func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error {
+	result, err := s.collection.UpdateOne(ctx, bson.M{"_id.id": id.String()}, mongo.Pipeline{cutoffStage(t, nil)})
+	if err != nil {
+		return fmt.Errorf("failed to set auth cut-off: %w", err)
+	}
+	if result.MatchedCount == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+// cutoffNotRefusingFilter matches the user whose stored cut-off does not refuse
+// a token issued at tokenIssuedAt (unset, or before the token's second; see
+// tokengate.IssuedBeforeCutoff). A zero tokenIssuedAt adds no condition.
+func cutoffNotRefusingFilter(id domain.UserID, tokenIssuedAt time.Time) bson.M {
+	filter := bson.M{"_id.id": id.String()}
+	if !tokenIssuedAt.IsZero() {
+		filter["$or"] = bson.A{
+			bson.M{"auth_invalid_before": bson.M{"$lt": time.Unix(tokenIssuedAt.Unix(), 0)}},
+			bson.M{"auth_invalid_before": nil}, // unset or null (zero cut-off is omitted)
+		}
+	}
+	return filter
+}
+
+func (s *UserStore) InvalidateAuthBeforeForToken(ctx context.Context, id domain.UserID, t time.Time, tokenIssuedAt time.Time) error {
+	// One conditional UpdateOne: check and advance are a single atomic write.
+	result, err := s.collection.UpdateOne(ctx, cutoffNotRefusingFilter(id, tokenIssuedAt), mongo.Pipeline{cutoffStage(t, nil)})
+	if err != nil {
+		return fmt.Errorf("failed to set auth cut-off: %w", err)
+	}
+	if result.MatchedCount == 0 {
+		n, err := s.collection.CountDocuments(ctx, bson.M{"_id.id": id.String()})
+		if err != nil {
+			return fmt.Errorf("failed to set auth cut-off: %w", err)
+		}
+		if n == 0 {
+			return storage.ErrNotFound
+		}
+		return storage.ErrStaleWrite
+	}
+	return nil
+}
+
+func (s *UserStore) EraseWalletData(ctx context.Context, id domain.UserID, fence time.Time) error {
+	// One pipeline update: erasure and fence advance land together.
+	stage := cutoffStage(fence, bson.D{
+		{Key: "private_data", Value: "$$REMOVE"},
+		{Key: "private_data_etag", Value: "$$REMOVE"},
+		{Key: "keys", Value: "$$REMOVE"},
+		{Key: "updated_at", Value: time.Now()},
+	})
+	result, err := s.collection.UpdateOne(ctx, bson.M{"_id.id": id.String()}, mongo.Pipeline{stage})
+	if err != nil {
+		return fmt.Errorf("failed to erase wallet data: %w", err)
+	}
+	if result.MatchedCount == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+func (s *UserStore) GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, error) {
+	var doc struct {
+		Cutoff time.Time `bson:"auth_invalid_before"`
+	}
+	err := s.collection.FindOne(ctx, bson.M{"_id.id": id.String()},
+		options.FindOne().SetProjection(bson.M{"auth_invalid_before": 1})).Decode(&doc)
+	if err != nil {
+		if err == mongo.ErrNoDocuments {
+			return time.Time{}, storage.ErrNotFound
+		}
+		return time.Time{}, fmt.Errorf("failed to read auth cut-off: %w", err)
+	}
+	return doc.Cutoff, nil
 }
 
 func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) (bool, error) {

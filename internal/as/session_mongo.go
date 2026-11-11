@@ -17,15 +17,16 @@ const asSessionsCollection = "as_sessions"
 // sessionDoc is the stored form of a Session. The document id is
 // HashSessionID(jti); the raw JTI is never written (see HashSessionID).
 type sessionDoc struct {
-	ID        string    `bson:"_id"`
-	UserID    string    `bson:"user_id"`
-	DID       string    `bson:"did,omitempty"`
-	TenantID  string    `bson:"tenant_id"`
-	ACR       string    `bson:"acr"`
-	MaxTAC    string    `bson:"max_tac"`
-	CreatedAt time.Time `bson:"created_at"`
-	ExpiresAt time.Time `bson:"expires_at"`
-	Revoked   bool      `bson:"revoked"`
+	ID              string    `bson:"_id"`
+	UserID          string    `bson:"user_id"`
+	DID             string    `bson:"did,omitempty"`
+	TenantID        string    `bson:"tenant_id"`
+	ACR             string    `bson:"acr"`
+	MaxTAC          string    `bson:"max_tac"`
+	CreatedAt       time.Time `bson:"created_at"`
+	AuthenticatedAt time.Time `bson:"authenticated_at,omitempty"`
+	ExpiresAt       time.Time `bson:"expires_at"`
+	Revoked         bool      `bson:"revoked"`
 }
 
 // MongoSessionStore is a SessionStore backed by MongoDB, so sessions survive
@@ -65,15 +66,16 @@ func NewMongoSessionStore(ctx context.Context, db *mongo.Database) (*MongoSessio
 // Create stores a new session. Returns an error if the JTI already exists.
 func (s *MongoSessionStore) Create(ctx context.Context, session *Session) error {
 	doc := sessionDoc{
-		ID:        HashSessionID(session.JTI),
-		UserID:    session.UserID,
-		DID:       session.DID,
-		TenantID:  session.TenantID,
-		ACR:       session.ACR,
-		MaxTAC:    string(session.MaxTAC),
-		CreatedAt: session.CreatedAt,
-		ExpiresAt: session.ExpiresAt,
-		Revoked:   session.Revoked,
+		ID:              HashSessionID(session.JTI),
+		UserID:          session.UserID,
+		DID:             session.DID,
+		TenantID:        session.TenantID,
+		ACR:             session.ACR,
+		MaxTAC:          string(session.MaxTAC),
+		CreatedAt:       session.CreatedAt,
+		AuthenticatedAt: session.AuthenticatedAt,
+		ExpiresAt:       session.ExpiresAt,
+		Revoked:         session.Revoked,
 	}
 	if _, err := s.coll.InsertOne(ctx, doc); err != nil {
 		if mongo.IsDuplicateKeyError(err) {
@@ -95,15 +97,16 @@ func (s *MongoSessionStore) Get(ctx context.Context, jti string) (*Session, erro
 		return nil, fmt.Errorf("get session: %w", err)
 	}
 	return &Session{
-		JTI:       jti, // only the hash is stored; the caller presented the real value
-		UserID:    doc.UserID,
-		DID:       doc.DID,
-		TenantID:  doc.TenantID,
-		ACR:       doc.ACR,
-		MaxTAC:    TAC(doc.MaxTAC),
-		CreatedAt: doc.CreatedAt,
-		ExpiresAt: doc.ExpiresAt,
-		Revoked:   doc.Revoked,
+		JTI:             jti, // only the hash is stored; the caller presented the real value
+		UserID:          doc.UserID,
+		DID:             doc.DID,
+		TenantID:        doc.TenantID,
+		ACR:             doc.ACR,
+		MaxTAC:          TAC(doc.MaxTAC),
+		CreatedAt:       doc.CreatedAt,
+		AuthenticatedAt: doc.AuthenticatedAt,
+		ExpiresAt:       doc.ExpiresAt,
+		Revoked:         doc.Revoked,
 	}, nil
 }
 
