@@ -293,6 +293,8 @@ func (h *PasskeyHandlers) RegisterFinish(c *gin.Context) {
 			c.JSON(http.StatusForbidden, gin.H{"error": "authenticator not allowed"})
 		case errors.Is(err, service.ErrInvalidInvite):
 			c.JSON(http.StatusForbidden, gin.H{"error": "invite_invalid"})
+		case errors.Is(err, service.ErrPrivateDataOwnership):
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": service.PrivateDataOwnershipErrorCode})
 		case errors.Is(err, service.ErrTenantMismatch):
 			c.JSON(http.StatusForbidden, gin.H{"error": "tenant mismatch"})
 		default:

@@ -315,6 +315,33 @@ func TestPasskeyRegisterFinish_Error(t *testing.T) {
 	}
 }
 
+func TestPasskeyRegisterFinish_PrivateDataOwnership_Is422(t *testing.T) {
+	mock := &mockWebAuthn{
+		finishRegErr: fmt.Errorf("refused: %w", service.ErrPrivateDataOwnership),
+	}
+	router, _ := setupPasskeyHandlers(mock)
+
+	body, _ := json.Marshal(service.FinishRegistrationRequest{ChallengeID: "c1"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/finish", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["error"] != service.PrivateDataOwnershipErrorCode {
+		t.Errorf("error = %q, want %q", resp["error"], service.PrivateDataOwnershipErrorCode)
+	}
+	if len(w.Result().Cookies()) != 0 {
+		t.Error("no session cookie must be set when registration is refused")
+	}
+}
+
 func TestPasskeyRegisterFinish_BadRequest(t *testing.T) {
 	mock := &mockWebAuthn{}
 	router, _ := setupPasskeyHandlers(mock)

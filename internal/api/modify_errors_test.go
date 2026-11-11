@@ -116,11 +116,11 @@ func TestRespondStorageUnavailable_NilAndUnrelated(t *testing.T) {
 	}
 }
 
-// TestDeleteWebAuthnCredential_EmptyTaggedValueSameAsEmptyBody: a tagged
-// empty value ({"$b64u":""}) must be treated like an absent privateData and
-// must not wipe the stored container. (Current PR behaviour; the contested
-// no-privateData semantics are owned by PR 536.)
-func TestDeleteWebAuthnCredential_EmptyTaggedValueSameAsEmptyBody(t *testing.T) {
+// TestDeleteWebAuthnCredential_NoPrivateDataIsRefused: a request without a
+// container (empty body, {}, null, or a tagged empty value) is refused with 422
+// and changes nothing, because keeping the old container would keep the
+// deleted passkey's prfKeys entry.
+func TestDeleteWebAuthnCredential_NoPrivateDataIsRefused(t *testing.T) {
 	for _, body := range []string{``, `{}`, `{"privateData":null}`, `{"privateData":{"$b64u":""}}`} {
 		t.Run(strings.ReplaceAll(body, `"`, "'"), func(t *testing.T) {
 			handlers, router, user := setupTestHandlersWithUser(t)
@@ -129,15 +129,17 @@ func TestDeleteWebAuthnCredential_EmptyTaggedValueSameAsEmptyBody(t *testing.T) 
 			before, beforeETag, _ := handlers.services.User.GetPrivateData(context.Background(), user.UUID)
 
 			w := httptest.NewRecorder()
-			req := httptest.NewRequest(http.MethodPost, "/webauthn/credential/cred-2/delete", strings.NewReader(body))
+			req := httptest.NewRequest(http.MethodPost, "/webauthn/credential/"+testCredID("2")+"/delete", strings.NewReader(body))
 			req.Header.Set("Content-Type", "application/json")
 			router.ServeHTTP(w, req)
-			if w.Code != http.StatusNoContent {
-				t.Fatalf("status = %d: %s", w.Code, w.Body.String())
-			}
+			assertOwnership422(t, w)
 			after, afterETag, _ := handlers.services.User.GetPrivateData(context.Background(), user.UUID)
 			if !bytes.Equal(before, after) || beforeETag != afterETag {
 				t.Errorf("private data changed for body %q", body)
+			}
+			u, _ := handlers.services.User.GetUserByID(context.Background(), user.UUID)
+			if len(u.WebauthnCredentials) != 2 {
+				t.Errorf("the credential was deleted for body %q", body)
 			}
 		})
 	}

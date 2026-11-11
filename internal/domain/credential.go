@@ -99,15 +99,18 @@ const (
 
 // CredentialIssuer represents a credential issuer with per-tenant trust status
 type CredentialIssuer struct {
-	ID                         int64       `json:"id" bson:"_id,omitempty" gorm:"primaryKey;autoIncrement"`
-	TenantID                   TenantID    `json:"tenantId" bson:"tenant_id" gorm:"index;not null;default:'default'"`
-	CredentialIssuerIdentifier string      `json:"credentialIssuerIdentifier" bson:"credential_issuer_identifier" gorm:"index;not null"`
-	ClientID                   string      `json:"clientId,omitempty" bson:"client_id"`
-	ClientJWK                  string      `json:"clientJwk,omitempty" bson:"client_jwk" gorm:"column:client_jwk"`
-	Visible                    bool        `json:"visible" bson:"visible"`
-	TrustStatus                TrustStatus `json:"trustStatus,omitempty" bson:"trust_status" gorm:"default:'unknown'"`
-	TrustFramework             string      `json:"trustFramework,omitempty" bson:"trust_framework"`
-	TrustEvaluatedAt           *time.Time  `json:"trustEvaluatedAt,omitempty" bson:"trust_evaluated_at"`
+	ID                         int64    `json:"id" bson:"_id,omitempty" gorm:"primaryKey;autoIncrement"`
+	TenantID                   TenantID `json:"tenantId" bson:"tenant_id" gorm:"index;not null;default:'default'"`
+	CredentialIssuerIdentifier string   `json:"credentialIssuerIdentifier" bson:"credential_issuer_identifier" gorm:"index;not null"`
+	ClientID                   string   `json:"clientId,omitempty" bson:"client_id"`
+	// ClientJWK is the backend's private_key_jwt client credential, including the
+	// private part. It is never serialized to JSON (the engine reads it
+	// in-process from storage; the admin API reports only HasClientJWK).
+	ClientJWK        string      `json:"-" bson:"client_jwk" gorm:"column:client_jwk"`
+	Visible          bool        `json:"visible" bson:"visible"`
+	TrustStatus      TrustStatus `json:"trustStatus,omitempty" bson:"trust_status" gorm:"default:'unknown'"`
+	TrustFramework   string      `json:"trustFramework,omitempty" bson:"trust_framework"`
+	TrustEvaluatedAt *time.Time  `json:"trustEvaluatedAt,omitempty" bson:"trust_evaluated_at"`
 }
 
 // TableName specifies the table name for GORM

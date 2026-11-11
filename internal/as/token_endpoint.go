@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
@@ -201,6 +202,20 @@ func TokenEndpointHandler(cfg TokenEndpointConfig) gin.HandlerFunc {
 			return
 		}
 
+		// The pseudonymous engine kind: a real session behind the mint, a
+		// random pseudonym in the token (engine-parity.md §8 G3). Like the
+		// anonymous branch it has no session-less form - checked before the
+		// delegation fallthrough for the same clear-error reason.
+		if req.Pseudonymous {
+			sessionID := GetSessionCookie(c, opts)
+			if sessionID == "" {
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+				return
+			}
+			handlePseudonymousTokenRequest(c, store, deps, sessionID, &req)
+			return
+		}
+
 		if sessionID := GetSessionCookie(c, opts); sessionID != "" {
 			handleSessionTokenRequest(c, store, deps, sessionID, &req)
 		} else {
@@ -242,31 +257,36 @@ func handleSessionTokenRequest(
 		return
 	}
 
-	issueToken(c, deps, sessionSubject(session), session.UserID, req.Audience, tenantID, tac, session.ACR)
+	issueToken(c, deps, sessionSubject(session), session.UserID, session.UserID, req.Audience, tenantID, tac, session.ACR)
 }
 
-// handleAnonymousTokenRequest issues a token that omits the caller's
-// identity ("sub"). Despite the name, this is NOT an unauthenticated path:
-// the caller must have a valid, already-authenticated session, resolved and
-// validated exactly like handleSessionTokenRequest. "Anonymous" means "omit
-// my identity from this specific token" - e.g. for a privacy-preserving
-// trust-evaluation or engine-transport call the caller doesn't want tied to
-// their identity - not "no authentication required at all". A caller with
-// no session never reaches this function (see TokenEndpointHandler).
+// handleIdentityKindToken is the shared shape of the session-backed
+// identity kinds - the anonymous kind (the token omits "sub") and the
+// pseudonymous engine kind (the token carries a fresh per-mint pseudonym,
+// engine-parity.md §8 G3). Neither is an unauthenticated path: the caller
+// must hold a valid, already-authenticated session, resolved and validated
+// exactly like handleSessionTokenRequest's.
 //
-// tenant_id and acr are threaded through from the real session exactly as
-// handleSessionTokenRequest does: the "default" tenant gets no special
-// treatment anywhere in this file, it is just whichever tenant the caller's
-// own session happens to belong to. tac is additionally capped to read-only
-// regardless of the session's own MaxTAC - the point of this path is a
-// narrowly-scoped, identity-free token, not "everything my session can do,
-// minus my name".
-func handleAnonymousTokenRequest(
+// The kind supplies its policy (the authorize function: the tenant scoping,
+// the kind's own TAC ceiling, the session's grants) and its two subjects:
+// the subject the POLICY sees (none at all for the anonymous kind; the
+// session's real subject for the pseudonymous one - the question it answers
+// is "may this authenticated user mint an engine token", which the pseudonym
+// would not carry) and the subject the MINT carries.
+//
+// The lifecycle cut-off (SID-AUTH-06) and the revocation check run before
+// the policy, the latter with the deletion-only exemption off and no TAC: a revoked owner gets no identity-kind token at
+// all - the anonymous kind's missing "sub" would bypass the user revocation,
+// and the pseudonymous kind's fresh sub would name nobody the revocation
+// lists.
+func handleIdentityKindToken(
 	c *gin.Context,
 	store SessionStore,
 	deps *tokenDeps,
 	sessionID string,
 	req *TokenRequest,
+	authorize func(*Session, *TokenRequest) (string, TAC, error),
+	subs func(*Session) (policy, minted string),
 ) {
 	session, err := store.Get(c.Request.Context(), sessionID)
 	if err != nil || session == nil || !session.IsValid() {
@@ -277,20 +297,69 @@ func handleAnonymousTokenRequest(
 		respondCutoff(c, deps, err)
 		return
 	}
-	// Before the policy, and with no TAC: a revoked owner gets no anonymous
-	// token at all, since a missing "sub" would bypass the user revocation.
 	if err := sessionOwnerRevoked(c.Request.Context(), deps.blacklist, session, false, ""); err != nil {
 		respondRevocation(c, deps, err)
 		return
 	}
 
-	tenantID, tac, err := authorizeAnonymousToken(session, req)
+	tenantID, tac, err := authorize(session, req)
 	if err != nil {
 		respondTokenError(c, err)
 		return
 	}
 
-	issueToken(c, deps, sessionSubject(session), "", req.Audience, tenantID, tac, session.ACR)
+	policySub, mintedSub := subs(session)
+	issueToken(c, deps, sessionSubject(session), policySub, mintedSub, req.Audience, tenantID, tac, session.ACR)
+}
+
+// handleAnonymousTokenRequest issues a token that omits the caller's
+// identity ("sub"): a privacy-preserving, narrowly-scoped, identity-free
+// token - tac capped to read-only regardless of the session's own MaxTAC -
+// not "everything my session can do, minus my name". The policy sees no
+// subject at all; tenant_id and acr thread through from the real session
+// exactly as handleSessionTokenRequest's, the "default" tenant getting no
+// special treatment anywhere in this file.
+func handleAnonymousTokenRequest(
+	c *gin.Context,
+	store SessionStore,
+	deps *tokenDeps,
+	sessionID string,
+	req *TokenRequest,
+) {
+	handleIdentityKindToken(c, store, deps, sessionID, req,
+		authorizeAnonymousToken,
+		func(*Session) (string, string) { return "", "" },
+	)
+}
+
+// handlePseudonymousTokenRequest issues the engine-transport token kind
+// (engine-parity.md §8 G3): the caller's real, authenticated session stands
+// behind the mint, but the token's `sub` is a fresh random pseudonym - per
+// mint, so it identifies nothing and cannot be correlated across mints. The
+// privacy point: the remote engine consumes this kind and attributes its
+// traffic to the TENANT, never to a person (its session store, its logs, its
+// KV flow registry all key the tenant's pseudonym, which rotates with the
+// token's TTL).
+//
+// The token is engine-shaped: `tac` defaults to and is capped at "ri" - the
+// two flow gates the WMP engine enforces (read for OID4VP sharing an
+// existing credential, insert for OID4VCI receiving a new one); the tenant
+// claimed as today.
+func handlePseudonymousTokenRequest(
+	c *gin.Context,
+	store SessionStore,
+	deps *tokenDeps,
+	sessionID string,
+	req *TokenRequest,
+) {
+	handleIdentityKindToken(c, store, deps, sessionID, req,
+		authorizePseudonymousToken,
+		// The policy sees the session's REAL subject; the mint carries a
+		// fresh pseudonym - NOT the user id.
+		func(session *Session) (string, string) {
+			return session.UserID, "p-" + uuid.New().String()
+		},
+	)
 }
 
 // handleDelegationTokenRequest issues a downscoped token from a Bearer token
@@ -339,7 +408,7 @@ func handleDelegationTokenRequest(
 		return
 	}
 
-	issueToken(c, deps, parent, parentClaims.Subject, req.Audience, tenantID, tac, parentClaims.ACR)
+	issueToken(c, deps, parent, parentClaims.Subject, parentClaims.Subject, req.Audience, tenantID, tac, parentClaims.ACR)
 }
 
 // parentTokenRevoked returns the refusal when the delegating token may no
@@ -397,7 +466,7 @@ func issueToken(
 	c *gin.Context,
 	deps *tokenDeps,
 	subject cutoffSubject,
-	sub, audience, tenantID string,
+	policySub, mintSub, audience, tenantID string,
 	tac TAC,
 	acr string,
 ) {
@@ -408,7 +477,7 @@ func issueToken(
 	}
 
 	// Build SPOCP query and evaluate.
-	query := BuildTokenQuery(sub, audience, tenantID, tac, acr)
+	query := BuildTokenQuery(policySub, audience, tenantID, tac, acr)
 
 	allowed, err := deps.policy.Evaluate(query)
 	if err != nil {
@@ -422,7 +491,7 @@ func issueToken(
 
 	if !allowed {
 		deps.logger.Info("token request denied by policy",
-			zap.String("user_id", sub),
+			zap.String("user_id", policySub),
 			zap.String("audience", audience),
 			zap.String("tenant_id", tenantID),
 			zap.String("tac", string(tac)),
@@ -432,7 +501,7 @@ func issueToken(
 	}
 
 	// Issue signed access token.
-	tokenStr, err := deps.issuer.Issue(sub, audience, tenantID, tac, acr)
+	tokenStr, err := deps.issuer.Issue(mintSub, audience, tenantID, tac, acr)
 	if err != nil {
 		deps.logger.Error("token issuance failed", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "token issuance failed"})

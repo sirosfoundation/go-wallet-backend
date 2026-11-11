@@ -64,7 +64,7 @@ func TestFinishAddCredential_PrivateDataAtomicWithAppend(t *testing.T) {
 	ctx := setup.ctx
 
 	userID := domain.NewUserID()
-	existing := domain.WebauthnCredential{ID: "existing-cred", CredentialID: []byte("existing-cred")}
+	existing := domain.WebauthnCredential{ID: testCredID("e"), CredentialID: []byte("cred-e")}
 	require.NoError(t, setup.store.Users().Create(ctx, &domain.User{
 		UUID:                userID,
 		CreatedAt:           time.Now(),
@@ -115,14 +115,15 @@ func TestFinishAddCredential_PrivateDataAtomicWithAppend(t *testing.T) {
 		u, err := setup.store.Users().GetByID(ctx, userID)
 		require.NoError(t, err)
 
-		resp, err := finish(t, []byte("new"), u.EffectivePrivateDataETag())
+		newData := testPrivateDataContainer(testCredID("e"))
+		resp, err := finish(t, newData, u.EffectivePrivateDataETag())
 		require.NoError(t, err)
 
 		u, err = setup.store.Users().GetByID(ctx, userID)
 		require.NoError(t, err)
 		assert.Len(t, u.WebauthnCredentials, 3)
-		assert.Equal(t, []byte("new"), u.PrivateData)
-		assert.Equal(t, domain.ComputePrivateDataETag([]byte("new")), resp.PrivateDataETag)
+		assert.Equal(t, newData, u.PrivateData)
+		assert.Equal(t, domain.ComputePrivateDataETag(newData), resp.PrivateDataETag)
 	})
 
 }

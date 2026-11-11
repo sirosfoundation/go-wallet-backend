@@ -61,7 +61,7 @@ func TestAccountInfo(t *testing.T) {
 // TestPrivateData tests private data endpoints
 func TestPrivateData(t *testing.T) {
 	h := NewTestHarness(t)
-	user := h.CreateTestUser("Private Data User")
+	user := h.CreateTestUserWithCredentials("Private Data User")
 
 	t.Run("GET returns private data with ETag", func(t *testing.T) {
 		resp := h.AuthGET(user, "/user/session/private-data")
@@ -88,11 +88,9 @@ func TestPrivateData(t *testing.T) {
 		etag := getResp.Header("X-Private-Data-ETag")
 
 		// Update with new data
-		newData := `{"updated":"value"}`
-		newDataB64 := base64.RawURLEncoding.EncodeToString([]byte(newData))
-		updateReq := map[string]interface{}{
-			"privateData": map[string]string{"$b64u": newDataB64},
-		}
+		newData := PrivateDataContainer(MockCredentialID, "c3RhbGU")
+		newDataB64 := base64.RawURLEncoding.EncodeToString(newData)
+		updateReq := map[string]interface{}{"$b64u": newDataB64}
 
 		// Create request with If-Match header
 		req, _ := http.NewRequest("POST", h.BaseURL+"/user/session/private-data", nil)
@@ -107,6 +105,26 @@ func TestPrivateData(t *testing.T) {
 			resp.Response.StatusCode != http.StatusNoContent &&
 			resp.Response.StatusCode != http.StatusPreconditionFailed {
 			t.Errorf("Expected 200, 204, or 412, got %d: %s", resp.Response.StatusCode, resp.Pretty())
+		}
+	})
+
+	t.Run("POST refuses a container of another account with 422", func(t *testing.T) {
+		before := h.AuthGET(user, "/user/session/private-data").Header("X-Private-Data-ETag")
+
+		foreign := PrivateDataContainer(base64.RawURLEncoding.EncodeToString([]byte("someone-elses-credential")))
+		resp := h.AuthPOST(user, "/user/session/private-data", map[string]interface{}{
+			"$b64u": base64.RawURLEncoding.EncodeToString(foreign),
+		})
+		resp.Status(http.StatusUnprocessableEntity)
+		var body map[string]string
+		resp.JSON(&body)
+		if body["error"] != "private_data_ownership" {
+			t.Errorf("error = %q, want private_data_ownership", body["error"])
+		}
+
+		after := h.AuthGET(user, "/user/session/private-data").Header("X-Private-Data-ETag")
+		if after != before {
+			t.Errorf("ETag changed after refused upload: %q -> %q", before, after)
 		}
 	})
 
@@ -187,7 +205,7 @@ func TestWebAuthnCredentialManagement(t *testing.T) {
 			"nickname": "My Security Key",
 		}
 
-		resp := h.AuthPOST(user, "/user/session/webauthn-credential/test-credential-1/rename", renameReq)
+		resp := h.AuthPOST(user, "/user/session/webauthn-credential/"+MockCredentialID+"/rename", renameReq)
 		// May return 200 or 404 depending on credential lookup
 		if resp.Response.StatusCode >= 500 {
 			t.Errorf("Got server error: %d - %s", resp.Response.StatusCode, resp.Pretty())
@@ -198,7 +216,7 @@ func TestWebAuthnCredentialManagement(t *testing.T) {
 		// Create a new user with credential to delete
 		user2 := h.CreateTestUserWithCredentials("Delete Cred User")
 
-		resp := h.AuthDELETE(user2, "/user/session/webauthn-credential/test-credential-1")
+		resp := h.AuthDELETE(user2, "/user/session/webauthn-credential/"+MockCredentialID+"")
 		// Should succeed or fail gracefully
 		if resp.Response.StatusCode >= 500 {
 			t.Errorf("Got server error: %d - %s", resp.Response.StatusCode, resp.Pretty())
