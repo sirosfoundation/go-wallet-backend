@@ -1,5 +1,4 @@
-// Package engine provides WebSocket v2 protocol implementation.
-package engine
+package service
 
 import (
 	"fmt"
@@ -12,21 +11,9 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/trust/authzen"
 )
 
-// Type aliases for backward compatibility.
-// The actual trust evaluation implementation lives in pkg/trust.Service.
-type (
-	// TrustService provides trust evaluation for engine flows.
-	// Deprecated: Use trust.Service directly when writing new code.
-	TrustService = trust.Service
-
-	// KeyMaterial represents cryptographic key material for trust evaluation.
-	// Deprecated: Use trust.KeyMaterial directly when writing new code.
-	KeyMaterial = trust.KeyMaterial
-)
-
 // NewTrustService creates a new trust service with the default AuthZEN evaluator factory.
 // This is a convenience wrapper for backward compatibility.
-func NewTrustService(cfg *config.Config, logger *zap.Logger) *TrustService {
+func NewTrustService(cfg *config.Config, logger *zap.Logger) *trust.Service {
 	return trust.NewService(cfg, logger, newAuthZENEvaluatorFactory(cfg))
 }
 

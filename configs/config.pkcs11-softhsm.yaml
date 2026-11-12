@@ -8,8 +8,6 @@ server:
   # Per-service bind addresses (default to 'host' if not specified)
   # admin_host: "127.0.0.1"    # Bind admin API to localhost only
   admin_port: 8081
-  # engine_host: "0.0.0.0"     # Bind engine to all interfaces
-  engine_port: 8082
   # registry_host: "127.0.0.1" # Bind registry to localhost only
   registry_port: 8097
   rp_id: "localhost"
@@ -62,7 +60,6 @@ server:
   # (optional - defaults to localhost with respective ports)
   # external_urls:
   #   backend_url: "https://backend.example.com"
-  #   engine_url: "wss://engine.example.com"
   #   registry_url: "https://registry.example.com"
   #   admin_url: "https://admin.example.com"
 

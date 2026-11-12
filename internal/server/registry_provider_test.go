@@ -6,7 +6,6 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
-	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -243,22 +242,4 @@ func TestRegistryProvider_RootAliases(t *testing.T) {
 	p2.SetRootAliases(true)
 	assert.Equal(t, http.StatusOK, get(p2, "/credentials"))
 	assert.Equal(t, http.StatusBadRequest, get(p2, "/type-metadata"), "handler reached (vct required)")
-}
-
-func TestRegistryProvider_InProcessHandler(t *testing.T) {
-	cfg := registryTestConfig(t)
-	cfg.Registry.RequireAuth = true // in-process callers are trusted: no auth, no rate limit
-	cfg.AS.ExternalURL = "http://127.0.0.1:1"
-	p, err := NewRegistryProvider(cfg, zap.NewNop())
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = p.Close() })
-	h := p.InProcessHandler()
-
-	w := httptest.NewRecorder()
-	h.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/registry/type-metadata", nil))
-	assert.Equal(t, http.StatusBadRequest, w.Code, "handler reached without a token")
-
-	// EngineProvider wiring
-	ep := &EngineProvider{manager: wsengine.NewManager(cfg, zap.NewNop())}
-	ep.SetRegistryHandler(h)
 }

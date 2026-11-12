@@ -368,7 +368,7 @@ kubectl apply -f k8s/ingress.yaml
 ## VCTM Registry Deployment
 
 The registry is a role of the main server binary. Deploy it either together
-with other roles (`--mode=backend,registry,engine,auth`, served from the shared
+with other roles (`--mode=backend,registry,auth`, served from the shared
 HTTP port under `/registry`) or on its own (`--mode=registry`).
 
 ### Registry-only
@@ -514,7 +514,6 @@ configured `as.audiences` is never altered (and no longer has to include
 - [ ] Configure CORS origins
 - [ ] Set `server.trusted_proxies` to your load balancer's addresses (or `["none"]` without one). Unset, every peer is trusted for `X-Forwarded-For`, so a direct caller can pick its own client IP and dodge the per-IP OIDC gate rate limit
 - [ ] Set up monitoring and logging
-- [ ] If running a standalone engine (`--mode=engine`, no backend) with `as.external_url`, read [Token revocation limits](#token-revocation-limits)
 - [ ] Configure health checks
 - [ ] Set resource limits
 - [ ] Enable autoscaling
@@ -537,28 +536,6 @@ scrape_configs:
     static_configs:
       - targets: ['wallet-backend:8080']
 ```
-
-### WebSocket close reasons
-
-Every engine WebSocket session that ends logs exactly one Info line,
-`Session close reason`, and increments the counter
-`siros_engine_ws_session_closed_total{reason}`. Use it to tell *why* clients
-that keep reconnecting are being dropped.
-
-| `reason` | Meaning | Extra fields |
-| --- | --- | --- |
-| `read_deadline` | No frame, ping or pong from the client within the read window (`ping_interval` + `pong_timeout`, default 3 s + 5 s) | `read_window`, `since_last_inbound` |
-| `peer_close` | The client sent a close frame or the TCP connection was closed | `close_code` (numeric only; the peer's close text is never logged) |
-| `superseded` | A newer connection for the same user replaced this one ("last connection wins") | `superseded_by_session_id` |
-| `account_deleted`, `token_revoked`, `revocation_check_failed` | Closed by the server because the user or token was revoked, or the revocation store could not answer | |
-| `write_error` | A ping or handshake write failed | |
-| `server_shutdown` | `engine.Manager.Close` closed the session. The server binary does not currently call it on SIGTERM, so this is not expected in production | |
-| `read_error` | Any other read failure | `error_class` (Go type only, no message) |
-| `server_close` | Any other server-initiated close | |
-
-Common fields: `session_id`, `session` (short user id), `tenant_id`,
-`remote_addr` (the raw socket peer: behind a proxy this is the proxy, not the
-client), `session_age`, `ping_interval`, `pong_timeout`.
 
 The default JSON logger uses zap's production sampling (the first 100 lines
 per second for a given level and message are kept, then every 100th), so a
@@ -707,8 +684,8 @@ revocations are idempotent and are never withdrawn after a failure. If
 the store cannot be set up at startup the process still starts, logs an
 error and refuses authenticated requests until restarted.
 
-A process that has no storage backend of its own, a standalone engine
-(`--mode=engine`) or registry (`--mode=registry`), connects to the same
+A process that has no storage backend of its own, a registry
+(`--mode=registry`), connects to the same
 revocation collections using `storage.mongodb` when the setting resolves to
 `storage`, so it rejects what the backend replicas revoked. Give such a
 process the same `storage.mongodb` settings as the backend. If the setting is
@@ -739,20 +716,12 @@ process is possible.
 Revocation is enforced by the revocation store; see [Token revocation with several replicas](#token-revocation-with-several-replicas) for what the shared and the per-process backends cover.
 
 <a id="split-mode-as-jwks"></a>
-**Split mode: reaching the AS for its signing keys.** The standalone engine, a registry-only process and an isolated wallet-provider fetch the AS keys from `<as.external_url>/auth/.well-known/jwks.json`. In a split-pod deployment just set `as.external_url` to the AS's in-cluster URL (`http` or `https`). The JWKS is fetched by go-tokenauth without SSRF filtering or a plaintext check, because it is infrastructure-internal traffic between components of the same cluster; do not point `as.external_url` at anything outside your own infrastructure. Example (engine and registry pods):
+**Split mode: reaching the AS for its signing keys.** A registry-only process and an isolated wallet-provider fetch the AS keys from `<as.external_url>/auth/.well-known/jwks.json`. In a split-pod deployment just set `as.external_url` to the AS's in-cluster URL (`http` or `https`). The JWKS is fetched by go-tokenauth without SSRF filtering or a plaintext check, because it is infrastructure-internal traffic between components of the same cluster; do not point `as.external_url` at anything outside your own infrastructure. Example (registry pods):
 
 ```yaml
 as:
   external_url: http://backend.wallet.svc:8080
 ```
-
-**Standalone engine (`--mode=engine`, no backend provider):** with the shared MongoDB revocation store (see above) the engine rejects what the backend revoked. With `backend: memory`, or non-MongoDB storage, it keeps no revocation state: after a logout or user revocation at the backend, a token **stays valid at the standalone engine until it expires**, and a new WebSocket handshake with it is still accepted. The engine logs a warning at startup when it is built this way.
-
-Mitigations:
-
-- Use short access token TTLs, so the exposure window is bounded by the TTL.
-- Co-host the engine with the backend (the default all-in-one mode), which shares the token blacklist.
-- Use the shared MongoDB revocation store (see above), which a standalone engine reads too.
 
 ### Database Scaling
 

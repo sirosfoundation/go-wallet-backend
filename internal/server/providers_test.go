@@ -32,7 +32,6 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/api"
 	"github.com/sirosfoundation/go-wallet-backend/internal/backend"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
-	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
@@ -210,63 +209,6 @@ func TestBackendProvider_CheckReady_Timeout(t *testing.T) {
 // =============================================================================
 // EngineProvider CheckReady tests
 // =============================================================================
-
-func TestEngineProvider_CheckReady_Healthy(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
-	cfg := &config.Config{}
-	manager := wsengine.NewManager(cfg, logger)
-
-	provider := &EngineProvider{
-		cfg:     cfg,
-		logger:  logger,
-		manager: manager,
-	}
-
-	err := provider.CheckReady(context.Background())
-	if err != nil {
-		t.Errorf("Expected no error, got %v", err)
-	}
-}
-
-func TestEngineProvider_CheckReady_NilManager(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
-
-	provider := &EngineProvider{
-		cfg:     &config.Config{},
-		logger:  logger,
-		manager: nil,
-	}
-
-	err := provider.CheckReady(context.Background())
-	if err == nil {
-		t.Error("Expected error for nil manager")
-	}
-	if err.Error() != "engine manager not initialized" {
-		t.Errorf("Expected 'engine manager not initialized' error, got %v", err)
-	}
-}
-
-func TestEngineProvider_CheckReady_AfterClose(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
-	cfg := &config.Config{}
-	manager := wsengine.NewManager(cfg, logger)
-
-	provider := &EngineProvider{
-		cfg:     cfg,
-		logger:  logger,
-		manager: manager,
-	}
-
-	// Close the manager
-	provider.Close()
-
-	// Should still be healthy as IsHealthy() checks sessions != nil
-	// and closing just clears the map, doesn't nil it
-	err := provider.CheckReady(context.Background())
-	if err != nil {
-		t.Errorf("After close, expected healthy (sessions map still exists), got %v", err)
-	}
-}
 
 // =============================================================================
 // RegistryProvider CheckReady tests
@@ -1404,39 +1346,6 @@ func TestNewBackendProvider_ASModuleInitFailure_ClosesAuthProviderAndStore(t *te
 	if provider != nil {
 		t.Error("expected a nil provider on initialization failure")
 	}
-}
-
-// TestEngineProvider_SetTokenBlacklist proves the wiring point exists and
-// is callable (see cmd/server/main.go, which wires the same blacklist
-// instance the HTTP auth middlewares use into the WebSocket engine so its
-// handshake honors revocation too - #391 review, round 2). The actual
-// revocation-checking behavior this enables is covered in depth by
-// internal/engine's own TestManager_validateToken_* tests; this just
-// proves the pass-through from the provider reaches the manager without
-// requiring internal/engine's unexported fields to be reachable from here.
-func TestEngineProvider_SetTokenBlacklist(t *testing.T) {
-	logger := zap.NewNop()
-	cfg := minimalEngineConfig(config.HTTPClientConfig{})
-
-	provider, err := NewEngineProvider(cfg, logger, nil, nil, nil)
-	if err != nil {
-		t.Fatalf("NewEngineProvider() error = %v", err)
-	}
-	t.Cleanup(provider.Close)
-
-	provider.SetTokenBlacklist(&fakeEngineBlacklistForProviderTest{})
-}
-
-// fakeEngineBlacklistForProviderTest is a minimal wsengine.TokenBlacklistChecker
-// implementation, just to prove SetTokenBlacklist accepts a real implementer.
-type fakeEngineBlacklistForProviderTest struct{}
-
-func (fakeEngineBlacklistForProviderTest) IsBlacklisted(ctx context.Context, jti string) (bool, error) {
-	return false, nil
-}
-
-func (fakeEngineBlacklistForProviderTest) IsUserRevoked(ctx context.Context, userID string) (bool, error) {
-	return false, nil
 }
 
 // TestNewBackendProvider_WiresASModuleWhenEnabled is a regression test for a
