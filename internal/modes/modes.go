@@ -3,7 +3,7 @@
 // Roles can be combined via comma-separated list:
 //
 //	--mode=backend              (just backend)
-//	--mode=backend,engine       (backend + websocket)
+//	--mode=backend,registry     (backend + registry)
 //	--mode=all                  (all roles)
 package modes
 
@@ -19,15 +19,18 @@ type Role string
 const (
 	RoleBackend        Role = "backend"
 	RoleRegistry       Role = "registry"
-	RoleEngine         Role = "engine"
 	RoleAuth           Role = "auth"
 	RoleStorage        Role = "storage"
 	RoleAdmin          Role = "admin"
 	RoleWalletProvider Role = "wallet-provider"
 )
 
+// removedRoleEngine is the former WebSocket engine role. It is refused with an
+// explanatory error rather than as an unknown role.
+const removedRoleEngine Role = "engine"
+
 // ValidRoles lists all valid operating roles
-var ValidRoles = []Role{RoleBackend, RoleRegistry, RoleEngine, RoleAuth, RoleStorage, RoleAdmin, RoleWalletProvider}
+var ValidRoles = []Role{RoleBackend, RoleRegistry, RoleAuth, RoleStorage, RoleAdmin, RoleWalletProvider}
 
 // IsValid checks if a role string is valid
 func (r Role) IsValid() bool {
@@ -115,6 +118,9 @@ func ParseRoles(s string) (*RoleSet, error) {
 		}
 
 		role := Role(p)
+		if role == removedRoleEngine {
+			return nil, fmt.Errorf("role %q was removed: the engine now lives in siros-wallet-core; drop it from --mode", p)
+		}
 		if !role.IsValid() {
 			return nil, fmt.Errorf("invalid role %q, valid roles: %v", p, ValidRoles)
 		}

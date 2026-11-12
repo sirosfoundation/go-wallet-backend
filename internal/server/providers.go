@@ -16,10 +16,8 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/api"
 	"github.com/sirosfoundation/go-wallet-backend/internal/as"
 	"github.com/sirosfoundation/go-wallet-backend/internal/backend"
-	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
-	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
@@ -346,198 +344,6 @@ func (p *StorageProvider) RegisterRoutes(router *gin.Engine) {
 // p.services.TokenBlacklist is replaced by the AuthProvider's instance so revocation applies here too.
 func (p *StorageProvider) authMiddleware() gin.HandlerFunc {
 	return sessionAuthMiddleware(p.tokenValidator, p.store, p.services.TokenBlacklist, p.logger)
-}
-
-// =============================================================================
-// Engine Provider - handles WebSocket flow orchestration
-// =============================================================================
-
-// EngineProvider provides WebSocket engine routes
-type EngineProvider struct {
-	cfg    *config.Config
-	logger *zap.Logger
-	// metadataResolver is the resolver the flow handlers were registered with,
-	// kept the way BackendProvider keeps its own: once it is handed to a
-	// handler factory it is otherwise unreachable, and the policy it was built
-	// with - AllowsPlaintext - is then only assertable by rebuilding it, which
-	// is a restatement of the rule rather than a check of it.
-	metadataResolver *issuermetadata.Resolver
-	manager          *wsengine.Manager
-}
-
-// NewEngineProvider creates a new WebSocket engine route provider.
-// If store is non-nil, the engine will cache verifier trust evaluations.
-// If sharedResolver is non-nil, it is used for issuer metadata resolution so
-// the TTL cache is shared with the HTTP /v1/resolve handler; otherwise a new
-// resolver is created from the config.
-// If issuerLookup is non-nil, the OID4VCI handler will enrich fetchMetadata results
-// with the registered-issuer record from backend storage (same data as /v1/resolve).
-func NewEngineProvider(cfg *config.Config, logger *zap.Logger, store storage.VerifierStore, sharedResolver *issuermetadata.Resolver, issuerLookup wsengine.CredentialIssuerLookup) (*EngineProvider, error) {
-	// Create WebSocket manager
-	manager := wsengine.NewManager(cfg, logger)
-
-	// Wire verifier store for trust caching
-	if store != nil {
-		manager.SetVerifierStore(store)
-	}
-
-	// Configure session store based on config
-	if cfg.SessionStore.Type == "redis" {
-		redisStore, err := wsengine.NewRedisSessionStore(&wsengine.RedisSessionConfig{
-			Address:    cfg.SessionStore.Redis.Address,
-			Password:   cfg.SessionStore.Redis.Password,
-			DB:         cfg.SessionStore.Redis.DB,
-			KeyPrefix:  cfg.SessionStore.Redis.KeyPrefix,
-			DefaultTTL: time.Duration(cfg.SessionStore.DefaultTTLHours) * time.Hour,
-		}, logger)
-		if err != nil {
-			logger.Warn("Failed to connect to Redis, falling back to memory store", zap.Error(err))
-		} else {
-			manager.SetSessionStore(redisStore)
-			logger.Info("Using Redis session store", zap.String("address", cfg.SessionStore.Redis.Address))
-		}
-	}
-
-	// Use the shared resolver when available so the TTL cache is not duplicated.
-	// Fall back to creating a local resolver (e.g. when the engine runs without
-	// the backend provider, or when resolution is disabled on the backend).
-	metadataResolver := sharedResolver
-	if metadataResolver == nil {
-		r, err := issuermetadata.New(issuermetadata.Config{
-			HTTPClient:    cfg.HTTPClient.NewHTTPClient(time.Duration(cfg.HTTPClient.Timeout) * time.Second),
-			AllowHTTP:     cfg.HTTPClient.AllowsPlaintext(),
-			MetadataType:  issuermetadata.MetadataType(cfg.HTTPClient.MetadataType), // validated by Config.Validate and New
-			CacheDisabled: cfg.HTTPClient.MetadataCacheDisabled,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("creating issuer metadata resolver: %w", err)
-		}
-		metadataResolver = r
-	}
-
-	// Register flow handlers
-	manager.RegisterFlowHandler(wsengine.ProtocolOID4VCI, wsengine.NewOID4VCIHandlerFactory(metadataResolver, issuerLookup))
-	manager.RegisterFlowHandler(wsengine.ProtocolOID4VP, wsengine.NewOID4VPHandler)
-	manager.RegisterFlowHandler(wsengine.ProtocolVCTM, wsengine.NewVCTMHandler)
-
-	return &EngineProvider{
-		cfg:              cfg,
-		logger:           logger,
-		metadataResolver: metadataResolver,
-		manager:          manager,
-	}, nil
-}
-
-func (p *EngineProvider) Transport() Transport { return TransportWebSocket }
-func (p *EngineProvider) Name() string         { return "engine" }
-
-// SessionStore returns the engine's session store for cross-provider wiring.
-func (p *EngineProvider) SessionStore() wsengine.SessionStore {
-	return p.manager.SessionStore()
-}
-
-// Manager returns the engine's WebSocket session manager for cross-provider
-// wiring. It duck-types service.SessionCleaner (via its DeleteByUser
-// method), so it can be wired into service.MultiSessionCleaner exactly like
-// SessionStore() is - see cmd/server/main.go. Unlike SessionStore(), which
-// only ever purges the persisted SessionData bookkeeping record, the
-// Manager itself closes the live *websocket.Conn* for the deleted user
-// (#393).
-func (p *EngineProvider) Manager() *wsengine.Manager {
-	return p.manager
-}
-
-// StandaloneValidator is a token validator owned by a standalone engine
-// process; Close stops its JWKS refresh.
-type StandaloneValidator struct {
-	*tokenvalidator.Validator
-}
-
-// Close stops the background JWKS refresh.
-func (v StandaloneValidator) Close() error { v.Stop(); return nil }
-
-// NewStandaloneEngineTokenValidator builds the token validator for an engine running without a backend
-// provider (--mode=engine). The JWKS comes from as.external_url; without it every connection would be
-// rejected, so it returns an error and startup fails.
-//
-// blacklist is the shared revocation store (see NewSharedBlacklist) when the
-// configuration selects it: the validator then checks every token's jti against
-// it, so a logged-out token (anonymous ones included) cannot open a connection.
-// User-level revocation is checked by the engine itself (see
-// EngineProvider.SetTokenBlacklist). With a nil blacklist a standalone engine
-// has no revocation source: a token stays valid until it expires, even after
-// logout or user revocation. A warning is logged.
-func NewStandaloneEngineTokenValidator(cfg *config.Config, logger *zap.Logger, blacklist *service.TokenBlacklist) (*StandaloneValidator, error) {
-	if cfg.AS.ExternalURL == "" {
-		return nil, fmt.Errorf("standalone engine needs as.external_url to fetch the AS JWKS; refusing to start with no way to authenticate connections (legacy HMAC tokens no longer exist)")
-	}
-	issuer, err := remoteASIssuer(cfg, "standalone engine")
-	if err != nil {
-		return nil, err
-	}
-	jwksURL, err := asJWKSURL(cfg)
-	if err != nil {
-		return nil, err
-	}
-	vcfg := tokenvalidator.Config{
-		JWKSURL:   jwksURL,
-		Issuer:    issuer,
-		Audiences: cfg.SessionAudiences(),
-	}
-	if blacklist != nil {
-		vcfg.Revocation = blacklistRevocationChecker{blacklist: blacklist, logger: logger}
-	}
-	v := tokenvalidator.New(vcfg)
-	v.Start(context.Background())
-	if blacklist == nil {
-		logger.Warn("Standalone engine has no token revocation source: AS session tokens stay valid at this engine until they expire, even after logout or user revocation. Mitigate with short access token TTLs, use the shared MongoDB revocation store, or co-host the engine with the backend.",
-			zap.String("jwks_source", "as.external_url"))
-	}
-	logger.Info("Standalone engine token validator started")
-	return &StandaloneValidator{Validator: v}, nil
-}
-
-// SetRegistryHandler wires a co-located registry (see
-// RegistryProvider.InProcessHandler) into the engine's VCTM client.
-func (p *EngineProvider) SetRegistryHandler(h http.Handler) { p.manager.SetRegistryHandler(h) }
-
-// SetTokenValidator passes the go-tokenauth validator to the WebSocket engine
-// so it can validate AS-issued session tokens during the handshake.
-func (p *EngineProvider) SetTokenValidator(v *tokenvalidator.Validator) {
-	p.manager.SetTokenValidator(v)
-}
-
-// SetTokenBlacklist passes a token blacklist to the WebSocket engine so its handshake honors per-jti
-// and per-user revocation like the HTTP middlewares (see wsengine.TokenBlacklistChecker).
-func (p *EngineProvider) SetTokenBlacklist(b wsengine.TokenBlacklistChecker) {
-	p.manager.SetTokenBlacklist(b)
-}
-
-func (p *EngineProvider) RegisterRoutes(router *gin.Engine) {
-	// WebSocket v2 endpoint
-	router.GET("/api/v2/wallet", func(c *gin.Context) {
-		p.manager.HandleConnection(c.Writer, c.Request)
-	})
-}
-
-// Close shuts down the engine manager
-func (p *EngineProvider) Close() {
-	if p.manager != nil {
-		p.manager.Close()
-	}
-}
-
-// CheckReady implements health.ReadinessChecker for EngineProvider.
-// It verifies the WebSocket engine manager is operational.
-func (p *EngineProvider) CheckReady(ctx context.Context) error {
-	if p.manager == nil {
-		return fmt.Errorf("engine manager not initialized")
-	}
-	// Check if manager is healthy (not shutting down, accepting connections)
-	if !p.manager.IsHealthy() {
-		return fmt.Errorf("engine manager not healthy")
-	}
-	return nil
 }
 
 // blacklistRevocationChecker adapts *service.TokenBlacklist to go-tokenauth's revocation.Checker
@@ -1093,16 +899,6 @@ func (p *RegistryProvider) SetTenantLookup(t middleware.TenantLookup) { p.tenant
 // SetTokenBlacklist lets a co-located backend supply its token blacklist so
 // tokens of revoked users are rejected on the registry routes too.
 func (p *RegistryProvider) SetTokenBlacklist(b middleware.TokenBlacklistChecker) { p.blacklist = b }
-
-// InProcessHandler returns a handler serving the registry routes under
-// /registry without authentication or rate limiting, for trusted in-process
-// callers (the co-located engine's VCTM client).
-func (p *RegistryProvider) InProcessHandler() http.Handler {
-	gin.SetMode(gin.ReleaseMode)
-	r := gin.New()
-	p.handler.RegisterRoutes(r.Group("/registry"))
-	return r
-}
 
 // SetRootAliases additionally serves /type-metadata and /credentials at the
 // server root, as the retired standalone registry binary did, so existing

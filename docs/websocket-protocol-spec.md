@@ -1,5 +1,10 @@
 # Wallet Protocol Channel Specification
 
+> **Removed.** The WebSocket engine this specification describes was removed from
+> go-wallet-backend (`--mode=engine` is refused at startup). Protocol flows run in
+> the wallet core (siros-wallet-core). The AuthZEN proxy remains a supported API
+> of this backend. This document is kept as a historical design record.
+
 **Version**: 0.1.0 (Draft)
 **Status**: Design Discussion
 **Date**: 2026-02-18

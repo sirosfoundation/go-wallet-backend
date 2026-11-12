@@ -14,13 +14,10 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
-	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
 	"github.com/sirosfoundation/go-wallet-backend/internal/server"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
-	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/logging"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
@@ -28,7 +25,7 @@ import (
 var (
 	configFile         = flag.String("config", "configs/config.yaml", "Path to backend configuration file")
 	registryConfigFile = flag.String("registry-config", "configs/registry.yaml", "DEPRECATED: path to the old standalone registry configuration file; use the registry: section of --config")
-	modeFlag           = flag.String("mode", "backend", "Operating roles: backend, registry, engine, admin, auth, wallet-provider (comma-separated or 'all')")
+	modeFlag           = flag.String("mode", "backend", "Operating roles: backend, registry, admin, auth, wallet-provider (comma-separated or 'all')")
 	version            = "dev"
 	commit             = "unknown"
 )
@@ -43,9 +40,9 @@ func main() {
 	}
 	roleStrings := roles.Strings()
 
-	// Load backend configuration (needed for backend, engine, admin, auth, and wallet-provider roles)
+	// Load backend configuration (needed for backend, admin, auth, and wallet-provider roles)
 	var backendCfg *config.Config
-	needsBackendCfg := roles.Has(modes.RoleBackend) || roles.Has(modes.RoleEngine) || roles.Has(modes.RoleAdmin) || roles.Has(modes.RoleAuth) || roles.Has(modes.RoleWalletProvider)
+	needsBackendCfg := roles.Has(modes.RoleBackend) || roles.Has(modes.RoleAdmin) || roles.Has(modes.RoleAuth) || roles.Has(modes.RoleWalletProvider)
 	if needsBackendCfg {
 		backendCfg, err = config.Load(*configFile)
 		if err != nil {
@@ -250,11 +247,11 @@ func main() {
 		resources = append(resources, backendProvider)
 	}
 
-	// Engine and registry processes without the backend role have no storage
+	// Registry processes without the backend role have no storage
 	// of their own: give them the shared revocation store so they reject what
 	// the backend replicas revoked.
 	var sharedBlacklist *server.SharedBlacklist
-	if backendProvider == nil && (roles.Has(modes.RoleEngine) || roles.Has(modes.RoleRegistry)) {
+	if backendProvider == nil && roles.Has(modes.RoleRegistry) {
 		revCfg := backendCfg
 		if revCfg == nil {
 			revCfg = registryCfg
@@ -269,7 +266,6 @@ func main() {
 		}
 	}
 
-	var registryProvider *server.RegistryProvider
 	if roles.Has(modes.RoleRegistry) {
 		provider, err := server.NewRegistryProvider(registryCfg, logger)
 		if err != nil {
@@ -285,88 +281,14 @@ func main() {
 		} else if sharedBlacklist != nil {
 			provider.SetTokenBlacklist(sharedBlacklist)
 		}
-		registryProvider = provider
 		mgr.AddProvider(provider)
 		resources = append(resources, provider)
 	}
 
-	var engineProvider *server.EngineProvider
-	if roles.Has(modes.RoleEngine) {
-		// Wire verifier store from backend if available (for trust caching)
-		var verifierStore storage.VerifierStore
-		if backendProvider != nil {
-			verifierStore = backendProvider.Store().Verifiers()
-		}
-		// Share the metadata resolver from the backend so the TTL cache is not duplicated.
-		var sharedResolver *issuermetadata.Resolver
-		if backendProvider != nil {
-			sharedResolver = backendProvider.MetadataResolver()
-		}
-		// Share the issuer lookup so the engine gets the same registered-issuer
-		// enrichment as the /v1/resolve HTTP endpoint.
-		var issuerLookup wsengine.CredentialIssuerLookup
-		if backendProvider != nil {
-			issuerLookup = backendProvider.Store().Issuers()
-		}
-		provider, err := server.NewEngineProvider(backendCfg, logger, verifierStore, sharedResolver, issuerLookup)
-		if err != nil {
-			logger.Fatal("Failed to create engine provider", zap.Error(err))
-		}
-		// Engine and registry in one process: the registry is served by the
-		// shared HTTP server under /registry (not on server.registry_port),
-		// and the outbound HTTP guards reject loopback, so give the engine's
-		// VCTM client the registry in-process - unless trust.registry_url
-		// names an explicit registry.
-		if registryProvider != nil && backendCfg.Trust.RegistryURL == "" {
-			provider.SetRegistryHandler(registryProvider.InProcessHandler())
-		}
-		// Wire token validator for WebSocket handshake auth
-		if backendProvider != nil && backendProvider.TokenValidator() != nil {
-			provider.SetTokenValidator(backendProvider.TokenValidator())
-		}
-		// Standalone engine: a JWKS-backed validator is the only way to authenticate handshakes.
-		if backendProvider == nil {
-			var rev *service.TokenBlacklist
-			if sharedBlacklist != nil {
-				rev = sharedBlacklist.TokenBlacklist
-			}
-			sv, err := server.NewStandaloneEngineTokenValidator(backendCfg, logger, rev)
-			if err != nil {
-				logger.Fatal("Failed to create standalone engine token validator", zap.Error(err))
-			}
-			if sv != nil {
-				provider.SetTokenValidator(sv.Validator)
-				resources = append(resources, sv)
-			}
-		}
-		// Wire the same token blacklist the HTTP auth middlewares use, so a
-		// revoked token (or a deleted user's other tokens) is rejected
-		// during the WebSocket handshake too - see
-		// EngineProvider.SetTokenBlacklist.
-		if backendProvider != nil {
-			provider.SetTokenBlacklist(backendProvider.Services().TokenBlacklist)
-		} else if sharedBlacklist != nil {
-			provider.SetTokenBlacklist(sharedBlacklist)
-		}
-		mgr.AddProvider(provider)
-		engineProvider = provider
-	}
-
-	// Wire session stores into UserService so DeleteUser purges AS cookie
-	// sessions and, when the engine runs in this process, active engine
-	// (WebSocket) sessions alike. The AS cleaner is wired regardless of the
-	// engine role: a --mode=backend deployment has AS sessions to drop too.
-	// Both engine cleaners are wired: SessionStore() only purges the
-	// persisted SessionData bookkeeping record, while Manager() closes the
-	// live *websocket.Conn* itself - without the latter, a connection that
-	// was already established before the user was deleted stayed open and
-	// usable until it disconnected on its own (#393).
+	// Wire the AS session store into UserService so DeleteUser purges AS
+	// cookie sessions.
 	if backendProvider != nil {
-		cleaners := service.MultiSessionCleaner{backendProvider.ASSessionCleaner()}
-		if engineProvider != nil {
-			cleaners = append(cleaners, engineProvider.SessionStore(), engineProvider.Manager())
-		}
-		backendProvider.Services().User.SetSessionCleaner(cleaners)
+		backendProvider.Services().User.SetSessionCleaner(service.MultiSessionCleaner{backendProvider.ASSessionCleaner()})
 	}
 
 	// Admin-only mode: standalone admin API without backend auth/storage routes.

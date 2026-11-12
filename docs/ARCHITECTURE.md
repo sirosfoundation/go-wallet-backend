@@ -102,7 +102,7 @@ Configuration management:
 ## Roles and the VCTM Registry
 
 The server is one binary (`cmd/server`) whose functionality is selected with
-`--mode` (`backend`, `auth`, `engine`, `registry`, `admin`, `wallet-provider`,
+`--mode` (`backend`, `auth`, `registry`, `admin`, `wallet-provider`,
 or a comma-separated list / `all`). The VCTM registry (`internal/registry`,
 routes under `/registry`) is the `registry` role of that binary; there is no
 separate registry binary. Its previous standalone form (`cmd/registry`, its own
