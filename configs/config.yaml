@@ -78,12 +78,17 @@ logging:
   format: "json" # Options: json, text
 
 jwt:
-  # Server secret (>= 32 bytes). It signs no tokens any more: it keys the HMAC
-  # that binds the OIDC `state` parameter to the browser. Tokens are issued by
-  # the Authorization Server below.
+  # Server secret (>= 32 bytes). It binds OIDC state to the browser and
+  # authenticates OID4VCI authorization resumption contexts with a separate
+  # derived key. Share it across engine replicas. Authentication tokens are
+  # issued by the Authorization Server below.
   secret: "change-this-secret-in-production"
   # Fallback for as.issuer (the "iss" of AS-issued access tokens)
   issuer: "wallet-backend"
+
+security:
+  # Enable for FAPI. AS-advertised RFC 9207 support requires iss regardless.
+  require_authorization_response_issuer: false
 
 # Authorization Server. AS-issued session tokens (ES256 access tokens from
 # POST /auth/token, validated through the AS JWKS) are the ONLY authentication

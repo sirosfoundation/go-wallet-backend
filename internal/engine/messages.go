@@ -311,8 +311,11 @@ type FlowStartMessage struct {
 	Features []string `json:"features,omitempty"`
 
 	// Resumption fields (same-tab redirect flow)
-	AuthCode     string `json:"auth_code,omitempty"`     // Authorization code from OAuth redirect
-	CodeVerifier string `json:"code_verifier,omitempty"` // PKCE code verifier (saved by client before redirect)
+	AuthCode                    string  `json:"auth_code,omitempty"`     // Authorization code from OAuth redirect
+	CodeVerifier                string  `json:"code_verifier,omitempty"` // PKCE code verifier (saved by client before redirect)
+	State                       string  `json:"state,omitempty"`         // State from the authorization response
+	AuthorizationResponseIssuer *string `json:"iss,omitempty"`
+	AuthorizationContext        string  `json:"authorization_context,omitempty"` // Opaque transaction binding saved before redirect
 
 	// Renewal fields (credential re-issuance/renewal plan, Phase 1 Slice 2).
 	// When RefreshToken is set, this FlowStart is a renewal request rather
@@ -346,6 +349,14 @@ type FlowStartMessage struct {
 	// SignActionSignClientAuth of the renewal so the client signs with that
 	// same key. Takes precedence over DPoPJWK.
 	DPoPKeyID string `json:"dpop_key_id,omitempty"`
+}
+
+func (m *FlowStartMessage) UnmarshalJSON(data []byte) error {
+	if err := validateAuthorizationIssuerJSON(data); err != nil {
+		return err
+	}
+	type alias FlowStartMessage
+	return json.Unmarshal(data, (*alias)(m))
 }
 
 // FeatureTransactionDataV1 is declared by a client that can process OID4VP

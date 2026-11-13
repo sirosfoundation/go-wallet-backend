@@ -114,27 +114,29 @@ func NewOID4VCIHandlerFactory(resolver MetadataResolver, issuerLookup Credential
 // oauthServerMetadata contains the OAuth Authorization Server metadata fields
 // relevant for the OID4VCI authorization code flow.
 type oauthServerMetadata struct {
-	Issuer                             string   `json:"issuer"`
-	AuthorizationEndpoint              string   `json:"authorization_endpoint"`
-	TokenEndpoint                      string   `json:"token_endpoint"`
-	PushedAuthorizationRequestEndpoint string   `json:"pushed_authorization_request_endpoint"`
-	RequirePushedAuthorizationRequests bool     `json:"require_pushed_authorization_requests"`
-	ChallengeEndpoint                  string   `json:"challenge_endpoint"`
-	CodeChallengeMethodsSupported      []string `json:"code_challenge_methods_supported"`
-	codeChallengeMethodsDeclared       bool
+	Issuer                                     string   `json:"issuer"`
+	AuthorizationEndpoint                      string   `json:"authorization_endpoint"`
+	TokenEndpoint                              string   `json:"token_endpoint"`
+	PushedAuthorizationRequestEndpoint         string   `json:"pushed_authorization_request_endpoint"`
+	RequirePushedAuthorizationRequests         bool     `json:"require_pushed_authorization_requests"`
+	AuthorizationResponseIssParameterSupported bool     `json:"authorization_response_iss_parameter_supported"`
+	ChallengeEndpoint                          string   `json:"challenge_endpoint"`
+	CodeChallengeMethodsSupported              []string `json:"code_challenge_methods_supported"`
+	codeChallengeMethodsDeclared               bool
 }
 
 // UnmarshalJSON preserves whether code_challenge_methods_supported was present
 // so supportsPKCE can distinguish an absent field from an explicit empty list.
 func (m *oauthServerMetadata) UnmarshalJSON(data []byte) error {
 	type alias struct {
-		Issuer                             string    `json:"issuer"`
-		AuthorizationEndpoint              string    `json:"authorization_endpoint"`
-		TokenEndpoint                      string    `json:"token_endpoint"`
-		PushedAuthorizationRequestEndpoint string    `json:"pushed_authorization_request_endpoint"`
-		RequirePushedAuthorizationRequests bool      `json:"require_pushed_authorization_requests"`
-		ChallengeEndpoint                  string    `json:"challenge_endpoint"`
-		CodeChallengeMethodsSupported      *[]string `json:"code_challenge_methods_supported"`
+		Issuer                                     string    `json:"issuer"`
+		AuthorizationEndpoint                      string    `json:"authorization_endpoint"`
+		TokenEndpoint                              string    `json:"token_endpoint"`
+		PushedAuthorizationRequestEndpoint         string    `json:"pushed_authorization_request_endpoint"`
+		RequirePushedAuthorizationRequests         bool      `json:"require_pushed_authorization_requests"`
+		AuthorizationResponseIssParameterSupported bool      `json:"authorization_response_iss_parameter_supported"`
+		ChallengeEndpoint                          string    `json:"challenge_endpoint"`
+		CodeChallengeMethodsSupported              *[]string `json:"code_challenge_methods_supported"`
 	}
 	var aux alias
 	if err := json.Unmarshal(data, &aux); err != nil {
@@ -145,6 +147,7 @@ func (m *oauthServerMetadata) UnmarshalJSON(data []byte) error {
 	m.TokenEndpoint = aux.TokenEndpoint
 	m.PushedAuthorizationRequestEndpoint = aux.PushedAuthorizationRequestEndpoint
 	m.RequirePushedAuthorizationRequests = aux.RequirePushedAuthorizationRequests
+	m.AuthorizationResponseIssParameterSupported = aux.AuthorizationResponseIssParameterSupported
 	m.ChallengeEndpoint = aux.ChallengeEndpoint
 	m.codeChallengeMethodsDeclared = aux.CodeChallengeMethodsSupported != nil
 	if aux.CodeChallengeMethodsSupported != nil {
@@ -2246,6 +2249,10 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 		return nil, fmt.Errorf("failed to generate state parameter: %w", err)
 	}
 	oauthState := base64.RawURLEncoding.EncodeToString(stateBytes)
+	transaction, authorizationContext, err := h.newAuthorizationContext(metadata, oauthMeta, oauthState, codeVerifier)
+	if err != nil {
+		return nil, h.failAuthorizationResponse(err)
+	}
 
 	// Parse and validate the authorization endpoint URL once
 	authEndpoint, err := url.Parse(oauthMeta.AuthorizationEndpoint)
@@ -2417,6 +2424,9 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 		"expected_redirect_uri": redirectURI,
 		"state":                 oauthState,
 		"credential_offer":      offer,
+		"authorization_context": authorizationContext,
+		"expected_issuer":       transaction.AuthorizationAS,
+		"require_iss":           transaction.IssuerRequired,
 	}
 	if pkceEnabled {
 		progressData["code_verifier"] = codeVerifier
@@ -2430,9 +2440,13 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 	}
 
 	var authResult struct {
-		Code         string `json:"code"`
-		State        string `json:"state"`
-		CodeVerifier string `json:"code_verifier"`
+		Code         string  `json:"code"`
+		State        string  `json:"state"`
+		CodeVerifier string  `json:"code_verifier"`
+		Issuer       *string `json:"iss"`
+	}
+	if err := validateAuthorizationIssuerJSON(action.Payload); err != nil {
+		return nil, h.failAuthorizationResponse(err)
 	}
 	if err := json.Unmarshal(action.Payload, &authResult); err != nil {
 		_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, "Invalid authorization response")
@@ -2440,9 +2454,8 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 	}
 
 	// Validate state parameter (CSRF protection)
-	if authResult.State != oauthState {
-		_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, "State parameter mismatch")
-		return nil, errors.New("state parameter mismatch (possible CSRF)")
+	if err := h.validateAuthorizationResponse(transaction, authResult.State, authResult.Issuer); err != nil {
+		return nil, h.failAuthorizationResponse(err)
 	}
 
 	// Use client-provided code_verifier if present (flow resume scenario);
@@ -2450,6 +2463,9 @@ func (h *OID4VCIHandler) startAuthorizationFlow(ctx context.Context, offer *Cred
 	verifier := ""
 	if pkceEnabled {
 		if authResult.CodeVerifier != "" {
+			if computeCodeChallenge(authResult.CodeVerifier) != transaction.CodeChallenge {
+				return nil, h.failAuthorizationResponse(errors.New("code_verifier does not match authorization request"))
+			}
 			verifier = authResult.CodeVerifier
 		} else {
 			verifier = codeVerifier
@@ -2538,8 +2554,18 @@ func (h *OID4VCIHandler) resumeWithAuthCode(ctx context.Context, msg *FlowStartM
 	h.Logger.Info("Resuming OID4VCI flow with authorization code")
 	_ = h.ProgressMessage(StepAuthorizationReq, "Resuming flow with authorization code")
 
-	// Fetch OAuth metadata to get token endpoint and check PKCE requirements
-	oauthMeta, err := h.discoverTokenEndpoint(ctx, metadata)
+	transaction, err := h.parseAuthorizationContext(msg.AuthorizationContext, metadata)
+	if err != nil {
+		return nil, h.failAuthorizationResponse(err)
+	}
+	if err := h.validateAuthorizationResponse(transaction, msg.State, msg.AuthorizationResponseIssuer); err != nil {
+		return nil, h.failAuthorizationResponse(err)
+	}
+
+	// Retain the endpoint and PKCE policy from the original authorization.
+	// Rediscovery can supply challenge hints but cannot relax response validation.
+	metadata.TokenEndpoint = transaction.TokenEndpoint
+	_, err = h.discoverTokenEndpoint(ctx, metadata)
 	if err != nil {
 		return nil, h.failASDiscovery(StepAuthorizationReq, ErrCodeAuthorizationFail, err)
 	}
@@ -2547,11 +2573,14 @@ func (h *OID4VCIHandler) resumeWithAuthCode(ctx context.Context, msg *FlowStartM
 	// Validate code_verifier: PKCE defaults to enabled (OID4VCI spec), so if the
 	// AS requires it the token exchange will fail without a verifier. Catch this
 	// early with a clear error rather than an opaque OAuth error from the AS.
-	pkceRequired := oauthMeta == nil || oauthMeta.supportsPKCE()
+	pkceRequired := transaction.PKCERequired
 	codeVerifier := strings.TrimSpace(msg.CodeVerifier)
 	if pkceRequired && codeVerifier == "" {
 		_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, "code_verifier is required for flow resumption")
 		return nil, errors.New("code_verifier is required for flow resumption")
+	}
+	if pkceRequired && computeCodeChallenge(codeVerifier) != transaction.CodeChallenge {
+		return nil, h.failAuthorizationResponse(errors.New("code_verifier does not match authorization request"))
 	}
 
 	// Use redirect URI from message
@@ -2559,6 +2588,9 @@ func (h *OID4VCIHandler) resumeWithAuthCode(ctx context.Context, msg *FlowStartM
 	if redirectURI == "" {
 		_ = h.Error(StepAuthorizationReq, ErrCodeAuthorizationFail, "redirect_uri is required for flow resumption")
 		return nil, errors.New("redirect_uri is required for flow resumption")
+	}
+	if redirectURI != transaction.RedirectURI {
+		return nil, h.failAuthorizationResponse(errors.New("redirect_uri does not match authorization request"))
 	}
 
 	// Exchange authorization code using provided code_verifier

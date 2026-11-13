@@ -1411,11 +1411,12 @@ type LoggingConfig struct {
 }
 
 // JWTConfig contains the jwt.* settings. Session tokens are signed by the AS's asymmetric key, so only
-// Secret (keys the OIDC state-binding cookie HMAC) and Issuer (fallback for as.issuer) matter;
+// Secret (authenticates OIDC state and OID4VCI resumption) and Issuer (fallback for as.issuer) matter;
 // ExpiryHours and RefreshDays are removed no-ops (see Config.DeprecatedSettings).
 type JWTConfig struct {
 	// Secret is a server-side secret of at least 32 bytes. It keys the HMAC that binds the OIDC
-	// state parameter to the browser (state-binding cookie). Required.
+	// state parameter to the browser and authenticates OID4VCI authorization
+	// resumption contexts using a domain-separated key. Required; share across engine replicas.
 	Secret string `yaml:"secret" envconfig:"SECRET"`
 	// SecretPath is the path to a file containing the secret (alternative to Secret).
 	SecretPath string `yaml:"secret_path" envconfig:"SECRET_PATH"`
@@ -2116,6 +2117,12 @@ func (c *AuthZENProxyConfig) GetPDPURL(defaultURL string) string {
 
 // SecurityConfig contains security-related configuration
 type SecurityConfig struct {
+	// RequireAuthorizationResponseIssuer enforces RFC 9207 issuer presence for
+	// OID4VCI authorization responses even when AS metadata omits support.
+	// Enable for FAPI deployments. Default: false. Advertised support always
+	// requires iss; any supplied issuer must match the original AS exactly.
+	RequireAuthorizationResponseIssuer bool `yaml:"require_authorization_response_issuer" envconfig:"REQUIRE_AUTHORIZATION_RESPONSE_ISSUER"`
+
 	// AuthRateLimit contains rate limiting configuration for auth endpoints
 	AuthRateLimit AuthRateLimitConfig `yaml:"auth_rate_limit" envconfig:"AUTH_RATE_LIMIT"`
 
@@ -2870,7 +2877,7 @@ func (c *Config) Validate() error {
 		return err
 	}
 
-	// jwt.secret keys the OIDC state-binding cookie HMAC (see JWTConfig).
+	// jwt.secret authenticates OIDC state and OID4VCI resumption (see JWTConfig).
 	if c.JWT.Secret == "" {
 		return fmt.Errorf("jwt secret is required (it keys the OIDC state-binding cookie)")
 	}
