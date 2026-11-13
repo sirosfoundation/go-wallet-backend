@@ -269,8 +269,9 @@ Session mode is the only mode:
 
 - `jwt.secret` (>= 32 bytes, `jwt.secret_path`) is still **required**: it keys
   the HMAC that binds the OIDC `state` parameter to the browser (the AS OIDC
-  state-binding cookie, `internal/as/oidc_state_cookie.go`). It no longer signs or
-  validates any token.
+  state-binding cookie, `internal/as/oidc_state_cookie.go`) and authenticates
+  OID4VCI authorization resumption contexts with a domain-separated key. Share it
+  across engine replicas. It does not sign or validate authentication tokens.
 - `jwt.issuer` is the fallback for `as.issuer` (the `iss` of AS tokens).
 - The WebSocket handshake message still names its token field `appToken`
   (`internal/websocket`, `internal/engine`); that is a wire-format field name that

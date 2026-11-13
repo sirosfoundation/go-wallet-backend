@@ -2989,6 +2989,21 @@ func TestServedDocumentMissingEndpointsDoesNotGuess(t *testing.T) {
 
 // ===== resumeWithAuthCode tests =====
 
+func prepareAuthCodeResumption(t *testing.T, h *OID4VCIHandler, msg *FlowStartMessage, metadata *IssuerMetadata, oauthMeta *oauthServerMetadata) {
+	t.Helper()
+	if h.Config == nil {
+		h.Config = &config.Config{JWT: config.JWTConfig{Secret: "test-authorization-context-secret-32-bytes"}}
+	}
+	h.redirectURI = "https://wallet.example.com/cb"
+	if oauthMeta == nil {
+		oauthMeta = &oauthServerMetadata{}
+	}
+	msg.State = "test-state"
+	_, encoded, err := h.newAuthorizationContext(metadata, oauthMeta, msg.State, msg.CodeVerifier)
+	require.NoError(t, err)
+	msg.AuthorizationContext = encoded
+}
+
 func TestResumeWithAuthCode_Success(t *testing.T) {
 	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		err := r.ParseForm()
@@ -3020,6 +3035,7 @@ func TestResumeWithAuthCode_Success(t *testing.T) {
 		CodeVerifier: "test-verifier",
 		RedirectURI:  "https://wallet.example.com/cb",
 	}
+	prepareAuthCodeResumption(t, h, msg, metadata, nil)
 
 	token, err := h.resumeWithAuthCode(context.Background(), msg, metadata)
 	require.NoError(t, err)
@@ -3040,6 +3056,7 @@ func TestResumeWithAuthCode_MissingRedirectURI(t *testing.T) {
 		CodeVerifier: "test-verifier",
 		// RedirectURI intentionally empty
 	}
+	prepareAuthCodeResumption(t, h, msg, metadata, nil)
 
 	_, err := h.resumeWithAuthCode(context.Background(), msg, metadata)
 	require.Error(t, err)
@@ -3082,6 +3099,7 @@ func TestResumeWithAuthCode_FetchesTokenEndpointFromOAuthMetadata(t *testing.T) 
 		CodeVerifier: "test-verifier",
 		RedirectURI:  "https://wallet.example.com/cb",
 	}
+	prepareAuthCodeResumption(t, h, msg, metadata, nil)
 
 	token, err := h.resumeWithAuthCode(context.Background(), msg, metadata)
 	require.NoError(t, err)
@@ -3105,6 +3123,7 @@ func TestResumeWithAuthCode_MissingCodeVerifier(t *testing.T) {
 		RedirectURI: "https://wallet.example.com/cb",
 		// CodeVerifier intentionally empty
 	}
+	prepareAuthCodeResumption(t, h, msg, metadata, nil)
 
 	_, err := h.resumeWithAuthCode(context.Background(), msg, metadata)
 	require.Error(t, err)
@@ -3146,6 +3165,7 @@ func TestResumeWithAuthCode_PKCENotRequired(t *testing.T) {
 		RedirectURI: "https://wallet.example.com/cb",
 		// CodeVerifier intentionally empty — PKCE not required
 	}
+	prepareAuthCodeResumption(t, h, msg, metadata, &oauthServerMetadata{codeChallengeMethodsDeclared: true})
 
 	token, err := h.resumeWithAuthCode(context.Background(), msg, metadata)
 	require.NoError(t, err)

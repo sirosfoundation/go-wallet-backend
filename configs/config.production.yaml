@@ -81,7 +81,7 @@ logging:
 jwt:
   # IMPORTANT: Use a strong secret (min 32 characters)
   # Generate with: openssl rand -base64 32
-  # (It signs no tokens: it keys the OIDC state-binding cookie.)
+  # It authenticates OIDC state and OID4VCI resumption contexts, not access tokens.
   secret: "${WALLET_JWT_SECRET}"
   # Fallback for as.issuer (the "iss" of AS-issued access tokens)
   issuer: "wallet.example.com"
