@@ -755,6 +755,58 @@ one replica is supported, but these limits apply:
   from the primary). See "Erasure and requests already in flight" in API.md for
   the exact guarantee and its limits.
 
+- **Erasure reconciler.** A background job (`lifecycle.reconciler.*`, on by
+  default, `docs/CONFIGURATION.md`) backs up the two items above. Every
+  `interval_seconds` (jittered) it examines up to `batch_size` users with a
+  revoked wallet instance, resuming from a cursor and wrapping at the end. A
+  user qualifies when every instance in every tenant is non-live (revoked or
+  legacy suspended), at least one is revoked and the latest revocation is older
+  than `grace_period_seconds`, and the user still has private data, key
+  material or holder data (credentials, presentations). A revoked instance
+  always wins: a user revoked in one tenant is erased in every tenant, even if
+  another tenant holds only a legacy suspended instance (fail closed). A
+  revoked instance with no recorded revocation time keeps its user in the grace
+  state indefinitely, so such a user is never erased by the reconciler. The
+  grace age is measured on the reconciler host's clock against the revocation
+  time written by whichever replica revoked, so keep replica clocks within a
+  small fraction of the grace period. Then it runs the same cascade as a revocation,
+  under the same per-user lock and cut-off ordering. It never touches a user
+  with a live or unrecognized-status instance, and a failed probe or cut-off
+  advance erases nothing. It needs no coordination between replicas: the
+  cascade is idempotent, and each replica re-checks liveness under its own user
+  lock immediately before erasing. Several replicas may erase the same user at
+  once with the same end state, at the price of duplicate work. Its guarantee
+  is eventual: data a late write or a failed cascade left behind is erased
+  within about one pass over the users plus the grace period. Limits: a
+  legacy suspended-only wallet (never revoked) is not erased; sessions and
+  challenges are dropped only when the cascade runs for another reason; a
+  first enrollment on another replica between the reconciler's liveness check
+  and its erase (milliseconds) is still unserialized across processes; and a
+  cycle takes `ceil(users / batch_size)` runs, so size the batch for the number
+  of users with revoked instances.
+
+  **Rolling it out.** On an existing deployment, first enable the reconciler
+  with `lifecycle.reconciler.dry_run: true`. It then makes every decision
+  (liveness, grace period, leftover-data probe) but writes nothing, not even
+  the token cut-off. It logs a warning at startup, sets the gauge
+  `siros_erasure_reconciler_dry_run` to 1, counts users in
+  `siros_erasure_reconciler_users_total{outcome="would_erase"}` and logs one
+  Info summary per pass that found something (`would_erase`, and
+  `would_erase_by_category` counting the categories `private_data`,
+  `key_material`, `credentials`, `presentations`, never contents). At debug
+  log level it also logs each such user (pseudonymous id and categories). Check
+  that the counts match what you expect, then set `dry_run: false`; users
+  counted as `erased` from then on are real.
+
+  **Upgrade note.** On the first real run, the reconciler erases the data of
+  every wallet that was revoked earlier but never fully erased (a revocation's
+  cascade that failed, or a revocation from before the cascade existed), for
+  all users that meet the rules above. This is irreversible. On an existing
+  deployment, start with `dry_run: true` (above), review the would-erase
+  counts, then switch it off. To opt out entirely set
+  `lifecycle.reconciler.enabled: false`. Do not leave dry run on: nothing is
+  erased while it is.
+
 #### Token revocation with several replicas
 
 Revoked access-token JTIs (logout) and revoked users (account deletion) are

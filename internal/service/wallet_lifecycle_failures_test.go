@@ -175,6 +175,13 @@ func (s *failCredentials) GetAllByHolder(ctx context.Context, t domain.TenantID,
 	return s.CredentialStore.GetAllByHolder(ctx, t, did)
 }
 
+func (s *failCredentials) TenantsByHolders(ctx context.Context, h []string) ([]domain.TenantID, error) {
+	if err := s.f.err("credentials.TenantsByHolders"); err != nil {
+		return nil, err
+	}
+	return s.CredentialStore.TenantsByHolders(ctx, h)
+}
+
 func (s *failCredentials) Delete(ctx context.Context, t domain.TenantID, did, id string) error {
 	if err := s.f.err("credentials.Delete"); err != nil {
 		return err

@@ -3386,6 +3386,81 @@ func TestApplyASSecurityDefaults_Parity(t *testing.T) {
 	}
 }
 
+func TestErasureReconcilerConfig(t *testing.T) {
+	def := defaultConfig().Lifecycle.Reconciler
+	if !def.Enabled || def.IntervalSeconds != 600 || def.GracePeriodSeconds != 900 || def.BatchSize != 50 {
+		t.Errorf("unexpected defaults: %+v", def)
+	}
+
+	cfgPath := filepath.Join(t.TempDir(), "c.yaml")
+	yaml := "server:\n  rp_id: localhost\n  rp_origin: http://localhost:8080\nstorage:\n  type: memory\njwt:\n  secret: test-secret-that-is-at-least-32-bytes!\nlifecycle:\n  reconciler:\n    enabled: false\n    batch_size: 7\n"
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := cfg.Lifecycle.Reconciler
+	if r.Enabled || r.BatchSize != 7 || r.IntervalSeconds != 600 {
+		t.Errorf("file did not override the defaults as expected: %+v", r)
+	}
+
+	var zero ErasureReconcilerConfig
+	zero.SetDefaults()
+	if zero.IntervalSeconds != 600 || zero.GracePeriodSeconds != 900 || zero.BatchSize != 50 {
+		t.Errorf("SetDefaults: %+v", zero)
+	}
+	neg := ErasureReconcilerConfig{IntervalSeconds: -1, GracePeriodSeconds: -1, BatchSize: -1}
+	neg.SetDefaults()
+	if neg != zero {
+		t.Errorf("non-positive values must fall back to defaults: %+v", neg)
+	}
+}
+
+func TestErasureReconcilerBatchSizeIsBounded(t *testing.T) {
+	for _, tc := range []struct {
+		batch int
+		ok    bool
+	}{{0, true}, {1, true}, {MaxReconcilerBatchSize, true}, {MaxReconcilerBatchSize + 1, false}, {-1, false}} {
+		cfg := validBaseConfig()
+		cfg.Lifecycle.Reconciler.BatchSize = tc.batch
+		err := cfg.Validate()
+		if tc.ok && err != nil {
+			t.Errorf("batch_size %d: unexpected error %v", tc.batch, err)
+		}
+		if !tc.ok && (err == nil || !strings.Contains(err.Error(), "lifecycle.reconciler.batch_size")) {
+			t.Errorf("batch_size %d: want a batch_size error, got %v", tc.batch, err)
+		}
+	}
+}
+
+func TestErasureReconcilerDryRunConfig(t *testing.T) {
+	if defaultConfig().Lifecycle.Reconciler.DryRun {
+		t.Error("dry_run must default to false")
+	}
+	cfgPath := filepath.Join(t.TempDir(), "c.yaml")
+	yaml := "server:\n  rp_id: localhost\n  rp_origin: http://localhost:8080\nstorage:\n  type: memory\njwt:\n  secret: test-secret-that-is-at-least-32-bytes!\n"
+	if err := os.WriteFile(cfgPath, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Lifecycle.Reconciler.DryRun {
+		t.Error("dry_run must default to false after Load")
+	}
+	t.Setenv("WALLET_LIFECYCLE_RECONCILER_DRY_RUN", "true")
+	cfg, err = Load(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Lifecycle.Reconciler.DryRun || !cfg.Lifecycle.Reconciler.Enabled {
+		t.Errorf("env override: %+v", cfg.Lifecycle.Reconciler)
+	}
+}
+
 func TestConfig_Validate_TokenBlacklistBackend(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -3759,5 +3834,18 @@ func TestAndroidKeyAttestationConfig_ValidateEnforcement(t *testing.T) {
 	full.WalletProvider.Attestation.AndroidKeyAttestation = AndroidKeyAttestationConfig{Enforcement: "reject"}
 	if full.Validate() == nil {
 		t.Fatal("Config.Validate accepted reject with nothing pinned")
+	}
+}
+
+func TestErasureReconcilerConfig_RefusesOverflowingDurations(t *testing.T) {
+	for name, set := range map[string]func(*Config){
+		"interval_seconds":     func(c *Config) { c.Lifecycle.Reconciler.IntervalSeconds = MaxReconcilerSeconds + 1 },
+		"grace_period_seconds": func(c *Config) { c.Lifecycle.Reconciler.GracePeriodSeconds = int(^uint(0) >> 1) },
+	} {
+		c := defaultConfig()
+		set(c)
+		if err := c.Validate(); err == nil || !strings.Contains(err.Error(), name) {
+			t.Errorf("%s: want refusal, got %v", name, err)
+		}
 	}
 }
