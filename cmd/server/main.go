@@ -188,8 +188,6 @@ func main() {
 	if backendCfg != nil {
 		serverCfg.HTTPAddress = backendCfg.Server.Host
 		serverCfg.HTTPPort = backendCfg.Server.Port
-		serverCfg.WSAddress = backendCfg.Server.Host
-		serverCfg.WSPort = backendCfg.Server.EnginePort
 		serverCfg.AdminPort = backendCfg.Server.AdminPort
 		serverCfg.AdminToken = backendCfg.Server.AdminToken
 		serverCfg.CORS = backendCfg.Server.CORS

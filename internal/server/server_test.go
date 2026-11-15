@@ -29,12 +29,6 @@ func TestDefaultServerConfig(t *testing.T) {
 	if cfg.HTTPPort != 8080 {
 		t.Errorf("HTTPPort = %d, want 8080", cfg.HTTPPort)
 	}
-	if cfg.WSAddress != "0.0.0.0" {
-		t.Errorf("WSAddress = %q, want '0.0.0.0'", cfg.WSAddress)
-	}
-	if cfg.WSPort != 8081 {
-		t.Errorf("WSPort = %d, want 8081", cfg.WSPort)
-	}
 }
 
 func TestNewManager(t *testing.T) {
@@ -128,11 +122,11 @@ func TestManager_AddProvider_MultipleProviders(t *testing.T) {
 
 	http1 := &mockRouteProvider{name: "http1", transport: TransportHTTP}
 	http2 := &mockRouteProvider{name: "http2", transport: TransportHTTP}
-	ws1 := &mockRouteProvider{name: "ws1", transport: TransportWebSocket}
+	wp1 := &mockRouteProvider{name: "wp1", transport: TransportWalletProvider}
 
 	manager.AddProvider(http1)
 	manager.AddProvider(http2)
-	manager.AddProvider(ws1)
+	manager.AddProvider(wp1)
 
 	if len(manager.providers) != 3 {
 		t.Errorf("providers count = %d, want 3", len(manager.providers))
@@ -142,9 +136,6 @@ func TestManager_AddProvider_MultipleProviders(t *testing.T) {
 func TestTransportConstants(t *testing.T) {
 	if TransportHTTP != "http" {
 		t.Errorf("TransportHTTP = %q, want 'http'", TransportHTTP)
-	}
-	if TransportWebSocket != "websocket" {
-		t.Errorf("TransportWebSocket = %q, want 'websocket'", TransportWebSocket)
 	}
 }
 
@@ -175,8 +166,6 @@ func TestServerConfig_Fields(t *testing.T) {
 	cfg := &ServerConfig{
 		HTTPAddress:  "127.0.0.1",
 		HTTPPort:     9000,
-		WSAddress:    "0.0.0.0",
-		WSPort:       9001,
 		AdminPort:    9002,
 		AdminToken:   "secret",
 		LoggingLevel: "debug",
@@ -333,9 +322,6 @@ func TestManager_ServersNotStarted(t *testing.T) {
 	// Check server fields are nil before Start
 	if manager.httpServer != nil {
 		t.Error("httpServer should be nil before Start")
-	}
-	if manager.wsServer != nil {
-		t.Error("wsServer should be nil before Start")
 	}
 	if manager.adminServer != nil {
 		t.Error("adminServer should be nil before Start")
