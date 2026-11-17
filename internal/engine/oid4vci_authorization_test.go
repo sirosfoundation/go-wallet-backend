@@ -73,6 +73,12 @@ func TestAuthorizationResponseIssuer(t *testing.T) {
 					CredentialIssuer:     "https://credentials.example",
 					AuthorizationServers: []string{server.URL},
 					TokenEndpoint:        server.URL + "/token",
+					// The selected set's configuration (#549): the scope
+					// the authorization requests, as the pre-#549 call's
+					// placeholder config carried.
+					CredentialConfigurationsSupported: CredentialConfigurations{
+						"pid": CredentialConfig{Scope: "pid"},
+					},
 				}
 				response := strings.ReplaceAll(tc.response, "$AS", server.URL)
 				cfg := &config.Config{
@@ -134,7 +140,7 @@ func TestAuthorizationResponseIssuer(t *testing.T) {
 					}
 					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 					defer cancel()
-					_, err = h.handleAuthorizationCode(ctx, &CredentialOffer{}, metadata, &CredentialConfig{Scope: "pid"})
+					_, err = h.handleAuthorizationCode(ctx, &CredentialOffer{}, metadata, []string{"pid"})
 				}
 				if tc.wantError != "" {
 					require.ErrorContains(t, err, tc.wantError)
