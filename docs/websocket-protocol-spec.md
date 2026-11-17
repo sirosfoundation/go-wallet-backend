@@ -220,6 +220,37 @@ Client → Server:
 }
 ```
 
+##### The selected set (multi-credential issuance)
+
+An offer may name several `credential_configuration_ids`. What issues is a
+SET, and the client that already resolved the user's choice (a picker UI
+ahead of the flow) names it on `flow_start`:
+
+```
+Client → Server:
+{
+  "type": "flow_start",
+  "flow_id": "<uuid>",
+  "protocol": "oid4vci",
+  "offer": "openid-credential-offer://...",
+  "credential_configuration_ids": ["pid", "mdl"]
+}
+```
+
+The member is the selection: no ask runs, whatever the deployment's
+`engine_issuance_selection_policy` (`issue_all`, the default, or
+`user_selects`; see "User Selection" below). Absent or empty means every
+offered configuration (the `issue_all` default). Every named id must be one
+the offer carries — an id outside the offer fails the flow per-id, never a
+silent fall-back to issuing configurations nobody chose. The offer's order
+wins over the answer's; duplicates collapse.
+
+One authorization and one token cover the whole set: the scope is the set's
+joined values (de-duplicated, offer order, RFC 6749 §3.3 space-delimited),
+and each configuration issues in its own request — its own proofs (a fresh
+key per proof beyond the first; two proofs over the same key link the
+credentials), its own c_nonce retry, its own deferred polling.
+
 #### Flow Progression
 
 Server executes the protocol, sending progress updates:
@@ -305,7 +336,11 @@ Server → Client:
 
 #### User Selection
 
-Flow pauses for user to select credential configuration:
+Under the `user_selects` policy (`engine_issuance_selection_policy`:
+`user_selects`; the default `issue_all` issues every offered configuration
+with no selection step at all — and a `flow_start`
+`credential_configuration_ids` set is the selection under either policy),
+the flow pauses for the user to select the credential configurations:
 
 ```
 Server → Client:
@@ -324,7 +359,8 @@ Server → Client:
 }
 ```
 
-Client responds:
+Client responds — the answer is a SET, a subset of the offer (one, several,
+or all):
 
 ```
 Client → Server:
@@ -332,9 +368,16 @@ Client → Server:
   "type": "flow_action",
   "flow_id": "<uuid>",
   "action": "select_credential",
-  "credential_configuration_id": "UniversityDegree_jwt_vc_json"
+  "credential_configuration_ids": ["UniversityDegree_jwt_vc_json", "Mdl_mso_mdoc"]
 }
 ```
+
+The legacy single `credential_configuration_id` member is accepted as the
+one-element answer (pre-#549 clients); the plural member wins when both
+arrive. Every named id must be one the offer carried — an id outside the
+offer refuses, per-id. A single-configuration offer never asks: it
+auto-selects under either policy. The offer's order wins; duplicates
+collapse.
 
 #### Authorization
 
@@ -643,6 +686,7 @@ Server → Client:
   "flow_id": "<uuid>",
   "credentials": [
     {
+      "credential_configuration_id": "UniversityDegree_jwt_vc_json",
       "format": "jwt_vc_json",
       "credential": "eyJ...",
       "vct": "https://example.com/credentials/degree",
@@ -651,6 +695,48 @@ Server → Client:
   ]
 }
 ```
+
+Each `credentials[i]` carries its own `credential_configuration_id` — the
+pairing a renewal's `selected_credential_configuration_id` needs; a
+multi-configuration completion carries one entry per issued configuration,
+in the offer's order. Each entry also carries its own
+`credential_response_encrypted` flag and its own `credential_metadata`
+(the filtered display-only `display`/`claims` members of its response) —
+a multi-configuration flow may mix plain and encrypted answers, so the
+encryption state and display metadata are per-result, not per-flow (the
+flow-level members stay as the legacy single-configuration view).
+
+A configuration of the set that fails does NOT abort the others: the flow
+still completes with every issued credential, and the completion carries
+the per-configuration failure report:
+
+```
+Server → Client:
+{
+  "type": "flow_complete",
+  "flow_id": "<uuid>",
+  "credentials": [
+    {
+      "credential_configuration_id": "pid",
+      "format": "dc+sd-jwt",
+      "credential": "eyJ...",
+      "credential_response_encrypted": false,
+      "credential_metadata": { "display": [ ... ] }
+    }
+  ],
+  "failures": [
+    {
+      "credential_configuration_id": "mdl",
+      "error": "oid4vci: credential endpoint answered 500"
+    }
+  ]
+}
+```
+
+Zero successes is a failed flow with exactly ONE `flow_error` (the first
+failure's step and code) — never one error per configuration; a partial
+success emits no `flow_error` at all, so a client treating `flow_error` as
+terminal can always consume the issued remainder.
 
 Encrypted issuer response (engine-blind): when the issuer's Credential
 Response is encrypted to a key only the client holds, `flow_complete` carries
