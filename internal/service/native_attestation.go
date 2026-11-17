@@ -487,7 +487,7 @@ func (s *NativeAttestationService) verifyGooglePlayIntegrity(_ context.Context, 
 	}
 
 	// Step 2: Decrypt the JWE token
-	jwe, err := jose.ParseEncrypted(req.Token, []jose.KeyAlgorithm{jose.A256KW}, []jose.ContentEncryption{jose.A256GCM})
+	jwe, err := jose.ParseEncryptedCompact(req.Token, []jose.KeyAlgorithm{jose.A256KW}, []jose.ContentEncryption{jose.A256GCM})
 	if err != nil {
 		return nil, fmt.Errorf("%w: parse JWE: %v", ErrNativeAttestationInvalid, err)
 	}
@@ -513,7 +513,7 @@ func (s *NativeAttestationService) verifyGooglePlayIntegrity(_ context.Context, 
 		return nil, fmt.Errorf("%w: verification key is not EC", ErrNativeAttestationInvalid)
 	}
 
-	jws, err := jose.ParseSigned(string(decrypted), []jose.SignatureAlgorithm{jose.ES256})
+	jws, err := jose.ParseSignedCompact(string(decrypted), []jose.SignatureAlgorithm{jose.ES256})
 	if err != nil {
 		return nil, fmt.Errorf("%w: parse JWS: %v", ErrNativeAttestationInvalid, err)
 	}
