@@ -179,6 +179,14 @@ type AuthorizationRequest struct {
 	// RequestJWT stores the raw request JWT (if the request was JWT-secured).
 	// Used to extract x5c/jwk key material from the JWT header for trust evaluation.
 	RequestJWT string `json:"-"`
+	// VerifierInfoMembers carries the ETSI TS 119 472-2 §6.3.2.2
+	// `verifier_info` members from the request JWT payload — the registrar
+	// dataset and the registration certificate that identify the fronted
+	// relying party in an intermediary-signed request. Relayed to the
+	// client in the credential_selection progress message so the consent
+	// UI can display the fronted RP's identity. Absent for a
+	// verifier-signed request (the members are optional in the JWT).
+	VerifierInfoMembers json.RawMessage `json:"verifier_info,omitempty"`
 	// VerifierSessionID is the verifier-assigned "sessionId" query parameter
 	// carried on the request_uri we fetched the signed request object from
 	// (e.g. ".../openid4vpRequest?sessionId=X"). A real ZK/PPID pseudonym's
@@ -1774,12 +1782,21 @@ func extractRawClientMetadata(requestObject []byte) (json.RawMessage, error) {
 // silence until the user-interaction timeout, which is what a wallet missing
 // the PID an issuer demands used to hit.
 func (h *OID4VPHandler) requestCredentialSelection(ctx context.Context, authReq *AuthorizationRequest, verifier *VerifierInfo) ([]ConsentSelection, error) {
+	// The 472-2 §6.3.2.2 verifier_info members ride alongside the trust
+	// result: an intermediary-signed request's fronted RP identity (the
+	// registrar dataset's srvDescription) is what the consent screen should
+	// display, not the raw x509_hash the trust evaluation names. Absent for
+	// a verifier-signed request; the frontend falls back to the verifier's
+	// name exactly as before.
 	selection := map[string]interface{}{
 		"dcql_query": authReq.DCQLQuery,
 		"verifier":   verifier,
 	}
 	if len(authReq.ClientMetadataRaw) > 0 {
 		selection["client_metadata"] = authReq.ClientMetadataRaw
+	}
+	if len(authReq.VerifierInfoMembers) > 0 {
+		selection["verifier_info"] = authReq.VerifierInfoMembers
 	}
 	selection["verified_request"] = verifiedInputs(authReq)
 	_ = h.Progress(StepCredentialSelection, selection)
