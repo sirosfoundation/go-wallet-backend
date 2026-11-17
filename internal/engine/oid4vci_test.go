@@ -4045,7 +4045,7 @@ func TestSelectCredentialConfigurations_IssueAllByDefault(t *testing.T) {
 	offer := &CredentialOffer{CredentialConfigurationIDs: []string{"pid", "mdl"}}
 	md := selectAllMetadata("https://issuer.example")
 
-	ids, err := h.selectCredentialConfigurations(context.Background(), offer, md)
+	ids, err := h.selectCredentialConfigurations(context.Background(), offer, md, nil)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"pid", "mdl"}, ids, "every offered configuration, in the offer's order")
 }
@@ -4059,7 +4059,7 @@ func TestSelectCredentialConfigurations_AutoSelectWhenOne(t *testing.T) {
 			h.Config = &config.Config{Server: config.ServerConfig{EngineIssuanceSelectionPolicy: policy}}
 			offer := &CredentialOffer{CredentialConfigurationIDs: []string{"pid"}}
 			md := selectAllMetadata("https://issuer.example")
-			ids, err := h.selectCredentialConfigurations(context.Background(), offer, md)
+			ids, err := h.selectCredentialConfigurations(context.Background(), offer, md, nil)
 			require.NoError(t, err)
 			assert.Equal(t, []string{"pid"}, ids)
 		})
@@ -4080,6 +4080,9 @@ func TestIssueCredentials_LoopIssuesEverySelectedConfiguration(t *testing.T) {
 	var creds []CredentialResult
 	require.NoError(t, json.Unmarshal(completion(t, fc)["credentials"], &creds))
 	require.Len(t, creds, 2, "the completion carries every result")
+	assert.Equal(t, "pid", creds[0].CredentialConfigurationID, "each result pairs with its configuration")
+	assert.Equal(t, "mdl", creds[1].CredentialConfigurationID)
+	assert.NotContains(t, completion(t, fc), "failures", "no failures member when everything issued")
 }
 
 // Partial failure: one configuration's failure does NOT abort the others -
@@ -4106,9 +4109,23 @@ func TestIssueCredentials_PartialFailureCompletes(t *testing.T) {
 	var creds []CredentialResult
 	require.NoError(t, json.Unmarshal(completion(t, fc)["credentials"], &creds))
 	require.Len(t, creds, 1, "the successful configuration's result")
-	failures, ok := h.Flow.Data["issuance_failures"].(map[string]string)
-	require.True(t, ok, "the failures ride the flow data")
-	assert.Len(t, failures, 1)
+	assert.Equal(t, "pid", creds[0].CredentialConfigurationID, "the success pairs with its configuration")
+
+	// The failures ride the COMPLETION payload (the client's view - #549:
+	// which configuration failed and why), not only the flow data.
+	var failureReport []CredentialFailure
+	require.NoError(t, json.Unmarshal(completion(t, fc)["failures"], &failureReport))
+	require.Len(t, failureReport, 1)
+	assert.Equal(t, "mdl", failureReport[0].CredentialConfigurationID)
+	assert.NotEmpty(t, failureReport[0].Error)
+	flowFailures, ok := h.Flow.Data["issuance_failures"].(map[string]string)
+	require.True(t, ok, "the failures also ride the flow data (server-side view)")
+	assert.Len(t, flowFailures, 1)
+
+	// A partial failure is NOT a flow error: no terminal flow_error may ride
+	// alongside the completion, or a client treating it as terminal loses the
+	// issued credentials.
+	assert.NotContains(t, completionTypes(fc), "flow_error", "a partial failure completes, it does not error")
 }
 
 // Zero successes: the flow fails with the per-configuration error.
@@ -4128,4 +4145,162 @@ func TestIssueCredentials_ZeroSuccessFails(t *testing.T) {
 	err := h.issueCredentials(context.Background(), md, tokenBearer(), []string{"pid", "mdl"}, nil, "")
 	require.Error(t, err)
 	assert.NotContains(t, completionTypes(fc), "flow_complete", "no completion on zero successes")
+
+	// Exactly ONE terminal flow_error for the whole loop (#549): the
+	// per-configuration emissions were suppressed mid-loop; the loop sent
+	// the single terminal error itself.
+	errs := terminalErrors(t, fc)
+	require.Len(t, errs, 1, "one flow error, not one per failed configuration")
+	assert.Equal(t, ErrCodeCredentialError, errs[0].Error.Code)
+}
+
+// --- #549: the flow-start credential_configuration_ids set ---
+
+// The flow-start set IS the selection: no ask runs, whatever the deployment
+// policy (the user already chose before the flow started).
+func TestSelectCredentialConfigurations_FlowStartSetWins(t *testing.T) {
+	for _, policy := range []string{"", "issue_all", "user_selects"} {
+		t.Run(policy, func(t *testing.T) {
+			h, ch, cleanup := captureHandler(t)
+			defer cleanup()
+			h.Config = &config.Config{Server: config.ServerConfig{EngineIssuanceSelectionPolicy: policy}}
+			offer := &CredentialOffer{CredentialConfigurationIDs: []string{"pid", "mdl"}}
+			md := selectAllMetadata("https://issuer.example")
+
+			ids, err := h.selectCredentialConfigurations(context.Background(), offer, md, []string{"mdl"})
+			require.NoError(t, err)
+			assert.Equal(t, []string{"mdl"}, ids)
+
+			// No ask: nothing was sent to the client.
+			select {
+			case m := <-ch:
+				t.Fatalf("no progress/action expected under a flow-start set, got %v", m["type"])
+			default:
+			}
+		})
+	}
+}
+
+// A flow-start id outside the offer fails the flow per-id - never a silent
+// fall-back to issuing everything (the subset a contract-following client
+// sent must never be ignored).
+func TestSelectCredentialConfigurations_FlowStartSetRefusesUnknown(t *testing.T) {
+	h, _, cleanup := captureHandler(t)
+	defer cleanup()
+	h.Config = &config.Config{}
+	offer := &CredentialOffer{CredentialConfigurationIDs: []string{"pid", "mdl"}}
+	md := selectAllMetadata("https://issuer.example")
+
+	_, err := h.selectCredentialConfigurations(context.Background(), offer, md, []string{"pid", "nope"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not offered")
+}
+
+// The flow-start set follows the offer's order and de-duplicates: the
+// client's own order is not a sorting instruction.
+func TestSelectCredentialConfigurations_FlowStartSetOfferOrder(t *testing.T) {
+	h, _, cleanup := captureHandler(t)
+	defer cleanup()
+	h.Config = &config.Config{}
+	offer := &CredentialOffer{CredentialConfigurationIDs: []string{"pid", "mdl"}}
+	md := selectAllMetadata("https://issuer.example")
+
+	ids, err := h.selectCredentialConfigurations(context.Background(), offer, md, []string{"mdl", "pid", "mdl"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"pid", "mdl"}, ids)
+}
+
+// Absent flow-start set: the policy decides (issue_all default = every
+// offered configuration; the ask only runs under user_selects).
+func TestSelectCredentialConfigurations_NoFlowStartSetFollowsPolicy(t *testing.T) {
+	h, _, cleanup := captureHandler(t)
+	defer cleanup()
+	h.Config = &config.Config{Server: config.ServerConfig{EngineIssuanceSelectionPolicy: "issue_all"}}
+	offer := &CredentialOffer{CredentialConfigurationIDs: []string{"pid", "mdl"}}
+	md := selectAllMetadata("https://issuer.example")
+
+	ids, err := h.selectCredentialConfigurations(context.Background(), offer, md, nil)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"pid", "mdl"}, ids)
+}
+
+// The user_selects ask: the awaiting_selection progress carries the offered
+// configurations to the client, whose select_credential answer - a SET, the
+// subset the user picked - is the selection. The legacy single
+// credential_configuration_id member stays accepted for pre-#549 clients.
+func TestSelectCredentialConfigurations_UserSelectsAskAnsweredWithSet(t *testing.T) {
+	for name, payload := range map[string]string{
+		"the set member":       `{"credential_configuration_ids":["mdl"]}`,
+		"the legacy single id": `{"credential_configuration_id":"mdl"}`,
+		"a mixed answer":       `{"credential_configuration_id":"pid","credential_configuration_ids":["mdl"]}`,
+		"the full set (all)":   `{"credential_configuration_ids":["pid","mdl"]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			h, ch, cleanup := captureHandler(t)
+			defer cleanup()
+			h.Config = &config.Config{Server: config.ServerConfig{EngineIssuanceSelectionPolicy: "user_selects"}}
+
+			// Wire the flow's action channel and register the flow, then
+			// answer the ask before it runs (the channel is buffered; the
+			// answer cannot be lost and the test cannot race).
+			actions := make(chan *FlowActionMessage, flowActionBuffer)
+			h.Flow.actions = actions
+			h.Flow.Session.flows[h.Flow.ID] = h.Flow
+			actions <- &FlowActionMessage{
+				Message: Message{Type: TypeFlowAction, FlowID: h.Flow.ID},
+				Action:  ActionSelectCredential,
+				Payload: json.RawMessage(payload),
+			}
+
+			offer := &CredentialOffer{CredentialConfigurationIDs: []string{"pid", "mdl"}}
+			md := selectAllMetadata("https://issuer.example")
+
+			ids, err := h.selectCredentialConfigurations(context.Background(), offer, md, nil)
+			require.NoError(t, err)
+
+			// The ask reached the client: the awaiting_selection progress
+			// carrying every offered configuration.
+			m := nextMsg(t, ch)
+			assert.JSONEq(t, `"flow_progress"`, string(m["type"]))
+			assert.JSONEq(t, `"awaiting_selection"`, string(m["step"]))
+			var ask struct {
+				Available []AvailableCredential `json:"available_credentials"`
+			}
+			require.NoError(t, json.Unmarshal(m["payload"], &ask))
+			require.Len(t, ask.Available, 2)
+
+			// The answer's set (offer-ordered) is the selection.
+			// The plural member is #549's; the single one is legacy compat, so
+			// a mixed answer takes the set. The full set answers with every
+			// offered id, offer-ordered.
+			if payload == `{"credential_configuration_ids":["pid","mdl"]}` {
+				assert.Equal(t, []string{"pid", "mdl"}, ids)
+			} else {
+				assert.Equal(t, []string{"mdl"}, ids)
+			}
+		})
+	}
+}
+
+// A user_selects answer naming an id outside the offer refuses per-id.
+func TestSelectCredentialConfigurations_UserSelectsRefusesUnknownAnswer(t *testing.T) {
+	h, _, cleanup := captureHandler(t)
+	defer cleanup()
+	h.Config = &config.Config{Server: config.ServerConfig{EngineIssuanceSelectionPolicy: "user_selects"}}
+
+	actions := make(chan *FlowActionMessage, flowActionBuffer)
+	h.Flow.actions = actions
+	h.Flow.Session.flows[h.Flow.ID] = h.Flow
+	actions <- &FlowActionMessage{
+		Message: Message{Type: TypeFlowAction, FlowID: h.Flow.ID},
+		Action:  ActionSelectCredential,
+		Payload: json.RawMessage(`{"credential_configuration_ids":["pid","nope"]}`),
+	}
+
+	offer := &CredentialOffer{CredentialConfigurationIDs: []string{"pid", "mdl"}}
+	md := selectAllMetadata("https://issuer.example")
+
+	_, err := h.selectCredentialConfigurations(context.Background(), offer, md, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not offered")
 }

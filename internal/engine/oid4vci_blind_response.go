@@ -67,13 +67,13 @@ func (h *OID4VCIHandler) negotiateResponseEncryption(metadata *IssuerMetadata, c
 	seedAdvertised, seedErr := secretSeedAdvertised(config)
 	if seedErr != nil {
 		h.Logger.Warn("rejecting issuer metadata", zap.Error(seedErr))
-		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer advertised malformed secret seed metadata")
+		h.issuanceFailure(StepRequestingCredential, ErrCodeCredentialError, "Issuer advertised malformed secret seed metadata")
 		return nil, seedErr
 	}
 	refuseSeed := func(msg string) (*responseEncryption, error) {
 		err := errors.New(msg)
 		h.Logger.Warn("rejecting credential request", zap.Error(err))
-		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer cannot deliver the secret seed over an encrypted response")
+		h.issuanceFailure(StepRequestingCredential, ErrCodeCredentialError, "Issuer cannot deliver the secret seed over an encrypted response")
 		return nil, err
 	}
 

@@ -59,15 +59,19 @@ type notificationContext struct {
 }
 
 // notificationContextStore is an in-memory, TTL-bounded registry of
-// notificationContext values keyed by flow ID. All state is ephemeral and
-// scoped to a live WebSocket session; nothing is persisted.
+// notificationContext values keyed by flow ID. A flow may carry SEVERAL
+// contexts (#549): one per issued configuration response, each one-shot.
+// take matches the client-supplied notification_id against them - an exact
+// id match first, else an empty-id context (an encrypted response's, whose
+// id only the client could read). All state is ephemeral and scoped to a
+// live WebSocket session; nothing is persisted.
 type notificationContextStore struct {
 	mu  sync.Mutex
-	ctx map[string]*notificationContext
+	ctx map[string][]*notificationContext
 }
 
 func newNotificationContextStore() *notificationContextStore {
-	return &notificationContextStore{ctx: make(map[string]*notificationContext)}
+	return &notificationContextStore{ctx: make(map[string][]*notificationContext)}
 }
 
 // put registers a notification context for the given flow ID with a bounded TTL.
@@ -79,19 +83,53 @@ func (s *notificationContextStore) put(flowID string, nc *notificationContext) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pruneLocked()
-	s.ctx[flowID] = nc
+	s.ctx[flowID] = append(s.ctx[flowID], nc)
 }
 
-// take returns and removes the notification context for the given flow ID.
-// It returns nil if the context is absent or expired (one-shot semantics).
-func (s *notificationContextStore) take(flowID string) *notificationContext {
+// take returns and removes the one notification context of the given flow the
+// supplied notification_id matches. An exact id match wins; an empty stored
+// notificationID (the encrypted-response case: the engine could not read the
+// id, the client supplies the real one) matches any supplied value. It returns
+// nil if nothing matches, or if the matched context is expired (one-shot
+// semantics).
+func (s *notificationContextStore) take(flowID, notificationID string) *notificationContext {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	nc, ok := s.ctx[flowID]
-	if !ok {
+	list := s.ctx[flowID]
+	idx := -1
+	for i, nc := range list {
+		if nc.notificationID != "" && nc.notificationID == notificationID {
+			idx = i
+			break
+		}
+	}
+	if idx == -1 {
+		for i, nc := range list {
+			if nc.notificationID == "" {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx == -1 && notificationID == "" {
+		// An empty SUPPLIED id is the old single-context take(flowID):
+		// whatever context the flow holds (the dispatch path validates the
+		// real id through hasValid before it ever gets here).
+		for i, nc := range list {
+			if !time.Now().After(nc.expiresAt) {
+				idx = i
+				break
+			}
+		}
+	}
+	if idx == -1 {
 		return nil
 	}
-	delete(s.ctx, flowID)
+	nc := list[idx]
+	s.ctx[flowID] = append(list[:idx], list[idx+1:]...)
+	if len(s.ctx[flowID]) == 0 {
+		delete(s.ctx, flowID)
+	}
 	if time.Now().After(nc.expiresAt) {
 		return nil
 	}
@@ -100,26 +138,39 @@ func (s *notificationContextStore) take(flowID string) *notificationContext {
 
 // hasValid reports whether a non-expired notification context exists for the
 // given flow ID whose stored notification_id matches the supplied value. It
-// does not consume the context. An empty stored notificationID matches any
+// does not consume any context. An empty stored notificationID matches any
 // supplied value. That is the normal case for an encrypted issuer response: the
 // engine cannot read the notification_id, registers the context with an empty
 // id and the client supplies the real one (see registerNotificationContext).
 func (s *notificationContextStore) hasValid(flowID, notificationID string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	nc, ok := s.ctx[flowID]
-	if !ok || time.Now().After(nc.expiresAt) {
-		return false
+	for _, nc := range s.ctx[flowID] {
+		if time.Now().After(nc.expiresAt) {
+			continue
+		}
+		if nc.notificationID == "" || nc.notificationID == notificationID {
+			return true
+		}
 	}
-	return nc.notificationID == "" || nc.notificationID == notificationID
+	return false
 }
 
 // pruneLocked removes expired entries. Caller must hold s.mu.
 func (s *notificationContextStore) pruneLocked() {
 	now := time.Now()
-	for id, nc := range s.ctx {
-		if now.After(nc.expiresAt) {
+	for id, list := range s.ctx {
+		kept := list[:0]
+		for _, nc := range list {
+			if now.After(nc.expiresAt) {
+				continue
+			}
+			kept = append(kept, nc)
+		}
+		if len(kept) == 0 {
 			delete(s.ctx, id)
+		} else {
+			s.ctx[id] = kept
 		}
 	}
 }

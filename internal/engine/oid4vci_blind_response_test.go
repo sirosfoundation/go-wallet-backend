@@ -493,7 +493,7 @@ func TestBlind_ImmediateIssuance_EngineNeverHoldsContents(t *testing.T) {
 	// The notification context holds no id: the client's id matches.
 	assert.True(t, h.Flow.Session.notifications.hasValid("f-blind", secretNotif))
 	assert.True(t, h.Flow.Session.notifications.hasValid("f-blind", "anything-the-client-sends"))
-	nc := h.Flow.Session.notifications.take("f-blind")
+	nc := h.Flow.Session.notifications.take("f-blind", "")
 	require.NotNil(t, nc)
 	assert.Empty(t, nc.notificationID)
 	assertNoSecrets(t, "notification context", fmt.Sprintf("%+v", *nc))
@@ -1131,7 +1131,7 @@ func TestPlainResponse_SeedRefused(t *testing.T) {
 	body := `{"credentials":["c0"],"credential_metadata":{"display":[{"name":"D"}],"claims":[],"org.example.x":"EXT",` +
 		`"org.siros.secret_seed":{"ns":"` + secretSeedA + `"}}}`
 	require.NoError(t, json.Unmarshal([]byte(body), &resp))
-	_, _, err := h.finishIssuance(context.Background(), &resp, &CredentialConfig{Format: "x"}, nil, nil, &TokenResponse{})
+	_, _, err := h.finishIssuance(context.Background(), &resp, "cfg", &CredentialConfig{Format: "x"}, nil, nil, &TokenResponse{})
 	require.Error(t, err)
 	assertNoSecrets(t, "error", err.Error())
 	m := nextMsg(t, ch)
@@ -1355,8 +1355,8 @@ func TestBlind_BatchSizeCappedWhenResponseEncrypted(t *testing.T) {
 // the results) - the message-shape assertions' entry point.
 func completeOne(t *testing.T, h *OID4VCIHandler, resp *CredentialResponse, cfg *CredentialConfig) {
 	t.Helper()
-	results, enc, err := h.finishIssuance(context.Background(), resp, cfg, nil, nil, &TokenResponse{})
+	results, enc, err := h.finishIssuance(context.Background(), resp, "cfg", cfg, nil, nil, &TokenResponse{})
 	require.NoError(t, err)
-	err = h.Flow.Session.sendFlowComplete(h.Flow.ID, results, "", "", "", "", enc, displayMetadata(resp))
+	err = h.Flow.Session.sendFlowComplete(h.Flow.ID, results, "", "", "", "", enc, displayMetadata(resp), nil)
 	require.NoError(t, err)
 }

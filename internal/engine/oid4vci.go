@@ -57,8 +57,20 @@ type OID4VCIHandler struct {
 	// encryptedNotificationRegistered is set once the notification context of
 	// an encrypted response has been registered for this issuance, so a later
 	// step (deferred polling, completion) cannot recreate a context the client
-	// already consumed with an early credential_notification.
+	// already consumed with an early credential_notification. The issuance
+	// loop resets it per configuration (#549): one guard per response, not one
+	// for the whole flow.
 	encryptedNotificationRegistered bool
+	// issuanceMultiConfig is set while the issuance loop runs over more than
+	// one configuration (#549): the per-configuration failure paths then
+	// suppress their own terminal flow_error (issuanceFailure) - a mid-loop
+	// failure must not end the flow while later configurations still issue -
+	// and the loop emits the flow's single terminal error itself.
+	issuanceMultiConfig bool
+	// suppressedIssuanceFailure records the first per-configuration failure
+	// whose terminal flow_error a multi-configuration loop suppressed, so the
+	// loop can emit exactly one flow error when no configuration issued.
+	suppressedIssuanceFailure *issuanceStepFailure
 	// authorizationDetails is what the client asked to be sent on the
 	// Authorization Request - see FlowStartMessage.AuthorizationDetails for
 	// why the Wallet decides this and the engine only forwards it.
@@ -1092,10 +1104,12 @@ func (h *OID4VCIHandler) Execute(ctx context.Context, msg *FlowStartMessage) err
 	}
 
 	// Step 4: Select the credential configurations - the SET (#549,
-	// Platform-Epics#63): every offered configuration under the issue_all
-	// policy (the default), or the user's subset under user_selects. See
-	// selectCredentialConfigurations for both shapes.
-	selectedConfigIDs, err := h.selectCredentialConfigurations(ctx, offer, metadata)
+	// Platform-Epics#63). Three sources, in order: the client's flow-start
+	// credential_configuration_ids (the set the user already chose - the
+	// contract's shape), every offered configuration under the issue_all
+	// policy (the default), or the user's subset through the user_selects ask.
+	// See selectCredentialConfigurations for all three shapes.
+	selectedConfigIDs, err := h.selectCredentialConfigurations(ctx, offer, metadata, msg.CredentialConfigurationIDs)
 	if err != nil {
 		return err
 	}
@@ -1199,7 +1213,16 @@ func (h *OID4VCIHandler) issueCredentials(ctx context.Context, metadata *IssuerM
 	var succeeded int
 	var lastDisplay json.RawMessage
 	var lastEncrypted bool
+	// #549: in a multi-configuration loop the per-configuration failure
+	// paths suppress their terminal flow_error (issuanceFailure); this loop
+	// is the only place the flow's terminal error may be sent. The first
+	// suppressed failure is remembered for exactly that emission.
+	h.issuanceMultiConfig = len(selectedConfigIDs) > 1
+	h.suppressedIssuanceFailure = nil
 	for _, configID := range selectedConfigIDs {
+		// One notification context per configuration response (#549): the
+		// encrypted-response registration guard is per response.
+		h.encryptedNotificationRegistered = false
 		config, ok := metadata.CredentialConfigurationsSupported[configID]
 		if !ok {
 			// selectCredentialConfigurations validated the offer against
@@ -1234,43 +1257,86 @@ func (h *OID4VCIHandler) issueCredentials(ctx context.Context, metadata *IssuerM
 		outcomes = append(outcomes, issuanceOutcome{configID: configID, results: results})
 	}
 
-	// Zero successes: the flow fails with the last per-configuration error
-	// (an Error progress per failing step was already sent inside
-	// issueOneCredential's own step handlers).
+	// Zero successes: the flow fails with the last per-configuration error.
+	// In a single-configuration flow the failing step already sent its
+	// terminal flow_error (issuanceFailure passes it through - the exact
+	// pre-#549 behavior); in a multi-configuration loop every
+	// per-configuration emission was suppressed, so exactly ONE flow error is
+	// sent here, from the first suppressed failure's step and code.
 	if succeeded == 0 {
 		if lastErr == nil {
 			lastErr = errors.New("credential issuance failed")
 		}
+		if h.issuanceMultiConfig {
+			if f := h.suppressedIssuanceFailure; f != nil {
+				_ = h.Error(FlowStep(f.step), f.code, f.msg)
+			} else {
+				_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
+			}
+		}
 		return lastErr
 	}
 
-	// One or more successes: complete with every result. The per-configuration
-	// failures ride the flow data (inspectable) and a completion notice.
+	// One or more successes: complete with every result, the per-configuration
+	// failures reported on the completion itself (#549 - the client must see
+	// WHICH configuration failed and why; flow data is a server-side view the
+	// completion never serializes).
 	var all []CredentialResult
-	failures := make(map[string]string, len(outcomes))
+	var failures []CredentialFailure
+	flowFailures := make(map[string]string, len(outcomes))
 	for _, o := range outcomes {
 		if o.err != nil {
-			failures[o.configID] = o.err.Error()
+			flowFailures[o.configID] = o.err.Error()
+			failures = append(failures, CredentialFailure{
+				CredentialConfigurationID: o.configID,
+				Error:                     o.err.Error(),
+			})
 			continue
 		}
 		all = append(all, o.results...)
 	}
 	if len(failures) > 0 {
-		h.SetData("issuance_failures", failures)
+		h.SetData("issuance_failures", flowFailures)
 		failureDetail := make([]string, 0, len(failures))
-		for id, reason := range failures {
-			failureDetail = append(failureDetail, id+": "+reason)
+		for _, f := range failures {
+			failureDetail = append(failureDetail, f.CredentialConfigurationID+": "+f.Error)
 		}
 		h.Logger.Warn("partial issuance failure",
 			zap.String("credential_issuer", metadata.CredentialIssuer),
 			zap.Strings("failed", failureDetail),
 		)
 		// Not an Error (the flow completes): the partial outcome rides the
-		// flow data (issuance_failures above) and the log; the completion
-		// carries every issued credential the same either way.
+		// completion's failures member, the flow data and the log; the
+		// completion carries every issued credential the same either way.
 	}
 	h.SetData("issued_credentials", all)
-	return h.Flow.Session.sendFlowComplete(h.Flow.ID, all, "", token.RefreshToken, h.dpopJWKForRefreshToken(token), h.dpopKeyIDForRefreshToken(token), lastEncrypted, lastDisplay)
+	return h.Flow.Session.sendFlowComplete(h.Flow.ID, all, "", token.RefreshToken, h.dpopJWKForRefreshToken(token), h.dpopKeyIDForRefreshToken(token), lastEncrypted, lastDisplay, failures)
+}
+
+// issuanceStepFailure records the step, code and message of a terminal
+// flow_error a multi-configuration issuance loop suppressed (#549), so the
+// loop can emit the flow's single terminal error from it.
+type issuanceStepFailure struct {
+	step string
+	code ErrorCode
+	msg  string
+}
+
+// issuanceFailure reports a per-configuration failure step. In a
+// single-configuration flow it is exactly the old flow_error, sent by the
+// failing step itself. In a multi-configuration issuance loop the terminal
+// flow_error is NOT sent mid-loop - a failure must not end the flow while
+// later configurations still issue - so the first one is recorded here and
+// the loop emits the flow's single terminal error itself (zero successes) or
+// reports the failures on the completion (partial success).
+func (h *OID4VCIHandler) issuanceFailure(step FlowStep, code ErrorCode, msg string) {
+	if !h.issuanceMultiConfig {
+		_ = h.Error(step, code, msg)
+		return
+	}
+	if h.suppressedIssuanceFailure == nil {
+		h.suppressedIssuanceFailure = &issuanceStepFailure{step: string(step), code: code, msg: msg}
+	}
 }
 
 // issueOneCredential runs steps 6 to 9 for ONE selected configuration:
@@ -1310,7 +1376,7 @@ func (h *OID4VCIHandler) issueOneCredential(ctx context.Context, metadata *Issue
 			proofs, respEnc, proofErr = h.requestProofs(ctx, metadata, selectedConfig, nonce, reissuanceKid, respOffer)
 			if proofErr != nil {
 				h.Logger.Debug("failed to request proofs", zap.Error(proofErr))
-				_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+				h.issuanceFailure(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
 				return nil, nil, false, proofErr
 			}
 		}
@@ -1333,7 +1399,7 @@ func (h *OID4VCIHandler) issueOneCredential(ctx context.Context, metadata *Issue
 				// No retry possible (second attempt, or no fresh nonce): send the
 				// flow error here and unwrap the underlying credential error so
 				// the caller receives the issuer's message (e.g. "invalid_nonce").
-				_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
+				h.issuanceFailure(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 				return nil, nil, false, cNonceErr.Err
 			}
 			return nil, nil, false, credErr
@@ -1354,17 +1420,17 @@ func (h *OID4VCIHandler) issueOneCredential(ctx context.Context, metadata *Issue
 		deferredResp, err := h.pollDeferredCredential(ctx, metadata, token, credential.TransactionID, credential.Interval, credential.ResponseEncryption)
 		if err != nil {
 			h.Logger.Debug("deferred polling failed", zap.Error(err))
-			_ = h.Error(StepDeferred, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
+			h.issuanceFailure(StepDeferred, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 			return nil, nil, false, err
 		}
 
 		// Complete this configuration with the issued credential
-		results, respEncrypted, err := h.finishIssuance(ctx, deferredResp, selectedConfig, trust, metadata, token)
+		results, respEncrypted, err := h.finishIssuance(ctx, deferredResp, selectedConfigID, selectedConfig, trust, metadata, token)
 		return results, displayMetadata(deferredResp), respEncrypted, err
 	}
 
 	// Step 9: Complete this configuration (fetch VCTM for display)
-	results, respEncrypted, err = h.finishIssuance(ctx, credential, selectedConfig, trust, metadata, token)
+	results, respEncrypted, err = h.finishIssuance(ctx, credential, selectedConfigID, selectedConfig, trust, metadata, token)
 	return results, displayMetadata(credential), respEncrypted, err
 }
 
@@ -1377,16 +1443,16 @@ func (h *OID4VCIHandler) issueOneCredential(ctx context.Context, metadata *Issue
 // (one sendFlowComplete over every configuration's results) belongs to
 // issueCredentials - this returns the results and the response's
 // credential_response_encrypted flag, nothing more.
-func (h *OID4VCIHandler) finishIssuance(ctx context.Context, resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo, metadata *IssuerMetadata, token *TokenResponse) ([]CredentialResult, bool, error) {
+func (h *OID4VCIHandler) finishIssuance(ctx context.Context, resp *CredentialResponse, configID string, config *CredentialConfig, trust *TrustInfo, metadata *IssuerMetadata, token *TokenResponse) ([]CredentialResult, bool, error) {
 	// A plain response never delivers a seed (privatedata-spec 5A.4), whether
 	// advertised or not: refuse it, without quoting any content.
 	if !resp.Encrypted && hasSecretSeedMember(resp.CredentialMetadata) {
 		err := errors.New("secret seed credential_metadata arrived in a plain response")
 		h.Logger.Warn("rejecting credential response", zap.Error(err))
-		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer returned malformed credential metadata")
+		h.issuanceFailure(StepRequestingCredential, ErrCodeCredentialError, "Issuer returned malformed credential metadata")
 		return nil, resp.Encrypted, err
 	}
-	results := h.buildCredentialResults(ctx, resp, config, trust)
+	results := h.buildCredentialResults(ctx, resp, configID, config, trust)
 	h.registerNotificationContext(metadata, token, resp)
 	return results, resp.Encrypted, nil
 }
@@ -1981,7 +2047,7 @@ func (h *OID4VCIHandler) fetchIACACertificates(ctx context.Context, iacasURL str
 //
 // A single-configuration offer auto-selects under either policy (the
 // historical rule: no ask for one).
-func (h *OID4VCIHandler) selectCredentialConfigurations(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata) ([]string, error) {
+func (h *OID4VCIHandler) selectCredentialConfigurations(ctx context.Context, offer *CredentialOffer, metadata *IssuerMetadata, preSelected []string) ([]string, error) {
 	// The offer's configurations, in the offer's order, that the issuer's
 	// metadata actually carries (an offered id the metadata lacks is
 	// dropped here as before - the loop below would fail its
@@ -2005,6 +2071,36 @@ func (h *OID4VCIHandler) selectCredentialConfigurations(ctx context.Context, off
 	}
 	if len(available) == 0 {
 		return nil, errors.New("no offered credential configuration is present in the issuer metadata")
+	}
+
+	// The flow-start set (#549's contract shape): the client that already
+	// chose names its subset in credential_configuration_ids on flow_start.
+	// It IS the selection - no ask runs, whatever the policy (the user already
+	// chose); every id must be one the offer carries and the metadata knows,
+	// and an id outside refuses per-id rather than issuing something nobody
+	// chose. The offer's order and de-duplication apply as everywhere.
+	if len(preSelected) > 0 {
+		offeredByID := make(map[string]bool, len(available))
+		for _, a := range available {
+			offeredByID[a.ID] = true
+		}
+		for _, id := range preSelected {
+			if !offeredByID[id] {
+				return nil, fmt.Errorf("invalid credential configuration %q: not offered", id)
+			}
+		}
+		seen := make(map[string]bool, len(preSelected))
+		ordered := make([]string, 0, len(preSelected))
+		for _, configID := range offer.CredentialConfigurationIDs {
+			if offeredByID[configID] && containsString(preSelected, configID) && !seen[configID] {
+				seen[configID] = true
+				ordered = append(ordered, configID)
+			}
+		}
+		if len(ordered) == 0 {
+			return nil, errors.New("the flow-start selection names no offered credential configuration")
+		}
+		return ordered, nil
 	}
 
 	// Auto-select-when-one, under either policy.
@@ -3123,13 +3219,13 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 	seedAdvertised, seedErr := secretSeedAdvertised(config)
 	if seedErr != nil {
 		h.Logger.Warn("rejecting issuer metadata", zap.Error(seedErr))
-		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer advertised malformed secret seed metadata")
+		h.issuanceFailure(StepRequestingCredential, ErrCodeCredentialError, "Issuer advertised malformed secret seed metadata")
 		return nil, seedErr
 	}
 	refuseSeed := func(msg string) (*CredentialResponse, error) {
 		err := errors.New(msg)
 		h.Logger.Warn("rejecting credential request", zap.Error(err))
-		_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Issuer cannot deliver the secret seed over an encrypted response")
+		h.issuanceFailure(StepRequestingCredential, ErrCodeCredentialError, "Issuer cannot deliver the secret seed over an encrypted response")
 		return nil, err
 	}
 	if seedAdvertised && (respEnc == nil || len(respEnc.JWK) == 0) {
@@ -3159,7 +3255,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 				reqContentType = "application/jwt"
 			case seedAdvertised || reqEnc.EncryptionRequired:
 				h.Logger.Warn("cannot encrypt credential request", zap.Error(err))
-				_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Cannot encrypt the credential request for this issuer")
+				h.issuanceFailure(StepRequestingCredential, ErrCodeCredentialError, "Cannot encrypt the credential request for this issuer")
 				return nil, fmt.Errorf("cannot encrypt credential request: %w", err)
 			default:
 				// Not required and no seed: drop the response encryption
@@ -3167,7 +3263,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 				// issuer demands it, then fail.
 				if metadata.CredentialResponseEncryption != nil && metadata.CredentialResponseEncryption.EncryptionRequired {
 					h.Logger.Warn("cannot encrypt credential request", zap.Error(err))
-					_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, "Cannot encrypt the credential request for this issuer")
+					h.issuanceFailure(StepRequestingCredential, ErrCodeCredentialError, "Cannot encrypt the credential request for this issuer")
 					return nil, fmt.Errorf("cannot encrypt credential request: %w", err)
 				}
 				h.Logger.Warn("sending credential request without encryption", zap.Error(err))
@@ -3242,7 +3338,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 				}
 			}
 
-			_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
+			h.issuanceFailure(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 			return nil, parseOAuthError(resp.StatusCode, body)
 		}
 
@@ -3270,7 +3366,7 @@ func (h *OID4VCIHandler) requestCredential(ctx context.Context, metadata *Issuer
 				// otherwise get neither completion nor a terminal message.
 				// The text is generic: relayErr and any client text stay out.
 				h.Logger.Debug("encrypted credential response relay failed", zap.Error(relayErr))
-				_ = h.Error(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
+				h.issuanceFailure(StepRequestingCredential, ErrCodeCredentialError, ErrCodeCredentialError.UserFacingMessage())
 				return nil, relayErr
 			}
 			return answer, nil
@@ -3470,7 +3566,7 @@ func (h *OID4VCIHandler) pollDeferredCredential(ctx context.Context, metadata *I
 	return nil, fmt.Errorf("deferred credential polling timeout after %d attempts", maxAttempts)
 }
 
-func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *CredentialResponse, config *CredentialConfig, trust *TrustInfo) []CredentialResult {
+func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *CredentialResponse, configID string, config *CredentialConfig, trust *TrustInfo) []CredentialResult {
 	var results []CredentialResult
 
 	// Fetch VCTM for display metadata embedding
@@ -3479,15 +3575,24 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 		typeMetadata = h.Registry.FetchTypeMetadataJSON(ctx, config.VCT)
 	}
 
+	// The per-result members every configuration's results carry (#549): its
+	// configuration id (the renewal pairing) and its own display metadata -
+	// per-result, not per-flow, because a multi-configuration completion
+	// carries each response's own. displayMetadata(resp) is nil for an
+	// encrypted response (the engine holds nothing it could leak).
+	displayMD := displayMetadata(resp)
+
 	if resp.Encrypted {
 		// The engine cannot read the response: one entry per credential the
 		// client reported, carrying the configuration's public metadata only.
 		// The client pairs entry i with the i-th decrypted credential.
 		for i := 0; i < resp.CredentialCount; i++ {
 			results = append(results, CredentialResult{
-				Format:       config.Format,
-				VCT:          config.VCT,
-				TypeMetadata: typeMetadata,
+				Format:                      config.Format,
+				VCT:                         config.VCT,
+				TypeMetadata:                typeMetadata,
+				CredentialConfigurationID:   configID,
+				CredentialResponseEncrypted: true,
 			})
 		}
 		return results
@@ -3499,11 +3604,13 @@ func (h *OID4VCIHandler) buildCredentialResults(ctx context.Context, resp *Crede
 	// same resp.NotificationID applies to every credential in the response.
 	appendResult := func(cred interface{}) {
 		results = append(results, CredentialResult{
-			Format:         config.Format,
-			Credential:     credentialToString(cred),
-			VCT:            config.VCT,
-			TypeMetadata:   typeMetadata,
-			NotificationID: resp.NotificationID,
+			Format:                    config.Format,
+			Credential:                credentialToString(cred),
+			VCT:                       config.VCT,
+			TypeMetadata:              typeMetadata,
+			NotificationID:            resp.NotificationID,
+			CredentialConfigurationID: configID,
+			CredentialMetadata:        displayMD,
 		})
 	}
 
@@ -3764,7 +3871,7 @@ func (h *OID4VCIHandler) checkPSCNeedsProof(config *CredentialConfig) error {
 		err = errors.New("issuer advertises a holder commitment but declares no proof type to carry it")
 	}
 	if err != nil {
-		_ = h.Error(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
+		h.issuanceFailure(StepRequestingCredential, ErrCodeSignError, ErrCodeSignError.UserFacingMessage())
 	}
 	return err
 }
@@ -3777,7 +3884,7 @@ func (h *OID4VCIHandler) pscConflictError(status int, body []byte) error {
 	if !ok {
 		return nil
 	}
-	_ = h.Error(StepRequestingCredential, ErrCodePSCConflict, msg)
+	h.issuanceFailure(StepRequestingCredential, ErrCodePSCConflict, msg)
 	return parseOAuthError(status, body)
 }
 
