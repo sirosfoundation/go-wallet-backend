@@ -25,40 +25,40 @@ func TestNotificationContextStore_PutTake_OneShot(t *testing.T) {
 	s := newNotificationContextStore()
 	s.put("flow-1", &notificationContext{endpoint: "https://issuer.example.com/notify"})
 
-	got := s.take("flow-1")
+	got := s.take("flow-1", "")
 	require.NotNil(t, got)
 	assert.Equal(t, "https://issuer.example.com/notify", got.endpoint)
 
 	// Second take must return nil (one-shot semantics).
-	assert.Nil(t, s.take("flow-1"))
+	assert.Nil(t, s.take("flow-1", ""))
 }
 
 func TestNotificationContextStore_Put_IgnoresEmptyEndpoint(t *testing.T) {
 	s := newNotificationContextStore()
 	s.put("flow-1", &notificationContext{endpoint: ""})
-	assert.Nil(t, s.take("flow-1"))
+	assert.Nil(t, s.take("flow-1", ""))
 }
 
 func TestNotificationContextStore_Take_ExpiredReturnsNil(t *testing.T) {
 	s := newNotificationContextStore()
-	s.ctx["flow-1"] = &notificationContext{
+	s.ctx["flow-1"] = []*notificationContext{{
 		endpoint:  "https://issuer.example.com/notify",
 		expiresAt: time.Now().Add(-time.Minute),
-	}
-	assert.Nil(t, s.take("flow-1"))
+	}}
+	assert.Nil(t, s.take("flow-1", ""))
 }
 
 func TestNotificationContextStore_Take_MissingReturnsNil(t *testing.T) {
 	s := newNotificationContextStore()
-	assert.Nil(t, s.take("nope"))
+	assert.Nil(t, s.take("nope", ""))
 }
 
 func TestNotificationContextStore_Put_PrunesExpired(t *testing.T) {
 	s := newNotificationContextStore()
-	s.ctx["old"] = &notificationContext{
+	s.ctx["old"] = []*notificationContext{{
 		endpoint:  "https://issuer.example.com/notify",
 		expiresAt: time.Now().Add(-time.Minute),
-	}
+	}}
 	// put triggers pruneLocked.
 	s.put("new", &notificationContext{endpoint: "https://issuer.example.com/notify"})
 
@@ -82,16 +82,16 @@ func TestNotificationContextStore_HasValid(t *testing.T) {
 	// Unknown flow must not validate.
 	assert.False(t, s.hasValid("nope", "notif-1"))
 	// hasValid must not consume the context.
-	assert.NotNil(t, s.take("flow-1"))
+	assert.NotNil(t, s.take("flow-1", ""))
 }
 
 func TestNotificationContextStore_HasValid_Expired(t *testing.T) {
 	s := newNotificationContextStore()
-	s.ctx["flow-1"] = &notificationContext{
+	s.ctx["flow-1"] = []*notificationContext{{
 		endpoint:       "https://issuer.example.com/notify",
 		notificationID: "notif-1",
 		expiresAt:      time.Now().Add(-time.Minute),
-	}
+	}}
 	assert.False(t, s.hasValid("flow-1", "notif-1"))
 }
 
@@ -308,7 +308,7 @@ func TestHandleCredentialNotification_ForwardsAndAcks(t *testing.T) {
 	assert.Equal(t, int32(1), atomic.LoadInt32(issuerCalls))
 
 	// Context must be consumed (one-shot).
-	assert.Nil(t, session.notifications.take("flow-9"))
+	assert.Nil(t, session.notifications.take("flow-9", ""))
 }
 
 // TestHandleCredentialNotification_Rejects covers the validation paths that
@@ -380,7 +380,7 @@ func TestDispatchCredentialNotification_RejectsIDMismatch(t *testing.T) {
 	assert.Contains(t, ack.Error, "notification context unavailable")
 	// No request must reach the issuer, and the context must remain (not consumed).
 	assert.Equal(t, int32(0), atomic.LoadInt32(issuerCalls))
-	assert.NotNil(t, session.notifications.take("flow-7"))
+	assert.NotNil(t, session.notifications.take("flow-7", ""))
 }
 
 func TestDispatchCredentialNotification_RejectsWhenAtCapacity(t *testing.T) {
@@ -409,7 +409,7 @@ func TestDispatchCredentialNotification_RejectsWhenAtCapacity(t *testing.T) {
 	assert.Equal(t, "rejected", ack.Status)
 	assert.Contains(t, ack.Error, "server busy")
 	// Context must remain since the request never entered the forwarding path.
-	assert.NotNil(t, session.notifications.take("flow-cap"))
+	assert.NotNil(t, session.notifications.take("flow-cap", ""))
 }
 
 // TestForwardCredentialNotification_ForwardingFailureAcks covers the path where
@@ -443,7 +443,7 @@ func TestForwardCredentialNotification_ForwardingFailureAcks(t *testing.T) {
 	assert.Equal(t, "rejected", ack.Status)
 	assert.Contains(t, ack.Error, "forwarding failed")
 	// The one-shot context must have been consumed even though forwarding failed.
-	assert.Nil(t, session.notifications.take("flow-fail"))
+	assert.Nil(t, session.notifications.take("flow-fail", ""))
 }
 
 func TestSendNotification_TransportError(t *testing.T) {
@@ -490,7 +490,7 @@ func TestRegisterNotificationContext_StoresWhenEndpointAndIDPresent(t *testing.T
 		&CredentialResponse{NotificationID: "notif-reg"},
 	)
 
-	nc := session.notifications.take("flow-reg")
+	nc := session.notifications.take("flow-reg", "")
 	require.NotNil(t, nc)
 	assert.Equal(t, "https://issuer.example.com/notify", nc.endpoint)
 	assert.Equal(t, "tok", nc.accessToken)
@@ -524,7 +524,7 @@ func TestRegisterNotificationContext_NoOpCases(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			h, session := newRegisterTestHandler("flow-noop")
 			h.registerNotificationContext(tc.meta, tc.token, tc.resp)
-			assert.Nil(t, session.notifications.take("flow-noop"),
+			assert.Nil(t, session.notifications.take("flow-noop", ""),
 				"no context should be registered for a no-op case")
 		})
 	}
@@ -598,7 +598,7 @@ func TestBuildCredentialResults_SingleAndBatch(t *testing.T) {
 	single := h.buildCredentialResults(context.Background(), &CredentialResponse{
 		Credential:     "eyJ.single",
 		NotificationID: "notif-single",
-	}, cfg, nil)
+	}, "cfg", cfg, nil)
 	require.Len(t, single, 1)
 	assert.Equal(t, "eyJ.single", single[0].Credential)
 	assert.Equal(t, "dc+sd-jwt", single[0].Format)
@@ -608,7 +608,7 @@ func TestBuildCredentialResults_SingleAndBatch(t *testing.T) {
 	batch := h.buildCredentialResults(context.Background(), &CredentialResponse{
 		Credentials:    []interface{}{"eyJ.a", map[string]interface{}{"credential": "eyJ.b"}},
 		NotificationID: "notif-batch",
-	}, cfg, nil)
+	}, "cfg", cfg, nil)
 	require.Len(t, batch, 2)
 	assert.Equal(t, "eyJ.a", batch[0].Credential)
 	assert.Equal(t, "eyJ.b", batch[1].Credential)
@@ -622,7 +622,7 @@ func TestBuildCredentialResults_OmitsNotificationIDWhenAbsent(t *testing.T) {
 
 	results := h.buildCredentialResults(context.Background(), &CredentialResponse{
 		Credential: "eyJ.x",
-	}, cfg, nil)
+	}, "cfg", cfg, nil)
 	require.Len(t, results, 1)
 	assert.Empty(t, results[0].NotificationID)
 }
@@ -636,10 +636,51 @@ func TestRegisterNotificationContext_EncryptedRegistersOncePerIssuance(t *testin
 	tok := &TokenResponse{AccessToken: "tok", TokenType: "Bearer"}
 
 	h.registerNotificationContext(meta, tok, &CredentialResponse{Encrypted: true})
-	require.NotNil(t, session.notifications.take("flow-enc"), "registered before the client answers")
+	require.NotNil(t, session.notifications.take("flow-enc", ""), "registered before the client answers")
 
 	// Deferred polling and completion register again.
 	h.registerNotificationContext(meta, tok, &CredentialResponse{Encrypted: true})
 	h.registerNotificationContext(meta, tok, &CredentialResponse{Encrypted: true})
-	assert.Nil(t, session.notifications.take("flow-enc"), "a consumed context is not recreated")
+	assert.Nil(t, session.notifications.take("flow-enc", ""), "a consumed context is not recreated")
+}
+
+// ===== notificationContextStore multi-configuration tests (#549) =====
+
+// A flow may carry one context per issued configuration response: puts
+// append, and take matches by the supplied notification_id - an exact match
+// first, an empty-id (encrypted-response) context otherwise.
+func TestNotificationContextStore_MultiContext_TakeById(t *testing.T) {
+	s := newNotificationContextStore()
+	s.put("flow-1", &notificationContext{endpoint: "https://i.example/notify", notificationID: "n-plain"})
+	s.put("flow-1", &notificationContext{endpoint: "https://i.example/notify"}) // encrypted response: empty id
+
+	// Exact id match wins over the empty-id context.
+	got := s.take("flow-1", "n-plain")
+	require.NotNil(t, got)
+	assert.Equal(t, "n-plain", got.notificationID)
+
+	// The empty-id context still serves the encrypted response's notification.
+	got = s.take("flow-1", "n-from-the-client")
+	require.NotNil(t, got)
+	assert.Empty(t, got.notificationID)
+
+	// One context per response: nothing left.
+	assert.Nil(t, s.take("flow-1", "n-anything"))
+}
+
+// A second configuration's plain context is not shadowed by the first's: both
+// ids are matchable in either order (the pre-#549 store kept one context per
+// flow, so the second put overwrote the first).
+func TestNotificationContextStore_MultiContext_BothPlainIdsMatch(t *testing.T) {
+	s := newNotificationContextStore()
+	s.put("flow-1", &notificationContext{endpoint: "https://i.example/notify", notificationID: "n-a"})
+	s.put("flow-1", &notificationContext{endpoint: "https://i.example/notify", notificationID: "n-b"})
+
+	got := s.take("flow-1", "n-b")
+	require.NotNil(t, got)
+	assert.Equal(t, "n-b", got.notificationID)
+	got = s.take("flow-1", "n-a")
+	require.NotNil(t, got)
+	assert.Equal(t, "n-a", got.notificationID)
+	assert.Nil(t, s.take("flow-1", "n-a"))
 }

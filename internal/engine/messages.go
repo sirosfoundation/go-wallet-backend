@@ -274,6 +274,18 @@ type FlowStartMessage struct {
 	VCT                string   `json:"vct,omitempty"`                  // VCTM lookup
 	RedirectURI        string   `json:"redirect_uri,omitempty"`         // OAuth redirect URI for authorization code flow
 
+	// CredentialConfigurationIDs is the client's pre-resolved selection for a
+	// multi-configuration offer (#549, Platform-Epics#63): the subset of the
+	// offer's credential_configuration_ids that the user chose before the
+	// flow started (a picker UI ahead of the flow, the realeyes wallet's
+	// checkbox). It IS the selection - the EngineIssuanceSelectionPolicy ask
+	// never runs when it is present, whatever the deployment's policy (the
+	// user already chose). Absent or empty means every offered configuration;
+	// every named id must be one the offer carries and the issuer metadata
+	// knows, and an id outside the offer fails the flow per-id rather than
+	// issuing credentials nobody chose.
+	CredentialConfigurationIDs []string `json:"credential_configuration_ids,omitempty"`
+
 	// Client attestation for wallet-to-issuer authentication (transport-supplied).
 	// The client (frontend/SDK/WMP) obtains the WIA via /wallet-provider/wia/generate
 	// and signs the PoP with its instance key, wherever that key is held for this
@@ -428,13 +440,25 @@ const (
 )
 
 // FlowCompleteMessage indicates successful flow completion
+// CredentialFailure reports one configuration of the selected set that did
+// not issue (#549): a partial-failure completion carries each failed
+// configuration's id and the reason, so the wallet can tell the user which
+// credential is missing while the issued ones ride the same completion.
+type CredentialFailure struct {
+	CredentialConfigurationID string `json:"credential_configuration_id"`
+	Error                     string `json:"error"`
+}
+
 type FlowCompleteMessage struct {
 	Message
-	Credentials                       []CredentialResult `json:"credentials,omitempty"`
-	RedirectURI                       string             `json:"redirect_uri,omitempty"`
-	TypeMetadata                      json.RawMessage    `json:"type_metadata,omitempty"`
-	CredentialIssuer                  string             `json:"credential_issuer,omitempty"`
-	SelectedCredentialConfigurationID string             `json:"selected_credential_configuration_id,omitempty"`
+	Credentials []CredentialResult `json:"credentials,omitempty"`
+	// Failures reports the configurations of the selected set that did not
+	// issue (#549): absent when every configuration issued.
+	Failures                          []CredentialFailure `json:"failures,omitempty"`
+	RedirectURI                       string              `json:"redirect_uri,omitempty"`
+	TypeMetadata                      json.RawMessage     `json:"type_metadata,omitempty"`
+	CredentialIssuer                  string              `json:"credential_issuer,omitempty"`
+	SelectedCredentialConfigurationID string              `json:"selected_credential_configuration_id,omitempty"`
 	// RefreshToken is the OAuth refresh_token the issuer's token endpoint
 	// returned alongside this batch, if any (OID4VCI issuance only - never
 	// set for OID4VP). The backend does not persist this itself (see the
@@ -763,11 +787,30 @@ type ErrorMessage struct {
 // CredentialResult represents an issued credential
 type CredentialResult struct {
 	Format string `json:"format"`
+	// CredentialConfigurationID names the configuration this credential issued
+	// under (#549): a multi-configuration completion pairs every result with
+	// its configuration - the pairing a renewal's
+	// selected_credential_configuration_id (and a re-issue offer) needs, since
+	// format or VCT need not identify a configuration uniquely.
+	CredentialConfigurationID string `json:"credential_configuration_id,omitempty"`
 	// Credential is empty (and omitted) when the issuer response was encrypted
-	// to the client's key: see FlowCompleteMessage.CredentialResponseEncrypted.
+	// to the client's key: see CredentialResponseEncrypted below and
+	// FlowCompleteMessage.CredentialResponseEncrypted.
 	Credential   string          `json:"credential,omitempty"`
 	VCT          string          `json:"vct,omitempty"`
 	TypeMetadata json.RawMessage `json:"type_metadata,omitempty"`
+	// CredentialResponseEncrypted reports whether THIS result's issuer
+	// response was encrypted to the client's key (#549): a
+	// multi-configuration completion may mix plain and encrypted answers, so
+	// the flag is per-result, not per-flow - the flow-level member is the
+	// legacy single-configuration view.
+	CredentialResponseEncrypted bool `json:"credential_response_encrypted,omitempty"`
+	// CredentialMetadata is this result's response display metadata (the
+	// filtered display/claims members of credential_metadata - the same
+	// filtering the flow-level member applies; nil for an encrypted response,
+	// which the engine cannot read). A multi-configuration completion carries
+	// each response's own metadata instead of one flow-level member.
+	CredentialMetadata json.RawMessage `json:"credential_metadata,omitempty"`
 	// NotificationID is the OID4VCI §10 notification identifier returned by the
 	// issuer for this credential, if any. The client persists it (client-side,
 	// encrypted) and echoes it back in a credential_notification message when a

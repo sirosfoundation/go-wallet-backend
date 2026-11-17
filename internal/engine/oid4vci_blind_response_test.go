@@ -351,12 +351,21 @@ func newIssuerStub(t *testing.T, credentialBody string, deferredBodies ...string
 	return st
 }
 
-func (st *issuerStub) metadata(encCfg *CredentialResponseEncryptionConfig) *IssuerMetadata {
+func (st *issuerStub) metadata(encCfg *CredentialResponseEncryptionConfig, cfgs ...*CredentialConfig) *IssuerMetadata {
+	selected := seedConfig()
+	if len(cfgs) > 0 {
+		selected = cfgs[0]
+	}
 	return &IssuerMetadata{
 		CredentialIssuer:             st.srv.URL,
 		CredentialEndpoint:           st.srv.URL + "/credential",
 		CredentialResponseEncryption: encCfg,
 		NotificationEndpoint:         st.srv.URL + "/notification",
+		// The selected configuration the issuance loop looks up (#549): the
+		// seed-advertised config by default (what the seed tests passed into
+		// the per-config issuance directly); the decline/plain tests pass
+		// their no-seed-adv config.
+		CredentialConfigurationsSupported: CredentialConfigurations{"cfg": *selected},
 	}
 }
 
@@ -438,7 +447,9 @@ func TestBlind_ImmediateIssuance_EngineNeverHoldsContents(t *testing.T) {
 
 	md := st.metadata(gcmCfg(false))
 	cfg := seedConfig()
-	require.NoError(t, h.issueCredential(context.Background(), md, tokenBearer(), "cfg", cfg, nil, ""))
+	_ = cfg
+	err := h.issueCredentials(context.Background(), md, tokenBearer(), []string{"cfg"}, nil, "")
+	require.NoError(t, err)
 
 	// The client saw the secrets in clear (it holds the key): the test is not
 	// vacuous, the response really did carry them.
@@ -482,7 +493,7 @@ func TestBlind_ImmediateIssuance_EngineNeverHoldsContents(t *testing.T) {
 	// The notification context holds no id: the client's id matches.
 	assert.True(t, h.Flow.Session.notifications.hasValid("f-blind", secretNotif))
 	assert.True(t, h.Flow.Session.notifications.hasValid("f-blind", "anything-the-client-sends"))
-	nc := h.Flow.Session.notifications.take("f-blind")
+	nc := h.Flow.Session.notifications.take("f-blind", "")
 	require.NotNil(t, nc)
 	assert.Empty(t, nc.notificationID)
 	assertNoSecrets(t, "notification context", fmt.Sprintf("%+v", *nc))
@@ -498,7 +509,8 @@ func TestBlind_SingleCredentialCount(t *testing.T) {
 	fc := &fakeClient{t: t}
 	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
-	require.NoError(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", seedConfig(), nil, ""))
+	err := h.issueCredentials(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), []string{"cfg"}, nil, "")
+	require.NoError(t, err)
 	var creds []map[string]any
 	require.NoError(t, json.Unmarshal(completion(t, fc)["credentials"], &creds))
 	assert.Len(t, creds, 1)
@@ -516,7 +528,8 @@ func TestBlind_DeferredIssuance_SameClientPath(t *testing.T) {
 	fc := &fakeClient{t: t}
 	h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
-	require.NoError(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", seedConfig(), nil, ""))
+	err := h.issueCredentials(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), []string{"cfg"}, nil, "")
+	require.NoError(t, err)
 
 	assert.Equal(t, []SignAction{SignActionGenerateProof, SignActionDecryptCredentialResponse, SignActionDecryptCredentialResponse, SignActionDecryptCredentialResponse}, fc.actions())
 	// First relay: deferred=false, then the encrypted pending 202 and the final answer: deferred=true.
@@ -565,7 +578,8 @@ func TestBlind_DeferredEncryptedPending202_ClientUpdatesTxAndInterval(t *testing
 	fc := &fakeClient{t: t}
 	h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
-	require.NoError(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", seedConfig(), nil, ""))
+	err := h.issueCredentials(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), []string{"cfg"}, nil, "")
+	require.NoError(t, err)
 
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -589,7 +603,7 @@ func TestBlind_DeferredEncrypted202MalformedJWE_Fails(t *testing.T) {
 	fc := &fakeClient{t: t}
 	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
-	err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", seedConfig(), nil, "")
+	err := h.issueCredentials(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), []string{"cfg"}, nil, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "malformed encrypted")
 	st.mu.Lock()
@@ -604,7 +618,7 @@ func TestBlind_DeferredPlain202ToSeedRefused(t *testing.T) {
 	fc := &fakeClient{t: t}
 	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
-	err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", seedConfig(), nil, "")
+	err := h.issueCredentials(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), []string{"cfg"}, nil, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "without encrypting")
 }
@@ -619,7 +633,7 @@ func TestBlind_DeferredPlainAnswerToSeedRefusedUnread(t *testing.T) {
 	fc := &fakeClient{t: t}
 	h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
-	err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", seedConfig(), nil, "")
+	err := h.issueCredentials(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), []string{"cfg"}, nil, "")
 	require.Error(t, err)
 	assertNoSecrets(t, "error", err.Error())
 	assertNoSecrets(t, "outbound", fc.engineSaw())
@@ -637,7 +651,7 @@ func TestBlind_ClientDeclinesRequiredEncryptionFailsClosed(t *testing.T) {
 	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
 	// seed advertised => required
-	err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", seedConfig(), nil, "")
+	err := h.issueCredentials(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), []string{"cfg"}, nil, "")
 	require.Error(t, err)
 	assert.Empty(t, st.requests, "no credential request is made")
 	assertNoSecrets(t, "outbound", fc.engineSaw())
@@ -647,7 +661,9 @@ func TestBlind_ClientDeclinesRequiredEncryptionFailsClosed(t *testing.T) {
 	h2, _, cleanup2 := newBlindHandler(t, fc2, st.srv.Client())
 	defer cleanup2()
 	plainCfg := &CredentialConfig{Format: "vc+sd-jwt", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}
-	require.Error(t, h2.issueCredential(context.Background(), st.metadata(gcmCfg(true)), tokenBearer(), "cfg", plainCfg, nil, ""))
+	_ = plainCfg
+	err2 := h2.issueCredentials(context.Background(), st.metadata(gcmCfg(true)), tokenBearer(), []string{"cfg"}, nil, "")
+	require.Error(t, err2)
 	assert.Empty(t, st.requests)
 }
 
@@ -658,7 +674,8 @@ func TestBlind_ClientDeclinesOptionalEncryptionProceedsInClear(t *testing.T) {
 	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
 	plainCfg := &CredentialConfig{Format: "vc+sd-jwt", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}
-	require.NoError(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", plainCfg, nil, ""))
+	err := h.issueCredentials(context.Background(), st.metadata(gcmCfg(false), plainCfg), tokenBearer(), []string{"cfg"}, nil, "")
+	require.NoError(t, err)
 	require.Len(t, st.requests, 1)
 	assert.NotContains(t, st.requests[0], "credential_response_encryption")
 	done := completion(t, fc)
@@ -694,7 +711,9 @@ func TestBlind_InvalidClientJWKFailsClosed(t *testing.T) {
 				h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
 				defer cleanup()
 				plainCfg := &CredentialConfig{Format: "vc+sd-jwt", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}
-				require.Error(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(required)), tokenBearer(), "cfg", plainCfg, nil, ""))
+				_ = plainCfg
+				err := h.issueCredentials(context.Background(), st.metadata(gcmCfg(required)), tokenBearer(), []string{"cfg"}, nil, "")
+				require.Error(t, err)
 				assert.Empty(t, st.requests, "no credential request with an unusable key")
 				assert.NotContains(t, completionTypes(fc), "flow_complete")
 			})
@@ -738,8 +757,10 @@ func TestBlind_ProofRequestCarriesNegotiatedEncryption(t *testing.T) {
 	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
 	cfg := &CredentialConfig{Format: "vc+sd-jwt", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}
-	require.NoError(t, h.issueCredential(context.Background(), st.metadata(&CredentialResponseEncryptionConfig{
-		AlgValuesSupported: []string{"ECDH-ES+A256KW"}, EncValuesSupported: []string{"A128GCM"}, EncryptionRequired: true}), tokenBearer(), "cfg", cfg, nil, ""))
+	err := h.issueCredentials(context.Background(), st.metadata(&CredentialResponseEncryptionConfig{
+		AlgValuesSupported: []string{"ECDH-ES+A256KW"}, EncValuesSupported: []string{"A128GCM"}, EncryptionRequired: true}, cfg), tokenBearer(), []string{"cfg"}, nil, "")
+	require.NoError(t, err)
+
 	var found bool
 	for _, m := range fc.outboundMessages() {
 		if string(m["action"]) != `"generate_proof"` {
@@ -760,8 +781,8 @@ func TestBlind_NoEncryptionOfferedWhenIssuerOffersNone(t *testing.T) {
 	fc := &fakeClient{t: t}
 	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
-	cfg := &CredentialConfig{Format: "vc+sd-jwt", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}
-	require.NoError(t, h.issueCredential(context.Background(), st.metadata(nil), tokenBearer(), "cfg", cfg, nil, ""))
+	err := h.issueCredentials(context.Background(), st.metadata(nil, &CredentialConfig{Format: "vc+sd-jwt", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}), tokenBearer(), []string{"cfg"}, nil, "")
+	require.NoError(t, err)
 	for _, m := range fc.outboundMessages() {
 		assert.NotContains(t, string(m["params"]), "credential_response_encryption")
 	}
@@ -777,7 +798,8 @@ func TestBlind_NoProofConfigStillGetsKey(t *testing.T) {
 	defer cleanup()
 	cfg := seedCfg(advOK)
 	cfg.Format = "vc+sd-jwt"
-	require.NoError(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", cfg, nil, ""))
+	err := h.issueCredentials(context.Background(), st.metadata(gcmCfg(false), cfg), tokenBearer(), []string{"cfg"}, nil, "")
+	require.NoError(t, err)
 	assert.Equal(t, []SignAction{SignActionGenerateProof, SignActionDecryptCredentialResponse}, fc.actions())
 	require.Len(t, st.requests, 1)
 	assert.Contains(t, st.requests[0], "credential_response_encryption")
@@ -808,7 +830,9 @@ func TestBlind_FreshKeyPerProofRequest(t *testing.T) {
 	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
 	cfg := &CredentialConfig{Format: "vc+sd-jwt", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}
-	require.NoError(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", cfg, nil, ""))
+	_ = cfg
+	err := h.issueCredentials(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), []string{"cfg"}, nil, "")
+	require.NoError(t, err)
 	require.Len(t, fc.keys, 2, "one key per generate_proof")
 	require.Len(t, st.requests, 1)
 	second := st.requests[0]["credential_response_encryption"].(map[string]any)
@@ -917,7 +941,7 @@ func TestRelayEncryptedResponse_ClientErrorTextNeverSurfaced(t *testing.T) {
 	fc := &fakeClient{t: t, decryptErr: true}
 	h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
-	err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", seedConfig(), nil, "")
+	err := h.issueCredentials(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), []string{"cfg"}, nil, "")
 	require.Error(t, err)
 	require.NotEmpty(t, fc.decrypted, "the client did see the plaintext, so the echo is real")
 	assertNoSecrets(t, "error", err.Error())
@@ -938,7 +962,7 @@ func TestBlind_SeedPlainAnswerRefusedUnread(t *testing.T) {
 	h, logs, cleanup := newBlindHandler(t, fc, srv.Client())
 	defer cleanup()
 	md := &IssuerMetadata{CredentialIssuer: srv.URL, CredentialEndpoint: srv.URL, CredentialResponseEncryption: gcmCfg(false)}
-	err := h.issueCredential(context.Background(), md, tokenBearer(), "cfg", seedConfig(), nil, "")
+	err := h.issueCredentials(context.Background(), md, tokenBearer(), []string{"cfg"}, nil, "")
 	require.Error(t, err)
 	assertNoSecrets(t, "error", err.Error())
 	assertNoSecrets(t, "logs", logDump(logs))
@@ -959,7 +983,9 @@ func TestBlind_NonCompactBodyUnderJWTContentTypeRefused(t *testing.T) {
 			defer cleanup()
 			md := &IssuerMetadata{CredentialIssuer: srv.URL, CredentialEndpoint: srv.URL, CredentialResponseEncryption: gcmCfg(false)}
 			cfg := &CredentialConfig{Format: "vc+sd-jwt", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}
-			require.Error(t, h.issueCredential(context.Background(), md, tokenBearer(), "cfg", cfg, nil, ""))
+			_ = cfg
+			err := h.issueCredentials(context.Background(), md, tokenBearer(), []string{"cfg"}, nil, "")
+			require.Error(t, err)
 			assert.NotContains(t, fc.actions(), SignActionDecryptCredentialResponse)
 			assertNoSecrets(t, "logs", logDump(logs))
 			assertNoSecrets(t, "outbound", fc.engineSaw())
@@ -972,7 +998,8 @@ func TestBlind_ProofErrorAndMissingKey(t *testing.T) {
 	fc := &fakeClient{t: t, errorOnProof: true}
 	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
-	require.Error(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", seedConfig(), nil, ""))
+	err := h.issueCredentials(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), []string{"cfg"}, nil, "")
+	require.Error(t, err)
 	assert.Empty(t, st.requests)
 }
 
@@ -1044,7 +1071,7 @@ func TestBlind_SeedRefusals(t *testing.T) {
 			fc := &fakeClient{t: t}
 			h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
 			defer cleanup()
-			err := h.issueCredential(context.Background(), st.metadata(encCfg), tokenBearer(), "cfg", seedConfig(), nil, "")
+			err := h.issueCredentials(context.Background(), st.metadata(encCfg), tokenBearer(), []string{"cfg"}, nil, "")
 			require.Error(t, err)
 			assert.Empty(t, st.requests, "refused before any request")
 			assert.Empty(t, fc.actions(), "refused before the client is asked for a key")
@@ -1057,7 +1084,8 @@ func TestBlind_SeedRefusals(t *testing.T) {
 		h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
 		defer cleanup()
 		cfg := seedCfg(`{"org.siros.secret_seed":{"ns":"` + secretSeedA + `"}}`)
-		err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", cfg, nil, "")
+		cfg.Format = "vc+sd-jwt"
+		err := h.issueCredentials(context.Background(), st.metadata(gcmCfg(false), cfg), tokenBearer(), []string{"cfg"}, nil, "")
 		require.Error(t, err)
 		assert.NotContains(t, err.Error(), secretSeedA)
 		assert.Empty(t, st.requests)
@@ -1082,7 +1110,7 @@ func TestFlowComplete_PlainResponseUnchanged(t *testing.T) {
 	h, ch, cleanup := captureHandler(t)
 	defer cleanup()
 	resp := &CredentialResponse{Credentials: []interface{}{"c0", "c1"}, NotificationID: "n-1"}
-	require.NoError(t, h.finishIssuance(context.Background(), resp, &CredentialConfig{Format: "mso_mdoc"}, nil, nil, &TokenResponse{}))
+	completeOne(t, h, resp, &CredentialConfig{Format: "mso_mdoc"})
 	m := nextMsg(t, ch)
 	assert.NotContains(t, m, "credential_response_encrypted")
 	assert.NotContains(t, m, "credential_metadata")
@@ -1103,7 +1131,7 @@ func TestPlainResponse_SeedRefused(t *testing.T) {
 	body := `{"credentials":["c0"],"credential_metadata":{"display":[{"name":"D"}],"claims":[],"org.example.x":"EXT",` +
 		`"org.siros.secret_seed":{"ns":"` + secretSeedA + `"}}}`
 	require.NoError(t, json.Unmarshal([]byte(body), &resp))
-	err := h.finishIssuance(context.Background(), &resp, &CredentialConfig{Format: "x"}, nil, nil, &TokenResponse{})
+	_, _, err := h.finishIssuance(context.Background(), &resp, "cfg", &CredentialConfig{Format: "x"}, nil, nil, &TokenResponse{})
 	require.Error(t, err)
 	assertNoSecrets(t, "error", err.Error())
 	m := nextMsg(t, ch)
@@ -1127,7 +1155,7 @@ func TestPlainResponse_OnlyDisplayMetadataRelayed(t *testing.T) {
 	body := `{"credentials":["c0"],"credential_metadata":{"display":[{"name":"MARKER-DISPLAY"}],` +
 		`"claims":[{"path":["a"]}],"org.example.x":"OTHER-MEMBER"}}`
 	require.NoError(t, json.Unmarshal([]byte(body), &resp))
-	require.NoError(t, h.finishIssuance(context.Background(), &resp, &CredentialConfig{Format: "x"}, nil, nil, &TokenResponse{}))
+	completeOne(t, h, &resp, &CredentialConfig{Format: "x"})
 	m := nextMsg(t, ch)
 	assert.JSONEq(t, `{"display":[{"name":"MARKER-DISPLAY"}],"claims":[{"path":["a"]}]}`, string(m["credential_metadata"]))
 	wire, err := json.Marshal(m)
@@ -1143,7 +1171,7 @@ func TestPlainResponse_NoDisplayMembersMeansNoField(t *testing.T) {
 		h, ch, cleanup := captureHandler(t)
 		var resp CredentialResponse
 		require.NoError(t, json.Unmarshal([]byte(`{"credentials":["c0"],"credential_metadata":`+md+`}`), &resp))
-		require.NoError(t, h.finishIssuance(context.Background(), &resp, &CredentialConfig{Format: "x"}, nil, nil, &TokenResponse{}))
+		completeOne(t, h, &resp, &CredentialConfig{Format: "x"})
 		m := nextMsg(t, ch)
 		assert.NotContains(t, m, "credential_metadata")
 		wire, _ := json.Marshal(m)
@@ -1158,7 +1186,7 @@ func TestEncryptedResponse_NeverCredentialMetadata(t *testing.T) {
 	defer cleanup()
 	resp := &CredentialResponse{Encrypted: true, CredentialCount: 1,
 		CredentialMetadata: json.RawMessage(`{"display":[{"name":"X"}]}`)}
-	require.NoError(t, h.finishIssuance(context.Background(), resp, &CredentialConfig{Format: "x"}, nil, nil, &TokenResponse{}))
+	completeOne(t, h, resp, &CredentialConfig{Format: "x"})
 	assert.NotContains(t, nextMsg(t, ch), "credential_metadata")
 }
 
@@ -1195,7 +1223,8 @@ func TestBlind_NotificationContextSurvivesClientRejection(t *testing.T) {
 	fc := &fakeClient{t: t, decryptErr: true}
 	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
-	require.Error(t, h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", seedConfig(), nil, ""))
+	err := h.issueCredentials(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), []string{"cfg"}, nil, "")
+	require.Error(t, err)
 	assert.True(t, h.Flow.Session.notifications.hasValid("f-blind", secretNotif))
 }
 
@@ -1236,7 +1265,7 @@ func TestBlind_ImmediateRelayFailureSendsTerminalError(t *testing.T) {
 			st := newIssuerStub(t, seedResponse)
 			h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
 			defer cleanup()
-			err := h.issueCredential(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), "cfg", seedConfig(), nil, "")
+			err := h.issueCredentials(context.Background(), st.metadata(gcmCfg(false)), tokenBearer(), []string{"cfg"}, nil, "")
 			require.Error(t, err)
 			fc.settle()
 			errs := terminalErrors(t, fc)
@@ -1260,9 +1289,14 @@ func TestBlind_ImmediateMalformedJWESendsTerminalError(t *testing.T) {
 	fc := &fakeClient{t: t}
 	h, _, cleanup := newBlindHandler(t, fc, srv.Client())
 	defer cleanup()
-	md := &IssuerMetadata{CredentialIssuer: srv.URL, CredentialEndpoint: srv.URL, CredentialResponseEncryption: gcmCfg(false)}
 	cfg := &CredentialConfig{Format: "vc+sd-jwt", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}
-	require.Error(t, h.issueCredential(context.Background(), md, tokenBearer(), "cfg", cfg, nil, ""))
+	md := &IssuerMetadata{
+		CredentialIssuer: srv.URL, CredentialEndpoint: srv.URL,
+		CredentialResponseEncryption:      gcmCfg(false),
+		CredentialConfigurationsSupported: CredentialConfigurations{"cfg": *cfg},
+	}
+	err := h.issueCredentials(context.Background(), md, tokenBearer(), []string{"cfg"}, nil, "")
+	require.Error(t, err)
 	fc.settle()
 	errs := terminalErrors(t, fc)
 	require.Len(t, errs, 1)
@@ -1285,12 +1319,12 @@ func TestBlind_DeferredRelayRejection_NotificationContextExists(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"transaction_id":"tx-plain","interval":1}`))
 	})
-	md := st.metadata(gcmCfg(false))
+	md := st.metadata(gcmCfg(false), &CredentialConfig{Format: "vc+sd-jwt", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}})
 	fc := &fakeClient{t: t, decryptErr: true}
 	h, logs, cleanup := newBlindHandler(t, fc, st.srv.Client())
 	defer cleanup()
-	cfg := &CredentialConfig{Format: "vc+sd-jwt", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}
-	require.Error(t, h.issueCredential(context.Background(), md, tokenBearer(), "cfg", cfg, nil, ""))
+	err := h.issueCredentials(context.Background(), md, tokenBearer(), []string{"cfg"}, nil, "")
+	require.Error(t, err)
 	require.Contains(t, fc.actions(), SignActionDecryptCredentialResponse, "the deferred JWE was relayed")
 	assert.True(t, h.Flow.Session.notifications.hasValid("f-blind", "id-the-client-read"))
 	assertNoSecrets(t, "logs", logDump(logs))
@@ -1307,11 +1341,22 @@ func TestBlind_BatchSizeCappedWhenResponseEncrypted(t *testing.T) {
 	defer cleanup()
 	md := st.metadata(gcmCfg(false))
 	md.BatchCredentialIssuance = &BatchCredentialIssuance{BatchSize: maxEncryptedCredentialCount + 1}
-	cfg := &CredentialConfig{Format: "vc+sd-jwt", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}
-	require.NoError(t, h.issueCredential(context.Background(), md, tokenBearer(), "cfg", cfg, nil, ""))
+	err := h.issueCredentials(context.Background(), md, tokenBearer(), []string{"cfg"}, nil, "")
+	require.NoError(t, err)
 	require.Len(t, st.requests, 1)
 	proofs, _ := st.requests[0]["proofs"].(map[string]any)
 	jwts, _ := proofs["jwt"].([]any)
 	assert.Len(t, jwts, maxEncryptedCredentialCount)
 	_ = completion(t, fc)
+}
+
+// completeOne drives ONE configuration's finish + the flow completion (#549:
+// the completion belongs to the issuance loop; finishIssuance only builds
+// the results) - the message-shape assertions' entry point.
+func completeOne(t *testing.T, h *OID4VCIHandler, resp *CredentialResponse, cfg *CredentialConfig) {
+	t.Helper()
+	results, enc, err := h.finishIssuance(context.Background(), resp, "cfg", cfg, nil, nil, &TokenResponse{})
+	require.NoError(t, err)
+	err = h.Flow.Session.sendFlowComplete(h.Flow.ID, results, "", "", "", "", enc, displayMetadata(resp), nil)
+	require.NoError(t, err)
 }
