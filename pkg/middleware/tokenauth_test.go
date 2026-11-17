@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,7 +21,9 @@ import (
 	"github.com/sirosfoundation/go-tokenauth/validator"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
 // stubTenantStore implements storage.TenantStore for testing.
@@ -42,6 +45,13 @@ func (s *stubTenantStore) GetAll(context.Context) ([]*domain.Tenant, error) {
 	return nil, nil
 }
 
+// testTokenAudience is the audience every test in this file configures its
+// validator with and signs its tokens for. go-tokenauth v0.5.0 made
+// Config.Audiences mandatory (both validation paths now refuse to validate
+// at all when it's empty, closing a fail-open audience-confusion gap) -
+// see signToken/setupTokenAuthTest.
+const testTokenAudience = "test-audience"
+
 // setupTokenAuthTest creates a test JWKS server and validator.
 func setupTokenAuthTest(t *testing.T) (*validator.Validator, *ecdsa.PrivateKey, string) {
 	t.Helper()
@@ -62,15 +72,18 @@ func setupTokenAuthTest(t *testing.T) (*validator.Validator, *ecdsa.PrivateKey, 
 	t.Cleanup(srv.Close)
 
 	v := validator.New(validator.Config{
-		JWKSURL: srv.URL,
-		Issuer:  "test-issuer",
+		JWKSURL:   srv.URL,
+		Issuer:    "test-issuer",
+		Audiences: []string{testTokenAudience},
 	})
 	v.Start(context.Background())
 	t.Cleanup(v.Stop)
 
 	// Poll until the validator has actually fetched the JWKS, rather than
 	// sleeping a fixed duration (flaky under slow/contended CI runners).
-	probe := signToken(t, key, "test-issuer", claims.AccessTokenClaims{})
+	probe := signToken(t, key, "test-issuer", claims.AccessTokenClaims{
+		Claims: jwt.Claims{Audience: jwt.Audience{testTokenAudience}},
+	})
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if _, err := v.Validate(context.Background(), probe); err == nil {
@@ -100,6 +113,7 @@ func signToken(t *testing.T, key *ecdsa.PrivateKey, issuer string, cl claims.Acc
 	cl.Claims = jwt.Claims{
 		Issuer:    issuer,
 		Subject:   cl.Claims.Subject,
+		Audience:  cl.Claims.Audience,
 		IssuedAt:  jwt.NewNumericDate(now),
 		NotBefore: jwt.NewNumericDate(now.Add(-1 * time.Second)),
 		Expiry:    jwt.NewNumericDate(now.Add(5 * time.Minute)),
@@ -120,14 +134,14 @@ func TestTokenAuthMiddleware_ValidToken(t *testing.T) {
 	logger := zap.NewNop()
 
 	token := signToken(t, key, issuer, claims.AccessTokenClaims{
-		Claims:   jwt.Claims{Subject: "user-123"},
+		Claims:   jwt.Claims{Subject: "user-123", Audience: jwt.Audience{testTokenAudience}},
 		TenantID: "test-tenant",
 		TAC:      "rwl",
 	})
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) {
 		c.JSON(200, gin.H{
 			"user_id":   c.GetString("user_id"),
@@ -160,7 +174,7 @@ func TestTokenAuthMiddleware_MissingAuth(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -178,7 +192,7 @@ func TestTokenAuthMiddleware_InvalidToken(t *testing.T) {
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -198,14 +212,14 @@ func TestTokenAuthMiddleware_DisabledTenant(t *testing.T) {
 	logger := zap.NewNop()
 
 	token := signToken(t, key, issuer, claims.AccessTokenClaims{
-		Claims:   jwt.Claims{Subject: "user-123"},
+		Claims:   jwt.Claims{Subject: "user-123", Audience: jwt.Audience{testTokenAudience}},
 		TenantID: "disabled",
 		TAC:      "r",
 	})
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -223,14 +237,14 @@ func TestTokenAuthMiddleware_UnknownTenant(t *testing.T) {
 	logger := zap.NewNop()
 
 	token := signToken(t, key, issuer, claims.AccessTokenClaims{
-		Claims:   jwt.Claims{Subject: "user-123"},
+		Claims:   jwt.Claims{Subject: "user-123", Audience: jwt.Audience{testTokenAudience}},
 		TenantID: "nonexistent",
 		TAC:      "r",
 	})
 
 	w := httptest.NewRecorder()
 	c, r := gin.CreateTestContext(w)
-	r.Use(TokenAuthMiddleware(v, tenants, logger))
+	r.Use(TokenAuthMiddleware(v, tenants, nil, logger))
 	r.GET("/test", func(c *gin.Context) { c.Status(200) })
 
 	c.Request = httptest.NewRequest("GET", "/test", nil)
@@ -239,6 +253,78 @@ func TestTokenAuthMiddleware_UnknownTenant(t *testing.T) {
 
 	if w.Code != 401 {
 		t.Fatalf("expected 401, got %d", w.Code)
+	}
+}
+
+// TestTokenAuthMiddleware_RevokedUserDenied proves the #391 review fix:
+// per-jti revocation is already enforced inside v.Validate itself (via the
+// go-tokenauth Validator's own Revocation checker - see
+// blacklistRevocationChecker in internal/server/providers.go) sees only a jti, so TokenAuthMiddleware
+// must check user-level revocation (TokenBlacklist.RevokeUser) itself, using the blacklist passed in.
+func TestTokenAuthMiddleware_RevokedUserDenied(t *testing.T) {
+	v, key, issuer := setupTokenAuthTest(t)
+	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{
+		"test-tenant": {ID: "test-tenant", Enabled: true},
+	}}
+	logger := zap.NewNop()
+
+	token := signToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   jwt.Claims{Subject: "revoked-user", Audience: jwt.Audience{testTokenAudience}},
+		TenantID: "test-tenant",
+		TAC:      "rwl",
+	})
+
+	blacklist := service.NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, logger)
+	if err := blacklist.RevokeUser(context.Background(), "revoked-user"); err != nil {
+		t.Fatalf("RevokeUser: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	c, r := gin.CreateTestContext(w)
+	r.Use(TokenAuthMiddleware(v, tenants, blacklist, logger))
+	r.GET("/test", func(c *gin.Context) { c.Status(200) })
+
+	c.Request = httptest.NewRequest("GET", "/test", nil)
+	c.Request.Header.Set("Authorization", "Bearer "+token)
+	r.ServeHTTP(w, c.Request)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for revoked user, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenAuthMiddleware_NonRevokedUserAllowed is the sanity check for the
+// test above: the same blacklist wiring still allows a token whose subject
+// hasn't been revoked.
+func TestTokenAuthMiddleware_NonRevokedUserAllowed(t *testing.T) {
+	v, key, issuer := setupTokenAuthTest(t)
+	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{
+		"test-tenant": {ID: "test-tenant", Enabled: true},
+	}}
+	logger := zap.NewNop()
+
+	token := signToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   jwt.Claims{Subject: "user-123", Audience: jwt.Audience{testTokenAudience}},
+		TenantID: "test-tenant",
+		TAC:      "rwl",
+	})
+
+	blacklist := service.NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, logger)
+	if err := blacklist.RevokeUser(context.Background(), "some-other-user"); err != nil {
+		t.Fatalf("RevokeUser: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	c, r := gin.CreateTestContext(w)
+	r.Use(TokenAuthMiddleware(v, tenants, blacklist, logger))
+	r.GET("/test", func(c *gin.Context) { c.Status(200) })
+
+	c.Request = httptest.NewRequest("GET", "/test", nil)
+	c.Request.Header.Set("Authorization", "Bearer "+token)
+	r.ServeHTTP(w, c.Request)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for non-revoked user, got %d: %s", w.Code, w.Body.String())
 	}
 }
 
@@ -418,5 +504,48 @@ func TestExtractBearer(t *testing.T) {
 				t.Errorf("extractBearer() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestLegacyEndpointRemoved(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	_, r := gin.CreateTestContext(w)
+	r.POST("/login", LegacyEndpointRemoved(), func(c *gin.Context) { c.Status(200) })
+	r.ServeHTTP(w, httptest.NewRequest("POST", "/login", nil))
+	if w.Code != 410 || !strings.Contains(w.Body.String(), "legacy_tokens_disabled") {
+		t.Errorf("a removed legacy endpoint must answer 410 legacy_tokens_disabled, got %d %s", w.Code, w.Body.String())
+	}
+}
+
+// A well-formed HS256 bearer token signed with the legacy secret and issuer is refused with 401.
+func TestTokenAuthMiddleware_HMACBearerTokenRejected(t *testing.T) {
+	v, _, issuer := setupTokenAuthTest(t)
+	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{
+		"test-tenant": {ID: "test-tenant", Enabled: true},
+	}}
+	secret := []byte("legacy-hmac-secret-that-is-at-least-32-bytes")
+	hmacToken := gojwtSigned(t, secret, map[string]any{
+		"iss":       issuer,
+		"aud":       testTokenAudience,
+		"user_id":   "user-123",
+		"tenant_id": "test-tenant",
+		"jti":       "jti-hmac",
+	})
+
+	reached := false
+	w := httptest.NewRecorder()
+	_, r := gin.CreateTestContext(w)
+	r.Use(TokenAuthMiddleware(v, tenants, nil, zap.NewNop()))
+	r.GET("/test", func(c *gin.Context) { reached = true; c.Status(200) })
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
+	req.Header.Set("Authorization", "Bearer "+hmacToken)
+	r.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("an HMAC bearer token must be rejected with 401, got %d: %s", w.Code, w.Body.String())
+	}
+	if reached {
+		t.Fatal("the handler must not run for an HMAC bearer token")
 	}
 }

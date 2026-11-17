@@ -62,3 +62,34 @@ func TestWalletInstanceStore_UpdateStatus_ValidTransitions(t *testing.T) {
 	err = wis.UpdateStatus(ctx, "inst-valid-transitions", domain.InstanceStatusActive, "")
 	require.Error(t, err)
 }
+
+func TestWalletInstanceStore_Upsert_PersistsWSCDTypeAndVerifiedAppID(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	wis := store.WalletInstances()
+
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-wscd-persist", TenantID: "acme", Status: domain.InstanceStatusActive,
+		WSCDType: domain.WSCDTypeWebCrypto, AttestationSource: "backend_attested",
+	}))
+	got, err := wis.GetByID(ctx, "inst-wscd-persist")
+	require.NoError(t, err)
+	require.Equal(t, domain.WSCDTypeWebCrypto, got.WSCDType, "insert must store the WSCD type")
+
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{
+		ID: "inst-wscd-persist", TenantID: "acme", WSCDType: domain.WSCDTypeNativeIOS,
+		AttestationSource: "platform_attested", VerifiedAppID: "app.example",
+	}))
+	got, err = wis.GetByID(ctx, "inst-wscd-persist")
+	require.NoError(t, err)
+	require.Equal(t, domain.WSCDTypeNativeIOS, got.WSCDType, "re-attestation must update the WSCD type")
+	require.Equal(t, "app.example", got.VerifiedAppID)
+	require.Equal(t, domain.InstanceStatusActive, got.Status)
+
+	// An upsert that does not know the type does not erase it.
+	require.NoError(t, wis.Upsert(ctx, &domain.WalletInstance{ID: "inst-wscd-persist", TenantID: "acme", AttestationSource: "backend_attested"}))
+	got, err = wis.GetByID(ctx, "inst-wscd-persist")
+	require.NoError(t, err)
+	require.Equal(t, domain.WSCDTypeNativeIOS, got.WSCDType)
+	require.Empty(t, got.VerifiedAppID)
+}

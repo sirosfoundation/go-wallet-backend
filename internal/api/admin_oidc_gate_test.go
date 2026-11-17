@@ -243,20 +243,165 @@ func TestGetTenant_WithOIDCGate(t *testing.T) {
 
 func TestApplyOIDCGateRequest_NilInputs(t *testing.T) {
 	// nil request, nil gate — should return nil error
-	if err := applyOIDCGateRequest(nil, nil); err != nil {
+	if err := applyOIDCGateRequest(nil, nil, false); err != nil {
 		t.Errorf("nil req + nil gate: %v", err)
 	}
 
 	// nil request, valid gate — no-op
 	gate := &domain.OIDCGateConfig{}
-	if err := applyOIDCGateRequest(nil, gate); err != nil {
+	if err := applyOIDCGateRequest(nil, gate, false); err != nil {
 		t.Errorf("nil req: %v", err)
 	}
 
 	// valid request, nil gate — no-op
 	req := &OIDCGateRequest{Mode: "none"}
-	if err := applyOIDCGateRequest(req, nil); err != nil {
+	if err := applyOIDCGateRequest(req, nil, false); err != nil {
 		t.Errorf("nil gate: %v", err)
+	}
+}
+
+// TestCreateTenant_OIDCGate_RejectsHTTPIssuer covers go-wallet-backend#373
+// (M-1): a plain http:// issuer must be rejected unless allow_http is set.
+func TestCreateTenant_OIDCGate_RejectsHTTPIssuer(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
+	router := gin.New()
+	router.POST("/admin/tenants", h.CreateTenant)
+
+	body := `{
+		"id": "http-issuer-tenant",
+		"name": "HTTP Issuer Tenant",
+		"oidc_gate": {
+			"mode": "login",
+			"login_op": {
+				"issuer": "http://idp.example.com",
+				"client_id": "client-1"
+			}
+		}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for http:// issuer, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestCreateTenant_OIDCGate_AllowsHTTPIssuerWhenAllowed verifies the
+// allow_http escape hatch (test/dev environments), mirroring the AuthZEN
+// proxy's existing allowHTTP behavior.
+func TestCreateTenant_OIDCGate_AllowsHTTPIssuerWhenAllowed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	store := memory.NewStore()
+	h := NewAdminHandlers(store, zap.NewNop(), nil)
+	h.SetAllowHTTP(true)
+	router := gin.New()
+	router.POST("/admin/tenants", h.CreateTenant)
+
+	body := `{
+		"id": "http-issuer-allowed",
+		"name": "HTTP Issuer Allowed",
+		"oidc_gate": {
+			"mode": "login",
+			"login_op": {
+				"issuer": "http://idp.internal:8080",
+				"client_id": "client-1"
+			}
+		}
+	}`
+	req := httptest.NewRequest(http.MethodPost, "/admin/tenants", bytes.NewBufferString(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestApplyOIDCGateRequest_RejectsHTTPIssuer is the unit-level counterpart.
+func TestApplyOIDCGateRequest_RejectsHTTPIssuer(t *testing.T) {
+	gate := &domain.OIDCGateConfig{}
+	req := &OIDCGateRequest{
+		Mode: "registration",
+		RegistrationOP: &OIDCProviderConfigRequest{
+			Issuer:   "http://idp.example.com",
+			ClientID: "client-1",
+		},
+	}
+	if err := applyOIDCGateRequest(req, gate, false); err == nil {
+		t.Fatal("expected error for http:// issuer with allowHTTP=false")
+	}
+	if err := applyOIDCGateRequest(req, gate, true); err != nil {
+		t.Errorf("expected http:// issuer to be accepted with allowHTTP=true, got: %v", err)
+	}
+}
+
+// TestApplyOIDCGateRequest_RevalidatesUntouchedStoredProvider covers a
+// Copilot review finding on this PR: a request that doesn't resupply
+// login_op/registration_op (e.g. one that only changes `mode` or
+// `trust_admin_claim`) must still reject an already-stored http:// issuer
+// left over from before the HTTPS-only check existed - otherwise that
+// issuer could never be caught by any later update that doesn't happen to
+// touch the provider fields. See go-wallet-backend#373.
+func TestApplyOIDCGateRequest_RevalidatesUntouchedStoredProvider(t *testing.T) {
+	// Simulate a tenant with a pre-existing http:// LoginOP, as if it were
+	// written before this validation existed (or via allow_http).
+	gate := &domain.OIDCGateConfig{
+		Mode: domain.OIDCGateModeLogin,
+		LoginOP: &domain.OIDCProviderConfig{
+			Issuer:   "http://legacy-idp.example.com",
+			ClientID: "legacy-client",
+		},
+	}
+
+	// A request that only flips trust_admin_claim, without resupplying
+	// login_op at all.
+	trustTrue := true
+	req := &OIDCGateRequest{
+		Mode:            "login",
+		TrustAdminClaim: &trustTrue,
+	}
+
+	if err := applyOIDCGateRequest(req, gate, false); err == nil {
+		t.Fatal("expected the untouched stored http:// login_op to be rejected")
+	}
+
+	// With allow_http, the same request must succeed.
+	if err := applyOIDCGateRequest(req, gate, true); err != nil {
+		t.Errorf("expected success with allowHTTP=true, got: %v", err)
+	}
+}
+
+// TestApplyOIDCGateRequest_TrustAdminClaim covers go-wallet-backend#376
+// (M-4): trust_admin_claim must be off by default and only settable via
+// explicit tenant config.
+func TestApplyOIDCGateRequest_TrustAdminClaim(t *testing.T) {
+	gate := &domain.OIDCGateConfig{}
+	req := &OIDCGateRequest{
+		Mode: "login",
+		LoginOP: &OIDCProviderConfigRequest{
+			Issuer:   "https://idp.example.com",
+			ClientID: "client-1",
+		},
+	}
+	if err := applyOIDCGateRequest(req, gate, false); err != nil {
+		t.Fatalf("applyOIDCGateRequest: %v", err)
+	}
+	if gate.TrustAdminClaim {
+		t.Error("expected trust_admin_claim to default to false")
+	}
+
+	trustTrue := true
+	req.TrustAdminClaim = &trustTrue
+	if err := applyOIDCGateRequest(req, gate, false); err != nil {
+		t.Fatalf("applyOIDCGateRequest: %v", err)
+	}
+	if !gate.TrustAdminClaim {
+		t.Error("expected trust_admin_claim=true to be applied")
 	}
 }
 
@@ -271,7 +416,7 @@ func TestApplyOIDCGateRequest_RequiredClaims(t *testing.T) {
 		},
 	}
 
-	if err := applyOIDCGateRequest(req, gate); err != nil {
+	if err := applyOIDCGateRequest(req, gate, false); err != nil {
 		t.Fatalf("applyOIDCGateRequest: %v", err)
 	}
 

@@ -5,20 +5,76 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
-
-	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
-	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
-	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
-// TokenBlacklistChecker is an interface for checking if a token is blacklisted
+// TokenBlacklistChecker is an interface for checking if a token is
+// blacklisted, either individually by jti or in bulk for every token of a user (TokenBlacklist.RevokeUser).
 type TokenBlacklistChecker interface {
-	IsBlacklisted(ctx context.Context, jti string) bool
+	// IsBlacklisted and IsUserRevoked return an error when the revocation
+	// store cannot answer; callers must then refuse the request.
+	IsBlacklisted(ctx context.Context, jti string) (bool, error)
+	IsUserRevoked(ctx context.Context, userID string) (bool, error)
+}
+
+// IsAccountDeletion reports whether the request is the account deletion call
+// (DELETE /user/session). A user revocation means the deletion has begun, so
+// that call stays reachable to a revoked user: a deletion interrupted after
+// the revocation was stored (including a write whose acknowledgement was
+// lost) can then be completed by retrying, with every other token check
+// (signature, jti, family, expiry) still applied.
+func IsAccountDeletion(c *gin.Context) bool {
+	return c.Request.Method == http.MethodDelete && strings.TrimSuffix(c.FullPath(), "/") == "/user/session"
+}
+
+// IsLogout reports whether the request is the session logout call
+// (POST /user/session/logout).
+//
+// Logout is the one call that stays reachable to a token whose own jti is
+// already revoked, so that it is an idempotent completion path: a logout whose
+// revocation write reported an error may still have been applied (a MongoDB
+// write can land before its majority acknowledgement times out), and the jti
+// entry is never withdrawn because another request may have completed a
+// logout with it. Without this the retry would be rejected as "revoked" and
+// the client could not tell a completed logout from a failed one. A revoked
+// jti is the only check relaxed:
+// signature, expiry, user revocation, tenant and the store-unavailable
+// refusal all still apply, and the call only revokes the caller's own
+// session, so repeating it is harmless.
+func IsLogout(c *gin.Context) bool {
+	return c.Request.Method == http.MethodPost && strings.TrimSuffix(c.FullPath(), "/") == "/user/session/logout"
+}
+
+type logoutCompletionKey struct{}
+
+// WithLogoutCompletion marks ctx as belonging to a logout call, so a
+// revocation checker running inside token validation (which cannot see the
+// request) admits a token whose jti is already revoked. See IsLogout.
+func WithLogoutCompletion(ctx context.Context) context.Context {
+	return context.WithValue(ctx, logoutCompletionKey{}, true)
+}
+
+// IsLogoutCompletion reports whether ctx was marked by WithLogoutCompletion.
+func IsLogoutCompletion(ctx context.Context) bool {
+	v, _ := ctx.Value(logoutCompletionKey{}).(bool)
+	return v
+}
+
+// RefuseRevocationUnavailable aborts the request with 503 because the
+// revocation store could not say whether the token is revoked. Only the
+// error is logged, never token content.
+func RefuseRevocationUnavailable(c *gin.Context, logger *zap.Logger, err error) {
+	logger.Error("Revocation check failed; refusing request",
+		zap.Error(err),
+		zap.String("method", c.Request.Method),
+		zap.String("path", c.FullPath()),
+	)
+	c.JSON(503, gin.H{"error": "Token revocation check unavailable"})
+	c.Abort()
 }
 
 // GenerateAdminToken generates a secure random token for admin API authentication
@@ -35,6 +91,7 @@ func AdminAuthMiddleware(token string, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
+			logAuthReject(logger, c, "missing_authorization_header")
 			c.JSON(401, gin.H{"error": "Authorization header required"})
 			c.Abort()
 			return
@@ -43,6 +100,7 @@ func AdminAuthMiddleware(token string, logger *zap.Logger) gin.HandlerFunc {
 		// Extract token from "Bearer <token>"
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+			logAuthReject(logger, c, "malformed_authorization_header")
 			c.JSON(401, gin.H{"error": "Invalid authorization header format"})
 			c.Abort()
 			return
@@ -50,6 +108,7 @@ func AdminAuthMiddleware(token string, logger *zap.Logger) gin.HandlerFunc {
 
 		providedToken := strings.TrimSpace(parts[1])
 		if providedToken == "" {
+			logAuthReject(logger, c, "empty_bearer_token")
 			c.JSON(401, gin.H{"error": "Token required"})
 			c.Abort()
 			return
@@ -57,7 +116,7 @@ func AdminAuthMiddleware(token string, logger *zap.Logger) gin.HandlerFunc {
 
 		// Constant-time comparison to prevent timing attacks
 		if subtle.ConstantTimeCompare([]byte(providedToken), []byte(token)) != 1 {
-			logger.Warn("Invalid admin token attempt")
+			logAuthReject(logger, c, "invalid_admin_token")
 			c.JSON(401, gin.H{"error": "Invalid token"})
 			c.Abort()
 			return
@@ -67,147 +126,18 @@ func AdminAuthMiddleware(token string, logger *zap.Logger) gin.HandlerFunc {
 	}
 }
 
-// AuthMiddleware validates JWT tokens, validates tenant, and sets user/tenant context.
-// The JWT tenant_id claim is authoritative for authenticated requests.
-// If X-Tenant-ID header is provided and differs from JWT, a warning is logged but JWT wins.
-func AuthMiddleware(cfg *config.Config, store storage.Store, logger *zap.Logger) gin.HandlerFunc {
-	return AuthMiddlewareWithBlacklist(cfg, store, nil, logger)
-}
-
-// AuthMiddlewareWithBlacklist is like AuthMiddleware but also checks for blacklisted tokens.
-func AuthMiddlewareWithBlacklist(cfg *config.Config, store storage.Store, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		authHeader := c.GetHeader("Authorization")
-		if authHeader == "" {
-			c.JSON(401, gin.H{"error": "Authorization header required"})
-			c.Abort()
-			return
-		}
-
-		// Extract token from "Bearer <token>"
-		parts := strings.SplitN(authHeader, " ", 2)
-		if len(parts) != 2 || parts[0] != "Bearer" {
-			c.JSON(401, gin.H{"error": "Invalid authorization header format"})
-			c.Abort()
-			return
-		}
-
-		tokenString := strings.TrimSpace(parts[1])
-		if tokenString == "" {
-			c.JSON(401, gin.H{"error": "Token required"})
-			c.Abort()
-			return
-		}
-
-		// Parse and validate the JWT token
-		token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
-			// Validate the signing method
-			if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-				return nil, jwt.ErrSignatureInvalid
-			}
-			return []byte(cfg.JWT.Secret), nil
-		})
-
-		if err != nil || !token.Valid {
-			c.JSON(401, gin.H{"error": "Invalid token"})
-			c.Abort()
-			return
-		}
-
-		// Extract claims
-		claims, ok := token.Claims.(jwt.MapClaims)
-		if !ok {
-			c.JSON(401, gin.H{"error": "Invalid token claims"})
-			c.Abort()
-			return
-		}
-
-		// Check if token is blacklisted (if blacklist is configured)
-		if blacklist != nil {
-			jti, _ := claims["jti"].(string)
-			if jti != "" && blacklist.IsBlacklisted(c.Request.Context(), jti) {
-				logger.Warn("Blacklisted token used",
-					zap.String("jti", jti),
-				)
-				c.JSON(401, gin.H{"error": "Token has been revoked"})
-				c.Abort()
-				return
-			}
-		}
-
-		// Get user_id from claims
-		userID, ok := claims["user_id"].(string)
-		if !ok {
-			c.JSON(401, gin.H{"error": "Invalid user ID in token"})
-			c.Abort()
-			return
-		}
-
-		// Get did from claims
-		did, _ := claims["did"].(string)
-
-		// Get tenant_id from claims (required for security boundary)
-		// This is the authoritative source for tenant on authenticated requests
-		tenantID, _ := claims["tenant_id"].(string)
-		if tenantID == "" {
-			// For backward compatibility with older tokens, default to "default"
-			tenantID = "default"
-		}
-
-		// Validate tenant exists and is enabled
-		tenant, err := store.Tenants().GetByID(c.Request.Context(), domain.TenantID(tenantID))
-		if err != nil {
-			if err == storage.ErrNotFound {
-				logger.Warn("JWT contains invalid tenant_id",
-					zap.String("tenant_id", tenantID),
-				)
-				c.JSON(401, gin.H{"error": "Invalid tenant in token"})
-			} else {
-				logger.Error("Failed to lookup tenant from JWT",
-					zap.String("tenant_id", tenantID),
-					zap.Error(err),
-				)
-				c.JSON(500, gin.H{"error": "Internal server error"})
-			}
-			c.Abort()
-			return
-		}
-
-		if !tenant.Enabled {
-			logger.Warn("JWT tenant is disabled",
-				zap.String("tenant_id", tenantID),
-			)
-			c.JSON(403, gin.H{"error": "Tenant is disabled"})
-			c.Abort()
-			return
-		}
-
-		// Check if X-Tenant-ID header was provided and log if it mismatches JWT
-		headerTenantID := c.GetHeader("X-Tenant-ID")
-		if headerTenantID != "" && headerTenantID != tenantID {
-			logger.Warn("X-Tenant-ID header mismatches JWT tenant_id - using JWT (authoritative)",
-				zap.String("header_tenant_id", headerTenantID),
-				zap.String("jwt_tenant_id", tenantID),
-			)
-		}
-
-		// user_id/did are only set when non-empty — see the matching comment
-		// in TokenAuthMiddleware for why (an always-true c.Set makes the
-		// common `val, exists := c.Get(...)` idiom unable to tell "no
-		// identity" apart from "identity is the empty string").
-		if userID != "" {
-			c.Set("user_id", userID)
-		}
-		if did != "" {
-			c.Set("did", did)
-		}
-		c.Set("token", tokenString)
-		c.Set("tenant_id", tenantID)   // Set tenant from JWT for security
-		c.Set("tenant", tenant)        // Set full tenant object for handlers
-		c.Set("tenant_from_jwt", true) // Flag to indicate this came from JWT (authoritative)
-
-		c.Next()
+// logAuthReject records why a request was refused by an authentication
+// middleware. Rejections used to be visible only as a JSON body on the
+// client, which is unreachable when debugging wrapper apps or platforms
+// without client-side request logs (#301). Never pass the token itself.
+func logAuthReject(logger *zap.Logger, c *gin.Context, reason string, fields ...zap.Field) {
+	base := []zap.Field{
+		zap.String("reason", reason),
+		zap.String("method", c.Request.Method),
+		zap.String("path", c.FullPath()),
+		zap.String("client_ip", c.ClientIP()),
 	}
+	logger.Warn("Authentication rejected", append(base, fields...)...)
 }
 
 // Logger returns a gin middleware for logging with optional path exclusions.

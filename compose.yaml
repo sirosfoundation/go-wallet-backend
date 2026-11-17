@@ -1,13 +1,37 @@
 services:
+  # Creates the AS signing key on first run (gitignored, never committed).
+  as-key-init:
+    image: alpine/openssl:latest
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        [ -f /configs/as-signing-key.pem ] || {
+          openssl ecparam -name prime256v1 -genkey -noout -out /configs/as-signing-key.pem &&
+          chmod 644 /configs/as-signing-key.pem
+        }
+    volumes:
+      - "./configs:/configs"
+
   wallet-backend:
     build:
       context: .
       dockerfile: Dockerfile
     restart: always
+    depends_on:
+      as-key-init:
+        condition: service_completed_successfully
     ports:
-      - "8002:8080"
+      # Host port must match the port in as.external_url (configs/config.yaml,
+      # http://localhost:8080): that URL also forms the browser-facing OIDC
+      # callback (<external_url>/auth/oidc/callback). If you publish a different
+      # host port or hostname, change as.external_url to match, and keep the AS
+      # JWKS URL reachable from inside the container.
+      - "8080:8080"
     volumes:
-      - "./configs/config.yaml:/app/configs/config.yaml"
+      # The whole directory, not single files: a file bind mount whose source does
+      # not exist yet (the key, on a clean checkout) is created as a directory.
+      # as-key-init writes configs/as-signing-key.pem, which then appears here.
+      - "./configs:/app/configs:ro"
     # Note: healthcheck is not configured because the distroless runtime image
     # doesn't have curl, wget, or a shell. A proper healthcheck would require
     # building a custom health binary into the image.

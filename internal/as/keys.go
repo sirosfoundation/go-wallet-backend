@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"github.com/go-jose/go-jose/v4"
+	"github.com/go-jose/go-jose/v4/cryptosigner"
 )
 
 // KeyManager manages asymmetric signing keys for the AS.
@@ -151,13 +152,20 @@ func parsePrivateKey(block *pem.Block) (crypto.Signer, error) {
 	}
 }
 
-// newSigningKey creates a SigningKey from a crypto.Signer, auto-detecting the algorithm.
+// newSigningKey creates a SigningKey from a crypto.Signer, detecting the
+// algorithm from its public key. The kid is the RFC 7638 thumbprint.
 func newSigningKey(signer crypto.Signer) (*SigningKey, error) {
+	if signer == nil {
+		return nil, fmt.Errorf("nil signer")
+	}
+	pub := signer.Public()
 	var alg jose.SignatureAlgorithm
-	var kid string
 
-	switch k := signer.(type) {
-	case *ecdsa.PrivateKey:
+	switch k := pub.(type) {
+	case *ecdsa.PublicKey:
+		if k == nil {
+			return nil, fmt.Errorf("signer has a nil public key")
+		}
 		switch k.Curve {
 		case elliptic.P256():
 			alg = jose.ES256
@@ -166,29 +174,58 @@ func newSigningKey(signer crypto.Signer) (*SigningKey, error) {
 		default:
 			return nil, fmt.Errorf("unsupported ECDSA curve: %v", k.Curve.Params().Name)
 		}
-		// kid from public key thumbprint
-		jwk := jose.JSONWebKey{Key: k.Public()}
-		tp, err := jwk.Thumbprint(crypto.SHA256)
-		if err != nil {
-			return nil, fmt.Errorf("failed to compute key thumbprint: %w", err)
+	case ed25519.PublicKey:
+		if len(k) != ed25519.PublicKeySize {
+			return nil, fmt.Errorf("invalid Ed25519 public key length %d", len(k))
 		}
-		kid = base64.RawURLEncoding.EncodeToString(tp)
-	case ed25519.PrivateKey:
 		alg = jose.EdDSA
-		jwk := jose.JSONWebKey{Key: k.Public()}
-		tp, err := jwk.Thumbprint(crypto.SHA256)
-		if err != nil {
-			return nil, fmt.Errorf("failed to compute key thumbprint: %w", err)
-		}
-		kid = base64.RawURLEncoding.EncodeToString(tp)
 	default:
-		return nil, fmt.Errorf("unsupported key type %T", signer)
+		return nil, fmt.Errorf("unsupported key type %T", pub)
+	}
+
+	jwk := jose.JSONWebKey{Key: pub}
+	tp, err := jwk.Thumbprint(crypto.SHA256)
+	if err != nil {
+		return nil, fmt.Errorf("failed to compute key thumbprint: %w", err)
 	}
 
 	return &SigningKey{
-		Kid:       kid,
+		Kid:       base64.RawURLEncoding.EncodeToString(tp),
 		Signer:    signer,
 		Algorithm: alg,
-		PublicKey: signer.Public(),
+		PublicKey: pub,
 	}, nil
+}
+
+// NewKeyManagerFromSigner creates a KeyManager whose active key is an
+// arbitrary crypto.Signer (for example a PKCS#11 HSM key).
+func NewKeyManagerFromSigner(signer crypto.Signer) (*KeyManager, error) {
+	sk, err := newSigningKey(signer)
+	if err != nil {
+		return nil, fmt.Errorf("as: unsupported signing key: %w", err)
+	}
+	km := &KeyManager{keys: map[string]*SigningKey{sk.Kid: sk}, active: sk.Kid}
+	km.rebuildJWKS()
+	return km, nil
+}
+
+// Close releases resources held by signers (e.g. PKCS#11 sessions).
+func (km *KeyManager) Close() error {
+	km.mu.RLock()
+	defer km.mu.RUnlock()
+	var first error
+	for _, sk := range km.keys {
+		if c, ok := sk.Signer.(interface{ Close() error }); ok {
+			if err := c.Close(); err != nil && first == nil {
+				first = err
+			}
+		}
+	}
+	return first
+}
+
+// joseKey adapts the signer for jose.NewSigner; cryptosigner converts the DER
+// ECDSA signatures HSMs return into JWS r||s.
+func (sk *SigningKey) joseKey() interface{} {
+	return cryptosigner.Opaque(sk.Signer)
 }

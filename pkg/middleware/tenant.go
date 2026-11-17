@@ -9,7 +9,7 @@ import (
 
 // TenantHeaderMiddleware extracts the tenant from X-Tenant-ID header and validates it.
 // This is used for unauthenticated requests where tenant context is needed (e.g., login begin).
-// For authenticated requests, the JWT tenant_id claim is authoritative (set by AuthMiddleware).
+// For authenticated requests, the JWT tenant_id claim is authoritative (set by TokenAuthMiddleware).
 func TenantHeaderMiddleware(store storage.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		tenantIDStr := c.GetHeader("X-Tenant-ID")
@@ -39,7 +39,7 @@ func TenantHeaderMiddleware(store storage.Store) gin.HandlerFunc {
 			return
 		}
 
-		// Set tenant context (can be overridden by AuthMiddleware if JWT has tenant_id)
+		// Set tenant context (can be overridden by TokenAuthMiddleware if JWT has tenant_id)
 		c.Set("tenant_id", tenantID)
 		c.Set("tenant", tenant)
 		c.Next()
@@ -47,7 +47,7 @@ func TenantHeaderMiddleware(store storage.Store) gin.HandlerFunc {
 }
 
 // TenantMembershipMiddleware verifies the user is a member of the current tenant
-// Must be used after AuthMiddleware (which sets tenant from JWT)
+// Must be used after TokenAuthMiddleware (which sets tenant from JWT)
 func TenantMembershipMiddleware(store storage.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Get user ID from auth context
@@ -93,14 +93,14 @@ func TenantMembershipMiddleware(store storage.Store) gin.HandlerFunc {
 }
 
 // GetTenantID extracts tenant ID from gin context
-// Handles both string (from JWT via AuthMiddleware) and domain.TenantID (from header via TenantHeaderMiddleware)
+// Handles both string (from JWT via TokenAuthMiddleware) and domain.TenantID (from header via TenantHeaderMiddleware)
 func GetTenantID(c *gin.Context) (domain.TenantID, bool) {
 	tenantIDVal, exists := c.Get("tenant_id")
 	if !exists {
 		return "", false
 	}
 
-	// Handle string type (from JWT via AuthMiddleware)
+	// Handle string type (from JWT via TokenAuthMiddleware)
 	if tidStr, ok := tenantIDVal.(string); ok {
 		return domain.TenantID(tidStr), true
 	}

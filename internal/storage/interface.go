@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 )
@@ -13,7 +14,20 @@ var (
 	ErrAlreadyExists = errors.New("already exists")
 	ErrInvalidInput  = errors.New("invalid input")
 	ErrDatabase      = errors.New("database error")
+	// ErrConflict is returned when an optimistic-concurrency write could not
+	// be applied after retrying because the record kept changing.
+	ErrConflict = errors.New("concurrent modification")
+	// ErrCounterNotAdvanced is returned by AppAttestKeyStore.AdvanceCounter when
+	// the counter is not strictly greater than the stored one (replay or
+	// regression) or the key is not active.
+	ErrCounterNotAdvanced = errors.New("counter not advanced")
 )
+
+// UserModifier mutates a user in place. It is used by UserStore.Modify and
+// may be invoked more than once if a concurrent write is detected, so it must
+// not have side effects outside the user it is given. Returning an error
+// aborts the modification without writing anything.
+type UserModifier func(user *domain.User) error
 
 // TenantStore defines the interface for tenant storage operations
 type TenantStore interface {
@@ -71,14 +85,55 @@ type UserStore interface {
 	// GetByDID retrieves a user by DID
 	GetByDID(ctx context.Context, did string) (*domain.User, error)
 
-	// Update updates a user
-	Update(ctx context.Context, user *domain.User) error
+	// Modify atomically reads the user, applies fn and writes the result.
+	// Concurrent writes are detected via User.Version and fn is re-applied
+	// to the fresh record. Errors returned by fn are passed through unchanged.
+	// Returns the stored user after modification.
+	Modify(ctx context.Context, id domain.UserID, fn UserModifier) (*domain.User, error)
 
 	// Delete deletes a user
 	Delete(ctx context.Context, id domain.UserID) error
 
-	// UpdatePrivateData updates user's private data with optimistic locking
-	UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error
+	// UpdateCredentialAuthenticator atomically persists a single WebAuthn
+	// credential's SignCount and CloneWarning, identified by the
+	// credential's ID (the base64url string, domain.WebauthnCredential.ID),
+	// without a whole-document read-modify-write. This exists because
+	// Update above replaces the entire document (Mongo: ReplaceOne): two
+	// concurrent logins that each read the user before either persisted
+	// would otherwise race on a last-writer-wins basis, and a "clean" login
+	// racing after a "clone detected" login could silently clobber the
+	// latter's CloneWarning=true back to false. CloneWarning is OR-only
+	// here — the underlying implementations must never let this method
+	// write false over an existing true — so it can only ever gain the
+	// signal, never lose it to a race, however the two calls interleave.
+	// SignCount is monotonic non-decreasing (Mongo: $max; memory: only
+	// assigned when greater), not a plain overwrite: concurrent logins can
+	// persist out of order, and letting a later write lower the stored
+	// counter would both falsely flag a subsequent legitimate assertion as
+	// a clone regression and let an actually-regressing counter slip
+	// through as non-regressing against an artificially-lowered baseline.
+	// Returns storage.ErrNotFound if the user doesn't exist. If the user exists but
+	// has no credential with that ID, this is a silent no-op success in
+	// both backends (MongoDB's arrayFilter update can't distinguish
+	// "matched the document but zero array elements" from "document not
+	// found", so this is a deliberate, matching behavior rather than an
+	// accidental divergence) — callers must only call this with a
+	// credentialID they've just matched on that same user.
+	//
+	// transitioned reports whether THIS call is the one that actually
+	// flipped CloneWarning from false to true in storage — a genuine
+	// compare-and-set outcome from the atomic write itself (MongoDB:
+	// FindOneAndUpdate returning the pre-image so the prior stored value
+	// can be inspected; memory: checked under the same mutex acquisition as
+	// the write), not something callers should try to infer from a
+	// separately-read snapshot. Two concurrent callers that both pass
+	// cloneWarning=true can both observe a stale "not yet latched" view
+	// before either persists; only relying on this return value (rather
+	// than a local pre-check) ensures exactly one of them sees
+	// transitioned=true, so a caller gating a one-time side effect (e.g. a
+	// security-event log line) on this value can't duplicate it under a
+	// race. Always false when cloneWarning is false.
+	UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) (transitioned bool, err error)
 }
 
 // CredentialStore defines the interface for credential storage operations
@@ -130,6 +185,43 @@ type ChallengeStore interface {
 
 	// GetByID retrieves a challenge by ID
 	GetByID(ctx context.Context, id string) (*domain.WebauthnChallenge, error)
+
+	// ConsumeByID atomically retrieves and deletes a challenge by ID in a
+	// single operation (Mongo: FindOneAndDelete; memory: mutex-protected
+	// delete-and-return). Callers MUST use this instead of GetByID+Delete to
+	// consume a one-time challenge: two concurrent calls racing on the same
+	// ID can never both receive a non-nil challenge back. Returns
+	// ErrNotFound if the challenge doesn't exist or was already consumed by
+	// another caller.
+	ConsumeByID(ctx context.Context, id string) (*domain.WebauthnChallenge, error)
+
+	// ConsumeByIDForUser atomically retrieves and deletes a challenge by ID,
+	// but ONLY if it also belongs to the given userID — the ownership check
+	// is part of the same atomic find-and-delete, not a separate check
+	// performed after consuming. This is what an authenticated, per-user
+	// operation (e.g. FinishAddCredential) must use instead of plain
+	// ConsumeByID: a caller presenting a DIFFERENT user's challenge ID gets
+	// an atomic ErrNotFound without ever touching that other user's real,
+	// still-pending challenge — a mismatched-owner call must never be able
+	// to burn someone else's ceremony. Returns ErrNotFound if the challenge
+	// doesn't exist, was already consumed, or belongs to a different user
+	// (deliberately indistinguishable, so a caller can't probe which).
+	ConsumeByIDForUser(ctx context.Context, id string, userID string) (*domain.WebauthnChallenge, error)
+
+	// ConsumeByIDForTenant atomically retrieves and deletes a challenge by
+	// ID, additionally constrained to expectedTenantID as part of the SAME
+	// atomic find-and-delete — unless expectedTenantID is empty, in which
+	// case this behaves exactly like plain ConsumeByID with no extra
+	// constraint. This is what FinishRegistration must use when it has a
+	// validated tenant context (e.g. from the X-Tenant-ID header) to check
+	// against the challenge's own tenant: a caller who knows a challenge ID
+	// but names the wrong tenant must not be able to burn that challenge
+	// via a mismatch check performed only AFTER a separate, unconstrained
+	// consume. Returns ErrNotFound if the challenge doesn't exist, was
+	// already consumed, or (when expectedTenantID is non-empty) belongs to
+	// a different tenant (deliberately indistinguishable from the other
+	// cases, so a caller can't probe which).
+	ConsumeByIDForTenant(ctx context.Context, id string, expectedTenantID string) (*domain.WebauthnChallenge, error)
 
 	// Delete deletes a challenge
 	Delete(ctx context.Context, id string) error
@@ -202,6 +294,7 @@ type Store interface {
 	Invites() InviteStore
 	WalletInstances() WalletInstanceStore
 	KeyAttestations() KeyAttestationStore
+	AppAttestKeys() AppAttestKeyStore
 
 	// Close closes the storage connection
 	Close() error
@@ -224,7 +317,16 @@ type InviteStore interface {
 	// GetAllByTenant retrieves all invites for a tenant
 	GetAllByTenant(ctx context.Context, tenantID domain.TenantID) ([]*domain.Invite, error)
 
-	// MarkCompleted atomically marks an active invite as completed
+	// MarkCompleted atomically marks an invite as completed, but only if it
+	// is currently active AND not expired — both conditions are checked as
+	// part of the same atomic operation (Mongo: a single filtered UpdateOne;
+	// memory: under one mutex acquisition). This closes a narrower TOCTOU
+	// than the active/completed race MarkCompleted itself already prevents:
+	// without the expiry check being atomic too, an invite that passed an
+	// earlier IsUsable() check could tick over its expiry while a slow
+	// caller (e.g. WebAuthn verification) is still in flight, and this call
+	// would otherwise still succeed. Returns storage.ErrNotFound if the
+	// invite isn't active, is expired, or doesn't exist.
 	MarkCompleted(ctx context.Context, tenantID domain.TenantID, code string, usedBy domain.UserID) error
 
 	// Update updates an invite (for renew/revoke)
@@ -273,4 +375,41 @@ type KeyAttestationStore interface {
 	// GetByKeyThumbprint retrieves a key attestation record by its JWK
 	// Thumbprint. Returns ErrNotFound if no evidence is on file for that key.
 	GetByKeyThumbprint(ctx context.Context, thumbprint string) (*domain.KeyAttestationRecord, error)
+
+	// MarkKeyRevoked marks the record of thumbprint revoked, but only when it
+	// is still the record whose chain has the given leaf fingerprint and is
+	// not already revoked: a record that a fresh submission replaced in the
+	// meantime is left alone. It reports whether this call set the mark. The
+	// record is never deleted. A missing record is not an error (false).
+	MarkKeyRevoked(ctx context.Context, thumbprint, chainFingerprint, reason string, at time.Time) (bool, error)
+
+	// ReplaceKeyEvidence atomically replaces the stored record of
+	// rec.KeyThumbprint with rec, but only when the stored record is still the
+	// one whose chain has the leaf fingerprint staleChainFingerprint, and
+	// whatever its rank (the no-downgrade rule is deliberately not applied: the
+	// caller found that record no longer good). It reports whether it replaced
+	// it; false (no error) means the stored record is another one now, or none,
+	// and nothing was written.
+	ReplaceKeyEvidence(ctx context.Context, rec *domain.KeyAttestationRecord, staleChainFingerprint string) (bool, error)
+}
+
+// AppAttestKeyStore defines durable storage of attested Apple App Attest keys
+// (see domain.AppAttestKeyRecord).
+type AppAttestKeyStore interface {
+	// Create stores a newly attested key. Returns ErrAlreadyExists when a
+	// record for rec.KeyID exists: an existing key's counter is never reset.
+	Create(ctx context.Context, rec *domain.AppAttestKeyRecord) error
+
+	// Get returns the record for keyID, or ErrNotFound.
+	Get(ctx context.Context, keyID string) (*domain.AppAttestKeyRecord, error)
+
+	// AdvanceCounter atomically sets the stored counter to next if and only
+	// if the record exists, is active and next is strictly greater than the
+	// stored counter (a compare-and-set: of any number of concurrent calls
+	// with the same counter exactly one succeeds). Otherwise it changes
+	// nothing and returns ErrCounterNotAdvanced (ErrNotFound when no record).
+	AdvanceCounter(ctx context.Context, keyID string, next uint32) error
+
+	// Revoke marks the key revoked. Returns ErrNotFound when no record.
+	Revoke(ctx context.Context, keyID string) error
 }

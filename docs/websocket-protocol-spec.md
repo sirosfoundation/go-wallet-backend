@@ -1,7 +1,7 @@
 # Wallet Protocol Channel Specification
 
-**Version**: 0.1.0 (Draft)  
-**Status**: Design Discussion  
+**Version**: 0.1.0 (Draft)
+**Status**: Design Discussion
 **Date**: 2026-02-18
 
 ## Overview
@@ -129,6 +129,19 @@ including how to request a token with the `tac` your client needs.
 Clients SHOULD send ping frames every 30 seconds. Servers MUST respond with pong.
 Connections idle for >60 seconds without ping/pong MAY be terminated.
 
+The engine's own cadence is reported in `handshake_complete.config.ping_interval_ms`
+(default 3000 ms). The engine pings at that interval and closes the connection
+when it has seen no sign of life for `ping_interval + pong_timeout` (default
+3 s + 5 s = 8 s). A pong, a client ping (answered with a pong) or inbound data
+(including each fragment of a message still being received, even an empty
+continuation frame) counts as a sign of life and restarts that window; any
+bytes read from the socket restart it, with the deadline refreshed at most
+once per eighth of the window. The engine's pings are not serialized behind
+the application's send lock; they are still ordered behind a data write that
+is stuck in the socket, and a ping that merely waits too long for that write is retried
+on the next tick, while a ping whose own socket write times out closes the
+connection.
+
 ### Reconnection
 
 On unexpected disconnect:
@@ -144,16 +157,16 @@ All messages are JSON objects with a common envelope:
 interface Message {
   // Message type - determines interpretation of payload
   type: string;
-  
+
   // Flow identifier for multi-step operations (optional)
   flow_id?: string;
-  
+
   // Correlation ID for request/response pairs (optional)
   message_id?: string;
-  
+
   // Timestamp (ISO 8601, optional)
   timestamp?: string;
-  
+
   // Type-specific payload
   [key: string]: unknown;
 }
@@ -206,6 +219,37 @@ Client → Server:
   "credential_offer_uri": "https://issuer.example.com/offers/abc123"
 }
 ```
+
+##### The selected set (multi-credential issuance)
+
+An offer may name several `credential_configuration_ids`. What issues is a
+SET, and the client that already resolved the user's choice (a picker UI
+ahead of the flow) names it on `flow_start`:
+
+```
+Client → Server:
+{
+  "type": "flow_start",
+  "flow_id": "<uuid>",
+  "protocol": "oid4vci",
+  "offer": "openid-credential-offer://...",
+  "credential_configuration_ids": ["pid", "mdl"]
+}
+```
+
+The member is the selection: no ask runs, whatever the deployment's
+`engine_issuance_selection_policy` (`issue_all`, the default, or
+`user_selects`; see "User Selection" below). Absent or empty means every
+offered configuration (the `issue_all` default). Every named id must be one
+the offer carries — an id outside the offer fails the flow per-id, never a
+silent fall-back to issuing configurations nobody chose. The offer's order
+wins over the answer's; duplicates collapse.
+
+One authorization and one token cover the whole set: the scope is the set's
+joined values (de-duplicated, offer order, RFC 6749 §3.3 space-delimited),
+and each configuration issues in its own request — its own proofs (a fresh
+key per proof beyond the first; two proofs over the same key link the
+credentials), its own c_nonce retry, its own deferred polling.
 
 #### Flow Progression
 
@@ -292,7 +336,11 @@ Server → Client:
 
 #### User Selection
 
-Flow pauses for user to select credential configuration:
+Under the `user_selects` policy (`engine_issuance_selection_policy`:
+`user_selects`; the default `issue_all` issues every offered configuration
+with no selection step at all — and a `flow_start`
+`credential_configuration_ids` set is the selection under either policy),
+the flow pauses for the user to select the credential configurations:
 
 ```
 Server → Client:
@@ -311,7 +359,8 @@ Server → Client:
 }
 ```
 
-Client responds:
+Client responds — the answer is a SET, a subset of the offer (one, several,
+or all):
 
 ```
 Client → Server:
@@ -319,9 +368,16 @@ Client → Server:
   "type": "flow_action",
   "flow_id": "<uuid>",
   "action": "select_credential",
-  "credential_configuration_id": "UniversityDegree_jwt_vc_json"
+  "credential_configuration_ids": ["UniversityDegree_jwt_vc_json", "Mdl_mso_mdoc"]
 }
 ```
+
+The legacy single `credential_configuration_id` member is accepted as the
+one-element answer (pre-#549 clients); the plural member wins when both
+arrive. Every named id must be one the offer carried — an id outside the
+offer refuses, per-id. A single-configuration offer never asks: it
+auto-selects under either policy. The offer's order wins; duplicates
+collapse.
 
 #### Authorization
 
@@ -333,8 +389,16 @@ Server → Client:
   "type": "flow_progress",
   "flow_id": "<uuid>",
   "step": "authorization_required",
-  "authorization_url": "https://auth.example.com/authorize?...",
-  "expected_redirect_uri": "https://wallet.example.com/callback"
+  "payload": {
+    "authorization_url": "https://auth.example.com/authorize?...",
+    "expected_redirect_uri": "https://wallet.example.com/callback",
+    "state": "xyz789",
+    "code_verifier": "<PKCE verifier>",
+    "credential_offer": { "credential_issuer": "https://issuer.example.com" },
+    "authorization_context": "<opaque signed transaction>",
+    "expected_issuer": "https://auth.example.com",
+    "require_iss": true
+  }
 }
 ```
 
@@ -346,10 +410,57 @@ Client → Server:
   "type": "flow_action",
   "flow_id": "<uuid>",
   "action": "authorization_complete",
-  "code": "abc123",
-  "state": "xyz789"
+  "payload": {
+    "code": "abc123",
+    "state": "xyz789",
+    "iss": "https://auth.example.com"
+  }
 }
 ```
+
+Clients MUST preserve the authorization response's `iss` parameter exactly after
+URL decoding, without URL normalization. Before forwarding a callback, reject
+duplicate `iss` parameters (including two identical values); do not select one
+using a first-value/last-value accessor. The browser callback parser lives outside
+this repository and must implement this check. The backend additionally rejects
+duplicate JSON `iss` fields, null/non-string values, empty values, and mismatches.
+Clients must not synthesize `iss` from `expected_issuer` when it is absent.
+
+The expected issuer is the selected authorization server identifier, not
+necessarily the credential issuer. When AS metadata advertises
+`authorization_response_iss_parameter_supported: true`, missing `iss` fails
+authorization before any token request. For FAPI deployments, set
+`security.require_authorization_response_issuer: true` (environment:
+`WALLET_SECURITY_REQUIRE_AUTHORIZATION_RESPONSE_ISSUER=true`) to require it even
+if metadata omits or disables that advertisement. The default is false, preserving
+non-FAPI issuers that do not support RFC 9207; a supplied issuer is always checked.
+
+For a same-tab redirect, save `authorization_context`, the offer, and the PKCE
+verifier before navigating. On return, start a new OID4VCI flow:
+
+```json
+{
+  "type": "flow_start",
+  "flow_id": "<new uuid>",
+  "protocol": "oid4vci",
+  "offer": "<saved credential offer as JSON>",
+  "auth_code": "abc123",
+  "state": "xyz789",
+  "iss": "https://auth.example.com",
+  "code_verifier": "<saved PKCE verifier>",
+  "redirect_uri": "https://wallet.example.com/callback",
+  "authorization_context": "<saved opaque signed transaction>"
+}
+```
+
+`state` and `iss` above come from the callback, not from the saved request.
+Resumption now requires the signed context and matching state; older clients
+must be updated. The context expires after five minutes and binds the original
+authorization server, credential issuer, token endpoint, client ID, redirect URI,
+PKCE challenge/policy, issuer requirement, user, and tenant. Rediscovery cannot
+relax the original checks or change the token destination. Resume on another
+replica is supported when its `jwt.secret` matches; secret rotation invalidates
+outstanding contexts. This context is not an authentication/bearer token.
 
 For pre-authorized flows:
 
@@ -415,6 +526,56 @@ Client → Server:
 }
 ```
 
+#### Holder commitments (`org.siros.psc`)
+
+A credential configuration can ask the wallet to give the issuer a commitment
+derived from a per-issuer secret the engine never sees (SIROS extension,
+tracked in https://github.com/SUNET/vc/issues/823). The issuer advertises names
+only, never values:
+
+```
+credential_configurations_supported[cfg].credential_metadata["org.siros.holder_commitments"]
+  = {"commitments": ["psc"]}
+```
+
+The member must be an object with exactly one member, `commitments`: 1 to 4
+distinct names of 1 to 32 characters (`[a-z][a-z0-9_]*`), none of them a
+hex-looking string (16 or more hex characters). Anything else makes the
+configuration not offered: the engine drops it when decoding issuer metadata
+and the resolve endpoint removes it from the metadata it serves (dropping
+`signed_metadata`, as for `org.siros.secret_seed`). Unknown but well-formed
+names are ignored. Without the advertisement, behaviour is unchanged.
+
+When the selected configuration advertises `psc`, the `generate_proof`
+`sign_request` carries three more params (`credential_type` is the
+configuration's `vct`, or its `doctype` for mdoc; `credential_issuer` is the
+exact `credential_issuer` string of the issuer metadata):
+
+```
+"params": {
+  "audience": "https://issuer.example.com", "nonce": "...",
+  "holder_commitments": ["psc"],
+  "credential_type": "urn:eudi:pid:1",
+  "credential_issuer": "https://issuer.example.com"
+}
+```
+
+The wallet derives `private_seed` for (`credential_type`, `credential_issuer`)
+and adds the claim `org.siros.psc` = base64url, WITHOUT padding (RFC 7515 s2), of
+the 32-byte `SHA-256(private_seed)` to the payload of every proof JWT before
+signing. The engine does not compute the value. On each returned proof it
+verifies that the proof is a JWT whose payload holds `org.siros.psc` as an
+unpadded base64url string of exactly 32 bytes; otherwise the issuance fails with
+`SIGN_ERROR` and nothing is sent to the issuer. The value is never logged or
+placed in an error.
+
+If the issuer's credential endpoint answers HTTP 400 with an `error_description`
+beginning `org.siros.psc_conflict:` (it already holds a different commitment for
+the subject; nothing was issued), the engine sends a `flow_error` with code
+`PSC_CONFLICT`, step `requesting_credential`, and `error.message` set to the
+issuer's text (control characters removed, at most 512 bytes), and does not
+retry. The flow-error path is shared by every transport (WebSocket and WMP).
+
 #### Client Authentication (Signing)
 
 Two further `sign_request` actions let the client authenticate the engine's
@@ -437,6 +598,7 @@ Server → Client:
   "params": {
     "audience": "https://as.example.com",      // present: WIA + fresh PoP wanted (aud)
     "issuer": "https://wallet.example.com/cb", // PoP iss = the flow's client_id
+    "attestation_challenge": "<server challenge for the attestation PoP, if any>",
     "htm": "POST",                             // present with htu: DPoP proof wanted
     "htu": "https://as.example.com/token",
     "dpop_nonce": "<server nonce, if any>",
@@ -473,7 +635,7 @@ replays both on the PAR and token requests:
 ```
 Server → Client:
 { "type": "sign_request", "action": "request_attestation",
-  "params": { "audience": "https://as.example.com", "issuer": "https://wallet.example.com/cb" } }
+  "params": { "audience": "https://as.example.com", "issuer": "https://wallet.example.com/cb", "attestation_challenge": "<server challenge, if any>" } }
 
 Client → Server:
 { "type": "sign_response", "client_attestation": "eyJ...", "client_attestation_pop": "eyJ..." }
@@ -491,6 +653,15 @@ legacy mode. The client stores it with the refresh token and sends the same
 field back on the renewal `flow_start`; with `dpop_key_id` the engine puts it
 in `params.key_id` of every `sign_client_auth` so the client signs with the
 original key.
+
+**Attestation challenge.** When an authorization server rejects a PAR or token
+request with `use_attestation_challenge`, the engine obtains a fresh challenge
+(from the `OAuth-Client-Attestation-Challenge` response header or the AS
+`challenge_endpoint`) and re-sends the request. `params.attestation_challenge`
+(in `sign_client_auth`, or `request_attestation` in legacy mode) then carries
+that challenge, and the client MUST include it as the `challenge` claim of the
+Client Attestation PoP JWT (draft-ietf-oauth-attestation-based-client-auth
+§5.1/§6).
 
 #### Credential Request
 
@@ -515,6 +686,7 @@ Server → Client:
   "flow_id": "<uuid>",
   "credentials": [
     {
+      "credential_configuration_id": "UniversityDegree_jwt_vc_json",
       "format": "jwt_vc_json",
       "credential": "eyJ...",
       "vct": "https://example.com/credentials/degree",
@@ -523,6 +695,182 @@ Server → Client:
   ]
 }
 ```
+
+Each `credentials[i]` carries its own `credential_configuration_id` — the
+pairing a renewal's `selected_credential_configuration_id` needs; a
+multi-configuration completion carries one entry per issued configuration,
+in the offer's order. Each entry also carries its own
+`credential_response_encrypted` flag and its own `credential_metadata`
+(the filtered display-only `display`/`claims` members of its response) —
+a multi-configuration flow may mix plain and encrypted answers, so the
+encryption state and display metadata are per-result, not per-flow (the
+flow-level members stay as the legacy single-configuration view).
+
+A configuration of the set that fails does NOT abort the others: the flow
+still completes with every issued credential, and the completion carries
+the per-configuration failure report:
+
+```
+Server → Client:
+{
+  "type": "flow_complete",
+  "flow_id": "<uuid>",
+  "credentials": [
+    {
+      "credential_configuration_id": "pid",
+      "format": "dc+sd-jwt",
+      "credential": "eyJ...",
+      "credential_response_encrypted": false,
+      "credential_metadata": { "display": [ ... ] }
+    }
+  ],
+  "failures": [
+    {
+      "credential_configuration_id": "mdl",
+      "error": "oid4vci: credential endpoint answered 500"
+    }
+  ]
+}
+```
+
+Zero successes is a failed flow with exactly ONE `flow_error` (the first
+failure's step and code) — never one error per configuration; a partial
+success emits no `flow_error` at all, so a client treating `flow_error` as
+terminal can always consume the issued remainder.
+
+Encrypted issuer response (engine-blind): when the issuer's Credential
+Response is encrypted to a key only the client holds, `flow_complete` carries
+no credential value and no `credential_metadata`:
+
+```
+{
+  "type": "flow_complete",
+  "credentials": [{"format": "mso_mdoc", "vct": "...", "type_metadata": { ... }}],
+  "credential_response_encrypted": true
+}
+```
+
+`credentials[i]` has `format`, `vct` and `type_metadata` but no `credential`
+(and no `notification_id`); the client pairs entry `i` with the `i`-th
+credential it decrypted itself (see "Credential response encryption" below), and
+a count mismatch is an error on the client. The response-level
+`credential_metadata` (OpenID4VCI 1.1, openid/OpenID4VCI#721), is never relayed by
+the engine: the client already holds it from its own decryption. An issuer that does not encrypt its response is
+visible to the engine, which relays its credentials as before (no
+`credential_response_encrypted`, `credential` present). For such a plain
+response `flow_complete` also carries a top-level `credential_metadata`
+containing ONLY the display-only members `display` and `claims` of the
+response-level `credential_metadata` (omitted when it has neither); every other
+member (extensions) is dropped by the engine and never relayed or logged. Clients
+ignore extension members arriving in `flow_complete`. An encrypted response never yields `credential_metadata`
+on `flow_complete`.
+
+#### Credential response encryption (engine-blind)
+
+The engine never holds a response-encryption key and never sees an encrypted
+response in clear. Every key lives in the client.
+
+1. **Negotiation.** From the issuer metadata (`credential_response_encryption`)
+   the engine picks an `alg`/`enc` pair exactly as before (prefer `ECDH-ES`
+   over `ECDH-ES+A256KW`, `+A192KW`, `+A128KW`, and `A256GCM` over `A128GCM`,
+   `A256CBC-HS512`, `A128CBC-HS256`; the gdc issuer needs `ECDH-ES+A256KW`).
+   It sends the pair in `generate_proof` (present only when the issuer offers
+   response encryption):
+
+   ```
+   { "type": "sign_request", "action": "generate_proof",
+     "params": { "audience": "...", "nonce": "...", "count": 1,
+       "proof_types_supported": { ... },
+       "credential_response_encryption": { "alg": "ECDH-ES", "enc": "A256GCM", "required": true } } }
+   ```
+
+   `required` is `true` when the issuer marks encryption as required. On this
+   branch the engine ALSO still sets it when the configuration advertises the
+   superseded `org.siros.secret_seed`, and then fails the issuance with
+   `CREDENTIAL_ERROR` before any request is sent if there is no usable issuer
+   encryption (and refuses a plain response carrying a seed). That handling is
+   removed by https://github.com/sirosfoundation/go-wallet-backend/pull/480; the
+   wallet clients now refuse the seed shapes. A configuration
+   without `proof_types_supported` still gets this request when encryption is
+   wanted: it is then for the key alone and the client returns no proofs.
+2. **Key.** The client generates a FRESH ephemeral P-256 key per `generate_proof`
+   request (so the `c_nonce` retry loop gets a new key each time), keeps the
+   private key in memory keyed by flow id, and returns the public JWK:
+
+   ```
+   { "type": "sign_response", "proofs": [ ... ],
+     "credential_response_encryption_jwk":
+       { "kty": "EC", "crv": "P-256", "x": "...", "y": "...", "use": "enc", "alg": "ECDH-ES" } }
+   ```
+
+   `kid` is optional. An absent or empty JWK means the client declines: with
+   `required: true` the engine fails the issuance (`SIGN_ERROR`), otherwise it
+   sends a plain request. A JWK that is present but unusable (not valid JSON, not
+   a public P-256 EC key, `use` other than `enc`, `alg` different from the
+   negotiated one) always fails the issuance closed. The engine forwards only the
+   key, with `use: "enc"` and the negotiated `alg`.
+3. **Request.** The engine puts the JWK in the Credential Request's
+   `credential_response_encryption` (`{enc, jwk}`); the negotiated `alg` is
+   included in the JWK. Request encryption to the issuer's key
+   (`credential_request_encryption`, OID4VCI 1.0 §10) is unchanged and stays
+   engine-side: the request holds only proofs, the configuration id and a public
+   JWK.
+4. **Relay.** The issuer answers with a compact JWE (`application/jwt` or
+   `application/jose`). The engine checks only that it has the shape of a compact
+   JWE (five base64url segments), then sends it unread:
+
+   ```
+   { "type": "sign_request", "action": "decrypt_credential_response",
+     "params": { "jwe": "<compact JWE>", "deferred": false } }
+   ```
+
+   `deferred` is always present. A body that is not a compact JWE (empty,
+   JSON, ...) is refused with no relay.
+5. **Answer.** The client decrypts with the flow's key, STORES the credentials and
+   the response-level `credential_metadata` locally, validates what it needs
+   from it (the superseded seed shapes `org.siros.secret_seed`,
+   `org.siros.holder_commitments`, `org.siros.psc` and `secret_members` are
+   refused; Credential Auxiliary Data, `auxiliary_data`, is the replacement,
+   implemented in the engine by
+   https://github.com/sirosfoundation/go-wallet-backend/pull/480) and answers
+   with control fields ONLY:
+
+   ```
+   { "type": "sign_response", "credential_count": 2 }                 // credentials issued
+   { "type": "sign_response", "transaction_id": "tx-1", "interval": 5 } // deferred
+   { "type": "sign_response", "error": "..." }                         // failure
+   ```
+
+   Exactly one of `transaction_id` and `credential_count` (1 to 256) must be
+   present; anything else fails the issuance. The `error` text is client-controlled
+   and is never logged or relayed by the engine.
+6. **Deferred.** With a `transaction_id` the engine polls the deferred endpoint.
+   The Deferred Credential Request repeats `credential_response_encryption` with
+   the same JWK (OID4VCI 1.0 §9.1; without it the issuer answers in clear), and is
+   encrypted to the issuer's request key when the issuer requires request
+   encryption or the request asks for an encrypted response. Each encrypted answer
+   goes through step 4 with `"deferred": true`; an answer that again reports a
+   `transaction_id` keeps the polling going. (Before this change the engine did
+   not decrypt deferred answers at all.)
+7. **Notification.** The client supplies `notification_id` (from the decrypted
+   body) in `credential_notification`. For an encrypted response the engine
+   registers its notification context with an empty id, which matches any id the
+   client sends (the engine never sees the real one; the client sends it to the
+   issuer's own endpoint through the engine, which adds the issuer access token).
+   The context is registered before the first JWE is relayed, so a
+   `credential_failure` still reaches the issuer when the client rejects what it
+   decrypted (for example auxiliary data that fails its checks).
+
+What the engine still sees: the proof JWTs (holder public key), DPoP traffic, the issuer metadata, timing and
+sizes, and `credential_count`/`transaction_id`/`interval`. It never sees a
+credential, auxiliary data or the response plaintext when the issuer encrypts. The same
+messages are carried by the WMP sign sub-flow (go-wallet-backend#163) once its translation copies the new fields.
+
+Engine-side handling of the superseded `org.siros.secret_seed` and
+`org.siros.holder_commitments` advertisements (dropping malformed ones when
+decoding issuer metadata, sanitising them in the resolve endpoint) predates this
+change and is replaced by Credential Auxiliary Data in
+https://github.com/sirosfoundation/go-wallet-backend/pull/480.
 
 Deferred issuance:
 
@@ -538,17 +886,9 @@ Server → Client:
 }
 ```
 
-Later, server polls and pushes result:
-
-```
-Server → Client:
-{
-  "type": "push",
-  "push_type": "credential_ready",
-  "flow_id": "<uuid>",
-  "credentials": [ ... ]
-}
-```
+The engine then polls the deferred endpoint and completes with `flow_complete`
+as above (for an encrypted issuer, through `decrypt_credential_response` with
+`"deferred": true`, see "Credential response encryption").
 
 #### Flow Errors
 
@@ -568,6 +908,45 @@ Server → Client:
   }
 }
 ```
+
+#### Unknown Flows
+
+Any client message that references a `flow_id` the session does not know -
+`flow_action` (including `decline`), and `sign_response` / `match_response`
+that carry a `flow_id` naming no flow on this session and do not answer a
+request the session still has outstanding - is answered with exactly one `flow_error`, never
+silently dropped:
+
+```
+Server → Client:
+{
+  "type": "flow_error",
+  "flow_id": "<the flow_id the client sent>",
+  "error": { "code": "UNKNOWN_FLOW", "message": "Flow not found or already completed" }
+}
+```
+
+Clients MUST treat this as "the flow is dead" and leave any waiting UI state.
+Typical cause: the WebSocket dropped (e.g. network or proxy stall) while a
+flow was waiting for user input. Flows are bound to the session that started
+them and are cancelled when that session closes; they are not resumed on a
+new session, and the engine does not push anything on reconnect. The first
+message the client sends for such a flow on the new session is what reveals
+it, via this error.
+
+Properties: the lookup is scoped to the current session, so a flow owned by
+another session or user produces the identical reply as a flow that never
+existed (no probing). Replies are rate-limited per session (burst 10, then
+about 2/s); beyond that, messages for unknown flows are dropped without a
+reply. A late `sign_response` / `match_response` (its request already timed out or was
+cancelled) naming a flow that is still live is dropped silently: UNKNOWN_FLOW
+is terminal and the flow is not dead. A `sign_response` answering an outstanding `sign_request` is always delivered,
+even if the requesting flow has completed (client-held DPoP signing after
+issuance relies on this). A `sign_response` without a `flow_id` is correlated
+by `message_id` only. A `match_response` MUST carry both the `flow_id` and the
+`message_id` of its `match_request`; without them it is ignored and the engine
+times the request out. `credential_notification` keeps its own
+`notification_ack` (`rejected`) semantics.
 
 ### OpenID4VP Credential Presentation
 
@@ -721,6 +1100,153 @@ Client → Server:
 **Note**: The `match_request`/`match_response` pattern uses `message_id` for
 correlation (same as `sign_request`/`sign_response`), with a 30-second timeout.
 
+#### Verifier trust result (`verifier_trust_evaluated`)
+
+When the engine evaluates verifier trust itself (a verifier PDP is configured)
+it sends a `flow_progress` whose payload has `verifier_trust_evaluated: true`,
+for a fresh evaluation and identically when the verdict is served from the
+engine's trust cache:
+
+```
+{
+  "type": "flow_progress",
+  "flow_id": "<uuid>",
+  "step": "trust_evaluated",
+  "payload": {
+    "verifier_trust_evaluated": true,
+    "verifier": "x509_san_dns:verifier.example.com",
+    "trusted": true,
+    "framework": "authzen",
+    "reason": "trust evaluation successful",
+    "context": {
+      "verifier_ids": [
+        { "verifier_id_type": "semantic",     "verifier_id": "semantic_id:VATSE-556000000101", "basis": "x5c-chain" },
+        { "verifier_id_type": "x509_san_dns", "verifier_id": "verifier.example.com",           "basis": "client-id-binding" }
+      ]
+    }
+  }
+}
+```
+
+`context` contains only `verifier_ids` from the PDP response; every other
+member of the PDP context (such as `reason` and `trust_metadata`, which are
+admin-visible) is never forwarded, and unknown members of each entry are
+dropped. Each entry is `{verifier_id_type, verifier_id, basis?}`. `context` is
+omitted when there are no `verifier_ids`. `verifier_ids` is
+present only when the PDP policy enables it and the identifier was verified;
+`verifier_id_type` is an opaque string, `verifier_id` is in the canonical form
+the PDP defines for that type (`semantic_id:<value>`, the lower-case A-label
+DNS name for `x509_san_dns`, the SAN URI byte for byte for `x509_san_uri`, the
+full DID, or the OpenID Federation entity id), and `basis` says how it was
+verified. A wallet that needs a stable verifier identifier (for example as
+input to a pseudonym function) reads it from here. Clients MUST ignore members
+they do not understand. The progress is informational: an untrusted verdict is
+still followed by a flow error.
+
+#### Verifier `client_metadata` (optional)
+
+The `credential_selection` progress message, the `match_request` message and
+the `sign_request` params of a `sign_presentation` action may carry an optional
+`client_metadata` member: the verifier's `client_metadata` JSON object, passed
+verbatim from the validated request object (inline, or fetched from
+`client_metadata_uri`). It is omitted when the request had none. Clients MUST
+ignore members they do not understand.
+
+The engine bounds the object at 64 KB (`MaxClientMetadataBytes`) however it
+arrives, because it is relayed three times per flow. Larger inline metadata
+fails the request parse (`request_parse_error`); a larger
+`client_metadata_uri` response is treated like an unusable one: no metadata is
+used or relayed, and the flow continues without it. Nothing is truncated.
+
+The engine only models the members it uses itself, so this object is how a
+wallet sees the rest, notably `vp_formats_supported`. For a `zkp_req`
+presentation (typically `response_mode=direct_post.jwt`) that carries the
+`system_id_values` and `proof_system_values` the wallet chooses its circuit
+and proof system from:
+
+```
+{
+  "type": "match_request",
+  "flow_id": "<uuid>",
+  "message_id": "<uuid>",
+  "dcql_query": { "credentials": [ { "id": "zkp", "format": "zkp_req", "_req": [ ... ] } ] },
+  "client_metadata": {
+    "jwks": { "keys": [ ... ] },
+    "vp_formats_supported": {
+      "zkp_req": {
+        "system_id_values": ["longfellow-libzk-v1"],
+        "proof_system_values": ["vega"]
+      }
+    }
+  }
+}
+```
+
+For `direct_post.jwt`, `sign_request` params also carry `verifier_jwk_thumbprint`:
+the unpadded base64url SHA-256 JWK Thumbprint (RFC 7638) of the verifier's
+response-encryption key. If that key cannot be read the engine fails the flow
+with a `SIGN_ERROR` flow error instead of sending an empty value. It is kept
+for compatibility: a client computes the mdoc session-transcript thumbprint from
+`response_encryption.jwk` and must not rely on this value when the two disagree.
+
+#### Verified request inputs (`verified_request`)
+
+The `credential_selection` progress message, the `match_request` message and
+the `sign_request` params of a `sign_presentation` action carry the same
+optional `verified_request` object: the OpenID4VP request as the engine
+validated it. It is built once per flow and emitted identically at all three
+points, so a wallet applies one policy over the whole flow and over every
+transport (including a redirect flow, not only the DC API). It carries no
+trust verdict; the wallet MUST still require `verifier.trusted`. The members
+are additive, and clients MUST ignore members they do not understand.
+
+| Member | Meaning |
+|--------|---------|
+| `client_id` | The request's own `client_id`, after the client_id match and scheme-prefix checks. Not the admin-configured VP audience that `verifier.client_id` carries. |
+| `client_id_scheme` | `x509_san_dns`, `x509_san_uri`, `x509_hash`, `did`/`decentralized_identifier`, `verifier_attestation`, `redirect_uri`. |
+| `response_mode` | `direct_post`, `direct_post.jwt`, `query`, `fragment`. A wallet refuses a `zkp_req` presentation over a non-encrypted mode; the engine does not do that itself. |
+| `response_uri` | The validated `response_uri` (the `redirect_uri` when the request has no `response_uri`). |
+| `signed` | `true` only when `signature_verification` is `"verified"`. A client that does not know the field reads it as not signed. |
+| `signature_verification` | `"verified"`, `"deferred"` or `"none"`. |
+| `client_metadata` | The verifier's `client_metadata`, verbatim, as below. |
+
+`signature_verification` states what the engine itself established: that the
+request object's signature verified against a key the scheme binds to
+`client_id`.
+
+| Scheme | `verified` when | Otherwise |
+|--------|-----------------|-----------|
+| `x509_san_dns`, `x509_san_uri`, `x509_hash` | the JWT signature verified against the header `x5c` | the flow fails |
+| `did`, `decentralized_identifier` | the signature verified against a key resolved for the DID (verifier PDP configured) | `deferred` with no verifier PDP: resolution and verification are left to the frontend |
+| `verifier_attestation` | the signature verified against the attestation's `cnf` key and the PDP is configured to validate the attestation | `deferred` with no verifier PDP: nothing has checked the attestation that binds `cnf` to `client_id` |
+| `redirect_uri` | never | `none`: a valid embedded key proves possession only |
+
+`deferred` MUST NOT be treated as verified. For the x509 schemes the SAN or
+hash binding to `client_id` is the PDP's check, which is why `verifier.trusted`
+stays mandatory.
+
+```
+"verified_request": {
+  "client_id": "x509_san_dns:verifier.example.com",
+  "client_id_scheme": "x509_san_dns",
+  "response_mode": "direct_post.jwt",
+  "response_uri": "https://verifier.example.com/response",
+  "signed": true,
+  "signature_verification": "verified",
+  "client_metadata": { "vp_formats_supported": { ... } }
+}
+```
+
+`"client_id": "did:web:verifier.example.com"` with no PDP gives
+`"signed": false, "signature_verification": "deferred"`; a `redirect_uri`
+request gives `"signed": false, "signature_verification": "none"`.
+
+The OID4VP handler does not send `match_request`: it hands the DCQL query to the
+client inside `credential_selection`, where the client matches and asks for
+consent in one step. `match_request` stays for flows that match first, and
+carries the same `verified_request` when sent. The top-level `client_metadata`
+member of all three messages is unchanged.
+
 #### User Consent
 
 Server prompts for user consent with the matched credentials:
@@ -808,6 +1334,63 @@ Client → Server:
 }
 ```
 
+#### Encrypted response (`direct_post.jwt`)
+
+For `response_mode=direct_post.jwt` the engine does not see the `vp_token`: the
+`sign_request` params additionally carry the recipient the client encrypts to,
+and the client answers with a finished JWE (see
+[engine-blind-encryption.md](engine-blind-encryption.md)).
+
+```
+Server → Client:
+{
+  "type": "sign_request",
+  "flow_id": "<uuid>",
+  "message_id": "<uuid>",
+  "action": "sign_presentation",
+  "params": {
+    "audience": "x509_san_dns:verifier.example.com",
+    "nonce": "verifier-nonce-123",
+    "credentials_to_include": [ { "credential_id": "local-cred-id-1", "credential_query_id": "q" } ],
+    "verified_request": { "client_id": "x509_san_dns:verifier.example.com", "response_mode": "direct_post.jwt", "response_uri": "https://verifier.example.com/response", "signed": true, "signature_verification": "verified" },
+    "response_encryption": {
+      "jwk": { "kty": "EC", "crv": "P-256", "x": "...", "y": "...", "kid": "verifier-enc-1", "use": "enc" },
+      "alg": "ECDH-ES",
+      "enc": "A128GCM"
+    },
+    "state": "state-1"
+  }
+}
+```
+
+```
+Client → Server:
+{
+  "type": "sign_response",
+  "flow_id": "<uuid>",
+  "message_id": "<uuid>",
+  "response_jwe": "<compact JWE>"
+}
+```
+
+The client builds the `vp_token` (for DCQL an object keyed by credential query
+id), the JARM claims (`iss` `https://self-issued.me/v2`, `aud` from
+`verified_request.client_id`, `iat`, `exp` = `iat` + 300, `vp_token`, `state`
+when present) and the compact JWE (`alg`/`enc` as requested, `kid` in the
+protected header; clients SHOULD NOT set `cty`, the plaintext is plain JSON
+claims, and the engine does not check it). The engine POSTs `response=<jwe>` to the
+validated `response_uri` and relays the verifier's `redirect_uri`. It refuses an
+empty, oversized, non-compact or mismatching `response_jwe`, and a
+`sign_response` that also carries `vp_token`, with a `SIGN_ERROR` flow error (no
+`details.redirect_uri`); the verifier is not contacted, because an error for
+`direct_post.jwt` would itself have to be a JARM JWT, which the engine does not
+build, so the verifier session ends by timeout. It never encrypts for the client.
+The key and algorithms are resolved by the engine (`client_metadata.jwks`
+`use=enc`, else the request JWT's `x5c`; `alg` from `client_metadata`, else the
+JWK, else the key type; `enc` defaults to `A128GCM`); when none can be resolved
+no `sign_request` is sent. Plain `direct_post`, `query` and `fragment` are
+unchanged: the client returns `vp_token`.
+
 #### Response Submission
 
 ```
@@ -863,7 +1446,7 @@ Server → Client:
 | `AUTH_FAILED` | Invalid or expired authentication token |
 | `FORBIDDEN` | Token's `tac` doesn't permit the requested action (e.g. `flow_start` for a protocol the token's `tac` doesn't cover) |
 | `INVALID_MESSAGE` | Malformed message |
-| `UNKNOWN_FLOW` | `flow_id` not recognized |
+| `UNKNOWN_FLOW` | `flow_id` not recognized on this session (see [Unknown Flows](#unknown-flows)) |
 | `FLOW_TIMEOUT` | Flow exceeded maximum duration |
 | `OFFER_PARSE_ERROR` | Could not parse credential offer |
 | `OFFER_FETCH_ERROR` | Could not fetch `credential_offer_uri` |
@@ -873,6 +1456,7 @@ Server → Client:
 | `AUTHORIZATION_FAILED` | OAuth authorization flow failed |
 | `TOKEN_ERROR` | Token endpoint returned error |
 | `CREDENTIAL_ERROR` | Credential endpoint returned error |
+| `PSC_CONFLICT` | Issuer already holds a different holder commitment (`org.siros.psc`) for this subject; message is the issuer's text |
 | `SIGN_TIMEOUT` | Client did not respond to sign request |
 | `SIGN_ERROR` | Client signature was invalid |
 | `PRESENTATION_ERROR` | VP creation or submission failed |
@@ -1204,19 +1788,19 @@ To support multiple protocols cleanly, the server implements a flow handler inte
 type FlowHandler interface {
     // Protocol returns the protocol identifier
     Protocol() string
-    
+
     // Start initializes a new flow from the start message
     Start(ctx context.Context, msg FlowStartMessage) (*FlowState, error)
-    
+
     // HandleAction processes a client action
     HandleAction(ctx context.Context, state *FlowState, action FlowActionMessage) error
-    
+
     // HandleSignResponse processes a signature from the client
     HandleSignResponse(ctx context.Context, state *FlowState, resp SignResponse) error
-    
+
     // Resume restores a flow from persisted state (for long-running flows)
     Resume(ctx context.Context, state *FlowState) error
-    
+
     // Cancel cleans up a flow
     Cancel(ctx context.Context, state *FlowState) error
 }
@@ -1278,11 +1862,22 @@ The server MUST implement strict controls on outbound requests:
 3. **Response validation**: All fetched content MUST validate against expected schemas:
    - Credential offers → OID4VCI CredentialOffer schema
    - Issuer metadata → OpenID4VCI Credential Issuer Metadata schema
-   - Authorization server metadata → RFC 8414 schema
+   - Authorization server metadata → RFC 8414 schema, and its `issuer` MUST equal the authorization server identifier exactly (see below)
 
 4. **Size limits**: Response bodies MUST NOT exceed 1MB (10MB for image embedding)
 
 5. **Timeouts**: Individual HTTP requests timeout after 10 seconds
+
+### Authorization Server Metadata Discovery
+
+The engine (`oid4vci` flow) and the AuthZEN proxy (`resource_type=oauth-authorization-server`) discover authorization server (AS) metadata the same way (`oidc.FetchAuthorizationServerMetadata`). The AS identifier is used as received (from `authorization_server`/`authorization_servers`, else the credential issuer identifier).
+
+1. **Ordered candidates**, each fetched with the same SSRF-guarded client and the same size/time limits:
+   1. RFC 8414 section 3.1: `/.well-known/oauth-authorization-server` inserted between host and path, a terminating `/` of the identifier removed (`https://h/t/` -> `https://h/.well-known/oauth-authorization-server/t`).
+   2. OpenID Connect Discovery section 4: `<issuer>/.well-known/openid-configuration` appended, a terminating `/` removed first (`https://h/t/` -> `https://h/t/.well-known/openid-configuration`).
+2. **Fallback only on HTTP 404.** Any other status (5xx, 401, 403, 410, ...), a network error or a timeout ends discovery after that one request.
+3. **Exact identity.** The document's `issuer` must equal the AS identifier as received, by simple string comparison (RFC 8414 section 3.3, OIDC Discovery section 4.3; no trailing-slash or case normalisation). Otherwise the document MUST NOT be used: the engine fails the flow, the proxy answers 502 without echoing the document or its issuer.
+4. **Endpoint guesses** (`<issuer>/token`, `<AS>/authorize`) are used only when discovery found no document at all (every candidate answered 404). They are never used after an identity mismatch, an invalid document, a 5xx or a network error. Where the token endpoint is already known from the credential issuer metadata, a failed or refused AS document is ignored (it is not used) and only the optional attestation `challenge_endpoint` discovery is lost.
 
 ### Rate Limiting
 
@@ -1381,15 +1976,15 @@ type FlowState struct {
     Protocol   string        // "oid4vci", "oid4vp", "vctm"
     Step       string
     StartedAt  time.Time
-    
+
     // OID4VCI state
     Offer      *CredentialOffer
     Metadata   *IssuerMetadata
     TokenResp  *TokenResponse
-    
+
     // OID4VP state
     Request    *AuthorizationRequest
-    
+
     // Pending sign request
     PendingSign *SignRequest
 }

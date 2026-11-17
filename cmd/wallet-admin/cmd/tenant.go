@@ -1,8 +1,11 @@
 package cmd
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -221,6 +224,8 @@ var (
 	oidcGateLoginName          string
 	oidcGateLoginScopes        string
 	oidcGateBindIdentity       bool
+	oidcGateTrustAdminClaim    bool
+	oidcGateRequiredClaims     string
 	oidcGateClear              bool
 )
 
@@ -242,6 +247,25 @@ Identity Binding:
   When --bind-identity is enabled, the enterprise identity (issuer + subject)
   is stored with the wallet user. On subsequent logins (if gated), the user
   must authenticate with the same enterprise identity.
+
+Admin Claim Trust:
+  --trust-admin-claim opts this tenant in to minting elevated (admin +
+  delegation) session permissions when a login_op ID token's
+  groups/roles/realm_roles claim contains "admin". OFF BY DEFAULT: the AS
+  does not control the IdP's claim semantics, so only enable this if you
+  trust the IdP to gate its own "admin" claim correctly.
+
+Required Claims:
+  --required-claims restricts the gate to tokens whose claims match. Give
+  either a JSON object or comma-separated key=value pairs:
+    --required-claims '{"department":"Engineering","groups":["admin"]}'
+    --required-claims email_verified=true,department=Engineering
+  key=value accepts only true/false (bool) or string values; use JSON for
+  numbers, arrays and objects. A string value also matches when it is an
+  element of an array claim (e.g. groups=admin matches ["admin","user"]),
+  and an array value matches when every element is present in the token's
+  array (order and extra elements ignored). Use --required-claims '{}' to
+  remove all required claims; omitting the flag leaves them unchanged.
 
 Examples:
   # Enable registration gate with Keycloak
@@ -271,11 +295,12 @@ Examples:
 		if oidcGateClear {
 			reqBody := map[string]interface{}{
 				"oidc_gate": map[string]interface{}{
-					"mode":            "none",
-					"registration_op": nil,
-					"login_op":        nil,
-					"bind_identity":   false,
-					"required_claims": nil,
+					"mode":              "none",
+					"registration_op":   nil,
+					"login_op":          nil,
+					"bind_identity":     false,
+					"trust_admin_claim": false,
+					"required_claims":   nil,
 				},
 			}
 
@@ -296,8 +321,17 @@ Examples:
 
 		// Build OIDC gate config
 		oidcGate := map[string]interface{}{
-			"mode":          oidcGateMode,
-			"bind_identity": oidcGateBindIdentity,
+			"mode":              oidcGateMode,
+			"bind_identity":     oidcGateBindIdentity,
+			"trust_admin_claim": oidcGateTrustAdminClaim,
+		}
+
+		if cmd.Flags().Changed("required-claims") {
+			claims, err := parseRequiredClaims(oidcGateRequiredClaims)
+			if err != nil {
+				return err
+			}
+			oidcGate["required_claims"] = claims
 		}
 
 		// Registration provider config
@@ -360,6 +394,101 @@ Examples:
 	},
 }
 
+// parseRequiredClaims parses the --required-claims flag value: either a JSON
+// object or comma-separated key=value pairs (values "true"/"false" become
+// booleans, everything else is a string). Anything it cannot parse
+// unambiguously is an error, so a typo can never silently weaken the gate.
+func parseRequiredClaims(raw string) (map[string]interface{}, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, fmt.Errorf("--required-claims must not be empty (use '{}' to remove all required claims)")
+	}
+
+	claims := map[string]interface{}{}
+	if strings.HasPrefix(raw, "{") {
+		// encoding/json keeps the last of two equal keys without complaint,
+		// so {"groups":["admin"],"groups":[]} would silently weaken the gate.
+		if err := rejectDuplicateJSONKeys([]byte(raw)); err != nil {
+			return nil, fmt.Errorf("invalid --required-claims JSON: %w", err)
+		}
+		if err := json.Unmarshal([]byte(raw), &claims); err != nil {
+			return nil, fmt.Errorf("invalid --required-claims JSON: %w", err)
+		}
+		return claims, nil
+	}
+
+	for _, pair := range strings.Split(raw, ",") {
+		key, value, ok := strings.Cut(pair, "=")
+		key = strings.TrimSpace(key)
+		value = strings.TrimSpace(value)
+		if !ok || key == "" || value == "" {
+			return nil, fmt.Errorf("invalid --required-claims entry %q: expected key=value", pair)
+		}
+		if _, dup := claims[key]; dup {
+			return nil, fmt.Errorf("duplicate --required-claims key %q", key)
+		}
+		switch value {
+		case "true":
+			claims[key] = true
+		case "false":
+			claims[key] = false
+		default:
+			claims[key] = value
+		}
+	}
+	return claims, nil
+}
+
+// rejectDuplicateJSONKeys returns an error if any object in data, at any
+// depth, repeats a key, or if data has trailing content after the first value.
+func rejectDuplicateJSONKeys(data []byte) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if err := checkJSONValue(dec); err != nil {
+		return err
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return fmt.Errorf("unexpected content after the JSON value")
+	}
+	return nil
+}
+
+func checkJSONValue(dec *json.Decoder) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := map[string]struct{}{}
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return err
+			}
+			key, _ := keyTok.(string)
+			if _, dup := seen[key]; dup {
+				return fmt.Errorf("duplicate key %q", key)
+			}
+			seen[key] = struct{}{}
+			if err := checkJSONValue(dec); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for dec.More() {
+			if err := checkJSONValue(dec); err != nil {
+				return err
+			}
+		}
+	}
+	_, err = dec.Token() // closing delimiter
+	return err
+}
+
 func init() {
 	rootCmd.AddCommand(tenantCmd)
 	tenantCmd.AddCommand(tenantListCmd)
@@ -392,5 +521,7 @@ func init() {
 	tenantOIDCGateCmd.Flags().StringVar(&oidcGateLoginName, "login-display-name", "", "Display name for login IdP (e.g., 'Enterprise SSO')")
 	tenantOIDCGateCmd.Flags().StringVar(&oidcGateLoginScopes, "login-scopes", "", "OIDC scopes for login (default: 'openid profile email')")
 	tenantOIDCGateCmd.Flags().BoolVar(&oidcGateBindIdentity, "bind-identity", false, "Bind enterprise identity to wallet user (verify on login)")
+	tenantOIDCGateCmd.Flags().BoolVar(&oidcGateTrustAdminClaim, "trust-admin-claim", false, "Mint elevated admin permissions from the login IdP's groups/roles claim (off by default)")
+	tenantOIDCGateCmd.Flags().StringVar(&oidcGateRequiredClaims, "required-claims", "", "Claims the ID token must carry: JSON object or key=value,key=value ('{}' removes all)")
 	tenantOIDCGateCmd.Flags().BoolVar(&oidcGateClear, "clear", false, "Clear OIDC gate configuration")
 }

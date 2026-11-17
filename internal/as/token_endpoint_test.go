@@ -9,6 +9,8 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -565,14 +567,32 @@ type fakeBlacklist struct {
 	revoked      map[string]bool
 	revokedUsers map[string]bool
 	added        map[string]time.Time
+	families     map[string]time.Time
+	familyErr    error
+	jtiErr       error // returned by IsBlacklisted
+	userErr      error // returned by IsUserRevoked
 }
 
-func (f *fakeBlacklist) IsBlacklisted(ctx context.Context, jti string) bool {
-	return f.revoked[jti]
+func (f *fakeBlacklist) RevokeFamily(ctx context.Context, sid string, expiry time.Time) error {
+	if f.familyErr != nil {
+		return f.familyErr
+	}
+	if f.families == nil {
+		f.families = make(map[string]time.Time)
+	}
+	if existing, ok := f.families[sid]; ok && existing.After(expiry) {
+		expiry = existing
+	}
+	f.families[sid] = expiry
+	return nil
 }
 
-func (f *fakeBlacklist) IsUserRevoked(ctx context.Context, userID string) bool {
-	return f.revokedUsers[userID]
+func (f *fakeBlacklist) IsBlacklisted(ctx context.Context, jti string) (bool, error) {
+	return f.revoked[jti], f.jtiErr
+}
+
+func (f *fakeBlacklist) IsUserRevoked(ctx context.Context, userID string) (bool, error) {
+	return f.revokedUsers[userID], f.userErr
 }
 
 func (f *fakeBlacklist) Add(ctx context.Context, jti string, expiry time.Time) error {
@@ -1078,6 +1098,219 @@ func TestTokenEndpoint_Anonymous_ExceedsSessionMaxTACDenied(t *testing.T) {
 	}
 }
 
+// A revocation lookup that fails must refuse the delegation (503), not mint a
+// token from a parent whose revocation status is unknown.
+func TestTokenEndpoint_Delegation_RevocationStoreErrorRefuses(t *testing.T) {
+	issuer := newTestTokenIssuer(t)
+	parentToken, err := issuer.Issue("user-1", "api", "tenant-1", TAC("rwlk"), "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	post := func(bl TokenBlacklistChecker) *httptest.ResponseRecorder {
+		router, _ := setupRouterWithIssuer(t, issuer, nil, bl)
+		body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r"})
+		req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+parentToken)
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+
+	if w := post(&fakeBlacklist{}); w.Code != http.StatusOK {
+		t.Fatalf("positive control: expected 200 with a working store, got %d: %s", w.Code, w.Body.String())
+	}
+	for name, bl := range map[string]*fakeBlacklist{
+		"jti lookup":  {jtiErr: errors.New("store down")},
+		"user lookup": {userErr: errors.New("store down")},
+	} {
+		if w := post(bl); w.Code != http.StatusServiceUnavailable {
+			t.Errorf("%s: expected 503 when revocation cannot be checked, got %d: %s", name, w.Code, w.Body.String())
+		}
+	}
+}
+
+// Account deletion revokes the user first and purges sessions after. If the
+// deletion is interrupted (or the revocation write's acknowledgement is lost)
+// the session survives, and its cookie must not mint tokens - identified or
+// anonymous - for a revoked owner, nor when revocation cannot be checked.
+func TestTokenEndpoint_SessionCookie_RevokedOwner(t *testing.T) {
+	issuer := newTestTokenIssuer(t)
+	post := func(bl TokenBlacklistChecker, anonymous bool) *httptest.ResponseRecorder {
+		router, store := setupRouterWithIssuer(t, issuer, nil, bl)
+		_ = store.Create(context.Background(), &Session{
+			JTI: "sess-del", UserID: "user-1", TenantID: "tenant-1", ACR: "urn:siros:acr:passkey",
+			MaxTAC: TAC("rwl"), CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+		})
+		body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: "r", Anonymous: anonymous})
+		req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-del"})
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+	for _, anonymous := range []bool{false, true} {
+		name := map[bool]string{false: "identified", true: "anonymous"}[anonymous]
+		t.Run(name, func(t *testing.T) {
+			if w := post(&fakeBlacklist{}, anonymous); w.Code != http.StatusOK {
+				t.Fatalf("positive control: expected 200, got %d: %s", w.Code, w.Body.String())
+			}
+			if w := post(&fakeBlacklist{revokedUsers: map[string]bool{"user-1": true}}, anonymous); w.Code != http.StatusUnauthorized {
+				t.Errorf("revoked owner: expected 401, got %d: %s", w.Code, w.Body.String())
+			}
+			if w := post(&fakeBlacklist{userErr: errors.New("store down")}, anonymous); w.Code != http.StatusServiceUnavailable {
+				t.Errorf("revocation lookup error: expected 503, got %d: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// An interrupted account deletion must stay completable after the previous
+// access token expired: the revoked owner's session may still obtain a token
+// that carries exactly the deletion permission (all DELETE /user/session
+// needs), and nothing broader.
+func TestTokenEndpoint_SessionCookie_RevokedOwnerMayObtainDeletionOnlyToken(t *testing.T) {
+	issuer := newTestTokenIssuer(t)
+	router, store := setupRouterWithIssuer(t, issuer, nil, &fakeBlacklist{revokedUsers: map[string]bool{"user-1": true}})
+	_ = store.Create(context.Background(), &Session{
+		JTI: "sess-del", UserID: "user-1", TenantID: "tenant-1", ACR: "urn:siros:acr:passkey",
+		MaxTAC: TAC("rwlid"), CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+	})
+	post := func(tac string) *httptest.ResponseRecorder {
+		body, _ := json.Marshal(TokenRequest{Audience: "api", TAC: tac})
+		req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-del"})
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w
+	}
+	if w := post("d"); w.Code != http.StatusOK {
+		t.Errorf("deletion-only token: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	for _, tac := range []string{"", "rd", "r", "rwlid"} {
+		if w := post(tac); w.Code != http.StatusUnauthorized {
+			t.Errorf("tac %q: expected 401 for a revoked owner, got %d: %s", tac, w.Code, w.Body.String())
+		}
+	}
+}
+
+// respondTokenError is the endpoint's whole knowledge of the error wire format, so it is
+// checked through a real gin context: a refusal renders its own status and message, and
+// anything else renders a generic 500 whose body cannot carry the underlying text. An unknown
+// error here is an engine fault (a store error reaching the wrong path), and its message may
+// name internal hosts or echo request content.
+func TestRespondTokenError(t *testing.T) {
+	const leaky = "mongo: connection refused to db-7.internal:27017"
+	for _, tc := range []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantError  string
+	}{
+		{
+			name:       "a refusal keeps its own status and message",
+			err:        errTACExceedsSession,
+			wantStatus: http.StatusForbidden,
+			wantError:  "requested permissions exceed session maximum",
+		},
+		{
+			name:       "an unauthorized refusal keeps its own status",
+			err:        errInvalidSession,
+			wantStatus: http.StatusUnauthorized,
+			wantError:  "invalid or expired session",
+		},
+		{
+			name:       "anything else is a generic 500",
+			err:        errors.New(leaky),
+			wantStatus: http.StatusInternalServerError,
+			wantError:  "token issuance failed",
+		},
+		{
+			name:       "including one wrapping an internal error",
+			err:        fmt.Errorf("issue token: %w", errors.New(leaky)),
+			wantStatus: http.StatusInternalServerError,
+			wantError:  "token issuance failed",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(w)
+
+			respondTokenError(c, tc.err)
+
+			if w.Code != tc.wantStatus {
+				t.Errorf("status = %d, want %d", w.Code, tc.wantStatus)
+			}
+			var body map[string]string
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("body %q: %v", w.Body.String(), err)
+			}
+			if body["error"] != tc.wantError {
+				t.Errorf("error = %q, want %q", body["error"], tc.wantError)
+			}
+			if len(body) != 1 {
+				t.Errorf("body has %d members, want only \"error\": %v", len(body), body)
+			}
+			for _, secret := range []string{"mongo", "internal:27017"} {
+				if strings.Contains(w.Body.String(), secret) {
+					t.Errorf("body %q leaks %q from the underlying error", w.Body.String(), secret)
+				}
+			}
+		})
+	}
+}
+
+// serveTokenRequest posts one /auth/token request under the session cookie
+// and answers the recorder - the pseudonymous tests' shared boilerplate.
+func serveTokenRequest(t *testing.T, router *gin.Engine, sessionID string, req TokenRequest) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(req)
+	httpReq := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
+	httpReq.Header.Set("Content-Type", "application/json")
+	if sessionID != "" {
+		httpReq.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: sessionID})
+	}
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httpReq)
+	return w
+}
+
+// parseMintedToken reads the recorder's token response and answers its
+// verified claims.
+func parseMintedToken(t *testing.T, issuer *TokenIssuer, w *httptest.ResponseRecorder) *AccessTokenClaims {
+	t.Helper()
+	var resp TokenResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := issuer.ParseAndVerify(resp.AccessToken, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return claims
+}
+
+// pseudonymousTestSession creates the session the pseudonymous tests mint
+// from - passkey ACR, tenant-1, the granted permissions the test needs.
+func pseudonymousTestSession(t *testing.T, store *MemorySessionStore, jti string, maxTAC TAC) {
+	t.Helper()
+	sess := &Session{
+		JTI:       jti,
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+		MaxTAC:    maxTAC,
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	if err := store.Create(context.Background(), sess); err != nil {
+		t.Fatalf("create %s: %v", jti, err)
+	}
+}
+
 // TestTokenEndpoint_PseudonymousMintsARotatingPseudonym: the engine-transport
 // kind (engine-parity.md §8 G3) - a real, authenticated session behind the
 // mint, a fresh random pseudonym in the token. Two mints from the same
@@ -1101,26 +1334,11 @@ func TestTokenEndpoint_PseudonymousMintsARotatingPseudonym(t *testing.T) {
 
 	mint := func() *AccessTokenClaims {
 		t.Helper()
-		body, _ := json.Marshal(TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
-		req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
-		req.Header.Set("Content-Type", "application/json")
-		req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-pseudonym"})
-
-		w := httptest.NewRecorder()
-		router.ServeHTTP(w, req)
-
+		w := serveTokenRequest(t, router, "sess-pseudonym", TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
 		if w.Code != http.StatusOK {
 			t.Fatalf("expected 200 for a session-backed pseudonymous mint, got %d: %s", w.Code, w.Body.String())
 		}
-		var resp TokenResponse
-		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
-			t.Fatal(err)
-		}
-		claims, err := issuer.ParseAndVerify(resp.AccessToken, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return claims
+		return parseMintedToken(t, issuer, w)
 	}
 
 	first := mint()
@@ -1155,12 +1373,7 @@ func TestTokenEndpoint_PseudonymousMintsARotatingPseudonym(t *testing.T) {
 func TestTokenEndpoint_Pseudonymous_NoSessionDenied(t *testing.T) {
 	router, _, _ := setupTokenEndpoint(t)
 
-	body, _ := json.Marshal(TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
-	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
+	w := serveTokenRequest(t, router, "", TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 without a session cookie, got %d: %s", w.Code, w.Body.String())
@@ -1173,24 +1386,9 @@ func TestTokenEndpoint_Pseudonymous_NoSessionDenied(t *testing.T) {
 func TestTokenEndpoint_Pseudonymous_WriteTACDenied(t *testing.T) {
 	router, store, _ := setupTokenEndpoint(t)
 
-	sess := &Session{
-		JTI:       "sess-pseudonym-write",
-		UserID:    "user-1",
-		TenantID:  "tenant-1",
-		MaxTAC:    TAC("rwil"),
-		ACR:       "urn:siros:acr:passkey",
-		CreatedAt: time.Now(),
-		ExpiresAt: time.Now().Add(time.Hour),
-	}
-	_ = store.Create(context.Background(), sess)
+	pseudonymousTestSession(t, store, "sess-pseudonym-write", TAC("rwil"))
 
-	body, _ := json.Marshal(TokenRequest{Audience: "wallet-engine", Pseudonymous: true, TAC: "rw"})
-	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-pseudonym-write"})
-
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
+	w := serveTokenRequest(t, router, "sess-pseudonym-write", TokenRequest{Audience: "wallet-engine", Pseudonymous: true, TAC: "rw"})
 
 	if w.Code != http.StatusForbidden {
 		t.Errorf("expected 403 for a write-scoped pseudonymous request, got %d: %s", w.Code, w.Body.String())
@@ -1203,26 +1401,27 @@ func TestTokenEndpoint_Pseudonymous_WriteTACDenied(t *testing.T) {
 func TestTokenEndpoint_Pseudonymous_ExceedsSessionMaxTACDenied(t *testing.T) {
 	router, store, _ := setupTokenEndpoint(t)
 
-	sess := &Session{
-		JTI:       "sess-pseudonym-read-only",
-		UserID:    "user-1",
-		TenantID:  "tenant-1",
-		MaxTAC:    TAC("r"),
-		ACR:       "urn:siros:acr:passkey",
-		CreatedAt: time.Now(),
-		ExpiresAt: time.Now().Add(time.Hour),
-	}
-	_ = store.Create(context.Background(), sess)
+	pseudonymousTestSession(t, store, "sess-pseudonym-read-only", TAC("r"))
 
-	body, _ := json.Marshal(TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
-	req := httptest.NewRequest(http.MethodPost, "/auth/token", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.AddCookie(&http.Cookie{Name: sessionCookieInsecure, Value: "sess-pseudonym-read-only"})
-
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
+	w := serveTokenRequest(t, router, "sess-pseudonym-read-only", TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
 
 	if w.Code != http.StatusForbidden {
 		t.Errorf("expected 403 for a read-only session minting the engine default (ri), got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestTokenEndpoint_Pseudonymous_RevokedOwnerDenied: the user-revocation
+// check runs before the policy with the deletion-only exemption OFF - a
+// revoked owner gets no engine token, the same rule as the anonymous kind's
+// (the fresh sub would otherwise name nobody the revocation lists).
+func TestTokenEndpoint_Pseudonymous_RevokedOwnerDenied(t *testing.T) {
+	router, store, _ := setupTokenEndpointWithDeps(t, nil, &fakeBlacklist{revokedUsers: map[string]bool{"user-1": true}})
+
+	pseudonymousTestSession(t, store, "sess-pseudonym-revoked", TAC("rwil"))
+
+	w := serveTokenRequest(t, router, "sess-pseudonym-revoked", TokenRequest{Audience: "wallet-engine", Pseudonymous: true})
+
+	if w.Code != http.StatusUnauthorized {
+		t.Errorf("expected 401 for a revoked owner, got %d: %s", w.Code, w.Body.String())
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -22,17 +23,14 @@ func NewWalletAdminCLI(t *testing.T) *WalletAdminCLI {
 
 	harness := NewAdminTestHarness(t)
 
-	// Build the CLI if not already built
-	binPath := "/tmp/wallet-admin-test"
+	// Build into a per-test directory so concurrent runs cannot collide;
+	// t.TempDir is removed automatically when the test ends.
+	binPath := filepath.Join(t.TempDir(), "wallet-admin-test")
 	cmd := exec.Command("go", "build", "-o", binPath, "./cmd/wallet-admin")
 	cmd.Dir = getProjectRoot()
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("Failed to build wallet-admin CLI: %v\n%s", err, out)
 	}
-
-	t.Cleanup(func() {
-		_ = os.Remove(binPath)
-	})
 
 	return &WalletAdminCLI{
 		T:       t,

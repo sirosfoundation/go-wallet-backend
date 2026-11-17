@@ -1209,13 +1209,14 @@ func TestResolve_UnknownResourceTypeURL_Rejected(t *testing.T) {
 // real issuer's pushed_authorization_request_endpoint - the wallet fell
 // back to an un-PARed authorize redirect even against a PAR-only AS.
 func TestResolve_URLSubject_OAuthAuthorizationServer_Success(t *testing.T) {
-	asServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var asServer *httptest.Server
+	asServer = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/.well-known/oauth-authorization-server" {
 			t.Errorf("unexpected well-known path: %s", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
-			"issuer":                                "https://as.example.com",
+			"issuer":                                asServer.URL,
 			"token_endpoint":                        "https://as.example.com/token",
 			"pushed_authorization_request_endpoint": "https://as.example.com/par",
 			"require_pushed_authorization_requests": true,
@@ -1266,6 +1267,96 @@ func TestResolve_URLSubject_OAuthAuthorizationServer_Success(t *testing.T) {
 	}
 	if resp.Context.TrustMetadata["pushed_authorization_request_endpoint"] != "https://as.example.com/par" {
 		t.Errorf("expected pushed_authorization_request_endpoint in trust_metadata, got: %v", resp.Context.TrustMetadata)
+	}
+}
+
+// resolveASMetadata drives resource_type=oauth-authorization-server against a
+// TLS test AS whose handler is given; it returns the HTTP recorder and the
+// request paths the AS saw.
+func resolveASMetadata(t *testing.T, subjectSuffix string, handle func(as *httptest.Server, w http.ResponseWriter, r *http.Request)) (*httptest.ResponseRecorder, []string, string) {
+	t.Helper()
+	var paths []string
+	var asServer *httptest.Server
+	asServer = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.EscapedPath())
+		handle(asServer, w, r)
+	}))
+	t.Cleanup(asServer.Close)
+
+	cfg := &config.AuthZENProxyConfig{Enabled: true, Timeout: 30, AllowResolution: true}
+	resolver := &mockMetadataResolver{result: &issuermetadata.ResolveResult{Metadata: map[string]interface{}{}}}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, asServer.Client(), asServer.Client(), zap.NewNop())
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{
+		"subject_id":    asServer.URL + subjectSuffix,
+		"subject_type":  "url",
+		"resource_type": "oauth-authorization-server",
+	})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+	return w, paths, asServer.URL + subjectSuffix
+}
+
+func TestResolve_OAuthAuthorizationServer_Candidates(t *testing.T) {
+	const rfc = "/.well-known/oauth-authorization-server"
+	const oidcPath = "/.well-known/openid-configuration"
+	serveAt := func(want string, issuer func(base string) string) func(*httptest.Server, http.ResponseWriter, *http.Request) {
+		return func(as *httptest.Server, w http.ResponseWriter, r *http.Request) {
+			if r.URL.EscapedPath() != want {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"issuer": issuer(as.URL), "token_endpoint": "https://as.example.com/token"})
+		}
+	}
+	self := func(b string) string { return b }
+
+	t.Run("only openid-configuration", func(t *testing.T) {
+		w, paths, _ := resolveASMetadata(t, "", serveAt(oidcPath, self))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", w.Code, w.Body.String())
+		}
+		if strings.Join(paths, ",") != rfc+","+oidcPath {
+			t.Errorf("paths %q", paths)
+		}
+	})
+	t.Run("path identifier with terminating slash", func(t *testing.T) {
+		w, paths, _ := resolveASMetadata(t, "/tenant/1/", func(as *httptest.Server, w http.ResponseWriter, r *http.Request) {
+			serveAt(rfc+"/tenant/1", func(string) string { return as.URL + "/tenant/1/" })(as, w, r)
+		})
+		if w.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", w.Code, w.Body.String())
+		}
+		if strings.Join(paths, ",") != rfc+"/tenant/1" {
+			t.Errorf("paths %q", paths)
+		}
+	})
+	t.Run("5xx is a 502 with no fallback", func(t *testing.T) {
+		w, paths, _ := resolveASMetadata(t, "", func(as *httptest.Server, w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		})
+		if w.Code != http.StatusBadGateway || len(paths) != 1 {
+			t.Errorf("status %d paths %q", w.Code, paths)
+		}
+	})
+	for name, want := range map[string]string{"RFC 8414 form": rfc, "OIDC form": oidcPath} {
+		t.Run("issuer mismatch refused, "+name, func(t *testing.T) {
+			w, _, _ := resolveASMetadata(t, "", serveAt(want, func(string) string { return "https://evil.example.com" }))
+			if w.Code != http.StatusBadGateway {
+				t.Fatalf("status %d: %s", w.Code, w.Body.String())
+			}
+			if strings.Contains(w.Body.String(), "evil") || strings.Contains(w.Body.String(), "token_endpoint") {
+				t.Errorf("response leaks document or issuer: %s", w.Body.String())
+			}
+		})
 	}
 }
 
@@ -1850,6 +1941,62 @@ func TestResolve_URLSubject_LocalResolution(t *testing.T) {
 	}
 }
 
+// An application/jwt issuer's payload carries no jwks or signed_metadata, so the
+// verified signer chain the resolver reports is what the PDP is asked about.
+func TestResolve_URLSubject_SignerChainReachesThePDP(t *testing.T) {
+	var got gotrust.EvaluationRequest
+	pdpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(gotrust.EvaluationResponse{Decision: true})
+	}))
+	defer pdpServer.Close()
+
+	resolver := &mockMetadataResolver{
+		result: &issuermetadata.ResolveResult{
+			Metadata: map[string]interface{}{
+				"credential_issuer":   "https://issuer.example.com",
+				"credential_endpoint": "https://issuer.example.com/credential",
+			},
+			Signed: true,
+			SignerKeyMaterial: &issuermetadata.SignerKeyMaterial{
+				Type: "x5c",
+				X5C:  []string{"MIIleaf", "MIIca"},
+			},
+		},
+	}
+
+	cfg := &config.AuthZENProxyConfig{Enabled: true, PDPURL: pdpServer.URL, Timeout: 30, AllowResolution: true}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, http.DefaultClient, zap.NewNop())
+
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("tenant_id", "test-tenant")
+		c.Set("user_id", "test-user")
+		c.Next()
+	})
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{"subject_id": "https://issuer.example.com", "subject_type": "url"})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
+	}
+	if got.Resource.Type != "x5c" {
+		t.Errorf("expected resource.type='x5c', got %q", got.Resource.Type)
+	}
+	if len(got.Resource.Key) == 0 {
+		t.Error("expected the signer chain in resource.key")
+	}
+}
+
 func TestResolve_URLSubject_Untrusted(t *testing.T) {
 	// Unsigned metadata that is untrusted: should still return metadata with decision=false.
 	// Logos are inlined because metadata is unsigned (display-only, no trust claim).
@@ -1994,6 +2141,15 @@ func TestResolve_URLSubject_LogoInlining(t *testing.T) {
 								},
 							},
 						},
+						"credential_metadata": map[string]interface{}{
+							"org.siros.secret_seed": map[string]interface{}{"namespaces": []interface{}{"x"}},
+						},
+					},
+					"leaky": map[string]interface{}{
+						"format": "vc+sd-jwt",
+						"credential_metadata": map[string]interface{}{
+							"org.siros.secret_seed": map[string]interface{}{"ns": "00112233445566778899aabbccddeeff"},
+						},
 					},
 				},
 			},
@@ -2057,6 +2213,19 @@ func TestResolve_URLSubject_LogoInlining(t *testing.T) {
 	credLogoURI := credLogo["uri"].(string)
 	if !strings.HasPrefix(credLogoURI, "data:image/png;base64,") {
 		t.Errorf("expected inlined data: URI for credential logo, got: %s", credLogoURI)
+	}
+
+	// A valid advertisement (names only) is public and is served; a malformed
+	// one (hex values) makes the configuration "not offered".
+	cm, _ := pid["credential_metadata"].(map[string]interface{})
+	if cm == nil || cm["org.siros.secret_seed"] == nil {
+		t.Error("valid org.siros.secret_seed advertisement must be served to the wallet")
+	}
+	if _, present := ccs["leaky"]; present {
+		t.Error("configuration with a malformed secret seed member must not be offered")
+	}
+	if strings.Contains(w.Body.String(), "00112233445566778899aabbccddeeff") {
+		t.Error("seed value must never reach the wallet")
 	}
 }
 
@@ -2182,6 +2351,58 @@ func TestResolve_URLSubject_SignedMetadata_VerificationFailed_Error(t *testing.T
 
 	if w.Code != http.StatusBadGateway {
 		t.Errorf("expected status %d for unverifiable signed_metadata JWT, got %d: %s", http.StatusBadGateway, w.Code, w.Body.String())
+	}
+}
+
+func TestResolve_URLSubject_SignedMetadata_MalformedSeedConfigAndJWTNotServed(t *testing.T) {
+	// A legacy signed document keeps the original JWT in signed_metadata; its
+	// payload still carries a rejected configuration (with a seed value). When
+	// sanitisation removes the configuration the JWT must not be served either.
+	const seedHex = "00112233445566778899aabbccddeeff"
+	pdpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(gotrust.EvaluationResponse{Decision: true})
+	}))
+	defer pdpServer.Close()
+
+	cc := `{"leaky":{"format":"vc+sd-jwt","credential_metadata":{"org.siros.secret_seed":{"ns":"` + seedHex + `"}}}}`
+	payload := base64.RawURLEncoding.EncodeToString([]byte(`{"credential_issuer":"https://signed.example.com","credential_configurations_supported":` + cc + `}`))
+	// No embedded key in the header: key material falls through to inline jwks.
+	jwt := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"ES256"}`)) + "." + payload + ".sig"
+	var ccs map[string]interface{}
+	if err := json.Unmarshal([]byte(cc), &ccs); err != nil {
+		t.Fatal(err)
+	}
+
+	resolver := &mockMetadataResolver{result: &issuermetadata.ResolveResult{
+		Signed: true,
+		Metadata: map[string]interface{}{
+			"credential_issuer":                   "https://signed.example.com",
+			"jwks":                                map[string]interface{}{"keys": []interface{}{map[string]interface{}{"kty": "EC"}}},
+			"signed_metadata":                     jwt,
+			"credential_configurations_supported": ccs,
+		},
+	}}
+	cfg := &config.AuthZENProxyConfig{Enabled: true, PDPURL: pdpServer.URL, Timeout: 30, AllowResolution: true}
+	handler := NewAuthZENProxyHandler(cfg, &mockAuthorizer{allowAll: true}, nil, nil, resolver, http.DefaultClient, http.DefaultClient, zap.NewNop())
+	router := gin.New()
+	router.Use(func(c *gin.Context) { c.Set("tenant_id", "test-tenant"); c.Next() })
+	router.POST("/v1/resolve", handler.Resolve)
+
+	body, _ := json.Marshal(map[string]string{"subject_id": "https://signed.example.com", "subject_type": "url"})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/resolve", strings.NewReader(string(body)))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	out := w.Body.String()
+	for _, bad := range []string{seedHex, payload, "leaky", "signed_metadata"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("response must not contain %q", bad)
+		}
 	}
 }
 

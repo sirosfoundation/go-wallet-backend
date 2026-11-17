@@ -5,12 +5,16 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/kelseyhightower/envconfig"
 )
 
 // validBaseConfig returns a minimal valid Config for testing.
@@ -18,7 +22,43 @@ func validBaseConfig() *Config {
 	return &Config{
 		Server:  ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
+	}
+}
+
+func TestLoad_DisableOpportunisticRequestEncryption(t *testing.T) {
+	const env = "WALLET_FEATURES_DISABLE_OPPORTUNISTIC_REQUEST_ENCRYPTION"
+	t.Setenv("WALLET_JWT_SECRET", "test-secret-that-is-at-least-32-bytes-long")
+	for _, tc := range []struct {
+		name string
+		yaml string
+		env  string
+		want bool
+	}{
+		{name: "enabled by default"},
+		{name: "disabled by YAML", yaml: "features:\n  disable_opportunistic_request_encryption: true\n", want: true},
+		{name: "disabled by environment", env: "true", want: true},
+		{name: "environment overrides YAML", yaml: "features:\n  disable_opportunistic_request_encryption: true\n", env: "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv(env, tc.env)
+			if tc.env == "" {
+				if err := os.Unsetenv(env); err != nil {
+					t.Fatal(err)
+				}
+			}
+			path := filepath.Join(t.TempDir(), "config.yaml")
+			if err := os.WriteFile(path, []byte(tc.yaml), 0600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := cfg.Features.DisableOpportunisticRequestEncryption; got != tc.want {
+				t.Errorf("DisableOpportunisticRequestEncryption = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -31,7 +71,7 @@ func TestConfig_Validate(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -60,7 +100,7 @@ func TestConfig_Validate_InvalidPort(t *testing.T) {
 					RPOrigin: "http://localhost:8080",
 				},
 				Storage: StorageConfig{Type: "memory"},
-				JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+				JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 			}
 
 			err := cfg.Validate()
@@ -111,7 +151,7 @@ func TestConfig_Validate_MissingRPID(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -130,7 +170,7 @@ func TestConfig_Validate_MissingRPOrigin(t *testing.T) {
 			// RPOrigins also empty
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -149,7 +189,7 @@ func TestConfig_Validate_RPOriginsAlone(t *testing.T) {
 			RPOrigins: []string{"https://id.example.com", "android:apk-key-hash:abc123"},
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	if err := cfg.Validate(); err != nil {
@@ -231,7 +271,7 @@ func TestConfig_Validate_InvalidStorageType(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "invalid"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -252,7 +292,7 @@ func TestConfig_Validate_MongoDBWithoutURI(t *testing.T) {
 			Type:    "mongodb",
 			MongoDB: MongoDBConfig{URI: ""},
 		},
-		JWT: JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT: JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -288,7 +328,7 @@ func TestConfig_Validate_SQLiteStorage(t *testing.T) {
 			RPOrigin: "http://localhost:8080",
 		},
 		Storage: StorageConfig{Type: "sqlite"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -309,7 +349,7 @@ func TestConfig_Validate_MongoDBStorageWithURI(t *testing.T) {
 			Type:    "mongodb",
 			MongoDB: MongoDBConfig{URI: "mongodb://localhost:27017"},
 		},
-		JWT: JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT: JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -462,7 +502,6 @@ storage:
   type: memory
 jwt:
   secret: test-secret-that-is-at-least-32-bytes-long
-  expiry_hours: 48
 `
 	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
 		t.Fatalf("Failed to write config file: %v", err)
@@ -483,8 +522,8 @@ jwt:
 	if cfg.Storage.Type != "memory" {
 		t.Errorf("Expected storage type 'memory', got %q", cfg.Storage.Type)
 	}
-	if cfg.JWT.ExpiryHours != 48 {
-		t.Errorf("Expected JWT expiry hours 48, got %d", cfg.JWT.ExpiryHours)
+	if cfg.JWT.Secret != "test-secret-that-is-at-least-32-bytes-long" {
+		t.Errorf("Expected JWT secret from YAML, got %q", cfg.JWT.Secret)
 	}
 }
 func TestTrustConfig_GetPDPURL(t *testing.T) {
@@ -759,7 +798,7 @@ func TestConfig_Validate_TLSEnabled_RequiresCertAndKey(t *testing.T) {
 					},
 				},
 				Storage: StorageConfig{Type: "memory"},
-				JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+				JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 			}
 
 			err := cfg.Validate()
@@ -787,7 +826,7 @@ func TestConfig_Validate_TLSDisabled_NoRequirements(t *testing.T) {
 			},
 		},
 		Storage: StorageConfig{Type: "memory"},
-		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+		JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 	}
 
 	err := cfg.Validate()
@@ -806,7 +845,7 @@ func TestConfig_Validate_AdminTLS(t *testing.T) {
 				RPOrigin: "http://localhost:8080",
 			},
 			Storage: StorageConfig{Type: "memory"},
-			JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"},
+			JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
 		}
 	}
 
@@ -1328,6 +1367,75 @@ func TestCORSConfig_SetDefaults(t *testing.T) {
 		t.Error("AllowedHeaders should have default value")
 	}
 }
+
+func TestCORSConfig_SetDefaults_KeepsPrivateDataHeadersWhenOverridden(t *testing.T) {
+	cfg := CORSConfig{
+		AllowedHeaders: []string{"Authorization", "content-type", "x-private-data-if-match"},
+		ExposedHeaders: []string{"X-Custom"},
+	}
+	cfg.SetDefaults()
+
+	count := func(list []string, name string) int {
+		n := 0
+		for _, h := range list {
+			if strings.EqualFold(h, name) {
+				n++
+			}
+		}
+		return n
+	}
+
+	for _, h := range RequiredCORSAllowedHeaders {
+		if count(cfg.AllowedHeaders, h) != 1 {
+			t.Errorf("AllowedHeaders = %v: want exactly one %q", cfg.AllowedHeaders, h)
+		}
+	}
+	for _, h := range RequiredCORSExposedHeaders {
+		if count(cfg.ExposedHeaders, h) != 1 {
+			t.Errorf("ExposedHeaders = %v: want exactly one %q", cfg.ExposedHeaders, h)
+		}
+	}
+	if count(cfg.AllowedHeaders, "Authorization") != 1 || count(cfg.ExposedHeaders, "X-Custom") != 1 {
+		t.Errorf("custom headers must be preserved: allowed=%v exposed=%v", cfg.AllowedHeaders, cfg.ExposedHeaders)
+	}
+}
+
+func TestCORSConfig_SetDefaults_WildcardAllowedHeaders(t *testing.T) {
+	cfg := CORSConfig{AllowedHeaders: []string{"*"}}
+	cfg.SetDefaults()
+	for _, h := range RequiredCORSAllowedHeaders {
+		found := false
+		for _, g := range cfg.AllowedHeaders {
+			if strings.EqualFold(g, h) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("wildcard AllowedHeaders must still list %q explicitly, got %v", h, cfg.AllowedHeaders)
+		}
+	}
+	exp := CORSConfig{ExposedHeaders: []string{"*"}}
+	exp.SetDefaults()
+	if !reflect.DeepEqual(exp.ExposedHeaders, []string{"*", "X-Private-Data-ETag"}) {
+		t.Errorf("wildcard ExposedHeaders must still list X-Private-Data-ETag explicitly, got %v", exp.ExposedHeaders)
+	}
+}
+
+func TestCORSConfig_DefaultExposedHeadersIncludeRetryAfter(t *testing.T) {
+	cfg := CORSConfig{}
+	cfg.SetDefaults()
+	want := []string{"X-Private-Data-ETag", "Retry-After"}
+	if !reflect.DeepEqual(cfg.ExposedHeaders, want) {
+		t.Fatalf("default ExposedHeaders = %v, want %v", cfg.ExposedHeaders, want)
+	}
+
+	explicit := CORSConfig{ExposedHeaders: []string{"X-Only"}}
+	explicit.SetDefaults()
+	if !reflect.DeepEqual(explicit.ExposedHeaders, []string{"X-Only", "X-Private-Data-ETag"}) {
+		t.Fatalf("explicit list must be kept plus required headers, got %v", explicit.ExposedHeaders)
+	}
+}
+
 func TestASConfig_SetDefaults(t *testing.T) {
 	cfg := &ASConfig{}
 	cfg.SetDefaults()
@@ -1338,8 +1446,8 @@ func TestASConfig_SetDefaults(t *testing.T) {
 	if cfg.SessionTTL != 24*time.Hour {
 		t.Errorf("expected SessionTTL 24h, got %v", cfg.SessionTTL)
 	}
-	if cfg.DefaultMaxTAC != "rwl" {
-		t.Errorf("expected DefaultMaxTAC 'rwl', got %q", cfg.DefaultMaxTAC)
+	if cfg.DefaultMaxTAC != "rwlid" {
+		t.Errorf("expected DefaultMaxTAC 'rwlid', got %q", cfg.DefaultMaxTAC)
 	}
 }
 
@@ -1424,8 +1532,8 @@ func TestConfig_EnableForRole_DoesNotInheritFileKeyWhenWalletProviderUsesPKCS11(
 	if cfg.AS.SigningKeyPath != "" {
 		t.Errorf("expected SigningKeyPath to stay empty (not inherit the file fallback key), got %q", cfg.AS.SigningKeyPath)
 	}
-	if cfg.AS.SigningKeyPKCS11 != "" {
-		t.Errorf("expected SigningKeyPKCS11 to stay empty (AS PKCS11 signing isn't implemented), got %q", cfg.AS.SigningKeyPKCS11)
+	if cfg.AS.SigningKeyPKCS11 != nil {
+		t.Errorf("expected SigningKeyPKCS11 to stay empty (never inherited from the wallet provider), got %+v", cfg.AS.SigningKeyPKCS11)
 	}
 }
 
@@ -1451,7 +1559,7 @@ func TestConfig_EnableForRole_NoOpWhenAlreadyEnabled(t *testing.T) {
 
 func TestConfig_EnableForRole_PreservesExplicitSigningKeyPKCS11(t *testing.T) {
 	cfg := &Config{}
-	cfg.AS.SigningKeyPKCS11 = "pkcs11:token=as-key"
+	cfg.AS.SigningKeyPKCS11 = &PKCS11SigningConfig{ModulePath: "/m.so", KeyLabel: "as-key", PIN: "1"}
 	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
 
 	cfg.EnableForRole()
@@ -1459,8 +1567,8 @@ func TestConfig_EnableForRole_PreservesExplicitSigningKeyPKCS11(t *testing.T) {
 	if cfg.AS.SigningKeyPath != "" {
 		t.Errorf("expected SigningKeyPath to stay empty when SigningKeyPKCS11 is set, got %q", cfg.AS.SigningKeyPath)
 	}
-	if cfg.AS.SigningKeyPKCS11 != "pkcs11:token=as-key" {
-		t.Errorf("expected explicit SigningKeyPKCS11 to be preserved, got %q", cfg.AS.SigningKeyPKCS11)
+	if cfg.AS.SigningKeyPKCS11 == nil || cfg.AS.SigningKeyPKCS11.KeyLabel != "as-key" {
+		t.Errorf("expected explicit SigningKeyPKCS11 to be preserved, got %+v", cfg.AS.SigningKeyPKCS11)
 	}
 }
 
@@ -1602,7 +1710,7 @@ func TestConfig_Validate_AS_MutuallyExclusiveKeys(t *testing.T) {
 	cfg := validBaseConfig()
 	cfg.AS.Enabled = true
 	cfg.AS.SigningKeyPath = "/path/to/key"
-	cfg.AS.SigningKeyPKCS11 = "pkcs11:token=foo"
+	cfg.AS.SigningKeyPKCS11 = &PKCS11SigningConfig{ModulePath: "/m.so", KeyLabel: "k", PIN: "1"}
 	cfg.AS.RulesDir = "/tmp/rules"
 	err := cfg.Validate()
 	if err == nil {
@@ -1613,17 +1721,39 @@ func TestConfig_Validate_AS_MutuallyExclusiveKeys(t *testing.T) {
 	}
 }
 
-func TestConfig_Validate_AS_PKCS11NotImplemented(t *testing.T) {
-	cfg := validBaseConfig()
-	cfg.AS.Enabled = true
-	cfg.AS.SigningKeyPKCS11 = "pkcs11:token=foo"
-	cfg.AS.RulesDir = "/tmp/rules"
-	err := cfg.Validate()
-	if err == nil {
-		t.Fatal("expected error for PKCS11 not implemented")
+func TestConfig_Validate_AS_PKCS11(t *testing.T) {
+	cases := []struct {
+		name    string
+		p       *PKCS11SigningConfig
+		wantErr string
+	}{
+		{"ok pin", &PKCS11SigningConfig{ModulePath: "/m.so", KeyLabel: "k", PIN: "1"}, ""},
+		{"ok pin_path", &PKCS11SigningConfig{ModulePath: "/m.so", KeyLabel: "k", PINPath: "/p"}, ""},
+		{"no module", &PKCS11SigningConfig{KeyLabel: "k", PIN: "1"}, "module_path is required"},
+		{"no label", &PKCS11SigningConfig{ModulePath: "/m.so", PIN: "1"}, "key_label is required"},
+		{"no pin", &PKCS11SigningConfig{ModulePath: "/m.so", KeyLabel: "k"}, "pin or pin_path is required"},
+		{"negative pool", &PKCS11SigningConfig{ModulePath: "/m.so", KeyLabel: "k", PIN: "1", PoolSize: -1}, "pool_size"},
 	}
-	if !strings.Contains(err.Error(), "not yet implemented") {
-		t.Errorf("unexpected error: %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validBaseConfig()
+			cfg.AS.Enabled = true
+			cfg.AS.SigningKeyPKCS11 = tc.p
+			cfg.AS.ExternalURL = "https://as.example"
+			cfg.AS.Issuer = "https://as.example"
+			cfg.AS.Audiences = []string{"wallet-backend"}
+			cfg.AS.RulesDir = "/tmp/rules"
+			err := cfg.Validate()
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected %q, got %v", tc.wantErr, err)
+			}
+		})
 	}
 }
 
@@ -1675,7 +1805,9 @@ func TestConfig_Validate_AS_IssuerFallsBackToJWT(t *testing.T) {
 	cfg := validBaseConfig()
 	cfg.AS.Enabled = true
 	cfg.AS.SigningKeyPath = "/path/to/key"
+	cfg.AS.ExternalURL = "https://example.com"
 	cfg.AS.RulesDir = "/tmp/rules"
+	cfg.AS.Audiences = []string{"wallet-backend"}
 	cfg.JWT.Issuer = "https://example.com"
 	err := cfg.Validate()
 	if err != nil {
@@ -1683,6 +1815,29 @@ func TestConfig_Validate_AS_IssuerFallsBackToJWT(t *testing.T) {
 	}
 	if cfg.AS.Issuer != "https://example.com" {
 		t.Errorf("expected AS issuer to fall back to JWT issuer, got %q", cfg.AS.Issuer)
+	}
+}
+
+// TestConfig_Validate_AS_MissingAudiences is a regression test for the
+// go-tokenauth v0.5.0 dependency bump: go-tokenauth's own Validator now
+// refuses to validate ANY token at all when its configured Audiences is
+// empty (previously "empty means accept any audience"). Config.Validate()
+// must fail fast at startup on the same condition, rather than let an
+// AS-enabled deployment with no audiences configured start up seemingly
+// fine and then silently reject every request once traffic arrives.
+func TestConfig_Validate_AS_MissingAudiences(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.Enabled = true
+	cfg.AS.SigningKeyPath = "/path/to/key"
+	cfg.AS.RulesDir = "/tmp/rules"
+	cfg.JWT.Issuer = "https://example.com"
+	// No AS.Audiences set.
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected error for missing as.audiences")
+	}
+	if !strings.Contains(err.Error(), "audiences is required") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 
@@ -1898,7 +2053,7 @@ func TestConfig_Validate_WIA_DefaultDoesNotRequireWalletProviderURI(t *testing.T
 	cfg := defaultConfig()
 	cfg.Server = ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"}
 	cfg.Storage = StorageConfig{Type: "memory"}
-	cfg.JWT = JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!"}
+	cfg.JWT = JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"}
 
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("unexpected error on zero-config default: %v", err)
@@ -2167,7 +2322,7 @@ func staticLookup(ips ...string) lookupFunc {
 // never to the hostname again.
 func TestGuardedDial_ConnectsToTheCheckedAddress(t *testing.T) {
 	var dialed []string
-	dial := guardedDial(staticLookup("93.184.216.34"), recordingDial(&dialed))
+	dial := guardedDial(staticLookup("93.184.216.34"), recordingDial(&dialed), nil)
 
 	if _, err := dial(context.Background(), "tcp", "verifier.example.com:443"); err != nil {
 		t.Fatalf("dial failed: %v", err)
@@ -2191,7 +2346,7 @@ func TestGuardedDial_SecondLookupCannotChangeTheTarget(t *testing.T) {
 	}
 
 	var dialed []string
-	dial := guardedDial(rebinding, recordingDial(&dialed))
+	dial := guardedDial(rebinding, recordingDial(&dialed), nil)
 
 	if _, err := dial(context.Background(), "tcp", "rebind.example.com:443"); err != nil {
 		t.Fatalf("dial failed: %v", err)
@@ -2215,6 +2370,19 @@ func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
 		{"rfc1918", "10.0.0.5", "private/loopback"},
 		{"rfc1918 172.16", "172.16.4.2", "private/loopback"},
 		{"link-local", "169.254.10.1", "private/loopback"},
+		{"cgnat", "100.64.0.1", "private/loopback"},
+		{"cgnat upper", "100.127.255.254", "private/loopback"},
+		{"alibaba metadata", "100.100.100.200", "cloud metadata"},
+		{"oracle metadata", "192.0.0.192", "cloud metadata"},
+		{"benchmarking", "198.19.1.1", "private/loopback"},
+		{"nat64 loopback", "64:ff9b::7f00:1", "private/loopback"},
+		{"nat64 rfc1918", "64:ff9b::a00:5", "private/loopback"},
+		{"nat64 link-local", "64:ff9b::a9fe:a00", "private/loopback"},
+		{"nat64 metadata", "64:ff9b::a9fe:a9fe", "cloud metadata"},
+		{"nat64 cgnat metadata", "64:ff9b::6464:64c8", "cloud metadata"},
+		{"nat64 unspecified", "64:ff9b::", "unspecified"},
+		{"nat64 local-use", "64:ff9b:1::1", "private/loopback"},
+		{"v4-mapped metadata", "::ffff:169.254.169.254", "cloud metadata"},
 		{"cloud metadata", "169.254.169.254", "cloud metadata"},
 		{"cloud metadata ipv6", "fd00::1", "cloud metadata"},
 		{"unspecified", "0.0.0.0", "unspecified"},
@@ -2224,7 +2392,7 @@ func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var dialed []string
-			dial := guardedDial(staticLookup(tt.ip), recordingDial(&dialed))
+			dial := guardedDial(staticLookup(tt.ip), recordingDial(&dialed), nil)
 
 			_, err := dial(context.Background(), "tcp", "internal.example.com:443")
 			if err == nil {
@@ -2240,11 +2408,24 @@ func TestGuardedDial_RefusesInternalAddresses(t *testing.T) {
 	}
 }
 
+// A well-known NAT64 address that embeds a public IPv4 address is a normal
+// destination on a DNS64 network and must not be refused.
+func TestGuardedDial_AllowsNAT64WithPublicEmbeddedAddress(t *testing.T) {
+	var dialed []string
+	dial := guardedDial(staticLookup("64:ff9b::5db8:d822"), recordingDial(&dialed), nil)
+	if _, err := dial(context.Background(), "tcp", "v4only.example.com:443"); err != nil {
+		t.Fatalf("dial refused: %v", err)
+	}
+	if len(dialed) != 1 {
+		t.Fatalf("dialed %v, want one connection", dialed)
+	}
+}
+
 // One internal address among public ones still refuses the whole dial: the
 // attacker chooses which answer the client happens to pick otherwise.
 func TestGuardedDial_RefusesWhenAnyAddressIsInternal(t *testing.T) {
 	var dialed []string
-	dial := guardedDial(staticLookup("93.184.216.34", "127.0.0.1"), recordingDial(&dialed))
+	dial := guardedDial(staticLookup("93.184.216.34", "127.0.0.1"), recordingDial(&dialed), nil)
 
 	if _, err := dial(context.Background(), "tcp", "mixed.example.com:443"); err == nil {
 		t.Fatal("expected the dial to be refused")
@@ -2256,7 +2437,7 @@ func TestGuardedDial_RefusesWhenAnyAddressIsInternal(t *testing.T) {
 
 func TestGuardedDial_HonoursTheRequestedAddressFamily(t *testing.T) {
 	var dialed []string
-	dial := guardedDial(staticLookup("2606:2800:220:1::1", "93.184.216.34"), recordingDial(&dialed))
+	dial := guardedDial(staticLookup("2606:2800:220:1::1", "93.184.216.34"), recordingDial(&dialed), nil)
 
 	if _, err := dial(context.Background(), "tcp4", "dual.example.com:443"); err != nil {
 		t.Fatalf("dial failed: %v", err)
@@ -2275,7 +2456,7 @@ func TestGuardedDial_TriesTheNextAddressWhenOneFails(t *testing.T) {
 		}
 		return stubConn{}, nil
 	}
-	dial := guardedDial(staticLookup("93.184.216.34", "93.184.216.35"), failFirst)
+	dial := guardedDial(staticLookup("93.184.216.34", "93.184.216.35"), failFirst, nil)
 
 	if _, err := dial(context.Background(), "tcp", "two.example.com:443"); err != nil {
 		t.Fatalf("dial failed: %v", err)
@@ -2298,6 +2479,7 @@ func TestGuardedDial_DoesNotWaitOutABlackHoledAddress(t *testing.T) {
 			}
 			return stubConn{}, nil
 		},
+		nil,
 	)
 
 	start := time.Now()
@@ -2535,5 +2717,975 @@ func TestHTTPClientConfig_NewHTTPClient_RefusesPlaintextRequest(t *testing.T) {
 		if !strings.Contains(err.Error(), key) {
 			t.Fatalf("error %q does not mention %s", err, key)
 		}
+	}
+}
+
+// TestTrustConfig_VerifierCacheTTL pins the one place that decides how long a
+// verifier trust decision may be reused, including the "off" case the engine
+// reads as "do not cache at all".
+func TestTrustConfig_VerifierCacheTTL(t *testing.T) {
+	tests := []struct {
+		name string
+		cfg  TrustConfig
+		want time.Duration
+	}{
+		{"unset means the default", TrustConfig{}, DefaultTrustCacheTTL},
+		{"explicit seconds win", TrustConfig{CacheTTLSeconds: 30}, 30 * time.Second},
+		{"disabled means zero", TrustConfig{CacheDisabled: true}, 0},
+		{"disabled beats an explicit ttl", TrustConfig{CacheDisabled: true, CacheTTLSeconds: 30}, 0},
+		// Negative never reaches here in a running process - Validate
+		// refuses it at startup - but the function still has to answer
+		// something, and the default is the safe answer for a value that
+		// should have been rejected.
+		{"a negative ttl reads as the default", TrustConfig{CacheTTLSeconds: -5}, DefaultTrustCacheTTL},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.cfg.VerifierCacheTTL(); got != tt.want {
+				t.Fatalf("VerifierCacheTTL() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// A negative trust.cache_ttl_seconds is refused at startup. Someone who
+// writes -1 means "off", and quietly giving them an hour of cached trust
+// decisions is the exact failure this setting exists to cure: an answer that
+// is not the one the operator asked for, with nothing saying so.
+func TestConfig_Validate_RejectsANegativeTrustCacheTTL(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Trust.CacheTTLSeconds = -1
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("a negative trust.cache_ttl_seconds must be refused")
+	}
+	if !strings.Contains(err.Error(), "cache_disabled") {
+		t.Errorf("the error should point at the way to turn the cache off, got %v", err)
+	}
+
+	// Zero and positive are both fine: zero means the default, and
+	// cache_disabled is the separate switch.
+	cfg.Trust.CacheTTLSeconds = 0
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("zero must be accepted (it selects the default): %v", err)
+	}
+	cfg.Trust.CacheTTLSeconds = 30
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("a positive ttl must be accepted: %v", err)
+	}
+}
+
+// A TTL past the int64 nanosecond range wraps to a negative time.Duration,
+// which the cache reads as "off" - so a number meant to cache for centuries
+// would disable caching instead. Same silent inversion as a negative value,
+// from the opposite end.
+func TestConfig_Validate_RejectsATrustCacheTTLThatOverflows(t *testing.T) {
+	cfg := validBaseConfig()
+
+	// The boundary itself still converts to a positive duration.
+	cfg.Trust.CacheTTLSeconds = MaxTrustCacheTTLSeconds
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("the largest representable ttl must be accepted: %v", err)
+	}
+	if got := cfg.Trust.VerifierCacheTTL(); got <= 0 {
+		t.Fatalf("the boundary must still be a positive duration, got %v", got)
+	}
+
+	// One past it does not.
+	cfg.Trust.CacheTTLSeconds = MaxTrustCacheTTLSeconds + 1
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("a ttl that overflows time.Duration must be refused")
+	}
+	if got := cfg.Trust.VerifierCacheTTL(); got > 0 {
+		t.Fatalf("the premise of this test is that it wraps negative, got %v", got)
+	}
+}
+
+func writeLoadConfig(t *testing.T, yamlText string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "c.yaml")
+	if err := os.WriteFile(p, []byte(yamlText), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+const minimalLoadConfig = "server:\n  rp_id: localhost\n  rp_origin: http://localhost:8080\njwt:\n  secret: test-secret-that-is-at-least-32-bytes!\n"
+
+// as.legacy.enabled=true (YAML or environment) must fail startup with a clear error.
+func TestLoad_LegacyEnabledTrueIsRefused(t *testing.T) {
+	t.Run("yaml", func(t *testing.T) {
+		_, err := Load(writeLoadConfig(t, minimalLoadConfig+"as:\n  legacy:\n    enabled: true\n"))
+		if err == nil || !strings.Contains(err.Error(), "as.legacy.enabled=true") || !strings.Contains(err.Error(), "removed") {
+			t.Fatalf("as.legacy.enabled=true must be refused with a clear error, got %v", err)
+		}
+	})
+	t.Run("environment", func(t *testing.T) {
+		t.Setenv("WALLET_AS_LEGACY_ENABLED", "true")
+		_, err := Load(writeLoadConfig(t, minimalLoadConfig))
+		if err == nil || !strings.Contains(err.Error(), "as.legacy.enabled=true") {
+			t.Fatalf("WALLET_AS_LEGACY_ENABLED=true must be refused, got %v", err)
+		}
+	})
+}
+
+// as.legacy.enabled=false and the other removed keys still load and are reported by DeprecatedSettings.
+func TestLoad_RemovedLegacySettingsLoadAndAreReported(t *testing.T) {
+	cfg, err := Load(writeLoadConfig(t, minimalLoadConfig+"  expiry_hours: 48\n  refresh_days: 7\nas:\n  legacy:\n    enabled: false\n    deprecation_header: true\n    sunset_date: \"2027-10-01T00:00:00Z\"\n"))
+	if err != nil {
+		t.Fatalf("a config with the removed keys set to non-enabling values must load: %v", err)
+	}
+	got := strings.Join(cfg.DeprecatedSettings(), ",")
+	for _, want := range []string{"as.legacy.enabled", "as.legacy.deprecation_header", "as.legacy.sunset_date", "jwt.expiry_hours", "jwt.refresh_days"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("DeprecatedSettings() = %q, missing %s", got, want)
+		}
+	}
+}
+
+// A configuration that does not mention any removed key loads clean.
+func TestLoad_NoRemovedSettingsByDefault(t *testing.T) {
+	cfg, err := Load(writeLoadConfig(t, minimalLoadConfig))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.DeprecatedSettings(); len(got) != 0 {
+		t.Errorf("DeprecatedSettings() on a default config = %v, want none", got)
+	}
+	if cfg.AS.Legacy.Enabled != nil {
+		t.Error("as.legacy.enabled must be unset by default")
+	}
+}
+
+func TestDefaultConfig_MetadataTypeIsPreferSigned(t *testing.T) {
+	if got := defaultConfig().HTTPClient.MetadataType; got != "prefer-signed" {
+		t.Errorf("default http_client.metadata_type = %q, want prefer-signed", got)
+	}
+}
+
+func TestConfig_Validate_MetadataType(t *testing.T) {
+	for _, v := range []string{"", "any", "prefer-signed", "require-signed", "prefer-unsigned", "require-unsigned"} {
+		cfg := validBaseConfig()
+		cfg.HTTPClient.MetadataType = v
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("metadata_type %q must be valid: %v", v, err)
+		}
+	}
+	for _, v := range []string{"signed", "Prefer-Signed", "true", "prefer_signed"} {
+		cfg := validBaseConfig()
+		cfg.HTTPClient.MetadataType = v
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "http_client.metadata_type") {
+			t.Errorf("metadata_type %q must be rejected with a clear error, got %v", v, err)
+		}
+	}
+}
+
+func TestLoad_MetadataTypeEnvOverride(t *testing.T) {
+	t.Setenv("WALLET_HTTP_CLIENT_METADATA_TYPE", "require-signed")
+	cfg := defaultConfig()
+	if err := envconfig.Process("WALLET", cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HTTPClient.MetadataType != "require-signed" {
+		t.Errorf("env override not applied: %q", cfg.HTTPClient.MetadataType)
+	}
+}
+
+func TestLoad_MetadataCacheDisabled(t *testing.T) {
+	if defaultConfig().HTTPClient.MetadataCacheDisabled {
+		t.Error("http_client.metadata_cache_disabled must default to false")
+	}
+	t.Setenv("WALLET_HTTP_CLIENT_METADATA_CACHE_DISABLED", "true")
+	cfg := defaultConfig()
+	if err := envconfig.Process("WALLET", cfg); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.HTTPClient.MetadataCacheDisabled {
+		t.Error("env override not applied")
+	}
+}
+
+func TestConfig_Validate_DCQLConsentCheck(t *testing.T) {
+	for _, m := range []DCQLConsentCheckMode{"", DCQLConsentCheckOff, DCQLConsentCheckWarn, DCQLConsentCheckEnforce} {
+		if err := m.validate(); err != nil {
+			t.Errorf("mode %q rejected: %v", m, err)
+		}
+	}
+	if DCQLConsentCheckMode("").Effective() != DCQLConsentCheckWarn {
+		t.Error("zero value must default to warn")
+	}
+	if defaultConfig().Presentation.DCQLConsentCheck != DCQLConsentCheckWarn {
+		t.Error("default config must be warn")
+	}
+	cfg := validBaseConfig()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("base config invalid: %v", err)
+	}
+	cfg.Presentation.DCQLConsentCheck = "enforced"
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "dcql_consent_check") {
+		t.Errorf("unknown mode must fail validation, got %v", err)
+	}
+}
+
+func TestDefaultConfig_OIDCGateRateLimit(t *testing.T) {
+	cfg := defaultConfig()
+	ip, tenant := cfg.Security.OIDCGateRateLimit.PerIP, cfg.Security.OIDCGateRateLimit.PerTenant
+	if !ip.Enabled || ip.MaxAttempts != 30 || ip.WindowSeconds != 60 || ip.LockoutSeconds != 60 {
+		t.Errorf("per-IP defaults wrong: %+v", ip)
+	}
+	if !tenant.Enabled || tenant.MaxAttempts != 300 || tenant.WindowSeconds != 60 || tenant.LockoutSeconds != 60 {
+		t.Errorf("per-tenant defaults wrong: %+v", tenant)
+	}
+}
+
+func TestConfig_Validate_TrustedProxies(t *testing.T) {
+	for _, ok := range [][]string{nil, {"none"}, {"10.0.0.0/8", "192.168.1.1", "fd00::/8"}} {
+		cfg := validBaseConfig()
+		cfg.Server.TrustedProxies = ok
+		if err := cfg.Validate(); err != nil {
+			t.Errorf("%v rejected: %v", ok, err)
+		}
+	}
+	for _, bad := range [][]string{{"10.0.0.0/33"}, {"lb.example.com"}, {"none", "10.0.0.1"}} {
+		cfg := validBaseConfig()
+		cfg.Server.TrustedProxies = bad
+		if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "server.trusted_proxies") {
+			t.Errorf("%v must be rejected, got %v", bad, err)
+		}
+	}
+}
+
+func TestConfig_Validate_Audit_IdentityEvents(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.Audit.IdentityEvents = []string{"bound"}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "requires audit.enabled") {
+		t.Errorf("identity_events without audit.enabled must be rejected, got %v", err)
+	}
+
+	cfg = validBaseConfig()
+	cfg.Audit = AuditConfig{Enabled: true, Issuer: "https://w", KeyPath: "/k", KeyID: "k", IdentityEvents: []string{"boudn"}}
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "unknown event") {
+		t.Errorf("a misspelt event name must be rejected, got %v", err)
+	}
+
+	cfg.Audit.IdentityEvents = []string{" Bound ", "verified", "mismatch", "gate_bypass"}
+	if err := cfg.Validate(); err != nil {
+		t.Errorf("valid names rejected: %v", err)
+	}
+	if !cfg.Audit.IdentityEventEnabled("bound") || cfg.Audit.IdentityEventEnabled("nope") {
+		t.Error("IdentityEventEnabled mismatch")
+	}
+	if (AuditConfig{}).IdentityEventEnabled("bound") {
+		t.Error("no event may be enabled by default")
+	}
+}
+
+// A trusted IdP host may resolve to a private address (#349); an unlisted
+// host, and the cloud metadata endpoints, may not.
+func TestGuardedDial_TrustedHostMayBePrivate(t *testing.T) {
+	trusted := map[string]struct{}{"idp.internal": {}}
+
+	tests := []struct {
+		name, host, ip string
+		wantErr        bool
+	}{
+		{"trusted host, private ip", "idp.internal", "10.1.2.3", false},
+		{"trusted host, case-insensitive", "IdP.Internal", "127.0.0.1", false},
+		{"unlisted host, private ip", "other.internal", "10.1.2.3", true},
+		{"trusted host, metadata ip", "idp.internal", "169.254.169.254", true},
+		{"trusted host, unspecified ip", "idp.internal", "0.0.0.0", true},
+		{"trusted host, cgnat ip", "idp.internal", "100.64.0.9", false},
+		{"trusted host, alibaba metadata ip", "idp.internal", "100.100.100.200", true},
+		{"trusted host, oracle metadata ip", "idp.internal", "192.0.0.192", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var dialed []string
+			dial := guardedDial(staticLookup(tt.ip), recordingDial(&dialed), trusted)
+			_, err := dial(context.Background(), "tcp", tt.host+":443")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestNewIdPHTTPClient_TrustedHostSet(t *testing.T) {
+	c := HTTPClientConfig{TrustedIdPHosts: []string{" IdP.Internal ", ""}}
+	set := c.trustedIdPHostSet()
+	if _, ok := set["idp.internal"]; !ok || len(set) != 1 {
+		t.Fatalf("unexpected set: %v", set)
+	}
+	if (HTTPClientConfig{}).trustedIdPHostSet() != nil {
+		t.Fatal("empty config must yield no trusted hosts")
+	}
+}
+
+// An https JWKS endpoint that redirects to plain http must be refused at the
+// redirect hop: the guard sits on the transport every hop passes through.
+func TestSSRFGuard_RefusesHTTPSToHTTPRedirect(t *testing.T) {
+	var hops []string
+	guard := ssrfGuard{httpsOnly: true, base: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		hops = append(hops, r.URL.String())
+		if r.URL.Scheme == "https" {
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header:     http.Header{"Location": []string{"http://evil.example/jwks.json"}},
+				Body:       http.NoBody,
+				Request:    r,
+			}, nil
+		}
+		return &http.Response{StatusCode: 200, Body: http.NoBody, Request: r}, nil
+	})}
+	client := &http.Client{Transport: guard}
+	_, err := client.Get("https://as.example/auth/.well-known/jwks.json")
+	if err == nil {
+		t.Fatal("expected the http redirect hop to be refused")
+	}
+	if len(hops) != 1 {
+		t.Errorf("the plaintext hop must never reach the base transport, hops=%v", hops)
+	}
+}
+
+// jwt.issuer is only the fallback for as.issuer; an enabled AS needs one of the two.
+func TestConfig_Validate_JWTIssuerIsOnlyASIssuerFallback(t *testing.T) {
+	t.Run("empty jwt.issuer is fine when the AS is off", func(t *testing.T) {
+		cfg := validBaseConfig()
+		cfg.JWT.Issuer = ""
+		if err := cfg.Validate(); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("AS on needs as.issuer or jwt.issuer", func(t *testing.T) {
+		cfg := validBaseConfig()
+		cfg.JWT.Issuer = ""
+		cfg.AS.Enabled = true
+		cfg.AS.Audiences = []string{"wallet-backend"}
+		cfg.AS.SigningKeyPath = filepath.Join(t.TempDir(), "as.key")
+		cfg.AS.RulesDir = t.TempDir()
+		err := cfg.Validate()
+		if err == nil || !strings.Contains(err.Error(), "issuer is required") {
+			t.Fatalf("expected an issuer error, got %v", err)
+		}
+		cfg.AS.Issuer = "https://as.example.org"
+		cfg.AS.ExternalURL = "https://as.example.org"
+		if err := cfg.Validate(); err != nil {
+			t.Fatalf("as.issuer alone must satisfy it: %v", err)
+		}
+	})
+}
+
+func TestConfig_Validate_ExternalURLRequiresExpectedIssuer(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS.ExternalURL = "https://as.example.com"
+	cfg.JWT.Issuer = ""
+	cfg.AS.Issuer = ""
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "as.external_url requires an expected issuer") {
+		t.Fatalf("expected issuer error, got %v", err)
+	}
+	cfg.AS.Issuer = "https://as.example.com"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("as.issuer must satisfy the check: %v", err)
+	}
+	cfg.AS.Issuer = ""
+	cfg.JWT.Issuer = "wallet-backend"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("jwt.issuer must satisfy the check: %v", err)
+	}
+}
+
+func TestASConfig_ExternalBaseURL(t *testing.T) {
+	cases := []struct {
+		name, in, wantPath string
+		wantErr            bool
+	}{
+		{"normal", "https://as.example", "", false},
+		{"trailing slash", "https://as.example/", "", false},
+		{"path prefix", "https://as.example/wallet", "/wallet", false},
+		{"path prefix trailing slash", "https://as.example/wallet/", "/wallet", false},
+		{"query", "https://as.example/?a=b", "", true},
+		{"fragment", "https://as.example/#frag", "", true},
+		{"empty query", "https://as.example/?", "", true},
+		{"empty fragment", "https://as.example/#", "", true},
+		{"not absolute", "as.example", "", true},
+		{"bad scheme", "ftp://as.example", "", true},
+		{"port only", "https://:443", "", true},
+		{"userinfo only", "https://user@", "", true},
+		{"userinfo and port only", "https://user@:443", "", true},
+		{"empty brackets", "https://[]", "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &ASConfig{ExternalURL: tc.in}
+			u, err := a.ExternalBaseURL()
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("expected error for %q", tc.in)
+				}
+				cfg := &Config{
+					Server:  ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
+					Storage: StorageConfig{Type: "memory"},
+					JWT:     JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "wallet-backend"},
+					AS:      ASConfig{ExternalURL: tc.in},
+				}
+				if cfg.Validate() == nil {
+					t.Fatalf("Validate accepted %q", tc.in)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if u.Path != tc.wantPath {
+				t.Fatalf("path = %q, want %q", u.Path, tc.wantPath)
+			}
+		})
+	}
+}
+
+// Errors from reading a secret file are logged at startup; they must name the
+// failure but not the file path (the caller wraps them with the config key).
+func TestReadSecretFile_ErrorsDoNotNameThePath(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "very-distinctive-secret-file-name")
+	_, err := readSecretFile(missing)
+	if err == nil || strings.Contains(err.Error(), "very-distinctive-secret-file-name") {
+		t.Fatalf("missing-file error must not include the path, got %v", err)
+	}
+	empty := filepath.Join(dir, "very-distinctive-empty-file")
+	if werr := os.WriteFile(empty, []byte("  \n"), 0o600); werr != nil {
+		t.Fatal(werr)
+	}
+	_, err = readSecretFile(empty)
+	if err == nil || strings.Contains(err.Error(), "very-distinctive-empty-file") || !strings.Contains(err.Error(), "is empty") {
+		t.Fatalf("empty-file error must say so without the path, got %v", err)
+	}
+}
+
+// The role flag alone (--mode=auth / --mode=all: Load -> EnableForRole ->
+// Validate) must yield a valid configuration, including the audience list.
+func TestConfig_EnableForRole_DefaultsAudiencesAndValidates(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.JWT.Issuer = "wallet-backend"
+	cfg.WalletProvider.PrivateKeyPath = "/wp/key.pem"
+	cfg.Server.RPID = "wallet.example.com"
+	cfg.AS.ExternalURL = "https://wallet.example.com"
+
+	cfg.EnableForRole()
+	for _, a := range defaultASAudiences {
+		if !containsString(cfg.AS.Audiences, a) {
+			t.Fatalf("default audience %q missing from %v", a, cfg.AS.Audiences)
+		}
+	}
+	if containsString(cfg.AS.Audiences, "wallet.example.com") {
+		t.Errorf("the RP ID is not an audience any more (it was the legacy token audience): %v", cfg.AS.Audiences)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("role-defaulted config must validate: %v", err)
+	}
+
+	// Explicit list: untouched.
+	ex := validBaseConfig()
+	ex.AS.Audiences = []string{"custom"}
+	ex.EnableForRole()
+	if len(ex.AS.Audiences) != 1 || ex.AS.Audiences[0] != "custom" {
+		t.Errorf("explicit audiences must be preserved: %v", ex.AS.Audiences)
+	}
+}
+
+// chartShapedConfig mirrors what siros-id-stack's templates/04-wallet-backend.yaml
+// renders for backend.yaml: as.enabled true, NO as.audiences, no jwt.issuer,
+// and as.legacy.enabled=false. config.Load must keep accepting it (documented defaults apply before
+// Validate), otherwise chart-based deployments crash-loop on upgrade.
+const chartShapedConfig = `
+server:
+  port: 8080
+  engine_port: 8082
+  rp_name: Test Wallet
+  rp_id: wallet.example.org
+  rp_origins:
+    - https://wallet.example.org
+  base_url: https://backend.example.org
+as:
+  enabled: true
+  legacy:
+    enabled: false
+  signing_key_path: /as-cert/tls.key
+  rules_dir: /as-rules
+  default_max_tac: rwlid
+  external_url: https://backend.example.org
+  issuer: https://backend.example.org
+storage:
+  type: memory
+jwt:
+  secret: "test-secret-that-is-at-least-32-bytes!"
+`
+
+func TestLoad_ChartShapedConfig_AppliesASDefaults(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "backend.yaml")
+	if err := os.WriteFile(path, []byte(chartShapedConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("chart-shaped config must load: %v", err)
+	}
+	for _, a := range defaultASAudiences {
+		if !containsString(cfg.AS.Audiences, a) {
+			t.Errorf("default audience %q missing from %v", a, cfg.AS.Audiences)
+		}
+	}
+	if cfg.JWT.Issuer != "wallet-backend" {
+		t.Errorf("jwt.issuer = %q", cfg.JWT.Issuer)
+	}
+	if got := cfg.DeprecatedSettings(); len(got) != 1 || !strings.Contains(got[0], "as.legacy.enabled") {
+		t.Errorf("DeprecatedSettings() = %v, want only as.legacy.enabled", got)
+	}
+}
+
+func TestLoad_ASPKCS11PINFileNotReadAtLoad(t *testing.T) {
+	dir := t.TempDir()
+	missing := filepath.Join(dir, "absent-pin")
+	configPath := filepath.Join(dir, "config.yaml")
+	yml := "jwt:\n  secret: 0123456789abcdef0123456789abcdef\nas:\n  external_url: https://as.example.com\n  signing_key_pkcs11:\n    module_path: /m.so\n    key_label: k\n    pin_path: " + missing + "\n"
+	if err := os.WriteFile(configPath, []byte(yml), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load must not read the AS HSM PIN file: %v", err)
+	}
+	p := cfg.AS.SigningKeyPKCS11
+	if p == nil || p.PINPath != missing || p.PIN != "" {
+		t.Fatalf("PINPath must be kept and PIN left unresolved, got %+v", p)
+	}
+}
+
+func TestPKCS11SigningConfig_ResolvePIN(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pin")
+	if err := os.WriteFile(path, []byte("1234\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// File wins over inline PIN.
+	pin, err := (&PKCS11SigningConfig{PIN: "inline", PINPath: path}).ResolvePIN()
+	if err != nil || pin != "1234" {
+		t.Fatalf("got %q, %v", pin, err)
+	}
+	// Inline PIN when no path.
+	pin, err = (&PKCS11SigningConfig{PIN: "inline"}).ResolvePIN()
+	if err != nil || pin != "inline" {
+		t.Fatalf("got %q, %v", pin, err)
+	}
+	// Missing file: clear error that does not name the path.
+	missing := filepath.Join(dir, "secret-location-xyz")
+	_, err = (&PKCS11SigningConfig{PINPath: missing}).ResolvePIN()
+	if err == nil || !strings.Contains(err.Error(), "pin_path") || strings.Contains(err.Error(), "secret-location-xyz") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+// Load and EnableForRole must apply the same AS defaults.
+func TestApplyASSecurityDefaults_Parity(t *testing.T) {
+	mk := func() *Config {
+		c := validBaseConfig()
+		c.Server.RPID = "wallet.example.org"
+		c.AS = ASConfig{Enabled: true, SigningKeyPath: "/k", RulesDir: "/r", Issuer: "https://x", ExternalURL: "https://x"}
+		return c
+	}
+	a := mk()
+	a.applyASSecurityDefaults()
+	if err := a.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	b := mk()
+	b.EnableForRole()
+	if fmt.Sprint(a.AS.Audiences) != fmt.Sprint(b.AS.Audiences) {
+		t.Errorf("Load and EnableForRole defaults differ: %v vs %v", a.AS.Audiences, b.AS.Audiences)
+	}
+	// AS disabled: untouched.
+	d := validBaseConfig()
+	d.applyASSecurityDefaults()
+	if len(d.AS.Audiences) != 0 {
+		t.Errorf("AS disabled must not get audiences: %v", d.AS.Audiences)
+	}
+}
+
+func TestConfig_Validate_TokenBlacklistBackend(t *testing.T) {
+	tests := []struct {
+		name    string
+		backend string
+		storage string
+		wantErr string
+	}{
+		{"default with memory storage", "", "memory", ""},
+		{"default with mongodb", "", "mongodb", ""},
+		{"memory with mongodb", "memory", "mongodb", ""},
+		{"storage with mongodb", "storage", "mongodb", ""},
+		{"storage needs mongodb", "storage", "memory", "requires storage.type=mongodb"},
+		{"unknown value", "redis", "mongodb", "invalid security.token_blacklist.backend"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validBaseConfig()
+			cfg.Storage.Type = tt.storage
+			cfg.Storage.MongoDB.URI = "mongodb://localhost"
+			cfg.Security.TokenBlacklist.Backend = tt.backend
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("Validate() = %v, want error containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestDefaultConfig_StatusCheck(t *testing.T) {
+	sc := defaultConfig().StatusCheck
+	if !sc.Enabled || !sc.StatusListSignerFallback {
+		t.Errorf("enabled/fallback must default to true: %+v", sc)
+	}
+	if sc.MaxListsPerRequest != 20 {
+		t.Errorf("max_lists_per_request default = %d, want 20", sc.MaxListsPerRequest)
+	}
+	if sc.RequestTimeoutSeconds != DefaultStatusRequestTimeoutSeconds || sc.RequestTimeoutSeconds >= 15 {
+		t.Errorf("request_timeout_seconds default = %d, must be well under the 15 s write timeout", sc.RequestTimeoutSeconds)
+	}
+	if sc.MaxListBytes != 2<<20 {
+		t.Errorf("max_list_bytes default = %d, want 2 MiB", sc.MaxListBytes)
+	}
+	if sc.StatusListMinEntries != 0 {
+		t.Error("status_list_min_entries must default to 0 (the draft sets no minimum)")
+	}
+	if !sc.RateLimit.Enabled || sc.RateLimit.MaxAttempts <= 0 {
+		t.Errorf("rate limit must default on: %+v", sc.RateLimit)
+	}
+}
+
+func TestConfig_Validate_StatusCheck(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*StatusCheckConfig)
+		want   string // "" = valid
+	}{
+		{"zero value", func(*StatusCheckConfig) {}, ""},
+		{"negative min entries", func(c *StatusCheckConfig) { c.StatusListMinEntries = -1 }, "status_list_min_entries"},
+		{"min entries", func(c *StatusCheckConfig) { c.StatusListMinEntries = 131072 }, ""},
+		{"negative loads", func(c *StatusCheckConfig) { c.StatusListMaxConcurrentLoads = -1 }, "status_list_max_concurrent_loads"},
+		{"loads", func(c *StatusCheckConfig) { c.StatusListMaxConcurrentLoads = 4 }, ""},
+		{"negative cap", func(c *StatusCheckConfig) { c.MaxListsPerRequest = -1 }, "max_lists_per_request"},
+		{"negative timeout", func(c *StatusCheckConfig) { c.RequestTimeoutSeconds = -1 }, "request_timeout_seconds"},
+		{"timeout over write timeout", func(c *StatusCheckConfig) { c.RequestTimeoutSeconds = MaxStatusRequestTimeoutSeconds + 1 }, "request_timeout_seconds"},
+		{"max timeout", func(c *StatusCheckConfig) { c.RequestTimeoutSeconds = MaxStatusRequestTimeoutSeconds }, ""},
+		{"negative size", func(c *StatusCheckConfig) { c.MaxListBytes = -1 }, "max_list_bytes"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := validBaseConfig()
+			tc.mutate(&cfg.StatusCheck)
+			err := cfg.Validate()
+			switch {
+			case tc.want == "" && err != nil:
+				t.Fatalf("unexpected error: %v", err)
+			case tc.want != "" && (err == nil || !strings.Contains(err.Error(), "status_check."+tc.want)):
+				t.Fatalf("err = %v, want one naming status_check.%s", err, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_StatusCheckSection checks that yaml and env values override the defaults.
+func TestLoad_StatusCheckSection(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	yaml := `
+server:
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+status_check:
+  enabled: false
+  status_list_signer_fallback: false
+  status_list_min_entries: 7
+  status_list_max_concurrent_loads: 3
+  max_lists_per_request: 5
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WALLET_STATUS_CHECK_REQUEST_TIMEOUT_SECONDS", "6")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc := cfg.StatusCheck
+	if sc.Enabled || sc.StatusListSignerFallback || sc.StatusListMinEntries != 7 || sc.StatusListMaxConcurrentLoads != 3 ||
+		sc.MaxListsPerRequest != 5 || sc.RequestTimeoutSeconds != 6 {
+		t.Fatalf("status_check = %+v", sc)
+	}
+	// Defaults survive a partial section.
+	if sc.MaxListBytes != DefaultStatusMaxListBytes || !sc.RateLimit.Enabled {
+		t.Fatalf("defaults lost: %+v", sc)
+	}
+}
+
+// An operator-configured proxy on a private address must be dialable while
+// destinations stay guarded.
+func TestNewHTTPClient_PrivateProxyIsDialable(t *testing.T) {
+	var gotURL string
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotURL = r.URL.String()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer proxy.Close() // listens on 127.0.0.1
+
+	cfg := HTTPClientConfig{ProxyURL: proxy.URL, AllowHTTP: true}
+	resp, err := cfg.NewHTTPClient(5 * time.Second).Get("http://93.184.216.34/list")
+	if err != nil {
+		t.Fatalf("request through the private proxy failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if gotURL != "http://93.184.216.34/list" {
+		t.Fatalf("proxy saw %q", gotURL)
+	}
+
+	// The destination itself is still checked, even through the proxy.
+	if resp, err := cfg.NewHTTPClient(5 * time.Second).Get("http://10.1.2.3/list"); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("private destination reached through the proxy")
+	}
+
+	// And the proxy's address does not open up the rest of the network.
+	other := httptest.NewServer(http.NotFoundHandler())
+	defer other.Close()
+	noProxy := HTTPClientConfig{AllowHTTP: true}
+	if resp, err := noProxy.NewHTTPClient(5 * time.Second).Get(other.URL); err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("loopback destination reached directly")
+	}
+}
+
+// The ignored sunset_date must still load and be reported by DeprecatedSettings.
+func TestLoad_DeprecatedSunsetDateStillLoads(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	content := `
+server:
+  host: localhost
+  port: 8080
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+storage:
+  type: memory
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+as:
+  legacy:
+    sunset_date: "2027-10-01T00:00:00Z"
+`
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("a config that still sets as.legacy.sunset_date must load: %v", err)
+	}
+	if got := cfg.DeprecatedSettings(); len(got) != 1 || !strings.Contains(got[0], "as.legacy.sunset_date") {
+		t.Errorf("DeprecatedSettings() = %v, want as.legacy.sunset_date", got)
+	}
+	if got := (&Config{}).DeprecatedSettings(); len(got) != 0 {
+		t.Errorf("DeprecatedSettings() on a clean config = %v, want none", got)
+	}
+}
+
+// The PKCS#11 key can be configured entirely by environment variables.
+func TestLoad_AS_PKCS11_FromEnv(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.yaml")
+	configYAML := []byte(`
+server:
+  host: localhost
+  port: 8080
+  rp_id: localhost
+  rp_origin: http://localhost:8080
+storage:
+  type: memory
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+`)
+	if err := os.WriteFile(configPath, configYAML, 0o600); err != nil {
+		t.Fatalf("failed to write config file: %v", err)
+	}
+
+	t.Setenv("WALLET_AS_SIGNING_KEY_PKCS11_MODULE_PATH", "/opt/vendor/libvendor-pkcs11.so")
+	t.Setenv("WALLET_AS_SIGNING_KEY_PKCS11_SLOT_ID", "7")
+	t.Setenv("WALLET_AS_SIGNING_KEY_PKCS11_KEY_LABEL", "as-signing")
+	t.Setenv("WALLET_AS_SIGNING_KEY_PKCS11_PIN_PATH", "/run/secrets/hsm-pin")
+	t.Setenv("WALLET_AS_SIGNING_KEY_PKCS11_POOL_SIZE", "3")
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	p := cfg.AS.SigningKeyPKCS11
+	if p == nil {
+		t.Fatal("AS.SigningKeyPKCS11 stayed nil although the PKCS#11 env vars were set")
+	}
+	if p.ModulePath != "/opt/vendor/libvendor-pkcs11.so" || p.SlotID != 7 || p.KeyLabel != "as-signing" ||
+		p.PINPath != "/run/secrets/hsm-pin" || p.PoolSize != 3 {
+		t.Errorf("unexpected PKCS#11 config from env: %+v", p)
+	}
+}
+
+// An enabled AS fetches its own JWKS from as.external_url, so Validate must reject it without one
+// rather than letting startup fail later in the provider.
+func TestConfig_Validate_AS_RequiresExternalURL(t *testing.T) {
+	cfg := validBaseConfig()
+	cfg.AS = ASConfig{
+		Enabled: true, SigningKeyPath: "/k", RulesDir: "/r", Issuer: "https://x",
+		Audiences: []string{"wallet-backend"},
+	}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "external_url is required") {
+		t.Fatalf("expected an external_url error, got %v", err)
+	}
+	cfg.AS.ExternalURL = "https://x"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("with external_url set: %v", err)
+	}
+
+	off := validBaseConfig()
+	off.AS.Enabled = false
+	if err := off.Validate(); err != nil {
+		t.Fatalf("AS disabled must not need external_url: %v", err)
+	}
+}
+
+func TestAndroidKeyAttestationConfig_YAMLAndEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	yaml := `
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+wallet_provider:
+  attestation:
+    android_key_attestation:
+      trust_anchors_path: /etc/siros/android-roots.pem
+      allowed_app_digests: ["aa", "bb"]
+      allowed_packages: [org.siros.wallet]
+      status_list_url: https://example.test/status
+      status_list_default_ttl_seconds: 120
+`
+	if err := os.WriteFile(path, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_TRUST_ANCHORS_PEM", "PEMDATA")
+	t.Setenv("WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_ALLOWED_APP_DIGESTS", "cc,dd")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := cfg.WalletProvider.Attestation.AndroidKeyAttestation
+	if a.TrustAnchorsPath != "/etc/siros/android-roots.pem" || a.TrustAnchorsPEM != "PEMDATA" ||
+		len(a.AllowedAppDigests) != 2 || a.AllowedAppDigests[0] != "cc" || // the environment overrides the file
+		len(a.AllowedPackages) != 1 || a.StatusListURL != "https://example.test/status" || a.StatusListDefaultTTLSeconds != 120 {
+		t.Fatalf("android_key_attestation = %+v", a)
+	}
+}
+
+func TestAndroidKeyAttestationConfig_EnforcementKeysAndDefaults(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	base := `
+jwt:
+  secret: test-secret-that-is-at-least-32-bytes-long
+`
+	if err := os.WriteFile(path, []byte(base), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := cfg.WalletProvider.Attestation.AndroidKeyAttestation
+	if a.Rejecting() || a.Enforcement != "" || !a.VerifiedBootRequired() || !a.LockedBootloaderRequired() || a.MinPatchLevel != 0 {
+		t.Fatalf("defaults = %+v (ignore mode; boot requirements default on; no patch level)", a)
+	}
+
+	y := base + `
+wallet_provider:
+  attestation:
+    android_key_attestation:
+      enforcement: reject
+      trust_anchors_pem: PEM
+      allowed_app_digests: [aa]
+      require_verified_boot: false
+      min_patch_level: 202601
+`
+	if err := os.WriteFile(path, []byte(y), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	const p = "WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_"
+	t.Setenv(p+"REQUIRE_LOCKED_BOOTLOADER", "false")
+	t.Setenv(p+"MIN_PATCH_LEVEL", "202603")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a = cfg.WalletProvider.Attestation.AndroidKeyAttestation
+	if !a.Rejecting() || a.VerifiedBootRequired() || a.LockedBootloaderRequired() || a.MinPatchLevel != 202603 {
+		t.Fatalf("yaml+env = %+v", a)
+	}
+
+	t.Setenv(p+"ENFORCEMENT", "ignore")
+	t.Setenv(p+"REQUIRE_VERIFIED_BOOT", "true")
+	cfg, err = Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a = cfg.WalletProvider.Attestation.AndroidKeyAttestation
+	if a.Rejecting() || !a.VerifiedBootRequired() {
+		t.Fatalf("env override = %+v", a)
+	}
+}
+
+func TestAndroidKeyAttestationConfig_ValidateEnforcement(t *testing.T) {
+	ok := AndroidKeyAttestationConfig{Enforcement: "reject", TrustAnchorsPEM: "x", AllowedAppDigests: []string{"aa"}, MinPatchLevel: 202601}
+	if err := ok.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for name, mut := range map[string]func(*AndroidKeyAttestationConfig){
+		"unknown mode":       func(c *AndroidKeyAttestationConfig) { c.Enforcement = "enforce" },
+		"reject, no anchors": func(c *AndroidKeyAttestationConfig) { c.TrustAnchorsPEM = " " },
+		"reject, no digests": func(c *AndroidKeyAttestationConfig) { c.AllowedAppDigests = nil },
+		"bad month":          func(c *AndroidKeyAttestationConfig) { c.MinPatchLevel = 202613 },
+		"not yyyymm":         func(c *AndroidKeyAttestationConfig) { c.MinPatchLevel = 2026 },
+	} {
+		c := ok
+		mut(&c)
+		if c.Validate() == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	// Anchors from a file count; ignore mode never needs either.
+	c := ok
+	c.TrustAnchorsPEM, c.TrustAnchorsPath = "", "/etc/roots.pem"
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if err := (AndroidKeyAttestationConfig{Enforcement: "ignore"}).Validate(); err != nil {
+		t.Fatal(err)
+	}
+	// The whole-config Validate applies it.
+	full := validBaseConfig()
+	full.WalletProvider.Attestation.AndroidKeyAttestation = AndroidKeyAttestationConfig{Enforcement: "reject"}
+	if full.Validate() == nil {
+		t.Fatal("Config.Validate accepted reject with nothing pinned")
 	}
 }

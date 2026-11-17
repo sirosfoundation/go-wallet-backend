@@ -8,8 +8,17 @@ import (
 	"io"
 )
 
+// PKCS11Supported reports whether this binary can load PKCS#11 modules.
+const PKCS11Supported = false
+
+// PKCS11Hint tells an operator how to get PKCS#11 support.
+const PKCS11Hint = "this binary was built without PKCS#11 support (the default distroless image cannot use an HSM): " +
+	"run the PKCS#11 image ghcr.io/sirosfoundation/go-wallet-backend-pkcs11 (Dockerfile.pkcs11) " +
+	"or build with -tags pkcs11; see docs/new-as.md"
+
 // ErrPKCS11NotSupported is returned when the binary is built without pkcs11 tag.
-var ErrPKCS11NotSupported = errors.New("PKCS#11 support not compiled in (build with -tags pkcs11)")
+var ErrPKCS11NotSupported = errors.New("PKCS#11 support not compiled in (build with -tags pkcs11, or use the " +
+	"go-wallet-backend-pkcs11 image)")
 
 // PKCS11Config holds configuration for a PKCS#11 token.
 type PKCS11Config struct {

@@ -9,11 +9,14 @@ import (
 	"crypto/x509/pkix"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,9 +26,51 @@ import (
 
 func newTestResolver(t *testing.T) *Resolver {
 	t.Helper()
-	r, err := New(Config{
-		CacheTTL:  5 * time.Minute,
-		AllowHTTP: true,
+	r, err := New(Config{HTTPClient: testHTTPClient(),
+		CacheTTL:     5 * time.Minute,
+		AllowHTTP:    true,
+		MetadataType: MetadataTypeAny, // one request, no staging
+	})
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	return r
+}
+
+// newTestResolverPreferSigned returns a resolver with the default staged
+// prefer-signed policy.
+// signedFixtureID is the identifier baked into the signed fixtures; the
+// identity check is exact, so those tests resolve this identifier and a
+// transport sends the request to the httptest server.
+const signedFixtureID = "https://issuer.example.com"
+
+func fixtureClient(srv *httptest.Server) *http.Client {
+	target := strings.TrimPrefix(srv.URL, "http://")
+	return &http.Client{Timeout: 10 * time.Second, Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Host != "issuer.example.com" {
+			return http.DefaultTransport.RoundTrip(r)
+		}
+		r2 := r.Clone(r.Context())
+		r2.URL.Scheme, r2.URL.Host = "http", target
+		return http.DefaultTransport.RoundTrip(r2)
+	})}
+}
+
+func newFixtureResolver(t *testing.T, srv *httptest.Server, _ Config) *Resolver {
+	t.Helper()
+	r, err := New(Config{HTTPClient: fixtureClient(srv), CacheTTL: 5 * time.Minute, AllowHTTP: true, MetadataType: MetadataTypeAny})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func newTestResolverPreferSigned(t *testing.T) *Resolver {
+	t.Helper()
+	r, err := New(Config{HTTPClient: testHTTPClient(),
+		CacheTTL:     5 * time.Minute,
+		AllowHTTP:    true,
+		MetadataType: MetadataTypePreferSigned,
 	})
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
@@ -86,16 +131,16 @@ func inlineJWKS(t *testing.T, pub jose.JSONWebKey) map[string]interface{} {
 // TestResolve_NoSignedMetadata verifies that plain (unsigned) metadata is
 // returned as-is when signed_metadata is absent.
 func TestResolve_NoSignedMetadata(t *testing.T) {
-	meta := map[string]interface{}{
-		"credential_issuer": "https://issuer.example.com",
-	}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/.well-known/openid-credential-issuer" {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(meta) //nolint:errcheck
+		json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+			"credential_issuer": server.URL,
+		})
 	}))
 	defer server.Close()
 
@@ -104,8 +149,59 @@ func TestResolve_NoSignedMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resolve() error: %v", err)
 	}
-	if got["credential_issuer"] != "https://issuer.example.com" {
+	if got["credential_issuer"] != server.URL {
 		t.Errorf("credential_issuer: got %v", got["credential_issuer"])
+	}
+}
+
+// TestResolve_CredentialIssuerMismatch verifies that a plain-JSON metadata
+// document whose credential_issuer claim does not match the requested issuer
+// URL is rejected (M-5 fix: bind unsigned metadata to the requested issuer).
+func TestResolve_CredentialIssuerMismatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-credential-issuer" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+			"credential_issuer": "https://attacker.example.com",
+		})
+	}))
+	defer server.Close()
+
+	r := newTestResolver(t)
+	_, err := r.Resolve(context.Background(), server.URL)
+	if err == nil {
+		t.Fatal("expected error for credential_issuer mismatch, got nil")
+	}
+	if !strings.Contains(err.Error(), "does not match") {
+		t.Errorf("expected 'does not match' in error, got: %v", err)
+	}
+}
+
+// TestResolve_CredentialIssuerMissing verifies that a plain-JSON metadata
+// document with no credential_issuer claim at all is rejected.
+func TestResolve_CredentialIssuerMissing(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-credential-issuer" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+			"credential_endpoint": "https://issuer.example.com/credential",
+		})
+	}))
+	defer server.Close()
+
+	r := newTestResolver(t)
+	_, err := r.Resolve(context.Background(), server.URL)
+	if err == nil {
+		t.Fatal("expected error for missing credential_issuer claim, got nil")
+	}
+	if !strings.Contains(err.Error(), "credential_issuer") {
+		t.Errorf("expected 'credential_issuer' in error, got: %v", err)
 	}
 }
 
@@ -141,7 +237,7 @@ func TestResolve_SignedMetadata_InlineJWKS(t *testing.T) {
 	}))
 	defer server.Close()
 
-	got, err := newTestResolver(t).Resolve(context.Background(), server.URL)
+	got, err := newFixtureResolver(t, server, Config{}).Resolve(context.Background(), signedFixtureID)
 	if err != nil {
 		t.Fatalf("Resolve() error: %v", err)
 	}
@@ -199,7 +295,7 @@ func TestResolve_SignedMetadata_JWKSURI(t *testing.T) {
 	}))
 	defer server.Close()
 
-	got, err := newTestResolver(t).Resolve(context.Background(), server.URL)
+	got, err := newFixtureResolver(t, server, Config{}).Resolve(context.Background(), signedFixtureID)
 	if err != nil {
 		t.Fatalf("Resolve() error: %v", err)
 	}
@@ -302,7 +398,7 @@ func TestResolve_SignedMetadata_X5CFallback(t *testing.T) {
 	}))
 	defer server.Close()
 
-	got, err := newTestResolver(t).Resolve(context.Background(), server.URL)
+	got, err := newFixtureResolver(t, server, Config{}).Resolve(context.Background(), signedFixtureID)
 	if err != nil {
 		t.Fatalf("Resolve() error: %v", err)
 	}
@@ -375,7 +471,7 @@ func TestResolve_SignedMetadata_KIDSelection(t *testing.T) {
 	}))
 	defer server.Close()
 
-	got, err := newTestResolver(t).Resolve(context.Background(), server.URL)
+	got, err := newFixtureResolver(t, server, Config{}).Resolve(context.Background(), signedFixtureID)
 	if err != nil {
 		t.Fatalf("Resolve() error: %v", err)
 	}
@@ -389,10 +485,11 @@ func TestResolve_SignedMetadata_KIDSelection(t *testing.T) {
 
 func TestResolve_Cached(t *testing.T) {
 	calls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": "https://test.com"}) //nolint:errcheck
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL}) //nolint:errcheck
 	}))
 	defer server.Close()
 
@@ -409,22 +506,200 @@ func TestResolve_Cached(t *testing.T) {
 	}
 }
 
-func TestResolve_TrailingSlashStripped(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": "https://test.com"}) //nolint:errcheck
-	}))
-	defer server.Close()
+// candidateServer serves metadata per request path. status maps a path to an
+// HTTP status (default 200); docIssuer maps a path to the credential_issuer it
+// declares (default: the identifier given by want).
+type candidateServer struct {
+	*httptest.Server
+	paths  []string
+	status map[string]int
+	claim  map[string]string
+}
 
-	r := newTestResolver(t)
-	// URL with trailing slash should work the same
-	if _, err := r.Resolve(context.Background(), server.URL+"/"); err != nil {
-		t.Fatalf("Resolve() with trailing slash error: %v", err)
+func newCandidateServer(t *testing.T) *candidateServer {
+	t.Helper()
+	cs := &candidateServer{status: map[string]int{}, claim: map[string]string{}}
+	cs.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cs.paths = append(cs.paths, r.URL.EscapedPath())
+		if st, ok := cs.status[r.URL.EscapedPath()]; ok && st != 200 {
+			w.WriteHeader(st)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": cs.claim[r.URL.EscapedPath()]}) //nolint:errcheck
+	}))
+	t.Cleanup(cs.Close)
+	return cs
+}
+
+const wk = "/.well-known/openid-credential-issuer"
+
+// Issue 505 (OIDF conformance suite): the identifier keeps its trailing slash
+// in the first request (OpenID4VCI 1.0 section 12.2.2 literal), a 200 is used
+// and there is no second request.
+func TestResolve_Conformance505_LiteralFormFirstNoFallback(t *testing.T) {
+	cs := newCandidateServer(t)
+	id := cs.URL + "/test/a/siros-wallet-vci-test-tecca-1/"
+	cs.claim[wk+"/test/a/siros-wallet-vci-test-tecca-1/"] = id
+	if _, err := newTestResolver(t).Resolve(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(cs.paths, []string{wk + "/test/a/siros-wallet-vci-test-tecca-1/"}) {
+		t.Fatalf("requests = %v", cs.paths)
+	}
+}
+
+// 404 on the literal form falls back to the 1.1 draft form; its document is
+// checked exactly like any other.
+func TestResolve_404FallsBackToStrippedForm(t *testing.T) {
+	cs := newCandidateServer(t)
+	id := cs.URL + "/tenant/"
+	cs.status[wk+"/tenant/"] = 404
+	cs.claim[wk+"/tenant"] = id
+	if _, err := newTestResolver(t).Resolve(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(cs.paths, []string{wk + "/tenant/", wk + "/tenant"}) {
+		t.Fatalf("requests = %v", cs.paths)
+	}
+}
+
+func TestResolve_404OnBothIsAnError(t *testing.T) {
+	cs := newCandidateServer(t)
+	id := cs.URL + "/tenant/"
+	cs.status[wk+"/tenant/"] = 404
+	cs.status[wk+"/tenant"] = 404
+	_, err := newTestResolver(t).Resolve(context.Background(), id)
+	if err == nil || !strings.Contains(err.Error(), "404") {
+		t.Fatalf("expected HTTP 404 error, got %v", err)
+	}
+	if len(cs.paths) != 2 {
+		t.Fatalf("requests = %v", cs.paths)
+	}
+}
+
+// Only 404 falls back: 5xx and other statuses are terminal after one request.
+func TestResolve_NoFallbackOnOtherStatuses(t *testing.T) {
+	for _, st := range []int{500, 502, 503, 401, 403, 410} {
+		cs := newCandidateServer(t)
+		id := cs.URL + "/tenant/"
+		cs.status[wk+"/tenant/"] = st
+		cs.claim[wk+"/tenant"] = id
+		if _, err := newTestResolver(t).Resolve(context.Background(), id); err == nil {
+			t.Fatalf("status %d: expected error", st)
+		}
+		if len(cs.paths) != 1 {
+			t.Fatalf("status %d: fallback must not happen, requests = %v", st, cs.paths)
+		}
+	}
+}
+
+// A document whose credential_issuer differs by the slash is refused, whichever
+// candidate URL served it, and no other form is tried to find a match.
+func TestResolve_CredentialIssuerMismatchRefusedForEitherURL(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		idSlash bool
+		claim   func(id string) string
+		serve   string // path served with 200; the literal form 404s when it is "stripped"
+	}{
+		{"literal form, id has slash, claim without", true, func(id string) string { return strings.TrimSuffix(id, "/") }, "literal"},
+		{"literal form, id without slash, claim with", false, func(id string) string { return id + "/" }, "literal"},
+		{"fallback form, claim differs from slashed id", true, func(id string) string { return id + "x" }, "stripped"},
+		{"fallback form, claim without slash vs slashed id", true, func(id string) string { return strings.TrimSuffix(id, "/") }, "stripped"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := newCandidateServer(t)
+			id := cs.URL + "/tenant"
+			if tc.idSlash {
+				id += "/"
+			}
+			lit := wk + "/tenant"
+			if tc.idSlash {
+				lit += "/"
+			}
+			if tc.serve == "stripped" {
+				cs.status[lit] = 404
+				cs.claim[wk+"/tenant"] = tc.claim(id)
+			} else {
+				cs.claim[lit] = tc.claim(id)
+			}
+			_, err := newTestResolver(t).Resolve(context.Background(), id)
+			if err == nil || !strings.Contains(err.Error(), "does not match") {
+				t.Fatalf("expected credential_issuer mismatch, got %v", err)
+			}
+			want := 1
+			if tc.serve == "stripped" {
+				want = 2
+			}
+			if len(cs.paths) != want {
+				t.Fatalf("a mismatch must not trigger another lookup: %v", cs.paths)
+			}
+		})
+	}
+}
+
+func TestResolve_CandidatePaths(t *testing.T) {
+	for _, tc := range []struct {
+		name, path string
+		want       []string
+	}{
+		{"no path", "", []string{wk}},
+		{"bare root slash", "/", []string{wk + "/", wk}},
+		{"path", "/tenant", []string{wk + "/tenant"}},
+		{"percent-encoded", "/a%2Fb/", []string{wk + "/a%2Fb/", wk + "/a%2Fb"}},
+		{"repeated slash", "/t//", []string{wk + "/t//", wk + "/t/"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cs := newCandidateServer(t)
+			for _, p := range tc.want {
+				cs.status[p] = 404
+			}
+			// Every candidate 404s: the requests made are exactly the candidates, in order.
+			_, _ = newTestResolver(t).Resolve(context.Background(), cs.URL+tc.path)
+			if !reflect.DeepEqual(cs.paths, tc.want) {
+				t.Fatalf("requests = %v, want %v", cs.paths, tc.want)
+			}
+		})
+	}
+}
+
+// One cache entry per identifier as received, regardless of which URL served
+// it; "x" and "x/" are different identifiers.
+func TestResolve_CacheIsolationPathSpellings(t *testing.T) {
+	cs := newCandidateServer(t)
+	a, b := cs.URL+"/x", cs.URL+"/x/"
+	cs.claim[wk+"/x"] = a
+	cs.status[wk+"/x/"] = 404 // b falls back to wk/x, whose claim is a: refused for b
+	res := newTestResolver(t)
+	if _, err := res.Resolve(context.Background(), a); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := res.Resolve(context.Background(), b); err == nil {
+		t.Fatal("b must not be served from a's cache entry or accept a's document")
+	}
+	r, err := res.ResolveWithInfo(context.Background(), a)
+	if err != nil || !r.Cached {
+		t.Fatalf("a should still be cached: %v", err)
+	}
+	// Fallback success is cached under the identifier as received.
+	cs2 := newCandidateServer(t)
+	id := cs2.URL + "/t/"
+	cs2.status[wk+"/t/"] = 404
+	cs2.claim[wk+"/t"] = id
+	res2 := newTestResolver(t)
+	for i := 0; i < 2; i++ {
+		if _, err := res2.Resolve(context.Background(), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(cs2.paths) != 2 {
+		t.Fatalf("second Resolve must be a cache hit: %v", cs2.paths)
 	}
 }
 
 func TestResolve_RejectsHTTPByDefault(t *testing.T) {
-	r, _ := New(Config{}) // AllowHTTP = false
+	r, _ := New(Config{HTTPClient: testHTTPClient()}) // AllowHTTP = false
 	_, err := r.Resolve(context.Background(), "http://issuer.example.com")
 	if err == nil {
 		t.Error("expected error for HTTP URL, got nil")
@@ -474,16 +749,161 @@ func TestResolve_RejectsNonOKStatus(t *testing.T) {
 	}
 }
 
-func TestResolve_CacheTTLExpiry(t *testing.T) {
-	calls := 0
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
+// TestResolve_SignedNotAcceptable_FallsBackToUnsignedJSON covers issuers that
+// reject the application/jwt Accept with 406 instead of serving the acceptable
+// JSON representation: the resolver retries once requesting unsigned JSON.
+func TestResolve_SignedNotAcceptable_FallsBackToUnsignedJSON(t *testing.T) {
+	var attempts int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if strings.HasPrefix(r.Header.Get("Accept"), "application/jwt") {
+			w.WriteHeader(http.StatusNotAcceptable)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]int{"call": calls}) //nolint:errcheck
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL}) //nolint:errcheck
 	}))
 	defer server.Close()
 
-	r, _ := New(Config{
+	r := newTestResolverPreferSigned(t)
+	res, err := r.ResolveWithInfo(context.Background(), server.URL)
+	if err != nil {
+		t.Fatalf("expected unsigned fallback to succeed, got error: %v", err)
+	}
+	if attempts != 2 {
+		t.Errorf("expected 2 requests (signed rejected, unsigned retry), got %d", attempts)
+	}
+	if res.Signed {
+		t.Error("fallback result must be reported as unsigned")
+	}
+	if res.Metadata["credential_issuer"] != server.URL {
+		t.Errorf("unexpected metadata: %v", res.Metadata)
+	}
+}
+
+// TestResolve_SignedNotAcceptable_BothFail verifies the unsigned retry is not
+// infinite: when the issuer 406s both representations, the error surfaces.
+func TestResolve_SignedNotAcceptable_BothFail(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotAcceptable)
+	}))
+	defer server.Close()
+
+	r := newTestResolverPreferSigned(t)
+	if _, err := r.Resolve(context.Background(), server.URL); err == nil {
+		t.Error("expected error when both signed and unsigned requests return 406")
+	}
+}
+
+// TestResolve_PreferUnsigned_RetriesSignedOn406 verifies that when unsigned
+// metadata is preferred and the issuer 406s the JSON request, the resolver
+// retries once with application/jwt before surfacing the error.
+func TestResolve_PreferUnsigned_RetriesSignedOn406(t *testing.T) {
+	var accepts []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		accepts = append(accepts, r.Header.Get("Accept"))
+		w.WriteHeader(http.StatusNotAcceptable)
+	}))
+	defer server.Close()
+
+	r, err := New(Config{HTTPClient: testHTTPClient(), AllowHTTP: true, MetadataType: MetadataTypePreferUnsigned})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if _, err := r.Resolve(context.Background(), server.URL); err == nil {
+		t.Error("expected error when both representations return 406")
+	}
+	if len(accepts) != 2 {
+		t.Fatalf("expected 2 requests (json then signed retry), got %d: %v", len(accepts), accepts)
+	}
+	if accepts[0] != "application/json" || accepts[1] != "application/jwt" {
+		t.Errorf("unexpected Accept sequence: %v", accepts)
+	}
+}
+
+// TestResolve_NotAcceptable_RetriesOtherRepresentation verifies that with the
+// fallback on, a 406 on the preferred representation triggers exactly one retry
+// with the other media type (#371).
+func TestResolve_NotAcceptable_RetriesOtherRepresentation(t *testing.T) {
+	var accepts []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		accepts = append(accepts, r.Header.Get("Accept"))
+		w.WriteHeader(http.StatusNotAcceptable)
+	}))
+	defer server.Close()
+
+	r := newTestResolverPreferSigned(t)
+	if _, err := r.Resolve(context.Background(), server.URL); err == nil {
+		t.Error("expected error for 406 on both representations")
+	}
+	if len(accepts) != 2 || accepts[0] != "application/jwt" || accepts[1] != "application/json" {
+		t.Errorf("a 406 must trigger exactly one retry with the other media type; got %v", accepts)
+	}
+}
+
+// TestResolve_TerminalStatuses_NoRetry verifies statuses that are not a
+// 406 are terminal even with the fallback on: other 4xx (400, 401, 403, 404,
+// 415, 451), 429 (a retry only adds load), redirects without a Location, and 5xx.
+func TestResolve_TerminalStatuses_NoRetry(t *testing.T) {
+	for _, status := range []int{400, 401, 403, 404, 415, 429, 451, 500, 502, 503} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var attempts int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				attempts++
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+
+			r := newTestResolverPreferSigned(t)
+			if _, err := r.Resolve(context.Background(), server.URL); err == nil {
+				t.Errorf("expected error for %d", status)
+			}
+			if attempts != 1 {
+				t.Errorf("%d must not trigger a retry; got %d requests", status, attempts)
+			}
+		})
+	}
+}
+
+// TestResolve_ClientErrorThenOK_Succeeds verifies the point of the fallback: a
+// 406 on the first representation followed by 200 on the second resolves.
+func TestResolve_NotAcceptableThenOK_Succeeds(t *testing.T) {
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if r.Header.Get("Accept") == "application/jwt" {
+			w.WriteHeader(http.StatusNotAcceptable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"credential_issuer":"` + "http://" + r.Host + `","credential_endpoint":"http://x/c"}`))
+	}))
+	defer server.Close()
+
+	r := newTestResolverPreferSigned(t)
+	if _, err := r.Resolve(context.Background(), server.URL); err != nil {
+		t.Fatalf("expected the unsigned retry to succeed, got %v", err)
+	}
+	if attempts != 2 {
+		t.Errorf("expected 2 requests, got %d", attempts)
+	}
+}
+
+func TestResolve_CacheTTLExpiry(t *testing.T) {
+	calls := 0
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
+			"credential_issuer": server.URL,
+			"call":              calls,
+		})
+	}))
+	defer server.Close()
+
+	r, _ := New(Config{HTTPClient: testHTTPClient(),
 		CacheTTL:  1 * time.Millisecond, // very short TTL
 		AllowHTTP: true,
 	})
@@ -603,11 +1023,11 @@ func TestResolveWithInfo_Validated_SignedMetadata(t *testing.T) {
 	defer server.Close()
 
 	evaluator := &mockTrustEvaluator{decision: true}
-	resolver, _ := New(Config{
+	resolver, _ := New(Config{HTTPClient: fixtureClient(server),
 		AllowHTTP:      true,
 		TrustEvaluator: evaluator,
 	})
-	result, err := resolver.ResolveWithInfo(context.Background(), server.URL)
+	result, err := resolver.ResolveWithInfo(context.Background(), signedFixtureID)
 	if err != nil {
 		t.Fatalf("ResolveWithInfo() error: %v", err)
 	}
@@ -637,7 +1057,7 @@ func TestResolveWithInfo_NotValidated_SignedWithoutEvaluator(t *testing.T) {
 	}))
 	defer server.Close()
 
-	result, err := newTestResolver(t).ResolveWithInfo(context.Background(), server.URL)
+	result, err := newFixtureResolver(t, server, Config{}).ResolveWithInfo(context.Background(), signedFixtureID)
 	if err != nil {
 		t.Fatalf("ResolveWithInfo() error: %v", err)
 	}
@@ -649,9 +1069,10 @@ func TestResolveWithInfo_NotValidated_SignedWithoutEvaluator(t *testing.T) {
 // TestResolveWithInfo_NotValidated_UnsignedJSON verifies that ResolveWithInfo
 // reports Validated=false for plain unsigned JSON.
 func TestResolveWithInfo_NotValidated_UnsignedJSON(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": "https://test.com"}) //nolint:errcheck
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL}) //nolint:errcheck
 	}))
 	defer server.Close()
 
@@ -689,7 +1110,7 @@ func TestResolve_ApplicationJWT_WithX5C(t *testing.T) {
 	}
 	token = signClaimsWithX5C(t, priv, []*x509.Certificate{cert}, "openidvci-issuer-metadata+jwt", claims)
 
-	resolver, err := New(Config{
+	resolver, err := New(Config{HTTPClient: testHTTPClient(),
 		CacheTTL:       5 * time.Minute,
 		AllowHTTP:      true,
 		TrustEvaluator: evaluator,
@@ -744,7 +1165,7 @@ func TestResolve_ApplicationJWT_TrustEvaluatorRejects(t *testing.T) {
 	}
 	token = signClaimsWithX5C(t, priv, []*x509.Certificate{cert}, "openidvci-issuer-metadata+jwt", claims)
 
-	resolver, _ := New(Config{
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(),
 		CacheTTL:       5 * time.Minute,
 		AllowHTTP:      true,
 		TrustEvaluator: evaluator,
@@ -779,7 +1200,7 @@ func TestResolve_ApplicationJWT_WrongTyp(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(),
 		AllowHTTP: true,
 	})
 
@@ -810,7 +1231,7 @@ func TestResolve_ApplicationJWT_MissingSub(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{AllowHTTP: true})
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(), AllowHTTP: true})
 	_, err := resolver.Resolve(context.Background(), server.URL)
 	if err == nil {
 		t.Error("expected error for missing sub claim")
@@ -835,7 +1256,7 @@ func TestResolve_ApplicationJWT_SubMismatch(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{AllowHTTP: true})
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(), AllowHTTP: true})
 	_, err := resolver.Resolve(context.Background(), server.URL)
 	if err == nil {
 		t.Error("expected error for sub mismatch")
@@ -863,7 +1284,7 @@ func TestResolve_ApplicationJWT_MissingIat(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{AllowHTTP: true})
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(), AllowHTTP: true})
 	_, err := resolver.Resolve(context.Background(), server.URL)
 	if err == nil {
 		t.Error("expected error for missing iat claim")
@@ -893,12 +1314,12 @@ func TestResolve_SignedMetadata_TrustEvaluatorCalled(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{
+	resolver, _ := New(Config{HTTPClient: fixtureClient(server),
 		AllowHTTP:      true,
 		TrustEvaluator: evaluator,
 	})
 
-	_, err := resolver.Resolve(context.Background(), server.URL)
+	_, err := resolver.Resolve(context.Background(), signedFixtureID)
 	if err != nil {
 		t.Fatalf("Resolve() error: %v", err)
 	}
@@ -936,7 +1357,7 @@ func TestResolve_SignedMetadata_TrustEvaluatorRejects(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(),
 		AllowHTTP:      true,
 		TrustEvaluator: evaluator,
 	})
@@ -957,14 +1378,13 @@ func TestResolve_AcceptHeader(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{AllowHTTP: true})
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(), AllowHTTP: true})
 	resolver.Resolve(context.Background(), server.URL) //nolint:errcheck
 
-	if !strings.Contains(acceptHeader, "application/jwt") {
-		t.Errorf("expected Accept header to include application/jwt, got %q", acceptHeader)
-	}
-	if !strings.Contains(acceptHeader, "application/json") {
-		t.Errorf("expected Accept header to include application/json, got %q", acceptHeader)
+	// Default is prefer-signed: the first request advertises only
+	// application/jwt. Unsigned JSON is requested separately, only after a 406.
+	if acceptHeader != "application/jwt" {
+		t.Errorf("expected preferred Accept header application/jwt, got %q", acceptHeader)
 	}
 }
 
@@ -976,7 +1396,7 @@ func TestResolve_UnsupportedContentType(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{AllowHTTP: true})
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(), AllowHTTP: true})
 	_, err := resolver.Resolve(context.Background(), server.URL)
 	if err == nil {
 		t.Error("expected error for unsupported Content-Type")
@@ -1007,7 +1427,7 @@ func TestResolve_TrustEvaluatorError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	resolver, _ := New(Config{
+	resolver, _ := New(Config{HTTPClient: testHTTPClient(),
 		AllowHTTP:      true,
 		TrustEvaluator: evaluator,
 	})
@@ -1018,5 +1438,264 @@ func TestResolve_TrustEvaluatorError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "trust engine unavailable") {
 		t.Errorf("expected propagated error, got: %v", err)
+	}
+}
+
+// The fallback is on by default (#371): a resolver built without saying so
+// retries the other media type after a 406.
+func TestResolve_FallbackOnByDefault(t *testing.T) {
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusNotAcceptable)
+	}))
+	defer server.Close()
+
+	r, err := New(Config{HTTPClient: testHTTPClient(), AllowHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = r.Resolve(context.Background(), server.URL)
+	if attempts != 2 {
+		t.Errorf("default must retry once after a 406; got %d requests", attempts)
+	}
+}
+
+// OpenID4VCI 1.0 section 12.2.4: credential_issuer MUST be identical to the
+// Credential Issuer Identifier, simple string comparison, no normalisation.
+// A root slash on either side is therefore a mismatch, in both directions.
+func TestResolve_CredentialIssuerExactComparison(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		reqSlash  bool
+		declSlash bool
+		ok        bool
+	}{
+		{"neither slash", false, false, true},
+		{"both slash", true, true, true},
+		{"requested only", true, false, false},
+		{"declared only", false, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var server *httptest.Server
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				id := server.URL
+				if tc.declSlash {
+					id += "/"
+				}
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]string{"credential_issuer": id}) //nolint:errcheck
+			}))
+			defer server.Close()
+			req := server.URL
+			if tc.reqSlash {
+				req += "/"
+			}
+			_, err := newTestResolver(t).Resolve(context.Background(), req)
+			if tc.ok && err != nil {
+				t.Fatalf("Resolve(%q) error: %v", req, err)
+			}
+			if !tc.ok && (err == nil || !strings.Contains(err.Error(), "does not match")) {
+				t.Fatalf("Resolve(%q) must refuse a differing slash, got %v", req, err)
+			}
+		})
+	}
+}
+
+func TestResolve_CredentialIssuerPathSlashExact(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL + "/tenant"}) //nolint:errcheck
+	}))
+	defer server.Close()
+	_, err := newTestResolver(t).Resolve(context.Background(), server.URL+"/tenant/")
+	if err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("expected mismatch for differing path slash, got %v", err)
+	}
+}
+
+// credential_issuer and the signed-metadata sub are compared exactly.
+func TestValidateIssuerClaims_Exact(t *testing.T) {
+	cases := []struct {
+		claim, issuer string
+		ok            bool
+	}{
+		{"https://i.example.com", "https://i.example.com", true},
+		{"https://i.example.com/", "https://i.example.com/", true},
+		{"https://i.example.com/", "https://i.example.com", false},
+		{"https://i.example.com", "https://i.example.com/", false},
+		{"https://i.example.com/t", "https://i.example.com/t/", false},
+		{"https://i.example.com/t/", "https://i.example.com/t", false},
+		{"HTTPS://i.example.com", "https://i.example.com", false},
+	}
+	for _, c := range cases {
+		if got := validateCredentialIssuerClaim(map[string]interface{}{"credential_issuer": c.claim}, c.issuer) == nil; got != c.ok {
+			t.Errorf("credential_issuer %q vs %q: ok=%v want %v", c.claim, c.issuer, got, c.ok)
+		}
+		if got := validateJWTClaims(map[string]interface{}{"sub": c.claim, "iat": 1}, c.issuer) == nil; got != c.ok {
+			t.Errorf("sub %q vs %q: ok=%v want %v", c.claim, c.issuer, got, c.ok)
+		}
+	}
+}
+
+// The two spellings of a root identifier are different identifiers and must not
+// share a cache entry: metadata validated for one is never served for the other.
+func TestResolve_CacheIsolatedBetweenSlashSpellings(t *testing.T) {
+	var hits atomic.Int32
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"credential_issuer": server.URL}) //nolint:errcheck
+	}))
+	defer server.Close()
+	res := newTestResolver(t)
+	if _, err := res.Resolve(context.Background(), server.URL); err != nil {
+		t.Fatal(err)
+	}
+	// Cached for the bare spelling; the slash spelling must not be served from it.
+	if _, err := res.Resolve(context.Background(), server.URL+"/"); err == nil {
+		t.Fatal("slash spelling must not be answered from the bare spelling's cache entry")
+	}
+	if hits.Load() != 2 {
+		t.Fatalf("slash spelling must be fetched and validated itself; got %d fetches", hits.Load())
+	}
+	// Still cached under its own key.
+	r1, err := res.ResolveWithInfo(context.Background(), server.URL)
+	if err != nil || !r1.Cached {
+		t.Fatalf("bare spelling should stay cached: %v cached=%v", err, r1 != nil && r1.Cached)
+	}
+}
+
+// Signed metadata: sub is compared exactly too (checked at the claim level in
+// TestValidateIssuerClaims_Exact).
+// testHTTPClient is an unguarded client for tests that fetch from loopback
+// httptest servers. Production code passes a client from
+// config.HTTPClientConfig.NewHTTPClient; the SSRF behaviour of that client is
+// tested in pkg/config and, through the resolver, in internal/server.
+func testHTTPClient() *http.Client { return &http.Client{Timeout: 10 * time.Second} }
+
+// There is no default client: New must refuse to build a resolver that would
+// fall back to http.DefaultClient (private, loopback and metadata addresses
+// reachable), and must use the caller's client when one is given.
+func TestNew_HTTPClientRequired(t *testing.T) {
+	for _, cfg := range []Config{{}, {AllowHTTP: true}, {HTTPClient: nil, CacheTTL: time.Minute}} {
+		if r, err := New(cfg); !errors.Is(err, ErrHTTPClientRequired) || r != nil {
+			t.Fatalf("New(%+v) = (%v, %v), want ErrHTTPClientRequired", cfg, r, err)
+		}
+	}
+	c := &http.Client{}
+	r, err := New(Config{HTTPClient: c})
+	if err != nil {
+		t.Fatalf("New with a client: %v", err)
+	}
+	if r.httpClient != c {
+		t.Fatal("resolver must use the caller's client")
+	}
+}
+
+// A guarded client supplied by the caller is what stops a loopback issuer; the
+// resolver does not bypass it.
+func TestResolve_UsesCallerSuppliedGuardedClient(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+	}))
+	defer srv.Close()
+	refuse := &http.Client{Transport: roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("refused by guard")
+	})}
+	r, err := New(Config{HTTPClient: refuse, AllowHTTP: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Resolve(context.Background(), srv.URL); err == nil || !strings.Contains(err.Error(), "refused by guard") {
+		t.Fatalf("expected the caller's client to refuse, got %v", err)
+	}
+	if hits.Load() != 0 {
+		t.Fatal("server was reached despite the guard")
+	}
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// Legacy JSON-wrapped signed_metadata is bound to the identifier exactly, also
+// when it is served by the fallback URL after a 404 on the literal one.
+func TestResolve_SignedMetadataIdentityExact_Fallback(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		claims map[string]interface{}
+		ok     bool
+	}{
+		{"credential_issuer other spelling", map[string]interface{}{"credential_issuer": "https://issuer.example.com/tenant"}, false},
+		{"sub other spelling", map[string]interface{}{"sub": "https://issuer.example.com/tenant", "credential_issuer": "https://issuer.example.com/tenant/"}, false},
+		{"no identity claim", map[string]interface{}{"x": "y"}, false},
+		{"exact", map[string]interface{}{"credential_issuer": "https://issuer.example.com/tenant/"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			priv, pub := newTestKey(t)
+			token := signClaims(t, priv, tc.claims)
+			outer := map[string]interface{}{"jwks": inlineJWKS(t, pub), "signed_metadata": token}
+			var paths []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				paths = append(paths, r.URL.Path)
+				if r.URL.Path == "/.well-known/openid-credential-issuer/tenant/" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(outer) //nolint:errcheck
+			}))
+			defer server.Close()
+			_, err := newFixtureResolver(t, server, Config{}).Resolve(context.Background(), signedFixtureID+"/tenant/")
+			if tc.ok != (err == nil) {
+				t.Fatalf("ok=%v err=%v", tc.ok, err)
+			}
+			if len(paths) != 2 {
+				t.Fatalf("requests = %v", paths)
+			}
+		})
+	}
+}
+
+// Identifier spellings from the preserve-only draft: each is requested at the
+// literal path first and, with a matching credential_issuer, accepted as is.
+func TestResolve_LiteralPathSpellingsAccepted(t *testing.T) {
+	for _, path := range []string{"", "/", "/test/a/issuer", "/test/a/issuer/", "/test/a/issuer//", "/path%2Fissuer/"} {
+		t.Run("path="+path, func(t *testing.T) {
+			cs := newCandidateServer(t)
+			id := cs.URL + path
+			cs.claim[wk+path] = id
+			if _, err := newTestResolver(t).Resolve(context.Background(), id); err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(cs.paths, []string{wk + path}) {
+				t.Fatalf("requests = %v", cs.paths)
+			}
+		})
+	}
+}
+
+// An application/jwt payload with an exact sub but another credential_issuer
+// (or a non-string one) is refused; so is a non-string sub in signed_metadata.
+func TestValidateClaims_NonStringAndMixedIdentity(t *testing.T) {
+	id := "https://i.example"
+	if err := validateJWTClaims(map[string]interface{}{"sub": id, "iat": 1, "credential_issuer": "https://other.example"}, id); err == nil {
+		t.Error("JWT with other credential_issuer must be refused")
+	}
+	if err := validateJWTClaims(map[string]interface{}{"sub": id, "iat": 1, "credential_issuer": 5}, id); err == nil {
+		t.Error("JWT with non-string credential_issuer must be refused")
+	}
+	if err := validateJWTClaims(map[string]interface{}{"sub": id, "iat": 1, "credential_issuer": id}, id); err != nil {
+		t.Errorf("matching claims must pass: %v", err)
+	}
+	if err := validateSignedMetadataIdentity(map[string]interface{}{"sub": 5, "credential_issuer": id}, id); err == nil {
+		t.Error("non-string sub must be refused")
+	}
+	if err := validateSignedMetadataIdentity(map[string]interface{}{"credential_issuer": []string{id}}, id); err == nil {
+		t.Error("non-string credential_issuer must be refused")
 	}
 }

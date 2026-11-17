@@ -1,0 +1,481 @@
+package assurance
+
+import (
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/sirosfoundation/go-spocp/pkg/sexp"
+	"github.com/sirosfoundation/go-spocp/pkg/starform"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+)
+
+// Severity of a lint finding.
+type Severity string
+
+const (
+	// SeverityError findings make a policy unusable: a rule that can never
+	// match, or a file whose ids cannot be trusted. Startup refuses it.
+	SeverityError Severity = "ERROR"
+	// SeverityWarn findings are legal but deserve a human's attention.
+	SeverityWarn Severity = "WARN"
+)
+
+// Finding is one lint result.
+type Finding struct {
+	Severity Severity
+	// RuleID is empty for findings about the configuration or the file.
+	RuleID  string
+	Message string
+}
+
+func (f Finding) String() string {
+	if f.RuleID != "" {
+		return fmt.Sprintf("%s: rule %s: %s", f.Severity, f.RuleID, f.Message)
+	}
+	return fmt.Sprintf("%s: %s", f.Severity, f.Message)
+}
+
+// HasErrors reports whether any finding is an error.
+func HasErrors(fs []Finding) bool {
+	for _, f := range fs {
+		if f.Severity == SeverityError {
+			return true
+		}
+	}
+	return false
+}
+
+// KnownDimensions are the top-level rule tags the engine knows. Later
+// features register their own here.
+var KnownDimensions = map[string]bool{
+	DimKeyStorage:         true,
+	DimUserAuthentication: true,
+	DimCertification:      true,
+	DimWIA:                true,
+	DimWIAIssue:           true,
+	DimWIACert:            true,
+}
+
+// slot describes the canonical, positional layout of a rule. A rule lists a
+// prefix of its parent's slots, in order: go-spocp matches lists by
+// position, so a rule that skips or reorders a slot can never match the
+// evidence the builder emits.
+type slot struct {
+	name     string
+	children []slot
+	// noneOK marks slots the builder emits as (slot none) when absent, so a
+	// rule may name that case. Containers (evidence, verified, claimed) are
+	// always emitted with child lists, so "none" there can never match.
+	noneOK bool
+}
+
+// evidenceLayout MUST mirror Evidence.Element.
+var evidenceLayout = slot{name: "evidence", children: []slot{
+	{name: "verified", children: []slot{
+		{name: "fido2", noneOK: true, children: []slot{{name: "mds3"}, {name: "aaguid"}, {name: "uv"}, {name: "cert"}}},
+		{name: "platform", noneOK: true, children: []slot{{name: "source"}, {name: "app_id"}}},
+		{name: "hsm", noneOK: true, children: []slot{{name: "id"}}},
+		{name: "instance_key", noneOK: true, children: []slot{{name: "kind"}, {name: "home"}, {name: "level"}, {name: "boot"}, {name: "binding"}}},
+	}},
+	{name: "claimed", children: []slot{
+		{name: "plugin"}, {name: "key_storage"}, {name: "user_authentication"}, {name: "certification"},
+	}},
+}}
+
+func topLayout(dimension string) []slot {
+	tag := candidateTag(dimension)
+	if tag == "" {
+		return []slot{evidenceLayout}
+	}
+	return []slot{{name: tag}, evidenceLayout}
+}
+
+// LintRuleSet checks a loaded rule set. cfg, when non-nil, enables the
+// checks that compare rules against the configured level schemes and
+// certification catalogue.
+func LintRuleSet(rs *RuleSet, cfg *config.AssuranceConfig) []Finding {
+	var out []Finding
+	hasIssue := false
+	for _, r := range rs.Rules {
+		if l, ok := r.Element.(*sexp.List); ok && l.Tag == DimWIAIssue {
+			hasIssue = true
+		}
+		out = append(out, lintRule(r, cfg)...)
+	}
+	if !hasIssue {
+		out = append(out, Finding{Severity: SeverityWarn, Message: "no assure-wia-issue rule: with the policy enabled every Wallet Instance Attestation request is refused (deny is the absence of a rule). Add a rule, see deploy/assurance/production.rules.example"})
+	}
+	return out
+}
+
+// LintConfig checks the configured schemes: values that are not registered
+// OpenID4VCI key-storage / user-authentication values are legal but visible.
+func LintConfig(cfg config.AssuranceConfig) []Finding {
+	var out []Finding
+	for _, s := range cfg.EffectiveSchemes() {
+		for i, v := range s.Values {
+			if !config.RegisteredAttackPotentialValues[v] {
+				out = append(out, Finding{Severity: SeverityWarn, Message: fmt.Sprintf(
+					"scheme %q level %q emits %q, which is not a value registered by OpenID4VCI Appendix D.2; issuers that match on registered values will not recognise it",
+					s.ID, s.Levels[i], v)})
+			}
+		}
+	}
+	return out
+}
+
+func lintRule(r Rule, cfg *config.AssuranceConfig) []Finding {
+	errf := func(format string, a ...interface{}) Finding {
+		return Finding{Severity: SeverityError, RuleID: r.ID, Message: fmt.Sprintf(format, a...)}
+	}
+	warnf := func(format string, a ...interface{}) Finding {
+		return Finding{Severity: SeverityWarn, RuleID: r.ID, Message: fmt.Sprintf(format, a...)}
+	}
+
+	list, ok := r.Element.(*sexp.List)
+	if !ok {
+		return []Finding{errf("is not a list (line %d); rules must be (assure-... ...)", r.Line)}
+	}
+	if !KnownDimensions[list.Tag] {
+		return []Finding{errf("has unknown dimension tag %q (line %d); known: %s", list.Tag, r.Line, knownList())}
+	}
+
+	var out []Finding
+	out = append(out, checkLayout(list, topLayout(list.Tag), false, list.Tag, errf)...)
+
+	// Candidate values against the configuration.
+	if cfg != nil {
+		out = append(out, lintCandidate(list, cfg, warnf)...)
+	}
+
+	// fido2_hw premise: verified fido2 evidence only counts as hardware when
+	// the rule names the operator's AAGUID list.
+	out = append(out, lintFido2AAGUIDFilter(list, cfg, warnf)...)
+
+	// Rules that depend on client claims.
+	if ev := childList(list, "evidence"); ev != nil {
+		if cl := childList(ev, "claimed"); cl != nil && hasRealChildren(cl) {
+			out = append(out, warnf("depends on client-claimed evidence ((claimed ...) has children); a client can assert anything it is asked to"))
+		}
+	}
+	return out
+}
+
+func knownList() string {
+	var names []string
+	for k := range KnownDimensions {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	return strings.Join(names, ", ")
+}
+
+// checkLayout verifies that l's child lists appear in the canonical order,
+// as a prefix of layout, and recurses into slots that have sub-slots.
+func checkLayout(l *sexp.List, layout []slot, noneOK bool, path string, errf func(string, ...interface{}) Finding) []Finding {
+	var out []Finding
+	if len(layout) == 0 {
+		// Leaf slot: the query always carries exactly one atom here, so a
+		// rule may carry zero values (don't care), one value or a single
+		// (* set ...) of alternatives. Several values, or a nested list,
+		// can never match.
+		if len(l.Elements) > 1 {
+			out = append(out, errf("%s has %d values; a query carries exactly one, so this can never match. Use a single (* set ...) for alternatives", path, len(l.Elements)))
+		} else if len(l.Elements) == 1 && hasListValue(l.Elements[0]) {
+			out = append(out, errf("%s value is (or contains) a list; a query carries one atom here, so this can never match", path))
+		}
+		return out
+	}
+	for i, el := range l.Elements {
+		child, isList := el.(*sexp.List)
+		if !isList {
+			// A value where sub-slots belong can never match, except the
+			// "absent" marker (slot none) of an optional verified slot.
+			if len(layout) > 0 {
+				if a, isAtom := el.(*sexp.Atom); isAtom && a.Value == None && len(l.Elements) == 1 && noneOK {
+					continue
+				}
+				out = append(out, errf("%s position %d: expected slot (%s) but found a value; positional matching would never match", path, i, layout[min(i, len(layout)-1)].name))
+			}
+			continue
+		}
+		if i >= len(layout) {
+			out = append(out, errf("%s: unexpected (%s) at position %d; the canonical slots are %s", path, child.Tag, i, slotNames(layout)))
+			continue
+		}
+		if child.Tag != layout[i].name {
+			out = append(out, errf("%s position %d: slot order is not canonical, found (%s) where (%s) belongs; positional matching makes this rule silently dead. Canonical order: %s",
+				path, i, child.Tag, layout[i].name, slotNames(layout)))
+			continue
+		}
+		out = append(out, checkLayout(child, layout[i].children, layout[i].noneOK, path+"/"+child.Tag, errf)...)
+	}
+	return out
+}
+
+func slotNames(layout []slot) string {
+	names := make([]string, len(layout))
+	for i, s := range layout {
+		names[i] = s.name
+	}
+	return strings.Join(names, ", ")
+}
+
+func childList(l *sexp.List, tag string) *sexp.List {
+	for _, el := range l.Elements {
+		if c, ok := el.(*sexp.List); ok && c.Tag == tag {
+			return c
+		}
+	}
+	return nil
+}
+
+// hasRealChildren is true when l has any child other than the bare "none"
+// atom (which only matches a request with no claims at all).
+func hasRealChildren(l *sexp.List) bool {
+	for _, el := range l.Elements {
+		if a, ok := el.(*sexp.Atom); ok && a.Value == None {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// candidateValues returns the atoms a (tier ...)/(name ...) group names and
+// whether it uses a star form that is not a plain set (an open grant).
+func candidateValues(l *sexp.List) (values []string, open bool) {
+	if len(l.Elements) == 0 {
+		// A bare (tier) is "don't care": it matches every tier.
+		return nil, true
+	}
+	for _, el := range l.Elements {
+		switch v := el.(type) {
+		case *sexp.Atom:
+			values = append(values, v.Value)
+		case *starform.Set:
+			for _, m := range v.Elements {
+				if a, ok := m.(*sexp.Atom); ok {
+					values = append(values, a.Value)
+				} else {
+					open = true
+				}
+			}
+		default:
+			open = true
+		}
+	}
+	return values, open
+}
+
+func lintCandidate(rule *sexp.List, cfg *config.AssuranceConfig, warnf func(string, ...interface{}) Finding) []Finding {
+	tag := candidateTag(rule.Tag)
+	if tag == "" {
+		return nil
+	}
+	group := childList(rule, tag)
+	if group == nil {
+		// A rule listing no (tier ...)/(name ...) group matches every
+		// candidate: positional prefix matching treats the omitted slot as
+		// "don't care".
+		return []Finding{warnf("has no (%s ...) group; it matches every candidate and grants every tier or entry", candidateTag(rule.Tag))}
+	}
+	values, open := candidateValues(group)
+	var out []Finding
+	if open {
+		out = append(out, warnf("(%s ...) uses a wildcard, prefix, suffix or range; it may grant levels or entries you did not list", group.Tag))
+	}
+	switch rule.Tag {
+	case DimKeyStorage, DimUserAuthentication:
+		id := cfg.KeyStorageScheme
+		if rule.Tag == DimUserAuthentication {
+			id = cfg.UserAuthenticationScheme
+		}
+		sc, ok := cfg.SchemeByID(id)
+		if !ok {
+			return out
+		}
+		known := map[string]bool{}
+		for _, l := range sc.Levels {
+			known[l] = true
+		}
+		for _, v := range values {
+			if !known[v] {
+				out = append(out, warnf("grants tier %q, which is outside the configured scheme %q (levels: %s); it can never be granted", v, sc.ID, strings.Join(sc.Levels, ", ")))
+			}
+		}
+	case DimWIA:
+		sc, ok := cfg.WIAProfileSchemeByID(cfg.WIAProfileScheme)
+		if !ok {
+			return out
+		}
+		known := map[string]bool{}
+		for _, l := range sc.Profiles {
+			known[l] = true
+		}
+		for _, v := range values {
+			if !known[v] {
+				out = append(out, warnf("grants profile %q, which is outside the configured WIA profile scheme %q (profiles: %s); it can never be granted", v, sc.ID, strings.Join(sc.Profiles, ", ")))
+			}
+		}
+	case DimWIACert:
+		known := map[string]bool{}
+		for _, e := range cfg.WIACertification.Entries {
+			known[e.Name] = true
+		}
+		for _, v := range values {
+			if !known[v] {
+				out = append(out, warnf("names WIA certification %q, which is not in the configured wia_certification catalogue", v))
+			}
+		}
+	case DimCertification:
+		known := map[string]bool{}
+		for _, e := range cfg.EffectiveCertificationEntries() {
+			known[e.Name] = true
+		}
+		for _, v := range values {
+			if !known[v] {
+				out = append(out, warnf("names certification %q, which is not in the configured catalogue", v))
+			}
+		}
+	}
+	return out
+}
+
+// hasListValue reports whether el is a list, or a star form with a list
+// anywhere among its members (a set may nest further sets).
+func hasListValue(el sexp.Element) bool {
+	switch v := el.(type) {
+	case *sexp.List:
+		return true
+	case *starform.Set:
+		for _, m := range v.Elements {
+			if hasListValue(m) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// lintFido2AAGUIDFilter enforces the documented fido2_hw premise: an
+// authenticator counts as hardware only if the operator's rules list its
+// AAGUID. The AAGUID set IS the hardware filter (MDS3 trust alone does not
+// say "hardware"). In assure-ks and assure-ua, a rule whose verified fido2
+// slot is not "none" and that either grants a tier above the scheme floor or
+// constrains mds3/uv/cert, must also constrain (aaguid ...) to a value or a
+// set. A bare (fido2) that grants only the floor is harmless and is not
+// reported. The check reads the configured scheme's floor and level order;
+// it never names a level. Without a configuration the floor is unknown, so
+// any granted tier counts as above it.
+func lintFido2AAGUIDFilter(rule *sexp.List, cfg *config.AssuranceConfig, warnf func(string, ...interface{}) Finding) []Finding {
+	if rule.Tag != DimKeyStorage && rule.Tag != DimUserAuthentication {
+		return nil
+	}
+	ev := childList(rule, "evidence")
+	if ev == nil {
+		return nil
+	}
+	ver := childList(ev, "verified")
+	if ver == nil {
+		return nil
+	}
+	f2 := childList(ver, "fido2")
+	if f2 == nil || (len(f2.Elements) > 0 && !hasRealChildren(f2)) {
+		return nil // absent, or (fido2 none)
+	}
+	if g := childList(f2, "aaguid"); g != nil && narrowsAAGUID(g) {
+		return nil
+	}
+	constrained := ""
+	for _, name := range []string{"mds3", "uv", "cert"} {
+		if g := childList(f2, name); g != nil && len(g.Elements) > 0 {
+			constrained = name
+			break
+		}
+	}
+	if constrained == "" && !grantsAboveFloor(rule, cfg) {
+		return nil
+	}
+	why := "grants a tier above the scheme floor"
+	if constrained != "" {
+		why = fmt.Sprintf("constrains fido2 %s", constrained)
+	}
+	return []Finding{warnf("%s from verified fido2 evidence without an (aaguid ...) constraint; the AAGUID set is the hardware filter (an authenticator counts as hardware only if the rules list its AAGUID), so narrow it with (fido2 (mds3 ...)(aaguid (* set ...)))", why)}
+}
+
+// grantsAboveFloor reports whether the rule's (tier ...) names any level
+// above the configured scheme's floor, or uses an open star form.
+func grantsAboveFloor(rule *sexp.List, cfg *config.AssuranceConfig) bool {
+	group := childList(rule, candidateTag(rule.Tag))
+	if group == nil {
+		return true // an omitted (tier ...) matches every tier
+	}
+	values, open := candidateValues(group)
+	if open {
+		return true
+	}
+	if cfg == nil {
+		return len(values) > 0
+	}
+	id := cfg.KeyStorageScheme
+	if rule.Tag == DimUserAuthentication {
+		id = cfg.UserAuthenticationScheme
+	}
+	sc, ok := cfg.SchemeByID(id)
+	if !ok {
+		return len(values) > 0
+	}
+	idx := map[string]int{}
+	for i, l := range sc.Levels {
+		idx[l] = i
+	}
+	floor, ok := idx[sc.Floor]
+	if !ok {
+		floor = 0
+	}
+	for _, v := range values {
+		if i, known := idx[v]; known && i > floor {
+			return true
+		}
+	}
+	return false
+}
+
+// narrowsAAGUID reports whether an (aaguid ...) group restricts to listed
+// models: at least one element, and no member that accepts every model (a
+// bare (*) wildcard, an empty prefix/suffix, or a range).
+func narrowsAAGUID(g *sexp.List) bool {
+	if len(g.Elements) == 0 {
+		return false
+	}
+	for _, el := range g.Elements {
+		if !narrowingElement(el) {
+			return false
+		}
+	}
+	return true
+}
+
+func narrowingElement(el sexp.Element) bool {
+	switch v := el.(type) {
+	case *starform.Wildcard, *starform.Range:
+		return false
+	case *starform.Prefix:
+		return v.Value != ""
+	case *starform.Suffix:
+		return v.Value != ""
+	case *starform.Set:
+		if len(v.Elements) == 0 {
+			return false
+		}
+		for _, m := range v.Elements {
+			if !narrowingElement(m) {
+				return false
+			}
+		}
+	}
+	return true
+}

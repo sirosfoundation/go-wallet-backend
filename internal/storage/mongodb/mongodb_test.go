@@ -2,7 +2,11 @@ package mongodb
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -11,6 +15,7 @@ import (
 	"go.mongodb.org/mongo-driver/bson"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
@@ -175,8 +180,10 @@ func TestUserStore_CRUD(t *testing.T) {
 
 	// Update
 	updatedName := "Updated User"
-	user.DisplayName = &updatedName
-	err = store.Users().Update(ctx, user)
+	_, err = store.Users().Modify(ctx, user.UUID, func(u *domain.User) error {
+		u.DisplayName = &updatedName
+		return nil
+	})
 	require.NoError(t, err)
 
 	retrieved, err = store.Users().GetByID(ctx, user.UUID)
@@ -189,6 +196,333 @@ func TestUserStore_CRUD(t *testing.T) {
 
 	_, err = store.Users().GetByID(ctx, user.UUID)
 	assert.Error(t, err)
+}
+
+func TestUserStore_Modify_ConcurrentConditionalWrites(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	initial := []byte("initial")
+	user := &domain.User{
+		UUID:            domain.NewUserID(),
+		DID:             "did:key:modify-concurrent",
+		PrivateData:     initial,
+		PrivateDataETag: domain.ComputePrivateDataETag(initial),
+	}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	ifMatch := user.PrivateDataETag
+	conflict := errors.New("conflict")
+
+	const n = 10
+	results := make([]error, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			_, results[i] = store.Users().Modify(ctx, user.UUID, func(u *domain.User) error {
+				if u.PrivateDataETag != ifMatch {
+					return conflict
+				}
+				u.UpdatePrivateData([]byte{byte('a' + i)})
+				return nil
+			})
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	ok := 0
+	for _, err := range results {
+		if err == nil {
+			ok++
+		} else {
+			assert.ErrorIs(t, err, conflict)
+		}
+	}
+	assert.Equal(t, 1, ok, "exactly one conditional write must succeed")
+}
+
+func TestUserStore_Modify_PreservesConcurrentFieldChanges(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:modify-fields"}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	// Writers touching different fields must not lose each other's updates.
+	const n = 20
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			_, err := store.Users().Modify(ctx, user.UUID, func(u *domain.User) error {
+				u.WebauthnCredentials = append(u.WebauthnCredentials, domain.WebauthnCredential{ID: fmt.Sprintf("c%d", i)})
+				return nil
+			})
+			assert.NoError(t, err)
+		}(i)
+		go func() {
+			defer wg.Done()
+			_, err := store.Users().Modify(ctx, user.UUID, func(u *domain.User) error {
+				u.OpenIDRefreshTokenMaxAge++
+				return nil
+			})
+			assert.NoError(t, err)
+		}()
+	}
+	wg.Wait()
+
+	got, err := store.Users().GetByID(ctx, user.UUID)
+	require.NoError(t, err)
+	assert.Len(t, got.WebauthnCredentials, n)
+	assert.Equal(t, int64(n), got.OpenIDRefreshTokenMaxAge)
+	assert.Equal(t, int64(2*n), got.Version)
+}
+
+func TestUserStore_Modify_LegacyDocumentWithoutVersion(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	id := domain.NewUserID()
+	// Insert a document the way older releases stored it: no "version" key.
+	_, err := store.users.collection.InsertOne(ctx, bson.M{
+		"_id":          bson.M{"id": id.String()},
+		"did":          "did:key:legacy",
+		"private_data": []byte("legacy"),
+	})
+	require.NoError(t, err)
+
+	stored, err := store.Users().Modify(ctx, id, func(u *domain.User) error {
+		u.UpdatePrivateData([]byte("new"))
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), stored.Version)
+
+	got, err := store.Users().GetByID(ctx, id)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("new"), got.PrivateData)
+	assert.Equal(t, domain.ComputePrivateDataETag([]byte("new")), got.PrivateDataETag)
+}
+
+// TestUserStore_Modify_InterleavedWithCredentialAuthenticatorUpdate proves
+// that a login's sign-count / clone-warning write bumps the document version:
+// a Modify that read the user before the login must retry on fresh data
+// instead of restoring the pre-login counter and clearing the clone warning.
+func TestUserStore_Modify_InterleavedWithCredentialAuthenticatorUpdate(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy_without_version=%v", legacy), func(t *testing.T) {
+			store := skipIfNoMongo(t)
+			ctx := context.Background()
+
+			user := &domain.User{
+				UUID: domain.NewUserID(),
+				WebauthnCredentials: []domain.WebauthnCredential{
+					{ID: "cred-1", Authenticator: domain.Authenticator{SignCount: 1}},
+				},
+			}
+			require.NoError(t, store.Users().Create(ctx, user))
+			if legacy {
+				_, err := store.users.collection.UpdateOne(ctx, bson.M{"_id.id": user.UUID.String()},
+					bson.M{"$unset": bson.M{"version": ""}})
+				require.NoError(t, err)
+			}
+
+			calls := 0
+			_, err := store.Users().Modify(ctx, user.UUID, func(u *domain.User) error {
+				calls++
+				if calls == 1 {
+					// A login lands after Modify read the user but before its write.
+					_, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 10, true)
+					require.NoError(t, err)
+				}
+				u.UpdatePrivateData([]byte("data"))
+				return nil
+			})
+			require.NoError(t, err)
+			assert.Equal(t, 2, calls, "Modify must detect the concurrent login and retry")
+
+			got, err := store.Users().GetByID(ctx, user.UUID)
+			require.NoError(t, err)
+			assert.Equal(t, uint32(10), got.WebauthnCredentials[0].Authenticator.SignCount, "login sign count must not be rolled back")
+			assert.True(t, got.WebauthnCredentials[0].Authenticator.CloneWarning, "clone warning must not be cleared")
+			assert.Equal(t, []byte("data"), got.PrivateData)
+		})
+	}
+}
+
+func TestUserStore_Modify_NotFound(t *testing.T) {
+	store := skipIfNoMongo(t)
+	_, err := store.Users().Modify(context.Background(), domain.NewUserID(), func(*domain.User) error { return nil })
+	assert.ErrorIs(t, err, storage.ErrNotFound)
+}
+
+// TestUserStore_UpdateCredentialAuthenticator_SetsFields covers the basic
+// happy path against a real MongoDB: the arrayFilter-based UpdateOne
+// correctly targets the right credential within the array and sets both
+// fields.
+func TestUserStore_UpdateCredentialAuthenticator_SetsFields(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-other", Authenticator: domain.Authenticator{SignCount: 99}},
+			{ID: "cred-1", Authenticator: domain.Authenticator{SignCount: 1}},
+		},
+	}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	transitioned, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 5, true)
+	require.NoError(t, err)
+	assert.True(t, transitioned, "this call moved CloneWarning from false to true")
+
+	got, err := store.Users().GetByID(ctx, user.UUID)
+	require.NoError(t, err)
+	require.Len(t, got.WebauthnCredentials, 2)
+	assert.Equal(t, uint32(5), got.WebauthnCredentials[1].Authenticator.SignCount)
+	assert.True(t, got.WebauthnCredentials[1].Authenticator.CloneWarning)
+	// The other credential in the array must be untouched.
+	assert.Equal(t, uint32(99), got.WebauthnCredentials[0].Authenticator.SignCount)
+	assert.False(t, got.WebauthnCredentials[0].Authenticator.CloneWarning)
+}
+
+// TestUserStore_UpdateCredentialAuthenticator_CloneWarningIsORonly covers
+// the exact property PR #388's review demanded, against a real MongoDB:
+// this method must never write CloneWarning=false over an existing true,
+// via a single atomic UpdateOne with no read-then-write window at all.
+func TestUserStore_UpdateCredentialAuthenticator_CloneWarningIsORonly(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-1"},
+		},
+	}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	// First call latches CloneWarning=true.
+	transitioned, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 3, true)
+	require.NoError(t, err)
+	assert.True(t, transitioned, "first call should report transitioned=true")
+
+	// A later call with cloneWarning=false (a clean, non-regressing login)
+	// must NOT clear it, and must not itself report a transition.
+	transitioned, err = store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 10, false)
+	require.NoError(t, err)
+	assert.False(t, transitioned, "a call with cloneWarning=false must never report transitioned=true")
+
+	got, err := store.Users().GetByID(ctx, user.UUID)
+	require.NoError(t, err)
+	assert.True(t, got.WebauthnCredentials[0].Authenticator.CloneWarning,
+		"CloneWarning must stay true — a call with cloneWarning=false must never clear it")
+	assert.Equal(t, uint32(10), got.WebauthnCredentials[0].Authenticator.SignCount)
+}
+
+// TestUserStore_UpdateCredentialAuthenticator_SignCountMonotonic covers a
+// review finding on PR #388: SignCount must never decrease. Against a real
+// MongoDB, this exercises the $max operator directly.
+func TestUserStore_UpdateCredentialAuthenticator_SignCountMonotonic(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-1"},
+		},
+	}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	_, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 20, false)
+	require.NoError(t, err)
+	// A lower counter arriving after must not decrease the stored baseline.
+	_, err = store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 10, false)
+	require.NoError(t, err)
+
+	got, err := store.Users().GetByID(ctx, user.UUID)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(20), got.WebauthnCredentials[0].Authenticator.SignCount,
+		"a lower value must never decrease the stored counter")
+}
+
+func TestUserStore_UpdateCredentialAuthenticator_UserNotFound(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	_, err := store.Users().UpdateCredentialAuthenticator(ctx, domain.UserIDFromString("nonexistent"), "cred-1", 1, true)
+	assert.ErrorIs(t, err, storage.ErrNotFound)
+}
+
+// TestUserStore_UpdateCredentialAuthenticator_CredentialNotFound covers the
+// documented silent no-op case against a real MongoDB: the user exists, but
+// no credential with the given ID does — the arrayFilter matches the
+// document but zero array elements, which must succeed with no error and
+// transitioned=false, not ErrNotFound.
+func TestUserStore_UpdateCredentialAuthenticator_CredentialNotFound(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "some-other-cred"},
+		},
+	}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	transitioned, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "nonexistent-cred", 1, true)
+	assert.NoError(t, err)
+	assert.False(t, transitioned)
+}
+
+// TestUserStore_UpdateCredentialAuthenticator_TransitionedOnlyOnce covers
+// the review finding that a caller-side "was this already latched" check
+// can let concurrent callers duplicate a one-time side effect: many
+// goroutines race to call UpdateCredentialAuthenticator(cloneWarning=true)
+// on the same credential against a real MongoDB, and exactly one of them
+// must see transitioned=true.
+func TestUserStore_UpdateCredentialAuthenticator_TransitionedOnlyOnce(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	user := &domain.User{
+		UUID: domain.NewUserID(),
+		WebauthnCredentials: []domain.WebauthnCredential{
+			{ID: "cred-1"},
+		},
+	}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	const attempts = 16
+	var successes atomic.Int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			transitioned, err := store.Users().UpdateCredentialAuthenticator(ctx, user.UUID, "cred-1", 1, true)
+			if err == nil && transitioned {
+				successes.Add(1)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	assert.Equal(t, int32(1), successes.Load(), "expected exactly 1 of %d concurrent calls to report transitioned=true", attempts)
 }
 
 func TestChallengeStore_CRUD(t *testing.T) {
@@ -636,6 +970,267 @@ func TestNewStore_TLSErrors(t *testing.T) {
 	})
 }
 
+// TestChallengeStore_ConsumeByID verifies the atomic FindOneAndDelete
+// primitive that fixes issue #379 (non-atomic WebAuthn challenge
+// consumption): a single ConsumeByID call both returns and deletes the
+// challenge.
+func TestChallengeStore_ConsumeByID(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "consume-challenge-id",
+		Challenge: "test-challenge-string",
+		Action:    "login",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+		CreatedAt: time.Now(),
+	}
+	require.NoError(t, store.Challenges().Create(ctx, challenge))
+
+	consumed, err := store.Challenges().ConsumeByID(ctx, challenge.ID)
+	require.NoError(t, err)
+	assert.Equal(t, challenge.Action, consumed.Action)
+
+	_, err = store.Challenges().GetByID(ctx, challenge.ID)
+	assert.Error(t, err)
+
+	// A second consume of the same, now-deleted ID must fail.
+	_, err = store.Challenges().ConsumeByID(ctx, challenge.ID)
+	assert.Error(t, err)
+}
+
+// TestChallengeStore_ConsumeByIDForUser covers the atomic ownership-scoped
+// consume added for issue #379's FinishAddCredential fix against a real
+// MongoDB: a matching userID succeeds and removes the challenge; a
+// mismatched userID gets ErrNotFound and leaves the real owner's challenge
+// untouched.
+func TestChallengeStore_ConsumeByIDForUser(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "add-cred-challenge-id",
+		UserID:    "user-owner",
+		Challenge: "test-challenge-string",
+		Action:    "add_credential",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+		CreatedAt: time.Now(),
+	}
+	require.NoError(t, store.Challenges().Create(ctx, challenge))
+
+	// Mismatched userID: must fail without consuming.
+	_, err := store.Challenges().ConsumeByIDForUser(ctx, challenge.ID, "user-attacker")
+	assert.ErrorIs(t, err, storage.ErrNotFound)
+	_, err = store.Challenges().GetByID(ctx, challenge.ID)
+	assert.NoError(t, err, "challenge should survive a mismatched-owner attempt")
+
+	// Matching userID: must succeed and consume it.
+	consumed, err := store.Challenges().ConsumeByIDForUser(ctx, challenge.ID, "user-owner")
+	require.NoError(t, err)
+	assert.Equal(t, "user-owner", consumed.UserID)
+	_, err = store.Challenges().GetByID(ctx, challenge.ID)
+	assert.Error(t, err, "challenge should be consumed after a matching-owner ConsumeByIDForUser")
+}
+
+func TestChallengeStore_ConsumeByIDForUser_NotFound(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	_, err := store.Challenges().ConsumeByIDForUser(ctx, "nonexistent", "user-owner")
+	assert.ErrorIs(t, err, storage.ErrNotFound)
+}
+
+// TestChallengeStore_ConsumeByIDForTenant covers the atomic tenant-scoped
+// consume added when this branch was rebased onto main's #386, against a
+// real MongoDB: a matching tenant succeeds; a mismatched tenant gets
+// ErrNotFound and leaves the challenge untouched; an empty
+// expectedTenantID behaves like plain ConsumeByID (no constraint).
+func TestChallengeStore_ConsumeByIDForTenant(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "register-challenge-id",
+		UserID:    "user-1",
+		TenantID:  "tenant-a",
+		Challenge: "test-challenge-string",
+		Action:    "register",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+		CreatedAt: time.Now(),
+	}
+	require.NoError(t, store.Challenges().Create(ctx, challenge))
+
+	// Mismatched tenant: must fail without consuming.
+	_, err := store.Challenges().ConsumeByIDForTenant(ctx, challenge.ID, "tenant-b")
+	assert.ErrorIs(t, err, storage.ErrNotFound)
+	_, err = store.Challenges().GetByID(ctx, challenge.ID)
+	assert.NoError(t, err, "challenge should survive a mismatched-tenant attempt")
+
+	// Matching tenant: must succeed and consume it.
+	consumed, err := store.Challenges().ConsumeByIDForTenant(ctx, challenge.ID, "tenant-a")
+	require.NoError(t, err)
+	assert.Equal(t, "tenant-a", consumed.TenantID)
+	_, err = store.Challenges().GetByID(ctx, challenge.ID)
+	assert.Error(t, err, "challenge should be consumed after a matching-tenant ConsumeByIDForTenant")
+}
+
+func TestChallengeStore_ConsumeByIDForTenant_EmptyExpectedTenantIDIsNoConstraint(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "global-challenge-id",
+		UserID:    "user-1",
+		TenantID:  "tenant-a",
+		Challenge: "test-challenge-string",
+		Action:    "register",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+		CreatedAt: time.Now(),
+	}
+	require.NoError(t, store.Challenges().Create(ctx, challenge))
+
+	_, err := store.Challenges().ConsumeByIDForTenant(ctx, challenge.ID, "")
+	assert.NoError(t, err, "empty expectedTenantID should mean no constraint")
+}
+
+func TestChallengeStore_ConsumeByIDForTenant_NotFound(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	_, err := store.Challenges().ConsumeByIDForTenant(ctx, "nonexistent", "tenant-a")
+	assert.ErrorIs(t, err, storage.ErrNotFound)
+}
+
+// TestChallengeStore_ConsumeByID_GenericError exercises ConsumeByID's other
+// error path: a real driver-level failure (as opposed to the "no such
+// document" case covered above). Codecov flagged this exact line
+// (`return nil, fmt.Errorf("failed to consume challenge: %w", err)`) as
+// untested on PR #388 — a cancelled context forces mongo's FindOneAndDelete
+// to fail with something other than mongo.ErrNoDocuments, so ConsumeByID
+// must wrap and return it rather than mistaking it for storage.ErrNotFound.
+func TestChallengeStore_ConsumeByID_GenericError(t *testing.T) {
+	store := skipIfNoMongo(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := store.Challenges().ConsumeByID(ctx, "any-id")
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, storage.ErrNotFound)
+	assert.Contains(t, err.Error(), "failed to consume challenge")
+}
+
+// TestChallengeStore_ConsumeByID_ConcurrentSingleWinner reproduces the W-2 /
+// issue #379 production incident directly against MongoDB: many goroutines
+// race FindOneAndDelete on the exact same challenge ID. Exactly one must get
+// a non-nil challenge back.
+func TestChallengeStore_ConsumeByID_ConcurrentSingleWinner(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	challenge := &domain.WebauthnChallenge{
+		ID:        "consume-race-id",
+		Challenge: "test-challenge-string",
+		Action:    "login",
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+		CreatedAt: time.Now(),
+	}
+	require.NoError(t, store.Challenges().Create(ctx, challenge))
+
+	const attempts = 16
+	var successes atomic.Int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if c, err := store.Challenges().ConsumeByID(ctx, challenge.ID); err == nil && c != nil {
+				successes.Add(1)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	assert.Equal(t, int32(1), successes.Load(), "expected exactly 1 of %d concurrent ConsumeByID calls to succeed", attempts)
+}
+
+// TestInviteStore_MarkCompleted_ConcurrentSingleWinner exercises the atomic
+// update-if-active operation the W-1 / issue #378 fix relies on: many
+// goroutines race to claim the same single-use invite code. Exactly one must
+// win.
+func TestInviteStore_MarkCompleted_ConcurrentSingleWinner(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	invite := &domain.Invite{
+		ID:        "invite-race-id",
+		TenantID:  domain.DefaultTenantID,
+		Code:      "RACE-CODE",
+		Status:    domain.InviteStatusActive,
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	require.NoError(t, store.Invites().Create(ctx, invite))
+
+	const attempts = 16
+	var successes atomic.Int32
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			userID := domain.UserIDFromString("racer")
+			if err := store.Invites().MarkCompleted(ctx, domain.DefaultTenantID, invite.Code, userID); err == nil {
+				successes.Add(1)
+			}
+		}()
+	}
+
+	close(start)
+	wg.Wait()
+
+	assert.Equal(t, int32(1), successes.Load(), "expected exactly 1 of %d concurrent MarkCompleted calls to succeed", attempts)
+
+	got, err := store.Invites().GetByID(ctx, invite.ID)
+	require.NoError(t, err)
+	assert.Equal(t, domain.InviteStatusCompleted, got.Status)
+}
+
+// TestInviteStore_MarkCompleted_ExpiredInviteRejected covers a review
+// finding on PR #388: MarkCompleted's atomic filter only checked
+// status == active, not expiry, as a separate condition. An invite that
+// ticks over its expiry between an earlier IsUsable() check and this call
+// (e.g. while WebAuthn verification is still in flight) must not still be
+// claimable — expiry has to be part of the same atomic filter.
+func TestInviteStore_MarkCompleted_ExpiredInviteRejected(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+
+	invite := &domain.Invite{
+		ID:        "invite-expired-id",
+		TenantID:  domain.DefaultTenantID,
+		Code:      "EXPIRED-CODE",
+		Status:    domain.InviteStatusActive,
+		ExpiresAt: time.Now().Add(-time.Minute), // active status, but expired
+	}
+	require.NoError(t, store.Invites().Create(ctx, invite))
+
+	userID := domain.UserIDFromString("racer")
+	err := store.Invites().MarkCompleted(ctx, domain.DefaultTenantID, invite.Code, userID)
+	assert.ErrorIs(t, err, storage.ErrNotFound, "MarkCompleted on an expired-but-active invite should return ErrNotFound")
+
+	got, err := store.Invites().GetByID(ctx, invite.ID)
+	require.NoError(t, err)
+	assert.Equal(t, domain.InviteStatusActive, got.Status, "MarkCompleted must not have claimed an expired invite")
+}
+
 // On a fresh database the counter must hand out 1, 2, 3, ...: with the
 // driver's default "return the document before the update" the first two
 // callers both got 1 and the second insert failed with a duplicate _id.
@@ -653,5 +1248,62 @@ func TestNextSequence_FreshDatabaseIsMonotonic(t *testing.T) {
 		got, err := nextSequence(ctx, counters, "test_seq")
 		require.NoError(t, err)
 		assert.Equal(t, want, got)
+	}
+}
+
+// TestUserStore_Modify_ConflictExhaustion: when every attempt loses the race,
+// Modify applies fn exactly maxModifyAttempts times and returns ErrConflict.
+func TestUserStore_Modify_ConflictExhaustion(t *testing.T) {
+	store := skipIfNoMongo(t)
+	ctx := context.Background()
+	user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:exhaust"}
+	require.NoError(t, store.Users().Create(ctx, user))
+
+	sleeps := 0
+	orig := modifySleep
+	modifySleep = func(context.Context, time.Duration) error { sleeps++; return nil }
+	t.Cleanup(func() { modifySleep = orig })
+
+	calls := 0
+	_, err := store.Users().Modify(ctx, user.UUID, func(u *domain.User) error {
+		calls++
+		// A competing writer bumps the version after our read.
+		_, e := store.users.collection.UpdateOne(ctx, bson.M{"_id.id": user.UUID.String()}, bson.M{"$inc": bson.M{"version": int64(1)}})
+		require.NoError(t, e)
+		return nil
+	})
+	require.ErrorIs(t, err, storage.ErrConflict)
+	assert.Equal(t, maxModifyAttempts, calls)
+	// Sleeps happen between attempts only, never after the final one.
+	assert.Equal(t, maxModifyAttempts-1, sleeps)
+}
+
+// TestUserStore_Modify_ContextCancelled: a cancelled context ends the retry
+// loop promptly with a context error instead of ErrConflict.
+func TestUserStore_Modify_ContextCancelled(t *testing.T) {
+	store := skipIfNoMongo(t)
+	user := &domain.User{UUID: domain.NewUserID(), DID: "did:key:cancel"}
+	require.NoError(t, store.Users().Create(context.Background(), user))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	_, err := store.Users().Modify(ctx, user.UUID, func(u *domain.User) error {
+		calls++
+		_, e := store.users.collection.UpdateOne(context.Background(), bson.M{"_id.id": user.UUID.String()}, bson.M{"$inc": bson.M{"version": int64(1)}})
+		require.NoError(t, e)
+		cancel()
+		return nil
+	})
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, 1, calls)
+}
+
+func TestModifyBackoffBounds(t *testing.T) {
+	for attempt := 0; attempt < 30; attempt++ {
+		for i := 0; i < 50; i++ {
+			d := modifyBackoff(attempt)
+			require.Greater(t, d, time.Duration(0))
+			require.LessOrEqual(t, d, modifyMaxBackoff)
+		}
 	}
 }

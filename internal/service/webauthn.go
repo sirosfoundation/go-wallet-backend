@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,12 +18,31 @@ import (
 	"github.com/go-webauthn/webauthn/webauthn"
 	"github.com/golang-jwt/jwt/v5"
 	cryptoutil "github.com/sirosfoundation/go-cryptoutil"
+	"github.com/sirosfoundation/go-siros-set/set"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/taggedbinary"
+)
+
+// EventWebAuthnCloneWarning is emitted when go-webauthn detects that an
+// authenticator's signature counter regressed — the classic signal that
+// credential key material has been cloned onto a second authenticator. Not
+// part of go-siros-set's predefined event catalog, so it's declared locally
+// the same way WIAService declares its own issuance-failure event.
+const EventWebAuthnCloneWarning = set.EventURI("urn:siros:audit:webauthn:clone_warning")
+
+// Enterprise-identity (OIDC gate) audit events (#66). Which of them are
+// emitted is selected by AuditConfig.IdentityEvents; none are by default.
+const (
+	EventIdentityBound      = set.EventURI("urn:siros:audit:identity:bound")
+	EventIdentityVerified   = set.EventURI("urn:siros:audit:identity:verified")
+	EventIdentityMismatch   = set.EventURI("urn:siros:audit:identity:mismatch")
+	EventIdentityGateBypass = set.EventURI("urn:siros:audit:identity:gate_bypass")
 )
 
 var (
@@ -48,6 +68,50 @@ type WebAuthnService struct {
 	logger          *zap.Logger
 	webauthn        *webauthn.WebAuthn
 	aaguidValidator *AAGUIDValidator
+	audit           *audit.Emitter
+	auditCfg        config.AuditConfig
+}
+
+// SetAuditEmitter attaches a SET audit emitter to the service, used to record
+// security-relevant events (currently: clone-authenticator warnings) in the
+// shared audit trail. Safe to call with nil, which leaves auditing disabled
+// (Emit/EmitWithSubject are no-ops on a nil *audit.Emitter).
+func (s *WebAuthnService) SetAuditEmitter(a *audit.Emitter) {
+	s.audit = a
+}
+
+// SetAuditIdentityConfig selects which enterprise-identity audit events are
+// emitted (see config.AuditConfig.IdentityEvents). The zero value emits none.
+func (s *WebAuthnService) SetAuditIdentityConfig(cfg config.AuditConfig) {
+	s.auditCfg = cfg
+}
+
+// auditIdentity emits an enterprise-identity audit event if that event is
+// selected in config. The subject is never emitted in the clear: it is
+// identified by a hash over issuer and subject.
+func (s *WebAuthnService) auditIdentity(name string, event set.EventURI, userID string, tenantID domain.TenantID, issuer, subject string, extra map[string]any) {
+	if s.audit == nil || !s.auditCfg.IdentityEventEnabled(name) {
+		return
+	}
+	data := map[string]any{
+		"user_id":   userID,
+		"tenant_id": string(tenantID),
+		"issuer":    issuer,
+	}
+	for k, v := range extra {
+		data[k] = v
+	}
+	subjectID := "user:" + userID
+	if subject != "" {
+		subjectID = subjectHash(issuer, subject)
+	}
+	s.audit.EmitWithSubject(event, subjectID, data)
+}
+
+// subjectHash returns a stable, non-reversible identifier for an OIDC subject.
+func subjectHash(issuer, subject string) string {
+	h := sha256.Sum256([]byte(issuer + "\x00" + subject))
+	return "sha256:" + hex.EncodeToString(h[:])
 }
 
 // ErrAAGUIDBlacklisted indicates the authenticator's AAGUID is blocked
@@ -250,6 +314,20 @@ type BeginRegistrationRequest struct {
 // BeginRegistration starts WebAuthn registration for a new user
 // If tenantId is provided, the user will be registered in that tenant
 func (s *WebAuthnService) BeginRegistration(ctx context.Context, req *BeginRegistrationRequest) (*BeginRegistrationResponse, error) {
+	// Invite codes are tenant-scoped (Invites().GetByCode requires a
+	// tenantID) and FinishRegistration's atomic invite claim is likewise
+	// only reachable when the challenge carries a tenantID. Without this
+	// guard, an invite code supplied alongside an empty tenantID would
+	// never be validated OR consumed at all: BeginRegistration's invite
+	// checks live entirely inside the `req.TenantID != ""` branch below, and
+	// FinishRegistration's completion-time claim is gated the same way — so
+	// that combination would silently create a global (non-tenant) account
+	// while leaving the referenced invite untouched, instead of being
+	// rejected. Fail closed here instead.
+	if req.InviteCode != "" && req.TenantID == "" {
+		return nil, ErrInvalidInvite
+	}
+
 	// Validate tenant exists if provided
 	var tenantID domain.TenantID
 	if req.TenantID != "" {
@@ -395,6 +473,19 @@ type FinishRegistrationRequest struct {
 	// OIDCGateBinding contains optional OIDC identity binding info (set by handler)
 	// This is populated from the OIDC gate middleware result when bind_identity is true
 	OIDCGateBinding *OIDCGateBinding `json:"-"` // Do not bind from JSON
+
+	// ExpectedTenantID, when set by the handler, must match the tenant
+	// BeginRegistration recorded on the challenge (challenge.TenantID).
+	// Handlers set this from their own validated tenant context (e.g. the
+	// X-Tenant-ID header, or the JWT tenant_id claim for an authenticated
+	// caller) so that a caller can't run BeginRegistration under one tenant
+	// and FinishRegistration under a different one - which would otherwise
+	// let tenant-scoped policy decisions the handler makes (e.g.
+	// bind_identity enforcement) run against the wrong tenant's config while
+	// the registration itself is still written under whatever tenant the
+	// challenge actually belongs to. Left empty, no check is performed (for
+	// callers that don't have this context). See issue #374/#395.
+	ExpectedTenantID string `json:"-"` // Do not bind from JSON
 }
 
 // OIDCGateBinding contains OIDC identity info for binding
@@ -403,12 +494,37 @@ type OIDCGateBinding struct {
 	Subject     string
 	Email       string
 	BindingType string // "registration" or "login"
+
+	// Audience, when set, is the audience the presented token was actually
+	// validated against (the tenant whose gate the caller passed - see
+	// AS PasskeyHandlers.LoginFinish, and internal/api/handlers.go's
+	// FinishWebAuthnLogin, which sets it the same way for /user/*).
+	// FinishLogin compares it against the CREDENTIAL's real tenant's LoginOP
+	// audience: without this, two tenants that share an OIDC issuer but use
+	// different client IDs/audiences could have a token valid for tenant A's
+	// app satisfy tenant B's login gate, since only Issuer was previously
+	// compared. Left empty (the default for any caller that doesn't set it),
+	// no audience check is performed - purely opt-in.
+	Audience string
+
+	// Claims, when set, are the full validated token claims (the same map
+	// the OIDC gate middleware itself checked against the HEADER tenant's
+	// OIDCGate.RequiredClaims). Set by both AS PasskeyHandlers.LoginFinish
+	// and internal/api/handlers.go's FinishWebAuthnLogin. FinishLogin
+	// re-checks them against the CREDENTIAL's real tenant's own
+	// RequiredClaims: Issuer and Audience matching isn't enough if two
+	// tenants share both but configure different RequiredClaims - a token
+	// accepted for a permissive tenant could otherwise satisfy a stricter
+	// tenant's login gate purely because the gate middleware only ever
+	// validated it against the header tenant's policy. Left nil (the
+	// default for any caller that doesn't set it), no claims re-check is
+	// performed - purely opt-in, like Audience above.
+	Claims jwt.MapClaims
 }
 
 // FinishRegistrationResponse contains the result of registration
 type FinishRegistrationResponse struct {
 	UUID              string                   `json:"uuid"`
-	Token             string                   `json:"appToken"`
 	DisplayName       string                   `json:"displayName"`
 	Username          string                   `json:"username,omitempty"`
 	PrivateData       taggedbinary.TaggedBytes `json:"privateData,omitempty"`
@@ -419,26 +535,47 @@ type FinishRegistrationResponse struct {
 
 // FinishRegistration completes WebAuthn registration
 func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishRegistrationRequest) (*FinishRegistrationResponse, error) {
-	// Get and validate challenge
-	challenge, err := s.store.Challenges().GetByID(ctx, req.ChallengeID)
+	// Atomically consume the challenge (single find-and-delete), constrained
+	// to the caller's validated tenant context (set by the handler) as part
+	// of the SAME atomic operation when one was given — see
+	// ExpectedTenantID's doc comment. This closes two TOCTOU windows at
+	// once: a separate GetByID+Delete lets concurrent callers presenting
+	// the same challengeId+assertion all read the challenge before any of
+	// them deletes it, and all pass verification (issue #379); and a
+	// tenant-mismatch check performed only AFTER an unconstrained consume
+	// would let a caller who merely knows a valid challenge ID submit it
+	// with the wrong tenant purely to burn the one-time challenge, denying
+	// the legitimate caller (with the matching tenant) the ability to ever
+	// finish it. ConsumeByIDForTenant guarantees at most one caller ever
+	// gets a non-nil challenge back for a given ID, and a tenant mismatch
+	// never touches the real challenge at all.
+	challenge, err := s.store.Challenges().ConsumeByIDForTenant(ctx, req.ChallengeID, req.ExpectedTenantID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
+			if req.ExpectedTenantID != "" {
+				// Distinguish "doesn't exist" from "tenant mismatch" only
+				// for the caller-facing error code, not the storage query
+				// itself (which is deliberately a single atomic op either
+				// way) — a non-existent challenge and a same-tenant lookup
+				// both already return ErrChallengeNotFound; we only need
+				// ErrTenantMismatch when a tenant context was actually
+				// supplied, matching the error this replaces.
+				if _, getErr := s.store.Challenges().GetByID(ctx, req.ChallengeID); getErr == nil {
+					return nil, ErrTenantMismatch
+				}
+			}
 			return nil, ErrChallengeNotFound
 		}
-		return nil, fmt.Errorf("failed to get challenge: %w", err)
+		return nil, fmt.Errorf("failed to consume challenge: %w", err)
 	}
 
 	if challenge.IsExpired() {
-		_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 		return nil, ErrChallengeExpired
 	}
 
 	if challenge.Action != "register" {
 		return nil, errors.New("invalid challenge action")
 	}
-
-	// Delete challenge (one-time use)
-	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 
 	// Check if this is a tenant-scoped registration
 	tenantID := domain.TenantID(challenge.TenantID)
@@ -641,7 +778,7 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 	user := &domain.User{
 		UUID:        userID,
 		DisplayName: &displayName,
-		DID:         fmt.Sprintf("did:key:%s", userID.String()),
+		DID:         domain.HolderDID(userID.String()),
 		WalletType:  domain.WalletTypeClient,
 		Keys:        req.Keys,
 		PrivateData: req.PrivateData,
@@ -668,6 +805,10 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 	}
 
 	if len(user.PrivateData) > 0 {
+		// Refuse before the invite is claimed or the user is created.
+		if err := validatePrivateDataOwnership(s.logger, userID, user.WebauthnCredentials, user.PrivateData); err != nil {
+			return nil, err
+		}
 		user.PrivateDataETag = domain.ComputePrivateDataETag(user.PrivateData)
 	}
 
@@ -698,10 +839,54 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 			zap.String("issuer", req.OIDCGateBinding.Issuer))
 	}
 
+	// Atomically consume the invite BEFORE creating the user account. The
+	// early IsUsable() check above and this atomic MarkCompleted are not
+	// atomic with each other, so a concurrent loser can still pass that
+	// early check while a winner's MarkCompleted has already committed; by
+	// gating user creation on MarkCompleted succeeding here, the loser is
+	// rejected before Users().Create()/AddMembership ever run, instead of
+	// after an account has already been committed (issue #378 — the invite
+	// single-use TOCTOU). MarkCompleted is a single atomic
+	// find-and-update-if-active operation in both storage backends, so only
+	// one concurrent caller can ever win it.
+	//
+	// A non-empty InviteCode with an empty tenantID is rejected up front in
+	// BeginRegistration and should therefore never reach a stored challenge,
+	// but fail closed here too as defense-in-depth: an invite code must
+	// always resolve to a real atomic claim, never be silently skipped.
+	if challenge.InviteCode != "" {
+		if tenantID == "" {
+			s.logger.Warn("Challenge carries an invite code but no tenant; rejecting registration",
+				zap.String("user_id", userID.String()))
+			return nil, ErrInvalidInvite
+		}
+		if err := s.store.Invites().MarkCompleted(ctx, tenantID, challenge.InviteCode, userID); err != nil {
+			invitePrefix := challenge.InviteCode
+			if len(invitePrefix) > 8 {
+				invitePrefix = invitePrefix[:8]
+			}
+			s.logger.Warn("Invite could not be atomically claimed; rejecting registration",
+				zap.Error(err),
+				zap.String("invite_code_prefix", invitePrefix),
+				zap.String("user_id", userID.String()))
+			return nil, ErrInvalidInvite
+		}
+	}
+
 	// Store the user
 	if err := s.store.Users().Create(ctx, user); err != nil {
 		s.logger.Error("Failed to create user", zap.Error(err))
 		return nil, fmt.Errorf("failed to create user: %w", err)
+	}
+
+	// Audit the binding only now that the user, and with it the bound
+	// identity, is persisted: an invite claim or Create failure above must
+	// not leave an immutable "bound" record for an identity that was never
+	// bound.
+	if req.OIDCGateBinding != nil && tenantID != "" {
+		s.auditIdentity(config.AuditIdentityBound, EventIdentityBound, userID.String(), tenantID,
+			req.OIDCGateBinding.Issuer, req.OIDCGateBinding.Subject,
+			map[string]any{"binding_type": req.OIDCGateBinding.BindingType})
 	}
 
 	// Add user to tenant if tenant-scoped registration
@@ -720,27 +905,10 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 				zap.String("tenant_id", string(tenantID)))
 		}
 
-		// Mark invite as completed if one was used
-		if challenge.InviteCode != "" {
-			if err := s.store.Invites().MarkCompleted(ctx, tenantID, challenge.InviteCode, userID); err != nil {
-				s.logger.Error("Failed to mark invite as completed — registration will be rolled back",
-					zap.Error(err),
-					zap.String("invite_code_prefix", challenge.InviteCode[:8]),
-					zap.String("user_id", userID.String()))
-				return nil, ErrInvalidInvite
-			}
-		}
-
 		// Get tenant display name for response
 		if tenant, err := s.store.Tenants().GetByID(ctx, tenantID); err == nil {
 			tenantDisplayName = tenant.DisplayName
 		}
-	}
-
-	// Generate JWT token with tenant_id included for security boundary
-	token, err := s.generateToken(user, tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate token: %w", err)
 	}
 
 	s.logger.Info("User registered via WebAuthn",
@@ -754,7 +922,6 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 
 	return &FinishRegistrationResponse{
 		UUID:              userID.String(),
-		Token:             token,
 		DisplayName:       displayName,
 		Username:          username,
 		PrivateData:       user.PrivateData,
@@ -843,8 +1010,6 @@ type FinishLoginRequest struct {
 // FinishLoginResponse contains the result of login
 type FinishLoginResponse struct {
 	UUID              string                   `json:"uuid"`
-	Token             string                   `json:"appToken"`
-	RefreshToken      string                   `json:"refreshToken,omitempty"` // Optional refresh token
 	DisplayName       string                   `json:"displayName"`
 	Username          string                   `json:"username,omitempty"`
 	PrivateData       taggedbinary.TaggedBytes `json:"privateData,omitempty"`
@@ -855,26 +1020,28 @@ type FinishLoginResponse struct {
 
 // FinishLogin completes WebAuthn authentication
 func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginRequest) (*FinishLoginResponse, error) {
-	// Get and validate challenge
-	challenge, err := s.store.Challenges().GetByID(ctx, req.ChallengeID)
+	// Atomically consume the challenge (single find-and-delete). Without
+	// this, N concurrent FinishLogin calls presenting the same
+	// challengeId+assertion could all read the challenge via GetByID before
+	// any of them called Delete, and all pass verification — confirmed on
+	// production as 16 parallel login_finish calls on one challenge
+	// producing 14 valid appTokens (issue #379). ConsumeByID guarantees at
+	// most one caller ever gets a non-nil challenge back for a given ID.
+	challenge, err := s.store.Challenges().ConsumeByID(ctx, req.ChallengeID)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil, ErrChallengeNotFound
 		}
-		return nil, fmt.Errorf("failed to get challenge: %w", err)
+		return nil, fmt.Errorf("failed to consume challenge: %w", err)
 	}
 
 	if challenge.IsExpired() {
-		_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 		return nil, ErrChallengeExpired
 	}
 
 	if challenge.Action != "login" {
 		return nil, errors.New("invalid challenge action")
 	}
-
-	// Delete challenge (one-time use)
-	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 
 	// Debug: log the credential data being parsed
 	credData := taggedbinary.MustDecodeJSON(req.Credential)
@@ -1074,9 +1241,21 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 		return nil, ErrVerificationFailed
 	}
 
-	// Update the credential's signature count
-	matchedCred.Authenticator.SignCount = credential.Authenticator.SignCount
-	user.UpdatedAt = time.Now()
+	// Keep the assertion's reported counter in a LOCAL value for
+	// logging/the atomic persist call below, rather than mutating
+	// matchedCred/the stored user object directly. This is the same
+	// aliasing hazard already documented (and fixed) for CloneWarning a few
+	// lines below: the memory store's GetByID returns the same pointer it
+	// holds internally rather than a copy (unlike MongoDB, which always
+	// decodes a fresh struct), so writing straight into matchedCred here
+	// would mutate the LIVE stored credential before
+	// UpdateCredentialAuthenticator's max-under-lock update ever runs — if
+	// 20 is stored and this assertion reports a regression to 10, the
+	// stored value would already be lowered to 10 by this line alone,
+	// defeating the monotonic $max/max-under-lock guarantee entirely (and
+	// racing unsynchronized against any other concurrent access to the same
+	// in-memory object). See go-wallet-backend#411.
+	newSignCount := credential.Authenticator.SignCount
 
 	// Log public key diagnostics for successful login
 	if s.logger.Core().Enabled(zap.DebugLevel) {
@@ -1086,13 +1265,94 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 			zap.String("user_id", userID.String()),
 			zap.String("stored_public_key_sha256", storedPublicKeyHash),
 			zap.Int("stored_public_key_len", storedPublicKeyLen),
-			zap.Uint32("sign_count", matchedCred.Authenticator.SignCount),
+			zap.Uint32("sign_count", newSignCount),
 		)
 	}
 
-	if err := s.store.Users().Update(ctx, user); err != nil {
-		s.logger.Error("Failed to update user", zap.Error(err))
-		// Don't fail login for this
+	// SECURITY: persist SignCount/CloneWarning via a single atomic,
+	// field-scoped update rather than the whole-document Update()/ReplaceOne
+	// used elsewhere. A read-then-write mitigation (re-reading the stored
+	// CloneWarning immediately before a ReplaceOne and OR-ing it in) was
+	// tried here first and was correctly flagged in review as still racy:
+	// two concurrent logins can both observe CloneWarning==false, and
+	// whichever one's ReplaceOne lands last — even if it's the "clean" one
+	// that read before the "clone detected" one wrote — clobbers the whole
+	// document with its own stale, false snapshot. There is no read-then-write
+	// window that closes that: it needs the storage layer itself to make
+	// the write conditional/OR-only in one round trip.
+	// UpdateCredentialAuthenticator does exactly that (MongoDB: a single
+	// UpdateOne with an arrayFilter that only ever includes clone_warning in
+	// its $set when true, never explicitly writing false — omitting the
+	// field leaves whatever is currently stored untouched; memory: the same
+	// OR-only assignment under one mutex acquisition). No concurrent
+	// ordering of two such calls can ever result in a true being overwritten
+	// by a false.
+	//
+	// It also reports whether THIS call is the one that actually flipped
+	// CloneWarning from false to true — a real compare-and-set outcome from
+	// the storage layer, not a locally precomputed guess. That distinction
+	// matters under concurrency: two logins on separate challenges can both
+	// read a stale CloneWarning=false before either persists, so a local
+	// "was it already true when I read it" check (as an earlier version of
+	// this fix used) would let both independently conclude "newly
+	// detected" and both emit the security event — a duplicate. Gating the
+	// emission on the atomic transition result instead means only the one
+	// call that actually won the race reports it.
+	transitioned, err := s.store.Users().UpdateCredentialAuthenticator(ctx, userID, credentialID, newSignCount, credential.Authenticator.CloneWarning)
+	if err != nil {
+		s.logger.Error("Failed to update credential authenticator", zap.Error(err))
+		// Don't fail login for this — but if a clone was genuinely detected
+		// on THIS assertion, the persistence failure must not also silently
+		// swallow the security signal itself. transitioned is unreliable
+		// here (the atomic call never got to compare-and-set), so this is a
+		// distinct, separately-greppable event from the normal
+		// "webauthn_clone_warning" line below — it says "detected, but we
+		// don't know if this made it into storage", not "confirmed newly
+		// latched". See go-wallet-backend#411.
+		if credential.Authenticator.CloneWarning {
+			s.logger.Error("possible cloned authenticator detected but the warning failed to persist",
+				zap.String("security_event", "webauthn_clone_warning_persist_failed"),
+				zap.String("user_id", userID.String()),
+				zap.String("tenant_id", string(tenantID)),
+				zap.String("credential_id", credentialID),
+				zap.Uint32("sign_count", newSignCount),
+				zap.Error(err),
+			)
+			s.audit.EmitWithSubject(EventWebAuthnCloneWarning, credentialID, map[string]any{
+				"user_id":    userID.String(),
+				"tenant_id":  string(tenantID),
+				"sign_count": newSignCount,
+				"persisted":  false,
+			})
+		}
+	}
+
+	// SECURITY: go-webauthn sets CloneWarning when the authenticator's
+	// signature counter regressed relative to what we have stored — the
+	// standard signal that this credential's private key has been cloned
+	// onto a second authenticator. We deliberately still let the login
+	// through (a single stateful counter is a weak signal in isolation, and
+	// some legitimate authenticators never increment it), but the warning
+	// must never be silently swallowed: log it as a distinct, greppable
+	// security-event line and, when audit is enabled, record it in the
+	// shared SET audit trail so it can be alerted on and investigated
+	// (issue #380). Gated on the atomic false-to-true transition reported by
+	// UpdateCredentialAuthenticator above, not the raw flag, so this fires
+	// exactly once per actual detection — even under concurrent logins —
+	// rather than on every subsequent login or being duplicated by a race.
+	if transitioned {
+		s.logger.Warn("possible cloned authenticator detected",
+			zap.String("security_event", "webauthn_clone_warning"),
+			zap.String("user_id", userID.String()),
+			zap.String("tenant_id", string(tenantID)),
+			zap.String("credential_id", credentialID),
+			zap.Uint32("sign_count", newSignCount),
+		)
+		s.audit.EmitWithSubject(EventWebAuthnCloneWarning, credentialID, map[string]any{
+			"user_id":    userID.String(),
+			"tenant_id":  string(tenantID),
+			"sign_count": newSignCount,
+		})
 	}
 
 	// SECURITY: Enforce OIDC gate based on the credential's tenant (not header tenant)
@@ -1110,6 +1370,7 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 			s.logger.Warn("Login gate required but no OIDC binding provided",
 				zap.String("user_id", userID.String()),
 				zap.String("tenant_id", string(tenantID)))
+			s.auditIdentity(config.AuditIdentityGateBypass, EventIdentityGateBypass, userID.String(), tenantID, "", "", nil)
 			return nil, ErrOIDCGateRequired
 		}
 
@@ -1127,7 +1388,51 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 				zap.String("tenant_id", string(tenantID)),
 				zap.String("expected_issuer", loginOP.Issuer),
 				zap.String("actual_issuer", req.OIDCGateBinding.Issuer))
+			s.auditIdentity(config.AuditIdentityMismatch, EventIdentityMismatch, userID.String(), tenantID,
+				req.OIDCGateBinding.Issuer, req.OIDCGateBinding.Subject,
+				map[string]any{"reason": "issuer", "expected_issuer": loginOP.Issuer})
 			return nil, ErrOIDCGateRequired // Reject with gate required - token was for wrong OP
+		}
+
+		// SECURITY: when the caller recorded which audience the token was
+		// actually validated against (see OIDCGateBinding.Audience's doc
+		// comment), it must match this tenant's own configured audience too.
+		// Two tenants can share an issuer (e.g. a shared multi-tenant IdP
+		// domain) while using different client IDs/audiences per app; issuer
+		// alone isn't enough to prove the token was meant for THIS tenant.
+		if req.OIDCGateBinding.Audience != "" && req.OIDCGateBinding.Audience != loginOP.EffectiveAudience() {
+			s.logger.Warn("OIDC binding audience mismatch",
+				zap.String("user_id", userID.String()),
+				zap.String("tenant_id", string(tenantID)),
+				zap.String("expected_audience", loginOP.EffectiveAudience()),
+				zap.String("actual_audience", req.OIDCGateBinding.Audience))
+			s.auditIdentity(config.AuditIdentityMismatch, EventIdentityMismatch, userID.String(), tenantID,
+				req.OIDCGateBinding.Issuer, req.OIDCGateBinding.Subject,
+				map[string]any{"reason": "audience"})
+			return nil, ErrOIDCGateRequired // Reject with gate required - token was for the wrong app
+		}
+
+		// SECURITY: when the caller recorded the token's full validated
+		// claims (see OIDCGateBinding.Claims's doc comment), re-check them
+		// against THIS tenant's own RequiredClaims. Issuer and Audience
+		// matching alone isn't enough: two tenants can share both while
+		// configuring different RequiredClaims, and the OIDC gate middleware
+		// only ever validated the token against the HEADER tenant's
+		// RequiredClaims - not the credential's real tenant's.
+		if req.OIDCGateBinding.Claims != nil && len(tenant.OIDCGate.RequiredClaims) > 0 {
+			for key, expected := range tenant.OIDCGate.RequiredClaims {
+				actual, exists := req.OIDCGateBinding.Claims[key]
+				if !exists || !oidc.ClaimsMatch(expected, actual) {
+					s.logger.Warn("OIDC binding required-claims mismatch",
+						zap.String("user_id", userID.String()),
+						zap.String("tenant_id", string(tenantID)),
+						zap.String("claim", key))
+					s.auditIdentity(config.AuditIdentityMismatch, EventIdentityMismatch, userID.String(), tenantID,
+						req.OIDCGateBinding.Issuer, req.OIDCGateBinding.Subject,
+						map[string]any{"reason": "required_claims", "claim": key})
+					return nil, ErrOIDCGateRequired
+				}
+			}
 		}
 
 		// If bind_identity is enabled, verify the enterprise identity matches
@@ -1137,6 +1442,9 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 				s.logger.Warn("User has no bound enterprise identity for tenant",
 					zap.String("user_id", userID.String()),
 					zap.String("tenant_id", string(tenantID)))
+				s.auditIdentity(config.AuditIdentityMismatch, EventIdentityMismatch, userID.String(), tenantID,
+					req.OIDCGateBinding.Issuer, req.OIDCGateBinding.Subject,
+					map[string]any{"reason": "not_bound"})
 				return nil, ErrIdentityNotBound
 			}
 
@@ -1150,6 +1458,15 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 					zap.String("actual_issuer", req.OIDCGateBinding.Issuer),
 					zap.String("expected_subject", existingIdentity.Subject),
 					zap.String("actual_subject", req.OIDCGateBinding.Subject))
+				s.auditIdentity(config.AuditIdentityMismatch, EventIdentityMismatch, userID.String(), tenantID,
+					req.OIDCGateBinding.Issuer, req.OIDCGateBinding.Subject,
+					map[string]any{
+						"reason":          "identity",
+						"expected_issuer": existingIdentity.Issuer,
+						// Hash of the bound identity, so the two can be compared
+						// without either subject appearing in the audit trail.
+						"expected_subject_hash": subjectHash(existingIdentity.Issuer, existingIdentity.Subject),
+					})
 				return nil, ErrIdentityBindingMismatch
 			}
 
@@ -1157,17 +1474,10 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 				zap.String("user_id", userID.String()),
 				zap.String("tenant_id", string(tenantID)),
 				zap.String("issuer", req.OIDCGateBinding.Issuer))
+			s.auditIdentity(config.AuditIdentityVerified, EventIdentityVerified, userID.String(), tenantID,
+				req.OIDCGateBinding.Issuer, req.OIDCGateBinding.Subject, nil)
 		}
 	}
-
-	// Generate JWT token with tenant_id included for security boundary
-	token, err := s.generateToken(user, tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate token: %w", err)
-	}
-
-	// Generate refresh token (if enabled)
-	refreshToken, _ := s.generateRefreshToken(user, tenantID) // Ignore error, refresh is optional
 
 	displayName := ""
 	if user.DisplayName != nil {
@@ -1189,151 +1499,12 @@ func (s *WebAuthnService) FinishLogin(ctx context.Context, req *FinishLoginReque
 
 	return &FinishLoginResponse{
 		UUID:              userID.String(),
-		Token:             token,
-		RefreshToken:      refreshToken,
 		DisplayName:       displayName,
 		Username:          username,
 		PrivateData:       user.PrivateData,
 		WebauthnRpId:      s.cfg.Server.RPID,
 		TenantID:          string(tenantID),
 		TenantDisplayName: tenantDisplayName,
-	}, nil
-}
-
-func (s *WebAuthnService) generateToken(user *domain.User, tenantID domain.TenantID) (string, error) {
-	// For backward compatibility, default to "default" tenant if not specified
-	if tenantID == "" {
-		tenantID = domain.DefaultTenantID
-	}
-
-	now := time.Now()
-	jti := generateChallengeID() // Generate unique token ID
-
-	claims := jwt.MapClaims{
-		"user_id":   user.UUID.String(),
-		"did":       user.DID,
-		"tenant_id": string(tenantID),
-		"iat":       now.Unix(),
-		"nbf":       now.Unix(),                                                       // Not Before: token valid from now
-		"exp":       now.Add(time.Duration(s.cfg.JWT.ExpiryHours) * time.Hour).Unix(), // Expiry
-		"iss":       s.cfg.JWT.Issuer,
-		"aud":       s.cfg.Server.RPID, // Audience: the RP ID
-		"jti":       jti,               // JWT ID: unique identifier for revocation
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString([]byte(s.cfg.JWT.Secret))
-}
-
-// generateRefreshToken creates a long-lived refresh token for token renewal
-func (s *WebAuthnService) generateRefreshToken(user *domain.User, tenantID domain.TenantID) (string, error) {
-	if s.cfg.JWT.RefreshDays <= 0 {
-		// Refresh tokens disabled
-		return "", nil
-	}
-
-	if tenantID == "" {
-		tenantID = domain.DefaultTenantID
-	}
-
-	now := time.Now()
-	jti := generateChallengeID()
-
-	claims := jwt.MapClaims{
-		"user_id":   user.UUID.String(),
-		"tenant_id": string(tenantID),
-		"type":      "refresh", // Mark as refresh token
-		"iat":       now.Unix(),
-		"nbf":       now.Unix(),
-		"exp":       now.AddDate(0, 0, s.cfg.JWT.RefreshDays).Unix(), // Expires in RefreshDays
-		"iss":       s.cfg.JWT.Issuer,
-		"aud":       s.cfg.Server.RPID,
-		"jti":       jti,
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString([]byte(s.cfg.JWT.Secret))
-}
-
-// ErrInvalidRefreshToken indicates the refresh token is invalid or expired
-var ErrInvalidRefreshToken = errors.New("invalid or expired refresh token")
-
-// RefreshTokenRequest contains the request for refreshing an access token
-type RefreshTokenRequest struct {
-	RefreshToken string `json:"refreshToken"`
-}
-
-// RefreshTokenResponse contains the new tokens
-type RefreshTokenResponse struct {
-	Token        string `json:"appToken"`
-	RefreshToken string `json:"refreshToken,omitempty"`
-}
-
-// RefreshAccessToken exchanges a valid refresh token for a new access token
-func (s *WebAuthnService) RefreshAccessToken(ctx context.Context, req *RefreshTokenRequest) (*RefreshTokenResponse, error) {
-	if s.cfg.JWT.RefreshDays <= 0 {
-		return nil, fmt.Errorf("refresh tokens are disabled")
-	}
-
-	// Parse the refresh token
-	token, err := jwt.Parse(req.RefreshToken, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, jwt.ErrSignatureInvalid
-		}
-		return []byte(s.cfg.JWT.Secret), nil
-	})
-
-	if err != nil || !token.Valid {
-		return nil, ErrInvalidRefreshToken
-	}
-
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		return nil, ErrInvalidRefreshToken
-	}
-
-	// Verify this is a refresh token
-	tokenType, _ := claims["type"].(string)
-	if tokenType != "refresh" {
-		return nil, ErrInvalidRefreshToken
-	}
-
-	// Extract user and tenant info
-	userIDStr, ok := claims["user_id"].(string)
-	if !ok {
-		return nil, ErrInvalidRefreshToken
-	}
-	userID := domain.UserIDFromString(userIDStr)
-
-	tenantIDStr, _ := claims["tenant_id"].(string)
-	tenantID := domain.TenantID(tenantIDStr)
-
-	// Get the user (verify they still exist)
-	user, err := s.store.Users().GetByID(ctx, userID)
-	if err != nil {
-		s.logger.Warn("Refresh token for non-existent user",
-			zap.String("user_id", userIDStr),
-		)
-		return nil, ErrInvalidRefreshToken
-	}
-
-	// Generate new access token
-	accessToken, err := s.generateToken(user, tenantID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate access token: %w", err)
-	}
-
-	// Generate new refresh token (rotation for security)
-	newRefreshToken, _ := s.generateRefreshToken(user, tenantID)
-
-	s.logger.Info("Access token refreshed",
-		zap.String("user_id", userIDStr),
-		zap.String("tenant_id", tenantIDStr),
-	)
-
-	return &RefreshTokenResponse{
-		Token:        accessToken,
-		RefreshToken: newRefreshToken,
 	}, nil
 }
 
@@ -1485,30 +1656,33 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 		return nil, err
 	}
 
-	// Get and validate challenge
-	challenge, err := s.store.Challenges().GetByID(ctx, req.ChallengeID)
+	// Atomically consume the challenge, constrained to this authenticated
+	// caller's own userID as part of the SAME atomic find-and-delete (not a
+	// separate check performed after consuming). This path is unlike
+	// FinishRegistration/FinishLogin: the caller here is already
+	// authenticated, and the challenge additionally carries an owning
+	// userID that must match. Plain ConsumeByID would let a caller who
+	// somehow obtains another user's add-credential challenge ID
+	// permanently burn that user's pending ceremony — it would consume
+	// (delete) the real owner's challenge before the ownership mismatch was
+	// ever checked. ConsumeByIDForUser folds the ownership check into the
+	// atomic filter itself, so a mismatched caller gets ErrNotFound without
+	// ever touching the real owner's challenge.
+	challenge, err := s.store.Challenges().ConsumeByIDForUser(ctx, req.ChallengeID, userID.String())
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return nil, ErrChallengeNotFound
 		}
-		return nil, fmt.Errorf("failed to get challenge: %w", err)
+		return nil, fmt.Errorf("failed to consume challenge: %w", err)
 	}
 
 	if challenge.IsExpired() {
-		_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 		return nil, ErrChallengeExpired
 	}
 
 	if challenge.Action != "add_credential" {
 		return nil, errors.New("invalid challenge action")
 	}
-
-	if challenge.UserID != userID.String() {
-		return nil, errors.New("challenge user mismatch")
-	}
-
-	// Delete challenge (one-time use)
-	_ = s.store.Challenges().Delete(ctx, req.ChallengeID)
 
 	waUser := &WebAuthnUser{user: user}
 
@@ -1559,13 +1733,6 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 		}
 	}
 
-	// Check private data ETag if updating
-	if len(req.PrivateData) > 0 && ifMatch != "" {
-		if user.PrivateDataETag != ifMatch {
-			return nil, ErrPrivateDataConflict
-		}
-	}
-
 	// Add the new credential
 	nickname := req.Nickname
 	if nickname == "" {
@@ -1595,17 +1762,28 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 		CreatedAt: now,
 	}
 
-	user.WebauthnCredentials = append(user.WebauthnCredentials, newCred)
-
-	// Update private data if provided
-	if len(req.PrivateData) > 0 {
-		user.PrivateData = req.PrivateData
-		user.PrivateDataETag = domain.ComputePrivateDataETag(req.PrivateData)
-	}
-
-	user.UpdatedAt = now
-
-	if err := s.store.Users().Update(ctx, user); err != nil {
+	// Atomically append the credential and (optionally) replace private data,
+	// checking the private data ETag against the current record.
+	stored, err := s.store.Users().Modify(ctx, userID, func(u *domain.User) error {
+		if len(req.PrivateData) > 0 && ifMatch != "" && ifMatch != u.EffectivePrivateDataETag() {
+			return ErrPrivateDataConflict
+		}
+		u.WebauthnCredentials = append(u.WebauthnCredentials, newCred)
+		if len(req.PrivateData) > 0 {
+			// The container legitimately carries the new credential, so it is
+			// judged against the list that includes it, inside the callback so
+			// the check and the write see the same record.
+			if err := validatePrivateDataOwnership(s.logger, userID, u.WebauthnCredentials, req.PrivateData); err != nil {
+				return err
+			}
+			u.UpdatePrivateData(req.PrivateData)
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrPrivateDataConflict) || errors.Is(err, storage.ErrNotFound) || errors.Is(err, ErrPrivateDataOwnership) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("failed to update user: %w", err)
 	}
 
@@ -1614,7 +1792,7 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 	return &FinishAddCredentialResponse{
 		// Return base64url encoded ID to match the stored format
 		CredentialID:    base64.RawURLEncoding.EncodeToString(credential.ID),
-		PrivateDataETag: user.PrivateDataETag,
+		PrivateDataETag: stored.EffectivePrivateDataETag(),
 	}, nil
 }
 

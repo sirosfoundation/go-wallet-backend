@@ -22,6 +22,7 @@ type Store struct {
 	invites         *InviteStore
 	walletInstances *WalletInstanceStore
 	keyAttestations *KeyAttestationStore
+	appAttestKeys   *AppAttestKeyStore
 }
 
 // NewStore creates a new in-memory store
@@ -38,6 +39,7 @@ func NewStore() *Store {
 		invites:         &InviteStore{data: make(map[string]*domain.Invite)},
 		walletInstances: &WalletInstanceStore{data: make(map[string]*domain.WalletInstance)},
 		keyAttestations: &KeyAttestationStore{data: make(map[string]*domain.KeyAttestationRecord)},
+		appAttestKeys:   &AppAttestKeyStore{data: make(map[string]*domain.AppAttestKeyRecord)},
 	}
 
 	// Create default tenant
@@ -64,6 +66,7 @@ func (s *Store) Verifiers() storage.VerifierStore             { return s.verifie
 func (s *Store) Invites() storage.InviteStore                 { return s.invites }
 func (s *Store) WalletInstances() storage.WalletInstanceStore { return s.walletInstances }
 func (s *Store) KeyAttestations() storage.KeyAttestationStore { return s.keyAttestations }
+func (s *Store) AppAttestKeys() storage.AppAttestKeyStore     { return s.appAttestKeys }
 func (s *Store) Close() error                                 { return nil }
 func (s *Store) Ping(ctx context.Context) error               { return nil }
 
@@ -240,6 +243,27 @@ type UserStore struct {
 	data map[string]*domain.User
 }
 
+// deepCopyUser returns an independent copy of user, safe to read and even
+// mutate (as long as the mutation is then persisted via Update()) without
+// synchronization. The in-memory map stores *domain.User pointers directly,
+// so handing out that same pointer from a Get* method (as this store used
+// to) means any concurrent writer holding s.mu.Lock() (e.g.
+// UpdateCredentialAuthenticator) can mutate fields - notably
+// WebauthnCredentials[i].Authenticator.SignCount/CloneWarning - while a
+// caller that already released its RLock is still reading through the
+// pointer returned by an earlier Get*, e.g. inside FinishLogin building
+// go-webauthn credentials. That's an unsynchronized concurrent read/write
+// of the same memory: a real Go data race (flagged by `go test -race` once
+// exercised, and reported directly by Copilot review on #388), and it's
+// also a behavioral divergence from the MongoDB backend, whose driver
+// always decodes a fresh, independent copy per call. Deep-copying here
+// closes both: every Get* caller gets its own snapshot, matching Mongo's
+// semantics, and the returned copy can never be mutated by a concurrent
+// writer underneath it.
+func deepCopyUser(user *domain.User) *domain.User {
+	return user.Clone()
+}
+
 func (s *UserStore) Create(ctx context.Context, user *domain.User) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -250,7 +274,8 @@ func (s *UserStore) Create(ctx context.Context, user *domain.User) error {
 
 	user.CreatedAt = time.Now()
 	user.UpdatedAt = time.Now()
-	s.data[user.UUID.String()] = user
+	// Store a private copy so callers cannot mutate shared state.
+	s.data[user.UUID.String()] = deepCopyUser(user)
 	return nil
 }
 
@@ -262,7 +287,7 @@ func (s *UserStore) GetByID(ctx context.Context, id domain.UserID) (*domain.User
 	if !exists {
 		return nil, storage.ErrNotFound
 	}
-	return user, nil
+	return deepCopyUser(user), nil
 }
 
 func (s *UserStore) GetByUsername(ctx context.Context, username string) (*domain.User, error) {
@@ -271,7 +296,7 @@ func (s *UserStore) GetByUsername(ctx context.Context, username string) (*domain
 
 	for _, user := range s.data {
 		if user.Username != nil && *user.Username == username {
-			return user, nil
+			return deepCopyUser(user), nil
 		}
 	}
 	return nil, storage.ErrNotFound
@@ -283,23 +308,35 @@ func (s *UserStore) GetByDID(ctx context.Context, did string) (*domain.User, err
 
 	for _, user := range s.data {
 		if user.DID == did {
-			return user, nil
+			return deepCopyUser(user), nil
 		}
 	}
 	return nil, storage.ErrNotFound
 }
 
-func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
+// Modify atomically applies fn to the stored user while holding the write lock.
+func (s *UserStore) Modify(ctx context.Context, id domain.UserID, fn storage.UserModifier) (*domain.User, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.data[user.UUID.String()]; !exists {
-		return storage.ErrNotFound
+	current, exists := s.data[id.String()]
+	if !exists {
+		return nil, storage.ErrNotFound
 	}
 
-	user.UpdatedAt = time.Now()
-	s.data[user.UUID.String()] = user
-	return nil
+	working := deepCopyUser(current)
+	if err := fn(working); err != nil {
+		return nil, err
+	}
+	working.UUID = current.UUID
+	working.Version = current.Version + 1
+	working.UpdatedAt = time.Now()
+	// fn may have attached caller-owned memory to working (for example
+	// UpdatePrivateData(data) keeps the slice it is given), so commit a private
+	// copy: later mutation of the caller's data must not change stored state.
+	stored := deepCopyUser(working)
+	s.data[id.String()] = stored
+	return deepCopyUser(stored), nil
 }
 
 func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
@@ -314,22 +351,42 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 	return nil
 }
 
-func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error {
+func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	user, exists := s.data[id.String()]
 	if !exists {
-		return storage.ErrNotFound
+		return false, storage.ErrNotFound
 	}
 
-	// Check ETag for optimistic locking
-	if ifMatch != "" && user.PrivateDataETag != ifMatch {
-		return storage.ErrInvalidInput
+	for i := range user.WebauthnCredentials {
+		if user.WebauthnCredentials[i].ID == credentialID {
+			// Monotonic non-decreasing, matching MongoDB's $max semantics
+			// (see the interface doc comment and the Mongo implementation
+			// for why an unconditional overwrite is unsafe here).
+			if signCount > user.WebauthnCredentials[i].Authenticator.SignCount {
+				user.WebauthnCredentials[i].Authenticator.SignCount = signCount
+			}
+			// Compare-and-set, under the same lock as the read: this is the
+			// authoritative "did I just cause the false->true transition"
+			// answer, safe from the duplicate-event race a caller-side
+			// precomputed comparison would be vulnerable to.
+			transitioned := cloneWarning && !user.WebauthnCredentials[i].Authenticator.CloneWarning
+			// OR-only: never write false over an existing true.
+			if cloneWarning {
+				user.WebauthnCredentials[i].Authenticator.CloneWarning = true
+			}
+			user.UpdatedAt = time.Now()
+			// Same contract as the Mongo implementation: every write to the
+			// user document bumps its version.
+			user.Version++
+			return transitioned, nil
+		}
 	}
-
-	user.UpdatePrivateData(data)
-	return nil
+	// User exists but no credential with that ID: silent no-op success,
+	// matching MongoDB's arrayFilter semantics (see interface doc comment).
+	return false, nil
 }
 
 // CredentialStore implements in-memory credential storage
@@ -529,6 +586,42 @@ func (s *ChallengeStore) GetByID(ctx context.Context, id string) (*domain.Webaut
 	if !exists {
 		return nil, storage.ErrNotFound
 	}
+	return challenge, nil
+}
+
+func (s *ChallengeStore) ConsumeByID(ctx context.Context, id string) (*domain.WebauthnChallenge, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	challenge, exists := s.data[id]
+	if !exists {
+		return nil, storage.ErrNotFound
+	}
+	delete(s.data, id)
+	return challenge, nil
+}
+
+func (s *ChallengeStore) ConsumeByIDForUser(ctx context.Context, id string, userID string) (*domain.WebauthnChallenge, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	challenge, exists := s.data[id]
+	if !exists || challenge.UserID != userID {
+		return nil, storage.ErrNotFound
+	}
+	delete(s.data, id)
+	return challenge, nil
+}
+
+func (s *ChallengeStore) ConsumeByIDForTenant(ctx context.Context, id string, expectedTenantID string) (*domain.WebauthnChallenge, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	challenge, exists := s.data[id]
+	if !exists || (expectedTenantID != "" && challenge.TenantID != expectedTenantID) {
+		return nil, storage.ErrNotFound
+	}
+	delete(s.data, id)
 	return challenge, nil
 }
 

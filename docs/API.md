@@ -21,11 +21,26 @@ See [openapi-admin.yaml](./openapi-admin.yaml) for the complete OpenAPI 3.0 spec
 
 ## Authentication
 
-Most endpoints require a JWT token in the `Authorization` header:
+Most endpoints require an access token issued by the Authorization Server in the `Authorization` header:
 
 ```
 Authorization: Bearer <token>
 ```
+
+Access tokens are short-lived, asymmetrically signed (ES256/ES384/EdDSA) JWTs. A client obtains one
+by authenticating with a passkey (or OIDC) in **session mode** and then calling the token endpoint:
+
+1. `POST /auth/passkey/login/begin` and `POST /auth/passkey/login/finish` (registration:
+   `/auth/passkey/register/{begin,finish}`) with the header `X-Token-Mode: session`. The
+   finish step sets the `__Host-session` cookie; the body carries no token.
+2. `POST /auth/token` (with the session cookie) returns an access token for a given
+   audience; keys are published at `/auth/.well-known/jwks.json`.
+3. `DELETE /auth/session` ends the session.
+
+The legacy HS256 `appToken` flow (`/user/register-webauthn-*`, `/user/login-webauthn-*`,
+`/user/session/refresh`, requests without `X-Token-Mode: session`) was removed and answers
+`410 {"error":"legacy_tokens_disabled"}`; HS256 bearer tokens are rejected with 401. See
+[new-as.md](new-as.md#removal-of-the-legacy-as).
 
 ## Endpoints
 
@@ -47,99 +62,54 @@ Health check endpoint.
 
 ### User Management
 
-#### POST /user/register
+#### POST /user/register and POST /user/login
 
-Register a new user.
+Removed. Password authentication no longer exists; both endpoints return
+HTTP 410 Gone. Use the WebAuthn endpoints below.
 
-**Request:**
-```json
-{
-  "username": "alice",
-  "display_name": "Alice Smith",
-  "password": "secret123",
-  "wallet_type": "db"
-}
-```
+#### POST /auth/passkey/register/begin and POST /auth/passkey/register/finish
 
-**Response:**
-```json
-{
-  "user_id": "550e8400-e29b-41d4-a716-446655440000",
-  "did": "did:key:550e8400-e29b-41d4-a716-446655440000",
-  "display_name": "Alice Smith"
-}
-```
+Passwordless WebAuthn registration. Send `X-Token-Mode: session` (and `X-Tenant-ID` for a tenant).
+`begin` returns `{"challengeId", "createOptions": {"publicKey": {...}}}`; `finish` takes
+`{"challengeId", "credential": {...}, "displayName", "privateData"}` and, on success, creates an
+AS session (cookie) and returns `{"uuid", "displayName", "tenantId", "tenantDisplayName"}`.
+A non-empty `privateData` is subject to the ownership check described under
+[Private data ownership](#private-data-ownership); a refusal is HTTP 422 and creates no account.
 
-#### POST /user/login
+#### Private data ownership
 
-Login with username and password.
+Every endpoint that writes a user's private data validates the container before storing it:
+`POST /user/session/private-data`, `POST /user/session/webauthn/credential/:id/delete` (the
+`privateData` in the body), `POST /user/session/webauthn/register-finish` (the optional
+`privateData`, checked against the credential list including the newly added credential) and
+`POST /auth/passkey/register/finish`.
 
-**Request:**
-```json
-{
-  "username": "alice",
-  "password": "secret123"
-}
-```
+The container is the privatedata-spec JSON `{mainKey, prfKeys[], jwe}` in which every
+`prfKeys[].credentialId` is tagged binary (`{"$b64u": "..."}`). Credential IDs are compared as
+raw bytes: the container's value (base64url, padded or not) is matched against each stored
+credential's `CredentialID` bytes and against its stored ID text decoded as url-safe or standard
+base64, padded or not, so accounts that stored the ID in another encoding still match. The
+write is accepted when at least one `credentialId` is among the user's registered WebAuthn credentials (for credential deletion: among the credentials
+that remain). It is refused when:
 
-**Response:**
-```json
-{
-  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "user_id": "550e8400-e29b-41d4-a716-446655440000",
-  "display_name": "Alice Smith"
-}
-```
+- no `credentialId` matches a registered credential;
+- `prfKeys` is empty;
+- `jwe` is missing, null, not a string, or not a compact JWE (five dot-separated parts with a
+  non-empty header and ciphertext); nothing is decrypted;
+- `mainKey` is present but not an object (an absent `mainKey` is accepted, as older containers omit it);
+- the data is not a valid container (not JSON, JSON `null`, `prfKeys` missing, null or not an
+  array, an entry that is not an object, or a `credentialId` that is not valid tagged base64url).
 
-#### POST /user/webauthn/register/start
+A refusal is **HTTP 422** with body `{"error": "private_data_ownership"}`, distinct from the 412
+ETag conflict, and leaves the stored private data, its ETag and the credential list unchanged.
+The server never logs container contents, only the user id and a reason. `If-Match` is not
+required by this check.
 
-Start WebAuthn registration (passwordless).
+#### POST /auth/passkey/login/begin and POST /auth/passkey/login/finish
 
-**Request:**
-```json
-{
-  "username": "alice",
-  "display_name": "Alice Smith"
-}
-```
-
-**Response:**
-```json
-{
-  "options": {
-    "publicKey": {
-      "challenge": "...",
-      "rp": {...},
-      "user": {...},
-      "pubKeyCredParams": [...]
-    }
-  }
-}
-```
-
-#### POST /user/webauthn/register/finish
-
-Finish WebAuthn registration.
-
-**Request:**
-```json
-{
-  "credential": {
-    "id": "...",
-    "rawId": "...",
-    "response": {...},
-    "type": "public-key"
-  }
-}
-```
-
-**Response:**
-```json
-{
-  "user_id": "550e8400-e29b-41d4-a716-446655440000",
-  "did": "did:key:..."
-}
-```
+Same shape for login: `begin` returns `{"challengeId", "getOptions": {"publicKey": {...}}}`;
+`finish` takes `{"challengeId", "credential": {...}}`, sets the session cookie and returns the same
+body as registration.
 
 ---
 
@@ -327,6 +297,178 @@ Get all registered verifiers.
   }
 ]
 ```
+
+---
+
+### Token Status Lists
+
+#### POST /status/v1/lists
+
+Fetches, verifies and trust-evaluates one or more IETF Token Status Lists
+([draft-ietf-oauth-status-list](https://datatracker.ietf.org/doc/draft-ietf-oauth-status-list/))
+on behalf of the client and returns them. Clients (web frontend, Kotlin SDK,
+Swift SDK) call this **in the background** to learn whether their credentials
+were revoked or suspended. **The wallet engine does not check status when you
+present**; see [ADR-013](adr/013-status-checking-outside-the-engine.md).
+
+The client **trusts the backend's verification** and reads its own credential's
+entry from the returned list **locally**. The backend never learns which
+credential, or which index, a client is interested in, only which list.
+
+Authenticated callers only (`Authorization: Bearer <token>`, audience
+`wallet-backend`, `tac` containing `r` when go-tokenauth is enforced); anonymous
+tokens are rejected. Rate limited per user (falling back to the tenant), see
+`status_check.rate_limit`. OpenAPI: [openapi-status.yaml](openapi-status.yaml).
+
+**Request:**
+```json
+{
+  "lists": [
+    { "uri": "https://status.example.org/statuslists/7", "etag": "\"1f2e3d4c5b6a79881f2e3d4c5b6a7988\"" }
+  ]
+}
+```
+
+- `lists`: 1 to `status_check.max_lists_per_request` items (default 20). Over
+  the cap: `400 TOO_MANY_URIS`. **Clients should send one to three per request**
+  (see Privacy); the server only enforces the cap.
+- `uri`: the exact `status.status_list.uri` string of the credential, `https`
+  only. A repeated `uri` is collapsed: one result per distinct `uri`, in first-
+  occurrence order. A `uri` that is not an acceptable `https` URI (or `http` when the operator allows plain HTTP) gets a result
+  with `reason: "uri_not_allowed"` rather than failing the request.
+- `etag` (optional): the `etag` of the version the client already holds.
+
+**Response `200`** (partial failure is still `200`; every item stands alone):
+```json
+{
+  "results": [
+    {
+      "uri": "https://status.example.org/statuslists/7",
+      "state": "verified",
+      "bits": 2,
+      "lst": "eNrbuRgAAhcBXQ",
+      "iat": 1790000000,
+      "exp": 1790086400,
+      "ttl": 900,
+      "expires_at": 1790000900,
+      "etag": "\"1f2e3d4c5b6a79881f2e3d4c5b6a7988\"",
+      "signer_trust": "status-list-signer"
+    },
+    { "uri": "https://other.example/l/1", "state": "undetermined", "reason": "signer_untrusted" },
+    { "uri": "https://third.example/l/9", "state": "not_modified", "etag": "\"...\"", "expires_at": 1790000900, "signer_trust": "status-list-signer" }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `state` | `verified`, `undetermined` or `not_modified`. **There is no "valid" state**: the response is about the *list*, never a verdict on a credential. |
+| `reason` | Only with `undetermined`: `fetch_failed`, `unsupported_media_type`, `signature_invalid`, `signer_untrusted`, `trust_unavailable`, `no_signer_key`, `expired`, `not_yet_valid`, `malformed`, `too_large`, `budget_exhausted`, `list_too_small`, `uri_not_allowed`. |
+| `bits` | Bits per entry: 1, 2, 4 or 8. |
+| `lst` | base64url (no padding) of the zlib-compressed bit string, **byte-identical to the `lst` of the signed token** (not re-encoded). At most `status_check.max_list_bytes` (default 2 MiB) compressed; a larger list is `undetermined`/`too_large`, never truncated. |
+| `iat`, `exp`, `ttl` | The token's claims (unix seconds / seconds); `exp` and `ttl` only when the token has them. |
+| `expires_at` | Unix time until which the backend treats this version as fresh (bounded by the token's `ttl`/`exp`, by the list host's `Cache-Control: max-age` and by one hour). Refresh before it. |
+| `etag` | Quoted opaque version id: a stable hash of the list URI and the token version, identical for every caller and across refetches of an unchanged token. Send it back as `etag` to get `not_modified` instead of the list. |
+| `signer_trust` | The trust action that accepted the signer: `status-list-signer`, or `credential-issuer` when the go-trust fallback applied. |
+
+A list is `verified` only if the backend fetched it, verified its signature
+(JWT `x5c`/`jwk`, or CWT `x5chain`), `typ`, `sub` (equal to the `uri`) and
+`iat`/`nbf`/`exp`/`ttl`, and the signer key was accepted by go-trust for the
+tenant (`status-list-signer`, see [ADR-012](adr/012-trust-evaluation-architecture.md)).
+Anything else, including no trust service being configured, is `undetermined`.
+
+When the list host supports it the backend refetches with `If-None-Match`; a
+`304` refreshes its cache (the signer trust decision and the token's `exp` are
+re-checked first).
+
+**Response headers:** `Cache-Control: private, max-age=<n>` with `n` the
+shortest remaining freshness over the returned lists, limited by each list's
+`ttl`; `Cache-Control: private, no-store` when any item is `undetermined`;
+`ETag` (the list's `etag`) for a single-list response; `Vary: Authorization`.
+The `no-cache` headers of the other authenticated routes are deliberately not
+applied.
+
+**Errors** (JSON `{"error": CODE, "message": ...}`):
+
+| Status | `error` | When |
+|---|---|---|
+| 400 | `INVALID_REQUEST` | not a JSON object, no `lists`, an item without `uri`, an over-long `etag`, trailing data |
+| 400 | `TOO_MANY_URIS` | more than `status_check.max_lists_per_request` items (response includes `max`) |
+| 401 | | missing/invalid token |
+| 403 | | token not for audience `wallet-backend`, or lacking `r` |
+| 413 | `REQUEST_TOO_LARGE` | body over 128 KiB |
+| 429 | `RATE_LIMIT_EXCEEDED` | rate limit; `Retry-After` is set |
+| 503 | `STATUS_NOT_SUPPORTED` | `status_check.enabled` is false |
+
+The whole request has a deadline (`status_check.request_timeout_seconds`,
+default 8 s, at most 12 s, below the 15 s server write timeout); lists not
+finished then are `undetermined`/`budget_exhausted`.
+
+##### Reading a credential's entry (client side)
+
+For a credential with `status.status_list = {idx, uri}`:
+
+1. Decode `lst` from base64url and zlib-inflate it (inflate at most 32 MiB).
+2. With `bits` = 1, 2, 4 or 8: `byte = idx * bits / 8` (integer division),
+   `shift = (idx * bits) % 8`, `value = (list[byte] >> shift) & ((1 << bits) - 1)`.
+   Bits are packed **least significant bit first** within a byte. An `idx` past
+   `len(list) * 8 / bits` is an error, not VALID.
+3. `value` 0 is VALID, 1 is INVALID (revoked), 2 is SUSPENDED; any other value is
+   application specific and **must be treated as not valid**.
+
+**Fail-closed rule:** only `state` `verified` (or `not_modified`, which refers to
+a version the client already verified through this API) with an in-range index
+and `value` 0 may be shown as valid. `undetermined`, an HTTP/transport error, a
+timeout or a malformed answer means **unknown**: show it as unknown, never as
+valid, and keep the last confirmed state (do not downgrade a credential to
+"revoked" on `undetermined` either: it says nothing about the credential).
+
+##### Recommended client behaviour
+
+- Check in the **background**, never as part of a presentation and never
+  blocking one: a presentation must work offline and without this API.
+- **One list per request** (at most three). Requesting several lists in one
+  call lets the server see which issuers a user's credentials come from
+  together; one at a time keeps the call about a single list.
+- **Refresh at a randomized time within the `expires_at` window** (for example
+  uniformly between 50% and 90% of the time remaining), not on a fixed schedule
+  and not at app start for every credential at once. Send the stored `etag`.
+- Back off on `429`/`503`/`undetermined`; honour `Retry-After`.
+- Do not request lists for credentials that carry no `status.status_list`.
+
+##### Outbound fetch policy
+
+List URIs are chosen by the client, so the backend fetches them like every
+other untrusted URL, under the `http_client` settings. By default only HTTPS is
+accepted and private, loopback, link-local and cloud-metadata addresses are
+refused (on every redirect hop and DNS answer). An operator can relax this for
+a test or development deployment with `http_client.allow_http` (plain HTTP),
+`http_client.allow_private_ips` (private addresses; this also permits plain HTTP,
+see `AllowsPlaintext`) or `http_client.insecure_skip_verify`, each relaxing only
+its own restriction. Whatever is fetched is still signature-verified and its
+signer trust-evaluated, so a relaxed policy never makes a list `verified`
+without the signer being trusted.
+
+##### Privacy properties
+
+Each list URI a user asks for identifies a status list published by a specific
+issuer, so asking for it reveals that the user holds a credential from that
+issuer (though not which credential, as a list covers many). The backend is
+built not to learn or keep that:
+
+- The request is a `POST` body: URIs are not in URLs or access logs.
+- URIs are **never logged**, at any level, alone or with a user or subject
+  identifier. The service logs counts, outcomes and durations only, and
+  errors that may contain a URI are never logged. The go-trust evaluation of the
+  signer is redacted the same way.
+- **No audit events** are emitted for status lists, and nothing is stored per
+  user about which lists were requested.
+- The service is handed the tenant, **not the user**; the rate limiter keeps
+  a counter per caller, never what was asked.
+- The only state is an in-process cache keyed by tenant and URI that holds
+  public data (the signed list and its metadata); it cannot say who asked.
+- The backend does not learn the credential or the index: clients compute the
+  entry locally from the returned list.
 
 ---
 

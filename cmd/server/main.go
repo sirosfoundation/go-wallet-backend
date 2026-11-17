@@ -3,34 +3,34 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
-	"github.com/kelseyhightower/envconfig"
 	"go.uber.org/zap"
-	"gopkg.in/yaml.v3"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/modes"
-	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
 	"github.com/sirosfoundation/go-wallet-backend/internal/server"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/logging"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/signing"
 )
 
 var (
 	configFile         = flag.String("config", "configs/config.yaml", "Path to backend configuration file")
-	registryConfigFile = flag.String("registry-config", "configs/registry.yaml", "Path to registry configuration file")
+	registryConfigFile = flag.String("registry-config", "configs/registry.yaml", "DEPRECATED: path to the old standalone registry configuration file; use the registry: section of --config")
 	modeFlag           = flag.String("mode", "backend", "Operating roles: backend, registry, engine, admin, auth, wallet-provider (comma-separated or 'all')")
 	version            = "dev"
-	buildTime          = "unknown"
+	commit             = "unknown"
 )
 
 func main() {
@@ -45,12 +45,15 @@ func main() {
 
 	// Load backend configuration (needed for backend, engine, admin, auth, and wallet-provider roles)
 	var backendCfg *config.Config
-	if roles.Has(modes.RoleBackend) || roles.Has(modes.RoleEngine) || roles.Has(modes.RoleAdmin) || roles.Has(modes.RoleAuth) || roles.Has(modes.RoleWalletProvider) {
+	needsBackendCfg := roles.Has(modes.RoleBackend) || roles.Has(modes.RoleEngine) || roles.Has(modes.RoleAdmin) || roles.Has(modes.RoleAuth) || roles.Has(modes.RoleWalletProvider)
+	if needsBackendCfg {
 		backendCfg, err = config.Load(*configFile)
 		if err != nil {
 			log.Fatalf("Failed to load backend configuration: %v", err)
 		}
-		if roles.Has(modes.RoleAuth) {
+		// The backend role's only authentication is AS session tokens, so it enables the AS
+		// like the auth role; an explicit as.enabled: false makes startup fail.
+		if roles.Has(modes.RoleAuth) || roles.Has(modes.RoleBackend) {
 			backendCfg.EnableForRole()
 			// EnableForRole mutates the already-validated config (e.g.
 			// falling back to WalletProvider's signing key for AS), so
@@ -63,30 +66,31 @@ func main() {
 		}
 	}
 
-	// Load registry configuration (needed for registry role)
-	var registryCfg *registry.Config
+	// Registry role: the registry section lives in the backend config. When
+	// the registry runs alone, only the registry-relevant parts of that config
+	// are required (see config.LoadRegistryOnly).
+	registryOnly := roles.Has(modes.RoleRegistry) && !needsBackendCfg
+	var registryCfg *config.Config // full config used by the registry role
+	var registryWarnings []string
 	if roles.Has(modes.RoleRegistry) {
-		registryCfg, err = loadRegistryConfig(*registryConfigFile)
-		if err != nil {
-			log.Fatalf("Failed to load registry configuration: %v", err)
+		if registryOnly {
+			registryCfg, err = config.LoadRegistryOnly(*configFile)
+			if err != nil {
+				log.Fatalf("Failed to load configuration for registry role: %v", err)
+			}
+		} else {
+			registryCfg = backendCfg
 		}
-		if err := registryCfg.Validate(); err != nil {
+		registryWarnings, err = setupRegistryConfig(registryCfg, *registryConfigFile, registryOnly)
+		if err != nil {
 			log.Fatalf("Invalid registry configuration: %v", err)
 		}
 	}
 
-	// Initialize logger (use backend config if available, otherwise registry)
+	// Initialize logger from the (shared) backend logging config
 	var logger *zap.Logger
-	if backendCfg != nil {
-		logger, err = logging.NewLogger(logging.Config{
-			Level:  backendCfg.Logging.Level,
-			Format: backendCfg.Logging.Format,
-		})
-	} else if registryCfg != nil {
-		logger, err = logging.NewLogger(logging.Config{
-			Level:  registryCfg.Logging.Level,
-			Format: registryCfg.Logging.Format,
-		})
+	if logCfg := loggingConfig(backendCfg, registryCfg); logCfg != nil {
+		logger, err = logging.NewLogger(*logCfg)
 	} else {
 		logger, err = zap.NewProduction()
 	}
@@ -95,11 +99,37 @@ func main() {
 	}
 	defer func() { _ = logger.Sync() }()
 
+	for _, w := range registryWarnings {
+		logger.Warn(w)
+	}
+	if registryCfg != nil {
+		for _, w := range registryCfg.Warnings() {
+			logger.Warn(w)
+		}
+	}
+
+	// Fail closed at startup on a bad assurance policy (missing/invalid rules
+	// file, lint errors) instead of discovering it on the first KA request.
+	if backendCfg != nil {
+		if err := assurance.CheckConfig(backendCfg.WalletProvider.Attestation.Assurance); err != nil {
+			logger.Fatal("Invalid assurance policy", zap.Error(err))
+		}
+		if err := service.CheckAndroidKeyAttestationConfig(backendCfg.WalletProvider.Attestation.AndroidKeyAttestation); err != nil {
+			logger.Fatal("Invalid android key attestation configuration", zap.Error(err))
+		}
+	}
+
+	checkPKCS11Support(backendCfg, logger)
+
 	logger.Info("Starting Wallet Backend",
 		zap.String("version", version),
-		zap.String("build_time", buildTime),
+		zap.String("commit", commit),
 		zap.Strings("roles", roleStrings),
+		zap.Bool("pkcs11_supported", signing.PKCS11Supported),
 	)
+
+	// Logged once per process, whatever its roles.
+	logLegacyStatus(backendCfg, registryCfg, logger)
 
 	// Security configuration validation for production environments
 	// Checks for potentially dangerous configurations and logs warnings
@@ -179,15 +209,23 @@ func main() {
 			serverCfg.WPPort = backendCfg.Server.WPPort
 		}
 	} else if registryCfg != nil {
-		// Registry-only mode - use registry server config
-		serverCfg.HTTPAddress = registryCfg.Server.Host
-		serverCfg.HTTPPort = registryCfg.Server.Port
+		// Registry-only mode: shared server/logging/CORS settings of the
+		// backend config, listening on server.registry_host/registry_port
+		// (default <host>:8097, as the retired standalone binary did).
+		addr := registryCfg.Server.RegistryAddress()
+		host, port := registryListenAddr(addr)
+		serverCfg.HTTPAddress = host
+		serverCfg.HTTPPort = port
 		serverCfg.LoggingLevel = registryCfg.Logging.Level
 		serverCfg.CORS = registryCfg.Server.CORS
+		serverCfg.TLS = registryCfg.Server.TLS
+		serverCfg.TrustedProxies = registryCfg.Server.TrustedProxies
 	}
 
 	if backendCfg != nil {
 		serverCfg.ServedByHeader = backendCfg.Server.ResolvedServedBy()
+		serverCfg.TrustedProxies = backendCfg.Server.TrustedProxies
+		serverCfg.WarnUntrustedClientIP = backendCfg.Security.OIDCGateRateLimit.PerIP.Enabled
 	} else if registryCfg != nil {
 		serverCfg.ServedByHeader = registryCfg.Server.ResolvedServedBy()
 	}
@@ -212,11 +250,42 @@ func main() {
 		resources = append(resources, backendProvider)
 	}
 
+	// Engine and registry processes without the backend role have no storage
+	// of their own: give them the shared revocation store so they reject what
+	// the backend replicas revoked.
+	var sharedBlacklist *server.SharedBlacklist
+	if backendProvider == nil && (roles.Has(modes.RoleEngine) || roles.Has(modes.RoleRegistry)) {
+		revCfg := backendCfg
+		if revCfg == nil {
+			revCfg = registryCfg
+		}
+		var err error
+		sharedBlacklist, err = server.NewSharedBlacklist(context.Background(), revCfg, logger)
+		if err != nil {
+			logger.Fatal("Failed to set up the shared token revocation store", zap.Error(err))
+		}
+		if sharedBlacklist != nil {
+			resources = append(resources, sharedBlacklist)
+		}
+	}
+
+	var registryProvider *server.RegistryProvider
 	if roles.Has(modes.RoleRegistry) {
 		provider, err := server.NewRegistryProvider(registryCfg, logger)
 		if err != nil {
 			logger.Fatal("Failed to create registry provider", zap.Error(err))
 		}
+		// Registry-only: keep the retired standalone binary's root paths.
+		provider.SetRootAliases(registryOnly)
+		// Co-located with the backend: share its tenant store and token
+		// blacklist so revocation and tenant checks apply to the registry too.
+		if backendProvider != nil {
+			provider.SetTenantLookup(backendProvider.Store().Tenants())
+			provider.SetTokenBlacklist(backendProvider.Services().TokenBlacklist)
+		} else if sharedBlacklist != nil {
+			provider.SetTokenBlacklist(sharedBlacklist)
+		}
+		registryProvider = provider
 		mgr.AddProvider(provider)
 		resources = append(resources, provider)
 	}
@@ -243,9 +312,41 @@ func main() {
 		if err != nil {
 			logger.Fatal("Failed to create engine provider", zap.Error(err))
 		}
+		// Engine and registry in one process: the registry is served by the
+		// shared HTTP server under /registry (not on server.registry_port),
+		// and the outbound HTTP guards reject loopback, so give the engine's
+		// VCTM client the registry in-process - unless trust.registry_url
+		// names an explicit registry.
+		if registryProvider != nil && backendCfg.Trust.RegistryURL == "" {
+			provider.SetRegistryHandler(registryProvider.InProcessHandler())
+		}
 		// Wire token validator for WebSocket handshake auth
 		if backendProvider != nil && backendProvider.TokenValidator() != nil {
 			provider.SetTokenValidator(backendProvider.TokenValidator())
+		}
+		// Standalone engine: a JWKS-backed validator is the only way to authenticate handshakes.
+		if backendProvider == nil {
+			var rev *service.TokenBlacklist
+			if sharedBlacklist != nil {
+				rev = sharedBlacklist.TokenBlacklist
+			}
+			sv, err := server.NewStandaloneEngineTokenValidator(backendCfg, logger, rev)
+			if err != nil {
+				logger.Fatal("Failed to create standalone engine token validator", zap.Error(err))
+			}
+			if sv != nil {
+				provider.SetTokenValidator(sv.Validator)
+				resources = append(resources, sv)
+			}
+		}
+		// Wire the same token blacklist the HTTP auth middlewares use, so a
+		// revoked token (or a deleted user's other tokens) is rejected
+		// during the WebSocket handshake too - see
+		// EngineProvider.SetTokenBlacklist.
+		if backendProvider != nil {
+			provider.SetTokenBlacklist(backendProvider.Services().TokenBlacklist)
+		} else if sharedBlacklist != nil {
+			provider.SetTokenBlacklist(sharedBlacklist)
 		}
 		mgr.AddProvider(provider)
 		engineProvider = provider
@@ -255,10 +356,15 @@ func main() {
 	// sessions and, when the engine runs in this process, active engine
 	// (WebSocket) sessions alike. The AS cleaner is wired regardless of the
 	// engine role: a --mode=backend deployment has AS sessions to drop too.
+	// Both engine cleaners are wired: SessionStore() only purges the
+	// persisted SessionData bookkeeping record, while Manager() closes the
+	// live *websocket.Conn* itself - without the latter, a connection that
+	// was already established before the user was deleted stayed open and
+	// usable until it disconnected on its own (#393).
 	if backendProvider != nil {
 		cleaners := service.MultiSessionCleaner{backendProvider.ASSessionCleaner()}
 		if engineProvider != nil {
-			cleaners = append(cleaners, engineProvider.SessionStore())
+			cleaners = append(cleaners, engineProvider.SessionStore(), engineProvider.Manager())
 		}
 		backendProvider.Services().User.SetSessionCleaner(cleaners)
 	}
@@ -302,8 +408,13 @@ func main() {
 	}
 
 	// Wait for shutdown signal
-	<-quit
-	logger.Info("Received shutdown signal")
+	var serveErr error
+	select {
+	case <-quit:
+		logger.Info("Received shutdown signal")
+	case serveErr = <-mgr.ServeErrors():
+		logger.Error("Listener stopped serving, shutting down", zap.Error(serveErr))
+	}
 	cancel()
 
 	// Graceful shutdown
@@ -323,25 +434,73 @@ func main() {
 	}
 
 	logger.Info("Server exited")
+	if serveErr != nil {
+		_ = logger.Sync()
+		os.Exit(1) //nolint:gocritic // cleanup above is complete; deferred cancel is irrelevant
+	}
 }
 
-// loadRegistryConfig loads registry configuration from file and environment
-func loadRegistryConfig(path string) (*registry.Config, error) {
-	cfg := registry.DefaultConfig()
-
-	data, err := os.ReadFile(path)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, fmt.Errorf("failed to read registry config file: %w", err)
+// setupRegistryConfig applies the deprecated standalone registry
+// configuration (--registry-config, REGISTRY_*) on top of cfg, then validates
+// everything the registry role needs. It returns the deprecation warnings to
+// log once the logger exists.
+func setupRegistryConfig(cfg *config.Config, legacyPath string, standalone bool) ([]string, error) {
+	warnings, err := cfg.ApplyLegacyRegistryConfig(legacyPath, standalone)
+	if err != nil {
+		return nil, err
 	}
-	if err == nil {
-		if err := yaml.Unmarshal(data, cfg); err != nil {
-			return nil, fmt.Errorf("failed to parse registry config file: %w", err)
+	// The overlay can change server settings (registry_port, TLS, CORS, ...)
+	// after LoadRegistryOnly validated the defaults: revalidate them.
+	if standalone {
+		if err := cfg.ValidateRegistryStandalone(); err != nil {
+			return warnings, err
 		}
 	}
-
-	if err := envconfig.Process("REGISTRY", cfg); err != nil {
-		return nil, fmt.Errorf("failed to process registry environment variables: %w", err)
+	if err := cfg.ValidateRegistry(); err != nil {
+		return warnings, err
 	}
+	return warnings, nil
+}
 
-	return cfg, nil
+// registryListenAddr splits a host:port address as returned by
+// config.ServerConfig.RegistryAddress.
+func registryListenAddr(addr string) (string, int) {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr, 8097
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		port = 8097
+	}
+	return host, port
+}
+
+// loggingConfig picks the logging settings: the backend config when any
+// backend role runs, otherwise the registry-only config; nil when neither is
+// loaded.
+func loggingConfig(backendCfg, registryCfg *config.Config) *logging.Config {
+	src := backendCfg
+	if src == nil {
+		src = registryCfg
+	}
+	if src == nil {
+		return nil
+	}
+	return &logging.Config{Level: src.Logging.Level, Format: src.Logging.Format}
+}
+
+// logLegacyStatus logs the legacy AS removal and warns about leftover as.legacy.* / jwt.*
+// settings. A registry-only process warns about the settings it was given.
+func logLegacyStatus(backendCfg, registryCfg *config.Config, logger *zap.Logger) {
+	if backendCfg != nil {
+		server.LogLegacyTokenStatus(backendCfg, logger)
+		return
+	}
+	if registryCfg != nil {
+		for _, name := range registryCfg.DeprecatedSettings() {
+			logger.Warn("Ignoring removed configuration setting: the legacy HMAC authorization server no longer exists; remove this setting",
+				zap.String("setting", name))
+		}
+	}
 }

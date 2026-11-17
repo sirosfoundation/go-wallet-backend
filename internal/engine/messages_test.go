@@ -483,10 +483,11 @@ func TestTrustEvaluationRequest_Validate_Valid(t *testing.T) {
 		{
 			name: "valid DID with requires_resolution",
 			req: TrustEvaluationRequest{
-				SubjectID:          "did:web:example.com",
-				SubjectType:        SubjectTypeCredentialVerifier,
-				RequiresResolution: true,
-				RequestJWT:         "eyJhbGciOiJFUzI1NiJ9...",
+				SubjectID:           "decentralized_identifier:did:web:example.com",
+				SubjectType:         SubjectTypeCredentialVerifier,
+				RequiresResolution:  true,
+				ResolutionSubjectID: "did:web:example.com",
+				RequestJWT:          "eyJhbGciOiJFUzI1NiJ9...",
 			},
 		},
 		{
@@ -531,11 +532,22 @@ func TestTrustEvaluationRequest_Validate_Invalid(t *testing.T) {
 		{
 			name: "requires_resolution without request_jwt",
 			req: TrustEvaluationRequest{
-				SubjectID:          "did:web:example.com",
-				SubjectType:        SubjectTypeCredentialVerifier,
-				RequiresResolution: true,
+				SubjectID:           "did:web:example.com",
+				SubjectType:         SubjectTypeCredentialVerifier,
+				RequiresResolution:  true,
+				ResolutionSubjectID: "did:web:example.com",
 			},
 			wantContain: "RequestJWT is required when RequiresResolution is true",
+		},
+		{
+			name: "requires_resolution without resolution_subject_id",
+			req: TrustEvaluationRequest{
+				SubjectID:          "decentralized_identifier:did:web:example.com",
+				SubjectType:        SubjectTypeCredentialVerifier,
+				RequiresResolution: true,
+				RequestJWT:         "eyJhbGciOiJFUzI1NiJ9...",
+			},
+			wantContain: "ResolutionSubjectID is required when RequiresResolution is true",
 		},
 		{
 			name: "invalid key material type",

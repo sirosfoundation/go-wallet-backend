@@ -18,14 +18,25 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 )
 
+// LegacyEndpointRemoved answers 410 Gone for endpoints that only minted legacy HMAC session tokens
+// (/user/*-webauthn-* login/registration and /user/session/refresh), telling old clients how to migrate.
+func LegacyEndpointRemoved() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.AbortWithStatusJSON(410, gin.H{
+			"error":   "legacy_tokens_disabled",
+			"message": "legacy HMAC session tokens are no longer issued; use the /auth/passkey endpoints with X-Token-Mode: session",
+		})
+	}
+}
+
 // TenantLookup is the subset of storage.TenantStore needed by TokenAuthMiddleware.
 type TenantLookup interface {
 	GetByID(ctx context.Context, id domain.TenantID) (*domain.Tenant, error)
 }
 
 // TokenAuthMiddleware validates Bearer tokens using a go-tokenauth validator
-// and populates the Gin context with the same keys that legacy AuthMiddleware
-// sets, so existing handlers work unchanged.
+// (AS-issued asymmetric session tokens) and populates the Gin context with
+// the keys that the handlers expect.
 //
 // Context keys set on success:
 //
@@ -36,23 +47,57 @@ type TenantLookup interface {
 //	"tenant_from_jwt" (bool)           — always true
 //	"token"          (string)           — raw Bearer token
 //	"tokenauth_result" (*claims.Result) — full validation result
-func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, logger *zap.Logger) gin.HandlerFunc {
+//
+// blacklist, when non-nil, is checked for user-level revocation (IsUserRevoked) after validation:
+// the validator's own Revocation checker only sees a jti, so RevokeUser would otherwise never apply.
+//
+// HMAC (legacy) bearer tokens fail validation and get a 401.
+func TokenAuthMiddleware(v *validator.Validator, tenants TenantLookup, blacklist TokenBlacklistChecker, logger *zap.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		// Extract Bearer token
 		rawToken := extractBearer(c)
 		if rawToken == "" {
+			logAuthReject(logger, c, "missing_or_malformed_bearer_token")
 			c.JSON(401, gin.H{"error": "Authorization header required"})
 			c.Abort()
 			return
 		}
 
-		// Validate via go-tokenauth (auto-detects new-style vs legacy HMAC)
-		result, err := v.Validate(c.Request.Context(), rawToken)
+		// Validate via go-tokenauth.
+		// Per-jti revocation is already checked inside Validate itself (see
+		// this function's doc comment).
+		vctx := c.Request.Context()
+		if IsLogout(c) {
+			// Lets the validator's revocation checker admit an already
+			// revoked jti for the idempotent logout call; see IsLogout.
+			vctx = WithLogoutCompletion(vctx)
+		}
+		result, err := v.Validate(vctx, rawToken)
 		if err != nil {
-			logger.Debug("Token validation failed", zap.Error(err))
+			logAuthReject(logger, c, "token_validation_failed", zap.Error(err))
 			c.JSON(401, gin.H{"error": "Invalid token"})
 			c.Abort()
 			return
+		}
+
+		// User-level revocation (#383/#391): rejects any token for a
+		// deleted user, even one whose own jti was never individually
+		// blacklisted. A no-op for anonymous tokens (empty UserID - see
+		// TokenBlacklist.IsUserRevoked).
+		if blacklist != nil {
+			userRevoked, err := blacklist.IsUserRevoked(c.Request.Context(), result.UserID)
+			if err != nil {
+				RefuseRevocationUnavailable(c, logger, err)
+				return
+			}
+			if userRevoked && !IsAccountDeletion(c) {
+				logger.Warn("Token for revoked user used",
+					zap.String("user_id", result.UserID),
+				)
+				c.JSON(401, gin.H{"error": "Token has been revoked"})
+				c.Abort()
+				return
+			}
 		}
 
 		// Tenant validation: look up and check enabled
@@ -173,8 +218,8 @@ func RequireAudience(allowed ...string) gin.HandlerFunc {
 	if len(allowed) == 0 {
 		// allowed is fixed at route-registration time, not per-request, so
 		// this is always a programming error, never a runtime condition -
-		// panic here (once, at startup) rather than have the match loop
-		// below silently 403 every request forever.
+		// panic here (once, at startup) rather than have the match below
+		// silently 403 every request forever.
 		panic("middleware: RequireAudience called with no allowed audiences")
 	}
 	return func(c *gin.Context) {

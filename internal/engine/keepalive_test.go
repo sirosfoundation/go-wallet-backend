@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -37,13 +36,7 @@ func dialAndHandshake(t *testing.T, cfg *config.Config) *HandshakeCompleteMessag
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ws.Close() })
 
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-		"user_id":   "test-user-123",
-		"tenant_id": "test-tenant",
-		"exp":       time.Now().Add(time.Hour).Unix(),
-	})
-	tokenString, err := token.SignedString([]byte("test-secret"))
-	require.NoError(t, err)
+	tokenString := engineSessionToken(t, m, "test-user-123")
 
 	require.NoError(t, ws.WriteJSON(HandshakeMessage{
 		Message:  Message{Type: TypeHandshake},
@@ -57,7 +50,7 @@ func dialAndHandshake(t *testing.T, cfg *config.Config) *HandshakeCompleteMessag
 
 func TestHandshake_ReportsConfiguredPingInterval(t *testing.T) {
 	cfg := &config.Config{
-		JWT: config.JWTConfig{Secret: "test-secret"},
+		JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"},
 		Server: config.ServerConfig{
 			EngineWSPingInterval: 7 * time.Second,
 		},
@@ -70,7 +63,7 @@ func TestHandshake_ReportsConfiguredPingInterval(t *testing.T) {
 }
 
 func TestHandshake_ReportsDefaultPingIntervalWhenUnconfigured(t *testing.T) {
-	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret"}}
+	cfg := &config.Config{JWT: config.JWTConfig{Secret: "test-secret", Issuer: "test-issuer"}}
 
 	complete := dialAndHandshake(t, cfg)
 

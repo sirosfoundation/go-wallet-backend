@@ -78,7 +78,14 @@ func (v *Validator) fetchDiscovery(ctx context.Context) (*DiscoveryDocument, err
 // DiscoverProvider fetches the OIDC configuration for a given issuer.
 // If httpClient is nil, a default client with 10s timeout is used.
 // This is a standalone function for use outside the Validator.
+//
+// The returned document's `issuer` field is validated against the requested
+// issuer (mirroring Validator.fetchDiscovery's check): without this, a
+// compromised, misconfigured, or MITM'd discovery endpoint could return an
+// authorization_endpoint/token_endpoint/jwks_uri for a different issuer
+// entirely, and callers (e.g. the AS's OIDC login flow) would trust it.
 func DiscoverProvider(ctx context.Context, issuer string, httpClient *http.Client) (*DiscoveryDocument, error) {
+	requestedIssuer := issuer
 	issuer = strings.TrimSuffix(issuer, "/")
 	discoveryURL := issuer + "/.well-known/openid-configuration"
 
@@ -112,6 +119,12 @@ func DiscoverProvider(ctx context.Context, issuer string, httpClient *http.Clien
 	var doc DiscoveryDocument
 	if err := json.Unmarshal(body, &doc); err != nil {
 		return nil, fmt.Errorf("failed to parse discovery document: %w", err)
+	}
+
+	// Validate issuer matches (same check as fetchDiscovery). Accept either
+	// the exact string passed in or its trailing-slash-trimmed form.
+	if doc.Issuer != requestedIssuer && doc.Issuer != issuer {
+		return nil, fmt.Errorf("issuer mismatch: expected %s, got %s", requestedIssuer, doc.Issuer)
 	}
 
 	return &doc, nil

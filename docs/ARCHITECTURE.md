@@ -65,7 +65,7 @@ Fully abstracted storage with multiple implementations:
 
 Business logic and orchestration:
 
-- **UserService**: User registration, authentication, JWT management
+- **UserService**: User registration and account management (tokens are issued by the AS, `internal/as`)
 - **KeystoreService**: Key management, signing operations
 - **IssuanceService** [TODO]: OpenID4VCI credential issuance
 - **VerificationService** [TODO]: OpenID4VP presentation verification
@@ -85,7 +85,7 @@ HTTP handlers using Gin framework:
 
 HTTP middleware:
 
-- **AuthMiddleware**: JWT authentication
+- **TokenAuthMiddleware**: validates AS-issued asymmetric session tokens (go-tokenauth, JWKS); HMAC tokens are never accepted
 - **Logger**: Request logging
 - **RateLimit** [TODO]: Rate limiting
 - **CORS**: Cross-origin resource sharing
@@ -98,6 +98,47 @@ Configuration management:
 - Environment variable overrides
 - Validation
 - Defaults
+
+## Roles and the VCTM Registry
+
+The server is one binary (`cmd/server`) whose functionality is selected with
+`--mode` (`backend`, `auth`, `engine`, `registry`, `admin`, `wallet-provider`,
+or a comma-separated list / `all`). The VCTM registry (`internal/registry`,
+routes under `/registry`) is the `registry` role of that binary; there is no
+separate registry binary. Its previous standalone form (`cmd/registry`, its own
+config file and its own HMAC-only JWT validation) was retired in favour of:
+
+- **One configuration.** Registry settings (`source`/`sources`, `cache`,
+  `dynamic_cache`, `image_embed`, `filter`, `rate_limit`, `require_auth`) are
+  the `registry:` section of the backend config (`pkg/config.RegistryConfig`).
+  Server address, TLS, CORS, `logging`, `http_client` and `trusted_proxies`
+  are the backend's own settings. When the registry role runs together with
+  other roles it is served from the shared HTTP server; when it runs alone
+  (`--mode=registry`) it listens on `server.registry_host`/`server.registry_port`
+  (default `0.0.0.0:8097`) and only the registry-relevant parts of the config
+  are validated (`config.LoadRegistryOnly`).
+- **Shared authentication.** Registry routes use the same go-tokenauth
+  validator as the other roles (`pkg/middleware.TokenAuthMiddleware` when
+  `registry.require_auth` is true). The validator is built by
+  `RegistryProvider.buildValidator` (`internal/server/providers.go`) the same
+  way as for the standalone engine and the wallet-provider: the JWKS is fetched
+  from `<as.external_url>/auth/.well-known/jwks.json` (no override) by go-tokenauth
+  directly (not through `http_client`; infrastructure-internal); the expected issuer is `as.issuer`
+  (falling back to `jwt.issuer`). It does not matter whether `as.enabled` is
+  true: a registry-only process does not run the authorization server but
+  validates the tokens it issues. There is no HMAC path: the legacy HMAC
+  authorization server was removed, and a deprecated registry.yaml `jwt` secret
+  is ignored with a warning (see REGISTRY_MIGRATION.md).
+- **Audience rule.** Tokens must carry the `wallet-registry` audience.
+- **Tenant and rate limiting.** The token's `tenant_id` claim is put into the
+  Gin context (`tenant_id`) exactly as before and keys the authenticated rate
+  limit. With `registry.require_auth: false` (default) unauthenticated access is
+  allowed at the lower unauthenticated rate; valid tokens are still recognised.
+  A co-located backend also supplies its tenant store and token blacklist, so
+  disabled tenants and revoked users are rejected on registry routes too.
+
+See [REGISTRY_MIGRATION.md](REGISTRY_MIGRATION.md) for moving off the retired
+standalone registry configuration.
 
 ## Data Flow
 
@@ -123,7 +164,7 @@ Client Request
 
 All application state is stored externally:
 
-- User sessions: JWT tokens (stateless) or Redis
+- User sessions: AS sessions (MongoDB-backed when shared across replicas) and short-lived asymmetric access tokens
 - WebAuthn challenges: Shared storage (MongoDB/Redis)
 - Credentials: Shared database
 
@@ -169,19 +210,17 @@ WALLET_STORAGE_MONGODB_URI=mongodb://cluster:27017
 
 ### Authentication
 
-1. **Password-based**: bcrypt hashing
-2. **WebAuthn**: Hardware security keys
-3. **JWT**: Stateless session management
+1. **WebAuthn**: Hardware security keys
+2. **AS session tokens**: cookie-bound AS session + short-lived ES256/ES384/EdDSA access tokens from `/auth/token` (the legacy HMAC token flow was removed, see [new-as.md](new-as.md#removal-of-the-legacy-as))
 
 ### Authorization
 
-- JWT claims include user_id and did
+- Access token claims include `sub` (user), `tenant_id` and `tac` (permissions)
 - Middleware validates tokens
 - Handlers check permissions
 
 ### Data Protection
 
-- Passwords: bcrypt hashed
 - Private data: Encrypted at rest [TODO]
 - Transport: HTTPS/TLS in production
 - Secrets: Environment variables, never committed

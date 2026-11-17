@@ -18,7 +18,10 @@ type FIDO2AttestationRegisterRequest struct {
 	// belongs to.
 	WalletInstanceID string `json:"wallet_instance_id" binding:"required"`
 	// AttestationObject is the base64url (unpadded) raw CTAP2 makeCredential
-	// attestation object (see siros-wscd-manager's AttestationChain.certificates[0]).
+	// attestation object (see siros-wscd-manager's fido2_sign plugin:
+	// AttestationChain.opaque_attestation, format Opaque — the backend never
+	// sees that Rust struct itself, only these bytes over this stable HTTP
+	// API; see FIDO2AttestationService's doc comment).
 	AttestationObject string `json:"attestation_object" binding:"required"`
 	// ClientDataHash is the base64url (unpadded) 32-byte hash the
 	// attestation signature was computed over (AttestationChain.client_data_hash).

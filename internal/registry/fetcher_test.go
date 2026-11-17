@@ -1010,7 +1010,7 @@ func TestConfig_Validate_BothSourceEmptyAndSourcesEmpty(t *testing.T) {
 	config.Sources = nil
 	err := config.Validate()
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "source URL is required")
+	assert.Contains(t, err.Error(), "source.url is required")
 }
 
 func TestFetcher_Fetch_WithFilter(t *testing.T) {
@@ -1237,7 +1237,7 @@ func TestResolveURL(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.expected, tt.source.resolveURL())
+			assert.Equal(t, tt.expected, resolveSourceURL(&tt.source))
 		})
 	}
 }

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"time"
 
 	"go.uber.org/zap"
@@ -15,21 +14,23 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
 
-// VCTMHandler handles VCTM (Verifiable Credential Type Metadata) lookup flows
+// VCTMHandler handles VCTM (Verifiable Credential Type Metadata) lookup flows.
+//
+// Registry lookups go through the Manager-supplied RegistryClient, so they use
+// the same transport as every other registry user: the in-process handler in
+// combined mode, HTTP to the configured registry otherwise. httpClient is only
+// for the fallback fetch of a VCT that is itself a URL (an external,
+// user-visible fetch, not a registry call).
 type VCTMHandler struct {
 	BaseHandler
-	httpClient  *http.Client
-	registryURL string
+	httpClient *http.Client
 }
 
 // NewVCTMHandler creates a new VCTM flow handler
 func NewVCTMHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc *TrustService, registry *RegistryClient, verifiers storage.VerifierStore, trustCache *TrustCache) (FlowHandler, error) {
-	// Get registry URL from config, or use default
-	registryURL := cfg.Trust.RegistryURL
-	if registryURL == "" {
-		registryURL = fmt.Sprintf("http://localhost:%d", cfg.Server.RegistryPort)
+	if registry == nil {
+		registry = NewRegistryClient(cfg, logger)
 	}
-
 	return &VCTMHandler{
 		BaseHandler: BaseHandler{
 			Flow:     flow,
@@ -38,8 +39,7 @@ func NewVCTMHandler(flow *Flow, cfg *config.Config, logger *zap.Logger, trustSvc
 			TrustSvc: trustSvc,
 			Registry: registry,
 		},
-		httpClient:  cfg.HTTPClient.NewHTTPClient(10 * time.Second),
-		registryURL: registryURL,
+		httpClient: cfg.HTTPClient.NewHTTPClient(10 * time.Second),
 	}, nil
 }
 
@@ -92,16 +92,7 @@ func (h *VCTMHandler) Execute(ctx context.Context, msg *FlowStartMessage) error 
 }
 
 func (h *VCTMHandler) lookupVCT(ctx context.Context, vct string) (*TypeMetadata, error) {
-	// Build registry lookup URL
-	lookupURL := h.registryURL + "/vctm/" + url.PathEscape(vct)
-
-	req, err := http.NewRequestWithContext(ctx, "GET", lookupURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Accept", "application/json")
-
-	resp, err := h.httpClient.Do(req)
+	resp, err := h.Registry.GetVCTM(ctx, vct)
 	if err != nil {
 		// Try direct VCT URL as fallback
 		return h.lookupVCTDirect(ctx, vct)

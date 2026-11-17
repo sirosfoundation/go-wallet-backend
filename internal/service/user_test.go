@@ -2,12 +2,14 @@ package service
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
@@ -21,9 +23,8 @@ func testConfig() *config.Config {
 			RPOrigin: "http://localhost:8080",
 		},
 		JWT: config.JWTConfig{
-			Secret:      "test-secret-key-for-testing-only",
-			Issuer:      "test-issuer",
-			ExpiryHours: 24,
+			Secret: "test-secret-key-for-testing-only",
+			Issuer: "test-issuer",
 		},
 		HTTPClient: config.HTTPClientConfig{
 			AllowPrivateIPs: true,
@@ -63,14 +64,11 @@ func TestUserService_Register(t *testing.T) {
 	service := NewUserService(store, cfg, logger)
 
 	username := "testuser"
-	password := "password123"
 	req := &domain.RegisterRequest{
 		Username:    &username,
 		DisplayName: "Test User",
-		Password:    &password,
 		WalletType:  domain.WalletTypeDB,
 		Keys:        []byte("key-data"),
-		PrivateData: []byte("private-data"),
 	}
 
 	user, err := service.Register(ctx, req)
@@ -98,9 +96,6 @@ func TestUserService_Register(t *testing.T) {
 		t.Error("WalletType not set correctly")
 	}
 
-	if user.PasswordHash == nil {
-		t.Error("PasswordHash should be set")
-	}
 }
 
 func TestUserService_Register_DuplicateUsername(t *testing.T) {
@@ -111,11 +106,9 @@ func TestUserService_Register_DuplicateUsername(t *testing.T) {
 	service := NewUserService(store, cfg, logger)
 
 	username := "duplicate"
-	password := "password123"
 	req := &domain.RegisterRequest{
 		Username:    &username,
 		DisplayName: "User 1",
-		Password:    &password,
 		WalletType:  domain.WalletTypeDB,
 	}
 
@@ -128,7 +121,6 @@ func TestUserService_Register_DuplicateUsername(t *testing.T) {
 	req2 := &domain.RegisterRequest{
 		Username:    &username,
 		DisplayName: "User 2",
-		Password:    &password,
 		WalletType:  domain.WalletTypeDB,
 	}
 
@@ -165,89 +157,6 @@ func TestUserService_Register_NoUsername(t *testing.T) {
 	}
 }
 
-func TestUserService_Login(t *testing.T) {
-	ctx := t.Context()
-	store := memory.NewStore()
-	cfg := testConfig()
-	logger := testLogger()
-	service := NewUserService(store, cfg, logger)
-
-	// Register user first
-	username := "logintest"
-	password := "password123"
-	req := &domain.RegisterRequest{
-		Username:    &username,
-		DisplayName: "Login Test User",
-		Password:    &password,
-		WalletType:  domain.WalletTypeDB,
-	}
-
-	_, err := service.Register(ctx, req)
-	if err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
-
-	// Login
-	user, token, err := service.Login(ctx, username, password)
-	if err != nil {
-		t.Fatalf("Login() error = %v", err)
-	}
-
-	if user == nil {
-		t.Fatal("Login() returned nil user")
-	}
-
-	if token == "" {
-		t.Error("Login() returned empty token")
-	}
-
-	if user.Username == nil || *user.Username != username {
-		t.Error("Login() returned wrong user")
-	}
-}
-
-func TestUserService_Login_WrongPassword(t *testing.T) {
-	ctx := t.Context()
-	store := memory.NewStore()
-	cfg := testConfig()
-	logger := testLogger()
-	service := NewUserService(store, cfg, logger)
-
-	// Register user first
-	username := "wrongpass"
-	password := "correctpassword"
-	req := &domain.RegisterRequest{
-		Username:    &username,
-		DisplayName: "Wrong Pass User",
-		Password:    &password,
-		WalletType:  domain.WalletTypeDB,
-	}
-
-	_, err := service.Register(ctx, req)
-	if err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
-
-	// Try login with wrong password
-	_, _, err = service.Login(ctx, username, "wrongpassword")
-	if err != ErrInvalidCredentials {
-		t.Errorf("Login() with wrong password should return ErrInvalidCredentials, got %v", err)
-	}
-}
-
-func TestUserService_Login_NonexistentUser(t *testing.T) {
-	ctx := t.Context()
-	store := memory.NewStore()
-	cfg := testConfig()
-	logger := testLogger()
-	service := NewUserService(store, cfg, logger)
-
-	_, _, err := service.Login(ctx, "nonexistent", "password")
-	if err != ErrInvalidCredentials {
-		t.Errorf("Login() with nonexistent user should return ErrInvalidCredentials, got %v", err)
-	}
-}
-
 func TestUserService_GetUserByID(t *testing.T) {
 	ctx := t.Context()
 	store := memory.NewStore()
@@ -257,11 +166,9 @@ func TestUserService_GetUserByID(t *testing.T) {
 
 	// Register user first
 	username := "getbyid"
-	password := "password123"
 	req := &domain.RegisterRequest{
 		Username:    &username,
 		DisplayName: "Get By ID User",
-		Password:    &password,
 		WalletType:  domain.WalletTypeDB,
 	}
 
@@ -281,95 +188,6 @@ func TestUserService_GetUserByID(t *testing.T) {
 	}
 }
 
-func TestUserService_ValidateToken(t *testing.T) {
-	ctx := t.Context()
-	store := memory.NewStore()
-	cfg := testConfig()
-	logger := testLogger()
-	service := NewUserService(store, cfg, logger)
-
-	// Register and login to get token
-	username := "validatetoken"
-	password := "password123"
-	req := &domain.RegisterRequest{
-		Username:    &username,
-		DisplayName: "Validate Token User",
-		Password:    &password,
-		WalletType:  domain.WalletTypeDB,
-	}
-
-	user, err := service.Register(ctx, req)
-	if err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
-
-	_, token, err := service.Login(ctx, username, password)
-	if err != nil {
-		t.Fatalf("Login() error = %v", err)
-	}
-
-	// Validate token
-	userID, err := service.ValidateToken(token)
-	if err != nil {
-		t.Fatalf("ValidateToken() error = %v", err)
-	}
-
-	if userID.String() != user.UUID.String() {
-		t.Errorf("ValidateToken() returned wrong user ID, got %q, want %q", userID.String(), user.UUID.String())
-	}
-}
-
-func TestUserService_ValidateToken_Invalid(t *testing.T) {
-	store := memory.NewStore()
-	cfg := testConfig()
-	logger := testLogger()
-	service := NewUserService(store, cfg, logger)
-
-	_, err := service.ValidateToken("invalid-token")
-	if err == nil {
-		t.Error("ValidateToken() with invalid token should return error")
-	}
-}
-
-func TestUserService_ValidateToken_WrongSecret(t *testing.T) {
-	ctx := t.Context()
-	store := memory.NewStore()
-	cfg := testConfig()
-	logger := testLogger()
-	service := NewUserService(store, cfg, logger)
-
-	// Register and login to get token
-	username := "wrongsecret"
-	password := "password123"
-	req := &domain.RegisterRequest{
-		Username:    &username,
-		DisplayName: "Wrong Secret User",
-		Password:    &password,
-		WalletType:  domain.WalletTypeDB,
-	}
-
-	_, err := service.Register(ctx, req)
-	if err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
-
-	_, token, err := service.Login(ctx, username, password)
-	if err != nil {
-		t.Fatalf("Login() error = %v", err)
-	}
-
-	// Create service with different secret
-	cfg2 := testConfig()
-	cfg2.JWT.Secret = "different-secret"
-	service2 := NewUserService(store, cfg2, logger)
-
-	// Try to validate with wrong secret
-	_, err = service2.ValidateToken(token)
-	if err == nil {
-		t.Error("ValidateToken() with wrong secret should return error")
-	}
-}
-
 func TestUserService_GetPrivateData(t *testing.T) {
 	ctx := t.Context()
 	store := memory.NewStore()
@@ -377,22 +195,20 @@ func TestUserService_GetPrivateData(t *testing.T) {
 	logger := testLogger()
 	service := NewUserService(store, cfg, logger)
 
-	// Register user with private data
+	// Register user, then give it a credential and private data for it
 	username := "privatedata"
-	password := "password123"
-	privateData := []byte(`{"key": "value"}`)
 	req := &domain.RegisterRequest{
 		Username:    &username,
 		DisplayName: "Private Data User",
-		Password:    &password,
 		WalletType:  domain.WalletTypeDB,
-		PrivateData: privateData,
 	}
 
 	user, err := service.Register(ctx, req)
 	if err != nil {
 		t.Fatalf("Register() error = %v", err)
 	}
+	privateData := testPrivateDataContainer(testCredID("a"))
+	setCredentialsAndPrivateData(t, store, user.UUID, privateData, domain.WebauthnCredential{ID: testCredID("a")})
 
 	// Get private data
 	data, etag, err := service.GetPrivateData(ctx, user.UUID)
@@ -418,19 +234,17 @@ func TestUserService_UpdatePrivateData(t *testing.T) {
 
 	// Register user
 	username := "updateprivate"
-	password := "password123"
 	req := &domain.RegisterRequest{
 		Username:    &username,
 		DisplayName: "Update Private User",
-		Password:    &password,
 		WalletType:  domain.WalletTypeDB,
-		PrivateData: []byte("initial"),
 	}
 
 	user, err := service.Register(ctx, req)
 	if err != nil {
 		t.Fatalf("Register() error = %v", err)
 	}
+	setCredentialsAndPrivateData(t, store, user.UUID, testPrivateDataContainer(testCredID("a")), domain.WebauthnCredential{ID: testCredID("a")})
 
 	// Get initial ETag
 	_, initialEtag, err := service.GetPrivateData(ctx, user.UUID)
@@ -439,7 +253,7 @@ func TestUserService_UpdatePrivateData(t *testing.T) {
 	}
 
 	// Update private data
-	newData := []byte("updated")
+	newData := testPrivateDataContainer(testCredID("a"), testCredID("z"))
 	newEtag, err := service.UpdatePrivateData(ctx, user.UUID, newData, initialEtag)
 	if err != nil {
 		t.Fatalf("UpdatePrivateData() error = %v", err)
@@ -455,7 +269,7 @@ func TestUserService_UpdatePrivateData(t *testing.T) {
 		t.Fatalf("GetPrivateData() error = %v", err)
 	}
 
-	if string(data) != "updated" {
+	if string(data) != string(newData) {
 		t.Errorf("GetPrivateData() after update = %s, want updated", data)
 	}
 }
@@ -469,22 +283,20 @@ func TestUserService_UpdatePrivateData_ETagConflict(t *testing.T) {
 
 	// Register user
 	username := "etagconflict"
-	password := "password123"
 	req := &domain.RegisterRequest{
 		Username:    &username,
 		DisplayName: "ETag Conflict User",
-		Password:    &password,
 		WalletType:  domain.WalletTypeDB,
-		PrivateData: []byte("initial"),
 	}
 
 	user, err := service.Register(ctx, req)
 	if err != nil {
 		t.Fatalf("Register() error = %v", err)
 	}
+	setCredentialsAndPrivateData(t, store, user.UUID, testPrivateDataContainer(testCredID("a")), domain.WebauthnCredential{ID: testCredID("a")})
 
 	// Try to update with wrong ETag
-	_, err = service.UpdatePrivateData(ctx, user.UUID, []byte("new"), "wrong-etag")
+	_, err = service.UpdatePrivateData(ctx, user.UUID, testPrivateDataContainer(testCredID("a")), "wrong-etag")
 	if err != ErrPrivateDataConflict {
 		t.Errorf("UpdatePrivateData() with wrong ETag should return ErrPrivateDataConflict, got %v", err)
 	}
@@ -499,11 +311,9 @@ func TestUserService_DeleteUser(t *testing.T) {
 
 	// Register user
 	username := "deleteuser"
-	password := "password123"
 	req := &domain.RegisterRequest{
 		Username:    &username,
 		DisplayName: "Delete User",
-		Password:    &password,
 		WalletType:  domain.WalletTypeDB,
 	}
 
@@ -534,11 +344,9 @@ func TestUserService_DeleteUser_CleansUpChallengesAndInvites(t *testing.T) {
 
 	// Register user
 	username := "cleanup-user"
-	password := "password123"
 	req := &domain.RegisterRequest{
 		Username:    &username,
 		DisplayName: "Cleanup User",
-		Password:    &password,
 		WalletType:  domain.WalletTypeDB,
 	}
 	user, err := service.Register(ctx, req)
@@ -617,11 +425,9 @@ func TestUserService_DeleteUser_CleansUpSessions(t *testing.T) {
 
 	// Register user
 	username := "session-cleanup-user"
-	password := "password123"
 	req := &domain.RegisterRequest{
 		Username:    &username,
 		DisplayName: "Session Cleanup User",
-		Password:    &password,
 		WalletType:  domain.WalletTypeDB,
 	}
 	user, err := svc.Register(ctx, req)
@@ -643,6 +449,131 @@ func TestUserService_DeleteUser_CleansUpSessions(t *testing.T) {
 	}
 }
 
+// erroringSessionCleaner always fails, to exercise DeleteUser's
+// best-effort error handling around the session cleaner.
+type erroringSessionCleaner struct{ err error }
+
+func (e erroringSessionCleaner) DeleteByUser(_ context.Context, _ string) error {
+	return e.err
+}
+
+// TestUserService_DeleteUser_SessionCleanerErrorDoesNotAbort proves a failing
+// SessionCleaner is best-effort: the user deletion still completes.
+func TestUserService_DeleteUser_SessionCleanerErrorDoesNotAbort(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	svc := NewUserService(store, testConfig(), testLogger())
+	svc.SetSessionCleaner(erroringSessionCleaner{err: errors.New("session cleanup boom")})
+
+	username := "cleaner-error-user"
+	user, err := svc.Register(ctx, &domain.RegisterRequest{Username: &username, DisplayName: "u", WalletType: domain.WalletTypeDB})
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+	if err := svc.DeleteUser(ctx, user.UUID, user.DID); err != nil {
+		t.Fatalf("DeleteUser() should not fail when the session cleaner errors, got: %v", err)
+	}
+	if _, err := store.Users().GetByID(ctx, user.UUID); err == nil {
+		t.Error("user should still have been deleted")
+	}
+}
+
+// TestUserService_DeleteUser_RevocationFailureFailsClosed proves a failed
+// token revocation aborts the deletion: the user stays, so the request can
+// be retried, rather than leaving a deleted user's tokens valid.
+func TestUserService_DeleteUser_RevocationFailureFailsClosed(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	svc := NewUserService(store, testConfig(), testLogger())
+	revoker := &flakyTokenRevoker{err: errors.New("revoke boom")}
+	svc.SetTokenBlacklist(revoker)
+
+	username := "revoke-fails-user"
+	user, err := svc.Register(ctx, &domain.RegisterRequest{Username: &username, DisplayName: "u", WalletType: domain.WalletTypeDB})
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	if err := store.UserTenants().AddMembership(ctx, &domain.UserTenantMembership{UserID: user.UUID, TenantID: domain.DefaultTenantID, Role: "user"}); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.UserTenants().GetUserTenants(ctx, user.UUID)
+	if err != nil || len(before) == 0 {
+		t.Fatalf("precondition: the user has a tenant membership (%v, %v)", before, err)
+	}
+
+	err = svc.DeleteUser(ctx, user.UUID, user.DID)
+	if !errors.Is(err, ErrTokenRevocationFailed) {
+		t.Fatalf("DeleteUser() = %v, want ErrTokenRevocationFailed", err)
+	}
+	if _, err := store.Users().GetByID(ctx, user.UUID); err != nil {
+		t.Fatalf("the user must not be deleted when revocation failed: %v", err)
+	}
+	after, err := store.UserTenants().GetUserTenants(ctx, user.UUID)
+	if err != nil || len(after) != len(before) {
+		t.Fatalf("tenant memberships must be untouched when revocation failed: %v, %v", after, err)
+	}
+
+	revoker.err = nil
+	if err := svc.DeleteUser(ctx, user.UUID, user.DID); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if _, err := store.Users().GetByID(ctx, user.UUID); err == nil {
+		t.Error("retry: user should be deleted")
+	}
+}
+
+type flakyTokenRevoker struct{ err error }
+
+func (f *flakyTokenRevoker) RevokeUser(context.Context, string) error { return f.err }
+
+// TestUserService_DeleteUser_RevokesTokens proves #383: deleting a user
+// revokes every previously-issued token for that user (via
+// TokenBlacklist.RevokeUser), not just the one that authenticated the
+// deletion request.
+func TestUserService_DeleteUser_RevokesTokens(t *testing.T) {
+	ctx := t.Context()
+	store := memory.NewStore()
+	cfg := testConfig()
+	cfg.Security.TokenBlacklist.Enabled = true
+	logger := testLogger()
+	svc := NewUserService(store, cfg, logger)
+
+	blacklist := NewTokenBlacklist(cfg.Security.TokenBlacklist, logger)
+	svc.SetTokenBlacklist(blacklist)
+
+	username := "revoke-me"
+	req := &domain.RegisterRequest{
+		Username:    &username,
+		DisplayName: "Revoke Me",
+		WalletType:  domain.WalletTypeDB,
+	}
+	user, err := svc.Register(ctx, req)
+	if err != nil {
+		t.Fatalf("Register() error = %v", err)
+	}
+
+	// A token issued before deletion (e.g. from a different, still-logged-in
+	// device) must be rejected afterward, even though it was never
+	// individually blacklisted by jti.
+	if userRevoked(t, blacklist, ctx, user.UUID.String()) {
+		t.Fatal("user should not be revoked before deletion")
+	}
+
+	if err := svc.DeleteUser(ctx, user.UUID, user.DID); err != nil {
+		t.Fatalf("DeleteUser() error = %v", err)
+	}
+
+	if !userRevoked(t, blacklist, ctx, user.UUID.String()) {
+		t.Error("expected a pre-deletion token to be revoked after DeleteUser")
+	}
+
+	// A different, unrelated user must be unaffected.
+	if userRevoked(t, blacklist, ctx, "some-other-user") {
+		t.Error("DeleteUser must not revoke tokens for unrelated users")
+	}
+}
+
 func TestUserService_DeleteUser_CleansUpCredentialsAndPresentations(t *testing.T) {
 	ctx := t.Context()
 	store := memory.NewStore()
@@ -652,11 +583,9 @@ func TestUserService_DeleteUser_CleansUpCredentialsAndPresentations(t *testing.T
 
 	// Register user
 	username := "vp-cleanup-user"
-	password := "password123"
 	req := &domain.RegisterRequest{
 		Username:    &username,
 		DisplayName: "VP Cleanup User",
-		Password:    &password,
 		WalletType:  domain.WalletTypeDB,
 	}
 	user, err := svc.Register(ctx, req)
@@ -715,87 +644,27 @@ func TestUserService_DeleteUser_CleansUpCredentialsAndPresentations(t *testing.T
 	}
 }
 
-func TestUserService_GenerateTokenForUser(t *testing.T) {
-	ctx := t.Context()
-	store := memory.NewStore()
-	cfg := testConfig()
-	logger := testLogger()
-	service := NewUserService(store, cfg, logger)
-
-	// Register user
-	username := "generatetoken"
-	password := "password123"
-	req := &domain.RegisterRequest{
-		Username:    &username,
-		DisplayName: "Generate Token User",
-		Password:    &password,
-		WalletType:  domain.WalletTypeDB,
-	}
-
-	user, err := service.Register(ctx, req)
-	if err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
-
-	// Generate token directly (with default tenant)
-	token, err := service.GenerateTokenForUser(user, domain.DefaultTenantID)
-	if err != nil {
-		t.Fatalf("GenerateTokenForUser() error = %v", err)
-	}
-
-	if token == "" {
-		t.Error("GenerateTokenForUser() returned empty token")
-	}
-
-	// Validate the token
-	userID, err := service.ValidateToken(token)
-	if err != nil {
-		t.Fatalf("ValidateToken() error = %v", err)
-	}
-
-	if userID.String() != user.UUID.String() {
-		t.Errorf("ValidateToken() returned wrong user ID")
+// setCredentials replaces a user's WebAuthn credentials through Modify.
+// setCredentialsAndPrivateData stores the credentials and a private-data
+// container for them in one atomic write.
+func setCredentialsAndPrivateData(t *testing.T, store storage.Store, id domain.UserID, privateData []byte, creds ...domain.WebauthnCredential) {
+	t.Helper()
+	if _, err := store.Users().Modify(context.Background(), id, func(u *domain.User) error {
+		u.WebauthnCredentials = creds
+		u.UpdatePrivateData(privateData)
+		return nil
+	}); err != nil {
+		t.Fatalf("Modify() error = %v", err)
 	}
 }
 
-func TestUserService_UpdateUser(t *testing.T) {
-	ctx := t.Context()
-	store := memory.NewStore()
-	cfg := testConfig()
-	logger := testLogger()
-	service := NewUserService(store, cfg, logger)
-
-	// Register user
-	username := "updateuser"
-	password := "password123"
-	req := &domain.RegisterRequest{
-		Username:    &username,
-		DisplayName: "Original Name",
-		Password:    &password,
-		WalletType:  domain.WalletTypeDB,
-	}
-
-	user, err := service.Register(ctx, req)
-	if err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
-
-	// Update user
-	newName := "Updated Name"
-	user.DisplayName = &newName
-	err = service.UpdateUser(ctx, user)
-	if err != nil {
-		t.Fatalf("UpdateUser() error = %v", err)
-	}
-
-	// Verify update
-	updated, err := service.GetUserByID(ctx, user.UUID)
-	if err != nil {
-		t.Fatalf("GetUserByID() error = %v", err)
-	}
-
-	if updated.DisplayName == nil || *updated.DisplayName != newName {
-		t.Errorf("UpdateUser() DisplayName = %v, want %s", updated.DisplayName, newName)
+func setCredentials(t *testing.T, store storage.Store, id domain.UserID, creds ...domain.WebauthnCredential) {
+	t.Helper()
+	if _, err := store.Users().Modify(context.Background(), id, func(u *domain.User) error {
+		u.WebauthnCredentials = creds
+		return nil
+	}); err != nil {
+		t.Fatalf("Modify() error = %v", err)
 	}
 }
 
@@ -808,11 +677,9 @@ func TestUserService_DeleteWebAuthnCredential(t *testing.T) {
 
 	// Register user
 	username := "webauthnuser"
-	password := "password123"
 	req := &domain.RegisterRequest{
 		Username:    &username,
 		DisplayName: "WebAuthn User",
-		Password:    &password,
 		WalletType:  domain.WalletTypeDB,
 	}
 
@@ -822,16 +689,13 @@ func TestUserService_DeleteWebAuthnCredential(t *testing.T) {
 	}
 
 	// Add multiple WebAuthn credentials to the user
-	user.WebauthnCredentials = []domain.WebauthnCredential{
-		{ID: "cred1", PublicKey: []byte("key1")},
-		{ID: "cred2", PublicKey: []byte("key2")},
-	}
-	if err := service.UpdateUser(ctx, user); err != nil {
-		t.Fatalf("UpdateUser() error = %v", err)
-	}
+	setCredentials(t, store, user.UUID,
+		domain.WebauthnCredential{ID: testCredID("1"), PublicKey: []byte("key1")},
+		domain.WebauthnCredential{ID: testCredID("2"), PublicKey: []byte("key2")},
+	)
 
 	t.Run("deletes credential successfully", func(t *testing.T) {
-		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, "cred1", []byte("{}"), "")
+		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, testCredID("1"), testPrivateDataContainer(testCredID("2")), "")
 		if err != nil {
 			t.Errorf("DeleteWebAuthnCredential() error = %v", err)
 		}
@@ -844,7 +708,7 @@ func TestUserService_DeleteWebAuthnCredential(t *testing.T) {
 	})
 
 	t.Run("fails on last credential", func(t *testing.T) {
-		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, "cred2", []byte("{}"), "")
+		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, testCredID("2"), testPrivateDataContainer(testCredID("2")), "")
 		if err != ErrLastWebAuthnCredential {
 			t.Errorf("Expected ErrLastWebAuthnCredential, got %v", err)
 		}
@@ -853,12 +717,11 @@ func TestUserService_DeleteWebAuthnCredential(t *testing.T) {
 	t.Run("fails on non-existent credential", func(t *testing.T) {
 		// Add another credential first
 		u, _ := service.GetUserByID(ctx, user.UUID)
-		u.WebauthnCredentials = append(u.WebauthnCredentials, domain.WebauthnCredential{
-			ID: "cred3", PublicKey: []byte("key3"),
-		})
-		_ = service.UpdateUser(ctx, u)
+		setCredentials(t, store, user.UUID, append(u.WebauthnCredentials, domain.WebauthnCredential{
+			ID: testCredID("3"), PublicKey: []byte("key3"),
+		})...)
 
-		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, "nonexistent", []byte("{}"), "")
+		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, "nonexistent", testPrivateDataContainer(testCredID("2")), "")
 		if err == nil {
 			t.Error("Expected error for non-existent credential")
 		}
@@ -866,7 +729,7 @@ func TestUserService_DeleteWebAuthnCredential(t *testing.T) {
 
 	t.Run("fails on ETag mismatch", func(t *testing.T) {
 		u, _ := service.GetUserByID(ctx, user.UUID)
-		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, "cred2", []byte("{}"), "wrong-etag")
+		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, testCredID("2"), testPrivateDataContainer(testCredID("2")), "wrong-etag")
 		if err != ErrPrivateDataConflict {
 			t.Errorf("Expected ErrPrivateDataConflict, got %v", err)
 		}
@@ -883,11 +746,9 @@ func TestUserService_RenameWebAuthnCredential(t *testing.T) {
 
 	// Register user
 	username := "renameuser"
-	password := "password123"
 	req := &domain.RegisterRequest{
 		Username:    &username,
 		DisplayName: "Rename User",
-		Password:    &password,
 		WalletType:  domain.WalletTypeDB,
 	}
 
@@ -897,12 +758,7 @@ func TestUserService_RenameWebAuthnCredential(t *testing.T) {
 	}
 
 	// Add a WebAuthn credential
-	user.WebauthnCredentials = []domain.WebauthnCredential{
-		{ID: "cred1", PublicKey: []byte("key1")},
-	}
-	if err := service.UpdateUser(ctx, user); err != nil {
-		t.Fatalf("UpdateUser() error = %v", err)
-	}
+	setCredentials(t, store, user.UUID, domain.WebauthnCredential{ID: "cred1", PublicKey: []byte("key1")})
 
 	t.Run("renames credential successfully", func(t *testing.T) {
 		err := service.RenameWebAuthnCredential(ctx, user.UUID, "cred1", "My Key")

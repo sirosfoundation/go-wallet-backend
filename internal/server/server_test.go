@@ -2,6 +2,9 @@ package server
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -441,4 +444,134 @@ func TestManager_ServedByMiddleware(t *testing.T) {
 			t.Errorf("expected no X-Served-By header, got %q", servedBy)
 		}
 	})
+}
+
+// server.trusted_proxies decides whether a caller can choose its own client
+// IP via X-Forwarded-For, which the per-IP rate limits key on.
+func TestConfigureTrustedProxies_ClientIP(t *testing.T) {
+	clientIP := func(proxies []string, remote string) string {
+		m := &Manager{cfg: &ServerConfig{TrustedProxies: proxies}, logger: zap.NewNop()}
+		gin.SetMode(gin.TestMode)
+		r := gin.New()
+		m.configureTrustedProxies(r)
+		var got string
+		r.GET("/", func(c *gin.Context) { got = c.ClientIP() })
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.RemoteAddr = remote + ":1234"
+		req.Header.Set("X-Forwarded-For", "203.0.113.9")
+		r.ServeHTTP(httptest.NewRecorder(), req)
+		return got
+	}
+
+	if got := clientIP(nil, "198.51.100.7"); got != "203.0.113.9" {
+		t.Errorf("unset keeps gin's legacy trust-all behaviour, got %q", got)
+	}
+	if got := clientIP([]string{"none"}, "198.51.100.7"); got != "198.51.100.7" {
+		t.Errorf("none must ignore X-Forwarded-For, got %q", got)
+	}
+	if got := clientIP([]string{"10.0.0.0/8"}, "198.51.100.7"); got != "198.51.100.7" {
+		t.Errorf("an untrusted peer must not choose its IP, got %q", got)
+	}
+	if got := clientIP([]string{"10.0.0.0/8"}, "10.1.2.3"); got != "203.0.113.9" {
+		t.Errorf("a trusted proxy's X-Forwarded-For must be honoured, got %q", got)
+	}
+}
+
+func startTestManager(t *testing.T, cfg *ServerConfig) (*Manager, error) {
+	t.Helper()
+	cfg.CORS.SetDefaults()
+	m := NewManager(cfg, zap.NewNop())
+	err := m.Start(context.Background())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = m.Shutdown(ctx)
+	})
+	return m, err
+}
+
+func TestManagerStartBindsSynchronouslyOnPortZero(t *testing.T) {
+	m, err := startTestManager(t, &ServerConfig{HTTPAddress: "127.0.0.1", HTTPPort: 0})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if m.httpServer == nil {
+		t.Fatal("httpServer not set")
+	}
+}
+
+func TestManagerStartFailsWhenPortOccupied(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	_, err = startTestManager(t, &ServerConfig{HTTPAddress: "127.0.0.1", HTTPPort: port})
+	if err == nil {
+		t.Fatal("Start() succeeded on an occupied port, want error")
+	}
+	if !strings.Contains(err.Error(), "cannot listen on") {
+		t.Errorf("error = %v, want a bind failure message", err)
+	}
+}
+
+func TestManagerStartFailsOnInvalidAddress(t *testing.T) {
+	_, err := startTestManager(t, &ServerConfig{HTTPAddress: "256.256.256.256", HTTPPort: 0})
+	if err == nil {
+		t.Fatal("Start() succeeded on an invalid address, want error")
+	}
+}
+
+func TestManagerStartAdminBindFailureReleasesHTTPListener(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	adminPort := ln.Addr().(*net.TCPAddr).Port
+
+	m, err := startTestManager(t, &ServerConfig{
+		HTTPAddress: "127.0.0.1", HTTPPort: 0,
+		AdminPort: adminPort, AdminToken: "test-token",
+	})
+	if err == nil {
+		t.Fatal("Start() succeeded with the admin port occupied, want error")
+	}
+	if !strings.Contains(err.Error(), "admin") {
+		t.Errorf("error = %v, want it to mention the admin server", err)
+	}
+	_ = m
+}
+
+// failingStartProvider fails Start, simulating a provider/background failure
+// after the HTTP listener is already bound.
+type failingStartProvider struct{}
+
+func (failingStartProvider) Name() string                 { return "failing" }
+func (failingStartProvider) Transport() Transport         { return TransportHTTP }
+func (failingStartProvider) RegisterRoutes(_ *gin.Engine) {}
+func (failingStartProvider) Start(_ context.Context) error {
+	return errors.New("injected start failure")
+}
+
+// A failure right after the first bind must release that listener before
+// Start returns, even when its Serve goroutine had not yet been scheduled.
+func TestManagerStartFailureReleasesListenerImmediately(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		port := freePort(t)
+		cfg := &ServerConfig{HTTPAddress: "127.0.0.1", HTTPPort: port}
+		cfg.CORS.SetDefaults()
+		m := NewManager(cfg, zap.NewNop())
+		m.AddProvider(failingStartProvider{})
+		if err := m.Start(context.Background()); err == nil || !strings.Contains(err.Error(), "injected") {
+			t.Fatalf("Start() error = %v, want injected failure", err)
+		}
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		if err != nil {
+			t.Fatalf("iteration %d: port still bound right after failed Start: %v", i, err)
+		}
+		_ = ln.Close()
+	}
 }

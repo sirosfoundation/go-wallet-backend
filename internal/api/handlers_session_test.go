@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,27 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/pkg/taggedbinary"
 )
 
+// testCredID returns a stored-format (base64url, no padding) credential ID
+// derived from a label.
+func testCredID(label string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte("cred-" + label))
+}
+
+// testPrivateDataContainer builds a privatedata container
+// {mainKey, prfKeys[], jwe} with one prfKeys entry per stored-format
+// credential ID.
+func testPrivateDataContainer(credentialIDs ...string) []byte {
+	prfKeys := make([]map[string]any, 0, len(credentialIDs))
+	for _, id := range credentialIDs {
+		prfKeys = append(prfKeys, map[string]any{"credentialId": map[string]string{"$b64u": id}})
+	}
+	b, err := json.Marshal(map[string]any{"mainKey": map[string]any{}, "prfKeys": prfKeys, "jwe": "a.b.c.d.e"})
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
 // setupTestHandlersWithUser creates test handlers and a user for authenticated tests
 func setupTestHandlersWithUser(t *testing.T) (*Handlers, *gin.Engine, *domain.User) {
 	t.Helper()
@@ -33,20 +55,19 @@ func setupTestHandlersWithUser(t *testing.T) (*Handlers, *gin.Engine, *domain.Us
 			RPName:   "Test Wallet",
 		},
 		JWT: config.JWTConfig{
-			Secret:      "test-secret",
-			ExpiryHours: 24,
-			Issuer:      "test-wallet",
+			Secret: "test-secret",
+			Issuer: "test-wallet",
 		},
 	}
 
 	store := memory.NewStore()
 	services := service.NewServices(store, cfg, logger)
-	handlers := NewHandlers(services, cfg, logger, []string{"test"})
+	handlers := NewHandlersWithStore(services, store, cfg, logger, []string{"test"})
 
 	// Create a test user
 	ctx := context.Background()
 	displayName := "Test User"
-	privateData := []byte(`{"encrypted": "data"}`)
+	privateData := testPrivateDataContainer(testCredID("1"))
 	user := &domain.User{
 		UUID:            domain.NewUserID(),
 		DID:             "did:key:test123",
@@ -55,7 +76,7 @@ func setupTestHandlersWithUser(t *testing.T) (*Handlers, *gin.Engine, *domain.Us
 		PrivateDataETag: domain.ComputePrivateDataETag(privateData),
 		WebauthnCredentials: []domain.WebauthnCredential{
 			{
-				ID:           "cred-1",
+				ID:           testCredID("1"),
 				CredentialID: []byte("credential-id-bytes"),
 				PublicKey:    []byte("public-key-bytes"),
 				PRFCapable:   true,
@@ -160,8 +181,8 @@ func TestHandlers_UpdatePrivateData_Success(t *testing.T) {
 	ctx := context.Background()
 	_, currentEtag, _ := handlers.services.User.GetPrivateData(ctx, user.UUID)
 
-	newPrivateData := taggedbinary.TaggedBytes([]byte(`{"new": "encrypted-data"}`))
-	body, _ := json.Marshal(map[string]interface{}{"privateData": newPrivateData})
+	newPrivateData := taggedbinary.TaggedBytes(testPrivateDataContainer(testCredID("1"), testCredID("new")))
+	body, _ := json.Marshal(newPrivateData)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/private-data", bytes.NewBuffer(body))
@@ -187,8 +208,8 @@ func TestHandlers_UpdatePrivateData_ETagMismatch(t *testing.T) {
 	handlers, router, user := setupTestHandlersWithUser(t)
 	router.POST("/private-data", authMiddlewareForUser(user), handlers.UpdatePrivateData)
 
-	newPrivateData := taggedbinary.TaggedBytes([]byte(`{"new": "encrypted-data"}`))
-	body, _ := json.Marshal(map[string]interface{}{"privateData": newPrivateData})
+	newPrivateData := taggedbinary.TaggedBytes(testPrivateDataContainer(testCredID("1")))
+	body, _ := json.Marshal(newPrivateData)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/private-data", bytes.NewBuffer(body))
@@ -217,6 +238,16 @@ func TestHandlers_GetAccountInfo_Success(t *testing.T) {
 		t.Errorf("Expected status %d, got %d: %s", http.StatusOK, w.Code, w.Body.String())
 	}
 
+	// Password authentication was removed (#162): the raw JSON must not
+	// carry hasPassword, which unmarshalling into the struct would hide.
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("Failed to parse raw response: %v", err)
+	}
+	if _, present := raw["hasPassword"]; present {
+		t.Error("account info must not include hasPassword")
+	}
+
 	var response AccountInfoResponse
 	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
 		t.Fatalf("Failed to parse response: %v", err)
@@ -241,8 +272,8 @@ func TestHandlers_GetAccountInfo_Success(t *testing.T) {
 
 	// Verify credential fields
 	cred := response.WebauthnCredentials[0]
-	if cred.ID != "cred-1" {
-		t.Errorf("Expected credential ID 'cred-1', got %s", cred.ID)
+	if cred.ID != testCredID("1") {
+		t.Errorf("Expected credential ID %q, got %s", testCredID("1"), cred.ID)
 	}
 	if !cred.PRFCapable {
 		t.Error("Expected credential to be PRF capable")
@@ -352,7 +383,7 @@ func TestHandlers_RenameWebAuthnCredential_Success(t *testing.T) {
 	})
 
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/webauthn/credential/cred-1/rename", bytes.NewBuffer(body))
+	req := httptest.NewRequest(http.MethodPost, "/webauthn/credential/"+testCredID("1")+"/rename", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
 	router.ServeHTTP(w, req)
 
@@ -387,13 +418,13 @@ func TestHandlers_DeleteWebAuthnCredential_LastCredential(t *testing.T) {
 	ctx := context.Background()
 	_, currentEtag, _ := handlers.services.User.GetPrivateData(ctx, user.UUID)
 
-	newPrivateData := taggedbinary.TaggedBytes([]byte(`{"updated": "private-data"}`))
+	newPrivateData := taggedbinary.TaggedBytes(testPrivateDataContainer(testCredID("1")))
 	body, _ := json.Marshal(map[string]interface{}{
 		"privateData": newPrivateData,
 	})
 
 	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/webauthn/credential/cred-1/delete", bytes.NewBuffer(body))
+	req := httptest.NewRequest(http.MethodPost, "/webauthn/credential/"+testCredID("1")+"/delete", bytes.NewBuffer(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Private-Data-If-Match", currentEtag)
 	router.ServeHTTP(w, req)
@@ -415,9 +446,8 @@ func TestHandlers_DeleteWebAuthnCredential_NotFound(t *testing.T) {
 			RPName:   "Test Wallet",
 		},
 		JWT: config.JWTConfig{
-			Secret:      "test-secret",
-			ExpiryHours: 24,
-			Issuer:      "test-wallet",
+			Secret: "test-secret",
+			Issuer: "test-wallet",
 		},
 	}
 
@@ -428,7 +458,7 @@ func TestHandlers_DeleteWebAuthnCredential_NotFound(t *testing.T) {
 	// Create user with multiple credentials for this test
 	ctx := context.Background()
 	displayName := "Multi-Cred User"
-	privateData := []byte(`{"encrypted": "data"}`)
+	privateData := testPrivateDataContainer(testCredID("1"))
 	userWithMultipleCreds := &domain.User{
 		UUID:            domain.NewUserID(),
 		DID:             "did:key:multicred123",
@@ -437,14 +467,14 @@ func TestHandlers_DeleteWebAuthnCredential_NotFound(t *testing.T) {
 		PrivateDataETag: domain.ComputePrivateDataETag(privateData),
 		WebauthnCredentials: []domain.WebauthnCredential{
 			{
-				ID:           "cred-1",
+				ID:           testCredID("1"),
 				CredentialID: []byte("credential-id-bytes-1"),
 				PublicKey:    []byte("public-key-bytes-1"),
 				PRFCapable:   true,
 				CreatedAt:    time.Now(),
 			},
 			{
-				ID:           "cred-2",
+				ID:           testCredID("2"),
 				CredentialID: []byte("credential-id-bytes-2"),
 				PublicKey:    []byte("public-key-bytes-2"),
 				PRFCapable:   true,
@@ -459,7 +489,7 @@ func TestHandlers_DeleteWebAuthnCredential_NotFound(t *testing.T) {
 	router := gin.New()
 	router.POST("/webauthn/credential/:id/delete", authMiddlewareForUser(userWithMultipleCreds), handlers.DeleteWebAuthnCredential)
 
-	newPrivateData := taggedbinary.TaggedBytes([]byte(`{"updated": "private-data"}`))
+	newPrivateData := taggedbinary.TaggedBytes(testPrivateDataContainer(testCredID("1")))
 	body, _ := json.Marshal(map[string]interface{}{
 		"privateData": newPrivateData,
 	})

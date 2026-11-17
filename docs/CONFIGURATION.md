@@ -5,7 +5,7 @@
 This document describes all configuration options for go-wallet-backend.
 Configuration is loaded from a YAML file and can be overridden by environment variables.
 
-Environment variables use the prefix `WALLET_` for the main backend and `REGISTRY_` for the registry server.
+Environment variables use the prefix `WALLET_` (the registry role's settings are `WALLET_REGISTRY_*`).
 
 ## Table of Contents
 
@@ -22,18 +22,9 @@ Environment variables use the prefix `WALLET_` for the main backend and `REGISTR
 - [http_client](#http_client)
 - [authzen_proxy](#authzen_proxy)
 - [audit](#audit)
-- [Registry Server](#registry-server)
-- [registry.server](#registryserver)
-- [registry.source](#registrysource)
-- [registry.sources](#registrysources)
-- [registry.cache](#registrycache)
-- [registry.dynamic_cache](#registrydynamic_cache)
-- [registry.image_embed](#registryimage_embed)
-- [registry.filter](#registryfilter)
-- [registry.rate_limit](#registryrate_limit)
-- [registry.jwt](#registryjwt)
-- [registry.logging](#registrylogging)
-- [registry.http_client](#registryhttp_client)
+- [presentation](#presentation)
+- [status_check](#status_check)
+- [registry](#registry)
 
 ---
 
@@ -49,8 +40,10 @@ Environment prefix: `WALLET_SERVER`
 | `server.admin_port` | `WALLET_SERVER_ADMIN_PORT` | integer | Internal admin API port (0 to disable) |
 | `server.engine_host` | `WALLET_SERVER_ENGINE_HOST` | string | WebSocket engine bind address (defaults to Host) |
 | `server.engine_port` | `WALLET_SERVER_ENGINE_PORT` | integer | WebSocket engine port (defaults to Port if 0) |
+| `server.trusted_proxies` | `WALLET_SERVER_TRUSTED_PROXIES` | string list | TrustedProxies lists the proxy addresses or CIDRs whose X-Forwarded-For (and X-Real-IP) headers are believed when determining the client IP, which the per-IP rate limits depend on. Use ["none"] to trust no proxy (the client IP is then the TCP peer, which is right when clients connect directly). BACKWARDS COMPATIBILITY: when unset, gin's original behaviour is kept and every peer is trusted. That lets any direct caller choose its own client IP by sending X-Forwarded-For, so the per-IP limits can be bypassed (the per-tenant limit still holds), and a warning is logged at startup while per-IP limiting is enabled. It stays the default so an upgrade does not put every client behind a load balancer into one rate-limit bucket. Production deployments should set this: to the load balancer's addresses behind one, or ["none"] without one. Env: WALLET_SERVER_TRUSTED_PROXIES (comma-separated) |
 | `server.engine_ws_ping_interval` | `WALLET_SERVER_ENGINE_WS_PING_INTERVAL` | duration | EngineWSPingInterval is how often the server sends a WebSocket ping to the client, and (via HandshakeCompleteMessage.Config) the interval the client is told to use for its own pings - see that message's doc comment for why both directions need to agree on this rather than each hardcoding its own guess. Defaults to 3s: found empirically (raw idle-TLS-connection tests against production Fly.io apps, not documentation - Fly's own docs don't state a number) that Fly.io's edge closes a connection with no traffic on it after ~5-6s, far sooner than the 30s this used to be hardcoded to, which is why every engine WebSocket on Fly was silently reconnecting every few seconds. Deployments behind a more permissive proxy/LB can raise this. |
 | `server.engine_ws_pong_timeout` | `WALLET_SERVER_ENGINE_WS_PONG_TIMEOUT` | duration | EngineWSPongTimeout is how long the server waits for a pong after sending a ping before treating the connection as dead. Unlike EngineWSPingInterval, this doesn't need to be short to keep an intermediary from seeing the connection go idle - the ping itself is what does that - so it stays generous. |
+| `server.engine_issuance_selection_policy` | `WALLET_SERVER_ENGINE_ISSUANCE_SELECTION_POLICY` | string | EngineIssuanceSelectionPolicy decides who selects the credential configurations a multi-configuration offer issues (go-wallet-backend#549, Platform-Epics#63):   "issue_all" (the default) - every offered configuration issues,   with no user-selection step at all;   "user_selects" - the awaiting_selection progress +   select_credential action run, and the answer carries a SET of   configuration ids: a subset of the offer (one, several, or all). A single-configuration offer issues unchanged under either policy (the auto-select-when-one rule). |
 | `server.registry_host` | `WALLET_SERVER_REGISTRY_HOST` | string | Registry bind address (defaults to Host) |
 | `server.registry_port` | `WALLET_SERVER_REGISTRY_PORT` | integer | VCTM registry port (defaults to 8097) |
 | `server.wp_host` | `WALLET_SERVER_WP_HOST` | string | Wallet-provider bind address (defaults to Host) |
@@ -64,8 +57,8 @@ Environment prefix: `WALLET_SERVER`
 | `server.base_url` | `WALLET_SERVER_BASE_URL` | string |  |
 | `server.cors.allowed_origins` | `WALLET_SERVER_CORS_ALLOWED_ORIGINS` | string list | AllowedOrigins is a list of origins that may access the resource. Use "*" to allow all origins (default for development). |
 | `server.cors.allowed_methods` | `WALLET_SERVER_CORS_ALLOWED_METHODS` | string list | AllowedMethods is a list of HTTP methods allowed for cross-origin requests. |
-| `server.cors.allowed_headers` | `WALLET_SERVER_CORS_ALLOWED_HEADERS` | string list | AllowedHeaders is a list of request headers allowed in cross-origin requests. |
-| `server.cors.exposed_headers` | `WALLET_SERVER_CORS_EXPOSED_HEADERS` | string list | ExposedHeaders is a list of headers that browsers are allowed to access. |
+| `server.cors.allowed_headers` | `WALLET_SERVER_CORS_ALLOWED_HEADERS` | string list | AllowedHeaders is a list of request headers allowed in cross-origin requests. An explicit list replaces the defaults, so it must include X-Token-Mode (mandatory on /auth/passkey/*) and the other headers clients send. The private-data sync headers (If-None-Match, X-Private-Data-If-Match, X-Private-Data-If-None-Match) are always added when missing. |
+| `server.cors.exposed_headers` | `WALLET_SERVER_CORS_EXPOSED_HEADERS` | string list | ExposedHeaders is a list of headers that browsers are allowed to access. Default: X-Private-Data-ETag and Retry-After (sent with every 429). An explicit list replaces the defaults, so it must keep Retry-After for cross-origin clients to read it. X-Private-Data-ETag is always added when missing. |
 | `server.cors.allow_credentials` | `WALLET_SERVER_CORS_ALLOW_CREDENTIALS` | boolean | AllowCredentials indicates whether the request can include credentials. Cannot be true when AllowedOrigins is "*". |
 | `server.cors.max_age` | `WALLET_SERVER_CORS_MAX_AGE` | integer | MaxAge indicates how long (in seconds) the results of a preflight request can be cached. |
 | `server.external_urls.backend_url` | `WALLET_SERVER_EXTERNAL_URLS_BACKEND_URL` | string | BackendURL is the external URL for the backend service (for engine → backend calls) |
@@ -114,11 +107,11 @@ Environment prefix: `WALLET_JWT`
 
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
-| `jwt.secret` | `WALLET_JWT_SECRET` | string |  |
-| `jwt.secret_path` | `WALLET_JWT_SECRET_PATH` | string | Path to file containing JWT secret |
-| `jwt.expiry_hours` | `WALLET_JWT_EXPIRY_HOURS` | integer |  |
-| `jwt.refresh_days` | `WALLET_JWT_REFRESH_DAYS` | integer |  |
-| `jwt.issuer` | `WALLET_JWT_ISSUER` | string |  |
+| `jwt.secret` | `WALLET_JWT_SECRET` | string | Secret is a server-side secret of at least 32 bytes. It keys the HMAC that binds the OIDC state parameter to the browser and authenticates OID4VCI authorization resumption contexts using a domain-separated key. Required; share across engine replicas. |
+| `jwt.secret_path` | `WALLET_JWT_SECRET_PATH` | string | SecretPath is the path to a file containing the secret (alternative to Secret). |
+| `jwt.expiry_hours` | `WALLET_JWT_EXPIRY_HOURS` | integer | REMOVED and ignored (startup warning). AS token lifetimes are as.default_token_ttl / as.audience_ttls.  Deprecated: no effect. |
+| `jwt.refresh_days` | `WALLET_JWT_REFRESH_DAYS` | integer | REMOVED and ignored (startup warning). AS sessions live as.session_ttl.  Deprecated: no effect. |
+| `jwt.issuer` | `WALLET_JWT_ISSUER` | string | Issuer is the fallback for as.issuer (the "iss" of AS-issued access tokens). Default: "wallet-backend". |
 
 ## as
 
@@ -128,19 +121,24 @@ Environment prefix: `WALLET_AS`
 |----------|-------------|------|-------------|
 | `as.enabled` | `WALLET_AS_ENABLED` | boolean | Enabled controls whether the new AS is active. |
 | `as.signing_key_path` | `WALLET_AS_SIGNING_KEY_PATH` | string | SigningKeyPath is the path to a PEM-encoded private key (ECDSA P-256, P-384, or Ed25519) used to sign access tokens. Mutually exclusive with SigningKeyPKCS11. |
-| `as.signing_key_pkcs11` | `WALLET_AS_SIGNING_KEY_PKCS11` | string | SigningKeyPKCS11 is a PKCS#11 URI for HSM-backed signing. Mutually exclusive with SigningKeyPath. |
+| `as.signing_key_pkcs11.module_path` | `WALLET_AS_SIGNING_KEY_PKCS11_MODULE_PATH` | string |  |
+| `as.signing_key_pkcs11.slot_id` | `WALLET_AS_SIGNING_KEY_PKCS11_SLOT_ID` | uint |  |
+| `as.signing_key_pkcs11.pin` | `WALLET_AS_SIGNING_KEY_PKCS11_PIN` | string |  |
+| `as.signing_key_pkcs11.pin_path` | `WALLET_AS_SIGNING_KEY_PKCS11_PIN_PATH` | string | Path to file containing PIN (preferred over inline PIN). Read at startup by Load for wallet_provider.pkcs11; for as.signing_key_pkcs11 it is read only when the AS signer is constructed, not by Load. |
+| `as.signing_key_pkcs11.key_label` | `WALLET_AS_SIGNING_KEY_PKCS11_KEY_LABEL` | string |  |
+| `as.signing_key_pkcs11.pool_size` | `WALLET_AS_SIGNING_KEY_PKCS11_POOL_SIZE` | integer | Session pool size (default 4) |
 | `as.issuer` | `WALLET_AS_ISSUER` | string | Issuer is the value of the "iss" claim in issued access tokens. Defaults to JWT.Issuer if not set. |
 | `as.default_token_ttl` | `WALLET_AS_DEFAULT_TOKEN_TTL` | duration | DefaultTokenTTL is the default access token lifetime. Default: 2m |
 | `as.audience_ttls` | `WALLET_AS_AUDIENCE_TTLS` | map[string]time.Duration | AudienceTTLs allows per-audience TTL overrides. Keys are audience strings, values are durations. |
-| `as.audiences` | `WALLET_AS_AUDIENCES` | string list | Audiences lists the accepted audience values for token validation. Tokens must contain at least one of these in their "aud" claim. When empty, audience validation is skipped. Documented values: "wallet-backend", "wallet-engine", "wallet-registry". |
+| `as.audiences` | `WALLET_AS_AUDIENCES` | string list | Audiences lists the accepted audience values for token validation. Tokens must contain at least one of these in their "aud" claim. Required when AS is enabled, but an empty list is filled with the documented defaults ("wallet-backend", "wallet-engine", "wallet-registry") before validation, so configs that never set it keep working. Validate() rejects an empty list only if that defaulting was skipped. go-tokenauth v0.5.0 made this mandatory at the validator level too (both its validation paths now refuse to validate at all when their own configured Audiences is empty, closing a fail-open audience-confusion gap - a deployment upgraded past that version with no audiences configured would otherwise reject every request silently at runtime instead of failing to start). Documented values: "wallet-backend", "wallet-engine", "wallet-registry". |
 | `as.rules_dir` | `WALLET_AS_RULES_DIR` | string | RulesDir is the path to a directory containing SPOCP policy rule files. |
 | `as.session_ttl` | `WALLET_AS_SESSION_TTL` | duration | SessionTTL is the maximum session lifetime before re-authentication. Default: 24h |
 | `as.session_store` | `WALLET_AS_SESSION_STORE` | string | SessionStore selects where AS sessions (the cookie-bound server-side sessions that mint access tokens) are kept: "mongodb", "memory" or "auto". "auto" (the default when empty) means "mongodb" when the storage backend is MongoDB and "memory" otherwise. Memory sessions are lost on restart and are not shared between instances; use "mongodb" for high availability. |
-| `as.default_max_tac` | `WALLET_AS_DEFAULT_MAX_TAC` | string | DefaultMaxTAC is the default maximum TAC for sessions created via passkey auth. Admin sessions (e.g. via OIDC) may get a different MaxTAC per policy. Default: "rwl" (read, write, list) |
-| `as.legacy.enabled` | `WALLET_AS_LEGACY_ENABLED` | boolean | Enabled controls whether legacy HMAC tokens are accepted. Default: true (for backward compatibility) |
-| `as.legacy.deprecation_header` | `WALLET_AS_LEGACY_DEPRECATION_HEADER` | boolean | DeprecationHeader controls whether Deprecation + Sunset headers are sent on legacy token responses. |
-| `as.legacy.sunset_date` | `WALLET_AS_LEGACY_SUNSET_DATE` | string | SunsetDate is the date after which legacy tokens will no longer be supported. Used in the Sunset HTTP header. Format: RFC 3339 date (e.g. "2027-10-01T00:00:00Z"). |
-| `as.external_url` | `WALLET_AS_EXTERNAL_URL` | string | ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com"). Used to construct OIDC redirect URIs. Required when OIDC is used. |
+| `as.default_max_tac` | `WALLET_AS_DEFAULT_MAX_TAC` | string | DefaultMaxTAC is the default maximum TAC for sessions created via passkey auth. Admin sessions (e.g. via OIDC) may get a different MaxTAC per policy. It is also what /auth/token issues when no tac is requested. Default: "rwlid" (read, write, list, insert, delete): adding a passkey needs i, and removing a passkey or deleting the account needs d. Delegation (k) and admin (a) are never granted by default. |
+| `as.legacy.enabled` | `WALLET_AS_LEGACY_ENABLED` | boolean | REMOVED. true makes startup fail; false is ignored with a startup warning. A pointer so that unset and explicit false differ. |
+| `as.legacy.deprecation_header` | `WALLET_AS_LEGACY_DEPRECATION_HEADER` | boolean | REMOVED and ignored (startup warning). |
+| `as.legacy.sunset_date` | `WALLET_AS_LEGACY_SUNSET_DATE` | string | REMOVED and ignored (startup warning). |
+| `as.external_url` | `WALLET_AS_EXTERNAL_URL` | string | ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com"). Used for OIDC redirect URIs and, in an isolated wallet-provider or standalone engine, to locate the AS JWKS. Must be an absolute http(s) URL without a query or fragment; a path prefix is allowed. Required whenever the AS is enabled, including the backend role (config validation fails without it).  A standalone engine (--mode=engine) has no revocation source: a token stays valid there until it expires, even after logout. Use short access token TTLs, or co-host the engine with the backend. |
 | `as.insecure_cookies` | `WALLET_AS_INSECURE_COOKIES` | boolean | InsecureCookies disables the __Host- prefix and Secure flag on session cookies. Required for local development over HTTP. NEVER enable in production. |
 
 ## wallet_provider
@@ -155,7 +153,7 @@ Environment prefix: `WALLET_WALLET_PROVIDER`
 | `wallet_provider.pkcs11.module_path` | `WALLET_WALLET_PROVIDER_PKCS11_MODULE_PATH` | string |  |
 | `wallet_provider.pkcs11.slot_id` | `WALLET_WALLET_PROVIDER_PKCS11_SLOT_ID` | uint |  |
 | `wallet_provider.pkcs11.pin` | `WALLET_WALLET_PROVIDER_PKCS11_PIN` | string |  |
-| `wallet_provider.pkcs11.pin_path` | `WALLET_WALLET_PROVIDER_PKCS11_PIN_PATH` | string | Path to file containing PIN (preferred over inline PIN) |
+| `wallet_provider.pkcs11.pin_path` | `WALLET_WALLET_PROVIDER_PKCS11_PIN_PATH` | string | Path to file containing PIN (preferred over inline PIN). Read at startup by Load for wallet_provider.pkcs11; for as.signing_key_pkcs11 it is read only when the AS signer is constructed, not by Load. |
 | `wallet_provider.pkcs11.key_label` | `WALLET_WALLET_PROVIDER_PKCS11_KEY_LABEL` | string |  |
 | `wallet_provider.pkcs11.pool_size` | `WALLET_WALLET_PROVIDER_PKCS11_POOL_SIZE` | integer | Session pool size (default 4) |
 | `wallet_provider.wia.enabled` | `WALLET_WALLET_PROVIDER_WIA_ENABLED` | boolean | Enabled controls whether WIA endpoints are registered |
@@ -183,9 +181,33 @@ Environment prefix: `WALLET_WALLET_PROVIDER`
 | `wallet_provider.attestation.native_attestation.google_play_integrity_verification_key` | `WALLET_WALLET_PROVIDER_ATTESTATION_NATIVE_ATTESTATION_GOOGLE_PLAY_INTEGRITY_VERIFICATION_KEY` | string | GooglePlayIntegrityVerificationKey is the base64-encoded verification key. Prefer GooglePlayIntegrityVerificationKeyPath for production deployments. |
 | `wallet_provider.attestation.native_attestation.google_play_integrity_verification_key_path` | `WALLET_WALLET_PROVIDER_ATTESTATION_NATIVE_ATTESTATION_GOOGLE_PLAY_INTEGRITY_VERIFICATION_KEY_PATH` | string | GooglePlayIntegrityVerificationKeyPath is a path to a file containing the verification key (preferred over the inline value). |
 | `wallet_provider.attestation.fido2_attestation.enabled` | `WALLET_WALLET_PROVIDER_ATTESTATION_FIDO2_ATTESTATION_ENABLED` | boolean | Enabled controls whether the FIDO2 key-attestation registration endpoint accepts and verifies attestation objects. Off by default — like NativeAttestation, this is an explicit opt-in trust decision. |
+| `wallet_provider.attestation.android_key_attestation.trust_anchors_path` | `WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_TRUST_ANCHORS_PATH` | string | TrustAnchorsPath is a file of PEM CERTIFICATE blocks: the pinned roots an attestation chain must end in. Unset and empty TrustAnchorsPEM mean no anchors, so nothing verifies. |
+| `wallet_provider.attestation.android_key_attestation.trust_anchors_pem` | `WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_TRUST_ANCHORS_PEM` | string | TrustAnchorsPEM is the same list given inline (for example from a mounted secret exposed as an environment variable). It is added to the anchors read from TrustAnchorsPath. |
+| `wallet_provider.attestation.android_key_attestation.allowed_app_digests` | `WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_ALLOWED_APP_DIGESTS` | string list | AllowedAppDigests are the SHA-256 digests (hex, optionally colon separated) of the signing certificates of the wallet apps whose keys are accepted. Every digest the chain reports for the app must be on the list. Empty: no app is accepted. |
+| `wallet_provider.attestation.android_key_attestation.allowed_packages` | `WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_ALLOWED_PACKAGES` | string list | AllowedPackages optionally narrows the accepted Android package names. Empty: any package whose signing digests are allowed. |
+| `wallet_provider.attestation.android_key_attestation.status_list_url` | `WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_STATUS_LIST_URL` | string | StatusListURL is Google's attestation revocation list. Default https://android.googleapis.com/attestation/status. |
+| `wallet_provider.attestation.android_key_attestation.status_list_default_ttl_seconds` | `WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_STATUS_LIST_DEFAULT_TTL_SECONDS` | integer | StatusListDefaultTTLSeconds is how long a fetched list is trusted when the response carries no Cache-Control max-age. Default 3600. The list is never used past its freshness: when it has expired and cannot be fetched, evidence is refused (fail closed). |
+| `wallet_provider.attestation.android_key_attestation.enforcement` | `WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_ENFORCEMENT` | string | Enforcement says what happens to evidence that is well formed but does not qualify (no trust anchors or app digests configured, a chain that does not end in a pinned anchor, a software security level, a key not generated in the keystore, no SIGN purpose, an app that is not allowed, and the boot-state requirements below):  	ignore (default)  the WIA issues and the instance key home stays 	                  unknown; a metric and a log line record the reason. 	reject            the request fails with 400 KEY_ATTESTATION_NOT_QUALIFYING 	                  and a machine-readable reason; nothing is recorded.  Evidence that is invalid (malformed, wrong key or challenge, revoked) is always refused whatever this says. |
+| `wallet_provider.attestation.android_key_attestation.require_verified_boot` | `WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_REQUIRE_VERIFIED_BOOT` | boolean | RequireVerifiedBoot, in reject mode, requires the attested verified boot state to be "verified". Unset means true; set false to switch it off. Ignored in ignore mode (the state is recorded either way). |
+| `wallet_provider.attestation.android_key_attestation.require_locked_bootloader` | `WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_REQUIRE_LOCKED_BOOTLOADER` | boolean | RequireLockedBootloader, in reject mode, requires the attested bootloader to be locked. Unset means true; set false to switch it off. |
+| `wallet_provider.attestation.android_key_attestation.min_patch_level` | `WALLET_WALLET_PROVIDER_ATTESTATION_ANDROID_KEY_ATTESTATION_MIN_PATCH_LEVEL` | integer | MinPatchLevel, in reject mode, is the oldest accepted OS patch level as YYYYMM (for example 202601). 0 (default) means no requirement. |
 | `wallet_provider.attestation.status_list.enabled` | `WALLET_WALLET_PROVIDER_ATTESTATION_STATUS_LIST_ENABLED` | boolean | Enabled controls whether `client_status`/`key_storage_status` are emitted at all. Defaults to true (CS-04 conformance); set false to go back to omitting them. |
 | `wallet_provider.attestation.status_list.uri` | `WALLET_WALLET_PROVIDER_ATTESTATION_STATUS_LIST_URI` | string | URI overrides the status list URI the claims reference. Defaults to this wallet provider's own endpoint, "<server.base_url>/wallet-provider/status-list". Set it only when the list is published somewhere else (e.g. behind a CDN on a different host than server.base_url). |
 | `wallet_provider.attestation.status_list.maintenance_period_seconds` | `WALLET_WALLET_PROVIDER_ATTESTATION_STATUS_LIST_MAINTENANCE_PERIOD_SECONDS` | integer | MaintenancePeriodSeconds is how far ahead of issuance the claims' `exp` — the revocation *maintenance* commitment, independent of the token's own `exp` (CS-04 §7.2's note; TS-03 clause 2.4.1) — is set. CS-04 §7.2.2 requires at least 31 days remaining at presentation; this defaults to 45 days so a WUA still satisfies that after sitting unused for a fortnight. Values below 31 days are rejected by Validate() when StatusList is enabled. |
+| `wallet_provider.attestation.assurance.enabled` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_ENABLED` | boolean | Enabled switches the policy engine on. Default false. |
+| `wallet_provider.attestation.assurance.rules_file` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_RULES_FILE` | string | RulesFile is the path to the SPOCP rules file (advanced form, one rule per line, each preceded by a "# id: <name>" comment line). Required when Enabled; an existing but empty file is valid and means every dimension resolves to its floor. The name must not end in .spocp or .bin (go-spocp auto-detects those as binary); use ".rules". |
+| `wallet_provider.attestation.assurance.level_schemes` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_LEVEL_SCHEMES` | LevelSchemeList | LevelSchemes are the named level schemes available to the dimensions. The built-in "iso_18045" scheme is always available unless a scheme with that id is configured here. |
+| `wallet_provider.attestation.assurance.key_storage_scheme` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_KEY_STORAGE_SCHEME` | string | KeyStorageScheme and UserAuthenticationScheme select the scheme (by id) used for each dimension. Default "iso_18045". |
+| `wallet_provider.attestation.assurance.user_authentication_scheme` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_USER_AUTHENTICATION_SCHEME` | string |  |
+| `wallet_provider.attestation.assurance.lower_by_claims_key_storage` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_LOWER_BY_CLAIMS_KEY_STORAGE` | boolean | LowerByClaims, per dimension: when true (default) the result is min(level the client claimed, level the rules grant) whenever the client sent a claim for that dimension; with no claim nothing is lowered. When false the rules are the sole authority and claims matter only through (claimed ...) groups in rules. |
+| `wallet_provider.attestation.assurance.lower_by_claims_user_authentication` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_LOWER_BY_CLAIMS_USER_AUTHENTICATION` | boolean |  |
+| `wallet_provider.attestation.assurance.certification.scheme` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_CERTIFICATION_SCHEME` | string | Scheme is the default certification scheme name for derived entries. |
+| `wallet_provider.attestation.assurance.certification.levels` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_CERTIFICATION_LEVELS` | string list | Levels are the assurance levels of Scheme, strongest first. When Entries is empty one entry per level is derived, named after the level. |
+| `wallet_provider.attestation.assurance.certification.entries` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_CERTIFICATION_ENTRIES` | CertificationEntryList | Entries are the named certifications, probed in order (list the strongest first); the first one a rule permits wins. |
+| `wallet_provider.attestation.assurance.certification_basis_in_claim` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_CERTIFICATION_BASIS_IN_CLAIM` | boolean | CertificationBasisInClaim, when true, adds a "basis" member ({policy, rules}) to an object-valued certification claim. Default false and NOT spec-supported: OpenID4VCI 1.0/1.1 Appendix D defines certification as a URL string. See docs/assurance-policy.md. |
+| `wallet_provider.attestation.assurance.wia_profile_schemes` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_WIA_PROFILE_SCHEMES` | WIAProfileSchemeList | WIAProfileSchemes are the named S-profile schemes available to the Wallet Instance Attestation (WIA) decision (assure-wia). The built-in "cs04_annex_c" scheme is always available unless one with that id is configured here. |
+| `wallet_provider.attestation.assurance.wia_profile_scheme` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_WIA_PROFILE_SCHEME` | string | WIAProfileScheme selects the scheme (by id) the WIA profile is decided in. Default "cs04_annex_c". |
+| `wallet_provider.attestation.assurance.wia_certification.entries` | `WALLET_WALLET_PROVIDER_ATTESTATION_ASSURANCE_WIA_CERTIFICATION_ENTRIES` | WIACertificationEntryList | Entries are probed in order (list the strongest first); the first one a rule permits wins. |
 
 ## trust
 
@@ -199,6 +221,8 @@ Environment prefix: `WALLET_TRUST`
 | `trust.timeout` | `WALLET_TRUST_TIMEOUT` | integer | Timeout is the HTTP timeout for trust evaluation requests (seconds). |
 | `trust.insecure_skip_verify` | `WALLET_TRUST_INSECURE_SKIP_VERIFY` | boolean | InsecureSkipVerify disables TLS certificate verification for PDP requests. Use only in development or when the PDP uses a self-signed certificate. |
 | `trust.ca_cert_path` | `WALLET_TRUST_CA_CERT_PATH` | string | CACertPath is the path to a PEM-encoded CA certificate used to verify the PDP's TLS certificate. Set this when the PDP is signed by an internal/private CA. |
+| `trust.cache_disabled` | `WALLET_TRUST_CACHE_DISABLED` | boolean | CacheDisabled turns the engine's in-memory verifier trust cache off, so every flow asks the PDP again.  For testing, not for production. A trust decision - including a denial - is otherwise reused for CacheTTLSeconds, which makes iterating on trust configuration nearly impossible: fix the whitelist or the keys, redeploy the PDP, retry, and the wallet is still refused by a cached answer, with nothing in any log to say the answer was stale. It also means a PDP that is briefly unreachable takes a verifier down for the rest of the TTL. |
+| `trust.cache_ttl_seconds` | `WALLET_TRUST_CACHE_TTL_SECONDS` | integer | CacheTTLSeconds is how long a verifier trust decision is reused. Zero selects the default of one hour. Ignored when CacheDisabled. |
 | `trust.issuer.pdp_url` | `WALLET_TRUST_ISSUER_PDP_URL` | string | PDPURL overrides the global PDP URL for this specific flow. Empty inherits from global. Set to "none" to explicitly disable trust. |
 | `trust.verifier.pdp_url` | `WALLET_TRUST_VERIFIER_PDP_URL` | string | PDPURL overrides the global PDP URL for this specific flow. Empty inherits from global. Set to "none" to explicitly disable trust. |
 
@@ -221,6 +245,7 @@ Environment prefix: `WALLET_FEATURES`
 
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
+| `features.disable_opportunistic_request_encryption` | `WALLET_FEATURES_DISABLE_OPPORTUNISTIC_REQUEST_ENCRYPTION` | boolean | DisableOpportunisticRequestEncryption disables optional OID4VCI credential request encryption, including deferred requests, for issuer compatibility. Required request encryption and encryption needed for an encrypted response are unaffected. Default: false (opportunistic encryption enabled). |
 | `features.proxy_enabled` | `WALLET_FEATURES_PROXY_ENABLED` | boolean | ProxyEnabled controls whether the /proxy endpoint is available. Set to false to disable the proxy (requires WebSocket engine for flows). Default: true (for backward compatibility) |
 | `features.websocket_required` | `WALLET_FEATURES_WEBSOCKET_REQUIRED` | boolean | WebSocketRequired forces WebSocket transport for credential flows. When true, the proxy endpoint will return an error directing clients to use the WebSocket transport instead. Default: false |
 | `features.credential_storage_enabled` | `WALLET_FEATURES_CREDENTIAL_STORAGE_ENABLED` | boolean | CredentialStorageEnabled controls whether server-side credential storage endpoints (/storage/vc/*) are available. By default, credentials are stored exclusively in the encrypted client-side private_data blob and the server-side storage path is unused. Set to true only if you need backward-compatible server-side credential storage. Default: false (server-side credential storage disabled) |
@@ -231,10 +256,19 @@ Environment prefix: `WALLET_SECURITY`
 
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
+| `security.require_authorization_response_issuer` | `WALLET_SECURITY_REQUIRE_AUTHORIZATION_RESPONSE_ISSUER` | boolean | RequireAuthorizationResponseIssuer enforces RFC 9207 issuer presence for OID4VCI authorization responses even when AS metadata omits support. Enable for FAPI deployments. Default: false. Advertised support always requires iss; any supplied issuer must match the original AS exactly. |
 | `security.auth_rate_limit.enabled` | `WALLET_SECURITY_AUTH_RATE_LIMIT_ENABLED` | boolean | Enabled controls whether rate limiting is active |
 | `security.auth_rate_limit.max_attempts` | `WALLET_SECURITY_AUTH_RATE_LIMIT_MAX_ATTEMPTS` | integer | MaxAttempts is the maximum number of login/registration attempts per window Default: 10 |
 | `security.auth_rate_limit.window_seconds` | `WALLET_SECURITY_AUTH_RATE_LIMIT_WINDOW_SECONDS` | integer | WindowSeconds is the time window for rate limiting (in seconds) Default: 60 (1 minute) |
 | `security.auth_rate_limit.lockout_seconds` | `WALLET_SECURITY_AUTH_RATE_LIMIT_LOCKOUT_SECONDS` | integer | LockoutSeconds is how long to lock out after exceeding the limit Default: 300 (5 minutes) |
+| `security.oidc_gate_rate_limit.per_ip.enabled` | `WALLET_SECURITY_OIDC_GATE_RATE_LIMIT_PER_IP_ENABLED` | boolean | Enabled controls whether the per-IP limit is active. Default: true |
+| `security.oidc_gate_rate_limit.per_ip.max_attempts` | `WALLET_SECURITY_OIDC_GATE_RATE_LIMIT_PER_IP_MAX_ATTEMPTS` | integer | MaxAttempts is the number of token-bearing gate requests one client IP may make per window. Default: 30 |
+| `security.oidc_gate_rate_limit.per_ip.window_seconds` | `WALLET_SECURITY_OIDC_GATE_RATE_LIMIT_PER_IP_WINDOW_SECONDS` | integer | WindowSeconds is the rate-limit window in seconds. Default: 60 |
+| `security.oidc_gate_rate_limit.per_ip.lockout_seconds` | `WALLET_SECURITY_OIDC_GATE_RATE_LIMIT_PER_IP_LOCKOUT_SECONDS` | integer | LockoutSeconds is how long a client IP is refused after exceeding the limit, and the Retry-After it is sent. Default: 60 |
+| `security.oidc_gate_rate_limit.per_tenant.enabled` | `WALLET_SECURITY_OIDC_GATE_RATE_LIMIT_PER_TENANT_ENABLED` | boolean | Enabled controls whether the per-tenant limit is active. Default: true |
+| `security.oidc_gate_rate_limit.per_tenant.max_attempts` | `WALLET_SECURITY_OIDC_GATE_RATE_LIMIT_PER_TENANT_MAX_ATTEMPTS` | integer | MaxAttempts is the number of token-bearing gate requests one tenant may receive per window, across all clients. Default: 300 |
+| `security.oidc_gate_rate_limit.per_tenant.window_seconds` | `WALLET_SECURITY_OIDC_GATE_RATE_LIMIT_PER_TENANT_WINDOW_SECONDS` | integer | WindowSeconds is the rate-limit window in seconds. Default: 60 |
+| `security.oidc_gate_rate_limit.per_tenant.lockout_seconds` | `WALLET_SECURITY_OIDC_GATE_RATE_LIMIT_PER_TENANT_LOCKOUT_SECONDS` | integer | LockoutSeconds is how long a tenant is refused after exceeding the limit, and the Retry-After it is sent. Default: 60 |
 | `security.aaguid_blacklist.enabled` | `WALLET_SECURITY_AAGUID_BLACKLIST_ENABLED` | boolean | Enabled controls whether AAGUID blacklist checking is active |
 | `security.aaguid_blacklist.aaguids` | `WALLET_SECURITY_AAGUID_BLACKLIST_AAGUIDS` | string list | AAGUIDs is a list of blocked AAGUIDs (hex-encoded UUIDs without dashes) Example: ["00000000000000000000000000000000"] to block zero AAGUID |
 | `security.aaguid_blacklist.reject_unknown` | `WALLET_SECURITY_AAGUID_BLACKLIST_REJECT_UNKNOWN` | boolean | RejectUnknown rejects authenticators with zero/unknown AAGUIDs Default: false (permissive - allows unknown authenticators) |
@@ -242,6 +276,7 @@ Environment prefix: `WALLET_SECURITY`
 | `security.challenge_cleanup.interval_seconds` | `WALLET_SECURITY_CHALLENGE_CLEANUP_INTERVAL_SECONDS` | integer | IntervalSeconds is how often to run cleanup (in seconds) Default: 300 (5 minutes) |
 | `security.token_blacklist.enabled` | `WALLET_SECURITY_TOKEN_BLACKLIST_ENABLED` | boolean | Enabled controls whether token blacklist checking is active |
 | `security.token_blacklist.cleanup_interval_seconds` | `WALLET_SECURITY_TOKEN_BLACKLIST_CLEANUP_INTERVAL_SECONDS` | integer | CleanupIntervalSeconds is how often to clean up expired blacklist entries Default: 3600 (1 hour) |
+| `security.token_blacklist.backend` | `WALLET_SECURITY_TOKEN_BLACKLIST_BACKEND` | string | Backend selects where revoked access-token jtis and revoked users are kept: "memory" (per process; lost on restart, not seen by other replicas) or "storage" (the MongoDB storage backend; shared by all replicas and survives restarts). Empty means "storage" when storage.type is mongodb and "memory" otherwise. |
 | `security.webauthn.attestation_conveyance` | `WALLET_SECURITY_WEBAUTHN_ATTESTATION_CONVEYANCE` | string | AttestationConveyance controls how the RP requests attestation from authenticators. Valid values: "none", "indirect", "direct", "enterprise" Default: "none" (recommended for most deployments - avoids certificate validation issues) Use "direct" only if you need to verify authenticator makes/models. |
 
 ## http_client
@@ -254,7 +289,10 @@ Environment prefix: `WALLET_HTTP_CLIENT`
 | `http_client.timeout` | `WALLET_HTTP_CLIENT_TIMEOUT` | integer | Timeout is the timeout for HTTP requests in seconds (default: 30) |
 | `http_client.insecure_skip_verify` | `WALLET_HTTP_CLIENT_INSECURE_SKIP_VERIFY` | boolean | InsecureSkipVerify disables TLS certificate verification (not recommended for production) |
 | `http_client.allow_private_ips` | `WALLET_HTTP_CLIENT_ALLOW_PRIVATE_IPS` | boolean | AllowPrivateIPs permits outbound requests to private/internal/loopback/link-local ranges. Required when credential issuers run on Docker, k8s internal networks, or localhost. Default: false (private/loopback/cloud-metadata IPs are blocked by the SSRF DialContext). Set to true when issuers are hosted on internal networks (dev/staging environments). Env: WALLET_HTTP_CLIENT_ALLOW_PRIVATE_IPS |
-| `http_client.allow_http` | `WALLET_HTTP_CLIENT_ALLOW_HTTP` | boolean | AllowHTTP permits non-TLS (plain HTTP) for every fetch that goes through the client this configuration builds - request objects, issuer and verifier metadata, JWKS, logos, registry and proxy calls - not only for metadata resolution, which was its scope while the resolver was the sole consumer. Code that builds its own client rather than taking this one is not governed by it; see NewHTTPClient for which paths those are. Default: false (HTTPS required). Use only for local development. It is not the only setting that permits plaintext: see AllowsPlaintext, which is what every check in the codebase actually consults. Env: WALLET_HTTP_CLIENT_ALLOW_HTTP |
+| `http_client.allow_http` | `WALLET_HTTP_CLIENT_ALLOW_HTTP` | boolean | AllowHTTP permits non-TLS (plain HTTP) for every fetch that goes through the client this configuration builds - request objects, issuer and verifier metadata, JWKS, logos, registry and proxy calls and Token Status List fetches (status_check) - not only for metadata resolution, which was its scope while the resolver was the sole consumer. Code that builds its own client rather than taking this one is not governed by it; see NewHTTPClient for which paths those are. Default: false (HTTPS required). Use only for local development. It is not the only setting that permits plaintext: see AllowsPlaintext, which is what every check in the codebase actually consults. Env: WALLET_HTTP_CLIENT_ALLOW_HTTP |
+| `http_client.metadata_type` | `WALLET_HTTP_CLIENT_METADATA_TYPE` | string | MetadataType selects which representation of OpenID4VCI issuer metadata the wallet requests and accepts (OpenID4VCI 12.2.2). One of: "prefer-signed" (default), "require-signed", "prefer-unsigned", "require-unsigned", "any". Each request carries one Accept value. A compliant issuer answers 406 when it cannot serve it. prefer-signed asks for application/jwt, and after a 406 (and only a 406; every other status is terminal) retries once with application/json; prefer-unsigned is the mirror image. A signed response that is present but fails verification is always an error and never triggers the fallback. require-signed asks only for application/jwt and rejects unsigned metadata; require-unsigned asks only for application/json and rejects application/jwt; neither falls back. any sends one request accepting both and takes what the issuer serves. The prefer-* modes retry the other form only after an HTTP 406. An issuer that answers a different 4xx (400, 415, ...) to an Accept header it cannot satisfy is not negotiating, so the wallet does not retry; serve such issuers with "any", which sends a single request with Accept: application/jwt, application/json and needs no retry. Unknown values are rejected at startup. Env: WALLET_HTTP_CLIENT_METADATA_TYPE Read only by the issuer-metadata resolvers, which the backend role (for AuthZEN proxy URL resolution) and the engine role build. The registry role builds no resolver and ignores the field. |
+| `http_client.metadata_cache_disabled` | `WALLET_HTTP_CLIENT_METADATA_CACHE_DISABLED` | boolean | MetadataCacheDisabled turns off caching of OpenID4VCI issuer metadata, so every resolution fetches it afresh. This covers the issuer-metadata resolvers (engine and AuthZEN proxy) and the backend's GET /issuer/:id/metadata endpoint cache. Useful for testing scenarios where the same issuer URL is reused with different metadata. Env: WALLET_HTTP_CLIENT_METADATA_CACHE_DISABLED |
+| `http_client.trusted_idp_hosts` | `WALLET_HTTP_CLIENT_TRUSTED_IDP_HOSTS` | string list | TrustedIdPHosts lists hostnames of operator-configured OIDC identity providers that may resolve to private/loopback/link-local addresses. It applies only to the client NewIdPHTTPClient builds (the AS's OIDC discovery, token exchange and JWKS fetches), never to the client used for issuers, verifiers and other counterparties. Matching is by exact, case-insensitive hostname of every request, redirect hops and the token_endpoint/jwks_uri named by a discovery document included, so a discovery document cannot steer the request to an unlisted internal host. Cloud metadata endpoints stay blocked regardless. Only the wallet server's AS reads this setting; the registry has no identity-provider client and ignores it. Env: WALLET_HTTP_CLIENT_TRUSTED_IDP_HOSTS (comma-separated) |
 
 ## authzen_proxy
 
@@ -280,160 +318,65 @@ Environment prefix: `WALLET_AUDIT`
 | `audit.issuer` | `WALLET_AUDIT_ISSUER` | string | Issuer is the iss claim in SET records (e.g. "https://wallet.siros.org"). |
 | `audit.key_path` | `WALLET_AUDIT_KEY_PATH` | string | KeyPath is the path to a PEM-encoded EC private key for signing SET records. |
 | `audit.key_id` | `WALLET_AUDIT_KEY_ID` | string | KeyID is the kid used in SET JWS headers. |
+| `audit.identity_events` | `WALLET_AUDIT_IDENTITY_EVENTS` | string list | IdentityEvents selects which enterprise-identity (OIDC gate) audit events are emitted, by short name: bound, verified, mismatch, gate_bypass. Default: none. Requires enabled. The subject is only ever emitted as a hash. Unknown names are rejected at startup. Env: WALLET_AUDIT_IDENTITY_EVENTS (comma-separated) |
 
-## Registry Server
+## presentation
 
-The registry server (`cmd/registry`) has its own configuration file. It serves VCTM (Verifiable Credential Type Metadata) fetched from upstream registries.
-
-Environment prefix: `REGISTRY`
-
-
-## registry.server
-
-Server configuration
-
-Environment prefix: `REGISTRY_SERVER`
+Environment prefix: `WALLET_PRESENTATION`
 
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
-| `server.host` | `REGISTRY_SERVER_HOST` | string |  |
-| `server.port` | `REGISTRY_SERVER_PORT` | integer |  |
-| `server.served_by_header` | `REGISTRY_SERVER_SERVEDBYHEADER` | string |  |
-| `server.tls.enabled` | `REGISTRY_SERVER_TLS_ENABLED` | boolean | Enabled enables TLS for the HTTP listeners |
-| `server.tls.cert_file` | `REGISTRY_SERVER_TLS_CERT_FILE` | string | CertFile is the path to the TLS certificate file |
-| `server.tls.key_file` | `REGISTRY_SERVER_TLS_KEY_FILE` | string | KeyFile is the path to the TLS private key file |
-| `server.tls.min_version` | `REGISTRY_SERVER_TLS_MIN_VERSION` | string | MinVersion is the minimum TLS version (tls12 or tls13, default: tls12) |
-| `server.cors.allowed_origins` | `REGISTRY_SERVER_CORS_ALLOWED_ORIGINS` | string list | AllowedOrigins is a list of origins that may access the resource. Use "*" to allow all origins (default for development). |
-| `server.cors.allowed_methods` | `REGISTRY_SERVER_CORS_ALLOWED_METHODS` | string list | AllowedMethods is a list of HTTP methods allowed for cross-origin requests. |
-| `server.cors.allowed_headers` | `REGISTRY_SERVER_CORS_ALLOWED_HEADERS` | string list | AllowedHeaders is a list of request headers allowed in cross-origin requests. |
-| `server.cors.exposed_headers` | `REGISTRY_SERVER_CORS_EXPOSED_HEADERS` | string list | ExposedHeaders is a list of headers that browsers are allowed to access. |
-| `server.cors.allow_credentials` | `REGISTRY_SERVER_CORS_ALLOW_CREDENTIALS` | boolean | AllowCredentials indicates whether the request can include credentials. Cannot be true when AllowedOrigins is "*". |
-| `server.cors.max_age` | `REGISTRY_SERVER_CORS_MAX_AGE` | integer | MaxAge indicates how long (in seconds) the results of a preflight request can be cached. |
+| `presentation.dcql_consent_check` | `WALLET_PRESENTATION_DCQL_CONSENT_CHECK` | DCQLConsentCheckMode | DCQLConsentCheck compares the user's consent (selected credential query ids and disclosed claims) with the DCQL query the backend sent to the client, before any signing. The frontend is not trusted to have honoured the query. Values: `off` (no check); `warn` (default: log a warning with the reason class and query id, never refuse; claim-path matching can disagree with a real verifier's notion of a path, so a deployer opts into enforcement); `enforce` (refuse with PRESENTATION_ERROR and answer the verifier access_denied, without signing). Nothing about claim names or values is logged. Not enforced: credential_sets satisfaction (only that no query outside every option is selected), `values` constraints, and the contents of the resulting vp_token. Unknown values fail at startup. Env: WALLET_PRESENTATION_DCQL_CONSENT_CHECK |
 
-## registry.source
+## status_check
 
-Source is the legacy single-registry source configuration. Use Sources for multi-registry support. If Sources is empty, Source is used.
-
-Environment prefix: `REGISTRY_SOURCE`
+Environment prefix: `WALLET_STATUS_CHECK`
 
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
-| `source.url` | `REGISTRY_SOURCE_URL` | string | URL of the upstream registry. The actual endpoint is determined by the Mode setting. |
-| `source.mode` | `REGISTRY_SOURCE_MODE` | string (`ts11` or `registry`) | Mode selects which API endpoint to use: "ts11" (default) or "registry" (all credentials). |
-| `source.local_overrides` | `REGISTRY_SOURCE_LOCAL_OVERRIDES` | string list | LocalOverrides is a list of local file or directory paths containing VCTM JSON files. These are loaded at startup and take priority over entries fetched from the remote registry. Directories are scanned for *.json files. Entries are keyed by their "vct" field. |
-| `source.poll_interval` | `REGISTRY_SOURCE_POLL_INTERVAL` | duration | PollInterval is how often to poll the upstream registry for updates |
-| `source.timeout` | `REGISTRY_SOURCE_TIMEOUT` | duration | Timeout for HTTP requests to the upstream registry |
+| `status_check.enabled` | `WALLET_STATUS_CHECK_ENABLED` | boolean | Enabled turns the API on; when false the route answers 503 STATUS_NOT_SUPPORTED. Default: true. Status list URIs are chosen by the caller, so lists are fetched like any other untrusted URL, under the http_client policy: HTTPS only and no private, loopback, link-local or cloud-metadata addresses unless http_client.allow_http or http_client.allow_private_ips (or insecure_skip_verify) is set, e.g. for a local test issuer. Fetched lists are always signature-verified and their signer trust-evaluated. Env: WALLET_STATUS_CHECK_ENABLED |
+| `status_check.status_list_signer_fallback` | `WALLET_STATUS_CHECK_STATUS_LIST_SIGNER_FALLBACK` | boolean | StatusListSignerFallback: when go-trust errors on the `status-list-signer` evaluation and this is true (default), ask once more as `credential-issuer`; when false the list is undetermined (trust_unavailable). A genuine negative never falls back. Env: WALLET_STATUS_CHECK_STATUS_LIST_SIGNER_FALLBACK |
+| `status_check.status_list_min_entries` | `WALLET_STATUS_CHECK_STATUS_LIST_MIN_ENTRIES` | integer | StatusListMinEntries rejects a list with fewer entries once inflated (bytes*8/bits) as undetermined (list_too_small). Default 0: no minimum, as the draft sets none; set e.g. 131072 only if every status issuer you rely on publishes at least that. Must not be negative. Env: WALLET_STATUS_CHECK_STATUS_LIST_MIN_ENTRIES |
+| `status_check.status_list_max_concurrent_loads` | `WALLET_STATUS_CHECK_STATUS_LIST_MAX_CONCURRENT_LOADS` | integer | StatusListMaxConcurrentLoads bounds concurrent list fetch-and-inflate loads across all requests; each can hold up to 36 MiB, which the cache limit does not cover. A request waiting for a slot gives up at its deadline (budget_exhausted). 0 (default) means 8. Must not be negative. Env: WALLET_STATUS_CHECK_STATUS_LIST_MAX_CONCURRENT_LOADS |
+| `status_check.max_lists_per_request` | `WALLET_STATUS_CHECK_MAX_LISTS_PER_REQUEST` | integer | MaxListsPerRequest caps the lists per request (over it: 400 TOO_MANY_URIS). Clients should ask for 1-3 to limit what the server learns. 0 (default) means 20. Env: WALLET_STATUS_CHECK_MAX_LISTS_PER_REQUEST |
+| `status_check.request_timeout_seconds` | `WALLET_STATUS_CHECK_REQUEST_TIMEOUT_SECONDS` | integer | RequestTimeoutSeconds is the deadline of one request, covering all its lists; unfinished lists are undetermined (budget_exhausted). Must stay under the 15 s HTTP write timeout. 0 (default) means 8; at most 12. Env: WALLET_STATUS_CHECK_REQUEST_TIMEOUT_SECONDS |
+| `status_check.max_list_bytes` | `WALLET_STATUS_CHECK_MAX_LIST_BYTES` | integer | MaxListBytes caps one returned compressed `lst`; a larger list is undetermined (too_large). 0 (default) means 2097152 (2 MiB). Must not be negative. Env: WALLET_STATUS_CHECK_MAX_LIST_BYTES |
+| `status_check.rate_limit.enabled` | `WALLET_STATUS_CHECK_RATE_LIMIT_ENABLED` | boolean | Enabled controls whether rate limiting is active |
+| `status_check.rate_limit.max_attempts` | `WALLET_STATUS_CHECK_RATE_LIMIT_MAX_ATTEMPTS` | integer | MaxAttempts is the maximum number of login/registration attempts per window Default: 10 |
+| `status_check.rate_limit.window_seconds` | `WALLET_STATUS_CHECK_RATE_LIMIT_WINDOW_SECONDS` | integer | WindowSeconds is the time window for rate limiting (in seconds) Default: 60 (1 minute) |
+| `status_check.rate_limit.lockout_seconds` | `WALLET_STATUS_CHECK_RATE_LIMIT_LOCKOUT_SECONDS` | integer | LockoutSeconds is how long to lock out after exceeding the limit Default: 300 (5 minutes) |
 
-## registry.sources
+## registry
 
-Sources is an ordered list of remote registry URLs to fetch from. Schemas fetched from later sources in the list overwrite earlier ones, allowing a registry to extend or override another. When non-empty, the Source.URL field is ignored for remote fetching (Source.PollInterval and Source.LocalOverrides remain global settings). (list of entries, each with the fields below)
+Registry configures the VCTM registry role (--mode=registry). It replaces the retired standalone registry configuration file (configs/registry.yaml, REGISTRY_* environment variables).
 
-Environment prefix: `REGISTRY_SOURCES`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `sources[*].url` | `REGISTRY_SOURCES_URL` | string | URL is the base URL of the registry (e.g. "https://registry.siros.org"). The actual endpoint path is determined by the Mode setting. For backward compatibility, if a full path to a specific endpoint is given (e.g. ending in schemas.json or registry.json), it is used as-is regardless of Mode. |
-| `sources[*].mode` | `REGISTRY_SOURCES_MODE` | string (`ts11` or `registry`) | Mode selects which API endpoint to use: "ts11" (default) for only TS11-compliant credentials, or "registry" for all credentials including non-TS11. |
-| `sources[*].timeout` | `REGISTRY_SOURCES_TIMEOUT` | duration | Timeout for HTTP requests to this source. Zero means no per-source timeout (the shared http.Client timeout applies). |
-
-## registry.cache
-
-Cache configuration
-
-Environment prefix: `REGISTRY_CACHE`
+Environment prefix: `WALLET_REGISTRY`
 
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
-| `cache.path` | `REGISTRY_CACHE_PATH` | string | Path to the cache file (JSON format) |
-| `cache.max_age` | `REGISTRY_CACHE_MAX_AGE` | duration | MaxAge is the maximum age of cached data before forcing a refresh |
-
-## registry.dynamic_cache
-
-DynamicCache configuration for on-demand URL fetching
-
-Environment prefix: `REGISTRY_DYNAMIC_CACHE`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `dynamic_cache.enabled` | `REGISTRY_DYNAMIC_CACHE_ENABLED` | boolean | Enabled controls whether dynamic URL fetching is active |
-| `dynamic_cache.default_ttl` | `REGISTRY_DYNAMIC_CACHE_DEFAULT_TTL` | duration | DefaultTTL is the default cache TTL for dynamically fetched VCTMs when no HTTP cache headers are present |
-| `dynamic_cache.max_ttl` | `REGISTRY_DYNAMIC_CACHE_MAX_TTL` | duration | MaxTTL is the maximum cache TTL to respect from HTTP headers Values larger than this will be capped |
-| `dynamic_cache.min_ttl` | `REGISTRY_DYNAMIC_CACHE_MIN_TTL` | duration | MinTTL is the minimum cache TTL; shorter values from HTTP headers will be bumped up to this value |
-| `dynamic_cache.timeout` | `REGISTRY_DYNAMIC_CACHE_TIMEOUT` | duration | Timeout for HTTP requests when fetching VCTMs dynamically |
-| `dynamic_cache.allowed_hosts` | `REGISTRY_DYNAMIC_CACHE_ALLOWED_HOSTS` | string list | AllowedHosts is an optional list of host patterns (regexps) that are allowed for dynamic fetching. If empty, all HTTPS hosts are allowed. |
-
-## registry.image_embed
-
-ImageEmbed configuration for embedding images as data URIs
-
-Environment prefix: `REGISTRY_IMAGE_EMBED`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `image_embed.enabled` | `REGISTRY_IMAGE_EMBED_ENABLED` | boolean | Enabled controls whether image embedding is active |
-| `image_embed.max_image_size` | `REGISTRY_IMAGE_EMBED_MAX_IMAGE_SIZE` | integer | MaxImageSize is the maximum size in bytes for images to embed Images larger than this will be left as URLs |
-| `image_embed.timeout` | `REGISTRY_IMAGE_EMBED_TIMEOUT` | duration | Timeout for fetching individual images |
-| `image_embed.concurrent_fetches` | `REGISTRY_IMAGE_EMBED_CONCURRENT_FETCHES` | integer | ConcurrentFetches is the maximum number of concurrent image fetches |
-
-## registry.filter
-
-Filter configuration for include/exclude patterns
-
-Environment prefix: `REGISTRY_FILTER`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `filter.include_patterns` | `REGISTRY_FILTER_INCLUDE_PATTERNS` | string list | IncludePatterns are regexps that VCT IDs must match to be included If empty, all VCT IDs are included (unless excluded) |
-| `filter.exclude_patterns` | `REGISTRY_FILTER_EXCLUDE_PATTERNS` | string list | ExcludePatterns are regexps that cause VCT IDs to be excluded |
-
-## registry.rate_limit
-
-Rate limiting configuration
-
-Environment prefix: `REGISTRY_RATE_LIMIT`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `rate_limit.enabled` | `REGISTRY_RATE_LIMIT_ENABLED` | boolean | Enabled controls whether rate limiting is active |
-| `rate_limit.authenticated_rpm` | `REGISTRY_RATE_LIMIT_AUTHENTICATED_RPM` | integer | AuthenticatedRPM is requests per minute for authenticated clients |
-| `rate_limit.unauthenticated_rpm` | `REGISTRY_RATE_LIMIT_UNAUTHENTICATED_RPM` | integer | UnauthenticatedRPM is requests per minute for unauthenticated clients |
-| `rate_limit.burst_multiplier` | `REGISTRY_RATE_LIMIT_BURST_MULTIPLIER` | integer | BurstMultiplier allows bursts of this multiple of the rate limit |
-
-## registry.jwt
-
-JWT configuration for authentication
-
-Environment prefix: `REGISTRY_JWT`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `jwt.secret` | `REGISTRY_JWT_SECRET` | string | Secret is the shared secret for validating JWT signatures (HMAC) |
-| `jwt.secret_path` | `REGISTRY_JWT_SECRET_PATH` | string | SecretPath is an alternative to Secret: path to a file containing the JWT secret. If both Secret and SecretPath are set, SecretPath takes precedence. |
-| `jwt.issuer` | `REGISTRY_JWT_ISSUER` | string | Issuer is the expected issuer claim in the JWT |
-| `jwt.require_auth` | `REGISTRY_JWT_REQUIRE_AUTH` | boolean | RequireAuth requires authentication for all requests (if false, unauthenticated access is allowed) |
-
-## registry.logging
-
-Logging configuration
-
-Environment prefix: `REGISTRY_LOGGING`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `logging.level` | `REGISTRY_LOGGING_LEVEL` | string | debug, info, warn, error |
-| `logging.format` | `REGISTRY_LOGGING_FORMAT` | string | json, text |
-
-## registry.http_client
-
-HTTPClient configuration for outbound requests (proxy, TLS settings)
-
-Environment prefix: `REGISTRY_HTTP_CLIENT`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `http_client.proxy_url` | `REGISTRY_HTTP_CLIENT_PROXY_URL` | string | ProxyURL is the URL of the HTTP proxy for egress requests (e.g., http://proxy:8080) |
-| `http_client.timeout` | `REGISTRY_HTTP_CLIENT_TIMEOUT` | integer | Timeout is the timeout for HTTP requests in seconds (default: 30) |
-| `http_client.insecure_skip_verify` | `REGISTRY_HTTP_CLIENT_INSECURE_SKIP_VERIFY` | boolean | InsecureSkipVerify disables TLS certificate verification (not recommended for production) |
-| `http_client.allow_private_ips` | `REGISTRY_HTTP_CLIENT_ALLOW_PRIVATE_IPS` | boolean | AllowPrivateIPs permits outbound requests to private/internal/loopback/link-local ranges. Required when credential issuers run on Docker, k8s internal networks, or localhost. Default: false (private/loopback/cloud-metadata IPs are blocked by the SSRF DialContext). Set to true when issuers are hosted on internal networks (dev/staging environments). Env: WALLET_HTTP_CLIENT_ALLOW_PRIVATE_IPS |
-| `http_client.allow_http` | `REGISTRY_HTTP_CLIENT_ALLOW_HTTP` | boolean | AllowHTTP permits non-TLS (plain HTTP) for every fetch that goes through the client this configuration builds - request objects, issuer and verifier metadata, JWKS, logos, registry and proxy calls - not only for metadata resolution, which was its scope while the resolver was the sole consumer. Code that builds its own client rather than taking this one is not governed by it; see NewHTTPClient for which paths those are. Default: false (HTTPS required). Use only for local development. It is not the only setting that permits plaintext: see AllowsPlaintext, which is what every check in the codebase actually consults. Env: WALLET_HTTP_CLIENT_ALLOW_HTTP |
+| `registry.source.url` | `WALLET_REGISTRY_SOURCE_URL` | string | URL of the upstream registry. The actual endpoint is determined by the Mode setting. |
+| `registry.source.mode` | `WALLET_REGISTRY_SOURCE_MODE` | RegistryAPIMode | Mode selects which API endpoint to use: "ts11" (default) or "registry" (all credentials). |
+| `registry.source.local_overrides` | `WALLET_REGISTRY_SOURCE_LOCAL_OVERRIDES` | string list | LocalOverrides is a list of local file or directory paths containing VCTM JSON files. These are loaded at startup and take priority over entries fetched from the remote registry. Directories are scanned for *.json files. Entries are keyed by their "vct" field. |
+| `registry.source.poll_interval` | `WALLET_REGISTRY_SOURCE_POLL_INTERVAL` | duration | PollInterval is how often to poll the upstream registry for updates |
+| `registry.source.timeout` | `WALLET_REGISTRY_SOURCE_TIMEOUT` | duration | Timeout for HTTP requests to the upstream registry |
+| `registry.sources` | `WALLET_REGISTRY_SOURCES` | RegistryRemoteSourceConfig list | Sources is an ordered list of remote registry URLs to fetch from. Schemas fetched from later sources in the list overwrite earlier ones, allowing a registry to extend or override another. When non-empty, the Source.URL field is ignored for remote fetching (Source.PollInterval and Source.LocalOverrides remain global settings). |
+| `registry.cache.path` | `WALLET_REGISTRY_CACHE_PATH` | string | Path to the cache file (JSON format) |
+| `registry.cache.max_age` | `WALLET_REGISTRY_CACHE_MAX_AGE` | duration | MaxAge is the maximum age of cached data before forcing a refresh |
+| `registry.dynamic_cache.enabled` | `WALLET_REGISTRY_DYNAMIC_CACHE_ENABLED` | boolean | Enabled controls whether dynamic URL fetching is active |
+| `registry.dynamic_cache.default_ttl` | `WALLET_REGISTRY_DYNAMIC_CACHE_DEFAULT_TTL` | duration | DefaultTTL is the default cache TTL for dynamically fetched VCTMs when no HTTP cache headers are present |
+| `registry.dynamic_cache.max_ttl` | `WALLET_REGISTRY_DYNAMIC_CACHE_MAX_TTL` | duration | MaxTTL is the maximum cache TTL to respect from HTTP headers Values larger than this will be capped |
+| `registry.dynamic_cache.min_ttl` | `WALLET_REGISTRY_DYNAMIC_CACHE_MIN_TTL` | duration | MinTTL is the minimum cache TTL; shorter values from HTTP headers will be bumped up to this value |
+| `registry.dynamic_cache.timeout` | `WALLET_REGISTRY_DYNAMIC_CACHE_TIMEOUT` | duration | Timeout for HTTP requests when fetching VCTMs dynamically |
+| `registry.dynamic_cache.allowed_hosts` | `WALLET_REGISTRY_DYNAMIC_CACHE_ALLOWED_HOSTS` | string list | AllowedHosts is an optional list of host patterns (regexps) that are allowed for dynamic fetching. If empty, all HTTPS hosts are allowed. |
+| `registry.image_embed.enabled` | `WALLET_REGISTRY_IMAGE_EMBED_ENABLED` | boolean | Enabled controls whether image embedding is active |
+| `registry.image_embed.max_image_size` | `WALLET_REGISTRY_IMAGE_EMBED_MAX_IMAGE_SIZE` | integer | MaxImageSize is the maximum size in bytes for images to embed Images larger than this will be left as URLs |
+| `registry.image_embed.timeout` | `WALLET_REGISTRY_IMAGE_EMBED_TIMEOUT` | duration | Timeout for fetching individual images |
+| `registry.image_embed.concurrent_fetches` | `WALLET_REGISTRY_IMAGE_EMBED_CONCURRENT_FETCHES` | integer | ConcurrentFetches is the maximum number of concurrent image fetches |
+| `registry.filter.include_patterns` | `WALLET_REGISTRY_FILTER_INCLUDE_PATTERNS` | string list | IncludePatterns are regexps that VCT IDs must match to be included If empty, all VCT IDs are included (unless excluded) |
+| `registry.filter.exclude_patterns` | `WALLET_REGISTRY_FILTER_EXCLUDE_PATTERNS` | string list | ExcludePatterns are regexps that cause VCT IDs to be excluded |
+| `registry.rate_limit.enabled` | `WALLET_REGISTRY_RATE_LIMIT_ENABLED` | boolean | Enabled controls whether rate limiting is active |
+| `registry.rate_limit.authenticated_rpm` | `WALLET_REGISTRY_RATE_LIMIT_AUTHENTICATED_RPM` | integer | AuthenticatedRPM is requests per minute for authenticated clients |
+| `registry.rate_limit.unauthenticated_rpm` | `WALLET_REGISTRY_RATE_LIMIT_UNAUTHENTICATED_RPM` | integer | UnauthenticatedRPM is requests per minute for unauthenticated clients |
+| `registry.rate_limit.burst_multiplier` | `WALLET_REGISTRY_RATE_LIMIT_BURST_MULTIPLIER` | integer | BurstMultiplier allows bursts of this multiple of the rate limit |
+| `registry.require_auth` | `WALLET_REGISTRY_REQUIRE_AUTH` | boolean | RequireAuth requires a valid access token on all registry requests. If false (default), unauthenticated access is allowed (with the lower unauthenticated rate limit); valid tokens are still recognised. Tokens are validated with the same go-tokenauth validator as the other roles; see ValidateRegistry for the as.* fields this needs when the registry runs without the auth role. |
 

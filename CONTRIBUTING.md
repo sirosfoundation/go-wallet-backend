@@ -302,7 +302,7 @@ type UserService struct {
 }
 
 // Register creates a new user account.
-// It validates the input, hashes the password, generates a DID,
+// It validates the input, generates a DID,
 // and stores the user in the database.
 //
 // Returns the created user and nil error on success,

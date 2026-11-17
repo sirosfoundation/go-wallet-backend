@@ -20,7 +20,7 @@ import (
 	"go.uber.org/zap"
 )
 
-func setupUnifiedAuth(t *testing.T) (*TokenIssuer, *LegacyTokenIssuer, *MemorySessionStore) {
+func setupSessionAuth(t *testing.T) (*TokenIssuer, *MemorySessionStore) {
 	t.Helper()
 
 	// Write a temp ECDSA key for the KeyManager.
@@ -50,18 +50,14 @@ func setupUnifiedAuth(t *testing.T) (*TokenIssuer, *LegacyTokenIssuer, *MemorySe
 		return 5 * time.Minute
 	})
 
-	// Legacy issuer.
-	secret := []byte("test-secret-32-bytes-long-value!")
-	legacyIssuer := NewLegacyTokenIssuer(secret, "test-issuer", 24*time.Hour)
-
 	store := NewMemorySessionStore()
 
-	return tokenIssuer, legacyIssuer, store
+	return tokenIssuer, store
 }
 
-func TestUnifiedAuth_NewStyleClient(t *testing.T) {
+func TestSessionAuth_NewStyleClient(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	tokenIssuer, _, store := setupUnifiedAuth(t)
+	tokenIssuer, store := setupSessionAuth(t)
 	logger := zap.NewNop()
 
 	// Create a session.
@@ -85,7 +81,7 @@ func TestUnifiedAuth_NewStyleClient(t *testing.T) {
 	}
 
 	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, true, logger))
+	router.Use(SessionAuthMiddleware(store, tokenIssuer, []string{"test-audience"}, true, logger))
 	router.GET("/test", func(c *gin.Context) {
 		ac := GetAuthContext(c)
 		if ac == nil {
@@ -95,9 +91,6 @@ func TestUnifiedAuth_NewStyleClient(t *testing.T) {
 		}
 		if ac.UserID != "user-1" {
 			t.Errorf("expected user-1, got %s", ac.UserID)
-		}
-		if ac.Mode != ClientModeSession {
-			t.Errorf("expected ClientModeSession, got %s", ac.Mode)
 		}
 		c.Status(http.StatusOK)
 	})
@@ -113,55 +106,13 @@ func TestUnifiedAuth_NewStyleClient(t *testing.T) {
 	}
 }
 
-func TestUnifiedAuth_LegacyClient(t *testing.T) {
+func TestSessionAuth_NoAuth(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	_, legacyIssuer, store := setupUnifiedAuth(t)
-	logger := zap.NewNop()
-
-	// Issue a legacy token.
-	token, err := legacyIssuer.Issue("user-2", "did:example:2", "tenant-2", "rp-1")
-	if err != nil {
-		t.Fatalf("issue legacy token: %v", err)
-	}
-
-	// Need a tokenIssuer for new-style path (won't be hit).
-	tokenIssuer, _, _ := setupUnifiedAuth(t)
-
-	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, legacyIssuer, []string{"rp-1"}, true, logger))
-	router.GET("/test", func(c *gin.Context) {
-		ac := GetAuthContext(c)
-		if ac == nil {
-			t.Error("expected AuthContext")
-			c.Status(http.StatusInternalServerError)
-			return
-		}
-		if ac.UserID != "user-2" {
-			t.Errorf("expected user-2, got %s", ac.UserID)
-		}
-		if ac.Mode != ClientModeLegacy {
-			t.Errorf("expected ClientModeLegacy, got %s", ac.Mode)
-		}
-		c.Status(http.StatusOK)
-	})
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/test", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("expected 200, got %d", w.Code)
-	}
-}
-
-func TestUnifiedAuth_NoAuth(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	tokenIssuer, legacyIssuer, store := setupUnifiedAuth(t)
+	tokenIssuer, store := setupSessionAuth(t)
 	logger := zap.NewNop()
 
 	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, legacyIssuer, []string{"aud"}, true, logger))
+	router.Use(SessionAuthMiddleware(store, tokenIssuer, []string{"aud"}, true, logger))
 	router.GET("/test", func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
@@ -175,9 +126,9 @@ func TestUnifiedAuth_NoAuth(t *testing.T) {
 	}
 }
 
-func TestUnifiedAuth_SessionButNoAccessToken(t *testing.T) {
+func TestSessionAuth_SessionButNoAccessToken(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	tokenIssuer, _, store := setupUnifiedAuth(t)
+	tokenIssuer, store := setupSessionAuth(t)
 	logger := zap.NewNop()
 
 	// Create session.
@@ -191,7 +142,7 @@ func TestUnifiedAuth_SessionButNoAccessToken(t *testing.T) {
 	_ = store.Create(context.Background(), sess)
 
 	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"aud"}, true, logger))
+	router.Use(SessionAuthMiddleware(store, tokenIssuer, []string{"aud"}, true, logger))
 	router.GET("/test", func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
@@ -207,16 +158,17 @@ func TestUnifiedAuth_SessionButNoAccessToken(t *testing.T) {
 	}
 }
 
-func TestUnifiedAuth_LegacyDisabled(t *testing.T) {
+// A bearer access token without the session cookie that minted it is refused.
+func TestSessionAuth_BearerWithoutSessionCookieRejected(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	tokenIssuer, legacyIssuer, store := setupUnifiedAuth(t)
+	tokenIssuer, store := setupSessionAuth(t)
 	logger := zap.NewNop()
 
-	// Issue a legacy token but pass nil as legacyIssuer.
-	token, _ := legacyIssuer.Issue("user-1", "", "tenant-1", "rp-1")
+	token, err := tokenIssuer.Issue("user-1", "aud", "tenant-1", TAC("r"), "urn:siros:acr:passkey")
+	require.NoError(t, err)
 
 	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"aud"}, true, logger))
+	router.Use(SessionAuthMiddleware(store, tokenIssuer, []string{"aud"}, true, logger))
 	router.GET("/test", func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
@@ -231,9 +183,9 @@ func TestUnifiedAuth_LegacyDisabled(t *testing.T) {
 	}
 }
 
-func TestUnifiedAuth_SessionTokenMismatch(t *testing.T) {
+func TestSessionAuth_SessionTokenMismatch(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	tokenIssuer, _, store := setupUnifiedAuth(t)
+	tokenIssuer, store := setupSessionAuth(t)
 	logger := zap.NewNop()
 
 	// Create a session for user-1.
@@ -257,7 +209,7 @@ func TestUnifiedAuth_SessionTokenMismatch(t *testing.T) {
 	}
 
 	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, true, logger))
+	router.Use(SessionAuthMiddleware(store, tokenIssuer, []string{"test-audience"}, true, logger))
 	router.GET("/test", func(c *gin.Context) {
 		c.Status(http.StatusOK)
 	})
@@ -273,9 +225,9 @@ func TestUnifiedAuth_SessionTokenMismatch(t *testing.T) {
 	}
 }
 
-func TestUnifiedAuth_TenantMismatch(t *testing.T) {
+func TestSessionAuth_TenantMismatch(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	tokenIssuer, _, store := setupUnifiedAuth(t)
+	tokenIssuer, store := setupSessionAuth(t)
 	logger := zap.NewNop()
 
 	sess := &Session{
@@ -294,7 +246,7 @@ func TestUnifiedAuth_TenantMismatch(t *testing.T) {
 	require.NoError(t, err)
 
 	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, true, logger))
+	router.Use(SessionAuthMiddleware(store, tokenIssuer, []string{"test-audience"}, true, logger))
 	router.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	w := httptest.NewRecorder()
@@ -307,9 +259,9 @@ func TestUnifiedAuth_TenantMismatch(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "tenant does not match")
 }
 
-func TestUnifiedAuth_CrossTenantSession_AllowsNarrowedToken(t *testing.T) {
+func TestSessionAuth_CrossTenantSession_AllowsNarrowedToken(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	tokenIssuer, _, store := setupUnifiedAuth(t)
+	tokenIssuer, store := setupSessionAuth(t)
 	logger := zap.NewNop()
 
 	// Session with cross-tenant scope.
@@ -329,7 +281,7 @@ func TestUnifiedAuth_CrossTenantSession_AllowsNarrowedToken(t *testing.T) {
 	require.NoError(t, err)
 
 	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, true, logger))
+	router.Use(SessionAuthMiddleware(store, tokenIssuer, []string{"test-audience"}, true, logger))
 	router.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	w := httptest.NewRecorder()
@@ -341,9 +293,9 @@ func TestUnifiedAuth_CrossTenantSession_AllowsNarrowedToken(t *testing.T) {
 	assert.Equal(t, http.StatusOK, w.Code)
 }
 
-func TestUnifiedAuth_TACExceedsSession(t *testing.T) {
+func TestSessionAuth_TACExceedsSession(t *testing.T) {
 	gin.SetMode(gin.TestMode)
-	tokenIssuer, _, store := setupUnifiedAuth(t)
+	tokenIssuer, store := setupSessionAuth(t)
 	logger := zap.NewNop()
 
 	// Session with limited TAC.
@@ -363,7 +315,7 @@ func TestUnifiedAuth_TACExceedsSession(t *testing.T) {
 	require.NoError(t, err)
 
 	router := gin.New()
-	router.Use(UnifiedAuthMiddleware(store, tokenIssuer, nil, []string{"test-audience"}, true, logger))
+	router.Use(SessionAuthMiddleware(store, tokenIssuer, []string{"test-audience"}, true, logger))
 	router.GET("/test", func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	w := httptest.NewRecorder()

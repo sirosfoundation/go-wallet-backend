@@ -443,14 +443,16 @@ func TestValidator_CustomClaims(t *testing.T) {
 }
 
 func TestDiscoverProvider(t *testing.T) {
-	// Test OIDC discovery
+	// Test OIDC discovery. The discovery document's issuer must match the
+	// requested issuer (server.URL) - see TestDiscoverProvider_IssuerMismatch
+	// for the case where it doesn't.
 	_, jwkJSON := createTestRSAKey(t)
 
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/.well-known/openid-configuration" {
 			config := map[string]string{
-				"issuer":   "https://test-issuer.example.com",
+				"issuer":   server.URL,
 				"jwks_uri": server.URL + "/jwks",
 			}
 			w.Header().Set("Content-Type", "application/json")
@@ -469,12 +471,40 @@ func TestDiscoverProvider(t *testing.T) {
 		t.Fatalf("failed to discover provider: %v", err)
 	}
 
-	if discovery.Issuer != "https://test-issuer.example.com" {
-		t.Errorf("expected issuer 'https://test-issuer.example.com', got '%s'", discovery.Issuer)
+	if discovery.Issuer != server.URL {
+		t.Errorf("expected issuer %q, got %q", server.URL, discovery.Issuer)
 	}
 
 	if discovery.JWKSURI != server.URL+"/jwks" {
 		t.Errorf("unexpected JWKS URI: %s", discovery.JWKSURI)
+	}
+}
+
+// TestDiscoverProvider_IssuerMismatch covers issue #373 (M-1): DiscoverProvider
+// must reject a discovery document whose `issuer` field doesn't match the
+// requested issuer, exactly like Validator.fetchDiscovery already does.
+// Without this check, a compromised or misrouted discovery endpoint could
+// hand back an authorization_endpoint/token_endpoint for a different issuer
+// and the AS's OIDC login flow would trust it blindly.
+func TestDiscoverProvider_IssuerMismatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/.well-known/openid-configuration" {
+			config := map[string]string{
+				"issuer":                 "https://attacker.example.com",
+				"authorization_endpoint": "https://attacker.example.com/authorize",
+				"token_endpoint":         "https://attacker.example.com/token",
+				"jwks_uri":               "https://attacker.example.com/jwks",
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(config)
+		}
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	_, err := DiscoverProvider(ctx, server.URL, nil)
+	if err == nil {
+		t.Fatal("expected issuer mismatch error, got nil")
 	}
 }
 

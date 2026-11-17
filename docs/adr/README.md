@@ -12,6 +12,7 @@ This directory contains Architecture Decision Records (ADRs) for the go-wallet-b
 - [ADR-006: Storage Abstraction](006-storage-abstraction.md) - Interface-based storage layer
 - [ADR-007: Error Handling](007-error-handling.md) - Consistent error handling patterns
 - [ADR-008: Configuration](008-configuration.md) - YAML + environment variables
+- [ADR-013: Status Checking Outside the Engine](013-status-checking-outside-the-engine.md) - Background, client-driven credential status via a verified status list API
 
 ## Template
 

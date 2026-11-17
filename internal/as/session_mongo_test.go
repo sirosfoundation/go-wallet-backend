@@ -96,7 +96,8 @@ func TestMongoSessionStore_RoundTrip(t *testing.T) {
 	jti, err := GenerateSessionID()
 	require.NoError(t, err)
 
-	require.NoError(t, store.Create(ctx, testSession(jti, "user-1")))
+	sess := testSession(jti, "user-1")
+	require.NoError(t, store.Create(ctx, sess))
 
 	got, err := store.Get(ctx, jti)
 	require.NoError(t, err)

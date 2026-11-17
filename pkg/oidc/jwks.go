@@ -14,8 +14,9 @@ import (
 	"math/big"
 	"net/http"
 
-	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/pkg/jwk"
 )
 
 type jwksTransportError struct {

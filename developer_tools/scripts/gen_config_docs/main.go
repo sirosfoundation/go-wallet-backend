@@ -429,7 +429,7 @@ func renderMarkdown(sections []SectionDoc, title string) string {
 	b.WriteString("# " + title + "\n\n")
 	b.WriteString("This document describes all configuration options for go-wallet-backend.\n")
 	b.WriteString("Configuration is loaded from a YAML file and can be overridden by environment variables.\n\n")
-	b.WriteString("Environment variables use the prefix `WALLET_` for the main backend and `REGISTRY_` for the registry server.\n\n")
+	b.WriteString("Environment variables use the prefix `WALLET_` (the registry role's settings are `WALLET_REGISTRY_*`).\n\n")
 	b.WriteString("## Table of Contents\n\n")
 
 	for _, sec := range sections {
@@ -476,6 +476,11 @@ func renderMarkdown(sections []SectionDoc, title string) string {
 	return b.String()
 }
 
+func dirExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
+}
+
 func main() {
 	rootFlag := flag.String("root", "", "workspace root (auto-detected from cwd if empty)")
 	outFlag := flag.String("out", "docs/CONFIGURATION.md", "output path relative to root")
@@ -498,45 +503,19 @@ func main() {
 			log.Fatalf("error parsing %s: %v", pkgDir, err)
 		}
 	}
-	mainSections := buildSections(mainReg, "config.Config", "WALLET", "config")
-
-	// Parse registry config (internal/registry + internal/embed + pkg/config for cross-refs)
-	// Parse pkg/config first so its types are available but internal/registry's Config wins
-	regReg := NewRegistry()
-	if _, err := os.Stat(pkgDir); err == nil {
-		if err := regReg.ParseDir(pkgDir); err != nil {
-			log.Fatalf("error parsing %s: %v", pkgDir, err)
-		}
-	}
-	embedDir := filepath.Join(root, "internal/embed")
-	if _, err := os.Stat(embedDir); err == nil {
-		if err := regReg.ParseDir(embedDir); err != nil {
+	// internal/embed defines registry.image_embed.
+	if embedDir := filepath.Join(root, "internal/embed"); dirExists(embedDir) {
+		if err := mainReg.ParseDir(embedDir); err != nil {
 			log.Fatalf("error parsing %s: %v", embedDir, err)
 		}
 	}
-	regDir := filepath.Join(root, "internal/registry")
-	if _, err := os.Stat(regDir); err == nil {
-		if err := regReg.ParseDir(regDir); err != nil {
-			log.Fatalf("error parsing %s: %v", regDir, err)
-		}
-	}
-	registrySections := buildSections(regReg, "registry.Config", "REGISTRY", "registry")
+	mainSections := buildSections(mainReg, "config.Config", "WALLET", "config")
 
-	// Render combined document
+	// The registry role's settings live under `registry:` in the backend
+	// config (pkg/config.RegistryConfig); its image_embed section is defined
+	// in internal/embed, which the main registry also needs to resolve.
 	var allSections []SectionDoc
 	allSections = append(allSections, mainSections...)
-
-	// Add registry sections with a heading marker
-	registryMarker := SectionDoc{
-		Title:       "Registry Server",
-		Description: "The registry server (`cmd/registry`) has its own configuration file. It serves VCTM (Verifiable Credential Type Metadata) fetched from upstream registries.",
-		EnvPrefix:   "REGISTRY",
-	}
-	allSections = append(allSections, registryMarker)
-	for i := range registrySections {
-		registrySections[i].Title = "registry." + registrySections[i].Title
-	}
-	allSections = append(allSections, registrySections...)
 
 	markdown := renderMarkdown(allSections, "Configuration Reference")
 

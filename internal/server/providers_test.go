@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -15,12 +16,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	gojose "github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
+	legacyjwt "github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-tokenauth/claims"
@@ -31,6 +34,7 @@ import (
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	wsengine "github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/registry"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
@@ -51,10 +55,8 @@ func minimalTestConfig() *config.Config {
 			RPOrigin: "http://localhost:8080",
 		},
 		JWT: config.JWTConfig{
-			Secret:      "test-secret-key",
-			ExpiryHours: 24,
-			RefreshDays: 7,
-			Issuer:      "test",
+			Secret: "test-secret-key",
+			Issuer: "test",
 		},
 		HTTPClient: config.HTTPClientConfig{
 			Timeout:         5,
@@ -103,9 +105,14 @@ func (b *memoryBackend) Invites() storage.InviteStore             { return b.sto
 func (b *memoryBackend) WalletInstances() storage.WalletInstanceStore {
 	return b.store.WalletInstances()
 }
+
 func (b *memoryBackend) KeyAttestations() storage.KeyAttestationStore {
 	return b.store.KeyAttestations()
 }
+func (b *memoryBackend) AppAttestKeys() storage.AppAttestKeyStore {
+	return b.store.AppAttestKeys()
+}
+
 func (b *memoryBackend) Ping(ctx context.Context) error { return b.store.Ping(ctx) }
 func (b *memoryBackend) Close() error                   { return b.store.Close() }
 
@@ -271,7 +278,7 @@ func TestRegistryProvider_CheckReady_Healthy(t *testing.T) {
 	store := registry.NewStore("")
 
 	provider := &RegistryProvider{
-		cfg:    cfg,
+		rcfg:   cfg,
 		logger: logger,
 		store:  store,
 	}
@@ -287,7 +294,7 @@ func TestRegistryProvider_CheckReady_NilStore(t *testing.T) {
 	cfg := registry.DefaultConfig()
 
 	provider := &RegistryProvider{
-		cfg:    cfg,
+		rcfg:   cfg,
 		logger: logger,
 		store:  nil,
 	}
@@ -308,7 +315,7 @@ func TestRegistryProvider_CheckReady_EmptyStore(t *testing.T) {
 	store := registry.NewStore("")   // Empty store
 
 	provider := &RegistryProvider{
-		cfg:    cfg,
+		rcfg:   cfg,
 		logger: logger,
 		store:  store,
 	}
@@ -363,6 +370,7 @@ func (m *mockBackend) Verifiers() storage.VerifierStore             { return nil
 func (m *mockBackend) Invites() storage.InviteStore                 { return nil }
 func (m *mockBackend) WalletInstances() storage.WalletInstanceStore { return nil }
 func (m *mockBackend) KeyAttestations() storage.KeyAttestationStore { return nil }
+func (m *mockBackend) AppAttestKeys() storage.AppAttestKeyStore     { return nil }
 
 // Verify mockBackend implements backend.Backend
 var _ backend.Backend = (*mockBackend)(nil)
@@ -533,13 +541,27 @@ func setupServerTokenValidatorTest(t *testing.T) (*tokenvalidator.Validator, *ec
 	v := tokenvalidator.New(tokenvalidator.Config{
 		JWKSURL: srv.URL,
 		Issuer:  "test-issuer",
+		// go-tokenauth v0.5.0 made Config.Audiences mandatory - both
+		// validation paths now refuse to validate at all when it's empty
+		// (closing a fail-open audience-confusion gap). This mirrors the
+		// real deployment's Audiences: cfg.AS.Audiences (the whole
+		// deployment's configured, accepted set - see
+		// NewBackendProvider/NewAuthProvider's own wiring), with
+		// route-level restriction still layered on top via
+		// result.HasAudience/RequireAudience - so it must list every
+		// audience any test in this file signs a token for, not just the
+		// one(s) a given test expects to ultimately be accepted after that
+		// finer route-level check.
+		Audiences: []string{"wallet-registry", "wallet-backend", "some-other-audience"},
 	})
 	v.Start(context.Background())
 	t.Cleanup(v.Stop)
 
 	// Poll until the validator has actually fetched the JWKS, rather than
 	// sleeping a fixed duration (flaky under slow/contended CI runners).
-	probe := signServerToken(t, key, "test-issuer", claims.AccessTokenClaims{})
+	probe := signServerToken(t, key, "test-issuer", claims.AccessTokenClaims{
+		Claims: jwt.Claims{Audience: jwt.Audience{"wallet-backend"}},
+	})
 	deadline := time.Now().Add(2 * time.Second)
 	for {
 		if _, err := v.Validate(context.Background(), probe); err == nil {
@@ -720,46 +742,6 @@ func TestAuthProvider_RequireAudience_AllowsWalletBackendToken(t *testing.T) {
 // requireTACIfEnforced / route-level TAC enforcement tests
 // =============================================================================
 
-func TestRequireTACIfEnforced_NoOpWhenValidatorNil(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	w := httptest.NewRecorder()
-	c, r := gin.CreateTestContext(w)
-
-	// No tokenauth_result set at all - if this enforced anything, it would
-	// 401, matching the legacy AuthMiddleware path having no TAC concept.
-	r.Use(requireTACIfEnforced(nil, "w"))
-	r.GET("/test", func(c *gin.Context) { c.Status(200) })
-
-	c.Request = httptest.NewRequest("GET", "/test", nil)
-	r.ServeHTTP(w, c.Request)
-
-	if w.Code != 200 {
-		t.Fatalf("expected no-op (200) when tokenValidator is nil, got %d: %s", w.Code, w.Body.String())
-	}
-}
-
-func TestRequireTACIfEnforced_EnforcesWhenValidatorSet(t *testing.T) {
-	v, _, _ := setupServerTokenValidatorTest(t)
-
-	gin.SetMode(gin.TestMode)
-	w := httptest.NewRecorder()
-	c, r := gin.CreateTestContext(w)
-
-	r.Use(func(c *gin.Context) {
-		c.Set("tokenauth_result", &claims.Result{TAC: "rl"})
-		c.Next()
-	})
-	r.Use(requireTACIfEnforced(v, "w"))
-	r.GET("/test", func(c *gin.Context) { c.Status(200) })
-
-	c.Request = httptest.NewRequest("GET", "/test", nil)
-	r.ServeHTTP(w, c.Request)
-
-	if w.Code != http.StatusForbidden {
-		t.Fatalf("expected 403 (tac 'rl' lacks 'w') when tokenValidator is set, got %d: %s", w.Code, w.Body.String())
-	}
-}
-
 // TestStorageProvider_RequireTAC_RejectsInsufficientPermission is an
 // end-to-end proof that requireTACIfEnforced is actually wired into a real
 // route, not just correct in isolation: a token with tac "rl" (read/list,
@@ -931,9 +913,6 @@ func writeTestECKeyAndCert(t *testing.T, dir, prefix string) (string, string) {
 // TestNewWalletProviderProvider_WiresTokenValidatorWhenASEnabled is a
 // regression test: isolated wallet-provider deployments must accept
 // AS-issued access tokens, the same as the co-hosted AuthProvider path.
-// Before this fix, RegisterRoutes hardcoded the legacy HMAC-only
-// AuthMiddleware regardless of cfg.AS.Enabled, so AS-issued tokens were
-// always rejected in isolated mode.
 func TestNewWalletProviderProvider_WiresTokenValidatorWhenASEnabled(t *testing.T) {
 	dir := t.TempDir()
 	keyPath, certPath := writeTestECKeyAndCert(t, dir, "wallet-provider")
@@ -962,30 +941,63 @@ func TestNewWalletProviderProvider_WiresTokenValidatorWhenASEnabled(t *testing.T
 	}
 }
 
-// TestNewWalletProviderProvider_NoTokenValidatorWhenASDisabled documents the
-// counterpart: without AS enabled, isolated wallet-provider mode falls back
-// to legacy HMAC auth, matching AuthProvider's default behavior.
-func TestNewWalletProviderProvider_NoTokenValidatorWhenASDisabled(t *testing.T) {
-	dir := t.TempDir()
-	keyPath, certPath := writeTestECKeyAndCert(t, dir, "wallet-provider")
-
+func walletProviderASConfig(t *testing.T, externalURL string) *config.Config {
+	t.Helper()
+	keyPath, certPath := writeTestECKeyAndCert(t, t.TempDir(), "wallet-provider")
 	cfg := &config.Config{
 		Storage: config.StorageConfig{Type: "memory"},
 		Server:  config.ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
 		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"},
+		AS: config.ASConfig{
+			Enabled:     true,
+			ExternalURL: externalURL,
+		},
 	}
 	cfg.WalletProvider.PrivateKeyPath = keyPath
 	cfg.WalletProvider.CertificatePath = certPath
 	cfg.WalletProvider.WIA.RateLimit = config.AuthRateLimitConfig{Enabled: false}
+	return cfg
+}
 
+// No as.external_url: nothing can authenticate, so startup must fail whether or not as.enabled is set.
+func TestNewWalletProviderProvider_NoExternalURL_Fails(t *testing.T) {
+	for _, asEnabled := range []bool{true, false} {
+		cfg := walletProviderASConfig(t, "")
+		cfg.AS.Enabled = asEnabled
+		p, err := NewWalletProviderProvider(cfg, zap.NewNop())
+		if err == nil {
+			_ = p.Close()
+			t.Fatalf("as.enabled=%t: expected startup error with no external_url", asEnabled)
+		}
+		if !strings.Contains(err.Error(), "as.external_url") {
+			t.Fatalf("as.enabled=%t: error should name as.external_url, got: %v", asEnabled, err)
+		}
+	}
+}
+
+// The wallet-provider process validates tokens of a remote AS (as.external_url); it does not need as.enabled.
+func TestNewWalletProviderProvider_ASDisabledLocally_ExternalURL_WiresValidator(t *testing.T) {
+	cfg := walletProviderASConfig(t, "https://as.example.com")
+	cfg.AS.Enabled = false
 	p, err := NewWalletProviderProvider(cfg, zap.NewNop())
 	if err != nil {
 		t.Fatalf("NewWalletProviderProvider: %v", err)
 	}
 	defer func() { _ = p.Close() }()
+	if p.tokenValidator == nil {
+		t.Fatal("expected a token validator")
+	}
+}
 
-	if p.tokenValidator != nil {
-		t.Fatal("expected tokenValidator to be nil when cfg.AS.Enabled is false")
+// AS enabled with as.external_url: the validator is wired.
+func TestNewWalletProviderProvider_ExternalURL_WiresValidator(t *testing.T) {
+	p, err := NewWalletProviderProvider(walletProviderASConfig(t, "https://as.example.com"), zap.NewNop())
+	if err != nil {
+		t.Fatalf("NewWalletProviderProvider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+	if p.tokenValidator == nil {
+		t.Fatal("expected token validator when as.external_url is set")
 	}
 }
 
@@ -1003,6 +1015,7 @@ func TestWalletProviderProvider_RegisterRoutes_RegistersJWKS(t *testing.T) {
 		Storage: config.StorageConfig{Type: "memory"},
 		Server:  config.ServerConfig{Host: "localhost", Port: 8080, RPID: "localhost", RPOrigin: "http://localhost:8080"},
 		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"},
+		AS:      config.ASConfig{ExternalURL: "https://as.example.com"},
 	}
 	cfg.WalletProvider.PrivateKeyPath = keyPath
 	cfg.WalletProvider.CertificatePath = certPath
@@ -1170,5 +1183,657 @@ func TestWIARateLimiter_TripsAfterMaxAttempts(t *testing.T) {
 	router2.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Errorf("different caller: status = %d, want %d (must not share the exhausted caller's lockout)", w.Code, http.StatusOK)
+	}
+}
+
+// TestBackendProvider_Logout_BlacklistSharedAcrossAuthAndStorage proves
+// #382/#383 end-to-end through the actual production wiring
+// (NewBackendProvider), not a hand-assembled test router with a manually
+// injected blacklist: a token blacklisted by hitting the real Logout route
+// (registered on AuthProvider's routes) is rejected on StorageProvider's
+// routes too - the two providers used to each build their own, unshared
+// TokenBlacklist instance, so this would previously have kept working.
+func TestBackendProvider_Logout_BlacklistSharedAcrossAuthAndStorage(t *testing.T) {
+	logger := zap.NewNop()
+	asKeyPath, _ := writeTestECKeyAndCert(t, t.TempDir(), "as")
+	// Serve this process's router (with /auth/.well-known/jwks.json) on a real listener and point external_url at it.
+	var routerRef atomic.Pointer[gin.Engine]
+	jwksSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if rt := routerRef.Load(); rt != nil {
+			rt.ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "not ready", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(jwksSrv.Close)
+	cfg := &config.Config{
+		Server: config.ServerConfig{RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		JWT:    config.JWTConfig{Secret: "test-secret-for-e2e-blacklist-0123456789", Issuer: "test"},
+		Storage: config.StorageConfig{
+			Type: "memory",
+		},
+		AS: config.ASConfig{
+			Enabled:        true,
+			SigningKeyPath: asKeyPath,
+			ExternalURL:    jwksSrv.URL,
+			Audiences:      []string{"wallet-backend"},
+			DefaultMaxTAC:  "rwlid",
+		},
+		Security: config.SecurityConfig{
+			TokenBlacklist: config.TokenBlacklistConfig{Enabled: true},
+		},
+		Features: config.FeaturesConfig{
+			CredentialStorageEnabled: true,
+		},
+	}
+
+	provider, err := NewBackendProvider(cfg, logger, []string{"auth", "storage"})
+	if err != nil {
+		t.Fatalf("NewBackendProvider() error = %v", err)
+	}
+	t.Cleanup(func() { _ = provider.Close() })
+
+	router := gin.New()
+	provider.RegisterRoutes(router)
+	routerRef.Store(router)
+
+	// A real AS session token, validated through the go-tokenauth validator (JWKS fetched from jwksSrv).
+	tokenStr, err := provider.ASModule().TokenIssuer.Issue("user-e2e", "wallet-backend", "default", "rwlid", "urn:siros:acr:passkey")
+	if err != nil {
+		t.Fatalf("issuing an AS token: %v", err)
+	}
+
+	get := func() *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/storage/vc", nil)
+		req.Header.Set("Authorization", "Bearer "+tokenStr)
+		router.ServeHTTP(w, req)
+		return w
+	}
+
+	// Storage route works before logout (the JWKS loads asynchronously).
+	var w *httptest.ResponseRecorder
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		w = get()
+		if w.Code == http.StatusOK || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if w.Code != http.StatusOK {
+		t.Fatalf("GET /storage/vc before logout: status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	// The validator accepts no HMAC token: one signed with jwt.secret is refused.
+	hmacToken, err := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
+		"iss": cfg.JWT.Issuer, "aud": "wallet-backend", "user_id": "user-e2e", "tenant_id": "default",
+		"jti": "jti-hmac-e2e", "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte(cfg.JWT.Secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	w = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/storage/vc", nil)
+	req.Header.Set("Authorization", "Bearer "+hmacToken)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("GET /storage/vc with an HMAC token: status = %d, want 401", w.Code)
+	}
+
+	// Log out via the auth provider's own route.
+	w = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/user/session/logout", nil)
+	req.Header.Set("Authorization", "Bearer "+tokenStr)
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("POST /user/session/logout: status = %d, body = %s", w.Code, w.Body.String())
+	}
+
+	// The same token must now be rejected on the STORAGE provider's routes,
+	// not just the auth provider's own - proving the blacklist instance is
+	// actually shared between them.
+	if w = get(); w.Code != http.StatusUnauthorized {
+		t.Errorf("GET /storage/vc after logout: status = %d, want %d", w.Code, http.StatusUnauthorized)
+	}
+}
+
+// TestBlacklistRevocationChecker_AdaptsToServiceBlacklist proves the
+// go-tokenauth revocation.Checker adapter (blacklistRevocationChecker,
+// wired into tokenvalidator.Config.Revocation in NewBackendProvider and
+// NewWalletProviderProvider) correctly reflects a *service.TokenBlacklist's
+// own state. Without this, AS-issued tokens validated through
+// go-tokenauth would never consult the blacklist at all, even after
+// #382/#383's other fixes.
+func TestBlacklistRevocationChecker_AdaptsToServiceBlacklist(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := config.TokenBlacklistConfig{Enabled: true}
+	blacklist := service.NewTokenBlacklist(cfg, logger)
+	checker := blacklistRevocationChecker{blacklist: blacklist}
+
+	ctx := context.Background()
+	if checker.IsRevoked(ctx, "jti-1") {
+		t.Error("expected jti-1 not to be revoked before Add")
+	}
+
+	if err := blacklist.Add(ctx, "jti-1", time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	if !checker.IsRevoked(ctx, "jti-1") {
+		t.Error("expected jti-1 to be revoked after Add")
+	}
+	if checker.IsRevoked(ctx, "jti-2") {
+		t.Error("expected unrelated jti-2 not to be revoked")
+	}
+}
+
+// TestNewBackendProvider_ASEnabled_WiresBlacklistAndRevocation exercises the
+// cfg.AS.Enabled branch of NewBackendProvider (see #382/#383): the AS
+// module receives the same TokenBlacklist instance as AuthProvider (not a
+// second, unshared one built for it), and the go-tokenauth validator's
+// Revocation checker is wired to that same instance.
+func TestNewBackendProvider_ASEnabled_WiresBlacklistAndRevocation(t *testing.T) {
+	dir := t.TempDir()
+	asKeyPath, _ := writeTestECKeyAndCert(t, dir, "as")
+
+	cfg := &config.Config{
+		Storage: config.StorageConfig{Type: "memory"},
+		Server:  config.ServerConfig{RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"},
+		AS: config.ASConfig{
+			Enabled:        true,
+			ExternalURL:    "https://as.example.com",
+			SigningKeyPath: asKeyPath,
+		},
+		Security: config.SecurityConfig{
+			TokenBlacklist: config.TokenBlacklistConfig{Enabled: true},
+		},
+	}
+
+	provider, err := NewBackendProvider(cfg, zap.NewNop(), []string{"auth", "storage"})
+	if err != nil {
+		t.Fatalf("NewBackendProvider() error = %v", err)
+	}
+	t.Cleanup(func() { _ = provider.Close() })
+
+	if provider.asModule == nil {
+		t.Fatal("expected asModule to be initialized when cfg.AS.Enabled is true")
+	}
+	if provider.tokenValidator == nil {
+		t.Fatal("expected tokenValidator to be initialized when cfg.AS.Enabled is true")
+	}
+	if provider.asModule.Blacklist == nil {
+		t.Fatal("expected AS module's Blacklist to be wired")
+	}
+
+	// Blacklisting a jti through AuthProvider's own TokenBlacklist instance
+	// (the one Logout/DeleteUser write to) must be visible through the AS
+	// module's Blacklist too - proving it's the SAME instance, not a second
+	// one the AS module built for itself.
+	ctx := context.Background()
+	if err := provider.auth.services.TokenBlacklist.Add(ctx, "jti-shared-with-as", time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if revoked, err := provider.asModule.Blacklist.IsBlacklisted(ctx, "jti-shared-with-as"); err != nil || !revoked {
+		t.Error("expected AS module's Blacklist to share AuthProvider's TokenBlacklist instance")
+	}
+}
+
+// TestNewBackendProvider_ASModuleInitFailure_ClosesAuthProviderAndStore
+// exercises the AS-module-construction failure path added alongside the
+// blacklist-sharing reorder: authProvider is now constructed before the AS
+// module, so a failure there must also close authProvider's own started
+// background workers (its TokenBlacklist cleanup loop etc.), not just the
+// storage backend.
+func TestNewBackendProvider_ASModuleInitFailure_ClosesAuthProviderAndStore(t *testing.T) {
+	cfg := &config.Config{
+		Storage: config.StorageConfig{Type: "memory"},
+		Server:  config.ServerConfig{RPID: "localhost", RPOrigin: "http://localhost:8080"},
+		JWT:     config.JWTConfig{Secret: "test-secret-that-is-at-least-32-bytes!", Issuer: "test-issuer"},
+		AS: config.ASConfig{
+			Enabled:        true,
+			SigningKeyPath: filepath.Join(t.TempDir(), "does-not-exist.pem"),
+		},
+	}
+
+	provider, err := NewBackendProvider(cfg, zap.NewNop(), []string{"auth", "storage"})
+	if err == nil {
+		t.Fatal("expected an error when the AS signing key path does not exist")
+	}
+	if provider != nil {
+		t.Error("expected a nil provider on initialization failure")
+	}
+}
+
+// TestEngineProvider_SetTokenBlacklist proves the wiring point exists and
+// is callable (see cmd/server/main.go, which wires the same blacklist
+// instance the HTTP auth middlewares use into the WebSocket engine so its
+// handshake honors revocation too - #391 review, round 2). The actual
+// revocation-checking behavior this enables is covered in depth by
+// internal/engine's own TestManager_validateToken_* tests; this just
+// proves the pass-through from the provider reaches the manager without
+// requiring internal/engine's unexported fields to be reachable from here.
+func TestEngineProvider_SetTokenBlacklist(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := minimalEngineConfig(config.HTTPClientConfig{})
+
+	provider, err := NewEngineProvider(cfg, logger, nil, nil, nil)
+	if err != nil {
+		t.Fatalf("NewEngineProvider() error = %v", err)
+	}
+	t.Cleanup(provider.Close)
+
+	provider.SetTokenBlacklist(&fakeEngineBlacklistForProviderTest{})
+}
+
+// fakeEngineBlacklistForProviderTest is a minimal wsengine.TokenBlacklistChecker
+// implementation, just to prove SetTokenBlacklist accepts a real implementer.
+type fakeEngineBlacklistForProviderTest struct{}
+
+func (fakeEngineBlacklistForProviderTest) IsBlacklisted(ctx context.Context, jti string) (bool, error) {
+	return false, nil
+}
+
+func (fakeEngineBlacklistForProviderTest) IsUserRevoked(ctx context.Context, userID string) (bool, error) {
+	return false, nil
+}
+
+// TestNewBackendProvider_WiresASModuleWhenEnabled is a regression test for a
+// Copilot review finding on the passkey tenant-perimeter fix (#374/#386):
+// NewBackendProvider must pass its own configured, SSRF-guarded HTTP client
+// into as.NewASModule (used for the passkey route group's OIDC gate), not a
+// bare nil one - exercising the real constructor end to end, not a
+// hand-built BackendProvider literal, so this wiring is actually covered.
+func TestNewBackendProvider_WiresASModuleWhenEnabled(t *testing.T) {
+	dir := t.TempDir()
+	keyPath, _ := writeTestECKeyAndCert(t, dir, "as-signing")
+
+	cfg := minimalTestConfig()
+	cfg.Storage = config.StorageConfig{Type: "memory"}
+	cfg.Server.RPName = "Test App"
+	cfg.AS = config.ASConfig{
+		Enabled:        true,
+		SigningKeyPath: keyPath,
+		ExternalURL:    "https://as.example.com",
+		SessionStore:   "memory",
+		DefaultMaxTAC:  "rwl",
+	}
+
+	logger := zap.NewNop()
+	p, err := NewBackendProvider(cfg, logger, nil)
+	if err != nil {
+		t.Fatalf("NewBackendProvider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	if p.ASModule() == nil {
+		t.Fatal("expected ASModule to be wired when cfg.AS.Enabled is true")
+	}
+
+	// End-to-end sanity check: the passkey route group (tenant-header +
+	// OIDC-gate middleware, backed by the ValidatorCache built from the
+	// configured HTTP client) must actually be reachable for the default
+	// (ungated) tenant memory.NewStore() pre-seeds.
+	router := gin.New()
+	p.RegisterRoutes(router)
+
+	req := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/begin", strings.NewReader(`{}`))
+	req.Header.Set("X-Token-Mode", "session")
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 from the default tenant's passkey register/begin, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// Each Services may open its own wallet-provider PKCS#11 signer (HSM session pool); the combined
+// backend role with the AS enabled must construct exactly two (auth + storage), none unmanaged.
+func TestNewBackendProvider_ASEnabled_DoesNotBuildExtraServices(t *testing.T) {
+	keyPath, _ := writeTestECKeyAndCert(t, t.TempDir(), "as-signing")
+
+	cfg := minimalTestConfig()
+	cfg.Storage = config.StorageConfig{Type: "memory"}
+	cfg.Server.RPName = "Test App"
+	cfg.AS = config.ASConfig{
+		Enabled:        true,
+		SigningKeyPath: keyPath,
+		ExternalURL:    "https://as.example.com",
+		SessionStore:   "memory",
+		DefaultMaxTAC:  "rwl",
+	}
+
+	orig := newServices
+	defer func() { newServices = orig }()
+	count := 0
+	newServices = func(s storage.Store, c *config.Config, l *zap.Logger) *service.Services {
+		count++
+		return orig(s, c, l)
+	}
+
+	p, err := NewBackendProvider(cfg, zap.NewNop(), nil)
+	if err != nil {
+		t.Fatalf("NewBackendProvider: %v", err)
+	}
+	defer func() { _ = p.Close() }()
+
+	if p.ASModule() == nil {
+		t.Fatal("expected ASModule to be wired")
+	}
+	if count != 2 {
+		t.Fatalf("expected 2 Services (auth + storage), got %d: an extra one leaks its HSM sessions", count)
+	}
+}
+
+type closeCountingSigner struct {
+	crypto.Signer
+	closed *int
+}
+
+func (s closeCountingSigner) Close() error { *s.closed++; return nil }
+
+// Both Services aggregates (auth + storage) own a wallet-provider signer, and
+// BackendProvider.Close must close each exactly once.
+func TestBackendProvider_Close_ClosesBothSignerPools(t *testing.T) {
+	keyPath, _ := writeTestECKeyAndCert(t, t.TempDir(), "as-signing")
+	cfg := minimalTestConfig()
+	cfg.Storage = config.StorageConfig{Type: "memory"}
+	cfg.Server.RPName = "Test App"
+	cfg.AS = config.ASConfig{
+		Enabled:        true,
+		SigningKeyPath: keyPath,
+		ExternalURL:    "https://as.example.com",
+		SessionStore:   "memory",
+		DefaultMaxTAC:  "rwl",
+	}
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	orig := newServices
+	defer func() { newServices = orig }()
+	var closes []*int
+	newServices = func(s storage.Store, c *config.Config, l *zap.Logger) *service.Services {
+		svc := orig(s, c, l)
+		n := new(int)
+		closes = append(closes, n)
+		svc.WalletProvider = service.NewWalletProviderServiceWithSigner(c, l, closeCountingSigner{Signer: key, closed: n})
+		return svc
+	}
+
+	p, err := NewBackendProvider(cfg, zap.NewNop(), nil)
+	if err != nil {
+		t.Fatalf("NewBackendProvider: %v", err)
+	}
+	if len(closes) != 2 {
+		t.Fatalf("expected 2 signer pools (auth + storage), got %d", len(closes))
+	}
+	_ = p.Close()
+	for i, n := range closes {
+		if *n != 1 {
+			t.Errorf("signer pool %d closed %d times, want exactly 1", i, *n)
+		}
+	}
+}
+
+// With no validator the shared auth middleware returns 401 for every request and never reaches the handler.
+func TestSessionAuthMiddleware_NoValidatorFailsClosed(t *testing.T) {
+	reached := false
+	r := gin.New()
+	r.Use(sessionAuthMiddleware(nil, newTestMemoryBackend(t), nil, zap.NewNop()))
+	r.GET("/x", func(c *gin.Context) { reached = true; c.Status(200) })
+
+	for _, authz := range []string{"", "Bearer anything"} {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/x", nil)
+		if authz != "" {
+			req.Header.Set("Authorization", authz)
+		}
+		r.ServeHTTP(w, req)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("authorization %q: status = %d, want 401", authz, w.Code)
+		}
+	}
+	if reached {
+		t.Fatal("handler must not be reached without a validator")
+	}
+}
+
+// An HS256 token signed with jwt.secret is refused on a protected route while a genuine AS token passes.
+func TestProtectedRoute_HMACBearerRejected_ASTokenAccepted(t *testing.T) {
+	v, key, issuer := setupServerTokenValidatorTest(t)
+	provider := newTestBackendProviderWithValidator(t, v)
+	provider.cfg.Features.CredentialStorageEnabled = true
+	router := gin.New()
+	provider.RegisterRoutes(router)
+
+	hmacToken, err := legacyjwt.NewWithClaims(legacyjwt.SigningMethodHS256, legacyjwt.MapClaims{
+		"iss": issuer, "aud": "wallet-backend", "user_id": "user-1", "tenant_id": "default",
+		"jti": "jti-hmac", "exp": time.Now().Add(time.Hour).Unix(),
+	}).SignedString([]byte(provider.cfg.JWT.Secret))
+	if err != nil {
+		t.Fatal(err)
+	}
+	asToken := signServerToken(t, key, issuer, claims.AccessTokenClaims{
+		Claims:   jwt.Claims{Subject: "user-1", Audience: jwt.Audience{"wallet-backend"}},
+		TenantID: string(domain.DefaultTenantID),
+		TAC:      "rl",
+		ACR:      "urn:siros:acr:passkey",
+	})
+
+	status := func(token string) int {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/storage/vc", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		router.ServeHTTP(w, req)
+		return w.Code
+	}
+	if got := status(hmacToken); got != http.StatusUnauthorized {
+		t.Errorf("HMAC bearer: status = %d, want 401", got)
+	}
+	if got := status(asToken); got != http.StatusOK {
+		t.Errorf("AS bearer: status = %d, want 200", got)
+	}
+}
+
+// With as.enabled=false the backend role must refuse to start with an actionable message, not 401 everything.
+func TestRequireSessionAuthMechanism(t *testing.T) {
+	err := requireSessionAuthMechanism(&config.Config{}, "backend")
+	if err == nil || !strings.Contains(err.Error(), "as.enabled") || !strings.Contains(err.Error(), "legacy") {
+		t.Fatalf("as.enabled=false must be refused with an actionable error, got %v", err)
+	}
+	if _, err := NewBackendProvider(&config.Config{}, zap.NewNop(), []string{"backend"}); err == nil {
+		t.Error("NewBackendProvider must reject as.enabled=false")
+	}
+	if err := requireSessionAuthMechanism(&config.Config{AS: config.ASConfig{Enabled: true}}, "backend"); err != nil {
+		t.Errorf("AS enabled must be accepted: %v", err)
+	}
+}
+
+var errFailingStore = errors.New("store down")
+
+// failingRevocationStore is a service.RevocationStore whose every call fails.
+type failingRevocationStore struct{}
+
+func (failingRevocationStore) Add(context.Context, string, time.Time) error { return errFailingStore }
+func (failingRevocationStore) Has(context.Context, string) (bool, error) {
+	return false, errFailingStore
+}
+func (failingRevocationStore) RevokeUser(context.Context, string) error { return errFailingStore }
+func (failingRevocationStore) IsUserRevoked(context.Context, string) (bool, error) {
+	return false, errFailingStore
+}
+
+// go-tokenauth's Checker has no error return, so a store failure must read
+// as revoked: the Validator then rejects the token.
+func TestBlacklistRevocationChecker_StoreErrorReadsAsRevoked(t *testing.T) {
+	bl := service.NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop(), failingRevocationStore{})
+	checker := blacklistRevocationChecker{blacklist: bl, logger: zap.NewNop()}
+	if !checker.IsRevoked(context.Background(), "jti-1") {
+		t.Error("a store failure must not read as 'not revoked'")
+	}
+	// Without a logger the adapter must still refuse.
+	if !(blacklistRevocationChecker{blacklist: bl}).IsRevoked(context.Background(), "jti-1") {
+		t.Error("a store failure must not read as 'not revoked' (no logger)")
+	}
+}
+
+// A revocation store that failed to initialize refuses every authenticated
+// request until restart, so readiness must not report healthy meanwhile even
+// though the database itself answers its ping.
+func TestBackendProvider_CheckReady_RevocationStoreUnavailable(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := &config.Config{}
+	cfg.Security.TokenBlacklist = config.TokenBlacklistConfig{Enabled: true, Backend: "storage"}
+	store := &mockBackend{healthy: true}
+
+	// mockBackend is not MongoDB, so the "storage" revocation backend cannot
+	// be built and NewServices installs the failing stand-in.
+	provider := &BackendProvider{
+		store:  store,
+		logger: logger,
+		auth:   &AuthProvider{services: service.NewServices(store, cfg, logger)},
+	}
+	err := provider.CheckReady(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "revocation store unavailable") {
+		t.Fatalf("expected revocation store unavailable error, got %v", err)
+	}
+}
+
+// The validator's revocation checker admits an already revoked jti only for
+// the logout call (to complete an interrupted logout); a store failure still
+// rejects there.
+func TestBlacklistRevocationChecker_LogoutCompletionAdmitsRevokedJTIOnly(t *testing.T) {
+	bl := service.NewTokenBlacklist(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop())
+	if err := bl.Add(context.Background(), "jti-r", time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	checker := blacklistRevocationChecker{blacklist: bl}
+
+	ctx := context.Background()
+	lctx := middleware.WithLogoutCompletion(ctx)
+	if !checker.IsRevoked(ctx, "jti-r") {
+		t.Error("a revoked jti must be rejected outside logout")
+	}
+	if checker.IsRevoked(lctx, "jti-r") {
+		t.Error("a revoked jti must be admitted for the logout call")
+	}
+	failing := service.NewTokenBlacklistWithStore(config.TokenBlacklistConfig{Enabled: true}, zap.NewNop(), failingRevocationStore{})
+	if !(blacklistRevocationChecker{blacklist: failing}).IsRevoked(lctx, "jti-r") {
+		t.Error("a store failure must still reject the logout call")
+	}
+}
+
+// The isolated wallet-provider authenticates through the same revocation
+// store, so a store that failed to initialize must make it not ready.
+func TestWalletProviderProvider_CheckReady_RevocationStoreUnavailable(t *testing.T) {
+	logger := zap.NewNop()
+	cfg := &config.Config{}
+	cfg.Security.TokenBlacklist = config.TokenBlacklistConfig{Enabled: true, Backend: "storage"}
+	store := &mockBackend{healthy: true}
+
+	p := &WalletProviderProvider{store: store, logger: logger, services: service.NewServices(store, cfg, logger)}
+	err := p.CheckReady(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "revocation store unavailable") {
+		t.Fatalf("expected revocation store unavailable error, got %v", err)
+	}
+
+	cfg.Security.TokenBlacklist.Backend = "memory"
+	p.services = service.NewServices(store, cfg, logger)
+	if err := p.CheckReady(context.Background()); err != nil {
+		t.Fatalf("memory backend must be ready, got %v", err)
+	}
+}
+
+// Manager.AddProvider only registers a readiness check for providers that
+// implement ReadinessCheckProvider.
+var _ ReadinessCheckProvider = (*WalletProviderProvider)(nil)
+
+// =============================================================================
+// /wallet-provider/assurance-preview wiring: registered in both providers with
+// the same authentication, audience and TAC "w" as key-attestation/generate.
+// =============================================================================
+
+func newTestWalletProviderProviderWithValidator(t *testing.T, v *tokenvalidator.Validator) *WalletProviderProvider {
+	t.Helper()
+	store := newTestMemoryBackend(t)
+	logger := zap.NewNop()
+	cfg := minimalTestConfig()
+	services := service.NewServices(store, cfg, logger)
+	return &WalletProviderProvider{
+		cfg:            cfg,
+		logger:         logger,
+		store:          store,
+		handlers:       api.NewHandlers(services, cfg, logger, []string{"wallet-provider"}),
+		services:       services,
+		wiaRateLimiter: middleware.NewAuthRateLimiter(cfg.WalletProvider.WIA.RateLimit, logger),
+		tokenValidator: v,
+	}
+}
+
+func TestAssurancePreviewRoute_RegisteredAndGuardedInBothProviders(t *testing.T) {
+	v, key, issuer := setupServerTokenValidatorTest(t)
+
+	registers := map[string]func(*gin.Engine){
+		"auth provider": func(r *gin.Engine) {
+			p := newTestBackendProviderWithValidator(t, v)
+			p.auth.RegisterRoutes(r)
+		},
+		"wallet-provider provider": func(r *gin.Engine) {
+			newTestWalletProviderProviderWithValidator(t, v).RegisterRoutes(r)
+		},
+	}
+	token := func(aud, tac string) string {
+		return signServerToken(t, key, issuer, claims.AccessTokenClaims{
+			Claims:   jwt.Claims{Subject: "user-1", Audience: jwt.Audience{aud}},
+			TenantID: string(domain.DefaultTenantID),
+			TAC:      claims.TAC(tac),
+			ACR:      "urn:siros:acr:passkey",
+		})
+	}
+	call := func(r *gin.Engine, bearer string) *httptest.ResponseRecorder {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/wallet-provider/assurance-preview", strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+		if bearer != "" {
+			req.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		r.ServeHTTP(w, req)
+		return w
+	}
+
+	for name, register := range registers {
+		t.Run(name, func(t *testing.T) {
+			router := gin.New()
+			register(router)
+			if !hasRoute(router.Routes(), http.MethodPost, "/wallet-provider/assurance-preview") {
+				t.Fatal("route not registered")
+			}
+			if w := call(router, ""); w.Code != http.StatusUnauthorized {
+				t.Errorf("no token: %d, want 401", w.Code)
+			}
+			if w := call(router, token("wallet-backend", "r")); w.Code != http.StatusForbidden {
+				t.Errorf("tac r: %d, want 403 (MustHaveTAC w)", w.Code)
+			}
+			if w := call(router, token("wallet-registry", "rw")); w.Code != http.StatusForbidden {
+				t.Errorf("wallet-registry audience: %d, want 403", w.Code)
+			}
+			w := call(router, token("wallet-backend", "w"))
+			if w.Code != http.StatusOK {
+				t.Fatalf("tac w: %d: %s", w.Code, w.Body.String())
+			}
+			var body map[string]interface{}
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatal(err)
+			}
+			for _, k := range []string{"key_storage", "user_authentication", "certification", "wia_profile", "wia_issue", "policy_version", "schema_version"} {
+				if _, ok := body[k]; !ok {
+					t.Errorf("response has no %q: %v", k, body)
+				}
+			}
+		})
 	}
 }

@@ -8,6 +8,8 @@ package trust
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"sync"
@@ -16,6 +18,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 )
 
 // Context keys for tenant propagation across trust evaluation boundaries.
@@ -75,6 +78,16 @@ type KeyMaterial struct {
 	CredentialType string
 }
 
+// KeyMaterialFromSigner converts the verified signer material the issuer
+// metadata resolver reports for a signed metadata document into PDP key
+// material. It returns nil for a nil signer.
+func KeyMaterialFromSigner(s *issuermetadata.SignerKeyMaterial) *KeyMaterial {
+	if s == nil {
+		return nil
+	}
+	return &KeyMaterial{Type: s.Type, X5C: s.X5C, JWK: s.JWK}
+}
+
 // NormalizeJWKS takes JWK data in various formats and returns a slice of individual
 // JWK objects suitable for the AuthZEN resource.key array.
 //
@@ -107,12 +120,33 @@ func NormalizeJWKS(jwkData interface{}) []interface{} {
 	}
 }
 
+// isAmbiguousJWK reports a JWK object that carries both its own key
+// parameters (kty) and a "keys" array.
+func isAmbiguousJWK(jwkData interface{}) bool {
+	m, ok := jwkData.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	_, hasKeys := m["keys"]
+	_, hasKty := m["kty"]
+	return hasKeys && hasKty
+}
+
 // TrustInfo contains trust evaluation results.
 type TrustInfo struct {
 	Trusted      bool     `json:"trusted"`
 	Framework    string   `json:"framework,omitempty"`
 	Reason       string   `json:"reason,omitempty"`
 	Certificates []string `json:"certificates,omitempty"`
+	// Context is the PDP's response context object, verbatim as JSON,
+	// including context.verifier_ids when the PDP policy enables it. Nil when
+	// the PDP returned no context. Never serialised with TrustInfo itself.
+	Context json.RawMessage `json:"-"`
+	// Action is the AuthZEN action that produced a positive result (EvaluateStatusListSigner only).
+	Action string `json:"action,omitempty"`
+	// EvaluationFailed means no decision could be had, as opposed to the PDP
+	// answering "no". Callers must use this, not Reason text.
+	EvaluationFailed bool `json:"evaluation_failed,omitempty"`
 }
 
 // EvaluatorFactory creates a TrustEvaluator for a given PDP endpoint.
@@ -216,7 +250,10 @@ func (s *Service) resolveVerifierEndpoint(sessionEndpoint string) string {
 // If keyMaterial is nil, performs resolution-only (only works for DIDs).
 func (s *Service) EvaluateIssuer(ctx context.Context, issuerID string, trustEndpoint string, keyMaterial *KeyMaterial) (*TrustInfo, error) {
 	endpoint := s.resolveIssuerEndpoint(trustEndpoint)
-	return s.evaluate(ctx, issuerID, endpoint, RoleCredentialIssuer, "", keyMaterial, "issuer")
+	return s.evaluate(ctx, issuerID, endpoint, RoleCredentialIssuer, evaluateOptions{
+		keyMaterial: keyMaterial,
+		logLabel:    "issuer",
+	})
 }
 
 // EvaluateVerifier evaluates trust for a credential verifier via the trust endpoint.
@@ -229,7 +266,31 @@ func (s *Service) EvaluateIssuer(ctx context.Context, issuerID string, trustEndp
 // If keyMaterial is nil, performs resolution-only (only works for DIDs).
 func (s *Service) EvaluateVerifier(ctx context.Context, verifierID string, trustEndpoint string, keyMaterial *KeyMaterial) (*TrustInfo, error) {
 	endpoint := s.resolveVerifierEndpoint(trustEndpoint)
-	return s.evaluate(ctx, verifierID, endpoint, RoleCredentialVerifier, "", keyMaterial, "verifier")
+	return s.evaluate(ctx, verifierID, endpoint, RoleCredentialVerifier, evaluateOptions{
+		keyMaterial: keyMaterial,
+		logLabel:    "verifier",
+	})
+}
+
+// EvaluateVerifierWithContext is EvaluateVerifier plus caller-supplied
+// AuthZEN evaluation context, forwarded to the PDP as-is (see
+// authzen.Evaluator.toAuthZENRequest, which puts it straight on the
+// outbound AuthZEN request's Context field).
+//
+// This exists so a direct-to-PDP evaluation (see
+// OID4VPHandler.evaluateVerifierTrustViaPDP) doesn't silently drop context
+// a frontend-mediated evaluation has always carried in
+// TrustEvaluationRequest.Context - in particular an OIDF trust_chain (OID4VP
+// §5.9.3.6) or verifier_attestation issuer/JWT fields (OID4VP §5.9.3.4),
+// both of which go-trust's PDP may need to validate a request that a bare
+// subject+key-material evaluation cannot.
+func (s *Service) EvaluateVerifierWithContext(ctx context.Context, verifierID string, trustEndpoint string, keyMaterial *KeyMaterial, evalContext map[string]interface{}) (*TrustInfo, error) {
+	endpoint := s.resolveVerifierEndpoint(trustEndpoint)
+	return s.evaluate(ctx, verifierID, endpoint, RoleCredentialVerifier, evaluateOptions{
+		keyMaterial: keyMaterial,
+		logLabel:    "verifier",
+		evalContext: evalContext,
+	})
 }
 
 // FIDO2AttestationAction is the AuthZEN action.name sent for FIDO2/CTAP2
@@ -258,22 +319,222 @@ const FIDO2AttestationAction = "wscd-previewsign-provision"
 // action.name at all, and go-trust could never target this call site with a
 // dedicated policy (e.g. an AAGUID allow/blocklist).
 func (s *Service) EvaluateFIDO2Attestation(ctx context.Context, aaguid string, x5cChain []string) (*TrustInfo, error) {
-	return s.evaluate(ctx, aaguid, s.cfg.Trust.PDPURL, RoleAny, FIDO2AttestationAction, &KeyMaterial{
-		Type: "x5c",
-		X5C:  x5cChain,
-	}, "aaguid")
+	return s.evaluate(ctx, aaguid, s.cfg.Trust.PDPURL, RoleAny, evaluateOptions{
+		action: FIDO2AttestationAction,
+		keyMaterial: &KeyMaterial{
+			Type: "x5c",
+			X5C:  x5cChain,
+		},
+		logLabel: "aaguid",
+	})
+}
+
+// StatusListSignerAction is the AuthZEN action.name used for the signer of a
+// Token Status List. It is distinct from credential-issuer because issuing
+// credentials and publishing their status are different trust decisions.
+//
+// The go-trust deployment must define a policy with exactly this name:
+// go-trust falls back to its DEFAULT policy for an unknown action.name. See
+// docs/adr/012-trust-evaluation-architecture.md.
+const StatusListSignerAction = "status-list-signer"
+
+// FrameworkNone is TrustInfo.Framework when no PDP endpoint is configured.
+const FrameworkNone = "none"
+
+// StatusListSignerFallbackAction is tried when the status-list-signer
+// evaluation errors and the fallback is enabled.
+const StatusListSignerFallbackAction = string(RoleCredentialIssuer)
+
+// evalFailedReasonPrefix starts TrustInfo.Reason when the evaluation failed.
+const evalFailedReasonPrefix = "Trust evaluation failed"
+
+// statusEvalFailedClass is all that is logged of a failed redacted evaluation
+// (the raw error may carry token-controlled text).
+const statusEvalFailedClass = "evaluation_failed"
+
+// EvaluateStatusListSigner asks the trust endpoint whether keyMaterial (x5c or
+// jwk from a status list header) may sign status lists for subject. The
+// endpoint is resolved like EvaluateIssuer's.
+//
+// The first call uses action "status-list-signer":
+//
+//   - positive: trusted;
+//   - genuine negative: final, no second call ("deny is deny");
+//   - no PDP (Framework FrameworkNone): untrusted, no second call;
+//   - error: with fallbackOnError, a second call as the credential-issuer role
+//     decides (a negative there is a negative; an error there leaves the first
+//     error); without it the error stands.
+//
+// TrustInfo.Action says which action produced a positive result;
+// EvaluationFailed distinguishes an error from a negative.
+func (s *Service) EvaluateStatusListSigner(ctx context.Context, subject string, trustEndpoint string, keyMaterial *KeyMaterial, fallbackOnError bool) (*TrustInfo, error) {
+	endpoint := s.resolveIssuerEndpoint(trustEndpoint)
+	first, err := s.evaluate(ctx, subject, endpoint, RoleAny, evaluateOptions{
+		action:      StatusListSignerAction,
+		keyMaterial: keyMaterial,
+		logLabel:    "status_list_signer",
+		redact:      true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if first.Trusted {
+		first.Action = StatusListSignerAction
+		s.logger.Debug("status list signer trusted",
+			zap.String("signer_trust_action", StatusListSignerAction))
+		return first, nil
+	}
+	if first.Framework == FrameworkNone {
+		return first, nil
+	}
+	if !first.EvaluationFailed {
+		s.logger.Warn("status list signer denied",
+			zap.String("reason", "signer_untrusted_denied"),
+			zap.String("signer_trust_action", StatusListSignerAction))
+		return first, nil
+	}
+	if !fallbackOnError {
+		return first, nil
+	}
+
+	second, err := s.evaluate(ctx, subject, endpoint, RoleCredentialIssuer, evaluateOptions{
+		keyMaterial: keyMaterial,
+		logLabel:    "issuer",
+		redact:      true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if second.Trusted {
+		second.Action = StatusListSignerFallbackAction
+		s.logger.Warn("status list signer trusted via credential-issuer fallback; the status-list-signer evaluation failed",
+			zap.String("signer_trust_action", StatusListSignerFallbackAction),
+			zap.String("status_list_signer_error", statusEvalFailedClass))
+		return second, nil
+	}
+	if !second.EvaluationFailed {
+		return second, nil
+	}
+	return first, nil
+}
+
+// evaluateOptions bundles evaluate's request-shaping parameters beyond the
+// required subject/endpoint/role, keeping evaluate's own parameter count
+// down (each field here used to be its own positional parameter).
+type evaluateOptions struct {
+	// action is an explicit AuthZEN action.name to send when role alone
+	// doesn't identify the call site (e.g. RoleAny). It's only applied when
+	// non-empty, and only when role itself is empty - see
+	// authzen.Evaluator.toAuthZENRequest, which prefers Role for
+	// action.name and falls back to this field. Leaving it empty preserves
+	// today's behavior for callers that rely on Role (EvaluateIssuer,
+	// EvaluateVerifier).
+	action string
+	// keyMaterial validates the subject-to-key binding when provided; nil
+	// performs resolution-only (only works for DIDs).
+	keyMaterial *KeyMaterial
+	// logLabel names the subject in this call site's log lines (e.g.
+	// "issuer", "verifier", "aaguid").
+	logLabel string
+	// evalContext, when non-nil, is forwarded as-is to
+	// EvaluationRequest.Context (see EvaluateVerifierWithContext's doc
+	// comment for why this exists).
+	evalContext map[string]interface{}
+	// redact keeps the subject, errors and PDP reasons (token-controlled) out
+	// of log lines; only an error class is logged.
+	redact bool
+}
+
+// attachKeyMaterial sets req's key type, resource and key from km.
+func (s *Service) attachKeyMaterial(req *EvaluationRequest, km *KeyMaterial, subjectID string, subjectField func() []zap.Field) {
+	switch km.Type {
+	case "x5c":
+		req.KeyType = KeyTypeX5C
+		req.Resource = Resource{
+			Type: ResourceTypeX5C,
+			ID:   subjectID,
+			Key:  km.X5C,
+		}
+		req.Key = km.X5C
+		s.logger.Debug("Trust evaluation with x5c",
+			append(subjectField(), zap.Int("cert_count", len(km.X5C)))...)
+	case "jwk":
+		// Normalize JWKS/JWK into a flat slice of individual JWK objects
+		normalized := NormalizeJWKS(km.JWK)
+		req.KeyType = KeyTypeJWK
+		req.Resource = Resource{
+			Type: ResourceTypeJWK,
+			ID:   subjectID,
+			Key:  normalized,
+		}
+		req.Key = normalized
+		s.logger.Debug("Trust evaluation with JWK",
+			append(subjectField(), zap.Int("key_count", len(normalized)))...)
+	case "":
+		// Type not set but key material provided; try to infer
+		if len(km.X5C) > 0 {
+			req.KeyType = KeyTypeX5C
+			req.Resource = Resource{Type: ResourceTypeX5C, ID: subjectID, Key: km.X5C}
+			req.Key = km.X5C
+		} else if km.JWK != nil {
+			normalized := NormalizeJWKS(km.JWK)
+			req.KeyType = KeyTypeJWK
+			req.Resource = Resource{Type: ResourceTypeJWK, ID: subjectID, Key: normalized}
+			req.Key = normalized
+		}
+	}
+}
+
+// buildEvaluationRequest shapes the AuthZEN request for subjectID, role and
+// opts, attaching the subject's key material when there is some.
+func (s *Service) buildEvaluationRequest(subjectID string, role Role, opts evaluateOptions, subjectField func() []zap.Field) *EvaluationRequest {
+	req := &EvaluationRequest{
+		Subject: Subject{
+			Type: SubjectTypeKey,
+			ID:   subjectID,
+		},
+	}
+	req.SubjectID = subjectID
+	req.Role = role
+	if role == "" && opts.action != "" {
+		req.Action = opts.action
+	}
+	if opts.evalContext != nil {
+		req.Context = opts.evalContext
+	}
+
+	// Set credential type if provided
+	if opts.keyMaterial != nil && opts.keyMaterial.CredentialType != "" {
+		req.CredentialType = opts.keyMaterial.CredentialType
+	}
+
+	// Set key material if provided
+	if opts.keyMaterial != nil {
+		s.attachKeyMaterial(req, opts.keyMaterial, subjectID, subjectField)
+	} else {
+		s.logger.Debug("Trust evaluation resolution-only", subjectField()...)
+	}
+	return req
 }
 
 // evaluate is the shared implementation for issuer, verifier, and FIDO2
-// attestation trust evaluation.
-//
-// action is an explicit AuthZEN action.name to send when role alone doesn't
-// identify the call site (e.g. RoleAny). It's only applied when non-empty,
-// and only when role itself is empty - see authzen.Evaluator.toAuthZENRequest,
-// which prefers Role for action.name and falls back to this field. Passing ""
-// preserves today's behavior for callers that rely on Role (EvaluateIssuer,
-// EvaluateVerifier).
-func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint string, role Role, action string, keyMaterial *KeyMaterial, logLabel string) (*TrustInfo, error) {
+// attestation trust evaluation. See evaluateOptions for opts' fields.
+func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint string, role Role, opts evaluateOptions) (*TrustInfo, error) {
+	logLabel := opts.logLabel
+	keyMaterial := opts.keyMaterial
+	subjectField := func() []zap.Field {
+		if opts.redact {
+			return nil
+		}
+		return []zap.Field{zap.String(logLabel, subjectID)}
+	}
+
+	// A key that is both a single JWK and a JWKS would be evaluated as only
+	// its nested keys; which key is meant is ambiguous, so refuse it.
+	if keyMaterial != nil && isAmbiguousJWK(keyMaterial.JWK) {
+		return nil, errors.New("jwk key material is both a single key and a key set")
+	}
+
 	eval, err := s.GetEvaluator(endpoint)
 	if err != nil {
 		return nil, err
@@ -283,84 +544,45 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 		// This prevents automatic trust bypass when trust evaluation is not properly set up
 		return &TrustInfo{
 			Trusted:   false,
-			Framework: "none",
+			Framework: FrameworkNone,
 			Reason:    "Trust evaluation not configured - no PDP endpoint available",
 		}, nil
 	}
 
-	// Create evaluation request
-	req := &EvaluationRequest{
-		Subject: Subject{
-			Type: SubjectTypeKey,
-			ID:   subjectID,
-		},
-	}
-	req.SubjectID = subjectID
-	req.Role = role
-	if role == "" && action != "" {
-		req.Action = action
-	}
-
-	// Set credential type if provided
-	if keyMaterial != nil && keyMaterial.CredentialType != "" {
-		req.CredentialType = keyMaterial.CredentialType
-	}
-
-	// Set key material if provided
-	if keyMaterial != nil {
-		switch keyMaterial.Type {
-		case "x5c":
-			req.KeyType = KeyTypeX5C
-			req.Resource = Resource{
-				Type: ResourceTypeX5C,
-				ID:   subjectID,
-				Key:  keyMaterial.X5C,
-			}
-			req.Key = keyMaterial.X5C
-			s.logger.Debug("Trust evaluation with x5c",
-				zap.String(logLabel, subjectID),
-				zap.Int("cert_count", len(keyMaterial.X5C)))
-		case "jwk":
-			// Normalize JWKS/JWK into a flat slice of individual JWK objects
-			normalized := NormalizeJWKS(keyMaterial.JWK)
-			req.KeyType = KeyTypeJWK
-			req.Resource = Resource{
-				Type: ResourceTypeJWK,
-				ID:   subjectID,
-				Key:  normalized,
-			}
-			req.Key = normalized
-			s.logger.Debug("Trust evaluation with JWK",
-				zap.String(logLabel, subjectID),
-				zap.Int("key_count", len(normalized)))
-		case "":
-			// Type not set but key material provided; try to infer
-			if len(keyMaterial.X5C) > 0 {
-				req.KeyType = KeyTypeX5C
-				req.Resource = Resource{Type: ResourceTypeX5C, ID: subjectID, Key: keyMaterial.X5C}
-				req.Key = keyMaterial.X5C
-			} else if keyMaterial.JWK != nil {
-				normalized := NormalizeJWKS(keyMaterial.JWK)
-				req.KeyType = KeyTypeJWK
-				req.Resource = Resource{Type: ResourceTypeJWK, ID: subjectID, Key: normalized}
-				req.Key = normalized
-			}
-		}
-	} else {
-		s.logger.Debug("Trust evaluation resolution-only",
-			zap.String(logLabel, subjectID))
-	}
+	req := s.buildEvaluationRequest(subjectID, role, opts, subjectField)
 
 	// Delegate evaluation to the trust endpoint
 	resp, err := eval.Evaluate(ctx, req)
 	if err != nil {
-		s.logger.Warn("Trust evaluation error",
-			zap.String(logLabel, subjectID),
-			zap.Error(err))
+		if opts.redact {
+			s.logger.Warn("Trust evaluation error", zap.String("error_class", statusEvalFailedClass))
+		} else {
+			s.logger.Warn("Trust evaluation error",
+				zap.String(logLabel, subjectID),
+				zap.Error(err))
+		}
 		return &TrustInfo{
-			Trusted:   false,
-			Framework: "authzen",
-			Reason:    "Trust evaluation failed: " + err.Error(),
+			Trusted:          false,
+			Framework:        "authzen",
+			Reason:           evalFailedReasonPrefix + ": " + err.Error(),
+			EvaluationFailed: true,
+		}, nil
+	}
+
+	if resp.Failed {
+		// In-band PDP/build failure: a failed evaluation, not a denial.
+		if opts.redact {
+			s.logger.Warn("Trust evaluation failed", zap.String("error_class", statusEvalFailedClass))
+		} else {
+			s.logger.Warn("Trust evaluation failed",
+				zap.String(logLabel, subjectID),
+				zap.String("reason", resp.Reason))
+		}
+		return &TrustInfo{
+			Trusted:          false,
+			Framework:        "authzen",
+			Reason:           evalFailedReasonPrefix + ": " + resp.Reason,
+			EvaluationFailed: true,
 		}, nil
 	}
 
@@ -368,6 +590,7 @@ func (s *Service) evaluate(ctx context.Context, subjectID string, endpoint strin
 		Trusted:   resp.Decision,
 		Framework: "authzen",
 		Reason:    resp.Reason,
+		Context:   resp.Context,
 	}, nil
 }
 
@@ -411,6 +634,11 @@ func (s *Service) ResolveDID(ctx context.Context, did string, trustEndpoint stri
 	resp, err := resolver.Resolve(ctx, did)
 	if err != nil {
 		return nil, fmt.Errorf("DID resolution failed: %w", err)
+	}
+
+	if resp.Failed {
+		// In-band evaluator failure (PDP outage etc.): not a denial.
+		return nil, fmt.Errorf("DID resolution failed: %s", resp.Reason)
 	}
 
 	if !resp.Decision {

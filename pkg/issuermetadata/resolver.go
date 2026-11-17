@@ -74,10 +74,19 @@ type Config struct {
 	// Default: 5 minutes.
 	CacheTTL time.Duration
 
+	// CacheDisabled turns off caching entirely: every Resolve fetches the
+	// metadata from the issuer. CacheTTL is ignored.
+	CacheDisabled bool
+
 	// HTTPClient is the HTTP client used for outbound requests.
 	// The caller is responsible for configuring timeouts, TLS settings,
-	// and SSRF protections (e.g. blocking private IP ranges).
-	// If nil, http.DefaultClient is used.
+	// and SSRF protections (e.g. blocking private IP ranges); production
+	// callers build it with config.HTTPClientConfig.NewHTTPClient.
+	// Required: issuer URLs are caller-controlled, so there is deliberately no
+	// default client. New returns ErrHTTPClientRequired when it is nil rather
+	// than fall back to http.DefaultClient, which reaches private, loopback and
+	// cloud-metadata addresses. (This package cannot build the guarded client
+	// itself: pkg/config imports it, so importing pkg/config here is a cycle.)
 	HTTPClient *http.Client
 
 	// AllowHTTP permits non-TLS issuer URLs.
@@ -89,9 +98,120 @@ type Config struct {
 	// cryptographic signature verification is performed (no trust decision).
 	TrustEvaluator TrustEvaluator
 
-	// PreferSigned controls whether the resolver sends Accept headers
-	// preferring signed (application/jwt) responses. Default: true.
+	// MetadataType selects which representation of the issuer metadata the
+	// resolver asks for and accepts (OpenID4VCI §12.2.2). Empty means
+	// MetadataTypePreferSigned. New rejects any value ParseMetadataType does
+	// not know.
+	MetadataType MetadataType
+
+	// PreferSigned is the pre-MetadataType switch for the Accept header.
+	//
+	// Deprecated: use MetadataType. Kept so existing callers keep compiling.
+	//
+	// Precedence: a non-empty MetadataType always wins and PreferSigned is
+	// ignored. Only when MetadataType is empty and PreferSigned is non-nil is
+	// it mapped: true -> MetadataTypePreferSigned, false ->
+	// MetadataTypePreferUnsigned. Both unset gives the default,
+	// MetadataTypePreferSigned.
+	//
+	// Mapping note: the old flag only ordered the media types in a single
+	// request (false sent "application/json, application/jwt;q=0.9") and never
+	// retried. There is no exact equivalent: prefer-unsigned asks for
+	// application/json alone first and, only after an HTTP 406,
+	// retries once with application/jwt (where the old behaviour was a hard
+	// error). It keeps the unsigned preference and is strictly more tolerant,
+	// never less verified; a signed response is still verified.
 	PreferSigned *bool
+}
+
+// MetadataType is the metadata-representation policy of a Resolver.
+//
+// Each request carries a single Accept value (no q-weights, which not every
+// issuer honours); a policy with a preference issues the requests in order.
+// A compliant issuer that cannot serve the requested media type answers 406.
+type MetadataType string
+
+const (
+	// MetadataTypeAny sends one request accepting both media types
+	// (Accept: application/jwt, application/json) and takes whichever the
+	// issuer serves. No retry.
+	//
+	// This is the mode for issuers that answer a 4xx other than 406 to an
+	// Accept header they cannot satisfy (for example 400 or 415 for
+	// Accept: application/jwt): the prefer-* modes retry only after a 406, so
+	// such an issuer must be configured with any.
+	MetadataTypeAny MetadataType = "any"
+	// MetadataTypePreferSigned requests application/jwt first and, if the
+	// issuer answers 406 Not Acceptable (how a compliant issuer says it cannot
+	// serve the requested media type), retries once with application/json.
+	//
+	// The retry is triggered by 406 alone; use MetadataTypeAny for issuers that
+	// reject Accept: application/jwt with another 4xx. Every other status (400, 401, 403,
+	// 404, 415, 429, 5xx, redirects) is terminal: an issuer that rejects an
+	// Accept header with some other 4xx is not negotiating, and retrying would
+	// mask real errors. A 200 of the other form is accepted as is.
+	//
+	// A signed response that is present but fails verification (bad signature, wrong typ/sub/iat,
+	// untrusted signer, malformed JWS) is a hard error and is never answered
+	// by falling back to the unsigned document: that would let anyone able to
+	// corrupt the signed form downgrade the wallet to unauthenticated data.
+	// A 200 carrying unsigned JSON (the issuer ignoring Accept) is accepted.
+	MetadataTypePreferSigned MetadataType = "prefer-signed"
+	// MetadataTypeRequireSigned requests only application/jwt and accepts only
+	// signed metadata (an application/jwt body, or JSON whose signed_metadata
+	// verifies). Any non-200, and any unsigned 200, is an error; never a
+	// fallback.
+	MetadataTypeRequireSigned MetadataType = "require-signed"
+	// MetadataTypePreferUnsigned is the mirror of prefer-signed: application/json
+	// first, one retry with application/jwt after a 406 only. A
+	// signed response that fails verification is a hard error.
+	MetadataTypePreferUnsigned MetadataType = "prefer-unsigned"
+	// MetadataTypeRequireUnsigned requests only application/json and rejects an
+	// application/jwt response. Any non-200 is an error; never a fallback.
+	// A legacy signed_metadata field inside the JSON, if present, is still
+	// verified and a failure is an error.
+	MetadataTypeRequireUnsigned MetadataType = "require-unsigned"
+)
+
+// MetadataTypes lists every valid MetadataType value.
+var MetadataTypes = []MetadataType{
+	MetadataTypeAny, MetadataTypePreferSigned, MetadataTypeRequireSigned,
+	MetadataTypePreferUnsigned, MetadataTypeRequireUnsigned,
+}
+
+// ParseMetadataType maps s (case-sensitive) to a MetadataType; the empty string
+// is the default, MetadataTypePreferSigned. Unknown values are an error.
+func ParseMetadataType(s string) (MetadataType, error) {
+	if s == "" {
+		return MetadataTypePreferSigned, nil
+	}
+	for _, t := range MetadataTypes {
+		if string(t) == s {
+			return t, nil
+		}
+	}
+	names := make([]string, len(MetadataTypes))
+	for i, t := range MetadataTypes {
+		names[i] = string(t)
+	}
+	return "", fmt.Errorf("invalid metadata type %q: must be one of %s", s, strings.Join(names, ", "))
+}
+
+// accepts returns the Accept value of each request stage, in order.
+func (t MetadataType) accepts() []string {
+	const jwt, js = "application/jwt", "application/json"
+	switch t {
+	case MetadataTypeAny:
+		return []string{jwt + ", " + js}
+	case MetadataTypeRequireSigned:
+		return []string{jwt}
+	case MetadataTypePreferUnsigned:
+		return []string{js, jwt}
+	case MetadataTypeRequireUnsigned:
+		return []string{js}
+	default: // prefer-signed
+		return []string{jwt, js}
+	}
 }
 
 type cachedEntry struct {
@@ -130,16 +250,33 @@ type Resolver struct {
 	group singleflight.Group
 }
 
+// ErrHTTPClientRequired is returned by New when Config.HTTPClient is nil.
+var ErrHTTPClientRequired = errors.New("issuermetadata: Config.HTTPClient is required (build one with config.HTTPClientConfig.NewHTTPClient)")
+
 // New creates a Resolver with the given configuration.
-// Sensible defaults are applied for zero-value fields.
+// Sensible defaults are applied for zero-value fields, except HTTPClient, which
+// is required.
 func New(cfg Config) (*Resolver, error) {
 	if cfg.CacheTTL == 0 {
 		cfg.CacheTTL = 5 * time.Minute
 	}
+	if cfg.MetadataType == "" && cfg.PreferSigned != nil {
+		// Deprecated flag; see Config.PreferSigned for the precedence rule.
+		if *cfg.PreferSigned {
+			cfg.MetadataType = MetadataTypePreferSigned
+		} else {
+			cfg.MetadataType = MetadataTypePreferUnsigned
+		}
+	}
+	mt, err := ParseMetadataType(string(cfg.MetadataType))
+	if err != nil {
+		return nil, err
+	}
+	cfg.MetadataType = mt
 
 	httpClient := cfg.HTTPClient
 	if httpClient == nil {
-		httpClient = http.DefaultClient
+		return nil, ErrHTTPClientRequired
 	}
 
 	return &Resolver{
@@ -172,9 +309,12 @@ type ResolveResult struct {
 // using a TTL-cached result when available.
 //
 // The issuerURL must use HTTPS (unless AllowHTTP is set in Config).
-// Any trailing slash in the issuer URL path is stripped per OID4VCI §12.2.1.
-// The endpoint queried follows RFC 8615:
-// https://{host}/.well-known/openid-credential-issuer{path}.
+// The identifier is used exactly as given (no normalisation) for the identity
+// check and the cache key.
+// The endpoints queried are formed per OpenID4VCI 1.0 section 12.2.2 (literal
+// path insertion) and, on HTTP 404 only, the 1.1 draft form with a terminating
+// slash removed; see oidc.CredentialIssuerMetadataURLs. RFC 8615 defines only
+// the /.well-known/ namespace.
 //
 // When the fetched document contains a signed_metadata field, its JWT
 // signature is verified against the issuer's JWKS (inline jwks or jwks_uri).
@@ -206,13 +346,10 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 		return nil, err
 	}
 
-	// Normalize trailing slash for consistent cache keys, but only when the
-	// path is empty or just "/". Issuers with meaningful paths (e.g.
-	// https://host/issuer/) retain their trailing slash per RFC 8615.
-	parsed, _ := url.Parse(issuerURL) // already validated above
-	if parsed.Path == "" || parsed.Path == "/" {
-		issuerURL = strings.TrimRight(issuerURL, "/")
-	}
+	// issuerURL is used exactly as received, including as the cache and
+	// singleflight key: "https://i.example" and "https://i.example/" are
+	// different identifiers (OpenID4VCI 1.0 section 12.2.4, simple string
+	// comparison, no normalisation), so they never share an entry.
 
 	if entry := r.getCachedEntry(issuerURL); entry != nil {
 		return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial}, nil
@@ -229,12 +366,29 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 			return &ResolveResult{Metadata: deepCopyMap(entry.parsed), Cached: true, Validated: entry.validated, Signed: entry.signed, SignerKeyMaterial: entry.signerKeyMaterial}, nil
 		}
 
-		// RFC 8615 well-known URI construction (required since OID4VCI draft 16):
-		// https://{host}/.well-known/openid-credential-issuer{path}
-		metadataURL, _ := oidc.WellKnownURL(issuerURL, "openid-credential-issuer") // already validated above
+		// Candidate metadata URLs, derived from the identifier as received
+		// (see oidc.CredentialIssuerMetadataURLs): the OpenID4VCI 1.0 literal
+		// form first, then the 1.1 draft form (terminating slash removed).
+		// The second is tried ONLY when the first answers HTTP 404; 5xx,
+		// timeouts, network errors and every other status are returned as they
+		// are, so a failing issuer is not hit twice and real failures are not
+		// masked. Both use the same guarded client and the same size, timeout
+		// and content-type rules. Whichever URL serves the document, its
+		// credential_issuer / sub is compared exactly with issuerURL; a
+		// mismatch is never retried against the other form.
+		candidates, _ := oidc.CredentialIssuerMetadataURLs(issuerURL) // already validated above
 		fetchCtx, fetchCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer fetchCancel()
-		result, err := r.fetch(fetchCtx, issuerURL, metadataURL)
+		var result *fetchResult
+		var err error
+		for i, metadataURL := range candidates {
+			result, err = r.fetch(fetchCtx, issuerURL, metadataURL)
+			var se *statusError
+			if err != nil && errors.As(err, &se) && se.status == http.StatusNotFound && i < len(candidates)-1 {
+				continue
+			}
+			break
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -245,7 +399,11 @@ func (r *Resolver) ResolveWithInfo(ctx context.Context, issuerURL string) (*Reso
 	if err != nil {
 		return nil, err
 	}
-	return val.(*ResolveResult), nil
+	result, ok := val.(*ResolveResult)
+	if !ok {
+		return nil, fmt.Errorf("issuer metadata resolver: unexpected singleflight result type %T", val)
+	}
+	return result, nil
 }
 
 func (r *Resolver) validateURL(issuerURL string) error {
@@ -265,26 +423,51 @@ func (r *Resolver) validateURL(issuerURL string) error {
 	return nil
 }
 
-// preferSigned returns whether to prefer signed metadata in Accept headers.
-func (r *Resolver) preferSigned() bool {
-	if r.cfg.PreferSigned != nil {
-		return *r.cfg.PreferSigned
+func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*fetchResult, error) {
+	// Content negotiation per OpenID4VCI §12.2.2, driven by the configured
+	// MetadataType: one Accept value per request, in preference order. Only an
+	// HTTP status moves on to the next stage; an error while processing a 200
+	// (including a failed signature verification) is returned as is.
+	accepts := r.cfg.MetadataType.accepts()
+	var lastStatus int
+	for i, accept := range accepts {
+		result, status, err := r.fetchOnce(ctx, issuerURL, metadataURL, accept)
+		if err != nil {
+			return nil, err
+		}
+		if status == http.StatusOK {
+			if r.cfg.MetadataType == MetadataTypeRequireSigned && !result.signed {
+				return nil, errors.New("metadata type require-signed: issuer returned unsigned metadata")
+			}
+			return result, nil
+		}
+		lastStatus = status
+		// 406 is how a compliant issuer says it lacks the requested form.
+		// Every other status (other 4xx, 429, 3xx, 5xx) is terminal.
+		retryable := status == http.StatusNotAcceptable
+		if !retryable || i == len(accepts)-1 {
+			break
+		}
 	}
-	return true
+	return nil, &statusError{status: lastStatus}
 }
 
-func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*fetchResult, error) {
+// statusError reports a non-200 metadata response. The resolver falls back to
+// the next candidate URL only for 404.
+type statusError struct{ status int }
+
+func (e *statusError) Error() string { return fmt.Sprintf("issuer returned HTTP %d", e.status) }
+
+// fetchOnce performs a single metadata GET with the given Accept header. It
+// returns the parsed result only on HTTP 200; on any other status it returns
+// the status code (and a nil result) so the caller can decide whether to retry
+// with a different Accept.
+func (r *Resolver) fetchOnce(ctx context.Context, issuerURL, metadataURL, accept string) (*fetchResult, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+		return nil, 0, fmt.Errorf("creating request: %w", err)
 	}
-
-	// Content negotiation per OpenID4VCI §12.2.2
-	if r.preferSigned() {
-		req.Header.Set("Accept", "application/jwt, application/json;q=0.9")
-	} else {
-		req.Header.Set("Accept", "application/json, application/jwt;q=0.9")
-	}
+	req.Header.Set("Accept", accept)
 
 	// The issuerURL is validated by validateURL() (HTTPS required) before
 	// fetch() is called, and r.httpClient enforces SSRF protection via its
@@ -292,39 +475,44 @@ func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*f
 	// HTTPS endpoints is inherent to OpenID4VCI issuer metadata discovery —
 	// the issuer URL comes from a user-presented credential and can be any
 	// public HTTPS endpoint; there is no known-good allowlist.
-	resp, err := r.httpClient.Do(req) // lgtm[go/request-forgery]
+	resp, err := r.httpClient.Do(req) // codeql[go/request-forgery]
 	if err != nil {
-		return nil, fmt.Errorf("HTTP request failed: %w", err)
+		return nil, 0, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close() //nolint:errcheck
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("issuer returned HTTP %d", resp.StatusCode)
+		return nil, resp.StatusCode, nil
 	}
 
 	body, err := readLimitedBody(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("reading response: %w", err)
+		return nil, resp.StatusCode, fmt.Errorf("reading response: %w", err)
 	}
 
 	// Determine format from Content-Type header.
 	contentType := resp.Header.Get("Content-Type")
 	mediaType, _, parseErr := mime.ParseMediaType(contentType)
 	if contentType != "" && parseErr != nil {
-		return nil, fmt.Errorf("malformed Content-Type %q: %w", contentType, parseErr)
+		return nil, resp.StatusCode, fmt.Errorf("malformed Content-Type %q: %w", contentType, parseErr)
 	}
 
 	switch mediaType {
 	case "application/jwt":
+		if r.cfg.MetadataType == MetadataTypeRequireUnsigned {
+			return nil, resp.StatusCode, errors.New("metadata type require-unsigned: issuer returned application/jwt")
+		}
 		// Entire response body is a JWS per OpenID4VCI §12.2.3
-		return r.handleJWTResponse(ctx, issuerURL, strings.TrimSpace(string(body)))
+		res, err := r.handleJWTResponse(ctx, issuerURL, strings.TrimSpace(string(body)))
+		return res, resp.StatusCode, err
 
 	case "application/json", "":
 		// Standard JSON response, possibly with legacy signed_metadata field
-		return r.handleJSONResponse(ctx, issuerURL, body)
+		res, err := r.handleJSONResponse(ctx, issuerURL, body)
+		return res, resp.StatusCode, err
 
 	default:
-		return nil, fmt.Errorf("unsupported Content-Type: %s", contentType)
+		return nil, resp.StatusCode, fmt.Errorf("unsupported Content-Type: %s", contentType)
 	}
 }
 
@@ -335,7 +523,7 @@ func (r *Resolver) fetch(ctx context.Context, issuerURL, metadataURL string) (*f
 //   - Key resolved from JOSE header (currently only x5c is supported; kid and
 //     trust_chain resolution are not yet implemented)
 func (r *Resolver) handleJWTResponse(ctx context.Context, issuerURL, jwtString string) (*fetchResult, error) {
-	jws, err := jose.ParseSigned(jwtString, supportedSignatureAlgorithms)
+	jws, err := jose.ParseSignedCompact(jwtString, supportedSignatureAlgorithms)
 	if err != nil {
 		return nil, fmt.Errorf("parsing JWT response: %w", err)
 	}
@@ -402,12 +590,65 @@ func (r *Resolver) handleJSONResponse(ctx context.Context, issuerURL string, bod
 			if err != nil {
 				return nil, err
 			}
+			// The verified claims must bind to the identifier exactly, whichever
+			// candidate URL served the document (sub and/or credential_issuer;
+			// at least one must be present, any present one must match).
+			if err := validateSignedMetadataIdentity(claims, issuerURL); err != nil {
+				return nil, err
+			}
 			// Validated only when a TrustEvaluator is configured and approved.
 			return &fetchResult{metadata: claims, validated: r.cfg.TrustEvaluator != nil, signed: true}, nil
 		}
 	}
 
+	// Bind the plain-JSON metadata document to the URL it was requested from.
+	// Per OpenID4VCI 1.0 section 12.2.4 (the same rule is in the 1.1 draft's
+	// Credential Issuer Metadata section), credential_issuer MUST be identical
+	// to the Credential Issuer Identifier that was used to fetch this metadata. Without this
+	// check a metadata document served from (or injected at) an unrelated
+	// path/host could impersonate a different issuer identifier.
+	if err := validateCredentialIssuerClaim(raw, issuerURL); err != nil {
+		return nil, err
+	}
+
 	return &fetchResult{metadata: raw, validated: false, signed: false}, nil
+}
+
+// validateCredentialIssuerClaim checks that the metadata's credential_issuer
+// claim matches the issuer URL the document was requested/offered for. This
+// mirrors the 'sub' claim check performed for signed (application/jwt)
+// metadata responses in validateJWTClaims.
+func validateCredentialIssuerClaim(claims map[string]interface{}, issuerURL string) error {
+	credentialIssuer, _ := claims["credential_issuer"].(string)
+	if credentialIssuer == "" {
+		return fmt.Errorf("metadata missing required 'credential_issuer' claim")
+	}
+	if credentialIssuer != issuerURL {
+		return fmt.Errorf("metadata 'credential_issuer' claim %q does not match issuer URL %q", credentialIssuer, issuerURL)
+	}
+	return nil
+}
+
+// validateSignedMetadataIdentity checks the identity claims of the verified
+// signed_metadata payload against the identifier exactly (no normalisation).
+func validateSignedMetadataIdentity(claims map[string]interface{}, issuerURL string) error {
+	subV, hasSub := claims["sub"]
+	ciV, hasCI := claims["credential_issuer"]
+	if !hasSub && !hasCI {
+		return fmt.Errorf("signed_metadata payload has neither 'sub' nor 'credential_issuer' to bind it to the issuer")
+	}
+	// Presence, not type: a non-string value is a mismatch, never a skip.
+	if hasSub {
+		if sub, _ := subV.(string); sub != issuerURL {
+			return fmt.Errorf("signed_metadata 'sub' claim %v does not match issuer URL %q", subV, issuerURL)
+		}
+	}
+	if hasCI {
+		if ci, _ := ciV.(string); ci != issuerURL {
+			return fmt.Errorf("signed_metadata 'credential_issuer' claim %v does not match issuer URL %q", ciV, issuerURL)
+		}
+	}
+	return nil
 }
 
 // validateSignedMetadata verifies the signed_metadata JWT against the issuer's
@@ -423,7 +664,7 @@ func (r *Resolver) handleJSONResponse(ctx context.Context, issuerURL string, bod
 // are tried first. If none match the kid or no kid is present, all JWKS keys
 // are tried in order.
 func (r *Resolver) validateSignedMetadata(ctx context.Context, issuerURL string, raw map[string]interface{}, signedMetadata string) (map[string]interface{}, error) {
-	jws, err := jose.ParseSigned(signedMetadata, supportedSignatureAlgorithms)
+	jws, err := jose.ParseSignedCompact(signedMetadata, supportedSignatureAlgorithms)
 	if err != nil {
 		return nil, fmt.Errorf("parsing signed_metadata JWT: %w", err)
 	}
@@ -576,10 +817,16 @@ func validateJWTClaims(claims map[string]interface{}, issuerURL string) error {
 	if sub == "" {
 		return fmt.Errorf("JWT payload missing required 'sub' claim")
 	}
-	normalizedSub := strings.TrimSuffix(sub, "/")
-	normalizedIssuer := strings.TrimSuffix(issuerURL, "/")
-	if normalizedSub != normalizedIssuer {
+	if sub != issuerURL {
 		return fmt.Errorf("JWT 'sub' claim %q does not match issuer URL %q", sub, issuerURL)
+	}
+	// The payload carries the metadata itself: when credential_issuer is
+	// present (any type) it must be the identifier too, since callers use it
+	// as the proof audience.
+	if v, present := claims["credential_issuer"]; present {
+		if ci, _ := v.(string); ci != issuerURL {
+			return fmt.Errorf("JWT 'credential_issuer' claim %v does not match issuer URL %q", v, issuerURL)
+		}
 	}
 
 	// iat MUST be present
@@ -759,6 +1006,9 @@ func (r *Resolver) fetchJWKSFromURI(ctx context.Context, uri string) (jose.JSONW
 }
 
 func (r *Resolver) getCachedEntry(issuerURL string) *cachedEntry {
+	if r.cfg.CacheDisabled {
+		return nil
+	}
 	r.mu.RLock()
 	entry, ok := r.cache[issuerURL]
 	if !ok {
@@ -793,6 +1043,9 @@ func deepCopyMap(m map[string]interface{}) map[string]interface{} {
 }
 
 func (r *Resolver) setCache(issuerURL string, result *fetchResult) {
+	if r.cfg.CacheDisabled {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.cache[issuerURL] = &cachedEntry{

@@ -174,7 +174,19 @@ func (h *Handler) GetTypeMetadata(c *gin.Context) {
 			return
 		}
 
-		result := v.(*FetchResult)
+		result, ok := v.(*FetchResult)
+		if !ok || result == nil {
+			h.logger.Error("dynamic fetch returned unexpected result type",
+				zap.String("vct", vctID),
+				zap.String("type", fmt.Sprintf("%T", v)),
+			)
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":   "internal_error",
+				"message": "Unexpected dynamic fetch result",
+				"vct":     vctID,
+			})
+			return
+		}
 
 		// Handle 304 Not Modified
 		if result.NotModified && existingEntry != nil {
@@ -331,6 +343,13 @@ func (h *Handler) RegisterRoutes(r gin.IRouter) {
 	r.GET("/type-metadata", h.GetTypeMetadata)
 	r.GET("/credentials", h.ListCredentials)
 	r.GET("/status", h.GetStatus)
+}
+
+// RegisterRootAliases registers the endpoints that do not collide with the
+// server's own health endpoints (/type-metadata, /credentials) on r.
+func (h *Handler) RegisterRootAliases(r gin.IRouter) {
+	r.GET("/type-metadata", h.GetTypeMetadata)
+	r.GET("/credentials", h.ListCredentials)
 }
 
 // Close shuts down the handler's background goroutines.

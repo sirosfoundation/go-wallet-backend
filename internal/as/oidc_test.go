@@ -28,6 +28,9 @@ func TestExchangeCode_Success(t *testing.T) {
 		if r.Form.Get("code") != "test-code" {
 			t.Errorf("expected code=test-code, got %s", r.Form.Get("code"))
 		}
+		if r.Form.Get("code_verifier") != "test-verifier" {
+			t.Errorf("expected code_verifier=test-verifier, got %s", r.Form.Get("code_verifier"))
+		}
 
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
@@ -39,7 +42,7 @@ func TestExchangeCode_Success(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	resp, err := exchangeCode(t.Context(), ts.URL, "test-code", "client-1", "https://example.com/callback")
+	resp, err := exchangeCode(t.Context(), nil, ts.URL, "test-code", "client-1", "https://example.com/callback", "test-verifier")
 	if err != nil {
 		t.Fatalf("exchangeCode: %v", err)
 	}
@@ -61,7 +64,7 @@ func TestExchangeCode_MissingIDToken(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	_, err := exchangeCode(t.Context(), ts.URL, "code", "client", "https://example.com/cb")
+	_, err := exchangeCode(t.Context(), nil, ts.URL, "code", "client", "https://example.com/cb", "verifier")
 	if err == nil {
 		t.Fatal("expected error for missing id_token")
 	}
@@ -74,7 +77,7 @@ func TestExchangeCode_ErrorResponse(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	_, err := exchangeCode(t.Context(), ts.URL, "bad-code", "client", "https://example.com/cb")
+	_, err := exchangeCode(t.Context(), nil, ts.URL, "bad-code", "client", "https://example.com/cb", "verifier")
 	if err == nil {
 		t.Fatal("expected error for bad status")
 	}
@@ -133,6 +136,16 @@ func TestRedirectURI(t *testing.T) {
 	h.cfg.ExternalURL = "https://auth.example.com/"
 	if got := h.redirectURI(); got != expected {
 		t.Errorf("expected %s, got %s (trailing slash)", expected, got)
+	}
+
+	h.cfg.ExternalURL = "https://auth.example.com/wallet/"
+	if got, want := h.redirectURI(), "https://auth.example.com/wallet/auth/oidc/callback"; got != want {
+		t.Errorf("expected %s, got %s (path prefix)", want, got)
+	}
+
+	h.cfg.ExternalURL = "https://auth.example.com/#frag"
+	if got := h.redirectURI(); got != "" {
+		t.Errorf("fragment external_url must yield no redirect URI, got %s", got)
 	}
 }
 

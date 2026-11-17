@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -84,6 +85,10 @@ func HashSessionID(jti string) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
+// ErrSessionNotFound is returned by SessionStore.Revoke for an unknown
+// session, which logout treats as already logged out.
+var ErrSessionNotFound = errors.New("session not found")
+
 // MemorySessionStore is an in-memory SessionStore implementation.
 type MemorySessionStore struct {
 	mu       sync.RWMutex
@@ -125,7 +130,7 @@ func (s *MemorySessionStore) Revoke(_ context.Context, jti string) error {
 	defer s.mu.Unlock()
 	session, ok := s.sessions[jti]
 	if !ok {
-		return fmt.Errorf("session %s not found", jti)
+		return ErrSessionNotFound
 	}
 	session.Revoked = true
 	return nil

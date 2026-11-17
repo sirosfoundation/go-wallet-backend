@@ -61,11 +61,17 @@ func (s *InviteStore) GetAllByTenant(ctx context.Context, tenantID domain.Tenant
 func (s *InviteStore) MarkCompleted(ctx context.Context, tenantID domain.TenantID, code string, usedBy domain.UserID) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now()
 	for _, inv := range s.data {
-		if inv.TenantID == tenantID && inv.Code == code && inv.Status == domain.InviteStatusActive {
+		// The expiry check must happen under the same lock as the
+		// active-status check, not as a separate earlier read: otherwise an
+		// invite that ticks over its expiry between an earlier IsUsable()
+		// check and this call (e.g. while WebAuthn verification is still in
+		// flight) would still be claimable here.
+		if inv.TenantID == tenantID && inv.Code == code && inv.Status == domain.InviteStatusActive && now.Before(inv.ExpiresAt) {
 			inv.Status = domain.InviteStatusCompleted
 			inv.UsedBy = &usedBy
-			inv.UpdatedAt = time.Now()
+			inv.UpdatedAt = now
 			return nil
 		}
 	}

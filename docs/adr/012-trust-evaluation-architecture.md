@@ -175,6 +175,7 @@ the DID document to obtain the verifier's public keys before evaluating trust:
 │     │──── flow_progress ────▶│                               │               │
 │     │     requires_resolution: true                          │               │
 │     │     request_jwt: "eyJ..."                              │               │
+│     │     resolution_subject_id: "did:web:verifier.example.com"│              │
 │     │     subject_id: "did:web:verifier.example.com"         │               │
 │     │                        │                               │               │
 │     │                 ┌──────┴──────┐                        │               │
@@ -182,7 +183,8 @@ the DID document to obtain the verifier's public keys before evaluating trust:
 │     │                 └──────┬──────┘                        │               │
 │     │                        │                               │               │
 │     │                        │──── POST /v1/resolve ────────▶│               │
-│     │                        │     { subject_id: "did:..." } │──▶ PDP        │
+│     │                        │  { subject_id: resolution_    │               │
+│     │                        │      subject_id }             │──▶ PDP        │
 │     │                        │                               │               │
 │     │                        │◀─── { keys: [...], ... } ─────│               │
 │     │                        │                               │               │
@@ -208,13 +210,18 @@ the DID document to obtain the verifier's public keys before evaluating trust:
 The engine sends `TrustEvaluationRequest` with:
 - `requires_resolution: true` - indicates frontend must resolve DID
 - `request_jwt` - the signed request JWT for frontend to verify
-- `subject_id` - the DID to resolve
+- `resolution_subject_id` - the bare DID to resolve via `/v1/resolve`
+- `subject_id` - the identifier to evaluate via `/v1/evaluate` (for OpenID4VP
+  1.0's `decentralized_identifier:`-prefixed client_id form, this keeps that
+  prefix - it's a different value from `resolution_subject_id` in that case,
+  since `/v1/resolve` and `/v1/evaluate` need different forms of the
+  identifier and one field can't serve both)
 
 Frontend flow:
-1. Call `POST /v1/resolve` with the DID to get the DID document
+1. Call `POST /v1/resolve` with `resolution_subject_id` to get the DID document
 2. Extract verification methods (public keys) from the response
 3. Verify the `request_jwt` signature using the resolved keys
-4. Call `POST /v1/evaluate` with the resolved keys for trust policy check
+4. Call `POST /v1/evaluate` with `subject_id` and the resolved keys for trust policy check
 5. Return `trust_result` action with the trust decision
 
 This ensures that:
@@ -238,6 +245,24 @@ trust:
   issuer_pdp_url: ""  # Per-flow override for issuers
   verifier_pdp_url: ""  # Per-flow override for verifiers
 ```
+
+### PDP Error Mapping
+
+When the PDP call behind `/v1/evaluate` or `/v1/resolve` fails, the proxy
+distinguishes a rejected request from an unavailable backend. Clients MUST NOT
+treat a 4xx as "backend unreachable" (and must not fall back to weaker local
+trust checks because of it).
+
+| PDP outcome | Proxy response |
+|---|---|
+| 422 | 422, PDP body under `details` |
+| other request-level 4xx (400, 405, 409, 413, 415, ...) | 400, PDP body under `details` |
+| 401, 403, 404, 408, 429 (proxy-to-PDP credentials/routing/throttling) | 502 |
+| 5xx, transport error | 502 (generic message; PDP body is not echoed) |
+| deadline exceeded | 504 |
+
+The 4xx body is `{"error": <PDP "error" string or a generic message>, "details": <PDP JSON object, or a truncated string>}`,
+the serialized response is bounded to 2 KiB. Requests that fail local validation before reaching the PDP (e.g. mismatched `resource.id`/`subject.id`) are also 400.
 
 ### SPOCP Authorization
 
@@ -313,7 +338,7 @@ For the engine transport, trust evaluation uses these message types:
   "payload": {
     "trust_evaluation_required": true,
     "request": {
-      "subject_id": "verifier.example.com",
+      "subject_id": "x509_san_dns:verifier.example.com",
       "subject_type": "credential_verifier",
       "key_material": {
         "type": "x5c",
@@ -328,6 +353,15 @@ For the engine transport, trust evaluation uses these message types:
 }
 ```
 
+`subject_id` always carries the `x509_san_dns:`/`x509_san_uri:`/`x509_hash:`
+prefix for these three schemes, even when the wire request presented
+`client_id_scheme` as a separate field with a bare `client_id` (rather than
+the prefix embedded in `client_id` itself) - go-trust's certificate-binding
+check (`ParseClientIDScheme`/`VerifyLeafBinding`) only fires when that
+prefix is present on `Subject.ID`, so the frontend must forward `subject_id`
+to its own `/v1/evaluate` call exactly as received here, never re-derived
+from `context.client_id_scheme` + a stripped value.
+
 **Server → Client (trust request with DID resolution - did scheme):**
 ```json
 {
@@ -340,6 +374,7 @@ For the engine transport, trust evaluation uses these message types:
       "subject_id": "did:web:verifier.example.com",
       "subject_type": "credential_verifier",
       "requires_resolution": true,
+      "resolution_subject_id": "did:web:verifier.example.com",
       "request_jwt": "eyJhbGciOiJFUzI1NiIsInR5cCI6Im9hdXRoLWF1dGh6LXJlcStqd3QifQ...",
       "context": {
         "client_id_scheme": "did",
@@ -350,10 +385,19 @@ For the engine transport, trust evaluation uses these message types:
 }
 ```
 
+`resolution_subject_id` and `subject_id` are the same bare DID here because
+the older `did:` client_id spelling carries no separate scheme prefix to
+strip in the first place. For OpenID4VP 1.0's final `decentralized_identifier:`
+spelling, `subject_id` keeps that prefix (it's what `/v1/evaluate` must see,
+matching what the server-side PDP path evaluates too) while
+`resolution_subject_id` is the prefix-stripped bare DID instead - the two
+fields exist precisely because `/v1/resolve` and `/v1/evaluate` need
+different forms of the identifier and one field can't serve both.
+
 For DID schemes, the frontend must:
-1. Call `/v1/resolve` with `subject_id` to get the DID document
+1. Call `/v1/resolve` with `resolution_subject_id` to get the DID document
 2. Verify `request_jwt` signature using resolved keys
-3. Call `/v1/evaluate` with the verified keys
+3. Call `/v1/evaluate` with `subject_id` and the verified keys
 4. Return the trust result
 
 **Client → Server (trust result):**
@@ -426,23 +470,32 @@ user interaction timeout.
 
 ### DID Resolution Error Handling
 
-For DID-based client_id schemes (`client_id_scheme=did`), the frontend must:
+For DID-based client_id schemes (`client_id_scheme=did` or
+`decentralized_identifier`), the frontend must:
 
-1. Receive `TrustEvaluationRequest` with `requires_resolution: true` and `request_jwt`
-2. Call `POST /v1/resolve` with the DID to get the DID document
+1. Receive `TrustEvaluationRequest` with `requires_resolution: true`,
+   `request_jwt`, and `resolution_subject_id`
+2. Call `POST /v1/resolve` with `resolution_subject_id` (the bare DID) to
+   get the DID document - never `subject_id`, which keeps the
+   `decentralized_identifier:` prefix `/v1/resolve` cannot accept as a
+   resolvable DID
 3. Verify `request_jwt` signature using resolved keys
-4. Call `POST /v1/evaluate` with the resolved key material
+4. Call `POST /v1/evaluate` with `subject_id` and the resolved key material
 5. Return `trust_result` action within `TrustEvaluationTimeout`
 
 **Error cases handled by the backend:**
 - `TrustEvaluationRequest` validation fails → Flow rejected with error
 - `RequestJWT` empty when `RequiresResolution=true` → Validation error
+- `ResolutionSubjectID` empty when `RequiresResolution=true` → Validation error
 - Frontend doesn't respond within 2 minutes → `ErrFlowTimeout`
 - Trust result validation fails → Flow rejected with error
 
-**Important**: The backend validates that `RequestJWT` is present when
-`RequiresResolution=true`. Issuers with DID-based identifiers do not require
-a signed request JWT (issuance is initiated by the issuer).
+**Important**: The backend validates that `RequestJWT` and
+`ResolutionSubjectID` are both present when `RequiresResolution=true`.
+Issuers with DID-based identifiers do not require a signed request JWT
+(issuance is initiated by the issuer) - that specific check does not apply
+to `OID4VCIHandler.evaluateTrustViaFrontend`, which never calls this
+shared `Validate()`.
 
 ### Input Validation
 
@@ -452,6 +505,7 @@ The backend validates all trust evaluation messages:
 - `SubjectID` must be non-empty
 - `SubjectType` must be `credential_issuer` or `credential_verifier`
 - `RequestJWT` required when `RequiresResolution=true` (for verifiers)
+- `ResolutionSubjectID` required when `RequiresResolution=true`
 - `KeyMaterial.Type` must be `x5c` or `jwk` (if provided)
 
 **TrustResultPayload validation:**
@@ -497,6 +551,128 @@ This ensures:
 For `x509_san_dns` client_id_scheme, the PDP is responsible for validating that
 the certificate's SAN DNS names match the `client_id`. The backend extracts
 key material but delegates all policy decisions to the PDP.
+
+## AuthZEN actions used by go-wallet-backend (contract with go-trust)
+
+go-trust selects a policy by `action.name` (`policies.policies.<name>` in its
+config). This section lists every action the backend sends, verified against
+`pkg/trust` (`Service.evaluate`, `pkg/trust/authzen`), `internal/engine` and
+`internal/api/authzen_proxy.go`. In every case the AuthZEN request is
+`subject {type: "key", id: <subject>}`, `resource {type, id: <subject>, key}`,
+optional `action {name}` and `context`, and the tenant is carried in the
+`X-Tenant-ID` header (`trust.TenantTransport`, from `trust.ContextWithTenant`).
+Inside the backend `Role` maps to `action.name`; an explicit action is used only
+when `Role` is empty.
+
+| Call site (backend) | action.name | subject.id | resource.type / key | context | decision=true means |
+|---|---|---|---|---|---|
+| `Service.EvaluateIssuer` (engine OID4VCI, `internal/engine/oid4vci.go`) | `credential-issuer` | issuer identifier | `x5c` (chain, base64 DER strings) or `jwk` (flat list of JWKs); none = resolution-only | `credential_type` (comma-separated vct/doctype list) when set | the key/chain is trusted for this issuer to issue credentials |
+| `Service.EvaluateVerifier` / `EvaluateVerifierWithContext` (engine OID4VP) | `credential-verifier` | verifier `client_id` | `x5c` or `jwk` as above | `client_id_scheme`, `response_uri`, `redirect_uri`, `trust_chain` (OIDF), attestation fields when present | the key is trusted for this verifier to request credentials |
+| `Service.EvaluateFIDO2Attestation` (`internal/service/fido2_attestation.go`) | `wscd-previewsign-provision` (`trust.FIDO2AttestationAction`) | authenticator AAGUID | `x5c` (attestation chain) | none | the AAGUID/chain is an acceptable hardware key (global PDP, no per-flow override) |
+| `Service.EvaluateStatusListSigner` (verified status list API, `internal/service/status.go`; see ADR-013) | `status-list-signer` (`trust.StatusListSignerAction`), then, only if that call errors, `credential-issuer` (see below) | list `iss` claim, else origin of the list URI (`scheme://host[:port]`) | `x5c` (JWS `x5c` / COSE `x5chain`, base64 DER, leaf first) or `jwk` | none | see below |
+| `Service.ResolveDID` (engine OID4VP JAR signed by a DID) | none | the DID | no type/key (resolution-only) | none | the DID resolved; the DID document comes back in `trust_metadata` |
+| `POST /v1/evaluate` (authzen proxy) | forwarded unchanged from the caller (`getActionName` only logs it) | as supplied | as supplied | as supplied | as the PDP defines it |
+| `POST /v1/resolve` for `url` subjects (`resolveURLSubject`) | `credential-issuer`, with `action.parameters.credential_types` when supplied | issuer URL | `x5c`/`jwk`, or `resolution` when no key could be extracted | none | as `credential-issuer` above |
+| `POST /v1/resolve` authorization pre-check (`Resolve`) | resource type (e.g. `resolution`, `credential_issuer`) as action name, only when `credential_types` are supplied | subject id | resource type as above | none | evaluated by the local SPOCP authorizer, not sent to go-trust |
+
+The roles `wallet_provider` and `pid-provider` exist as constants in
+`pkg/trust` (aliases of go-trust's `trustapi`) but no backend code path sends
+them today.
+
+### `status-list-signer`
+
+Sent when the backend has verified the signature of a Token Status List (JWT or
+CWT form) while serving the verified status list API (`POST /status/v1/lists`,
+ADR-013; the engine does not check status) and must decide whether the signing key may publish status lists:
+
+```
+POST /evaluation            X-Tenant-ID: <tenant>
+{ "subject":  {"type": "key", "id": "https://status.example"},
+  "resource": {"type": "x5c", "id": "https://status.example", "key": ["<base64 DER leaf>", "<base64 DER CA>"]},
+  "action":   {"name": "status-list-signer"} }
+```
+
+- `subject.id` is the list's `iss` claim if it has one, otherwise the origin of
+  the list URI. `resource.type` is `x5c` (preferred; the list carries `x5c` in
+  the JWS header or `x5chain` in the COSE headers) or `jwk`. A list with no key
+  material is never sent; it is unverifiable.
+- **A positive decision MUST mean**: the key or chain chains to a trust anchor
+  that is authorised to sign revocation status lists for that origin/issuer.
+  It must not merely mean "is a credential issuer": a credential issuer key
+  is not thereby a status list signer, and the service that signs lists is
+  normally a different party with a different key.
+- **Typed result.** `TrustInfo.EvaluationFailed` (not the `Reason` text) says
+  the evaluation errored rather than the PDP answering no; `TrustInfo.Framework ==
+  trust.FrameworkNone` says no PDP is configured. The backend never inspects
+  PDP-supplied reason text for control flow.
+- **Caching.** Verified lists are cached per (tenant, list URI), because the trust
+  decision is tenant-scoped; a list is cached until `iat + ttl` (capped by `exp`
+  and one hour), or not at all if already past it. The cache is bounded by entry
+  count and by total inflated bytes (64 MiB).
+- **Call sequence ("deny is deny").** `EvaluateStatusListSigner` first sends
+  `status-list-signer`:
+  - positive: the signer is trusted, no second call;
+  - **genuine negative: final**, the signer is untrusted and no second call is made
+    (logged as a warning with `reason=signer_untrusted_denied` and
+    `signer_trust_action=status-list-signer`);
+  - no PDP configured (Framework `none`): untrusted, no second call;
+  - **error** (transport or evaluation failure): if
+    `status_check.status_list_signer_fallback` is true (the default), a second
+    request is sent as `credential-issuer` (`EvaluateIssuer`) with the same subject,
+    key material, endpoint and tenant, and the signer is trusted if that is
+    positive; a negative there is a negative, an error there leaves the first error.
+    With the switch false the error stands, no second call is made and the list is
+    unverifiable.
+  Trust via the fallback logs the warning `status list signer trusted via
+  credential-issuer fallback; ...` with `signer_trust_action=credential-issuer` and
+  the first call's error; a positive first call logs `signer_trust_action=status-list-signer`
+  (debug). A negative and an error stay distinguishable in the result. The fallback
+  therefore only covers PDP unavailability or evaluation errors on the new action
+  (for example an older go-trust that rejects it); it never overrides a decision.
+- **Endpoint**: the issuer PDP resolution of `EvaluateIssuer` (session override,
+  `trust.issuer.pdp_url`, then the global `trust.pdp_url`); there is no separate
+  status-list PDP setting.
+- **Backend fail-closed semantics**: no PDP configured, a transport or evaluation
+  error, or a negative decision all leave the list *unverifiable*; an unverifiable
+  list is reported `undetermined` (reasons `signer_untrusted`, `trust_unavailable`,
+  `no_signer_key`) and never as verified.
+
+#### Default-policy fallback hazard
+
+go-trust's `PolicyManager.GetPolicy(actionName)` returns the **default policy**
+when `action.name` matches no configured policy
+(`go-trust/pkg/registry/policy.go`). If the deployment has no policy named
+`status-list-signer`, every list signer is judged by the default policy (for
+example the `credential-verifier` policy). That can produce a positive decision
+for a key that must never sign revocation data, **or a negative one**, and since
+a negative is now final, a missing policy can also DENY every list signer.
+**A go-trust deployment MUST define an explicit policy named
+`status-list-signer`**; the backend cannot detect its absence. Because a
+status-list-signer policy's decision is final, it can both widen and narrow trust
+relative to the `credential-issuer` policy. An
+example (keys from `go-trust/pkg/config`; the registry name is operator-defined
+and must refer to a registry that holds only the anchors allowed to sign status
+lists):
+
+```yaml
+policies:
+  default_policy: credential-verifier
+  policies:
+    status-list-signer:
+      description: "Keys allowed to sign Token Status Lists"
+      registries:
+        - status-list-signers      # a registry whose anchors are status-list signers only
+      constraints:
+        require_key_binding: true  # the key must be validated, not just the name resolved
+        allowed_key_types: ["x5c", "jwk"]
+```
+
+Compatibility: a go-trust version or deployment without this policy applies its
+default policy to the action (there is no error), with the consequences above.
+The `credential-issuer` fallback does not help there, since it happens only on
+errors. Roll the policy out to go-trust before enabling the status API
+(`status_check.enabled`, on by default): a missing policy can DENY every list
+signer, in which case every list is `undetermined`/`signer_untrusted`.
 
 ## Related
 

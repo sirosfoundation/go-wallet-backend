@@ -5,12 +5,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
+	"go.mongodb.org/mongo-driver/mongo/readpref"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
@@ -34,10 +36,12 @@ type Store struct {
 	invites         *InviteStore
 	walletInstances *WalletInstanceStore
 	keyAttestations *KeyAttestationStore
+	appAttestKeys   *AppAttestKeyStore
 }
 
-// NewStore creates a new MongoDB store
-func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
+// Connect opens a client for cfg (including TLS settings) and verifies the
+// connection with a ping. It does not touch any collection.
+func Connect(ctx context.Context, cfg *config.MongoDBConfig) (*mongo.Client, error) {
 	clientOptions := options.Client().
 		ApplyURI(cfg.URI).
 		SetConnectTimeout(time.Duration(cfg.Timeout) * time.Second)
@@ -72,7 +76,17 @@ func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
 
 	// Ping the database to verify connection
 	if err := client.Ping(ctx, nil); err != nil {
+		_ = client.Disconnect(context.Background())
 		return nil, fmt.Errorf("failed to ping MongoDB: %w", err)
+	}
+	return client, nil
+}
+
+// NewStore creates a new MongoDB store
+func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
+	client, err := Connect(ctx, cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	database := client.Database(cfg.Database)
@@ -84,8 +98,12 @@ func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
 		cfg:      cfg,
 	}
 
-	// Initialize sub-stores
-	s.users = &UserStore{collection: database.Collection("users")}
+	// Initialize sub-stores.
+	// Users always read from the primary, regardless of any readPreference in
+	// the connection URI: a secondary read right after a private-data write
+	// would return a stale ETag and make the client report a sync failure.
+	s.users = &UserStore{collection: database.Collection("users",
+		options.Collection().SetReadPreference(readpref.Primary()))}
 	s.tenants = &TenantStore{collection: database.Collection("tenants")}
 	s.userTenants = &UserTenantStore{collection: database.Collection("user_tenants")}
 	s.credentials = &CredentialStore{collection: database.Collection("credentials"), counter: counters}
@@ -96,6 +114,7 @@ func NewStore(ctx context.Context, cfg *config.MongoDBConfig) (*Store, error) {
 	s.invites = &InviteStore{collection: database.Collection("invites")}
 	s.walletInstances = &WalletInstanceStore{collection: database.Collection("wallet_instances")}
 	s.keyAttestations = &KeyAttestationStore{collection: database.Collection("key_attestations")}
+	s.appAttestKeys = &AppAttestKeyStore{collection: database.Collection("app_attest_keys")}
 
 	// Initialize default tenant
 	if err := s.initializeDefaultTenant(ctx); err != nil {
@@ -223,6 +242,15 @@ func (s *Store) createIndexes(ctx context.Context) error {
 		return fmt.Errorf("failed to create key attestation indexes: %w", err)
 	}
 
+	// App Attest keys collection indexes (the primary key is the key id)
+	_, err = s.appAttestKeys.collection.Indexes().CreateMany(ctx, []mongo.IndexModel{
+		{Keys: bson.D{{Key: "tenant_id", Value: 1}}},
+		{Keys: bson.D{{Key: "wallet_instance_id", Value: 1}}},
+	})
+	if err != nil {
+		return fmt.Errorf("failed to create app attest key indexes: %w", err)
+	}
+
 	return nil
 }
 
@@ -263,6 +291,7 @@ func (s *Store) Verifiers() storage.VerifierStore             { return s.verifie
 func (s *Store) Invites() storage.InviteStore                 { return s.invites }
 func (s *Store) WalletInstances() storage.WalletInstanceStore { return s.walletInstances }
 func (s *Store) KeyAttestations() storage.KeyAttestationStore { return s.keyAttestations }
+func (s *Store) AppAttestKeys() storage.AppAttestKeyStore     { return s.appAttestKeys }
 
 // Database returns the underlying MongoDB database for creating additional
 // collections (e.g., WIA challenge store with TTL indexes).
@@ -339,16 +368,79 @@ func (s *UserStore) GetByDID(ctx context.Context, did string) (*domain.User, err
 	return &user, nil
 }
 
-func (s *UserStore) Update(ctx context.Context, user *domain.User) error {
-	user.UpdatedAt = time.Now()
-	result, err := s.collection.ReplaceOne(ctx, bson.M{"_id.id": user.UUID.String()}, user)
-	if err != nil {
-		return fmt.Errorf("failed to update user: %w", err)
+// Optimistic-concurrency retry tuning for Modify. Contention on a single user
+// document is normally low (one user, a few tabs/devices), so these limits
+// are generous; backoff with jitter keeps competing writers from retrying in
+// lockstep.
+const (
+	maxModifyAttempts = 20
+	modifyBaseBackoff = 2 * time.Millisecond
+	modifyMaxBackoff  = 100 * time.Millisecond
+)
+
+// modifyBackoff returns a full-jitter exponential backoff for the given attempt.
+func modifyBackoff(attempt int) time.Duration {
+	d := modifyBaseBackoff << min(attempt, 6)
+	if d > modifyMaxBackoff {
+		d = modifyMaxBackoff
 	}
-	if result.MatchedCount == 0 {
-		return storage.ErrNotFound
+	return time.Duration(rand.Int64N(int64(d)) + 1)
+}
+
+// modifySleep waits d or until ctx ends (a variable so tests can count sleeps).
+var modifySleep = func(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
-	return nil
+}
+
+// Modify performs an optimistic read-modify-write on a user document.
+// The write is conditional on the version read, so a concurrent write causes
+// a retry with fresh data instead of silently overwriting it.
+func (s *UserStore) Modify(ctx context.Context, id domain.UserID, fn storage.UserModifier) (*domain.User, error) {
+	for attempt := 0; attempt < maxModifyAttempts; attempt++ {
+		current, err := s.GetByID(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+
+		readVersion := current.Version
+		if err := fn(current); err != nil {
+			return nil, err
+		}
+		current.UUID = id
+		current.Version = readVersion + 1
+		current.UpdatedAt = time.Now()
+
+		filter := bson.M{"_id.id": id.String(), "version": readVersion}
+		if readVersion == 0 {
+			// Documents written before the version field existed have no
+			// "version" key; {version: null} matches missing fields.
+			filter["version"] = bson.M{"$in": bson.A{int64(0), nil}}
+		}
+
+		result, err := s.collection.ReplaceOne(ctx, filter, current)
+		if err != nil {
+			return nil, fmt.Errorf("failed to update user: %w", err)
+		}
+		if result.MatchedCount == 1 {
+			return current, nil
+		}
+		// Either the user was deleted or another writer won the race.
+		// Loop: GetByID distinguishes the two cases.
+		if attempt == maxModifyAttempts-1 {
+			break // out of attempts: report the conflict without a pointless sleep
+		}
+		if err := modifySleep(ctx, modifyBackoff(attempt)); err != nil {
+			return nil, err
+		}
+	}
+	return nil, storage.ErrConflict
 }
 
 func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
@@ -362,40 +454,77 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 	return nil
 }
 
-func (s *UserStore) UpdatePrivateData(ctx context.Context, id domain.UserID, data []byte, ifMatch string) error {
-	filter := bson.M{"id.id": id.String()}
-	if ifMatch != "" {
-		filter["private_data_etag"] = ifMatch
+func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) (bool, error) {
+	setFields := bson.M{
+		"updated_at": time.Now(),
+	}
+	// OR-only: only ever include clone_warning in the $set when it's true.
+	// Omitting the field entirely when false leaves whatever is currently
+	// stored untouched — this single UpdateOne is the whole operation, so
+	// there is no read-then-write window at all: it can never overwrite an
+	// existing true with false, regardless of how concurrent calls
+	// interleave.
+	if cloneWarning {
+		setFields["webauthn_credentials.$[cred].authenticator.clone_warning"] = true
 	}
 
-	// Generate new ETag
-	newETag := fmt.Sprintf("%d", time.Now().UnixNano())
-
+	// SignCount must be monotonic non-decreasing: two concurrent logins can
+	// persist out of order (e.g. a counter=20 assertion lands before a
+	// counter=10 one from an earlier, slower request), and a plain
+	// unconditional overwrite would let the later write lower the stored
+	// baseline — which would falsely flag a subsequent legitimate assertion
+	// as a clone regression, and could let an actually-regressing counter
+	// slip through as "non-regressing" against the artificially-lowered
+	// baseline. $max is MongoDB's atomic "only update if greater" operator:
+	// combined with $set in the same update document, this whole operation
+	// is still a single atomic write.
+	//
+	// $inc bumps the document version in the same atomic write. Modify's
+	// ReplaceOne is conditional on the version it read, so without this a
+	// concurrent Modify holding a pre-login snapshot would still match and
+	// restore the old sign count / clear a freshly latched clone warning.
+	// $inc on a missing field (legacy document) sets it to 1.
 	update := bson.M{
-		"$set": bson.M{
-			"private_data":      data,
-			"private_data_etag": newETag,
-			"updated_at":        time.Now(),
+		"$set": setFields,
+		"$max": bson.M{
+			"webauthn_credentials.$[cred].authenticator.sign_count": signCount,
 		},
+		"$inc": bson.M{"version": int64(1)},
 	}
 
-	result, err := s.collection.UpdateOne(ctx, filter, update)
+	opts := options.FindOneAndUpdate().
+		SetArrayFilters(options.ArrayFilters{
+			Filters: []interface{}{bson.M{"cred.id": credentialID}},
+		}).
+		// Return the PRE-image (the document as it was immediately before
+		// this update was applied), not the default post-image, so we can
+		// inspect what CloneWarning was a moment before this exact write —
+		// this is what makes the returned "transitioned" value a genuine
+		// compare-and-set outcome of the single atomic operation, rather
+		// than a separate, racy read.
+		SetReturnDocument(options.Before)
+
+	var before domain.User
+	err := s.collection.FindOneAndUpdate(ctx, bson.M{"_id.id": id.String()}, update, opts).Decode(&before)
 	if err != nil {
-		return fmt.Errorf("failed to update private data: %w", err)
-	}
-	if result.MatchedCount == 0 {
-		// Could be not found or ETag mismatch
-		var user domain.User
-		err := s.collection.FindOne(ctx, bson.M{"id.id": id.String()}).Decode(&user)
-		if err != nil {
-			if err == mongo.ErrNoDocuments {
-				return storage.ErrNotFound
-			}
-			return fmt.Errorf("failed to check user: %w", err)
+		if err == mongo.ErrNoDocuments {
+			return false, storage.ErrNotFound
 		}
-		return storage.ErrInvalidInput // ETag mismatch
+		return false, fmt.Errorf("failed to update credential authenticator: %w", err)
 	}
-	return nil
+
+	if !cloneWarning {
+		return false, nil
+	}
+	for _, c := range before.WebauthnCredentials {
+		if c.ID == credentialID {
+			return !c.Authenticator.CloneWarning, nil
+		}
+	}
+	// Credential not found in the pre-image: the arrayFilter matched zero
+	// array elements (see the interface doc comment on the silent no-op
+	// case) — conservatively report no transition.
+	return false, nil
 }
 
 // idFilter returns a BSON filter that matches a document by _id.

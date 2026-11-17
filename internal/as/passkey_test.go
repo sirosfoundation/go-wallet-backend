@@ -52,7 +52,7 @@ func setupPasskeyHandlers(mock *mockWebAuthn) (*gin.Engine, *MemorySessionStore)
 	}
 	logger := zap.NewNop()
 
-	h := NewPasskeyHandlers(mock, store, nil, cfg, logger)
+	h := NewPasskeyHandlers(mock, store, cfg, logger)
 
 	router := gin.New()
 	router.POST("/auth/passkey/login/begin", h.LoginBegin)
@@ -190,36 +190,6 @@ func TestPasskeyLoginFinish_BadRequest(t *testing.T) {
 	}
 }
 
-func TestPasskeyLoginFinish_LegacyMode(t *testing.T) {
-	mock := &mockWebAuthn{
-		finishLoginResp: &service.FinishLoginResponse{
-			UUID:        "user-legacy",
-			DisplayName: "Legacy User",
-			TenantID:    "tenant-1",
-			Token:       "legacy-token-value",
-		},
-	}
-	router, _ := setupPasskeyHandlers(mock)
-
-	body, _ := json.Marshal(service.FinishLoginRequest{ChallengeID: "c2"})
-	req := httptest.NewRequest(http.MethodPost, "/auth/passkey/login/finish", bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	// No X-Token-Mode header → legacy mode.
-	w := httptest.NewRecorder()
-	router.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
-	}
-
-	// Legacy mode returns the full response including appToken.
-	var resp map[string]interface{}
-	_ = json.NewDecoder(w.Body).Decode(&resp)
-	if resp["appToken"] != "legacy-token-value" {
-		t.Errorf("expected appToken in legacy response, got %v", resp["appToken"])
-	}
-}
-
 func TestPasskeyRegisterBegin_Success(t *testing.T) {
 	mock := &mockWebAuthn{
 		beginRegResp: &service.BeginRegistrationResponse{
@@ -302,6 +272,33 @@ func TestPasskeyRegisterFinish_Error(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestPasskeyRegisterFinish_PrivateDataOwnership_Is422(t *testing.T) {
+	mock := &mockWebAuthn{
+		finishRegErr: fmt.Errorf("refused: %w", service.ErrPrivateDataOwnership),
+	}
+	router, _ := setupPasskeyHandlers(mock)
+
+	body, _ := json.Marshal(service.FinishRegistrationRequest{ChallengeID: "c1"})
+	req := httptest.NewRequest(http.MethodPost, "/auth/passkey/register/finish", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("expected 422, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp["error"] != service.PrivateDataOwnershipErrorCode {
+		t.Errorf("error = %q, want %q", resp["error"], service.PrivateDataOwnershipErrorCode)
+	}
+	if len(w.Result().Cookies()) != 0 {
+		t.Error("no session cookie must be set when registration is refused")
 	}
 }
 

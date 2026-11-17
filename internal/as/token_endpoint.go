@@ -2,6 +2,7 @@ package as
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -20,9 +21,68 @@ import (
 // TokenBlacklistChecker's read methods plus service.TokenBlacklist's own
 // Add; *service.TokenBlacklist satisfies this.
 type TokenBlacklistChecker interface {
-	IsBlacklisted(ctx context.Context, jti string) bool
-	IsUserRevoked(ctx context.Context, userID string) bool
+	IsBlacklisted(ctx context.Context, jti string) (bool, error)
+	IsUserRevoked(ctx context.Context, userID string) (bool, error)
 	Add(ctx context.Context, jti string, expiry time.Time) error
+}
+
+// refuseRevocationUnavailable answers 503 when the revocation store cannot say
+// whether a token is revoked. Only the error is logged, never token content.
+func refuseRevocationUnavailable(c *gin.Context, logger *zap.Logger, err error) {
+	if logger != nil {
+		logger.Error("token request refused: revocation check failed", zap.Error(err))
+	}
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "revocation check unavailable"})
+}
+
+// respondTokenError writes a policy refusal. Together with
+// refuseRevocationUnavailable it is the whole of this endpoint's knowledge of
+// the error wire format; the policy itself (token_policy.go) has none and
+// imports no web framework.
+func respondTokenError(c *gin.Context, err error) {
+	var te *tokenError
+	if !errors.As(err, &te) {
+		te = &tokenError{http.StatusInternalServerError, "server_error", "token issuance failed"}
+	}
+	c.JSON(te.Status, gin.H{"error": te.Message})
+}
+
+// respondRevocation answers a failed revocation check and is the only caller
+// that has to tell the two kinds of failure apart: a refusal, which is a
+// *tokenError, or a store that could not answer, which is anything else.
+func respondRevocation(c *gin.Context, deps *tokenDeps, err error) {
+	var te *tokenError
+	if errors.As(err, &te) {
+		respondTokenError(c, te)
+		return
+	}
+	refuseRevocationUnavailable(c, deps.logger, err)
+}
+
+// sessionOwnerRevoked returns the refusal when the session's user has been
+// revoked, or nil when a token may still be issued. Account deletion revokes
+// the user before the sessions are purged, so an interrupted or
+// unacknowledged deletion can leave a live session whose owner is already
+// revoked.
+//
+// deletionOnly names the one token a revoked owner may still obtain: exactly
+// the deletion permission, which is all DELETE /user/session needs and the
+// only call the resource middleware lets a revoked user reach. It lets an
+// interrupted deletion be completed after the previous access token expired,
+// while every other token (including any anonymous one, whose missing "sub"
+// would bypass the user revocation) stays refused.
+func sessionOwnerRevoked(ctx context.Context, bl TokenBlacklistChecker, session *Session, deletionOnly bool, tac TAC) error {
+	revoked, err := bl.IsUserRevoked(ctx, session.UserID)
+	if err != nil {
+		return err
+	}
+	if !revoked {
+		return nil
+	}
+	if deletionOnly && tac == TAC(string(TACDelete)) {
+		return nil
+	}
+	return errInvalidSession
 }
 
 // tokenDeps groups the shared dependencies for token issuance handlers.
@@ -30,10 +90,10 @@ type tokenDeps struct {
 	issuer *TokenIssuer
 	policy PolicyEngine
 	// ttlFunc, audiences and blacklist are used differently across the two
-	// token-issuance paths: ttlFunc for both; audiences and blacklist only
-	// by handleDelegationTokenRequest, which is the only path that verifies
-	// an already-issued Bearer token rather than trusting a server-side
-	// session record.
+	// token-issuance paths: ttlFunc for both; audiences only by
+	// handleDelegationTokenRequest, which verifies an already-issued Bearer
+	// token. blacklist is used by every path: delegation checks the parent
+	// token, the session paths check the session owner (sessionOwnerRevoked).
 	ttlFunc   func(string) time.Duration
 	audiences []string
 	blacklist TokenBlacklistChecker
@@ -57,10 +117,11 @@ type TokenEndpointConfig struct {
 	Issuer  *TokenIssuer
 	Policy  PolicyEngine
 	TTLFunc func(string) time.Duration
-	// Audiences and Blacklist are used only by the delegation-exchange path
-	// (handleDelegationTokenRequest), which is the only one that verifies an
-	// already-issued Bearer token rather than trusting a server-side session
-	// record - see #381/#382.
+	// Audiences is used only by the delegation-exchange path
+	// (handleDelegationTokenRequest), which verifies an already-issued Bearer
+	// token - see #381/#382. Blacklist is consulted by every path: delegation
+	// checks the parent token; the session-cookie paths check that the
+	// session's owner has not been revoked (account deletion).
 	Audiences       []string
 	Blacklist       TokenBlacklistChecker
 	InsecureCookies bool
@@ -84,7 +145,7 @@ func TokenEndpointHandler(cfg TokenEndpointConfig) gin.HandlerFunc {
 		policy:    cfg.Policy,
 		ttlFunc:   cfg.TTLFunc,
 		audiences: cfg.Audiences,
-		blacklist: cfg.Blacklist,
+		blacklist: blacklistOrNoop(cfg.Blacklist),
 		logger:    cfg.Logger,
 	}
 	return func(c *gin.Context) {
@@ -120,11 +181,10 @@ func TokenEndpointHandler(cfg TokenEndpointConfig) gin.HandlerFunc {
 			return
 		}
 
-		// The pseudonymous engine kind: a real session behind the mint,
-		// a random pseudonym in the token (engine-parity.md §8 G3). Like
-		// the anonymous branch it has no session-less form - checked
-		// before the delegation fallthrough for the same clear-error
-		// reason.
+		// The pseudonymous engine kind: a real session behind the mint, a
+		// random pseudonym in the token (engine-parity.md §8 G3). Like the
+		// anonymous branch it has no session-less form - checked before the
+		// delegation fallthrough for the same clear-error reason.
 		if req.Pseudonymous {
 			sessionID := GetSessionCookie(c, opts)
 			if sessionID == "" {
@@ -153,64 +213,81 @@ func handleSessionTokenRequest(
 ) {
 	session, err := store.Get(c.Request.Context(), sessionID)
 	if err != nil || session == nil || !session.IsValid() {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
+		respondTokenError(c, errInvalidSession)
 		return
 	}
 
-	tenantID := req.TenantID
-	if tenantID == "" {
-		tenantID = session.TenantID
-	}
-
-	// Enforce tenant scoping: session-based tokens cannot target a different tenant
-	// unless the session itself is cross-tenant (TenantID == "*").
-	if session.TenantID != "*" && tenantID != session.TenantID {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "cannot issue token for a different tenant",
-		})
+	tenantID, tac, err := authorizeSessionToken(session, req)
+	if err != nil {
+		respondTokenError(c, err)
 		return
 	}
 
-	tac := TAC(req.TAC)
-	if tac == "" {
-		tac = session.MaxTAC
-	}
-
-	// An empty MaxTAC means the session grants no permissions.
-	if session.MaxTAC == "" {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "session has no granted permissions",
-		})
-		return
-	}
-
-	// Validate requested TAC is a subset of session MaxTAC.
-	if !tac.IsSubsetOf(session.MaxTAC) {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "requested permissions exceed session maximum",
-		})
+	// After the policy, because the deletion-only exemption needs the
+	// resolved TAC.
+	if err := sessionOwnerRevoked(c.Request.Context(), deps.blacklist, session, true, tac); err != nil {
+		respondRevocation(c, deps, err)
 		return
 	}
 
 	issueToken(c, deps, session.UserID, session.UserID, req.Audience, tenantID, tac, session.ACR)
 }
 
-// handleAnonymousTokenRequest issues a token that omits the caller's
-// identity ("sub"). Despite the name, this is NOT an unauthenticated path:
-// the caller must have a valid, already-authenticated session, resolved and
-// validated exactly like handleSessionTokenRequest. "Anonymous" means "omit
-// my identity from this specific token" - e.g. for a privacy-preserving
-// trust-evaluation or engine-transport call the caller doesn't want tied to
-// their identity - not "no authentication required at all". A caller with
-// no session never reaches this function (see TokenEndpointHandler).
+// handleIdentityKindToken is the shared shape of the session-backed
+// identity kinds - the anonymous kind (the token omits "sub") and the
+// pseudonymous engine kind (the token carries a fresh per-mint pseudonym,
+// engine-parity.md §8 G3). Neither is an unauthenticated path: the caller
+// must hold a valid, already-authenticated session, resolved and validated
+// exactly like handleSessionTokenRequest's.
 //
-// tenant_id and acr are threaded through from the real session exactly as
-// handleSessionTokenRequest does: the "default" tenant gets no special
-// treatment anywhere in this file, it is just whichever tenant the caller's
-// own session happens to belong to. tac is additionally capped to read-only
-// regardless of the session's own MaxTAC - the point of this path is a
-// narrowly-scoped, identity-free token, not "everything my session can do,
-// minus my name".
+// The kind supplies its policy (the authorize function: the tenant scoping,
+// the kind's own TAC ceiling, the session's grants) and its two subjects:
+// the subject the POLICY sees (none at all for the anonymous kind; the
+// session's real subject for the pseudonymous one - the question it answers
+// is "may this authenticated user mint an engine token", which the pseudonym
+// would not carry) and the subject the MINT carries.
+//
+// The revocation check runs before the policy, with the deletion-only
+// exemption off and no TAC: a revoked owner gets no identity-kind token at
+// all - the anonymous kind's missing "sub" would bypass the user revocation,
+// and the pseudonymous kind's fresh sub would name nobody the revocation
+// lists.
+func handleIdentityKindToken(
+	c *gin.Context,
+	store SessionStore,
+	deps *tokenDeps,
+	sessionID string,
+	req *TokenRequest,
+	authorize func(*Session, *TokenRequest) (string, TAC, error),
+	subs func(*Session) (policy, minted string),
+) {
+	session, err := store.Get(c.Request.Context(), sessionID)
+	if err != nil || session == nil || !session.IsValid() {
+		respondTokenError(c, errInvalidSession)
+		return
+	}
+	if err := sessionOwnerRevoked(c.Request.Context(), deps.blacklist, session, false, ""); err != nil {
+		respondRevocation(c, deps, err)
+		return
+	}
+
+	tenantID, tac, err := authorize(session, req)
+	if err != nil {
+		respondTokenError(c, err)
+		return
+	}
+
+	policySub, mintedSub := subs(session)
+	issueToken(c, deps, policySub, mintedSub, req.Audience, tenantID, tac, session.ACR)
+}
+
+// handleAnonymousTokenRequest issues a token that omits the caller's
+// identity ("sub"): a privacy-preserving, narrowly-scoped, identity-free
+// token - tac capped to read-only regardless of the session's own MaxTAC -
+// not "everything my session can do, minus my name". The policy sees no
+// subject at all; tenant_id and acr thread through from the real session
+// exactly as handleSessionTokenRequest's, the "default" tenant getting no
+// special treatment anywhere in this file.
 func handleAnonymousTokenRequest(
 	c *gin.Context,
 	store SessionStore,
@@ -218,87 +295,25 @@ func handleAnonymousTokenRequest(
 	sessionID string,
 	req *TokenRequest,
 ) {
-	session, err := store.Get(c.Request.Context(), sessionID)
-	if err != nil || session == nil || !session.IsValid() {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
-		return
-	}
-
-	// ACR proves this session came from a real authentication event. Every
-	// login flow sets it, so this should be unreachable in practice, but
-	// fail closed rather than mint a token with no authentication context
-	// behind it at all if a session somehow lacks one.
-	if session.ACR == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "session has no authentication context"})
-		return
-	}
-
-	tenantID := req.TenantID
-	if tenantID == "" {
-		tenantID = session.TenantID
-	}
-
-	// Enforce tenant scoping: identical to handleSessionTokenRequest - a
-	// session-backed token (identity-free or not) cannot target a different
-	// tenant unless the session itself is cross-tenant (TenantID == "*").
-	if session.TenantID != "*" && tenantID != session.TenantID {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "cannot issue token for a different tenant",
-		})
-		return
-	}
-
-	tac := TAC(req.TAC)
-	if tac == "" {
-		tac = TAC("r") // anonymous tokens default to read-only
-	}
-
-	// Anonymous tokens are capped to read-only regardless of what the
-	// session's own MaxTAC allows.
-	if !tac.IsSubsetOf(TAC("rl")) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "anonymous tokens are read-only"})
-		return
-	}
-
-	// An empty MaxTAC means the session grants no permissions at all.
-	if session.MaxTAC == "" {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "session has no granted permissions",
-		})
-		return
-	}
-
-	// Validate requested TAC is a subset of session MaxTAC (in addition to
-	// the read-only cap above - a session with only "w" granted, for
-	// instance, still can't be used to mint even a read-only token).
-	if !tac.IsSubsetOf(session.MaxTAC) {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "requested permissions exceed session maximum",
-		})
-		return
-	}
-
-	issueToken(c, deps, "", "", req.Audience, tenantID, tac, session.ACR)
+	handleIdentityKindToken(c, store, deps, sessionID, req,
+		authorizeAnonymousToken,
+		func(*Session) (string, string) { return "", "" },
+	)
 }
 
 // handlePseudonymousTokenRequest issues the engine-transport token kind
-// (engine-parity.md §8 G3): the caller's real, authenticated session
-// stands behind the mint exactly as the session path's does, but the
-// token's `sub` is a fresh random pseudonym - per mint, so it identifies
-// nothing and cannot be correlated across mints. The privacy point: the
-// remote engine consumes this kind and attributes its traffic to the
-// TENANT, never to a person (its session store, its logs, its KV flow
-// registry all key the tenant's pseudonym, which rotates with the
+// (engine-parity.md §8 G3): the caller's real, authenticated session stands
+// behind the mint, but the token's `sub` is a fresh random pseudonym - per
+// mint, so it identifies nothing and cannot be correlated across mints. The
+// privacy point: the remote engine consumes this kind and attributes its
+// traffic to the TENANT, never to a person (its session store, its logs, its
+// KV flow registry all key the tenant's pseudonym, which rotates with the
 // token's TTL).
 //
-// The token is engine-shaped: `tac` defaults to and is capped at "ri" -
-// the two flow gates the WMP engine enforces (read for OID4VCI's
-// presentations... rather: read for OID4VP sharing an existing
-// credential, insert for OID4VCI receiving a new one). Tenant claimed
-// as today (the session's own, unless the session is cross-tenant).
-// The policy sees the session's REAL subject - the question it answers
-// is "may this authenticated user mint an engine token", which the
-// pseudonym in the answer would not carry.
+// The token is engine-shaped: `tac` defaults to and is capped at "ri" - the
+// two flow gates the WMP engine enforces (read for OID4VP sharing an
+// existing credential, insert for OID4VCI receiving a new one); the tenant
+// claimed as today.
 func handlePseudonymousTokenRequest(
 	c *gin.Context,
 	store SessionStore,
@@ -306,65 +321,14 @@ func handlePseudonymousTokenRequest(
 	sessionID string,
 	req *TokenRequest,
 ) {
-	session, err := store.Get(c.Request.Context(), sessionID)
-	if err != nil || session == nil || !session.IsValid() {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired session"})
-		return
-	}
-
-	if session.ACR == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "session has no authentication context"})
-		return
-	}
-
-	tenantID := req.TenantID
-	if tenantID == "" {
-		tenantID = session.TenantID
-	}
-
-	// Enforce tenant scoping: identical to the other session-backed
-	// paths - the pseudonym token cannot target a different tenant than
-	// the session that minted it.
-	if session.TenantID != "*" && tenantID != session.TenantID {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "cannot issue token for a different tenant",
-		})
-		return
-	}
-
-	tac := TAC(req.TAC)
-	if tac == "" {
-		tac = TAC("ri") // the engine's own two flow gates
-	}
-
-	// The pseudonymous kind is capped to the engine's needs, regardless
-	// of the session's own MaxTAC: read (present) and insert (receive) -
-	// not "everything my session can do, minus my name".
-	if !tac.IsSubsetOf(TAC("ri")) {
-		c.JSON(http.StatusForbidden, gin.H{"error": "pseudonymous tokens are engine-scoped (read, insert)"})
-		return
-	}
-
-	if session.MaxTAC == "" {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "session has no granted permissions",
-		})
-		return
-	}
-
-	if !tac.IsSubsetOf(session.MaxTAC) {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "requested permissions exceed session maximum",
-		})
-		return
-	}
-
-	// The minted subject: a fresh pseudonym per mint. It is NOT the
-	// session's user id - the engine-mode deployments key the tenant,
-	// never a person.
-	pseudonym := "p-" + uuid.New().String()
-
-	issueToken(c, deps, session.UserID, pseudonym, req.Audience, tenantID, tac, session.ACR)
+	handleIdentityKindToken(c, store, deps, sessionID, req,
+		authorizePseudonymousToken,
+		// The policy sees the session's REAL subject; the mint carries a
+		// fresh pseudonym - NOT the user id.
+		func(session *Session) (string, string) {
+			return session.UserID, "p-" + uuid.New().String()
+		},
+	)
 }
 
 // handleDelegationTokenRequest issues a downscoped token from a Bearer token
@@ -376,7 +340,7 @@ func handleDelegationTokenRequest(
 ) {
 	bearerToken := extractBearerToken(c)
 	if bearerToken == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
+		respondTokenError(c, errNoDelegateAuth)
 		return
 	}
 
@@ -390,77 +354,71 @@ func handleDelegationTokenRequest(
 	// behavior for every other caller.
 	parentClaims, err := deps.issuer.ParseAndVerify(bearerToken, deps.audiences)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid delegating token"})
+		respondTokenError(c, errInvalidParent)
 		return
 	}
 
-	// A revoked parent token must not be usable to mint a fresh, differently
-	// -jti'd token - otherwise logout/account deletion (#382/#383) would not
-	// actually stop re-delegation. Checks both the parent's own jti
-	// (individually blacklisted, e.g. by AS logout - see LogoutHandler) and
-	// its subject in bulk (account deletion - see
-	// service.TokenBlacklist.RevokeUser): checking jti alone missed a
-	// different, not-yet-blacklisted delegation-capable token for the same
-	// deleted user still being exchangeable here (#391 review). Only fails
-	// closed when a blacklist is actually wired (deps.blacklist != nil);
-	// ASModule always wires one from NewBackendProvider, so this is only
-	// ever nil in tests that don't care.
-	if deps.blacklist != nil {
-		ctx := c.Request.Context()
-		if parentClaims.ID != "" && deps.blacklist.IsBlacklisted(ctx, parentClaims.ID) {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token has been revoked"})
-			return
-		}
-		if deps.blacklist.IsUserRevoked(ctx, parentClaims.Subject) {
-			c.JSON(http.StatusUnauthorized, gin.H{"error": "delegating token's user has been revoked"})
-			return
-		}
-	}
-
-	// Delegating token must have the 'k' permission.
-	if !parentClaims.TAC.Has(TACDelegate) {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "delegating token lacks delegate (k) permission",
-		})
+	if err := parentTokenRevoked(c.Request.Context(), deps.blacklist, parentClaims); err != nil {
+		respondRevocation(c, deps, err)
 		return
 	}
 
-	// Derive tenant — delegation must match or narrow.
-	tenantID := req.TenantID
-	if tenantID == "" {
-		tenantID = parentClaims.TenantID
-	}
-	// Delegated token must have the same tenant_id, unless the parent has
-	// cross-tenant scope ("*"), in which case it may be narrowed to a specific tenant.
-	if parentClaims.TenantID != "*" && tenantID != parentClaims.TenantID {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "delegation cannot change tenant",
-		})
-		return
-	}
-
-	// Derive TAC — must be a subset of parent, and 'k' is stripped by default
-	// unless explicitly requested (re-delegation).
-	tac := TAC(req.TAC)
-	if tac == "" {
-		// Default: same as parent minus 'k'.
-		tac = parentClaims.TAC.Without(TACDelegate)
-	}
-
-	// Validate downscoping: delegated TAC must be subset of parent TAC.
-	// This is the complete security boundary for delegation - a delegated
-	// token can never exceed what its own parent already had, regardless
-	// of what SPOCP evaluation below would otherwise allow - see
-	// rules/delegation.rules for why SPOCP itself doesn't independently
-	// restrict this.
-	if !tac.IsSubsetOf(parentClaims.TAC) {
-		c.JSON(http.StatusForbidden, gin.H{
-			"error": "delegated permissions exceed parent token",
-		})
+	tenantID, tac, err := authorizeDelegationToken(parentClaims, req)
+	if err != nil {
+		respondTokenError(c, err)
 		return
 	}
 
 	issueToken(c, deps, parentClaims.Subject, parentClaims.Subject, req.Audience, tenantID, tac, parentClaims.ACR)
+}
+
+// parentTokenRevoked returns the refusal when the delegating token may no
+// longer be exchanged, or nil when it may. A revoked parent must not be
+// usable to mint a fresh, differently-jti'd token, or logout and account
+// deletion (#382/#383) would not actually stop re-delegation.
+//
+// The two checks below are independent and both are needed; see each.
+func parentTokenRevoked(ctx context.Context, bl TokenBlacklistChecker, parent *AccessTokenClaims) error {
+	if err := parentJTIRevoked(ctx, bl, parent.ID); err != nil {
+		return err
+	}
+	return parentUserRevoked(ctx, bl, parent.Subject)
+}
+
+// parentJTIRevoked refuses a delegating token whose own jti was individually
+// blacklisted, e.g. by AS logout (see LogoutHandler).
+//
+// A parent with no jti has nothing to look up and is passed to the user
+// check, which is the only thing that can still refuse it.
+func parentJTIRevoked(ctx context.Context, bl TokenBlacklistChecker, jti string) error {
+	if jti == "" {
+		return nil
+	}
+	revoked, err := bl.IsBlacklisted(ctx, jti)
+	if err != nil {
+		return err
+	}
+	if revoked {
+		return errParentRevoked
+	}
+	return nil
+}
+
+// parentUserRevoked refuses a delegating token whose subject was revoked in
+// bulk (account deletion - see service.TokenBlacklist.RevokeUser).
+//
+// It is not covered by the jti check: a different, not-yet-blacklisted
+// delegation-capable token belonging to the same deleted user was still
+// exchangeable here when only the jti was checked (#391 review).
+func parentUserRevoked(ctx context.Context, bl TokenBlacklistChecker, subject string) error {
+	revoked, err := bl.IsUserRevoked(ctx, subject)
+	if err != nil {
+		return err
+	}
+	if revoked {
+		return errParentUserGone
+	}
+	return nil
 }
 
 // issueToken is the common path for both session and delegation flows.
@@ -477,11 +435,7 @@ func issueToken(
 		return
 	}
 
-	// Build SPOCP query and evaluate. The policy sees the requester the
-	// session stands behind (policySub); the minted subject (mintSub) is
-	// what the token carries - the same value everywhere except the
-	// pseudonymous engine kind, which mints a random per-mint pseudonym
-	// while the policy still sees the real, authenticated user.
+	// Build SPOCP query and evaluate.
 	query := BuildTokenQuery(policySub, audience, tenantID, tac, acr)
 
 	allowed, err := deps.policy.Evaluate(query)
