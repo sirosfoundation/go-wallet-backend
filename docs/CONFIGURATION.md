@@ -106,7 +106,7 @@ Environment prefix: `WALLET_JWT`
 
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
-| `jwt.secret` | `WALLET_JWT_SECRET` | string | Secret is a server-side secret of at least 32 bytes. It keys the HMAC that binds the OIDC state parameter to the browser (state-binding cookie). Required. |
+| `jwt.secret` | `WALLET_JWT_SECRET` | string | Secret is a server-side secret of at least 32 bytes. It keys the HMAC that binds the OIDC state parameter to the browser and authenticates OID4VCI authorization resumption contexts using a domain-separated key. Required; share across engine replicas. |
 | `jwt.secret_path` | `WALLET_JWT_SECRET_PATH` | string | SecretPath is the path to a file containing the secret (alternative to Secret). |
 | `jwt.expiry_hours` | `WALLET_JWT_EXPIRY_HOURS` | integer | REMOVED and ignored (startup warning). AS token lifetimes are as.default_token_ttl / as.audience_ttls.  Deprecated: no effect. |
 | `jwt.refresh_days` | `WALLET_JWT_REFRESH_DAYS` | integer | REMOVED and ignored (startup warning). AS sessions live as.session_ttl.  Deprecated: no effect. |
@@ -255,6 +255,7 @@ Environment prefix: `WALLET_SECURITY`
 
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
+| `security.require_authorization_response_issuer` | `WALLET_SECURITY_REQUIRE_AUTHORIZATION_RESPONSE_ISSUER` | boolean | RequireAuthorizationResponseIssuer enforces RFC 9207 issuer presence for OID4VCI authorization responses even when AS metadata omits support. Enable for FAPI deployments. Default: false. Advertised support always requires iss; any supplied issuer must match the original AS exactly. |
 | `security.auth_rate_limit.enabled` | `WALLET_SECURITY_AUTH_RATE_LIMIT_ENABLED` | boolean | Enabled controls whether rate limiting is active |
 | `security.auth_rate_limit.max_attempts` | `WALLET_SECURITY_AUTH_RATE_LIMIT_MAX_ATTEMPTS` | integer | MaxAttempts is the maximum number of login/registration attempts per window Default: 10 |
 | `security.auth_rate_limit.window_seconds` | `WALLET_SECURITY_AUTH_RATE_LIMIT_WINDOW_SECONDS` | integer | WindowSeconds is the time window for rate limiting (in seconds) Default: 60 (1 minute) |
