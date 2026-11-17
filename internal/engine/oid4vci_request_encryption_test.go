@@ -195,7 +195,9 @@ func TestRequestCredential_EncryptedRequestRoundTrip(t *testing.T) {
 		CredentialRequestEncryption:  &CredentialRequestEncryptionConfig{JWKS: jwks, EncValuesSupported: []string{"A256GCM"}},
 	}
 	cfg := &CredentialConfig{Format: "vc+sd-jwt", CredentialMetadata: json.RawMessage(seedMetadata)}
-	require.NoError(t, h.issueCredential(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, "cfg", cfg, nil, ""))
+	md.CredentialConfigurationsSupported = CredentialConfigurations{"cfg": *cfg}
+	err := h.issueCredentials(context.Background(), md, &TokenResponse{AccessToken: "t", TokenType: "Bearer"}, []string{"cfg"}, nil, "")
+	require.NoError(t, err)
 	assert.Equal(t, "application/jwt", ct)
 	assert.NotEmpty(t, kid)
 	assert.Equal(t, "cfg", got["credential_configuration_id"])

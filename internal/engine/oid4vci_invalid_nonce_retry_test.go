@@ -59,7 +59,14 @@ func newNonceIssuer(t *testing.T, credReplies ...string) *nonceIssuer {
 }
 
 func (ni *nonceIssuer) metadata(withNonceEndpoint bool) *IssuerMetadata {
-	m := &IssuerMetadata{CredentialIssuer: ni.srv.URL, CredentialEndpoint: ni.srv.URL + "/credential"}
+	m := &IssuerMetadata{
+		CredentialIssuer:   ni.srv.URL,
+		CredentialEndpoint: ni.srv.URL + "/credential",
+		// The selected configuration the issuance loop looks up (#549).
+		CredentialConfigurationsSupported: CredentialConfigurations{"cfg": CredentialConfig{
+			Format: "vc+sd-jwt", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}},
+		}},
+	}
 	if withNonceEndpoint {
 		m.NonceEndpoint = ni.srv.URL + "/nonce"
 	}
@@ -93,10 +100,9 @@ func runNonceRetry(t *testing.T, withEndpoint bool, replies ...string) (*nonceIs
 	fc := &fakeClient{t: t}
 	h, logs, cleanup := newBlindHandler(t, fc, ni.srv.Client())
 	defer cleanup()
-	cfg := &CredentialConfig{Format: "vc+sd-jwt", ProofTypesSupported: map[string]interface{}{"jwt": map[string]interface{}{}}}
 	tok := tokenBearer()
 	tok.CNonce = "token-nonce"
-	err := h.issueCredential(context.Background(), ni.metadata(withEndpoint), tok, "cfg", cfg, nil, "")
+	err := h.issueCredentials(context.Background(), ni.metadata(withEndpoint), tok, []string{"cfg"}, nil, "")
 	return ni, fc, logDump(logs), err
 }
 

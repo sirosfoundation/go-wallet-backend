@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2960,7 +2961,7 @@ func TestServedDocumentMissingEndpointsDoesNotGuess(t *testing.T) {
 		})
 		h, cleanup := testOID4VCIHandler(t, srv.Client())
 		defer cleanup()
-		_, err := h.handleAuthorizationCode(context.Background(), &CredentialOffer{}, &IssuerMetadata{CredentialIssuer: srv.URL}, &CredentialConfig{})
+		_, err := h.handleAuthorizationCode(context.Background(), &CredentialOffer{}, &IssuerMetadata{CredentialIssuer: srv.URL}, []string{})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "no authorization_endpoint")
 	})
@@ -2975,7 +2976,7 @@ func TestServedDocumentMissingEndpointsDoesNotGuess(t *testing.T) {
 		})
 		h, cleanup := testOID4VCIHandler(t, srv.Client())
 		defer cleanup()
-		_, err := h.handleAuthorizationCode(context.Background(), &CredentialOffer{}, &IssuerMetadata{CredentialIssuer: srv.URL}, &CredentialConfig{})
+		_, err := h.handleAuthorizationCode(context.Background(), &CredentialOffer{}, &IssuerMetadata{CredentialIssuer: srv.URL}, []string{})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "no token_endpoint")
 		assert.NotContains(t, *paths, "/token")
@@ -3188,9 +3189,8 @@ func TestHandleAuthorization_NoGrantsFallsThrough(t *testing.T) {
 	metadata := &IssuerMetadata{
 		CredentialIssuer: "https://issuer.example.com",
 	}
-	config := &CredentialConfig{}
 
-	_, err := h.handleAuthorization(context.Background(), offer, metadata, config)
+	_, err := h.handleAuthorization(context.Background(), offer, metadata, []string{"cfg"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no supported grant type")
 }
@@ -3207,9 +3207,7 @@ func TestHandleAuthorization_NilGrantsFallsThrough(t *testing.T) {
 	metadata := &IssuerMetadata{
 		CredentialIssuer: "https://issuer.example.com",
 	}
-	config := &CredentialConfig{}
-
-	_, err := h.handleAuthorization(context.Background(), offer, metadata, config)
+	_, err := h.handleAuthorization(context.Background(), offer, metadata, []string{"cfg"})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "no supported grant type")
 }
@@ -3233,10 +3231,8 @@ func TestHandleAuthorization_PreAuthGrantSelected(t *testing.T) {
 		CredentialIssuer: "https://issuer.example.com",
 		TokenEndpoint:    "https://issuer.example.com/token",
 	}
-	config := &CredentialConfig{}
-
 	// Will fail at token exchange (network error), but proves the pre-auth path was taken
-	_, err := h.handleAuthorization(context.Background(), offer, metadata, config)
+	_, err := h.handleAuthorization(context.Background(), offer, metadata, []string{"cfg"})
 	require.Error(t, err)
 	// Should NOT be "no supported grant type" — the pre-auth path was dispatched
 	assert.NotContains(t, err.Error(), "no supported grant type")
@@ -4023,4 +4019,113 @@ func TestIssuerMetadata_NullCredentialConfigurationsClearsReusedValue(t *testing
 
 	require.NoError(t, json.Unmarshal([]byte(`{"credential_configurations_supported":null}`), &m))
 	assert.Empty(t, m.CredentialConfigurationsSupported)
+}
+
+// --- #549: the multi-credential issuance set ---
+
+// selectAllMetadata builds a two-configuration metadata (both "vc+sd-jwt",
+// distinct scopes) for the set tests.
+func selectAllMetadata(srvURL string) *IssuerMetadata {
+	return &IssuerMetadata{
+		CredentialIssuer:   srvURL,
+		CredentialEndpoint: srvURL + "/credential",
+		CredentialConfigurationsSupported: CredentialConfigurations{
+			"pid": CredentialConfig{Format: "vc+sd-jwt", Scope: "pid.scope", ProofTypesSupported: map[string]interface{}{}},
+			"mdl": CredentialConfig{Format: "vc+sd-jwt", Scope: "mdl.scope", ProofTypesSupported: map[string]interface{}{}},
+		},
+	}
+}
+
+// The issue_all policy (the default): every offered configuration issues,
+// with NO selection ask at all.
+func TestSelectCredentialConfigurations_IssueAllByDefault(t *testing.T) {
+	h, _, cleanup := captureHandler(t)
+	defer cleanup()
+	h.Config = &config.Config{Server: config.ServerConfig{EngineIssuanceSelectionPolicy: ""}}
+	offer := &CredentialOffer{CredentialConfigurationIDs: []string{"pid", "mdl"}}
+	md := selectAllMetadata("https://issuer.example")
+
+	ids, err := h.selectCredentialConfigurations(context.Background(), offer, md)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"pid", "mdl"}, ids, "every offered configuration, in the offer's order")
+}
+
+// Single configuration auto-selects under either policy: no ask.
+func TestSelectCredentialConfigurations_AutoSelectWhenOne(t *testing.T) {
+	for _, policy := range []string{"", "issue_all", "user_selects"} {
+		t.Run(policy, func(t *testing.T) {
+			h, _, cleanup := captureHandler(t)
+			defer cleanup()
+			h.Config = &config.Config{Server: config.ServerConfig{EngineIssuanceSelectionPolicy: policy}}
+			offer := &CredentialOffer{CredentialConfigurationIDs: []string{"pid"}}
+			md := selectAllMetadata("https://issuer.example")
+			ids, err := h.selectCredentialConfigurations(context.Background(), offer, md)
+			require.NoError(t, err)
+			assert.Equal(t, []string{"pid"}, ids)
+		})
+	}
+}
+
+// The issuance loop: two selected configurations issue sequentially with one
+// token; the completion carries both results.
+func TestIssueCredentials_LoopIssuesEverySelectedConfiguration(t *testing.T) {
+	st := newIssuerStub(t, `{"credential":"c-one"}`)
+	fc := &fakeClient{t: t}
+	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
+	defer cleanup()
+	md := selectAllMetadata(st.srv.URL)
+	err := h.issueCredentials(context.Background(), md, tokenBearer(), []string{"pid", "mdl"}, nil, "")
+	require.NoError(t, err)
+	require.Len(t, st.requests, 2, "one credential request per selected configuration")
+	var creds []CredentialResult
+	require.NoError(t, json.Unmarshal(completion(t, fc)["credentials"], &creds))
+	require.Len(t, creds, 2, "the completion carries every result")
+}
+
+// Partial failure: one configuration's failure does NOT abort the others -
+// the flow completes with the successes, the failure rides the flow data.
+func TestIssueCredentials_PartialFailureCompletes(t *testing.T) {
+	st := newIssuerStub(t, `{"credential":"c-ok"}`)
+	var hits int32
+	inner := st.srv.Config.Handler
+	st.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 2 {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":"server_error"}`))
+			return
+		}
+		inner.ServeHTTP(w, r)
+	})
+	fc := &fakeClient{t: t}
+	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
+	defer cleanup()
+	md := selectAllMetadata(st.srv.URL)
+	err := h.issueCredentials(context.Background(), md, tokenBearer(), []string{"pid", "mdl"}, nil, "")
+	require.NoError(t, err, "one or more successes complete the flow")
+	var creds []CredentialResult
+	require.NoError(t, json.Unmarshal(completion(t, fc)["credentials"], &creds))
+	require.Len(t, creds, 1, "the successful configuration's result")
+	failures, ok := h.Flow.Data["issuance_failures"].(map[string]string)
+	require.True(t, ok, "the failures ride the flow data")
+	assert.Len(t, failures, 1)
+}
+
+// Zero successes: the flow fails with the per-configuration error.
+func TestIssueCredentials_ZeroSuccessFails(t *testing.T) {
+	st := newIssuerStub(t, `{"credential":"c-ok"}`)
+	inner := st.srv.Config.Handler
+	st.srv.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"error":"server_error"}`))
+		_ = inner // every request fails
+	})
+	fc := &fakeClient{t: t}
+	h, _, cleanup := newBlindHandler(t, fc, st.srv.Client())
+	defer cleanup()
+	md := selectAllMetadata(st.srv.URL)
+	err := h.issueCredentials(context.Background(), md, tokenBearer(), []string{"pid", "mdl"}, nil, "")
+	require.Error(t, err)
+	assert.NotContains(t, completionTypes(fc), "flow_complete", "no completion on zero successes")
 }
