@@ -346,8 +346,16 @@ Server → Client:
   "type": "flow_progress",
   "flow_id": "<uuid>",
   "step": "authorization_required",
-  "authorization_url": "https://auth.example.com/authorize?...",
-  "expected_redirect_uri": "https://wallet.example.com/callback"
+  "payload": {
+    "authorization_url": "https://auth.example.com/authorize?...",
+    "expected_redirect_uri": "https://wallet.example.com/callback",
+    "state": "xyz789",
+    "code_verifier": "<PKCE verifier>",
+    "credential_offer": { "credential_issuer": "https://issuer.example.com" },
+    "authorization_context": "<opaque signed transaction>",
+    "expected_issuer": "https://auth.example.com",
+    "require_iss": true
+  }
 }
 ```
 
@@ -359,10 +367,57 @@ Client → Server:
   "type": "flow_action",
   "flow_id": "<uuid>",
   "action": "authorization_complete",
-  "code": "abc123",
-  "state": "xyz789"
+  "payload": {
+    "code": "abc123",
+    "state": "xyz789",
+    "iss": "https://auth.example.com"
+  }
 }
 ```
+
+Clients MUST preserve the authorization response's `iss` parameter exactly after
+URL decoding, without URL normalization. Before forwarding a callback, reject
+duplicate `iss` parameters (including two identical values); do not select one
+using a first-value/last-value accessor. The browser callback parser lives outside
+this repository and must implement this check. The backend additionally rejects
+duplicate JSON `iss` fields, null/non-string values, empty values, and mismatches.
+Clients must not synthesize `iss` from `expected_issuer` when it is absent.
+
+The expected issuer is the selected authorization server identifier, not
+necessarily the credential issuer. When AS metadata advertises
+`authorization_response_iss_parameter_supported: true`, missing `iss` fails
+authorization before any token request. For FAPI deployments, set
+`security.require_authorization_response_issuer: true` (environment:
+`WALLET_SECURITY_REQUIRE_AUTHORIZATION_RESPONSE_ISSUER=true`) to require it even
+if metadata omits or disables that advertisement. The default is false, preserving
+non-FAPI issuers that do not support RFC 9207; a supplied issuer is always checked.
+
+For a same-tab redirect, save `authorization_context`, the offer, and the PKCE
+verifier before navigating. On return, start a new OID4VCI flow:
+
+```json
+{
+  "type": "flow_start",
+  "flow_id": "<new uuid>",
+  "protocol": "oid4vci",
+  "offer": "<saved credential offer as JSON>",
+  "auth_code": "abc123",
+  "state": "xyz789",
+  "iss": "https://auth.example.com",
+  "code_verifier": "<saved PKCE verifier>",
+  "redirect_uri": "https://wallet.example.com/callback",
+  "authorization_context": "<saved opaque signed transaction>"
+}
+```
+
+`state` and `iss` above come from the callback, not from the saved request.
+Resumption now requires the signed context and matching state; older clients
+must be updated. The context expires after five minutes and binds the original
+authorization server, credential issuer, token endpoint, client ID, redirect URI,
+PKCE challenge/policy, issuer requirement, user, and tenant. Rediscovery cannot
+relax the original checks or change the token destination. Resume on another
+replica is supported when its `jwt.secret` matches; secret rotation invalidates
+outstanding contexts. This context is not an authentication/bearer token.
 
 For pre-authorized flows:
 

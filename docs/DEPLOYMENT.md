@@ -238,6 +238,24 @@ Apply:
 kubectl apply -f k8s/deployment.yaml
 ```
 
+### Rolling Upgrades and the User Document Version
+
+User documents carry a `version` field that the backend uses for optimistic
+concurrency (`UserStore.Modify`): a write is applied only if the document still
+has the version that was read. Releases before this one do not know the field:
+an old replica writes the whole user document and thereby drops `version`
+(a document without `version` counts as version 0), and it writes from a
+snapshot without any version check. While old and new replicas both serve
+traffic, an old replica's write can therefore land between a new replica's read
+and its conditional write without being detected, and the new replica then
+overwrites it.
+
+For the upgrade, run a single replica or drain the old replicas before the new
+ones take traffic (scale to one, upgrade, scale back up). With MongoDB no
+migration step is needed: documents without `version` are upgraded on their
+next write. Once every replica runs this release, normal rolling updates are
+safe again.
+
 ### Rolling Upgrades and the Redis Session Store
 
 Earlier releases kept the per-user session pointer at `<prefix>user:<userID>`.
@@ -473,7 +491,10 @@ Operator checklist when upgrading:
   `as.legacy.sunset_date`, `jwt.expiry_hours` and `jwt.refresh_days` are accepted but
   ignored, with a startup warning each; delete them.
 - `jwt.secret` is still required (>= 32 bytes): it keys the OIDC state-binding
-  cookie; it signs no tokens. `jwt.issuer` is the fallback for `as.issuer`.
+  cookie and authenticates OID4VCI authorization resumption contexts using a
+  domain-separated key. Use the same secret across engine replicas; rotation
+  invalidates outstanding contexts. It does not sign authentication tokens.
+  `jwt.issuer` is the fallback for `as.issuer`.
 - Set `as.external_url` in every process that validates AS tokens, including the
   `backend` role: the validator fetches the AS JWKS from it, and config
   validation fails without it. The shipped sample configs set it.

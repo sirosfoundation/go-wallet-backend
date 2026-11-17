@@ -9,6 +9,7 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 )
@@ -68,7 +69,6 @@ func TestUserService_Register(t *testing.T) {
 		DisplayName: "Test User",
 		WalletType:  domain.WalletTypeDB,
 		Keys:        []byte("key-data"),
-		PrivateData: []byte("private-data"),
 	}
 
 	user, err := service.Register(ctx, req)
@@ -195,20 +195,20 @@ func TestUserService_GetPrivateData(t *testing.T) {
 	logger := testLogger()
 	service := NewUserService(store, cfg, logger)
 
-	// Register user with private data
+	// Register user, then give it a credential and private data for it
 	username := "privatedata"
-	privateData := []byte(`{"key": "value"}`)
 	req := &domain.RegisterRequest{
 		Username:    &username,
 		DisplayName: "Private Data User",
 		WalletType:  domain.WalletTypeDB,
-		PrivateData: privateData,
 	}
 
 	user, err := service.Register(ctx, req)
 	if err != nil {
 		t.Fatalf("Register() error = %v", err)
 	}
+	privateData := testPrivateDataContainer(testCredID("a"))
+	setCredentialsAndPrivateData(t, store, user.UUID, privateData, domain.WebauthnCredential{ID: testCredID("a")})
 
 	// Get private data
 	data, etag, err := service.GetPrivateData(ctx, user.UUID)
@@ -238,13 +238,13 @@ func TestUserService_UpdatePrivateData(t *testing.T) {
 		Username:    &username,
 		DisplayName: "Update Private User",
 		WalletType:  domain.WalletTypeDB,
-		PrivateData: []byte("initial"),
 	}
 
 	user, err := service.Register(ctx, req)
 	if err != nil {
 		t.Fatalf("Register() error = %v", err)
 	}
+	setCredentialsAndPrivateData(t, store, user.UUID, testPrivateDataContainer(testCredID("a")), domain.WebauthnCredential{ID: testCredID("a")})
 
 	// Get initial ETag
 	_, initialEtag, err := service.GetPrivateData(ctx, user.UUID)
@@ -253,7 +253,7 @@ func TestUserService_UpdatePrivateData(t *testing.T) {
 	}
 
 	// Update private data
-	newData := []byte("updated")
+	newData := testPrivateDataContainer(testCredID("a"), testCredID("z"))
 	newEtag, err := service.UpdatePrivateData(ctx, user.UUID, newData, initialEtag)
 	if err != nil {
 		t.Fatalf("UpdatePrivateData() error = %v", err)
@@ -269,7 +269,7 @@ func TestUserService_UpdatePrivateData(t *testing.T) {
 		t.Fatalf("GetPrivateData() error = %v", err)
 	}
 
-	if string(data) != "updated" {
+	if string(data) != string(newData) {
 		t.Errorf("GetPrivateData() after update = %s, want updated", data)
 	}
 }
@@ -287,16 +287,16 @@ func TestUserService_UpdatePrivateData_ETagConflict(t *testing.T) {
 		Username:    &username,
 		DisplayName: "ETag Conflict User",
 		WalletType:  domain.WalletTypeDB,
-		PrivateData: []byte("initial"),
 	}
 
 	user, err := service.Register(ctx, req)
 	if err != nil {
 		t.Fatalf("Register() error = %v", err)
 	}
+	setCredentialsAndPrivateData(t, store, user.UUID, testPrivateDataContainer(testCredID("a")), domain.WebauthnCredential{ID: testCredID("a")})
 
 	// Try to update with wrong ETag
-	_, err = service.UpdatePrivateData(ctx, user.UUID, []byte("new"), "wrong-etag")
+	_, err = service.UpdatePrivateData(ctx, user.UUID, testPrivateDataContainer(testCredID("a")), "wrong-etag")
 	if err != ErrPrivateDataConflict {
 		t.Errorf("UpdatePrivateData() with wrong ETag should return ErrPrivateDataConflict, got %v", err)
 	}
@@ -644,42 +644,27 @@ func TestUserService_DeleteUser_CleansUpCredentialsAndPresentations(t *testing.T
 	}
 }
 
-func TestUserService_UpdateUser(t *testing.T) {
-	ctx := t.Context()
-	store := memory.NewStore()
-	cfg := testConfig()
-	logger := testLogger()
-	service := NewUserService(store, cfg, logger)
-
-	// Register user
-	username := "updateuser"
-	req := &domain.RegisterRequest{
-		Username:    &username,
-		DisplayName: "Original Name",
-		WalletType:  domain.WalletTypeDB,
+// setCredentials replaces a user's WebAuthn credentials through Modify.
+// setCredentialsAndPrivateData stores the credentials and a private-data
+// container for them in one atomic write.
+func setCredentialsAndPrivateData(t *testing.T, store storage.Store, id domain.UserID, privateData []byte, creds ...domain.WebauthnCredential) {
+	t.Helper()
+	if _, err := store.Users().Modify(context.Background(), id, func(u *domain.User) error {
+		u.WebauthnCredentials = creds
+		u.UpdatePrivateData(privateData)
+		return nil
+	}); err != nil {
+		t.Fatalf("Modify() error = %v", err)
 	}
+}
 
-	user, err := service.Register(ctx, req)
-	if err != nil {
-		t.Fatalf("Register() error = %v", err)
-	}
-
-	// Update user
-	newName := "Updated Name"
-	user.DisplayName = &newName
-	err = service.UpdateUser(ctx, user)
-	if err != nil {
-		t.Fatalf("UpdateUser() error = %v", err)
-	}
-
-	// Verify update
-	updated, err := service.GetUserByID(ctx, user.UUID)
-	if err != nil {
-		t.Fatalf("GetUserByID() error = %v", err)
-	}
-
-	if updated.DisplayName == nil || *updated.DisplayName != newName {
-		t.Errorf("UpdateUser() DisplayName = %v, want %s", updated.DisplayName, newName)
+func setCredentials(t *testing.T, store storage.Store, id domain.UserID, creds ...domain.WebauthnCredential) {
+	t.Helper()
+	if _, err := store.Users().Modify(context.Background(), id, func(u *domain.User) error {
+		u.WebauthnCredentials = creds
+		return nil
+	}); err != nil {
+		t.Fatalf("Modify() error = %v", err)
 	}
 }
 
@@ -704,16 +689,13 @@ func TestUserService_DeleteWebAuthnCredential(t *testing.T) {
 	}
 
 	// Add multiple WebAuthn credentials to the user
-	user.WebauthnCredentials = []domain.WebauthnCredential{
-		{ID: "cred1", PublicKey: []byte("key1")},
-		{ID: "cred2", PublicKey: []byte("key2")},
-	}
-	if err := service.UpdateUser(ctx, user); err != nil {
-		t.Fatalf("UpdateUser() error = %v", err)
-	}
+	setCredentials(t, store, user.UUID,
+		domain.WebauthnCredential{ID: testCredID("1"), PublicKey: []byte("key1")},
+		domain.WebauthnCredential{ID: testCredID("2"), PublicKey: []byte("key2")},
+	)
 
 	t.Run("deletes credential successfully", func(t *testing.T) {
-		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, "cred1", []byte("{}"), "")
+		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, testCredID("1"), testPrivateDataContainer(testCredID("2")), "")
 		if err != nil {
 			t.Errorf("DeleteWebAuthnCredential() error = %v", err)
 		}
@@ -726,7 +708,7 @@ func TestUserService_DeleteWebAuthnCredential(t *testing.T) {
 	})
 
 	t.Run("fails on last credential", func(t *testing.T) {
-		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, "cred2", []byte("{}"), "")
+		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, testCredID("2"), testPrivateDataContainer(testCredID("2")), "")
 		if err != ErrLastWebAuthnCredential {
 			t.Errorf("Expected ErrLastWebAuthnCredential, got %v", err)
 		}
@@ -735,12 +717,11 @@ func TestUserService_DeleteWebAuthnCredential(t *testing.T) {
 	t.Run("fails on non-existent credential", func(t *testing.T) {
 		// Add another credential first
 		u, _ := service.GetUserByID(ctx, user.UUID)
-		u.WebauthnCredentials = append(u.WebauthnCredentials, domain.WebauthnCredential{
-			ID: "cred3", PublicKey: []byte("key3"),
-		})
-		_ = service.UpdateUser(ctx, u)
+		setCredentials(t, store, user.UUID, append(u.WebauthnCredentials, domain.WebauthnCredential{
+			ID: testCredID("3"), PublicKey: []byte("key3"),
+		})...)
 
-		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, "nonexistent", []byte("{}"), "")
+		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, "nonexistent", testPrivateDataContainer(testCredID("2")), "")
 		if err == nil {
 			t.Error("Expected error for non-existent credential")
 		}
@@ -748,7 +729,7 @@ func TestUserService_DeleteWebAuthnCredential(t *testing.T) {
 
 	t.Run("fails on ETag mismatch", func(t *testing.T) {
 		u, _ := service.GetUserByID(ctx, user.UUID)
-		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, "cred2", []byte("{}"), "wrong-etag")
+		_, err := service.DeleteWebAuthnCredential(ctx, user.UUID, testCredID("2"), testPrivateDataContainer(testCredID("2")), "wrong-etag")
 		if err != ErrPrivateDataConflict {
 			t.Errorf("Expected ErrPrivateDataConflict, got %v", err)
 		}
@@ -777,12 +758,7 @@ func TestUserService_RenameWebAuthnCredential(t *testing.T) {
 	}
 
 	// Add a WebAuthn credential
-	user.WebauthnCredentials = []domain.WebauthnCredential{
-		{ID: "cred1", PublicKey: []byte("key1")},
-	}
-	if err := service.UpdateUser(ctx, user); err != nil {
-		t.Fatalf("UpdateUser() error = %v", err)
-	}
+	setCredentials(t, store, user.UUID, domain.WebauthnCredential{ID: "cred1", PublicKey: []byte("key1")})
 
 	t.Run("renames credential successfully", func(t *testing.T) {
 		err := service.RenameWebAuthnCredential(ctx, user.UUID, "cred1", "My Key")

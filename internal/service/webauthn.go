@@ -805,6 +805,10 @@ func (s *WebAuthnService) FinishRegistration(ctx context.Context, req *FinishReg
 	}
 
 	if len(user.PrivateData) > 0 {
+		// Refuse before the invite is claimed or the user is created.
+		if err := validatePrivateDataOwnership(s.logger, userID, user.WebauthnCredentials, user.PrivateData); err != nil {
+			return nil, err
+		}
 		user.PrivateDataETag = domain.ComputePrivateDataETag(user.PrivateData)
 	}
 
@@ -1729,13 +1733,6 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 		}
 	}
 
-	// Check private data ETag if updating
-	if len(req.PrivateData) > 0 && ifMatch != "" {
-		if user.PrivateDataETag != ifMatch {
-			return nil, ErrPrivateDataConflict
-		}
-	}
-
 	// Add the new credential
 	nickname := req.Nickname
 	if nickname == "" {
@@ -1765,17 +1762,28 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 		CreatedAt: now,
 	}
 
-	user.WebauthnCredentials = append(user.WebauthnCredentials, newCred)
-
-	// Update private data if provided
-	if len(req.PrivateData) > 0 {
-		user.PrivateData = req.PrivateData
-		user.PrivateDataETag = domain.ComputePrivateDataETag(req.PrivateData)
-	}
-
-	user.UpdatedAt = now
-
-	if err := s.store.Users().Update(ctx, user); err != nil {
+	// Atomically append the credential and (optionally) replace private data,
+	// checking the private data ETag against the current record.
+	stored, err := s.store.Users().Modify(ctx, userID, func(u *domain.User) error {
+		if len(req.PrivateData) > 0 && ifMatch != "" && ifMatch != u.EffectivePrivateDataETag() {
+			return ErrPrivateDataConflict
+		}
+		u.WebauthnCredentials = append(u.WebauthnCredentials, newCred)
+		if len(req.PrivateData) > 0 {
+			// The container legitimately carries the new credential, so it is
+			// judged against the list that includes it, inside the callback so
+			// the check and the write see the same record.
+			if err := validatePrivateDataOwnership(s.logger, userID, u.WebauthnCredentials, req.PrivateData); err != nil {
+				return err
+			}
+			u.UpdatePrivateData(req.PrivateData)
+		}
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, ErrPrivateDataConflict) || errors.Is(err, storage.ErrNotFound) || errors.Is(err, ErrPrivateDataOwnership) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("failed to update user: %w", err)
 	}
 
@@ -1784,7 +1792,7 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 	return &FinishAddCredentialResponse{
 		// Return base64url encoded ID to match the stored format
 		CredentialID:    base64.RawURLEncoding.EncodeToString(credential.ID),
-		PrivateDataETag: user.PrivateDataETag,
+		PrivateDataETag: stored.EffectivePrivateDataETag(),
 	}, nil
 }
 

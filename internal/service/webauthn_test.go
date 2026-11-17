@@ -1394,14 +1394,15 @@ func TestFullLoginFlow_CloneWarningSurvivesReplaceOneRace(t *testing.T) {
 			// between this request's own initial snapshot and its final
 			// persist: directly latch CloneWarning=true in the backing
 			// store, bypassing this request's in-memory copy entirely.
-			u, err := baseStore.Users().GetByID(ctx, userID)
-			require.NoError(t, err)
-			for i := range u.WebauthnCredentials {
-				if u.WebauthnCredentials[i].ID == credentialIDStr {
-					u.WebauthnCredentials[i].Authenticator.CloneWarning = true
+			_, err := baseStore.Users().Modify(ctx, userID, func(u *domain.User) error {
+				for i := range u.WebauthnCredentials {
+					if u.WebauthnCredentials[i].ID == credentialIDStr {
+						u.WebauthnCredentials[i].Authenticator.CloneWarning = true
+					}
 				}
-			}
-			require.NoError(t, baseStore.Users().Update(ctx, u))
+				return nil
+			})
+			require.NoError(t, err)
 		},
 	}
 	wrapped := &storeWithUserOverride{Store: baseStore, users: raceStore}

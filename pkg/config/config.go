@@ -1235,13 +1235,16 @@ type CORSConfig struct {
 
 	// AllowedHeaders is a list of request headers allowed in cross-origin requests.
 	// An explicit list replaces the defaults, so it must include X-Token-Mode
-	// (mandatory on /auth/passkey/*) and the other headers clients send.
+	// (mandatory on /auth/passkey/*) and the other headers clients send. The
+	// private-data sync headers (If-None-Match, X-Private-Data-If-Match,
+	// X-Private-Data-If-None-Match) are always added when missing.
 	AllowedHeaders []string `yaml:"allowed_headers" envconfig:"ALLOWED_HEADERS"`
 
 	// ExposedHeaders is a list of headers that browsers are allowed to access.
 	// Default: X-Private-Data-ETag and Retry-After (sent with every 429). An
 	// explicit list replaces the defaults, so it must keep Retry-After for
-	// cross-origin clients to read it.
+	// cross-origin clients to read it. X-Private-Data-ETag is always added
+	// when missing.
 	ExposedHeaders []string `yaml:"exposed_headers" envconfig:"EXPOSED_HEADERS"`
 
 	// AllowCredentials indicates whether the request can include credentials.
@@ -1271,6 +1274,37 @@ func (c *ServerConfig) GetRPOrigins() []string {
 	return result
 }
 
+// RequiredCORSAllowedHeaders are request headers the wallet frontend needs for
+// private-data sync. They are always allowed, even when allowed_headers is
+// overridden, because omitting them silently breaks optimistic locking.
+var RequiredCORSAllowedHeaders = []string{"If-None-Match", "X-Private-Data-If-Match", "X-Private-Data-If-None-Match"}
+
+// RequiredCORSExposedHeaders are response headers the wallet frontend must be
+// able to read for private-data sync. They are always exposed, even when
+// exposed_headers is overridden.
+var RequiredCORSExposedHeaders = []string{"X-Private-Data-ETag"}
+
+// appendMissingHeaders appends each required header not already present
+// (case-insensitive, as HTTP header names are). A "*" entry does not count as
+// presence: under credentialed CORS a "*" in Access-Control-Allow-Headers or
+// Access-Control-Expose-Headers is a literal header name, not a wildcard, so
+// the required names must be listed explicitly.
+func appendMissingHeaders(headers, required []string) []string {
+	for _, r := range required {
+		found := false
+		for _, h := range headers {
+			if strings.EqualFold(strings.TrimSpace(h), r) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			headers = append(headers, r)
+		}
+	}
+	return headers
+}
+
 // SetDefaults sets default values for CORS configuration
 func (c *CORSConfig) SetDefaults() {
 	if len(c.AllowedOrigins) == 0 {
@@ -1290,6 +1324,8 @@ func (c *CORSConfig) SetDefaults() {
 	if len(c.ExposedHeaders) == 0 {
 		c.ExposedHeaders = []string{"X-Private-Data-ETag", "Retry-After"}
 	}
+	c.AllowedHeaders = appendMissingHeaders(c.AllowedHeaders, RequiredCORSAllowedHeaders)
+	c.ExposedHeaders = appendMissingHeaders(c.ExposedHeaders, RequiredCORSExposedHeaders)
 	if c.MaxAge == 0 {
 		c.MaxAge = 43200 // 12 hours
 	}
@@ -1375,11 +1411,12 @@ type LoggingConfig struct {
 }
 
 // JWTConfig contains the jwt.* settings. Session tokens are signed by the AS's asymmetric key, so only
-// Secret (keys the OIDC state-binding cookie HMAC) and Issuer (fallback for as.issuer) matter;
+// Secret (authenticates OIDC state and OID4VCI resumption) and Issuer (fallback for as.issuer) matter;
 // ExpiryHours and RefreshDays are removed no-ops (see Config.DeprecatedSettings).
 type JWTConfig struct {
 	// Secret is a server-side secret of at least 32 bytes. It keys the HMAC that binds the OIDC
-	// state parameter to the browser (state-binding cookie). Required.
+	// state parameter to the browser and authenticates OID4VCI authorization
+	// resumption contexts using a domain-separated key. Required; share across engine replicas.
 	Secret string `yaml:"secret" envconfig:"SECRET"`
 	// SecretPath is the path to a file containing the secret (alternative to Secret).
 	SecretPath string `yaml:"secret_path" envconfig:"SECRET_PATH"`
@@ -2080,6 +2117,12 @@ func (c *AuthZENProxyConfig) GetPDPURL(defaultURL string) string {
 
 // SecurityConfig contains security-related configuration
 type SecurityConfig struct {
+	// RequireAuthorizationResponseIssuer enforces RFC 9207 issuer presence for
+	// OID4VCI authorization responses even when AS metadata omits support.
+	// Enable for FAPI deployments. Default: false. Advertised support always
+	// requires iss; any supplied issuer must match the original AS exactly.
+	RequireAuthorizationResponseIssuer bool `yaml:"require_authorization_response_issuer" envconfig:"REQUIRE_AUTHORIZATION_RESPONSE_ISSUER"`
+
 	// AuthRateLimit contains rate limiting configuration for auth endpoints
 	AuthRateLimit AuthRateLimitConfig `yaml:"auth_rate_limit" envconfig:"AUTH_RATE_LIMIT"`
 
@@ -2834,7 +2877,7 @@ func (c *Config) Validate() error {
 		return err
 	}
 
-	// jwt.secret keys the OIDC state-binding cookie HMAC (see JWTConfig).
+	// jwt.secret authenticates OIDC state and OID4VCI resumption (see JWTConfig).
 	if c.JWT.Secret == "" {
 		return fmt.Errorf("jwt secret is required (it keys the OIDC state-binding cookie)")
 	}

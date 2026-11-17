@@ -6,6 +6,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -526,6 +527,24 @@ func (h *TestHarness) CreateTestUser(displayName string) *TestUser {
 	}
 }
 
+// MockCredentialID is the stored ID (base64url of the credential bytes) of the
+// credential CreateTestUserWithCredentials registers.
+var MockCredentialID = base64.RawURLEncoding.EncodeToString([]byte("mock-credential-id-1"))
+
+// PrivateDataContainer builds a privatedata container {mainKey, prfKeys[], jwe}
+// with one prfKeys entry per stored-format credential ID.
+func PrivateDataContainer(credentialIDs ...string) []byte {
+	prfKeys := make([]map[string]any, 0, len(credentialIDs))
+	for _, id := range credentialIDs {
+		prfKeys = append(prfKeys, map[string]any{"credentialId": map[string]string{"$b64u": id}})
+	}
+	b, err := json.Marshal(map[string]any{"mainKey": map[string]any{}, "prfKeys": prfKeys, "jwe": "a.b.c.d.e"})
+	if err != nil {
+		panic(err)
+	}
+	return b
+}
+
 // CreateTestUserWithCredentials creates a user with a mock WebAuthn credential.
 // Useful for testing credential management endpoints.
 func (h *TestHarness) CreateTestUserWithCredentials(displayName string) *TestUser {
@@ -537,11 +556,11 @@ func (h *TestHarness) CreateTestUserWithCredentials(displayName string) *TestUse
 	userID := domain.NewUserID()
 	now := time.Now()
 	did := fmt.Sprintf("did:key:%s", userID.String())
-	privateData := []byte(`{"testKey":"testValue"}`)
+	privateData := PrivateDataContainer(MockCredentialID)
 
 	// Create a mock credential
 	credential := domain.WebauthnCredential{
-		ID:              "test-credential-1",
+		ID:              MockCredentialID,
 		CredentialID:    []byte("mock-credential-id-1"),
 		PublicKey:       []byte("mock-public-key"),
 		AttestationType: "none",

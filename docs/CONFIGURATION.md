@@ -56,8 +56,8 @@ Environment prefix: `WALLET_SERVER`
 | `server.base_url` | `WALLET_SERVER_BASE_URL` | string |  |
 | `server.cors.allowed_origins` | `WALLET_SERVER_CORS_ALLOWED_ORIGINS` | string list | AllowedOrigins is a list of origins that may access the resource. Use "*" to allow all origins (default for development). |
 | `server.cors.allowed_methods` | `WALLET_SERVER_CORS_ALLOWED_METHODS` | string list | AllowedMethods is a list of HTTP methods allowed for cross-origin requests. |
-| `server.cors.allowed_headers` | `WALLET_SERVER_CORS_ALLOWED_HEADERS` | string list | AllowedHeaders is a list of request headers allowed in cross-origin requests. An explicit list replaces the defaults, so it must include X-Token-Mode (mandatory on /auth/passkey/*) and the other headers clients send. |
-| `server.cors.exposed_headers` | `WALLET_SERVER_CORS_EXPOSED_HEADERS` | string list | ExposedHeaders is a list of headers that browsers are allowed to access. Default: X-Private-Data-ETag and Retry-After (sent with every 429). An explicit list replaces the defaults, so it must keep Retry-After for cross-origin clients to read it. |
+| `server.cors.allowed_headers` | `WALLET_SERVER_CORS_ALLOWED_HEADERS` | string list | AllowedHeaders is a list of request headers allowed in cross-origin requests. An explicit list replaces the defaults, so it must include X-Token-Mode (mandatory on /auth/passkey/*) and the other headers clients send. The private-data sync headers (If-None-Match, X-Private-Data-If-Match, X-Private-Data-If-None-Match) are always added when missing. |
+| `server.cors.exposed_headers` | `WALLET_SERVER_CORS_EXPOSED_HEADERS` | string list | ExposedHeaders is a list of headers that browsers are allowed to access. Default: X-Private-Data-ETag and Retry-After (sent with every 429). An explicit list replaces the defaults, so it must keep Retry-After for cross-origin clients to read it. X-Private-Data-ETag is always added when missing. |
 | `server.cors.allow_credentials` | `WALLET_SERVER_CORS_ALLOW_CREDENTIALS` | boolean | AllowCredentials indicates whether the request can include credentials. Cannot be true when AllowedOrigins is "*". |
 | `server.cors.max_age` | `WALLET_SERVER_CORS_MAX_AGE` | integer | MaxAge indicates how long (in seconds) the results of a preflight request can be cached. |
 | `server.external_urls.backend_url` | `WALLET_SERVER_EXTERNAL_URLS_BACKEND_URL` | string | BackendURL is the external URL for the backend service (for engine → backend calls) |
@@ -106,7 +106,7 @@ Environment prefix: `WALLET_JWT`
 
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
-| `jwt.secret` | `WALLET_JWT_SECRET` | string | Secret is a server-side secret of at least 32 bytes. It keys the HMAC that binds the OIDC state parameter to the browser (state-binding cookie). Required. |
+| `jwt.secret` | `WALLET_JWT_SECRET` | string | Secret is a server-side secret of at least 32 bytes. It keys the HMAC that binds the OIDC state parameter to the browser and authenticates OID4VCI authorization resumption contexts using a domain-separated key. Required; share across engine replicas. |
 | `jwt.secret_path` | `WALLET_JWT_SECRET_PATH` | string | SecretPath is the path to a file containing the secret (alternative to Secret). |
 | `jwt.expiry_hours` | `WALLET_JWT_EXPIRY_HOURS` | integer | REMOVED and ignored (startup warning). AS token lifetimes are as.default_token_ttl / as.audience_ttls.  Deprecated: no effect. |
 | `jwt.refresh_days` | `WALLET_JWT_REFRESH_DAYS` | integer | REMOVED and ignored (startup warning). AS sessions live as.session_ttl.  Deprecated: no effect. |
@@ -255,6 +255,7 @@ Environment prefix: `WALLET_SECURITY`
 
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
+| `security.require_authorization_response_issuer` | `WALLET_SECURITY_REQUIRE_AUTHORIZATION_RESPONSE_ISSUER` | boolean | RequireAuthorizationResponseIssuer enforces RFC 9207 issuer presence for OID4VCI authorization responses even when AS metadata omits support. Enable for FAPI deployments. Default: false. Advertised support always requires iss; any supplied issuer must match the original AS exactly. |
 | `security.auth_rate_limit.enabled` | `WALLET_SECURITY_AUTH_RATE_LIMIT_ENABLED` | boolean | Enabled controls whether rate limiting is active |
 | `security.auth_rate_limit.max_attempts` | `WALLET_SECURITY_AUTH_RATE_LIMIT_MAX_ATTEMPTS` | integer | MaxAttempts is the maximum number of login/registration attempts per window Default: 10 |
 | `security.auth_rate_limit.window_seconds` | `WALLET_SECURITY_AUTH_RATE_LIMIT_WINDOW_SECONDS` | integer | WindowSeconds is the time window for rate limiting (in seconds) Default: 60 (1 minute) |

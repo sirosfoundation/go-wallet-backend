@@ -100,6 +100,14 @@ type TokenRequest struct {
 	TenantID  string `json:"tenant_id,omitempty"`
 	TAC       string `json:"tac,omitempty"`
 	Anonymous bool   `json:"anonymous,omitempty"`
+	// Pseudonymous: mint the engine-transport token kind — the token's
+	// `sub` is a fresh random pseudonym (per mint, so it identifies
+	// nothing and cannot be correlated across mints), while the
+	// session's real identity stands behind the mint exactly as the
+	// session path's does. The token carries `tac` capped to "ri" — the
+	// WMP engine's two flow gates (read for OID4VP, insert for OID4VCI;
+	// engine-parity.md §8 G3) — and the tenant, claimed as today.
+	Pseudonymous bool `json:"pseudonymous,omitempty"`
 }
 
 // TokenIssuer issues signed access tokens.
