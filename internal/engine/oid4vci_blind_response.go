@@ -38,6 +38,9 @@ type responseEncryption struct {
 	// JWK is the client's public response-encryption JWK, validated and
 	// normalised by the engine. Empty until the client has answered.
 	JWK json.RawMessage
+	// CredentialConfigurationID is the configuration this negotiation is for,
+	// relayed to the client on every key and decrypt request of it.
+	CredentialConfigurationID string
 }
 
 // withJWK returns a copy carrying the client's key.
@@ -188,7 +191,11 @@ func (h *OID4VCIHandler) relayEncryptedResponse(ctx context.Context, jwe string,
 	if !isCompactJWE(jwe) {
 		return nil, errors.New("issuer returned a malformed encrypted credential response")
 	}
-	resp, err := h.RequestSign(ctx, SignActionDecryptCredentialResponse, SignRequestParams{JWE: jwe, Deferred: &deferred})
+	resp, err := h.RequestSign(ctx, SignActionDecryptCredentialResponse, SignRequestParams{
+		JWE:                       jwe,
+		Deferred:                  &deferred,
+		CredentialConfigurationID: enc.CredentialConfigurationID,
+	})
 	if err != nil {
 		// RequestSign turns a client-reported failure into a SignError; its text is
 		// the client's and is neither logged nor relayed.

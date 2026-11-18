@@ -1364,6 +1364,9 @@ func (h *OID4VCIHandler) issueOneCredential(ctx context.Context, metadata *Issue
 	if err != nil {
 		return nil, nil, false, err
 	}
+	if respOffer != nil {
+		respOffer.CredentialConfigurationID = selectedConfigID
+	}
 	if err := h.checkPSCNeedsProof(selectedConfig); err != nil {
 		return nil, nil, false, err
 	}
@@ -3008,6 +3011,7 @@ func (h *OID4VCIHandler) requestProofs(ctx context.Context, metadata *IssuerMeta
 	}
 	if offer != nil {
 		params.CredentialResponseEncryption = offer.params()
+		params.CredentialConfigurationID = offer.CredentialConfigurationID
 	}
 	wantPSC, err := holderCommitmentPSCAdvertised(config)
 	if err != nil {
