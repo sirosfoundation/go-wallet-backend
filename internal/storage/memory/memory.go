@@ -28,7 +28,7 @@ type Store struct {
 // NewStore creates a new in-memory store
 func NewStore() *Store {
 	s := &Store{
-		users:           &UserStore{data: make(map[string]*domain.User)},
+		users:           &UserStore{data: make(map[string]*domain.User), tombstones: make(map[string]*domain.DeletionTombstone)},
 		tenants:         &TenantStore{data: make(map[domain.TenantID]*domain.Tenant)},
 		userTenants:     &UserTenantStore{data: make(map[string]*domain.UserTenantMembership)},
 		credentials:     &CredentialStore{data: make(map[int64]*domain.VerifiableCredential)},
@@ -239,8 +239,78 @@ func (s *UserTenantStore) GetMembership(ctx context.Context, userID domain.UserI
 
 // UserStore implements in-memory user storage
 type UserStore struct {
-	mu   sync.RWMutex
-	data map[string]*domain.User
+	mu         sync.RWMutex
+	data       map[string]*domain.User
+	tombstones map[string]*domain.DeletionTombstone
+}
+
+func (s *UserStore) PutDeletionTombstone(_ context.Context, t *domain.DeletionTombstone) error {
+	if t == nil || t.UserID == "" {
+		return storage.ErrInvalidInput
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tombstones == nil {
+		s.tombstones = make(map[string]*domain.DeletionTombstone)
+	}
+	cp := *t
+	cp.TenantIDs = append([]domain.TenantID(nil), t.TenantIDs...)
+	if existing, ok := s.tombstones[t.UserID]; ok {
+		if existing.DeletedAt.Before(cp.DeletedAt) || cp.DeletedAt.IsZero() {
+			cp.DeletedAt = existing.DeletedAt
+		}
+		if existing.ExpiresAt.After(cp.ExpiresAt) {
+			cp.ExpiresAt = existing.ExpiresAt
+		}
+		seen := map[domain.TenantID]bool{}
+		merged := make([]domain.TenantID, 0, len(existing.TenantIDs)+len(cp.TenantIDs))
+		for _, id := range append(append([]domain.TenantID{}, existing.TenantIDs...), cp.TenantIDs...) {
+			if !seen[id] {
+				seen[id] = true
+				merged = append(merged, id)
+			}
+		}
+		cp.TenantIDs = merged
+		if cp.HolderDID == "" {
+			cp.HolderDID = existing.HolderDID
+		}
+	}
+	s.tombstones[t.UserID] = &cp
+	return nil
+}
+
+func (s *UserStore) ClearDeletionTombstoneHolderDID(_ context.Context, userID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t, ok := s.tombstones[userID]; ok {
+		t.HolderDID = ""
+	}
+	return nil
+}
+
+func (s *UserStore) GetDeletionTombstone(_ context.Context, userID string) (*domain.DeletionTombstone, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	t, ok := s.tombstones[userID]
+	if !ok {
+		return nil, storage.ErrNotFound
+	}
+	cp := *t
+	cp.TenantIDs = append([]domain.TenantID(nil), t.TenantIDs...)
+	return &cp, nil
+}
+
+func (s *UserStore) DeleteExpiredDeletionTombstones(_ context.Context, now time.Time) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for id, t := range s.tombstones {
+		if !t.ExpiresAt.After(now) {
+			delete(s.tombstones, id)
+			n++
+		}
+	}
+	return n, nil
 }
 
 // deepCopyUser returns an independent copy of user, safe to read and even
@@ -351,6 +421,68 @@ func (s *UserStore) Delete(ctx context.Context, id domain.UserID) error {
 	return nil
 }
 
+func (s *UserStore) InvalidateAuthBefore(ctx context.Context, id domain.UserID, t time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, exists := s.data[id.String()]
+	if !exists {
+		return storage.ErrNotFound
+	}
+	advanceCutoff(user, t)
+	return nil
+}
+
+func (s *UserStore) InvalidateAuthBeforeForToken(ctx context.Context, id domain.UserID, t time.Time, tokenIssuedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, exists := s.data[id.String()]
+	if !exists {
+		return storage.ErrNotFound
+	}
+	if !tokenIssuedAt.IsZero() && !user.AuthInvalidBefore.IsZero() && tokenIssuedAt.Unix() <= user.AuthInvalidBefore.Unix() {
+		return storage.ErrStaleWrite
+	}
+	advanceCutoff(user, t)
+	return nil
+}
+
+// advanceCutoff moves the cut-off forward, ignoring a delayed older event so
+// it cannot roll one back. The fence counter always advances, and so does
+// Version, so a Modify that read the record before this write is not mistaken
+// for current (the store's optimistic concurrency, as the Mongo pipeline does).
+func advanceCutoff(user *domain.User, t time.Time) {
+	user.AuthFence++
+	user.Version++
+	if t.After(user.AuthInvalidBefore) {
+		user.AuthInvalidBefore = t
+	}
+}
+
+func (s *UserStore) EraseWalletData(ctx context.Context, id domain.UserID, fence time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	user, exists := s.data[id.String()]
+	if !exists {
+		return storage.ErrNotFound
+	}
+	user.PrivateData = nil
+	user.PrivateDataETag = ""
+	user.Keys = nil
+	user.UpdatedAt = time.Now()
+	advanceCutoff(user, fence)
+	return nil
+}
+
+func (s *UserStore) GetAuthCutoff(ctx context.Context, id domain.UserID) (time.Time, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	user, exists := s.data[id.String()]
+	if !exists {
+		return time.Time{}, storage.ErrNotFound
+	}
+	return user.AuthInvalidBefore, nil
+}
+
 func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain.UserID, credentialID string, signCount uint32, cloneWarning bool) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -393,7 +525,30 @@ func (s *UserStore) UpdateCredentialAuthenticator(ctx context.Context, id domain
 type CredentialStore struct {
 	mu     sync.RWMutex
 	data   map[int64]*domain.VerifiableCredential
+	undo   map[int64]*storage.UndoLog[domain.VerifiableCredential]
 	nextID int64
+	// now is the clock the undo log ages by; nil means time.Now.
+	now func() time.Time
+}
+
+func (s *CredentialStore) clock() time.Time {
+	if s.now != nil {
+		return s.now()
+	}
+	return time.Now()
+}
+
+// logFor returns the undo log of record id, creating it. Caller holds s.mu.
+func (s *CredentialStore) logFor(id int64) *storage.UndoLog[domain.VerifiableCredential] {
+	if s.undo == nil {
+		s.undo = make(map[int64]*storage.UndoLog[domain.VerifiableCredential])
+	}
+	l, ok := s.undo[id]
+	if !ok {
+		l = &storage.UndoLog[domain.VerifiableCredential]{}
+		s.undo[id] = l
+	}
+	return l
 }
 
 func (s *CredentialStore) Create(ctx context.Context, credential *domain.VerifiableCredential) error {
@@ -404,7 +559,12 @@ func (s *CredentialStore) Create(ctx context.Context, credential *domain.Verifia
 	credential.ID = s.nextID
 	credential.CreatedAt = time.Now()
 	credential.UpdatedAt = time.Now()
-	s.data[credential.ID] = credential
+	credential.WriteToken = storage.NewWriteToken()
+	// Store a copy: the caller keeps its own record, so a later write (which
+	// replaces the token) cannot change what the caller captured for its rollback.
+	stored := *credential
+	s.data[credential.ID] = &stored
+	s.logFor(credential.ID).Push(s.clock(), credential.WriteToken, nil)
 	return nil
 }
 
@@ -420,7 +580,8 @@ func (s *CredentialStore) GetByID(ctx context.Context, tenantID domain.TenantID,
 	if credential.TenantID != tenantID {
 		return nil, storage.ErrNotFound
 	}
-	return credential, nil
+	out := *credential
+	return &out, nil
 }
 
 func (s *CredentialStore) GetByIdentifier(ctx context.Context, tenantID domain.TenantID, holderDID, credentialIdentifier string) (*domain.VerifiableCredential, error) {
@@ -429,7 +590,8 @@ func (s *CredentialStore) GetByIdentifier(ctx context.Context, tenantID domain.T
 
 	for _, cred := range s.data {
 		if cred.TenantID == tenantID && cred.HolderDID == holderDID && cred.CredentialIdentifier == credentialIdentifier {
-			return cred, nil
+			out := *cred
+			return &out, nil
 		}
 	}
 	return nil, storage.ErrNotFound
@@ -442,7 +604,8 @@ func (s *CredentialStore) GetAllByHolder(ctx context.Context, tenantID domain.Te
 	credentials := make([]*domain.VerifiableCredential, 0)
 	for _, cred := range s.data {
 		if cred.TenantID == tenantID && cred.HolderDID == holderDID {
-			credentials = append(credentials, cred)
+			out := *cred
+			credentials = append(credentials, &out)
 		}
 	}
 	return credentials, nil
@@ -452,13 +615,58 @@ func (s *CredentialStore) Update(ctx context.Context, credential *domain.Verifia
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.data[credential.ID]; !exists {
+	current, exists := s.data[credential.ID]
+	if !exists {
 		return storage.ErrNotFound
 	}
+	before := *current
 
 	credential.UpdatedAt = time.Now()
-	s.data[credential.ID] = credential
+	credential.WriteToken = storage.NewWriteToken()
+	stored := *credential // a copy, as in Create
+	s.data[credential.ID] = &stored
+	s.logFor(credential.ID).Push(s.clock(), credential.WriteToken, &before)
 	return nil
+}
+
+// DeleteIfUnchanged undoes the write that set writeToken (see undoLog): a
+// create is deleted, an update goes back to the record it replaced. Writes made
+// on top of it since are not undone. ErrNotFound if the token is not one of the
+// record's recent writes.
+func (s *CredentialStore) DeleteIfUnchanged(ctx context.Context, tenantID domain.TenantID, id int64, writeToken string) error {
+	return s.rollback(tenantID, id, writeToken)
+}
+
+// RestoreIfUnchanged undoes the write that set written.WriteToken, exactly as
+// DeleteIfUnchanged does; previous is ignored: the record's own undo log, not
+// what the caller read, says what the write replaced.
+func (s *CredentialStore) RestoreIfUnchanged(ctx context.Context, written, previous *domain.VerifiableCredential) error {
+	return s.rollback(written.TenantID, written.ID, written.WriteToken)
+}
+
+func (s *CredentialStore) rollback(tenantID domain.TenantID, id int64, writeToken string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cur, exists := s.data[id]
+	if !exists || cur.TenantID != tenantID {
+		return storage.ErrNotFound
+	}
+	kind, before := s.logFor(id).Take(s.clock(), writeToken)
+	switch kind {
+	case storage.UndoHead:
+		if before == nil {
+			delete(s.data, id)
+			delete(s.undo, id)
+			return nil
+		}
+		restored := *before
+		s.data[id] = &restored
+		return nil
+	case storage.UndoSpliced:
+		return nil
+	}
+	return storage.ErrNotFound
 }
 
 func (s *CredentialStore) Delete(ctx context.Context, tenantID domain.TenantID, holderDID, credentialIdentifier string) error {
@@ -468,6 +676,7 @@ func (s *CredentialStore) Delete(ctx context.Context, tenantID domain.TenantID, 
 	for id, cred := range s.data {
 		if cred.TenantID == tenantID && cred.HolderDID == holderDID && cred.CredentialIdentifier == credentialIdentifier {
 			delete(s.data, id)
+			delete(s.undo, id)
 			return nil
 		}
 	}
@@ -562,6 +771,18 @@ func (s *PresentationStore) Delete(ctx context.Context, tenantID domain.TenantID
 		}
 	}
 	return storage.ErrNotFound
+}
+
+func (s *PresentationStore) DeleteByID(ctx context.Context, tenantID domain.TenantID, id int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	pres, exists := s.data[id]
+	if !exists || pres.TenantID != tenantID {
+		return storage.ErrNotFound
+	}
+	delete(s.data, id)
+	return nil
 }
 
 // ChallengeStore implements in-memory challenge storage

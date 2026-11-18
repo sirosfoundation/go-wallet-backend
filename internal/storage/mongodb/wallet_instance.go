@@ -2,9 +2,11 @@ package mongodb
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/google/uuid"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -16,45 +18,168 @@ import (
 // WalletInstanceStore implements storage.WalletInstanceStore using MongoDB.
 type WalletInstanceStore struct {
 	collection *mongo.Collection
+	// now is the clock the undo log ages by; nil means time.Now.
+	now func() time.Time
 }
 
+func lit(v any) bson.M { return bson.M{"$literal": v} }
+
 func (s *WalletInstanceStore) Upsert(ctx context.Context, instance *domain.WalletInstance) error {
-	filter := bson.M{"_id": instance.ID}
+	// Tenant-scoped: a mismatch inserts a duplicate _id, and that duplicate-key
+	// error is how "another tenant's record" reaches the caller.
+	filter := bson.M{"_id": instance.ID, "tenant_id": instance.TenantID}
+	newGeneration := uuid.NewString()
+	writeToken := uuid.NewString()
+	now := undoClock(s.now)
+	// One atomic pipeline update: the write and its undo-log entry (the
+	// attestation fields as they were, null for an insert) land together. On an
+	// insert the document holds only the filter's fields, so no created_at means
+	// "this call inserts".
+	isNew := bson.M{"$eq": bson.A{bson.M{"$type": "$created_at"}, "missing"}}
 	set := bson.M{
-		"tenant_id":          instance.TenantID,
-		"attestation_source": instance.AttestationSource,
-		"verified_app_id":    instance.VerifiedAppID,
-		"last_attested_at":   instance.LastAttestedAt,
-		"updated_at":         instance.UpdatedAt,
-	}
-	update := bson.M{
-		"$set": set,
-		// Status is only ever set here for a brand-new document (via $setOnInsert).
-		// An existing instance's status must only change through UpdateStatus —
-		// otherwise a routine re-attestation would silently reactivate a
-		// suspended/revoked instance.
-		"$setOnInsert": bson.M{
-			"created_at": instance.CreatedAt,
-			"status":     instance.Status,
-		},
-		"$inc": bson.M{
-			"attestation_count": 1,
-		},
+		"write_token":        lit(writeToken),
+		"attestation_source": lit(instance.AttestationSource),
+		"verified_app_id":    lit(instance.VerifiedAppID),
+		"last_attested_at":   lit(instance.LastAttestedAt),
+		"updated_at":         lit(instance.UpdatedAt),
+		// Status and tenant are fixed at insert: re-attestation must not reactivate
+		// a revoked instance or move it to another tenant. Fresh generation per
+		// insert (domain.InstanceBinding).
+		"created_at":        bson.M{"$ifNull": bson.A{"$created_at", lit(instance.CreatedAt)}},
+		"generation":        bson.M{"$cond": bson.A{isNew, lit(newGeneration), "$generation"}},
+		"status":            bson.M{"$cond": bson.A{isNew, lit(instance.Status), "$status"}},
+		"attestation_count": bson.M{"$add": bson.A{bson.M{"$ifNull": bson.A{"$attestation_count", 0}}, 1}},
+		undoField: pushedLogExpr(now, writeToken, bson.M{"$cond": bson.A{isNew, nil, bson.M{
+			"attestation_source": "$attestation_source",
+			"verified_app_id":    "$verified_app_id",
+			"wscd_type":          "$wscd_type",
+			"last_attested_at":   "$last_attested_at",
+			"updated_at":         "$updated_at",
+			"device_info":        "$device_info",
+			"write_token":        "$write_token",
+			"user_id":            "$user_id",
+			"credential_id":      "$credential_id",
+		}}}),
 	}
 	if instance.WSCDType != "" {
-		set["wscd_type"] = instance.WSCDType
-	}
-	if instance.UserID != nil {
-		set["user_id"] = instance.UserID
+		set["wscd_type"] = lit(instance.WSCDType)
 	}
 	if instance.DeviceInfo != nil {
-		set["device_info"] = instance.DeviceInfo
+		set["device_info"] = lit(instance.DeviceInfo)
+	}
+	update := mongo.Pipeline{{{Key: "$set", Value: set}}}
+
+	// Bind and link are scoped to the generation this upsert wrote or matched.
+	var written struct {
+		Generation string `bson:"generation"`
+	}
+	err := s.collection.FindOneAndUpdate(ctx, filter, update,
+		options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After).
+			SetProjection(bson.M{"generation": 1}),
+	).Decode(&written)
+	if err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			return storage.ErrAlreadyExists
+		}
+		return fmt.Errorf("%w: upsert wallet instance: %v", storage.ErrDatabase, err)
+	}
+	instance.Generation = written.Generation
+	instance.WriteToken = writeToken
+	// $setOnInsert wrote our fresh generation only if this call inserted the record.
+	instance.Inserted = written.Generation == newGeneration
+
+	// Bind only while unowned and scoped to the tenant, so racing attestations
+	// cannot both win and a foreign user is not parked on this record.
+	if instance.UserID != nil {
+		res, err := s.collection.UpdateOne(ctx, upsertBindFilter(instance), bson.M{"$set": bson.M{"user_id": instance.UserID}})
+		if err != nil {
+			return fmt.Errorf("%w: bind wallet instance user: %v", storage.ErrDatabase, err)
+		}
+		if res.MatchedCount == 0 {
+			if err := s.requireGeneration(ctx, instance); err != nil {
+				return err
+			}
+		}
 	}
 
-	opts := options.Update().SetUpsert(true)
-	_, err := s.collection.UpdateOne(ctx, filter, update, opts)
+	// Only the first non-empty passkey link is recorded (credential_id unset),
+	// scoped like the bind, so a racer whose bind lost cannot link its credential
+	// to the winner's record (SID-AUTH-06).
+	if instance.CredentialID != "" {
+		res, err := s.collection.UpdateOne(ctx, upsertLinkFilter(instance), bson.M{"$set": bson.M{"credential_id": instance.CredentialID}})
+		if err != nil {
+			return fmt.Errorf("%w: link wallet instance credential: %v", storage.ErrDatabase, err)
+		}
+		if res.MatchedCount == 0 {
+			if err := s.requireGeneration(ctx, instance); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// generationCond matches the generation the upsert wrote (none for legacy records).
+func generationCond(gen string) bson.M {
+	if gen == "" {
+		return bson.M{"$or": []bson.M{
+			{"generation": bson.M{"$exists": false}},
+			{"generation": nil},
+			{"generation": ""},
+		}}
+	}
+	return bson.M{"generation": gen}
+}
+
+// upsertBindFilter is Upsert's owner-bind filter: id, tenant, generation, live and unowned.
+func upsertBindFilter(instance *domain.WalletInstance) bson.M {
+	return bson.M{"$and": []bson.M{
+		{"_id": instance.ID},
+		{"tenant_id": instance.TenantID},
+		generationCond(instance.Generation),
+		// Live only: a revocation that landed after the caller's status check must
+		// not gain an owner.
+		{"status": domain.InstanceStatusActive},
+		{"$or": []bson.M{
+			{"user_id": bson.M{"$exists": false}},
+			{"user_id": nil},
+		}},
+	}}
+}
+
+// upsertLinkFilter is Upsert's passkey-link filter, scoped like upsertBindFilter.
+func upsertLinkFilter(instance *domain.WalletInstance) bson.M {
+	conds := []bson.M{
+		{"_id": instance.ID},
+		{"tenant_id": instance.TenantID},
+		generationCond(instance.Generation),
+		// Live only: a revoked record must not gain the passkey link, which would
+		// then fail that passkey's login over a refused WIA request.
+		{"status": domain.InstanceStatusActive},
+		{"$or": []bson.M{
+			{"credential_id": bson.M{"$exists": false}},
+			{"credential_id": ""},
+		}},
+	}
+	if instance.UserID != nil {
+		conds = append(conds, bson.M{"user_id": *instance.UserID})
+	}
+	return bson.M{"$and": conds}
+}
+
+// requireGeneration separates "already bound or linked" (fine) from "no longer
+// the record the upsert wrote" (ErrBindingChanged).
+func (s *WalletInstanceStore) requireGeneration(ctx context.Context, instance *domain.WalletInstance) error {
+	n, err := s.collection.CountDocuments(ctx, bson.M{"$and": []bson.M{
+		{"_id": instance.ID},
+		{"tenant_id": instance.TenantID},
+		generationCond(instance.Generation),
+	}})
 	if err != nil {
-		return fmt.Errorf("%w: upsert wallet instance: %v", storage.ErrDatabase, err)
+		return fmt.Errorf("%w: re-check wallet instance generation: %v", storage.ErrDatabase, err)
+	}
+	if n == 0 {
+		return storage.ErrBindingChanged
 	}
 	return nil
 }
@@ -103,27 +228,115 @@ func (s *WalletInstanceStore) GetByUser(ctx context.Context, tenantID domain.Ten
 	return instances, nil
 }
 
-func (s *WalletInstanceStore) UpdateStatus(ctx context.Context, id string, status domain.InstanceStatus, reason string) error {
+// GetAllByUser lists every instance of the user across all tenants.
+func (s *WalletInstanceStore) GetAllByUser(ctx context.Context, userID domain.UserID) ([]*domain.WalletInstance, error) {
+	cursor, err := s.collection.Find(ctx, bson.M{"user_id": userID})
+	if err != nil {
+		return nil, fmt.Errorf("%w: list wallet instances across tenants: %v", storage.ErrDatabase, err)
+	}
+	defer func() { _ = cursor.Close(ctx) }()
+
+	var instances []*domain.WalletInstance
+	if err := cursor.All(ctx, &instances); err != nil {
+		return nil, fmt.Errorf("%w: decode wallet instances: %v", storage.ErrDatabase, err)
+	}
+	return instances, nil
+}
+
+func (s *WalletInstanceStore) UpdateStatus(ctx context.Context, id string, tenantID domain.TenantID, status domain.InstanceStatus, reason string) error {
+	return s.updateStatus(ctx, bson.M{"_id": id, "tenant_id": tenantID}, status, reason)
+}
+
+// UpdateStatusForUser is UpdateStatus with the owner in the filter too.
+func (s *WalletInstanceStore) UpdateStatusForUser(ctx context.Context, id string, tenantID domain.TenantID, userID domain.UserID, status domain.InstanceStatus, reason string) error {
+	return s.updateStatus(ctx, bson.M{"_id": id, "tenant_id": tenantID, "user_id": userID}, status, reason)
+}
+
+// bindingFilter matches id, tenant, expected owner and generation (absent, null, "" mean none).
+func bindingFilter(id string, tenantID domain.TenantID, b domain.InstanceBinding) bson.M {
+	none := func(field string) bson.M {
+		return bson.M{"$or": []bson.M{
+			{field: bson.M{"$exists": false}},
+			{field: nil},
+			{field: ""},
+		}}
+	}
+	conds := []bson.M{{"_id": id}, {"tenant_id": tenantID}}
+	if b.Owner == nil {
+		conds = append(conds, none("user_id"))
+	} else {
+		conds = append(conds, bson.M{"user_id": *b.Owner})
+	}
+	if b.Generation == "" {
+		conds = append(conds, none("generation"))
+	} else {
+		conds = append(conds, bson.M{"generation": b.Generation})
+	}
+	return bson.M{"$and": conds}
+}
+
+// UpdateStatusIfUnchanged is UpdateStatus conditional on owner and generation.
+func (s *WalletInstanceStore) UpdateStatusIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding, status domain.InstanceStatus, reason string) error {
+	err := s.updateStatus(ctx, bindingFilter(id, tenantID, expected), status, reason)
+	if errors.Is(err, storage.ErrNotFound) {
+		// Distinguish "no such record" from "a different record now".
+		count, cerr := s.collection.CountDocuments(ctx, bson.M{"_id": id, "tenant_id": tenantID})
+		if cerr != nil {
+			return fmt.Errorf("%w: update wallet instance status: %v", storage.ErrDatabase, cerr)
+		}
+		if count > 0 {
+			return storage.ErrBindingChanged
+		}
+	}
+	return err
+}
+
+// DeleteIfUnchanged deletes only while owner and generation match.
+func (s *WalletInstanceStore) DeleteIfUnchanged(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding) error {
+	res, err := s.collection.DeleteOne(ctx, bindingFilter(id, tenantID, expected))
+	if err != nil {
+		return fmt.Errorf("%w: delete wallet instance: %v", storage.ErrDatabase, err)
+	}
+	if res.DeletedCount == 0 {
+		return s.missOrChanged(ctx, id, tenantID)
+	}
+	return nil
+}
+
+// missOrChanged classifies a conditional write that matched nothing.
+func (s *WalletInstanceStore) missOrChanged(ctx context.Context, id string, tenantID domain.TenantID) error {
+	count, err := s.collection.CountDocuments(ctx, bson.M{"_id": id, "tenant_id": tenantID})
+	if err != nil {
+		return fmt.Errorf("%w: delete wallet instance: %v", storage.ErrDatabase, err)
+	}
+	if count == 0 {
+		return storage.ErrNotFound
+	}
+	return storage.ErrBindingChanged
+}
+
+// revocableSourceFilter requires a status in domain.RevocableStatuses.
+func revocableSourceFilter() bson.M {
+	return bson.M{"$in": domain.RevocableStatuses()}
+}
+
+// updateStatus revokes the record matching match (always _id and tenant_id).
+func (s *WalletInstanceStore) updateStatus(ctx context.Context, match bson.M, status domain.InstanceStatus, reason string) error {
 	now := time.Now().UTC()
 
-	// Use a conditional filter to enforce valid state transitions atomically.
-	// Revoked instances cannot transition to any other state.
-	filter := bson.M{"_id": id}
+	// The filter enforces the one legal transition (active to revoked) atomically.
+	filter := bson.M{}
+	for k, v := range match {
+		filter[k] = v
+	}
 	switch status {
-	case domain.InstanceStatusActive:
-		// Only suspended → active is allowed (not revoked → active).
-		filter["status"] = domain.InstanceStatusSuspended
-	case domain.InstanceStatusSuspended:
-		// Only active → suspended is allowed.
-		filter["status"] = domain.InstanceStatusActive
 	case domain.InstanceStatusRevoked:
-		// active → revoked and suspended → revoked are both allowed.
-		filter["status"] = bson.M{"$in": []domain.InstanceStatus{domain.InstanceStatusActive, domain.InstanceStatusSuspended}}
+		// Active and legacy suspended may be revoked; an unknown status matches
+		// nothing (fail closed).
+		filter["status"] = revocableSourceFilter()
 	default:
-		// Reject anything other than the three known statuses — otherwise the
-		// filter above stays unconstrained ({_id: id} only) and this would
-		// write an arbitrary status with no transition check at all.
-		return fmt.Errorf("%w: unknown wallet instance status %q", domain.ErrInvalidStatusTransition, status)
+		// Anything else is refused: an unconstrained filter would skip the transition check.
+		return fmt.Errorf("%w: cannot set wallet instance status to %q", domain.ErrInvalidStatusTransition, status)
 	}
 
 	set := bson.M{
@@ -131,12 +344,8 @@ func (s *WalletInstanceStore) UpdateStatus(ctx context.Context, id string, statu
 		"deactivation_reason": reason,
 		"updated_at":          now,
 	}
+	set["deactivated_at"] = now
 	update := bson.M{"$set": set}
-	if status == domain.InstanceStatusSuspended || status == domain.InstanceStatusRevoked {
-		set["deactivated_at"] = now
-	} else {
-		update["$unset"] = bson.M{"deactivated_at": "", "deactivation_reason": ""}
-	}
 
 	res, err := s.collection.UpdateOne(ctx, filter, update)
 	if err != nil {
@@ -144,7 +353,7 @@ func (s *WalletInstanceStore) UpdateStatus(ctx context.Context, id string, statu
 	}
 	if res.MatchedCount == 0 {
 		// Distinguish "not found" from "invalid transition" by checking existence.
-		count, cerr := s.collection.CountDocuments(ctx, bson.M{"_id": id})
+		count, cerr := s.collection.CountDocuments(ctx, match)
 		if cerr != nil || count == 0 {
 			return storage.ErrNotFound
 		}
@@ -172,8 +381,200 @@ func (s *WalletInstanceStore) IncrementAttestation(ctx context.Context, id strin
 	return nil
 }
 
+// DeleteIfRemovable deletes only while the instance is removable, so a
+// concurrent revocation keeps its tombstone.
+func (s *WalletInstanceStore) DeleteIfRemovable(ctx context.Context, id string, tenantID domain.TenantID, expected domain.InstanceBinding) error {
+	bound := bindingFilter(id, tenantID, expected)
+	filter := bson.M{"$and": []bson.M{
+		bound,
+		{"status": domain.InstanceStatusActive},
+	}}
+	res, err := s.collection.DeleteOne(ctx, filter)
+	if err != nil {
+		return fmt.Errorf("%w: delete wallet instance: %v", storage.ErrDatabase, err)
+	}
+	if res.DeletedCount == 0 {
+		// Distinguish gone/foreign, a different record, and "became a tombstone".
+		if err := s.missOrChanged(ctx, id, tenantID); !errors.Is(err, storage.ErrBindingChanged) {
+			return err
+		}
+		count, cerr := s.collection.CountDocuments(ctx, bound)
+		if cerr != nil {
+			return fmt.Errorf("%w: delete wallet instance: %v", storage.ErrDatabase, cerr)
+		}
+		if count == 0 {
+			return storage.ErrBindingChanged
+		}
+		return domain.ErrInvalidStatusTransition
+	}
+	return nil
+}
+
+// RestoreAttestation undoes the Upsert that set written.WriteToken and matched an
+// existing record (see storage.UndoLog), in one atomic pipeline update: when it
+// is the newest attestation the fields go back to the record it replaced,
+// including that record's write token and clearing the owner or passkey link it
+// set when the record had none and the stored value is still the one written;
+// when newer attestations sit on top it is spliced out of the log, their values
+// stay (a newer attestation may rely on the owner or link), and only the
+// attestation counter is undone. The caller's before is ignored for a record
+// that has an undo log; it is used only for a record written before the log
+// existed. An Upsert that inserted the record has nothing to restore
+// (ErrBindingChanged). Status is never touched.
+func (s *WalletInstanceStore) RestoreAttestation(ctx context.Context, before, written *domain.WalletInstance) error {
+	if written.WriteToken == "" {
+		return storage.ErrBindingChanged
+	}
+	for try := 0; try < rollbackMaxTries; try++ {
+		now := undoClock(s.now)
+		base := bson.A{
+			bson.M{"_id": written.ID}, bson.M{"tenant_id": written.TenantID}, generationCond(written.Generation),
+		}
+		// The write is in the log and replaced a record (it was not the insert).
+		logged := bson.M{undoField: bson.M{"$elemMatch": bson.M{
+			"token": written.WriteToken, "at": bson.M{"$gte": undoCutoff(now)}, "before": bson.M{"$ne": nil},
+		}}}
+		filter := bson.M{"$and": append(base, logged)}
+
+		unsetUser := bson.M{"$literal": false}
+		if written.UserID != nil {
+			unsetUser = bson.M{"$and": bson.A{
+				bson.M{"$eq": bson.A{bson.M{"$ifNull": bson.A{"$_rb.b.user_id", nil}}, nil}},
+				bson.M{"$eq": bson.A{"$user_id", lit(*written.UserID)}},
+			}}
+		}
+		unsetLink := bson.M{"$literal": false}
+		if written.CredentialID != "" {
+			unsetLink = bson.M{"$and": bson.A{
+				bson.M{"$in": bson.A{bson.M{"$ifNull": bson.A{"$_rb.b.credential_id", ""}}, bson.A{"", nil}}},
+				bson.M{"$eq": bson.A{"$credential_id", lit(written.CredentialID)}},
+			}}
+		}
+		// Only the newest attestation restores fields and unbinds; an older one
+		// spliced out of the log changes the counter and the log only.
+		fromBefore := func(field string) bson.M {
+			return bson.M{"$cond": bson.A{"$_rb.head", bson.M{"$ifNull": bson.A{"$_rb.b." + field, "$$REMOVE"}}, "$" + field}}
+		}
+		res, err := s.collection.UpdateOne(ctx, filter, mongo.Pipeline{
+			{{Key: "$set", Value: bson.M{"_rb": rollbackLet(now, written.WriteToken, bson.M{
+				"head": "$$isHead",
+				"b":    "$$entry.before",
+				"log":  bson.M{"$cond": bson.A{"$$isHead", "$$below", "$$spliced"}},
+			})}}},
+			{{Key: "$set", Value: bson.M{
+				"attestation_source": fromBefore("attestation_source"),
+				"verified_app_id":    fromBefore("verified_app_id"),
+				"wscd_type":          fromBefore("wscd_type"),
+				"last_attested_at":   fromBefore("last_attested_at"),
+				"updated_at":         fromBefore("updated_at"),
+				"device_info":        fromBefore("device_info"),
+				"write_token":        fromBefore("write_token"),
+				"user_id":            bson.M{"$cond": bson.A{bson.M{"$and": bson.A{"$_rb.head", unsetUser}}, "$$REMOVE", "$user_id"}},
+				"credential_id":      bson.M{"$cond": bson.A{bson.M{"$and": bson.A{"$_rb.head", unsetLink}}, "$$REMOVE", "$credential_id"}},
+				"attestation_count":  bson.M{"$subtract": bson.A{bson.M{"$ifNull": bson.A{"$attestation_count", 1}}, 1}},
+				undoField:            "$_rb.log",
+			}}},
+			{{Key: "$unset", Value: "_rb"}},
+		})
+		if err != nil {
+			return fmt.Errorf("%w: restore wallet instance attestation: %v", storage.ErrDatabase, err)
+		}
+		if res.MatchedCount == 1 {
+			return nil
+		}
+		// The write is still in the log: the state moved under us, try again.
+		n, err := s.collection.CountDocuments(ctx, filter)
+		if err != nil {
+			return fmt.Errorf("%w: restore wallet instance attestation: %v", storage.ErrDatabase, err)
+		}
+		if n > 0 {
+			continue
+		}
+		return s.restoreAttestationNoLog(ctx, before, written)
+	}
+	return fmt.Errorf("%w: restore wallet instance attestation: too much contention", storage.ErrDatabase)
+}
+
+// restoreAttestationNoLog is RestoreAttestation for a record that has no undo
+// log (written before it existed), and the classification of every miss: every
+// step is conditional on the Upsert's write token, so a newer attestation (which
+// replaced the token) makes the rest a no-op instead of being clobbered.
+func (s *WalletInstanceStore) restoreAttestationNoLog(ctx context.Context, before, written *domain.WalletInstance) error {
+	filter := bson.M{"$and": []bson.M{
+		{"_id": written.ID}, {"tenant_id": written.TenantID}, generationCond(written.Generation), {"write_token": written.WriteToken},
+		{undoField: bson.M{"$exists": false}},
+	}}
+	// Clear the owner and link first, only while still the values this request wrote.
+	if before.UserID == nil && written.UserID != nil {
+		if _, err := s.collection.UpdateOne(ctx, bson.M{"$and": []bson.M{filter, {"user_id": *written.UserID}}},
+			bson.M{"$unset": bson.M{"user_id": ""}}); err != nil {
+			return fmt.Errorf("%w: restore wallet instance owner: %v", storage.ErrDatabase, err)
+		}
+	}
+	if before.CredentialID == "" && written.CredentialID != "" {
+		if _, err := s.collection.UpdateOne(ctx, bson.M{"$and": []bson.M{filter, {"credential_id": written.CredentialID}}},
+			bson.M{"$unset": bson.M{"credential_id": ""}}); err != nil {
+			return fmt.Errorf("%w: restore wallet instance credential link: %v", storage.ErrDatabase, err)
+		}
+	}
+	set := bson.M{
+		"attestation_source": before.AttestationSource,
+		"verified_app_id":    before.VerifiedAppID,
+		"last_attested_at":   before.LastAttestedAt,
+		"updated_at":         before.UpdatedAt,
+	}
+	if before.WriteToken != "" {
+		set["write_token"] = before.WriteToken
+	}
+	update := bson.M{"$set": set, "$inc": bson.M{"attestation_count": -1}}
+	unset := bson.M{}
+	if before.WriteToken == "" {
+		unset["write_token"] = ""
+	}
+	if before.WSCDType != "" {
+		set["wscd_type"] = before.WSCDType
+	} else {
+		unset["wscd_type"] = ""
+	}
+	if before.DeviceInfo != nil {
+		set["device_info"] = before.DeviceInfo
+	} else {
+		unset["device_info"] = ""
+	}
+	if len(unset) > 0 {
+		update["$unset"] = unset
+	}
+	res, err := s.collection.UpdateOne(ctx, filter, update)
+	if err != nil {
+		return fmt.Errorf("%w: restore wallet instance attestation: %v", storage.ErrDatabase, err)
+	}
+	if res.MatchedCount == 0 {
+		count, cerr := s.collection.CountDocuments(ctx, bson.M{"_id": written.ID, "tenant_id": written.TenantID})
+		if cerr != nil {
+			return fmt.Errorf("%w: restore wallet instance attestation: %v", storage.ErrDatabase, cerr)
+		}
+		if count > 0 {
+			return storage.ErrBindingChanged
+		}
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
 func (s *WalletInstanceStore) Delete(ctx context.Context, id string) error {
 	res, err := s.collection.DeleteOne(ctx, bson.M{"_id": id})
+	if err != nil {
+		return fmt.Errorf("%w: delete wallet instance: %v", storage.ErrDatabase, err)
+	}
+	if res.DeletedCount == 0 {
+		return storage.ErrNotFound
+	}
+	return nil
+}
+
+// DeleteForUser deletes only while the record is in tenantID and bound to userID.
+func (s *WalletInstanceStore) DeleteForUser(ctx context.Context, id string, tenantID domain.TenantID, userID domain.UserID) error {
+	res, err := s.collection.DeleteOne(ctx, bson.M{"_id": id, "tenant_id": tenantID, "user_id": userID})
 	if err != nil {
 		return fmt.Errorf("%w: delete wallet instance: %v", storage.ErrDatabase, err)
 	}

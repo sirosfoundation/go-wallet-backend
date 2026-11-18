@@ -67,17 +67,32 @@ func (h *Handlers) FIDO2AttestationRegister(c *gin.Context) {
 		return
 	}
 
-	err = h.services.FIDO2Attestation.Verify(c.Request.Context(), &service.FIDO2AttestationRequest{
+	tenantID, _ := h.getTenantID(c)
+	err = h.services.FIDO2Attestation.Verify(service.WithKeyAttestationTenant(c.Request.Context(), tenantID), &service.FIDO2AttestationRequest{
 		WalletInstanceID:  req.WalletInstanceID,
 		AttestationObject: attestationObject,
 		ClientDataHash:    clientDataHash,
 	})
 	if err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
 		switch {
+		case errors.Is(err, service.ErrKeyAttestationInstanceRefused):
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":   "FORBIDDEN",
+				"message": "wallet instance not usable by this caller",
+			})
 		case errors.Is(err, service.ErrFIDO2AttestationDisabled):
 			c.JSON(http.StatusServiceUnavailable, gin.H{
 				"error":   "FIDO2_ATTESTATION_NOT_SUPPORTED",
 				"message": "FIDO2 hardware-key attestation is not configured",
+			})
+		case errors.Is(err, service.ErrFIDO2AttestationUnavailable):
+			h.logger.Warn("FIDO2 attestation cannot be verified right now", zap.Error(err))
+			c.JSON(http.StatusServiceUnavailable, gin.H{
+				"error":   "ATTESTATION_UNAVAILABLE",
+				"message": "FIDO2 attestation cannot be verified right now, retry later",
 			})
 		case errors.Is(err, service.ErrFIDO2AttestationInvalid):
 			h.logger.Debug("FIDO2 attestation verification failed", zap.Error(err))

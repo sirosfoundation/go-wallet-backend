@@ -352,14 +352,28 @@ func TestWIAAndroidKey_EvidenceIsScopedToTenantAndUser(t *testing.T) {
 		}
 		return instanceType(t, a.inst, jkt)
 	}
-	if got := later(domain.DefaultTenantID, &bob); got != domain.WSCDTypeUnknown {
-		t.Fatalf("another user reused the evidence: %s", got)
+	// Another user cannot renew the instance at all (it is bound to alice),
+	// and the stored evidence is not lent to bob on its own either.
+	{
+		c, _, _ := a.svc.CreateChallenge(ctx, domain.DefaultTenantID)
+		if _, err := a.svc.GenerateWIA(ctx, domain.DefaultTenantID, &bob, &WIARequest{Pop: signPopWithKey(t, key, c), Challenge: c}); !errors.Is(err, ErrWIAInstanceNotOwned) {
+			t.Fatalf("another user renewed alice's instance: %v", err)
+		}
+		if got, _ := a.svc.instanceKeyEvidence(ctx, domain.DefaultTenantID, bob.String(), jkt); got != nil {
+			t.Fatal("another user reused the evidence")
+		}
 	}
 	if got := later(domain.DefaultTenantID, nil); got != domain.WSCDTypeUnknown {
 		t.Fatalf("an unauthenticated request reused the evidence: %s", got)
 	}
-	if got := later("other-tenant", &alice); got != domain.WSCDTypeUnknown {
-		t.Fatalf("another tenant reused the evidence: %s", got)
+	{
+		c, _, _ := a.svc.CreateChallenge(ctx, "other-tenant")
+		if _, err := a.svc.GenerateWIA(ctx, "other-tenant", &alice, &WIARequest{Pop: signPopWithKey(t, key, c), Challenge: c}); !errors.Is(err, ErrWIAInstanceNotOwned) {
+			t.Fatalf("another tenant renewed the instance: %v", err)
+		}
+		if got, _ := a.svc.instanceKeyEvidence(ctx, "other-tenant", alice.String(), jkt); got != nil {
+			t.Fatal("another tenant reused the evidence")
+		}
 	}
 	if got := later(domain.DefaultTenantID, &alice); got != domain.WSCDTypeNativeAndroid {
 		t.Fatalf("the verified user lost its evidence: %s", got)
