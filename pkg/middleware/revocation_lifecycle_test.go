@@ -20,7 +20,7 @@ import (
 // A user revoked in the shared revocation store and the SID-AUTH-06 wallet
 // lifecycle cut-off are independent gates in TokenAuthMiddleware; a request
 // must pass both. The revoked user's deletion exemption (DELETE
-// /user/session) relaxes only the store check, never the cut-off.
+// /user/session and its delete-begin) relaxes only the store check, never the cut-off.
 func TestTokenAuthMiddleware_RevocationStoreAndLifecycleCutoffBothApply(t *testing.T) {
 	v, key, issuer := setupTokenAuthTest(t)
 	tenants := &stubTenantStore{tenants: map[domain.TenantID]*domain.Tenant{
@@ -45,6 +45,10 @@ func TestTokenAuthMiddleware_RevocationStoreAndLifecycleCutoffBothApply(t *testi
 		{"revoked, fresh token, deletion: reachable to complete it", true, fresh, "DELETE", "/user/session", 200},
 		{"revoked, token behind the cut-off, deletion: cut-off still refuses", true, stale, "DELETE", "/user/session", 401},
 		{"live user behind the cut-off, deletion: refused", false, stale, "DELETE", "/user/session", 401},
+		{"revoked, fresh token, delete-begin: reachable to retry the deletion", true, fresh, "POST", "/user/session/delete-begin", 200},
+		{"revoked, token behind the cut-off, delete-begin: cut-off still refuses", true, stale, "POST", "/user/session/delete-begin", 401},
+		{"live user behind the cut-off, delete-begin: refused", false, stale, "POST", "/user/session/delete-begin", 401},
+		{"revoked, fresh token, another POST: still refused", true, fresh, "POST", "/user/session/settings", 401},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -70,6 +74,8 @@ func TestTokenAuthMiddleware_RevocationStoreAndLifecycleCutoffBothApply(t *testi
 			ok := func(c *gin.Context) { c.Status(200) }
 			r.GET("/user/session/account-info", ok)
 			r.DELETE("/user/session", ok)
+			r.POST("/user/session/delete-begin", ok)
+			r.POST("/user/session/settings", ok)
 			w := httptest.NewRecorder()
 			req := httptest.NewRequest(c.method, c.path, nil)
 			req.Header.Set("Authorization", "Bearer "+token)

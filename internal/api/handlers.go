@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -546,7 +547,7 @@ func (h *Handlers) GetPrivateData(c *gin.Context) {
 	data, etag, err := h.services.User.GetPrivateData(c.Request.Context(), domain.UserIDFromString(userID))
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
-			c.JSON(404, gin.H{"error": "User not found"})
+			c.JSON(404, gin.H{"error": msgUserNotFound})
 			return
 		}
 		h.logger.Error("Failed to get private data", zap.Error(err))
@@ -639,7 +640,7 @@ func (h *Handlers) UpdatePrivateData(c *gin.Context) {
 			return
 		}
 		if errors.Is(err, storage.ErrNotFound) {
-			c.JSON(404, gin.H{"error": "User not found"})
+			c.JSON(404, gin.H{"error": msgUserNotFound})
 			return
 		}
 		if respondPrivateDataOwnership(c, err) {
@@ -715,11 +716,132 @@ func (h *Handlers) Logout(c *gin.Context) {
 	c.JSON(200, gin.H{"message": "Logged out successfully"})
 }
 
-// DeleteUser deletes the current user and all associated data
+// Error texts shared by several handlers.
+const (
+	msgUserNotFound        = "User not found"
+	msgWebAuthnUnavailable = "WebAuthn not available"
+)
+
+// deleteAccountConfirmation is the text the caller must send in `confirm`.
+const deleteAccountConfirmation = "DELETE"
+
+// maxDeleteAccountBody bounds the step-up request body.
+const maxDeleteAccountBody = 1 << 20
+
+// Error codes of the account-deletion step-up.
+const (
+	errCodeStepUpRequired       = "STEP_UP_REQUIRED"
+	errCodeStepUpFailed         = "STEP_UP_FAILED"
+	errCodeStepUpExpired        = "STEP_UP_EXPIRED"
+	errCodeConfirmationRequired = "CONFIRMATION_REQUIRED"
+
+	errCodeEnrollmentAuthorizationRequired = "ENROLLMENT_AUTHORIZATION_REQUIRED"
+	errCodeEnrollmentAuthorizationFailed   = "ENROLLMENT_AUTHORIZATION_FAILED"
+	errCodeNoPasskey                       = "NO_PASSKEY"
+)
+
+// deleteAccountRequest is the body of DELETE /user/session.
+type deleteAccountRequest struct {
+	ChallengeID string          `json:"challengeId"`
+	Credential  json.RawMessage `json:"credential"`
+	Confirm     string          `json:"confirm"`
+}
+
+// BeginDeleteAccount returns WebAuthn assertion options, restricted to the
+// caller's own passkeys, whose assertion authorises DELETE /user/session.
+func (h *Handlers) BeginDeleteAccount(c *gin.Context) {
+	if h.services.WebAuthn == nil {
+		c.JSON(503, gin.H{"error": msgWebAuthnUnavailable})
+		return
+	}
+	userID, ok := contextUserID(c)
+	if !ok {
+		c.JSON(401, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	resp, err := h.services.WebAuthn.BeginDeleteAccountStepUp(c.Request.Context(), domain.UserIDFromString(userID))
+	if err != nil {
+		if abortIfTokenRevoked(c, err) {
+			return
+		}
+		switch {
+		case errors.Is(err, storage.ErrNotFound):
+			c.JSON(404, gin.H{"error": msgUserNotFound})
+		case errors.Is(err, service.ErrCredentialNotFound):
+			c.JSON(400, gin.H{"error": errCodeNoPasskey, "message": "the account has no passkey to confirm the deletion with"})
+		default:
+			h.logger.Error("Failed to begin account deletion step-up", zap.Error(err))
+			c.JSON(500, gin.H{"error": "Failed to start account deletion"})
+		}
+		return
+	}
+	c.JSON(200, resp)
+}
+
+// requireDeleteStepUp authorises an account deletion. It answers and returns
+// false unless the request carries a verified step-up assertion (or is the
+// legacy bodyless request and the flag still allows it). The body is
+// authoritative: a non-empty body never falls back to the legacy path.
+func (h *Handlers) requireDeleteStepUp(c *gin.Context, userID domain.UserID) bool {
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxDeleteAccountBody))
+	if err != nil {
+		c.JSON(400, gin.H{"error": errCodeStepUpFailed, "message": "the request body could not be read"})
+		return false
+	}
+	if len(bytes.TrimSpace(body)) == 0 {
+		if h.cfg.User.Delete.RequireStepUp {
+			c.JSON(401, gin.H{
+				"error":   errCodeStepUpRequired,
+				"message": "deleting the account requires a fresh passkey assertion: call POST /user/session/delete-begin and send the result with the confirmation",
+			})
+			return false
+		}
+		h.services.User.AuditAccountEvent(config.AuditAccountRequested, userID, map[string]any{"step_up": false})
+		return true
+	}
+
+	var req deleteAccountRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		c.JSON(401, gin.H{"error": errCodeStepUpFailed, "message": "the step-up request is malformed"})
+		return false
+	}
+	// A mistyped confirmation does not burn the assertion.
+	if req.Confirm != deleteAccountConfirmation {
+		c.JSON(400, gin.H{"error": errCodeConfirmationRequired, "message": `set "confirm" to "DELETE" to delete the account`})
+		return false
+	}
+	if h.services.WebAuthn == nil {
+		c.JSON(503, gin.H{"error": msgWebAuthnUnavailable})
+		return false
+	}
+
+	if err := h.services.WebAuthn.VerifyDeleteAccountStepUp(c.Request.Context(), userID, req.ChallengeID, req.Credential); err != nil {
+		switch {
+		case errors.Is(err, service.ErrChallengeExpired):
+			c.JSON(410, gin.H{"error": errCodeStepUpExpired, "message": "the step-up assertion expired; start again with POST /user/session/delete-begin"})
+		case errors.Is(err, service.ErrStepUpFailed):
+			c.JSON(401, gin.H{"error": errCodeStepUpFailed, "message": "the step-up assertion was not accepted; start again with POST /user/session/delete-begin"})
+		default:
+			h.logger.Error("Account deletion step-up failed", zap.Error(err))
+			c.JSON(500, gin.H{"error": "Failed to verify step-up"})
+		}
+		return false
+	}
+	h.services.User.AuditAccountEvent(config.AuditAccountRequested, userID, map[string]any{"step_up": true})
+	return true
+}
+
+// DeleteUser deletes the current user and all associated data. With
+// user.delete.require_step_up it needs a verified step-up assertion and the
+// typed confirmation (see requireDeleteStepUp).
 func (h *Handlers) DeleteUser(c *gin.Context) {
 	userID, ok := contextUserID(c)
 	if !ok {
 		c.JSON(401, gin.H{"error": "Unauthorized"})
+		return
+	}
+	if !h.requireDeleteStepUp(c, domain.UserIDFromString(userID)) {
 		return
 	}
 
@@ -738,13 +860,14 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 			return
 		}
 		if errors.Is(err, service.ErrUserNotFound) {
-			c.JSON(404, gin.H{"error": "User not found"})
+			c.JSON(404, gin.H{"error": msgUserNotFound})
 			return
 		}
 		if errors.Is(err, service.ErrDeletionCleanupPending) {
 			// The account is gone and the caller's token is refused from now
 			// on; the remainder is for an operator. 202: what was asked happened.
 			h.logger.Error("Account deleted but cleanup incomplete", zap.Error(err))
+			h.services.User.AuditAccountEvent(config.AuditAccountCleanupPending, domain.UserIDFromString(userID), map[string]any{"error": errCodeDeletionCleanupPending})
 			c.JSON(http.StatusAccepted, gin.H{
 				"error":   errCodeDeletionCleanupPending,
 				"result":  "DELETED",
@@ -756,6 +879,7 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 			// Tokens are already refused for good, so a repeat cannot pass the
 			// gate; an operator must finish the deletion. 202: under way.
 			h.logger.Error("Account deletion stalled after token revocation, operator required", zap.Error(err))
+			h.services.User.AuditAccountEvent(config.AuditAccountCleanupPending, domain.UserIDFromString(userID), map[string]any{"error": errCodeDeletionOperatorRequired})
 			c.JSON(http.StatusAccepted, gin.H{
 				"error":   errCodeDeletionOperatorRequired,
 				"result":  "PENDING",
@@ -783,6 +907,7 @@ func (h *Handlers) DeleteUser(c *gin.Context) {
 		return
 	}
 
+	h.services.User.AuditAccountEvent(config.AuditAccountSucceeded, domain.UserIDFromString(userID), nil)
 	c.JSON(200, gin.H{"result": "DELETED"})
 }
 
@@ -900,7 +1025,7 @@ func (h *Handlers) UpdateSettings(c *gin.Context) {
 // StartAddWebAuthnCredential begins adding a new credential to an existing user
 func (h *Handlers) StartAddWebAuthnCredential(c *gin.Context) {
 	if h.services.WebAuthn == nil {
-		c.JSON(503, gin.H{"error": "WebAuthn not available"})
+		c.JSON(503, gin.H{"error": msgWebAuthnUnavailable})
 		return
 	}
 
@@ -927,7 +1052,7 @@ func (h *Handlers) StartAddWebAuthnCredential(c *gin.Context) {
 // FinishAddWebAuthnCredential completes adding a new credential to an existing user
 func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 	if h.services.WebAuthn == nil {
-		c.JSON(503, gin.H{"error": "WebAuthn not available"})
+		c.JSON(503, gin.H{"error": msgWebAuthnUnavailable})
 		return
 	}
 
@@ -964,6 +1089,10 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 			c.JSON(404, gin.H{})
 		case errors.Is(err, service.ErrChallengeExpired):
 			c.JSON(404, gin.H{})
+		case errors.Is(err, service.ErrEnrollmentAuthorizationRequired):
+			c.JSON(401, gin.H{"error": errCodeEnrollmentAuthorizationRequired, "message": "adding a passkey needs an assertion from an existing passkey: send it as \"authorization\""})
+		case errors.Is(err, service.ErrEnrollmentAuthorizationFailed):
+			c.JSON(401, gin.H{"error": errCodeEnrollmentAuthorizationFailed, "message": "the authorising assertion was not accepted; start again with POST /user/session/webauthn/register-begin"})
 		case errors.Is(err, service.ErrVerificationFailed):
 			c.JSON(400, gin.H{"error": "Registration response could not be verified"})
 		case errors.Is(err, service.ErrAAGUIDBlacklisted):

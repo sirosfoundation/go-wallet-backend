@@ -31,8 +31,21 @@ type TokenBlacklistChecker interface {
 // the revocation was stored (including a write whose acknowledgement was
 // lost) can then be completed by retrying, with every other token check
 // (signature, jti, family, expiry) still applied.
+//
+// POST /user/session/delete-begin is part of the same call: with
+// user.delete.require_step_up the deletion needs a challenge from it, so a
+// retry would otherwise be impossible for a revoked user. It only mints
+// assertion options for the caller's own passkeys; the token cut-off and every
+// other token check still apply to it.
 func IsAccountDeletion(c *gin.Context) bool {
-	return c.Request.Method == http.MethodDelete && strings.TrimSuffix(c.FullPath(), "/") == "/user/session"
+	path := strings.TrimSuffix(c.FullPath(), "/")
+	switch c.Request.Method {
+	case http.MethodDelete:
+		return path == "/user/session"
+	case http.MethodPost:
+		return path == "/user/session/delete-begin"
+	}
+	return false
 }
 
 // IsLogout reports whether the request is the session logout call
