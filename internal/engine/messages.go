@@ -659,6 +659,10 @@ type SignRequestParams struct {
 	// Deferred is, on decrypt_credential_response, true when the JWE answers a
 	// Deferred Credential Request (always sent, false included).
 	Deferred *bool `json:"deferred,omitempty"`
+	// CredentialConfigurationID is the configuration this key or JWE is for.
+	// The client uses it to match each decrypted response to the flow_complete
+	// result with the same id.
+	CredentialConfigurationID string `json:"credential_configuration_id,omitempty"`
 }
 
 // CredentialResponseEncryptionParams is the negotiated credential response

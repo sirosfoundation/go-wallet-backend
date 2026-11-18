@@ -1206,6 +1206,31 @@ func TestSignRequestWire_DecryptAndGenerateProofShapes(t *testing.T) {
 	assert.NotContains(t, string(b), "credential_response_encryption")
 }
 
+// #549: every decrypt request names its configuration, so the client can pair
+// the decrypted response with the completion's per-result id.
+func TestSignRequestWire_CarriesCredentialConfigurationID(t *testing.T) {
+	f := false
+	b, err := json.Marshal(SignRequestParams{JWE: "a.b.c.d.e", Deferred: &f, CredentialConfigurationID: "pid"})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"jwe":"a.b.c.d.e","deferred":false,"credential_configuration_id":"pid"}`, string(b))
+
+	fc := &fakeClient{t: t, reply: func([]byte) (SignResponseMessage, bool) { return SignResponseMessage{CredentialCount: 1}, true }}
+	h, _, cleanup := newBlindHandler(t, fc, http.DefaultClient)
+	defer cleanup()
+	k := fc.newKey()
+	var jm any
+	require.NoError(t, json.Unmarshal(mustJWK(t, k), &jm))
+	jm.(map[string]any)["alg"] = "ECDH-ES"
+	enc := map[string]any{"enc": "A128GCM", "jwk": jm}
+	_, err = h.relayEncryptedResponse(context.Background(), jweTo(t, enc, `{"credential":"c"}`), false, &responseEncryption{CredentialConfigurationID: "mdl"})
+	require.NoError(t, err)
+	fc.settle()
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	require.NotEmpty(t, fc.outbound)
+	assert.Contains(t, fc.outbound[len(fc.outbound)-1], `"credential_configuration_id":"mdl"`)
+}
+
 // normaliseEnvelope reduces a message to type/timestamp placeholders so a
 // test can pin action and params only.
 func normaliseEnvelope(b []byte) string {
