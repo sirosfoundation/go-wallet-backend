@@ -94,10 +94,12 @@ type ServerConfig struct {
 	WPAddress string
 	WPPort    int
 
-	// Admin server settings
-	AdminPort  int
-	AdminToken string
-	AdminTLS   *config.TLSConfig // nil = inherit from TLS
+	// Admin server settings. AdminAddress is the bind address; empty falls
+	// back to HTTPAddress.
+	AdminAddress string
+	AdminPort    int
+	AdminToken   string
+	AdminTLS     *config.TLSConfig // nil = inherit from TLS
 
 	// Common settings
 	CORS         config.CORSConfig
@@ -584,7 +586,11 @@ func (m *Manager) startAdminServer() error {
 		}
 	}
 
-	adminAddr := fmt.Sprintf("%s:%d", m.cfg.HTTPAddress, m.cfg.AdminPort)
+	adminHost := m.cfg.AdminAddress
+	if adminHost == "" {
+		adminHost = m.cfg.HTTPAddress
+	}
+	adminAddr := fmt.Sprintf("%s:%d", adminHost, m.cfg.AdminPort)
 	m.adminServer = &http.Server{
 		Addr:         adminAddr,
 		Handler:      adminRouter,

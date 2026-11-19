@@ -575,3 +575,60 @@ func TestManagerStartFailureReleasesListenerImmediately(t *testing.T) {
 		_ = ln.Close()
 	}
 }
+
+func freeTCPPort(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+func canConnect(addr string) bool {
+	c, err := net.DialTimeout("tcp", addr, time.Second)
+	if err != nil {
+		return false
+	}
+	_ = c.Close()
+	return true
+}
+
+// The admin listener binds to AdminAddress, not to the public HTTPAddress
+// (#444): an operator who sets admin_host to a loopback address must not see
+// the admin API on the public interface.
+func TestManagerAdminServerBindsToAdminAddress(t *testing.T) {
+	adminPort := freeTCPPort(t)
+	m, err := startTestManager(t, &ServerConfig{
+		HTTPAddress: "127.0.0.1", HTTPPort: 0,
+		AdminAddress: "127.0.0.2", AdminPort: adminPort, AdminToken: "test-token",
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	want := fmt.Sprintf("127.0.0.2:%d", adminPort)
+	if m.adminServer.Addr != want {
+		t.Errorf("admin server address = %q, want %q", m.adminServer.Addr, want)
+	}
+	if !canConnect(want) {
+		t.Errorf("admin API is not reachable on %s", want)
+	}
+	if canConnect(fmt.Sprintf("127.0.0.1:%d", adminPort)) {
+		t.Errorf("admin API is reachable on the HTTP address 127.0.0.1:%d, want only on its own address", adminPort)
+	}
+}
+
+func TestManagerAdminServerFallsBackToHTTPAddress(t *testing.T) {
+	adminPort := freeTCPPort(t)
+	m, err := startTestManager(t, &ServerConfig{
+		HTTPAddress: "127.0.0.1", HTTPPort: 0,
+		AdminPort: adminPort, AdminToken: "test-token",
+	})
+	if err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if want := fmt.Sprintf("127.0.0.1:%d", adminPort); m.adminServer.Addr != want {
+		t.Errorf("admin server address = %q, want %q", m.adminServer.Addr, want)
+	}
+}
