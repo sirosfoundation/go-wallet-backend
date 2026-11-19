@@ -491,7 +491,10 @@ Operator checklist when upgrading:
   `as.legacy.sunset_date`, `jwt.expiry_hours` and `jwt.refresh_days` are accepted but
   ignored, with a startup warning each; delete them.
 - `jwt.secret` is still required (>= 32 bytes): it keys the OIDC state-binding
-  cookie; it signs no tokens. `jwt.issuer` is the fallback for `as.issuer`.
+  cookie and authenticates OID4VCI authorization resumption contexts using a
+  domain-separated key. Use the same secret across engine replicas; rotation
+  invalidates outstanding contexts. It does not sign authentication tokens.
+  `jwt.issuer` is the fallback for `as.issuer`.
 - Set `as.external_url` in every process that validates AS tokens, including the
   `backend` role: the validator fetches the AS JWKS from it, and config
   validation fails without it. The shipped sample configs set it.
