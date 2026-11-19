@@ -151,7 +151,7 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 		p.authMiddleware(),
 	)
 	// These are general user-facing routes, not the narrow-purpose calls
-	// (trust evaluation, engine transport) an identity-free anonymous token
+	// (trust evaluation, the wallet engine transport) an identity-free anonymous token
 	// is scoped to - reject a wallet-registry-only token here.
 	protected.Use(middleware.RequireAudience(audienceWalletBackend))
 	{
@@ -661,8 +661,7 @@ func (p *BackendProvider) Store() backend.Backend {
 }
 
 // MetadataResolver returns the shared issuer metadata resolver, or nil if
-// resolution is not enabled. The engine provider can accept this resolver to
-// share the TTL cache with the HTTP /v1/resolve handler.
+// resolution is not enabled.
 func (p *BackendProvider) MetadataResolver() *issuermetadata.Resolver {
 	return p.metadataResolver
 }
@@ -679,7 +678,7 @@ func (p *BackendProvider) TokenValidator() *tokenvalidator.Validator {
 
 // ASSessionCleaner returns the AS session store as a service.SessionCleaner,
 // or nil if the AS is not enabled, so user deletion can revoke AS cookie
-// sessions alongside engine sessions.
+// sessions.
 func (p *BackendProvider) ASSessionCleaner() service.SessionCleaner {
 	if p.asModule == nil || p.asModule.Sessions == nil {
 		return nil
@@ -1043,7 +1042,7 @@ func NewWalletProviderProvider(cfg *config.Config, logger *zap.Logger) (*WalletP
 	handlers := api.NewHandlers(services, cfg, logger, []string{"wallet-provider"})
 
 	// Build the validator for AS-issued session tokens from the JWKS at as.external_url (as.enabled
-	// is not needed); without it fail startup, as in NewStandaloneEngineTokenValidator.
+	// is not needed); without it fail startup.
 	var tv *tokenvalidator.Validator
 	if cfg.AS.ExternalURL == "" {
 		services.Stop()

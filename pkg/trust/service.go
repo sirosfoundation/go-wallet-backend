@@ -1,7 +1,6 @@
 // Package trust provides a plugin-based trust evaluation system for the wallet backend.
 //
-// The Service type provides trust evaluation for both engine (WebSocket) and
-// HTTP service layers, with independent configuration for issuer (OID4VCI)
+// The Service type provides trust evaluation for the HTTP service layers, with independent configuration for issuer (OID4VCI)
 // and verifier (OID4VP) flows.
 
 package trust
@@ -160,7 +159,7 @@ type EvaluatorFactory func(endpoint string, timeout time.Duration) (TrustEvaluat
 //
 // Service supports independent configuration for issuer and verifier flows,
 // with per-flow PDP URLs and the ability to disable trust evaluation per flow.
-// The same Service instance is used by both engine and HTTP service layers.
+// The same Service instance is shared by the HTTP service layers.
 type Service struct {
 	cfg              *config.Config
 	logger           *zap.Logger

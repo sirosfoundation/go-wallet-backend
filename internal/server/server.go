@@ -6,7 +6,6 @@
 //   - RouteProvider: modes implement this to contribute routes
 //   - ServerManager: combines RouteProviders into HTTP servers
 //   - A single HTTP server can serve multiple modes (auth, storage, backend, registry)
-//   - WebSocket engine can optionally use its own port (for long-lived connections)
 package server
 
 import (

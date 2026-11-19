@@ -99,8 +99,8 @@ type CredentialIssuer struct {
 	CredentialIssuerIdentifier string   `json:"credentialIssuerIdentifier" bson:"credential_issuer_identifier" gorm:"index;not null"`
 	ClientID                   string   `json:"clientId,omitempty" bson:"client_id"`
 	// ClientJWK is the backend's private_key_jwt client credential, including the
-	// private part. It is never serialized to JSON (the engine reads it
-	// in-process from storage; the admin API reports only HasClientJWK).
+	// private part. It is never serialized to JSON (the admin API reports
+	// only HasClientJWK).
 	ClientJWK        string      `json:"-" bson:"client_jwk" gorm:"column:client_jwk"`
 	Visible          bool        `json:"visible" bson:"visible"`
 	TrustStatus      TrustStatus `json:"trustStatus,omitempty" bson:"trust_status" gorm:"default:'unknown'"`
@@ -142,7 +142,7 @@ var ValidClientIDSchemes = map[string]bool{
 	"did":                  true,
 	// OpenID4VP 1.0's name for "did". Both spellings are accepted so a
 	// verifier can be configured with whichever its requests actually carry;
-	// the engine treats them as one scheme.
+	// both are treated as one scheme.
 	"decentralized_identifier": true,
 }
 

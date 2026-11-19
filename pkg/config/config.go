@@ -1324,12 +1324,11 @@ type LoggingConfig struct {
 }
 
 // JWTConfig contains the jwt.* settings. Session tokens are signed by the AS's asymmetric key, so only
-// Secret (authenticates OIDC state and OID4VCI resumption) and Issuer (fallback for as.issuer) matter;
+// Secret (authenticates OIDC state) and Issuer (fallback for as.issuer) matter;
 // ExpiryHours and RefreshDays are removed no-ops (see Config.DeprecatedSettings).
 type JWTConfig struct {
 	// Secret is a server-side secret of at least 32 bytes. It keys the HMAC that binds the OIDC
-	// state parameter to the browser and authenticates OID4VCI authorization
-	// resumption contexts using a domain-separated key. Required; share across engine replicas.
+	// state parameter to the browser. Required; share it across replicas.
 	Secret string `yaml:"secret" envconfig:"SECRET"`
 	// SecretPath is the path to a file containing the secret (alternative to Secret).
 	SecretPath string `yaml:"secret_path" envconfig:"SECRET_PATH"`
@@ -2716,7 +2715,7 @@ func (c *Config) Validate() error {
 		return err
 	}
 
-	// jwt.secret authenticates OIDC state and OID4VCI resumption (see JWTConfig).
+	// jwt.secret authenticates OIDC state (see JWTConfig).
 	if c.JWT.Secret == "" {
 		return fmt.Errorf("jwt secret is required (it keys the OIDC state-binding cookie)")
 	}
