@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
@@ -1538,15 +1539,45 @@ type BeginAddCredentialResponse struct {
 	CreateOptions CreateOptionsResponse `json:"createOptions"`
 }
 
-// BeginAddCredential starts the process of adding a new credential to an existing user
-func (s *WebAuthnService) BeginAddCredential(ctx context.Context, userID domain.UserID) (*BeginAddCredentialResponse, error) {
+// addCredentialTenant normalizes the tenant an add-credential request runs in.
+// The default tenant (and no tenant) use the plain user handle and a credential
+// without a tenant, exactly as a default-tenant signup does; login reads that
+// as the default tenant.
+func addCredentialTenant(tenantID domain.TenantID) domain.TenantID {
+	if tenantID == domain.DefaultTenantID {
+		return ""
+	}
+	return tenantID
+}
+
+// BeginAddCredential starts the process of adding a new credential to an existing user.
+//
+// tenantID is the tenant of the caller's session. A passkey added in a tenant
+// is bound to it the way a signup passkey is: its user handle encodes the
+// tenant and the credential is stored with it. Without that, login finds a
+// tenant-less handle on a tenant member and refuses it (ErrTenantAccessDenied).
+// The caller must be a member of the tenant.
+func (s *WebAuthnService) BeginAddCredential(ctx context.Context, userID domain.UserID, tenantID domain.TenantID) (*BeginAddCredentialResponse, error) {
 	// Get the existing user
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
 
-	waUser := &WebAuthnUser{user: user}
+	tenantID = addCredentialTenant(tenantID)
+	var waUser webauthn.User = &WebAuthnUser{user: user}
+	userHandle := userID.AsUserHandle()
+	if tenantID != "" {
+		memberships, err := s.store.UserTenants().GetUserTenants(ctx, userID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read tenant memberships: %w", err)
+		}
+		if !slices.Contains(memberships, tenantID) {
+			return nil, ErrTenantAccessDenied
+		}
+		userHandle = domain.EncodeUserHandle(tenantID, userID)
+		waUser = &TenantWebAuthnUser{user: user, userHandle: userHandle}
+	}
 
 	// Generate creation options
 	_, session, err := s.webauthn.BeginRegistration(waUser,
@@ -1568,6 +1599,7 @@ func (s *WebAuthnService) BeginAddCredential(ctx context.Context, userID domain.
 		Challenge: session.Challenge,
 		UserID:    userID.String(),
 		Action:    "add_credential",
+		TenantID:  string(tenantID),
 		ExpiresAt: time.Now().Add(5 * time.Minute),
 	}
 
@@ -1603,7 +1635,7 @@ func (s *WebAuthnService) BeginAddCredential(ctx context.Context, userID domain.
 				Name: s.cfg.Server.RPName,
 			},
 			User: PublicKeyCredentialUserEntity{
-				ID:          userID.AsUserHandle(),
+				ID:          userHandle,
 				Name:        waUser.WebAuthnName(),
 				DisplayName: waUser.WebAuthnDisplayName(),
 			},
@@ -1648,8 +1680,10 @@ type FinishAddCredentialResponse struct {
 	PrivateDataETag string `json:"privateDataETag"`
 }
 
-// FinishAddCredential completes adding a new credential to an existing user
-func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain.UserID, req *FinishAddCredentialRequest, ifMatch string) (*FinishAddCredentialResponse, error) {
+// FinishAddCredential completes adding a new credential to an existing user.
+// tenantID is the tenant of the caller's session and must be the one the
+// challenge was begun in.
+func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain.UserID, tenantID domain.TenantID, req *FinishAddCredentialRequest, ifMatch string) (*FinishAddCredentialResponse, error) {
 	// Get the user
 	user, err := s.store.Users().GetByID(ctx, userID)
 	if err != nil {
@@ -1682,6 +1716,9 @@ func (s *WebAuthnService) FinishAddCredential(ctx context.Context, userID domain
 
 	if challenge.Action != "add_credential" {
 		return nil, errors.New("invalid challenge action")
+	}
+	if domain.TenantID(challenge.TenantID) != addCredentialTenant(tenantID) {
+		return nil, ErrTenantAccessDenied
 	}
 
 	waUser := &WebAuthnUser{user: user}

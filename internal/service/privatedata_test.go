@@ -339,14 +339,14 @@ func TestFinishAddCredential_PrivateDataOwnership(t *testing.T) {
 		user.UpdatePrivateData(testPrivateDataContainer(testCredID("a")))
 		require.NoError(t, setup.store.Users().Create(ctx, user))
 
-		begin, err := setup.service.BeginAddCredential(ctx, user.UUID)
+		begin, err := setup.service.BeginAddCredential(ctx, user.UUID, "")
 		require.NoError(t, err)
 		opts := vwaOptions(t, begin.CreateOptions)
 		return setup, user, virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2), opts, begin.ChallengeID
 	}
 	finish := func(setup *testVirtualWebAuthnSetup, user *domain.User, cred virtualwebauthn.Credential, opts virtualwebauthn.AttestationOptions, challengeID string, pd []byte) error {
 		resp := virtualwebauthn.CreateAttestationResponse(setup.rp, setup.authenticator, cred, opts)
-		_, err := setup.service.FinishAddCredential(ctx, user.UUID, &FinishAddCredentialRequest{
+		_, err := setup.service.FinishAddCredential(ctx, user.UUID, "", &FinishAddCredentialRequest{
 			ChallengeID: challengeID,
 			Credential:  json.RawMessage(resp),
 			PrivateData: pd,
@@ -445,11 +445,11 @@ func TestPrivateDataWritePaths_RefuseBrokenEnvelope(t *testing.T) {
 			}
 			user.UpdatePrivateData(testPrivateDataContainer(testCredID("a")))
 			require.NoError(t, setup.store.Users().Create(ctx, user))
-			begin, err := setup.service.BeginAddCredential(ctx, user.UUID)
+			begin, err := setup.service.BeginAddCredential(ctx, user.UUID, "")
 			require.NoError(t, err)
 			opts := vwaOptions(t, begin.CreateOptions)
 			resp := virtualwebauthn.CreateAttestationResponse(setup.rp, setup.authenticator, virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2), opts)
-			_, err = setup.service.FinishAddCredential(ctx, user.UUID, &FinishAddCredentialRequest{
+			_, err = setup.service.FinishAddCredential(ctx, user.UUID, "", &FinishAddCredentialRequest{
 				ChallengeID: begin.ChallengeID, Credential: json.RawMessage(resp), PrivateData: d,
 			}, "")
 			require.ErrorIs(t, err, ErrPrivateDataOwnership, name)

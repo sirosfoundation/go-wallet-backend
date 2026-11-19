@@ -166,7 +166,7 @@ func TestHandlers_FinishAddCredential_Ownership(t *testing.T) {
 	prepare := func(t *testing.T) (*Handlers, *gin.Engine, *domain.User, virtualwebauthn.Credential, virtualwebauthn.AttestationOptions, string) {
 		h, router, user := setupTestHandlersWithUser(t)
 		router.POST("/webauthn/add/finish", authMiddlewareForUser(user), h.FinishAddWebAuthnCredential)
-		begin, err := h.services.WebAuthn.BeginAddCredential(context.Background(), user.UUID)
+		begin, err := h.services.WebAuthn.BeginAddCredential(context.Background(), user.UUID, "")
 		require.NoError(t, err)
 		raw, err := json.Marshal(begin.CreateOptions)
 		require.NoError(t, err)
