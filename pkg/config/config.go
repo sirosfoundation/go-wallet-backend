@@ -1841,7 +1841,8 @@ type WIAConfig struct {
 // The pdp_url field controls both which PDP to use and whether trust is enabled:
 //   - Not set (empty): inherit the global trust configuration
 //   - Set to a URL: use that PDP for this flow (implies trust is enabled)
-//   - Set to "none": explicitly disable trust evaluation for this flow ("allow all")
+//   - Set to "none": explicitly disable trust evaluation for this flow (the
+//     flow skips evaluation; not supported outside development/testing)
 type FlowTrustConfig struct {
 	// PDPURL overrides the global PDP URL for this specific flow.
 	// Empty inherits from global. Set to "none" to explicitly disable trust.
@@ -1858,7 +1859,10 @@ func (c *FlowTrustConfig) IsExplicitlyDisabled() bool {
 //
 // Trust evaluation operates in one of two modes:
 //   - When PDPURL is configured: "default deny" mode - all trust decisions go through the PDP
-//   - When PDPURL is empty: "allow all" mode - requests are always considered trusted
+//   - When PDPURL is empty: trust evaluation is skipped by the flows (not supported
+//     outside development/testing). Calling trust.Service directly with no PDP
+//     denies; the skip lives in the callers' IsIssuerTrustEnabled /
+//     IsVerifierTrustEnabled checks
 //
 // Per-flow overrides allow independent trust configuration for issuer (OID4VCI)
 // and verifier (OID4VP) flows. Setting a per-flow pdp_url implies trust is enabled
@@ -1867,7 +1871,8 @@ func (c *FlowTrustConfig) IsExplicitlyDisabled() bool {
 type TrustConfig struct {
 	// PDPURL is the URL of the AuthZEN PDP (Policy Decision Point) for trust evaluation.
 	// When set, operates in "default deny" mode - trust decisions require PDP approval.
-	// When empty, operates in "allow all" mode - requests are always considered trusted.
+	// When empty, trust evaluation is skipped by the flows (not supported outside
+	// development/testing); a direct trust.Service call with no PDP denies.
 	PDPURL string `yaml:"pdp_url" envconfig:"PDP_URL"`
 
 	// DefaultEndpoint is deprecated. Use PDPURL instead.
