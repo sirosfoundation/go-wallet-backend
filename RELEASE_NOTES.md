@@ -4,6 +4,23 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.25.3:start -->
+## [v0.25.3] - 2026-11-17
+
+### Added
+- Multi-credential issuance support in OID4VCI: clients can now request multiple credentials in a single flow, with per-credential result pairing and completion notifications (#549, #554, #555)
+- Verifier information relay in OID4VP: `verifier_info` members are now passed through to the client for display during presentation flows (#556)
+- Configurable WebSocket ping interval for engine connections, defaulting to 3 seconds for improved keepalive behavior (#548)
+
+### Fixed
+- Authorization response issuer validation in OID4VCI now occurs before token exchange, preventing potential token misuse (#551)
+- WebSocket keepalive configuration now rejects sub-millisecond values that could cause connection instability (#548)
+- Updated to compact go-jose parsers to address deprecation warnings in go-jose 4.1.8 (#548)
+
+### Changed
+- Dependency updates across the go-deps group (#552)
+<!-- release-notes:v0.25.3:end -->
+
 <!-- release-notes:v0.25.2:start -->
 ## [v0.25.2] - 2026-11-11
 
