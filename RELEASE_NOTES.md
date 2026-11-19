@@ -4,6 +4,13 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.25.4:start -->
+## [v0.25.4] - 2026-11-19
+
+### Fixed
+- Each sign request now includes a credential configuration ID, allowing clients to distinguish between different credentials when multiple are in use (#558)
+<!-- release-notes:v0.25.4:end -->
+
 <!-- release-notes:v0.25.3:start -->
 ## [v0.25.3] - 2026-11-17
 
