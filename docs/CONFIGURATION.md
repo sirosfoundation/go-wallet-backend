@@ -215,7 +215,7 @@ Environment prefix: `WALLET_TRUST`
 
 | YAML Key | Env Variable | Type | Description |
 |----------|-------------|------|-------------|
-| `trust.pdp_url` | `WALLET_TRUST_PDP_URL` | string | PDPURL is the URL of the AuthZEN PDP (Policy Decision Point) for trust evaluation. When set, operates in "default deny" mode - trust decisions require PDP approval. When empty, operates in "allow all" mode - requests are always considered trusted. |
+| `trust.pdp_url` | `WALLET_TRUST_PDP_URL` | string | PDPURL is the URL of the AuthZEN PDP (Policy Decision Point) for trust evaluation. When set, operates in "default deny" mode - trust decisions require PDP approval. When empty, trust evaluation is skipped by the flows (not supported outside development/testing); a direct trust.Service call with no PDP denies. |
 | `trust.default_endpoint` | `WALLET_TRUST_DEFAULT_ENDPOINT` | string | DefaultEndpoint is deprecated. Use PDPURL instead. Retained for backward compatibility - if PDPURL is empty and DefaultEndpoint is set, DefaultEndpoint is used. Deprecated: This field will be removed in a future release. |
 | `trust.registry_url` | `WALLET_TRUST_REGISTRY_URL` | string | RegistryURL is the URL for the VCTM registry service. |
 | `trust.timeout` | `WALLET_TRUST_TIMEOUT` | integer | Timeout is the HTTP timeout for trust evaluation requests (seconds). |

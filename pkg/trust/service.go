@@ -183,7 +183,10 @@ func NewService(cfg *config.Config, logger *zap.Logger, factory EvaluatorFactory
 }
 
 // GetEvaluator returns a TrustEvaluator for the given endpoint.
-// Returns nil if endpoint is empty (operating in "allow all" mode).
+// Returns nil if endpoint is empty. evaluate treats a nil evaluator as a
+// denial (fail-closed); skipping trust evaluation altogether is decided by the
+// callers (config.TrustConfig.IsIssuerTrustEnabled / IsVerifierTrustEnabled),
+// not here.
 // Evaluators are cached by endpoint URL for reuse.
 func (s *Service) GetEvaluator(endpoint string) (TrustEvaluator, error) {
 	if endpoint == "" {
@@ -244,7 +247,10 @@ func (s *Service) resolveVerifierEndpoint(sessionEndpoint string) string {
 //
 // The trustEndpoint parameter allows session-level overrides (e.g., from JWT claims).
 // If empty, the per-flow issuer PDP URL is used; if that's empty, the global PDP URL.
-// If no PDP URL is resolved, returns "allow all" (trusted=true).
+// If no PDP URL is resolved, the result is untrusted (fail-closed, Framework
+// "none"). A caller that wants trust evaluation skipped checks
+// config.TrustConfig.IsIssuerTrustEnabled / IsVerifierTrustEnabled first and
+// does not call this.
 //
 // If keyMaterial is provided, validates the subject-to-key binding.
 // If keyMaterial is nil, performs resolution-only (only works for DIDs).
@@ -260,7 +266,10 @@ func (s *Service) EvaluateIssuer(ctx context.Context, issuerID string, trustEndp
 //
 // The trustEndpoint parameter allows session-level overrides (e.g., from JWT claims).
 // If empty, the per-flow verifier PDP URL is used; if that's empty, the global PDP URL.
-// If no PDP URL is resolved, returns "allow all" (trusted=true).
+// If no PDP URL is resolved, the result is untrusted (fail-closed, Framework
+// "none"). A caller that wants trust evaluation skipped checks
+// config.TrustConfig.IsIssuerTrustEnabled / IsVerifierTrustEnabled first and
+// does not call this.
 //
 // If keyMaterial is provided, validates the subject-to-key binding.
 // If keyMaterial is nil, performs resolution-only (only works for DIDs).
