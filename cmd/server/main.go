@@ -193,6 +193,7 @@ func main() {
 		serverCfg.HTTPPort = backendCfg.Server.Port
 		serverCfg.WSAddress = backendCfg.Server.Host
 		serverCfg.WSPort = backendCfg.Server.EnginePort
+		serverCfg.AdminAddress = backendCfg.Server.AdminHost
 		serverCfg.AdminPort = backendCfg.Server.AdminPort
 		serverCfg.AdminToken = backendCfg.Server.AdminToken
 		serverCfg.CORS = backendCfg.Server.CORS
