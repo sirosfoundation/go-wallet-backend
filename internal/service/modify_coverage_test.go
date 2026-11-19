@@ -74,7 +74,7 @@ func TestFinishAddCredential_PrivateDataAtomicWithAppend(t *testing.T) {
 
 	finish := func(t *testing.T, privateData []byte, ifMatch string) (*FinishAddCredentialResponse, error) {
 		t.Helper()
-		begin, err := setup.service.BeginAddCredential(ctx, userID)
+		begin, err := setup.service.BeginAddCredential(ctx, userID, "")
 		require.NoError(t, err)
 		raw, err := json.Marshal(begin.CreateOptions)
 		require.NoError(t, err)
@@ -82,7 +82,7 @@ func TestFinishAddCredential_PrivateDataAtomicWithAppend(t *testing.T) {
 		require.NoError(t, err)
 		cred := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
 		resp := virtualwebauthn.CreateAttestationResponse(setup.rp, setup.authenticator, cred, *opts)
-		return setup.service.FinishAddCredential(ctx, userID, &FinishAddCredentialRequest{
+		return setup.service.FinishAddCredential(ctx, userID, "", &FinishAddCredentialRequest{
 			ChallengeID: begin.ChallengeID,
 			Credential:  json.RawMessage(resp),
 			PrivateData: privateData,

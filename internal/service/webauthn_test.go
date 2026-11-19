@@ -1765,7 +1765,7 @@ func TestConsumeChallenge_GenericStorageError_IsWrapped(t *testing.T) {
 		svc, err := NewWebAuthnService(wrapped, cfg, zap.NewNop())
 		require.NoError(t, err)
 
-		_, err = svc.FinishAddCredential(context.Background(), userID, &FinishAddCredentialRequest{
+		_, err = svc.FinishAddCredential(context.Background(), userID, "", &FinishAddCredentialRequest{
 			ChallengeID: "boom-challenge",
 		}, "")
 		require.Error(t, err)
@@ -2056,7 +2056,7 @@ func TestBeginAddCredential(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Run("creates add credential options", func(t *testing.T) {
-		resp, err := setup.service.BeginAddCredential(setup.ctx, userID)
+		resp, err := setup.service.BeginAddCredential(setup.ctx, userID, "")
 		require.NoError(t, err)
 
 		assert.NotEmpty(t, resp.ChallengeID)
@@ -2066,14 +2066,14 @@ func TestBeginAddCredential(t *testing.T) {
 	})
 
 	t.Run("excludes existing credentials", func(t *testing.T) {
-		resp, err := setup.service.BeginAddCredential(setup.ctx, userID)
+		resp, err := setup.service.BeginAddCredential(setup.ctx, userID, "")
 		require.NoError(t, err)
 
 		assert.Len(t, resp.CreateOptions.PublicKey.ExcludeCredentials, 1)
 	})
 
 	t.Run("stores challenge with add_credential action", func(t *testing.T) {
-		resp, err := setup.service.BeginAddCredential(setup.ctx, userID)
+		resp, err := setup.service.BeginAddCredential(setup.ctx, userID, "")
 		require.NoError(t, err)
 
 		challenge, err := setup.store.Challenges().GetByID(setup.ctx, resp.ChallengeID)
@@ -2084,7 +2084,7 @@ func TestBeginAddCredential(t *testing.T) {
 
 	t.Run("user not found", func(t *testing.T) {
 		nonExistentUserID := domain.NewUserID()
-		_, err := setup.service.BeginAddCredential(setup.ctx, nonExistentUserID)
+		_, err := setup.service.BeginAddCredential(setup.ctx, nonExistentUserID, "")
 		assert.Error(t, err)
 	})
 }
@@ -2103,7 +2103,7 @@ func TestFinishAddCredential_Errors(t *testing.T) {
 			Credential:  json.RawMessage(`{}`),
 		}
 
-		_, err := setup.service.FinishAddCredential(setup.ctx, userID, finishReq, "")
+		_, err := setup.service.FinishAddCredential(setup.ctx, userID, "", finishReq, "")
 		// FinishAddCredential first checks user existence, so we get ErrNotFound from user lookup
 		assert.Error(t, err)
 	})
@@ -2133,7 +2133,7 @@ func TestFinishAddCredential_Errors(t *testing.T) {
 			Credential:  json.RawMessage(`{}`),
 		}
 
-		_, err = setup.service.FinishAddCredential(setup.ctx, userID, finishReq, "")
+		_, err = setup.service.FinishAddCredential(setup.ctx, userID, "", finishReq, "")
 		assert.ErrorIs(t, err, ErrChallengeExpired)
 	})
 
@@ -2174,7 +2174,7 @@ func TestFinishAddCredential_Errors(t *testing.T) {
 		// user 2's request must be rejected as "not found" (indistinguishable
 		// from the challenge simply not existing — deliberately, so a caller
 		// can't probe which) WITHOUT consuming it.
-		_, err = setup.service.FinishAddCredential(setup.ctx, userID2, finishReq, "")
+		_, err = setup.service.FinishAddCredential(setup.ctx, userID2, "", finishReq, "")
 		assert.ErrorIs(t, err, ErrChallengeNotFound)
 
 		// The real owner (user 1) must still be able to use their own
@@ -2228,7 +2228,7 @@ func TestFullAddCredentialFlow(t *testing.T) {
 	newCredential := virtualwebauthn.NewCredential(virtualwebauthn.KeyTypeEC2)
 
 	// Begin add credential
-	beginAddResp, err := setup.service.BeginAddCredential(setup.ctx, userID)
+	beginAddResp, err := setup.service.BeginAddCredential(setup.ctx, userID, "")
 	require.NoError(t, err)
 
 	// Parse options
@@ -2258,7 +2258,7 @@ func TestFullAddCredentialFlow(t *testing.T) {
 		Nickname:    "Second Passkey",
 	}
 
-	finishAddResp, err := setup.service.FinishAddCredential(setup.ctx, userID, finishAddReq, "")
+	finishAddResp, err := setup.service.FinishAddCredential(setup.ctx, userID, "", finishAddReq, "")
 	require.NoError(t, err)
 
 	assert.NotEmpty(t, finishAddResp.CredentialID)
