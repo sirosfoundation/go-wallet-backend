@@ -369,21 +369,6 @@ func TestHandlers_GetIssuerByID_InvalidID(t *testing.T) {
 	}
 }
 
-// Test KeystoreStatus handler
-func TestHandlers_KeystoreStatus_Unauthorized(t *testing.T) {
-	handlers, router := setupTestHandlers(t)
-	router.GET("/keystore/status", handlers.KeystoreStatus)
-
-	w := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/keystore/status", nil)
-	router.ServeHTTP(w, req)
-
-	// Returns 401 when no user context
-	if w.Code != http.StatusUnauthorized {
-		t.Errorf("Expected status %d, got %d", http.StatusUnauthorized, w.Code)
-	}
-}
-
 // Test GetCertificate handler - returns certificate chain
 func TestHandlers_GetCertificate_Success(t *testing.T) {
 	handlers, router := setupTestHandlers(t)

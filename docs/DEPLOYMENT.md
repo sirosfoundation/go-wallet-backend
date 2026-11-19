@@ -670,7 +670,7 @@ lag is therefore not a concern for these collections.
 The store fails closed. If it cannot be reached or set up, a revocation
 lookup that cannot be answered refuses the request instead of accepting it:
 API requests get `503 {"error":"Token revocation check unavailable"}`, the
-token-delegation endpoint answers 503, a WebSocket handshake is refused, and a
+token-delegation endpoint answers 503, and a
 token checked by the token validator is rejected with 401. Every lookup is
 bounded to 5 seconds. A revocation write that fails
 fails the request: logout (`POST /user/session/logout`, `DELETE /auth/session`)

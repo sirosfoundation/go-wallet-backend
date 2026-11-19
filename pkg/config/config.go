@@ -29,7 +29,6 @@ type Config struct {
 	AS             ASConfig             `yaml:"as" envconfig:"AS"`
 	WalletProvider WalletProviderConfig `yaml:"wallet_provider" envconfig:"WALLET_PROVIDER"`
 	Trust          TrustConfig          `yaml:"trust" envconfig:"TRUST"`
-	SessionStore   SessionStoreConfig   `yaml:"session_store" envconfig:"SESSION_STORE"`
 	Features       FeaturesConfig       `yaml:"features" envconfig:"FEATURES"`
 	Security       SecurityConfig       `yaml:"security" envconfig:"SECURITY"`
 	HTTPClient     HTTPClientConfig     `yaml:"http_client" envconfig:"HTTP_CLIENT"`
@@ -1904,12 +1903,6 @@ type FeaturesConfig struct {
 	// Default: true (for backward compatibility)
 	ProxyEnabled bool `yaml:"proxy_enabled" envconfig:"PROXY_ENABLED"`
 
-	// WebSocketRequired forces WebSocket transport for credential flows.
-	// When true, the proxy endpoint will return an error directing clients
-	// to use the WebSocket transport instead.
-	// Default: false
-	WebSocketRequired bool `yaml:"websocket_required" envconfig:"WEBSOCKET_REQUIRED"`
-
 	// CredentialStorageEnabled controls whether server-side credential storage
 	// endpoints (/storage/vc/*) are available. By default, credentials are stored
 	// exclusively in the encrypted client-side private_data blob and the server-side
@@ -2171,24 +2164,6 @@ func (c *TokenBlacklistConfig) SetDefaults() {
 	if c.CleanupIntervalSeconds == 0 {
 		c.CleanupIntervalSeconds = 3600
 	}
-}
-
-// SessionStoreConfig contains WebSocket session store configuration
-type SessionStoreConfig struct {
-	// Type is the session store type: "memory" or "redis"
-	Type string `yaml:"type" envconfig:"TYPE"`
-	// Redis contains Redis-specific configuration
-	Redis RedisConfig `yaml:"redis" envconfig:"REDIS"`
-	// DefaultTTL is the default session TTL in hours
-	DefaultTTLHours int `yaml:"default_ttl_hours" envconfig:"DEFAULT_TTL_HOURS"`
-}
-
-// RedisConfig contains Redis connection configuration
-type RedisConfig struct {
-	Address   string `yaml:"address" envconfig:"ADDRESS"`
-	Password  string `yaml:"password" envconfig:"PASSWORD"`
-	DB        int    `yaml:"db" envconfig:"DB"`
-	KeyPrefix string `yaml:"key_prefix" envconfig:"KEY_PREFIX"`
 }
 
 // Load loads configuration from file and environment variables
@@ -2508,17 +2483,8 @@ func defaultConfig() *Config {
 		Trust: TrustConfig{
 			Timeout: 30, // seconds
 		},
-		SessionStore: SessionStoreConfig{
-			Type:            "memory",
-			DefaultTTLHours: 24,
-			Redis: RedisConfig{
-				Address:   "localhost:6379",
-				KeyPrefix: "ws:session:",
-			},
-		},
 		Features: FeaturesConfig{
 			ProxyEnabled:             true,  // Default: proxy enabled for backward compatibility
-			WebSocketRequired:        false, // Default: proxy still allowed
 			CredentialStorageEnabled: false, // Default: server-side credential storage disabled
 		},
 		Security: SecurityConfig{

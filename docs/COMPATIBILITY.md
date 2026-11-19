@@ -192,8 +192,6 @@ The following endpoints extend the functionality beyond the reference implementa
 | Endpoint | Method | Description |
 |----------|--------|-------------|
 | `/status` | GET | Extended status with service info |
-| `/keystore/status` | GET | Check if keystore client is connected |
-| `/ws/keystore` | WS | WebSocket for client-side keystore |
 
 ## Intentional Extensions
 
@@ -232,16 +230,7 @@ Configuration via multiple sources (in order of precedence):
 2. Environment variables (prefixed with `WALLET_`)
 3. YAML configuration file
 
-### 4. WebSocket Client Keystore
-
-Extended WebSocket-based keystore for client-side key management:
-
-- **`/ws/keystore`**: WebSocket endpoint for keystore clients
-- **`/keystore/status`**: Check if a user's keystore client is connected
-
-This allows the wallet frontend to maintain keys client-side while the server can request signatures.
-
-### 5. Deprecated Password Authentication
+### 4. Deprecated Password Authentication
 
 The Go implementation deprecates password-based authentication:
 
@@ -249,7 +238,7 @@ The Go implementation deprecates password-based authentication:
 - Users are directed to use WebAuthn endpoints instead
 - This improves security by enforcing passwordless authentication
 
-### 6. Extended Error Responses
+### 5. Extended Error Responses
 
 More informative error responses with consistent structure:
 
@@ -272,7 +261,7 @@ Error codes are HTTP status codes that match the reference implementation:
 - 503: Temporarily unavailable; user writes that keep losing a concurrent-modification race answer 503 with `Retry-After` and can be retried
 - 504: Gateway timeout (request deadline exceeded while writing user data)
 
-### 7. Prepared Future Extensions
+### 6. Prepared Future Extensions
 
 The following capabilities are prepared but not yet exposed as API endpoints:
 

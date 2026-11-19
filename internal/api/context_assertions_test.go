@@ -34,7 +34,6 @@ func TestHandlers_NonStringUserID_FailsClosed(t *testing.T) {
 		{http.MethodPost, "/webauthn/add/finish", handlers.FinishAddWebAuthnCredential},
 		{http.MethodDelete, "/webauthn/credential/:id", handlers.DeleteWebAuthnCredential},
 		{http.MethodPatch, "/webauthn/credential/:id", handlers.RenameWebAuthnCredential},
-		{http.MethodGet, "/keystore/status", handlers.KeystoreStatus},
 	}
 	for _, r := range routes {
 		router.Handle(r.method, r.path, r.handler)

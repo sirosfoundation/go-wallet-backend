@@ -16,7 +16,6 @@ Environment variables use the prefix `WALLET_` (the registry role's settings are
 - [as](#as)
 - [wallet_provider](#wallet_provider)
 - [trust](#trust)
-- [session_store](#session_store)
 - [features](#features)
 - [security](#security)
 - [http_client](#http_client)
@@ -217,19 +216,6 @@ Environment prefix: `WALLET_TRUST`
 | `trust.issuer.pdp_url` | `WALLET_TRUST_ISSUER_PDP_URL` | string | PDPURL overrides the global PDP URL for this specific flow. Empty inherits from global. Set to "none" to explicitly disable trust. |
 | `trust.verifier.pdp_url` | `WALLET_TRUST_VERIFIER_PDP_URL` | string | PDPURL overrides the global PDP URL for this specific flow. Empty inherits from global. Set to "none" to explicitly disable trust. |
 
-## session_store
-
-Environment prefix: `WALLET_SESSION_STORE`
-
-| YAML Key | Env Variable | Type | Description |
-|----------|-------------|------|-------------|
-| `session_store.type` | `WALLET_SESSION_STORE_TYPE` | string | Type is the session store type: "memory" or "redis" |
-| `session_store.redis.address` | `WALLET_SESSION_STORE_REDIS_ADDRESS` | string |  |
-| `session_store.redis.password` | `WALLET_SESSION_STORE_REDIS_PASSWORD` | string |  |
-| `session_store.redis.db` | `WALLET_SESSION_STORE_REDIS_DB` | integer |  |
-| `session_store.redis.key_prefix` | `WALLET_SESSION_STORE_REDIS_KEY_PREFIX` | string |  |
-| `session_store.default_ttl_hours` | `WALLET_SESSION_STORE_DEFAULT_TTL_HOURS` | integer | DefaultTTL is the default session TTL in hours |
-
 ## features
 
 Environment prefix: `WALLET_FEATURES`
@@ -238,7 +224,6 @@ Environment prefix: `WALLET_FEATURES`
 |----------|-------------|------|-------------|
 | `features.disable_opportunistic_request_encryption` | `WALLET_FEATURES_DISABLE_OPPORTUNISTIC_REQUEST_ENCRYPTION` | boolean | DisableOpportunisticRequestEncryption disables optional OID4VCI credential request encryption, including deferred requests, for issuer compatibility. Required request encryption and encryption needed for an encrypted response are unaffected. Default: false (opportunistic encryption enabled). |
 | `features.proxy_enabled` | `WALLET_FEATURES_PROXY_ENABLED` | boolean | ProxyEnabled controls whether the /proxy endpoint is available. Set to false to disable the proxy . Default: true (for backward compatibility) |
-| `features.websocket_required` | `WALLET_FEATURES_WEBSOCKET_REQUIRED` | boolean | WebSocketRequired forces WebSocket transport for credential flows. When true, the proxy endpoint will return an error directing clients to use the WebSocket transport instead. Default: false |
 | `features.credential_storage_enabled` | `WALLET_FEATURES_CREDENTIAL_STORAGE_ENABLED` | boolean | CredentialStorageEnabled controls whether server-side credential storage endpoints (/storage/vc/*) are available. By default, credentials are stored exclusively in the encrypted client-side private_data blob and the server-side storage path is unused. Set to true only if you need backward-compatible server-side credential storage. Default: false (server-side credential storage disabled) |
 
 ## security

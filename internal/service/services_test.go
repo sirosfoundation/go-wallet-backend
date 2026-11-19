@@ -63,9 +63,6 @@ func TestNewServices(t *testing.T) {
 	if services.Verifier == nil {
 		t.Error("expected Verifier service to be initialized")
 	}
-	if services.Keystore == nil {
-		t.Error("expected Keystore service to be initialized")
-	}
 	if services.Proxy == nil {
 		t.Error("expected Proxy service to be initialized")
 	}

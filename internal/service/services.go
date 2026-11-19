@@ -21,7 +21,6 @@ type Services struct {
 	Credential       *CredentialService
 	Issuer           *IssuerService
 	Verifier         *VerifierService
-	Keystore         *KeystoreService
 	Proxy            *ProxyService
 	Helper           *HelperService
 	WalletProvider   *WalletProviderService
@@ -161,7 +160,6 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		Credential:       NewCredentialService(store, cfg, logger),
 		Issuer:           NewIssuerService(store, logger),
 		Verifier:         NewVerifierService(store, logger),
-		Keystore:         NewKeystoreService(store, cfg, logger),
 		Proxy:            NewProxyService(cfg, logger),
 		Helper:           NewHelperService(logger, cfg.HTTPClient),
 		WalletProvider:   wpSvc,

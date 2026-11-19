@@ -548,22 +548,3 @@ The API does not currently use versioning. When versioning is introduced, it wil
 
 ---
 
-## WebSocket API
-
-TODO: WebSocket support for client-side keystores is not yet implemented.
-
-When implemented, the WebSocket endpoint will be:
-
-```
-ws://localhost:8080/ws
-```
-
-### Message Format
-
-```json
-{
-  "message_id": "unique-id",
-  "action": "sign_presentation",
-  "payload": {...}
-}
-```

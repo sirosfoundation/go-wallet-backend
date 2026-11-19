@@ -6,7 +6,6 @@ package api
 //
 // Note: API versioning refers to capability levels, not URL prefixes.
 // - REST API endpoints are at /api/... (no version prefix)
-// - WebSocket API is at /api/v2/wallet (when engine role is active)
 //
 // The api_version field in /status indicates what features are available.
 const (
@@ -33,9 +32,6 @@ var roleCapabilities = map[string][]string{
 	},
 	"registry": {
 		"vctm-registry",
-	},
-	"engine": {
-		"websocket", // WebSocket v2 protocol at /api/v2/wallet
 	},
 	"auth": {
 		"webauthn",       // WebAuthn registration/authentication

@@ -203,12 +203,6 @@ func (p *AuthProvider) RegisterRoutes(router *gin.Engine) {
 			protected.POST("/proxy", middleware.MustHaveTAC("r"), p.handlers.ProxyRequest)
 		}
 
-		// Keystore routes
-		keystoreGroup := protected.Group("/keystore")
-		{
-			keystoreGroup.GET("/status", middleware.MustHaveTAC("r"), p.handlers.KeystoreStatus)
-		}
-
 		// Wallet provider routes
 		walletProvider := protected.Group("/wallet-provider")
 		{
@@ -538,10 +532,6 @@ func NewBackendProvider(cfg *config.Config, logger *zap.Logger, roles []string) 
 	}
 
 	authProvider.tokenValidator = tv
-	if tv != nil {
-		// The keystore websocket handshake uses the same JWKS validator as the HTTP routes.
-		authProvider.services.Keystore.SetTokenValidator(tv)
-	}
 	storageProvider := NewStorageProvider(cfg, store, logger, roles)
 	storageProvider.tokenValidator = tv
 	// Share the auth provider's blacklist instance (see the comment above

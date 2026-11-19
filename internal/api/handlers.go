@@ -1049,26 +1049,6 @@ func (h *Handlers) AuthCheck(c *gin.Context) {
 	c.Status(200)
 }
 
-// WebSocketKeystore handles WebSocket connections for client-side keystores
-// The wallet client connects here to receive signing requests from the server
-func (h *Handlers) WebSocketKeystore(c *gin.Context) {
-	h.services.Keystore.HandleWebSocket(c.Writer, c.Request)
-}
-
-// KeystoreStatus checks if a user's keystore client is connected
-func (h *Handlers) KeystoreStatus(c *gin.Context) {
-	userID, ok := contextUserID(c)
-	if !ok {
-		c.JSON(401, gin.H{"error": "Unauthorized"})
-		return
-	}
-
-	connected := h.services.Keystore.IsClientConnected(userID)
-	c.JSON(200, gin.H{
-		"connected": connected,
-	})
-}
-
 // =============================================================================
 // Public Tenant Config
 // =============================================================================
