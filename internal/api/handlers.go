@@ -848,9 +848,10 @@ func (h *Handlers) StartAddWebAuthnCredential(c *gin.Context) {
 		return
 	}
 
-	resp, err := h.services.WebAuthn.BeginAddCredential(c.Request.Context(), domain.UserIDFromString(userID))
+	tenantID, _ := h.getTenantID(c)
+	resp, err := h.services.WebAuthn.BeginAddCredential(c.Request.Context(), domain.UserIDFromString(userID), tenantID)
 	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
+		if errors.Is(err, storage.ErrNotFound) || errors.Is(err, service.ErrTenantAccessDenied) {
 			c.JSON(403, gin.H{})
 			return
 		}
@@ -884,9 +885,11 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 	// Get If-Match header for private data
 	ifMatch := c.GetHeader("X-Private-Data-If-Match")
 
+	tenantID, _ := h.getTenantID(c)
 	resp, err := h.services.WebAuthn.FinishAddCredential(
 		c.Request.Context(),
 		domain.UserIDFromString(userID),
+		tenantID,
 		&req,
 		ifMatch,
 	)
@@ -901,6 +904,8 @@ func (h *Handlers) FinishAddWebAuthnCredential(c *gin.Context) {
 			c.JSON(404, gin.H{})
 		case errors.Is(err, service.ErrVerificationFailed):
 			c.JSON(400, gin.H{"error": "Registration response could not be verified"})
+		case errors.Is(err, service.ErrTenantAccessDenied):
+			c.JSON(403, gin.H{})
 		case errors.Is(err, service.ErrAAGUIDBlacklisted):
 			c.JSON(403, gin.H{"error": "Authenticator not allowed"})
 		case errors.Is(err, service.ErrPrivateDataConflict):
