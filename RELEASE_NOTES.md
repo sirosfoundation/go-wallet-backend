@@ -4,6 +4,14 @@
      `release-notes:<tag>` markers; edit the prose inside a fence freely —
      regeneration only ever rewrites the fence it was asked to rewrite. -->
 
+<!-- release-notes:v0.25.5:start -->
+## [v0.25.5] - 2026-11-19
+
+### Fixed
+
+- Passkeys added through settings are now correctly bound to the session's tenant, preventing cross-tenant credential issues (#561)
+<!-- release-notes:v0.25.5:end -->
+
 <!-- release-notes:v0.25.4:start -->
 ## [v0.25.4] - 2026-11-19
 
