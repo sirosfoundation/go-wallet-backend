@@ -225,6 +225,37 @@ Client → Server:
 }
 ```
 
+##### The selected set (multi-credential issuance)
+
+An offer may name several `credential_configuration_ids`. What issues is a
+SET, and the client that already resolved the user's choice (a picker UI
+ahead of the flow) names it on `flow_start`:
+
+```
+Client → Server:
+{
+  "type": "flow_start",
+  "flow_id": "<uuid>",
+  "protocol": "oid4vci",
+  "offer": "openid-credential-offer://...",
+  "credential_configuration_ids": ["pid", "mdl"]
+}
+```
+
+The member is the selection: no ask runs, whatever the deployment's
+`engine_issuance_selection_policy` (`issue_all`, the default, or
+`user_selects`; see "User Selection" below). Absent or empty means every
+offered configuration (the `issue_all` default). Every named id must be one
+the offer carries — an id outside the offer fails the flow per-id, never a
+silent fall-back to issuing configurations nobody chose. The offer's order
+wins over the answer's; duplicates collapse.
+
+One authorization and one token cover the whole set: the scope is the set's
+joined values (de-duplicated, offer order, RFC 6749 §3.3 space-delimited),
+and each configuration issues in its own request — its own proofs (a fresh
+key per proof beyond the first; two proofs over the same key link the
+credentials), its own c_nonce retry, its own deferred polling.
+
 #### Flow Progression
 
 Server executes the protocol, sending progress updates:
@@ -310,7 +341,11 @@ Server → Client:
 
 #### User Selection
 
-Flow pauses for user to select credential configuration:
+Under the `user_selects` policy (`engine_issuance_selection_policy`:
+`user_selects`; the default `issue_all` issues every offered configuration
+with no selection step at all — and a `flow_start`
+`credential_configuration_ids` set is the selection under either policy),
+the flow pauses for the user to select the credential configurations:
 
 ```
 Server → Client:
@@ -329,7 +364,8 @@ Server → Client:
 }
 ```
 
-Client responds:
+Client responds — the answer is a SET, a subset of the offer (one, several,
+or all):
 
 ```
 Client → Server:
@@ -337,9 +373,16 @@ Client → Server:
   "type": "flow_action",
   "flow_id": "<uuid>",
   "action": "select_credential",
-  "credential_configuration_id": "UniversityDegree_jwt_vc_json"
+  "credential_configuration_ids": ["UniversityDegree_jwt_vc_json", "Mdl_mso_mdoc"]
 }
 ```
+
+The legacy single `credential_configuration_id` member is accepted as the
+one-element answer (pre-#549 clients); the plural member wins when both
+arrive. Every named id must be one the offer carried — an id outside the
+offer refuses, per-id. A single-configuration offer never asks: it
+auto-selects under either policy. The offer's order wins; duplicates
+collapse.
 
 #### Authorization
 
@@ -351,8 +394,16 @@ Server → Client:
   "type": "flow_progress",
   "flow_id": "<uuid>",
   "step": "authorization_required",
-  "authorization_url": "https://auth.example.com/authorize?...",
-  "expected_redirect_uri": "https://wallet.example.com/callback"
+  "payload": {
+    "authorization_url": "https://auth.example.com/authorize?...",
+    "expected_redirect_uri": "https://wallet.example.com/callback",
+    "state": "xyz789",
+    "code_verifier": "<PKCE verifier>",
+    "credential_offer": { "credential_issuer": "https://issuer.example.com" },
+    "authorization_context": "<opaque signed transaction>",
+    "expected_issuer": "https://auth.example.com",
+    "require_iss": true
+  }
 }
 ```
 
@@ -364,10 +415,57 @@ Client → Server:
   "type": "flow_action",
   "flow_id": "<uuid>",
   "action": "authorization_complete",
-  "code": "abc123",
-  "state": "xyz789"
+  "payload": {
+    "code": "abc123",
+    "state": "xyz789",
+    "iss": "https://auth.example.com"
+  }
 }
 ```
+
+Clients MUST preserve the authorization response's `iss` parameter exactly after
+URL decoding, without URL normalization. Before forwarding a callback, reject
+duplicate `iss` parameters (including two identical values); do not select one
+using a first-value/last-value accessor. The browser callback parser lives outside
+this repository and must implement this check. The backend additionally rejects
+duplicate JSON `iss` fields, null/non-string values, empty values, and mismatches.
+Clients must not synthesize `iss` from `expected_issuer` when it is absent.
+
+The expected issuer is the selected authorization server identifier, not
+necessarily the credential issuer. When AS metadata advertises
+`authorization_response_iss_parameter_supported: true`, missing `iss` fails
+authorization before any token request. For FAPI deployments, set
+`security.require_authorization_response_issuer: true` (environment:
+`WALLET_SECURITY_REQUIRE_AUTHORIZATION_RESPONSE_ISSUER=true`) to require it even
+if metadata omits or disables that advertisement. The default is false, preserving
+non-FAPI issuers that do not support RFC 9207; a supplied issuer is always checked.
+
+For a same-tab redirect, save `authorization_context`, the offer, and the PKCE
+verifier before navigating. On return, start a new OID4VCI flow:
+
+```json
+{
+  "type": "flow_start",
+  "flow_id": "<new uuid>",
+  "protocol": "oid4vci",
+  "offer": "<saved credential offer as JSON>",
+  "auth_code": "abc123",
+  "state": "xyz789",
+  "iss": "https://auth.example.com",
+  "code_verifier": "<saved PKCE verifier>",
+  "redirect_uri": "https://wallet.example.com/callback",
+  "authorization_context": "<saved opaque signed transaction>"
+}
+```
+
+`state` and `iss` above come from the callback, not from the saved request.
+Resumption now requires the signed context and matching state; older clients
+must be updated. The context expires after five minutes and binds the original
+authorization server, credential issuer, token endpoint, client ID, redirect URI,
+PKCE challenge/policy, issuer requirement, user, and tenant. Rediscovery cannot
+relax the original checks or change the token destination. Resume on another
+replica is supported when its `jwt.secret` matches; secret rotation invalidates
+outstanding contexts. This context is not an authentication/bearer token.
 
 For pre-authorized flows:
 
@@ -593,6 +691,7 @@ Server → Client:
   "flow_id": "<uuid>",
   "credentials": [
     {
+      "credential_configuration_id": "UniversityDegree_jwt_vc_json",
       "format": "jwt_vc_json",
       "credential": "eyJ...",
       "vct": "https://example.com/credentials/degree",
@@ -601,6 +700,48 @@ Server → Client:
   ]
 }
 ```
+
+Each `credentials[i]` carries its own `credential_configuration_id` — the
+pairing a renewal's `selected_credential_configuration_id` needs; a
+multi-configuration completion carries one entry per issued configuration,
+in the offer's order. Each entry also carries its own
+`credential_response_encrypted` flag and its own `credential_metadata`
+(the filtered display-only `display`/`claims` members of its response) —
+a multi-configuration flow may mix plain and encrypted answers, so the
+encryption state and display metadata are per-result, not per-flow (the
+flow-level members stay as the legacy single-configuration view).
+
+A configuration of the set that fails does NOT abort the others: the flow
+still completes with every issued credential, and the completion carries
+the per-configuration failure report:
+
+```
+Server → Client:
+{
+  "type": "flow_complete",
+  "flow_id": "<uuid>",
+  "credentials": [
+    {
+      "credential_configuration_id": "pid",
+      "format": "dc+sd-jwt",
+      "credential": "eyJ...",
+      "credential_response_encrypted": false,
+      "credential_metadata": { "display": [ ... ] }
+    }
+  ],
+  "failures": [
+    {
+      "credential_configuration_id": "mdl",
+      "error": "oid4vci: credential endpoint answered 500"
+    }
+  ]
+}
+```
+
+Zero successes is a failed flow with exactly ONE `flow_error` (the first
+failure's step and code) — never one error per configuration; a partial
+success emits no `flow_error` at all, so a client treating `flow_error` as
+terminal can always consume the issued remainder.
 
 Encrypted issuer response (engine-blind): when the issuer's Credential
 Response is encrypted to a key only the client holds, `flow_complete` carries

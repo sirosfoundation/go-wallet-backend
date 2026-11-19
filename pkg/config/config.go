@@ -1118,13 +1118,24 @@ type ServerConfig struct {
 	// intermediary from seeing the connection go idle - the ping itself is
 	// what does that - so it stays generous.
 	EngineWSPongTimeout time.Duration `yaml:"engine_ws_pong_timeout" envconfig:"ENGINE_WS_PONG_TIMEOUT"`
-	RegistryHost        string        `yaml:"registry_host" envconfig:"REGISTRY_HOST"`       // Registry bind address (defaults to Host)
-	RegistryPort        int           `yaml:"registry_port" envconfig:"REGISTRY_PORT"`       // VCTM registry port (defaults to 8097)
-	WPHost              string        `yaml:"wp_host" envconfig:"WP_HOST"`                   // Wallet-provider bind address (defaults to Host)
-	WPPort              int           `yaml:"wp_port" envconfig:"WP_PORT"`                   // Wallet-provider port (0 = co-hosted with backend)
-	AdminToken          string        `yaml:"admin_token" envconfig:"ADMIN_TOKEN"`           // Bearer token for admin API (auto-generated if empty)
-	AdminTokenPath      string        `yaml:"admin_token_path" envconfig:"ADMIN_TOKEN_PATH"` // Path to file containing admin token
-	RPID                string        `yaml:"rp_id" envconfig:"RP_ID"`
+	// EngineIssuanceSelectionPolicy decides who selects the credential
+	// configurations a multi-configuration offer issues
+	// (go-wallet-backend#549, Platform-Epics#63):
+	//   "issue_all" (the default) - every offered configuration issues,
+	//   with no user-selection step at all;
+	//   "user_selects" - the awaiting_selection progress +
+	//   select_credential action run, and the answer carries a SET of
+	//   configuration ids: a subset of the offer (one, several, or all).
+	// A single-configuration offer issues unchanged under either policy
+	// (the auto-select-when-one rule).
+	EngineIssuanceSelectionPolicy string `yaml:"engine_issuance_selection_policy" envconfig:"ENGINE_ISSUANCE_SELECTION_POLICY" default:"issue_all"`
+	RegistryHost                  string `yaml:"registry_host" envconfig:"REGISTRY_HOST"`       // Registry bind address (defaults to Host)
+	RegistryPort                  int    `yaml:"registry_port" envconfig:"REGISTRY_PORT"`       // VCTM registry port (defaults to 8097)
+	WPHost                        string `yaml:"wp_host" envconfig:"WP_HOST"`                   // Wallet-provider bind address (defaults to Host)
+	WPPort                        int    `yaml:"wp_port" envconfig:"WP_PORT"`                   // Wallet-provider port (0 = co-hosted with backend)
+	AdminToken                    string `yaml:"admin_token" envconfig:"ADMIN_TOKEN"`           // Bearer token for admin API (auto-generated if empty)
+	AdminTokenPath                string `yaml:"admin_token_path" envconfig:"ADMIN_TOKEN_PATH"` // Path to file containing admin token
+	RPID                          string `yaml:"rp_id" envconfig:"RP_ID"`
 	// RPOrigin is the legacy single-origin setting. Kept for backward compatibility.
 	// New deployments should use RPOrigins. When both are set, RPOrigin is prepended.
 	RPOrigin  string   `yaml:"rp_origin" envconfig:"RP_ORIGIN"`
@@ -1411,11 +1422,12 @@ type LoggingConfig struct {
 }
 
 // JWTConfig contains the jwt.* settings. Session tokens are signed by the AS's asymmetric key, so only
-// Secret (keys the OIDC state-binding cookie HMAC) and Issuer (fallback for as.issuer) matter;
+// Secret (authenticates OIDC state and OID4VCI resumption) and Issuer (fallback for as.issuer) matter;
 // ExpiryHours and RefreshDays are removed no-ops (see Config.DeprecatedSettings).
 type JWTConfig struct {
 	// Secret is a server-side secret of at least 32 bytes. It keys the HMAC that binds the OIDC
-	// state parameter to the browser (state-binding cookie). Required.
+	// state parameter to the browser and authenticates OID4VCI authorization
+	// resumption contexts using a domain-separated key. Required; share across engine replicas.
 	Secret string `yaml:"secret" envconfig:"SECRET"`
 	// SecretPath is the path to a file containing the secret (alternative to Secret).
 	SecretPath string `yaml:"secret_path" envconfig:"SECRET_PATH"`
@@ -2116,6 +2128,12 @@ func (c *AuthZENProxyConfig) GetPDPURL(defaultURL string) string {
 
 // SecurityConfig contains security-related configuration
 type SecurityConfig struct {
+	// RequireAuthorizationResponseIssuer enforces RFC 9207 issuer presence for
+	// OID4VCI authorization responses even when AS metadata omits support.
+	// Enable for FAPI deployments. Default: false. Advertised support always
+	// requires iss; any supplied issuer must match the original AS exactly.
+	RequireAuthorizationResponseIssuer bool `yaml:"require_authorization_response_issuer" envconfig:"REQUIRE_AUTHORIZATION_RESPONSE_ISSUER"`
+
 	// AuthRateLimit contains rate limiting configuration for auth endpoints
 	AuthRateLimit AuthRateLimitConfig `yaml:"auth_rate_limit" envconfig:"AUTH_RATE_LIMIT"`
 
@@ -2815,6 +2833,19 @@ func (c *Config) Validate() error {
 			c.Server.EngineWSPongTimeout,
 		)
 	}
+	// The issuance-selection policy (#549): an unrecognized value must never
+	// silently fall back to a default here - the deployment meant
+	// "user_selects" and got "issue_all" would issue credentials the user
+	// never chose, exactly the class of misconfiguration validation exists
+	// to prevent.
+	switch c.Server.EngineIssuanceSelectionPolicy {
+	case "", "issue_all", "user_selects":
+	default:
+		return fmt.Errorf(
+			"server.engine_issuance_selection_policy must be \"issue_all\" or \"user_selects\" (empty = the issue_all default) - got %q",
+			c.Server.EngineIssuanceSelectionPolicy,
+		)
+	}
 
 	if len(c.Server.GetRPOrigins()) == 0 {
 		return fmt.Errorf("rp_origin or rp_origins is required")
@@ -2870,7 +2901,7 @@ func (c *Config) Validate() error {
 		return err
 	}
 
-	// jwt.secret keys the OIDC state-binding cookie HMAC (see JWTConfig).
+	// jwt.secret authenticates OIDC state and OID4VCI resumption (see JWTConfig).
 	if c.JWT.Secret == "" {
 		return fmt.Errorf("jwt secret is required (it keys the OIDC state-binding cookie)")
 	}
