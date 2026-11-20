@@ -20,14 +20,13 @@ var (
 )
 
 // SessionCleaner can remove sessions for a user.
-// Implemented by engine.SessionStore (memory or Redis) and as.SessionStore.
+// Implemented by as.SessionStore.
 type SessionCleaner interface {
 	DeleteByUser(ctx context.Context, userID string) error
 }
 
-// MultiSessionCleaner fans DeleteByUser out to several cleaners (engine
-// WebSocket sessions and AS cookie sessions), so one wiring point drops
-// every kind of session a user holds. Every cleaner is called even if an
+// MultiSessionCleaner fans DeleteByUser out to several cleaners, so one wiring
+// point drops every kind of session a user holds. Every cleaner is called even if an
 // earlier one fails; the first error is returned.
 type MultiSessionCleaner []SessionCleaner
 
@@ -198,16 +197,8 @@ func (s *UserService) DeleteUser(ctx context.Context, userID domain.UserID, hold
 	// before this request's) would keep working until they naturally
 	// expire.
 	//
-	// The ordering matters for engine (WebSocket) sessions specifically
-	// (#393 review): a handshake can pass the engine's own IsUserRevoked
-	// check and then only finish registering itself in
-	// engine.Manager.sessions *after* the cleaner below has already
-	// scanned it. Revoking first means engine.Manager.registerSession's own
-	// recheck (done under the same lock the scan uses) will already see
-	// this user as revoked for any such late registration, and any
-	// registration that instead completed *before* this revocation is
-	// still guaranteed to be present in m.sessions by the time the scan
-	// below runs. Reversing this order would reopen that gap.
+	// The user is revoked before their sessions are swept, so a session that
+	// registers between the two steps is already refused.
 	if s.tokenBlacklist != nil {
 		if err := s.tokenBlacklist.RevokeUser(ctx, userID.String()); err != nil {
 			// Fail closed: deleting the user without the revocation would

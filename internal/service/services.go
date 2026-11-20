@@ -7,7 +7,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/assurance"
-	"github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/audit"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
@@ -22,7 +21,6 @@ type Services struct {
 	Credential       *CredentialService
 	Issuer           *IssuerService
 	Verifier         *VerifierService
-	Keystore         *KeystoreService
 	Proxy            *ProxyService
 	Helper           *HelperService
 	WalletProvider   *WalletProviderService
@@ -72,7 +70,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	}
 
 	wpSvc := NewWalletProviderService(cfg, logger, store.WalletInstances(), store.KeyAttestations())
-	fido2Svc := NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), engine.NewTrustService(cfg, logger), logger)
+	fido2Svc := NewFIDO2AttestationService(cfg, store.WalletInstances(), store.KeyAttestations(), NewTrustService(cfg, logger), logger)
 	// The assurance preview runs the same FIDO2 verifier in dry-run.
 	wpSvc.SetFIDO2Verifier(fido2Svc)
 	// One re-check of stored instance-key evidence (revocation, expiry) is
@@ -152,7 +150,7 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 	// external caller like cmd/server/main.go does for SetSessionCleaner,
 	// since both objects are already owned by this constructor.
 	userSvc.SetTokenBlacklist(tokenBlacklist)
-	trustSvc := engine.NewTrustService(cfg, logger)
+	trustSvc := NewTrustService(cfg, logger)
 
 	return &Services{
 		User:             userSvc,
@@ -162,7 +160,6 @@ func NewServices(store storage.Store, cfg *config.Config, logger *zap.Logger) *S
 		Credential:       NewCredentialService(store, cfg, logger),
 		Issuer:           NewIssuerService(store, logger),
 		Verifier:         NewVerifierService(store, logger),
-		Keystore:         NewKeystoreService(store, cfg, logger),
 		Proxy:            NewProxyService(cfg, logger),
 		Helper:           NewHelperService(logger, cfg.HTTPClient),
 		WalletProvider:   wpSvc,

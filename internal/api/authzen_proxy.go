@@ -21,8 +21,8 @@ import (
 	"github.com/sirosfoundation/go-trust/pkg/registry/didutil"
 	"go.uber.org/zap"
 
+	"github.com/sirosfoundation/go-wallet-backend/internal/advertisement"
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
-	"github.com/sirosfoundation/go-wallet-backend/internal/engine"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/authz"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
@@ -1116,7 +1116,7 @@ func (h *AuthZENProxyHandler) extractKeyMaterial(ctx context.Context, metadata m
 // wallet cannot re-verify the (by now modified) document itself.
 func sanitizeSecretSeedAdvertisement(metadata map[string]interface{}) {
 	sanitizeAdvertisement(metadata, "org.siros.secret_seed", func(raw []byte) bool {
-		present, valid := engine.SecretSeedAdvertisement(raw)
+		present, valid := advertisement.SecretSeedAdvertisement(raw)
 		return present && !valid
 	})
 }
@@ -1157,7 +1157,7 @@ func sanitizeAdvertisement(metadata map[string]interface{}, member string, malfo
 // for the same reason as in sanitizeSecretSeedAdvertisement.
 func sanitizeHolderCommitmentsAdvertisement(metadata map[string]interface{}) {
 	sanitizeAdvertisement(metadata, "org.siros.holder_commitments", func(raw []byte) bool {
-		present, _, valid := engine.HolderCommitmentsAdvertisement(raw)
+		present, _, valid := advertisement.HolderCommitmentsAdvertisement(raw)
 		return present && !valid
 	})
 }

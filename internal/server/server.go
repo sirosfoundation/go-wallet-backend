@@ -6,7 +6,6 @@
 //   - RouteProvider: modes implement this to contribute routes
 //   - ServerManager: combines RouteProviders into HTTP servers
 //   - A single HTTP server can serve multiple modes (auth, storage, backend, registry)
-//   - WebSocket engine can optionally use its own port (for long-lived connections)
 package server
 
 import (
@@ -35,8 +34,6 @@ type Transport string
 const (
 	// TransportHTTP is regular HTTP request/response
 	TransportHTTP Transport = "http"
-	// TransportWebSocket is for persistent WebSocket connections
-	TransportWebSocket Transport = "websocket"
 	// TransportWalletProvider is for wallet-provider isolation on a separate port
 	TransportWalletProvider Transport = "wallet-provider"
 )
@@ -85,10 +82,6 @@ type ServerConfig struct {
 	HTTPAddress string
 	HTTPPort    int
 
-	// WebSocket server settings (always on separate port - different protocol)
-	WSAddress string
-	WSPort    int
-
 	// Wallet-provider server settings (for PKCS#11 isolation)
 	// When WPPort > 0, wallet-provider routes run on a separate HTTP server.
 	WPAddress string
@@ -132,8 +125,6 @@ func DefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
 		HTTPAddress: "0.0.0.0",
 		HTTPPort:    8080,
-		WSAddress:   "0.0.0.0",
-		WSPort:      8081,
 	}
 }
 
@@ -145,12 +136,10 @@ type Manager struct {
 	providers []RouteProvider
 
 	httpServer  *http.Server
-	wsServer    *http.Server // Only used if WSSeparate
 	wpServer    *http.Server // Wallet-provider isolation server
 	adminServer *http.Server
 
 	httpRouter *gin.Engine
-	wsRouter   *gin.Engine // Only used if WSSeparate
 	wpRouter   *gin.Engine // Wallet-provider isolation router
 
 	// Readiness management for /readyz endpoint
@@ -276,12 +265,10 @@ func (m *Manager) start(ctx context.Context) error {
 	// Build HTTP router with common middleware
 	m.httpRouter = m.buildRouter()
 
-	// Separate WebSocket and wallet-provider providers if configured
-	var httpProviders, wsProviders, wpProviders []RouteProvider
+	// Separate wallet-provider providers if configured
+	var httpProviders, wpProviders []RouteProvider
 	for _, p := range m.providers {
 		switch p.Transport() {
-		case TransportWebSocket:
-			wsProviders = append(wsProviders, p)
 		case TransportWalletProvider:
 			wpProviders = append(wpProviders, p)
 		default:
@@ -303,15 +290,6 @@ func (m *Manager) start(ctx context.Context) error {
 		}
 	}
 
-	// Handle WebSocket providers - always on separate port (different protocol)
-	if len(wsProviders) > 0 {
-		m.wsRouter = m.buildRouter()
-		for _, p := range wsProviders {
-			m.logger.Info("Registering WebSocket routes", zap.String("mode", p.Name()))
-			p.RegisterRoutes(m.wsRouter)
-		}
-	}
-
 	// Add common status endpoints to HTTP router
 	m.addStatusEndpoints(m.httpRouter)
 
@@ -327,25 +305,6 @@ func (m *Manager) start(ctx context.Context) error {
 
 	if err := m.listenAndServe(m.httpServer, &m.cfg.TLS, "HTTP server listening", "HTTP server error", []zap.Field{zap.String("address", httpAddr)}); err != nil {
 		return err
-	}
-
-	// Start WebSocket server if providers registered
-	if m.wsRouter != nil {
-		wsAddr := fmt.Sprintf("%s:%d", m.cfg.WSAddress, m.cfg.WSPort)
-		m.wsServer = &http.Server{
-			Addr:         wsAddr,
-			Handler:      m.wsRouter,
-			ReadTimeout:  15 * time.Second,
-			WriteTimeout: 15 * time.Second,
-			IdleTimeout:  120 * time.Second, // Longer for WebSocket
-		}
-
-		// Add status to WebSocket server too
-		m.addStatusEndpoints(m.wsRouter)
-
-		if err := m.listenAndServe(m.wsServer, &m.cfg.TLS, "WebSocket server listening", "WebSocket server error", []zap.Field{zap.String("address", wsAddr)}); err != nil {
-			return err
-		}
 	}
 
 	// Start wallet-provider server if providers registered on separate port
@@ -408,12 +367,6 @@ func (m *Manager) Shutdown(ctx context.Context) error {
 	if m.httpServer != nil {
 		if err := m.httpServer.Shutdown(ctx); err != nil {
 			errs = append(errs, fmt.Errorf("HTTP server shutdown: %w", err))
-		}
-	}
-
-	if m.wsServer != nil {
-		if err := m.wsServer.Shutdown(ctx); err != nil {
-			errs = append(errs, fmt.Errorf("WebSocket server shutdown: %w", err))
 		}
 	}
 

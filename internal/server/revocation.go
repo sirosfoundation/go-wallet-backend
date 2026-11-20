@@ -14,7 +14,7 @@ import (
 )
 
 // SharedBlacklist is the token blacklist of a process that has no storage
-// backend of its own (a standalone engine or registry), backed by the shared
+// backend of its own (a standalone registry), backed by the shared
 // revocation collections.
 type SharedBlacklist struct {
 	*service.TokenBlacklist

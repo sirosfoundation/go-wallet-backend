@@ -1,6 +1,7 @@
 package modes
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -11,7 +12,6 @@ func TestRole_IsValid(t *testing.T) {
 	}{
 		{RoleBackend, true},
 		{RoleRegistry, true},
-		{RoleEngine, true},
 		{RoleAuth, true},
 		{RoleStorage, true},
 		{RoleAdmin, true},
@@ -28,13 +28,13 @@ func TestRole_IsValid(t *testing.T) {
 }
 
 func TestNewRoleSet(t *testing.T) {
-	rs := NewRoleSet([]Role{RoleBackend, RoleEngine})
+	rs := NewRoleSet([]Role{RoleBackend, RoleRegistry})
 
 	if !rs.Has(RoleBackend) {
 		t.Error("expected Has(backend) = true")
 	}
-	if !rs.Has(RoleEngine) {
-		t.Error("expected Has(engine) = true")
+	if !rs.Has(RoleRegistry) {
+		t.Error("expected Has(registry) = true")
 	}
 	if rs.Has(RoleAdmin) {
 		t.Error("expected Has(admin) = false")
@@ -42,7 +42,7 @@ func TestNewRoleSet(t *testing.T) {
 }
 
 func TestRoleSet_List(t *testing.T) {
-	rs := NewRoleSet([]Role{RoleEngine, RoleBackend})
+	rs := NewRoleSet([]Role{RoleRegistry, RoleBackend})
 	list := rs.List()
 
 	if len(list) != 2 {
@@ -52,8 +52,8 @@ func TestRoleSet_List(t *testing.T) {
 	if list[0] != RoleBackend {
 		t.Errorf("list[0] = %q, want backend", list[0])
 	}
-	if list[1] != RoleEngine {
-		t.Errorf("list[1] = %q, want engine", list[1])
+	if list[1] != RoleRegistry {
+		t.Errorf("list[1] = %q, want registry", list[1])
 	}
 }
 
@@ -81,11 +81,11 @@ func TestParseRoles(t *testing.T) {
 	})
 
 	t.Run("multiple roles", func(t *testing.T) {
-		rs, err := ParseRoles("backend,engine,admin")
+		rs, err := ParseRoles("backend,registry,admin")
 		if err != nil {
 			t.Fatalf("ParseRoles: %v", err)
 		}
-		if !rs.Has(RoleBackend) || !rs.Has(RoleEngine) || !rs.Has(RoleAdmin) {
+		if !rs.Has(RoleBackend) || !rs.Has(RoleRegistry) || !rs.Has(RoleAdmin) {
 			t.Error("missing expected roles")
 		}
 	})
@@ -127,7 +127,7 @@ func TestParseRoles(t *testing.T) {
 	})
 
 	t.Run("duplicate roles", func(t *testing.T) {
-		rs, err := ParseRoles("backend,backend,engine")
+		rs, err := ParseRoles("backend,backend,registry")
 		if err != nil {
 			t.Fatalf("ParseRoles: %v", err)
 		}
@@ -137,12 +137,30 @@ func TestParseRoles(t *testing.T) {
 	})
 
 	t.Run("whitespace handling", func(t *testing.T) {
-		rs, err := ParseRoles(" backend , engine ")
+		rs, err := ParseRoles(" backend , registry ")
 		if err != nil {
 			t.Fatalf("ParseRoles: %v", err)
 		}
-		if !rs.Has(RoleBackend) || !rs.Has(RoleEngine) {
+		if !rs.Has(RoleBackend) || !rs.Has(RoleRegistry) {
 			t.Error("expected whitespace-trimmed roles")
 		}
 	})
+}
+
+func TestParseRoles_EngineRoleWasRemoved(t *testing.T) {
+	for _, mode := range []string{"engine", "backend,engine", "all,engine"} {
+		_, err := ParseRoles(mode)
+		if err == nil || !strings.Contains(err.Error(), "was removed") {
+			t.Errorf("ParseRoles(%q) error = %v, want a removal error", mode, err)
+		}
+	}
+	rs, err := ParseRoles("all")
+	if err != nil {
+		t.Fatalf("ParseRoles(all): %v", err)
+	}
+	for _, r := range rs.List() {
+		if r == removedRoleEngine {
+			t.Error(`"all" must not include the removed engine role`)
+		}
+	}
 }

@@ -13,8 +13,9 @@ import (
 	"github.com/sirosfoundation/go-trust/pkg/registry/static"
 	"github.com/sirosfoundation/go-trust/pkg/testserver"
 
-	"github.com/sirosfoundation/go-wallet-backend/internal/engine"
+	"github.com/sirosfoundation/go-wallet-backend/internal/service"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
+	"github.com/sirosfoundation/go-wallet-backend/pkg/trust"
 )
 
 // TestTrustService_WithGoTrustTestServer tests TrustService integration
@@ -34,7 +35,7 @@ func TestTrustService_WithGoTrustTestServer(t *testing.T) {
 			},
 		}
 		logger, _ := zap.NewDevelopment()
-		trustService := engine.NewTrustService(cfg, logger)
+		trustService := service.NewTrustService(cfg, logger)
 
 		// Evaluate issuer trust (nil keyMaterial for DID resolution)
 		ctx := context.Background()
@@ -60,7 +61,7 @@ func TestTrustService_WithGoTrustTestServer(t *testing.T) {
 			},
 		}
 		logger, _ := zap.NewDevelopment()
-		trustService := engine.NewTrustService(cfg, logger)
+		trustService := service.NewTrustService(cfg, logger)
 
 		// Evaluate issuer trust (nil keyMaterial for DID resolution)
 		ctx := context.Background()
@@ -80,7 +81,7 @@ func TestTrustService_WithGoTrustTestServer(t *testing.T) {
 			},
 		}
 		logger, _ := zap.NewDevelopment()
-		trustService := engine.NewTrustService(cfg, logger)
+		trustService := service.NewTrustService(cfg, logger)
 
 		// Evaluate - should return fail-closed (not trusted, no evaluation possible)
 		ctx := context.Background()
@@ -110,7 +111,7 @@ func TestTrustService_VerifierEvaluation(t *testing.T) {
 			},
 		}
 		logger, _ := zap.NewDevelopment()
-		trustService := engine.NewTrustService(cfg, logger)
+		trustService := service.NewTrustService(cfg, logger)
 
 		ctx := context.Background()
 		info, err := trustService.EvaluateVerifier(ctx, "https://verifier.example.com", "", nil)
@@ -136,7 +137,7 @@ func TestTrustService_VerifierEvaluation(t *testing.T) {
 			},
 		}
 		logger, _ := zap.NewDevelopment()
-		trustService := engine.NewTrustService(cfg, logger)
+		trustService := service.NewTrustService(cfg, logger)
 
 		ctx := context.Background()
 		info, err := trustService.EvaluateVerifier(ctx, "https://untrusted-verifier.example.com", "", nil)
@@ -166,7 +167,7 @@ func TestTrustService_EndpointOverride(t *testing.T) {
 		},
 	}
 	logger, _ := zap.NewDevelopment()
-	trustService := engine.NewTrustService(cfg, logger)
+	trustService := service.NewTrustService(cfg, logger)
 
 	ctx := context.Background()
 
@@ -194,7 +195,7 @@ func TestTrustService_EvaluatorCaching(t *testing.T) {
 		},
 	}
 	logger, _ := zap.NewDevelopment()
-	trustService := engine.NewTrustService(cfg, logger)
+	trustService := service.NewTrustService(cfg, logger)
 
 	// Get evaluator twice - should return same instance
 	eval1, err := trustService.GetEvaluator(srv.URL())
@@ -223,7 +224,7 @@ func TestTrustService_Timeout(t *testing.T) {
 		},
 	}
 	logger, _ := zap.NewDevelopment()
-	trustService := engine.NewTrustService(cfg, logger)
+	trustService := service.NewTrustService(cfg, logger)
 
 	ctx := context.Background()
 	info, err := trustService.EvaluateIssuer(ctx, "did:example:test", "", nil)
@@ -247,13 +248,13 @@ func TestTrustService_ConcurrentRequests(t *testing.T) {
 		},
 	}
 	logger, _ := zap.NewDevelopment()
-	trustService := engine.NewTrustService(cfg, logger)
+	trustService := service.NewTrustService(cfg, logger)
 
 	ctx := context.Background()
 
 	// Run concurrent requests
 	const concurrency = 10
-	results := make(chan *engine.TrustInfo, concurrency)
+	results := make(chan *trust.TrustInfo, concurrency)
 	errors := make(chan error, concurrency)
 
 	for i := 0; i < concurrency; i++ {
@@ -294,10 +295,10 @@ func TestTrustService_JWKKeyMaterial(t *testing.T) {
 			},
 		}
 		logger, _ := zap.NewDevelopment()
-		trustService := engine.NewTrustService(cfg, logger)
+		trustService := service.NewTrustService(cfg, logger)
 
 		ctx := context.Background()
-		km := &engine.KeyMaterial{
+		km := &trust.KeyMaterial{
 			Type: "jwk",
 			JWK: map[string]interface{}{
 				"kty": "EC",
@@ -327,11 +328,11 @@ func TestTrustService_JWKKeyMaterial(t *testing.T) {
 			},
 		}
 		logger, _ := zap.NewDevelopment()
-		trustService := engine.NewTrustService(cfg, logger)
+		trustService := service.NewTrustService(cfg, logger)
 
 		ctx := context.Background()
 		// JWKS object with keys array (as returned by fetchJWKS)
-		km := &engine.KeyMaterial{
+		km := &trust.KeyMaterial{
 			Type: "jwk",
 			JWK: map[string]interface{}{
 				"keys": []interface{}{
@@ -364,10 +365,10 @@ func TestTrustService_JWKKeyMaterial(t *testing.T) {
 			},
 		}
 		logger, _ := zap.NewDevelopment()
-		trustService := engine.NewTrustService(cfg, logger)
+		trustService := service.NewTrustService(cfg, logger)
 
 		ctx := context.Background()
-		km := &engine.KeyMaterial{
+		km := &trust.KeyMaterial{
 			Type: "jwk",
 			JWK: map[string]interface{}{
 				"kty": "EC",
@@ -395,10 +396,10 @@ func TestTrustService_JWKKeyMaterial(t *testing.T) {
 			},
 		}
 		logger, _ := zap.NewDevelopment()
-		trustService := engine.NewTrustService(cfg, logger)
+		trustService := service.NewTrustService(cfg, logger)
 
 		ctx := context.Background()
-		km := &engine.KeyMaterial{
+		km := &trust.KeyMaterial{
 			Type: "jwk",
 			JWK: map[string]interface{}{
 				"kty": "EC",
@@ -427,10 +428,10 @@ func TestTrustService_JWKKeyMaterial(t *testing.T) {
 			},
 		}
 		logger, _ := zap.NewDevelopment()
-		trustService := engine.NewTrustService(cfg, logger)
+		trustService := service.NewTrustService(cfg, logger)
 
 		ctx := context.Background()
-		km := &engine.KeyMaterial{
+		km := &trust.KeyMaterial{
 			Type: "jwk",
 			JWK: map[string]interface{}{
 				"kty": "EC",

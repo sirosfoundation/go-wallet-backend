@@ -82,7 +82,6 @@ go-wallet-backend/
 ├── internal/
 │   ├── api/             # HTTP handlers and routes
 │   ├── domain/          # Business logic and domain models
-│   ├── engine/          # Protocol engine (OID4VCI/VP state machines)
 │   ├── service/         # Service layer (keystores, issuance, etc.)
 │   ├── storage/         # Storage implementations
 │   ├── modes/           # Server operation modes

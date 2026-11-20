@@ -6,7 +6,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -30,13 +29,11 @@ type Config struct {
 	AS             ASConfig             `yaml:"as" envconfig:"AS"`
 	WalletProvider WalletProviderConfig `yaml:"wallet_provider" envconfig:"WALLET_PROVIDER"`
 	Trust          TrustConfig          `yaml:"trust" envconfig:"TRUST"`
-	SessionStore   SessionStoreConfig   `yaml:"session_store" envconfig:"SESSION_STORE"`
 	Features       FeaturesConfig       `yaml:"features" envconfig:"FEATURES"`
 	Security       SecurityConfig       `yaml:"security" envconfig:"SECURITY"`
 	HTTPClient     HTTPClientConfig     `yaml:"http_client" envconfig:"HTTP_CLIENT"`
 	AuthZENProxy   AuthZENProxyConfig   `yaml:"authzen_proxy" envconfig:"AUTHZEN_PROXY"`
 	Audit          AuditConfig          `yaml:"audit" envconfig:"AUDIT"`
-	Presentation   PresentationConfig   `yaml:"presentation" envconfig:"PRESENTATION"`
 	StatusCheck    StatusCheckConfig    `yaml:"status_check" envconfig:"STATUS_CHECK"`
 
 	// Registry configures the VCTM registry role (--mode=registry). It
@@ -172,13 +169,9 @@ type ASConfig struct {
 
 	// ExternalURL is the public-facing base URL of the AS (e.g. "https://wallet.example.com").
 	// Used for OIDC redirect URIs and, in an isolated wallet-provider or
-	// standalone engine, to locate the AS JWKS. Must be an absolute http(s) URL
+	// registry, to locate the AS JWKS. Must be an absolute http(s) URL
 	// without a query or fragment; a path prefix is allowed. Required whenever the
 	// AS is enabled, including the backend role (config validation fails without it).
-	//
-	// A standalone engine (--mode=engine) has no revocation source: a token
-	// stays valid there until it expires, even after logout. Use short access
-	// token TTLs, or co-host the engine with the backend.
 	ExternalURL string `yaml:"external_url" envconfig:"EXTERNAL_URL"`
 
 	// InsecureCookies disables the __Host- prefix and Secure flag on session cookies.
@@ -353,7 +346,7 @@ func (c *Config) applyASSecurityDefaults() {
 }
 
 // SessionAudiences returns the audiences a validator must be built with: as.audiences, else the
-// documented defaults. Load() fills as.audiences only when the AS is enabled; a standalone engine
+// documented defaults. Load() fills as.audiences only when the AS is enabled; a standalone registry
 // still needs a non-empty list because go-tokenauth refuses to validate without one.
 func (c *Config) SessionAudiences() []string {
 	if len(c.AS.Audiences) > 0 {
@@ -368,56 +361,6 @@ func (c *ASConfig) GetTokenTTL(audience string) time.Duration {
 		return ttl
 	}
 	return c.DefaultTokenTTL
-}
-
-// DCQLConsentCheckMode selects how the engine treats a consent that does not
-// fit the DCQL query the backend sent to the client.
-type DCQLConsentCheckMode string
-
-const (
-	// DCQLConsentCheckOff performs no comparison.
-	DCQLConsentCheckOff DCQLConsentCheckMode = "off"
-	// DCQLConsentCheckWarn (the default) logs a structured warning naming the
-	// reason class and query id, and proceeds.
-	DCQLConsentCheckWarn DCQLConsentCheckMode = "warn"
-	// DCQLConsentCheckEnforce refuses the presentation before any signing:
-	// the verifier gets access_denied and the client a PRESENTATION_ERROR.
-	DCQLConsentCheckEnforce DCQLConsentCheckMode = "enforce"
-)
-
-// Effective returns the mode to apply, treating the zero value as the default.
-func (m DCQLConsentCheckMode) Effective() DCQLConsentCheckMode {
-	if m == "" {
-		return DCQLConsentCheckWarn
-	}
-	return m
-}
-
-func (m DCQLConsentCheckMode) validate() error {
-	switch m.Effective() {
-	case DCQLConsentCheckOff, DCQLConsentCheckWarn, DCQLConsentCheckEnforce:
-		return nil
-	}
-	return fmt.Errorf("invalid presentation.dcql_consent_check %q: must be one of off, warn, enforce", string(m))
-}
-
-// PresentationConfig controls checks the engine applies to what the wallet is
-// about to present in an OpenID4VP flow.
-type PresentationConfig struct {
-	// DCQLConsentCheck compares the user's consent (selected credential query
-	// ids and disclosed claims) with the DCQL query the backend sent to the
-	// client, before any signing. The frontend is not trusted to have
-	// honoured the query. Values: `off` (no check);
-	// `warn` (default: log a warning with the reason class and query id, never
-	// refuse; claim-path matching can disagree with a real verifier's
-	// notion of a path, so a deployer opts into enforcement);
-	// `enforce` (refuse with PRESENTATION_ERROR and answer the verifier
-	// access_denied, without signing). Nothing about claim names or values is
-	// logged. Not enforced: credential_sets satisfaction (only that no query
-	// outside every option is selected), `values` constraints, and the
-	// contents of the resulting vp_token. Unknown values fail at startup.
-	// Env: WALLET_PRESENTATION_DCQL_CONSENT_CHECK
-	DCQLConsentCheck DCQLConsentCheckMode `yaml:"dcql_consent_check" envconfig:"DCQL_CONSENT_CHECK"`
 }
 
 // Limits of the verified status list API (StatusCheckConfig).
@@ -538,13 +481,13 @@ type HTTPClientConfig struct {
 	// Unknown values are rejected at startup.
 	// Env: WALLET_HTTP_CLIENT_METADATA_TYPE
 	// Read only by the issuer-metadata resolvers, which the backend role (for
-	// AuthZEN proxy URL resolution) and the engine role build. The registry
+	// AuthZEN proxy URL resolution) builds. The registry
 	// role builds no resolver and ignores the field.
 	MetadataType string `yaml:"metadata_type" envconfig:"METADATA_TYPE"`
 
 	// MetadataCacheDisabled turns off caching of OpenID4VCI issuer metadata,
 	// so every resolution fetches it afresh. This covers the issuer-metadata
-	// resolvers (engine and AuthZEN proxy) and the backend's
+	// resolvers (the AuthZEN proxy) and the backend's
 	// GET /issuer/:id/metadata endpoint cache. Useful for testing scenarios
 	// where the same issuer URL is reused with different metadata.
 	// Env: WALLET_HTTP_CLIENT_METADATA_CACHE_DISABLED
@@ -1079,12 +1022,10 @@ func (g ssrfGuard) proxied(req *http.Request) bool {
 
 // ServerConfig contains HTTP server configuration
 type ServerConfig struct {
-	Host       string `yaml:"host" envconfig:"HOST"`
-	Port       int    `yaml:"port" envconfig:"PORT"`
-	AdminHost  string `yaml:"admin_host" envconfig:"ADMIN_HOST"`   // Admin API bind address (defaults to Host)
-	AdminPort  int    `yaml:"admin_port" envconfig:"ADMIN_PORT"`   // Internal admin API port (0 to disable)
-	EngineHost string `yaml:"engine_host" envconfig:"ENGINE_HOST"` // WebSocket engine bind address (defaults to Host)
-	EnginePort int    `yaml:"engine_port" envconfig:"ENGINE_PORT"` // WebSocket engine port (defaults to Port if 0)
+	Host      string `yaml:"host" envconfig:"HOST"`
+	Port      int    `yaml:"port" envconfig:"PORT"`
+	AdminHost string `yaml:"admin_host" envconfig:"ADMIN_HOST"` // Admin API bind address (defaults to Host)
+	AdminPort int    `yaml:"admin_port" envconfig:"ADMIN_PORT"` // Internal admin API port (0 to disable)
 	// TrustedProxies lists the proxy addresses or CIDRs whose X-Forwarded-For
 	// (and X-Real-IP) headers are believed when determining the client IP,
 	// which the per-IP rate limits depend on. Use ["none"] to trust no proxy
@@ -1100,42 +1041,13 @@ type ServerConfig struct {
 	// behind one, or ["none"] without one.
 	// Env: WALLET_SERVER_TRUSTED_PROXIES (comma-separated)
 	TrustedProxies []string `yaml:"trusted_proxies" envconfig:"TRUSTED_PROXIES"`
-	// EngineWSPingInterval is how often the server sends a WebSocket ping to
-	// the client, and (via HandshakeCompleteMessage.Config) the interval the
-	// client is told to use for its own pings - see that message's doc
-	// comment for why both directions need to agree on this rather than
-	// each hardcoding its own guess. Defaults to 3s: found empirically (raw
-	// idle-TLS-connection tests against production Fly.io apps, not
-	// documentation - Fly's own docs don't state a number) that Fly.io's
-	// edge closes a connection with no traffic on it after ~5-6s, far
-	// sooner than the 30s this used to be hardcoded to, which is why every
-	// engine WebSocket on Fly was silently reconnecting every few seconds.
-	// Deployments behind a more permissive proxy/LB can raise this.
-	EngineWSPingInterval time.Duration `yaml:"engine_ws_ping_interval" envconfig:"ENGINE_WS_PING_INTERVAL"`
-	// EngineWSPongTimeout is how long the server waits for a pong after
-	// sending a ping before treating the connection as dead. Unlike
-	// EngineWSPingInterval, this doesn't need to be short to keep an
-	// intermediary from seeing the connection go idle - the ping itself is
-	// what does that - so it stays generous.
-	EngineWSPongTimeout time.Duration `yaml:"engine_ws_pong_timeout" envconfig:"ENGINE_WS_PONG_TIMEOUT"`
-	// EngineIssuanceSelectionPolicy decides who selects the credential
-	// configurations a multi-configuration offer issues
-	// (go-wallet-backend#549, Platform-Epics#63):
-	//   "issue_all" (the default) - every offered configuration issues,
-	//   with no user-selection step at all;
-	//   "user_selects" - the awaiting_selection progress +
-	//   select_credential action run, and the answer carries a SET of
-	//   configuration ids: a subset of the offer (one, several, or all).
-	// A single-configuration offer issues unchanged under either policy
-	// (the auto-select-when-one rule).
-	EngineIssuanceSelectionPolicy string `yaml:"engine_issuance_selection_policy" envconfig:"ENGINE_ISSUANCE_SELECTION_POLICY" default:"issue_all"`
-	RegistryHost                  string `yaml:"registry_host" envconfig:"REGISTRY_HOST"`       // Registry bind address (defaults to Host)
-	RegistryPort                  int    `yaml:"registry_port" envconfig:"REGISTRY_PORT"`       // VCTM registry port (defaults to 8097)
-	WPHost                        string `yaml:"wp_host" envconfig:"WP_HOST"`                   // Wallet-provider bind address (defaults to Host)
-	WPPort                        int    `yaml:"wp_port" envconfig:"WP_PORT"`                   // Wallet-provider port (0 = co-hosted with backend)
-	AdminToken                    string `yaml:"admin_token" envconfig:"ADMIN_TOKEN"`           // Bearer token for admin API (auto-generated if empty)
-	AdminTokenPath                string `yaml:"admin_token_path" envconfig:"ADMIN_TOKEN_PATH"` // Path to file containing admin token
-	RPID                          string `yaml:"rp_id" envconfig:"RP_ID"`
+	RegistryHost   string   `yaml:"registry_host" envconfig:"REGISTRY_HOST"`       // Registry bind address (defaults to Host)
+	RegistryPort   int      `yaml:"registry_port" envconfig:"REGISTRY_PORT"`       // VCTM registry port (defaults to 8097)
+	WPHost         string   `yaml:"wp_host" envconfig:"WP_HOST"`                   // Wallet-provider bind address (defaults to Host)
+	WPPort         int      `yaml:"wp_port" envconfig:"WP_PORT"`                   // Wallet-provider port (0 = co-hosted with backend)
+	AdminToken     string   `yaml:"admin_token" envconfig:"ADMIN_TOKEN"`           // Bearer token for admin API (auto-generated if empty)
+	AdminTokenPath string   `yaml:"admin_token_path" envconfig:"ADMIN_TOKEN_PATH"` // Path to file containing admin token
+	RPID           string   `yaml:"rp_id" envconfig:"RP_ID"`
 	// RPOrigin is the legacy single-origin setting. Kept for backward compatibility.
 	// New deployments should use RPOrigins. When both are set, RPOrigin is prepended.
 	RPOrigin  string   `yaml:"rp_origin" envconfig:"RP_ORIGIN"`
@@ -1345,11 +1257,8 @@ func (c *CORSConfig) SetDefaults() {
 // ExternalURLsConfig contains URLs for split-mode deployment
 // When services run as separate containers/pods, they need external URLs to reference each other.
 type ExternalURLsConfig struct {
-	// BackendURL is the external URL for the backend service (for engine → backend calls)
+	// BackendURL is the external URL for the backend service
 	BackendURL string `yaml:"backend_url" envconfig:"BACKEND_URL"`
-
-	// EngineURL is the external URL for the engine service (for WebSocket connections)
-	EngineURL string `yaml:"engine_url" envconfig:"ENGINE_URL"`
 
 	// RegistryURL is the external URL for the registry service (for VCTM lookups)
 	RegistryURL string `yaml:"registry_url" envconfig:"REGISTRY_URL"`
@@ -1362,14 +1271,6 @@ type ExternalURLsConfig struct {
 func (e *ExternalURLsConfig) GetBackendURL(host string, port int) string {
 	if e.BackendURL != "" {
 		return e.BackendURL
-	}
-	return fmt.Sprintf("http://%s:%d", host, port)
-}
-
-// GetEngineURL returns the engine URL, with fallback to localhost
-func (e *ExternalURLsConfig) GetEngineURL(host string, port int) string {
-	if e.EngineURL != "" {
-		return e.EngineURL
 	}
 	return fmt.Sprintf("http://%s:%d", host, port)
 }
@@ -1422,12 +1323,11 @@ type LoggingConfig struct {
 }
 
 // JWTConfig contains the jwt.* settings. Session tokens are signed by the AS's asymmetric key, so only
-// Secret (authenticates OIDC state and OID4VCI resumption) and Issuer (fallback for as.issuer) matter;
+// Secret (authenticates OIDC state) and Issuer (fallback for as.issuer) matter;
 // ExpiryHours and RefreshDays are removed no-ops (see Config.DeprecatedSettings).
 type JWTConfig struct {
 	// Secret is a server-side secret of at least 32 bytes. It keys the HMAC that binds the OIDC
-	// state parameter to the browser and authenticates OID4VCI authorization
-	// resumption contexts using a domain-separated key. Required; share across engine replicas.
+	// state parameter to the browser. Required; share it across replicas.
 	Secret string `yaml:"secret" envconfig:"SECRET"`
 	// SecretPath is the path to a file containing the secret (alternative to Secret).
 	SecretPath string `yaml:"secret_path" envconfig:"SECRET_PATH"`
@@ -1894,21 +1794,6 @@ type TrustConfig struct {
 	// TLS certificate. Set this when the PDP is signed by an internal/private CA.
 	CACertPath string `yaml:"ca_cert_path" envconfig:"CA_CERT_PATH"`
 
-	// CacheDisabled turns the engine's in-memory verifier trust cache off, so
-	// every flow asks the PDP again.
-	//
-	// For testing, not for production. A trust decision - including a denial -
-	// is otherwise reused for CacheTTLSeconds, which makes iterating on trust
-	// configuration nearly impossible: fix the whitelist or the keys, redeploy
-	// the PDP, retry, and the wallet is still refused by a cached answer, with
-	// nothing in any log to say the answer was stale. It also means a PDP that
-	// is briefly unreachable takes a verifier down for the rest of the TTL.
-	CacheDisabled bool `yaml:"cache_disabled" envconfig:"CACHE_DISABLED"`
-
-	// CacheTTLSeconds is how long a verifier trust decision is reused.
-	// Zero selects the default of one hour. Ignored when CacheDisabled.
-	CacheTTLSeconds int `yaml:"cache_ttl_seconds" envconfig:"CACHE_TTL_SECONDS"`
-
 	// Issuer contains per-flow trust configuration overrides for OID4VCI (credential issuance).
 	// When not set, inherits the global trust configuration.
 	Issuer FlowTrustConfig `yaml:"issuer" envconfig:"ISSUER"`
@@ -1916,38 +1801,6 @@ type TrustConfig struct {
 	// Verifier contains per-flow trust configuration overrides for OID4VP (credential presentation).
 	// When not set, inherits the global trust configuration.
 	Verifier FlowTrustConfig `yaml:"verifier" envconfig:"VERIFIER"`
-}
-
-// DefaultTrustCacheTTL is how long a verifier trust decision is reused when
-// TrustConfig.CacheTTLSeconds says nothing.
-const DefaultTrustCacheTTL = time.Hour
-
-// MaxTrustCacheTTLSeconds is the largest CacheTTLSeconds that survives the
-// conversion to a time.Duration, which counts nanoseconds in an int64 - about
-// 292 years. Anything larger wraps to a negative duration, which the cache
-// reads as "off", so a number meant to say "cache for a very long time" would
-// silently mean the opposite. Config.Validate refuses those.
-const MaxTrustCacheTTLSeconds = int(math.MaxInt64 / int64(time.Second))
-
-// VerifierCacheTTL is how long the engine may reuse a verifier trust decision.
-//
-// Zero means "do not cache at all", which is what CacheDisabled selects; the
-// engine's cache treats a non-positive TTL as off rather than as an instantly
-// expiring entry, so there is one meaning for the value and one place that
-// decides it.
-//
-// A negative CacheTTLSeconds reads as the default here, but Config.Validate
-// refuses it before a process gets this far: it is the one value whose intent
-// ("off") differs from what this returns, so it is rejected at startup rather
-// than guessed at.
-func (t TrustConfig) VerifierCacheTTL() time.Duration {
-	if t.CacheDisabled {
-		return 0
-	}
-	if t.CacheTTLSeconds > 0 {
-		return time.Duration(t.CacheTTLSeconds) * time.Second
-	}
-	return DefaultTrustCacheTTL
 }
 
 // NewPDPHTTPClient creates an *http.Client for use with operator-configured PDP endpoints.
@@ -2051,15 +1904,9 @@ type FeaturesConfig struct {
 	DisableOpportunisticRequestEncryption bool `yaml:"disable_opportunistic_request_encryption" envconfig:"DISABLE_OPPORTUNISTIC_REQUEST_ENCRYPTION"`
 
 	// ProxyEnabled controls whether the /proxy endpoint is available.
-	// Set to false to disable the proxy (requires WebSocket engine for flows).
+	// Set to false to disable the proxy .
 	// Default: true (for backward compatibility)
 	ProxyEnabled bool `yaml:"proxy_enabled" envconfig:"PROXY_ENABLED"`
-
-	// WebSocketRequired forces WebSocket transport for credential flows.
-	// When true, the proxy endpoint will return an error directing clients
-	// to use the WebSocket transport instead.
-	// Default: false
-	WebSocketRequired bool `yaml:"websocket_required" envconfig:"WEBSOCKET_REQUIRED"`
 
 	// CredentialStorageEnabled controls whether server-side credential storage
 	// endpoints (/storage/vc/*) are available. By default, credentials are stored
@@ -2322,24 +2169,6 @@ func (c *TokenBlacklistConfig) SetDefaults() {
 	if c.CleanupIntervalSeconds == 0 {
 		c.CleanupIntervalSeconds = 3600
 	}
-}
-
-// SessionStoreConfig contains WebSocket session store configuration
-type SessionStoreConfig struct {
-	// Type is the session store type: "memory" or "redis"
-	Type string `yaml:"type" envconfig:"TYPE"`
-	// Redis contains Redis-specific configuration
-	Redis RedisConfig `yaml:"redis" envconfig:"REDIS"`
-	// DefaultTTL is the default session TTL in hours
-	DefaultTTLHours int `yaml:"default_ttl_hours" envconfig:"DEFAULT_TTL_HOURS"`
-}
-
-// RedisConfig contains Redis connection configuration
-type RedisConfig struct {
-	Address   string `yaml:"address" envconfig:"ADDRESS"`
-	Password  string `yaml:"password" envconfig:"PASSWORD"`
-	DB        int    `yaml:"db" envconfig:"DB"`
-	KeyPrefix string `yaml:"key_prefix" envconfig:"KEY_PREFIX"`
 }
 
 // Load loads configuration from file and environment variables
@@ -2628,19 +2457,15 @@ func defaultConfig() *Config {
 	return &Config{
 		Registry: DefaultRegistryConfig(),
 		Server: ServerConfig{
-			Host:       "0.0.0.0",
-			Port:       8080,
-			AdminPort:  8081, // Internal admin API port
-			EnginePort: 8082, // WebSocket engine port
-			// See EngineWSPingInterval's doc comment for where 3s/5s come from.
-			EngineWSPingInterval: 3 * time.Second,
-			EngineWSPongTimeout:  5 * time.Second,
-			RegistryPort:         8097, // VCTM registry port
-			RPID:                 "localhost",
-			RPOrigin:             "http://localhost:8080",
-			RPOrigins:            nil,
-			RPName:               "Wallet Backend",
-			CORS:                 corsConfig,
+			Host:         "0.0.0.0",
+			Port:         8080,
+			AdminPort:    8081, // Internal admin API port
+			RegistryPort: 8097, // VCTM registry port
+			RPID:         "localhost",
+			RPOrigin:     "http://localhost:8080",
+			RPOrigins:    nil,
+			RPName:       "Wallet Backend",
+			CORS:         corsConfig,
 		},
 		Storage: StorageConfig{
 			Type: "memory",
@@ -2663,17 +2488,8 @@ func defaultConfig() *Config {
 		Trust: TrustConfig{
 			Timeout: 30, // seconds
 		},
-		SessionStore: SessionStoreConfig{
-			Type:            "memory",
-			DefaultTTLHours: 24,
-			Redis: RedisConfig{
-				Address:   "localhost:6379",
-				KeyPrefix: "ws:session:",
-			},
-		},
 		Features: FeaturesConfig{
 			ProxyEnabled:             true,  // Default: proxy enabled for backward compatibility
-			WebSocketRequired:        false, // Default: proxy still allowed
 			CredentialStorageEnabled: false, // Default: server-side credential storage disabled
 		},
 		Security: SecurityConfig{
@@ -2708,11 +2524,10 @@ func defaultConfig() *Config {
 			// Set allow_private_ips: true in config when issuers are on internal networks.
 		},
 		AuthZENProxy: AuthZENProxyConfig{
-			Enabled:         true, // Enabled by default - required for engine flows
+			Enabled:         true,
 			AllowResolution: true, // Allow DID/metadata resolution by default
 			Timeout:         30,
 		},
-		Presentation: PresentationConfig{DCQLConsentCheck: DCQLConsentCheckWarn},
 		StatusCheck: StatusCheckConfig{
 			Enabled:                  true,
 			StatusListSignerFallback: true,
@@ -2817,41 +2632,6 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("rp_id is required")
 	}
 
-	// Sub-millisecond values are silently unrepresentable on the wire:
-	// HandshakeCompleteMessage.Config reports PingIntervalMs via
-	// time.Duration.Milliseconds(), which truncates a positive
-	// sub-millisecond duration to 0 - the client would then see "unset"
-	// and fall back to its own hardcoded default while the server keeps
-	// pinging at the (much faster) configured cadence, exactly the
-	// client/server disagreement this whole mechanism exists to prevent.
-	// 0 itself is the legitimate "use the default" sentinel (see
-	// Manager.wsKeepalive) and is not rejected here.
-	if c.Server.EngineWSPingInterval != 0 && c.Server.EngineWSPingInterval < time.Millisecond {
-		return fmt.Errorf(
-			"server.engine_ws_ping_interval must be at least 1ms (or 0 to use the default) - got %s",
-			c.Server.EngineWSPingInterval,
-		)
-	}
-	if c.Server.EngineWSPongTimeout != 0 && c.Server.EngineWSPongTimeout < time.Millisecond {
-		return fmt.Errorf(
-			"server.engine_ws_pong_timeout must be at least 1ms (or 0 to use the default) - got %s",
-			c.Server.EngineWSPongTimeout,
-		)
-	}
-	// The issuance-selection policy (#549): an unrecognized value must never
-	// silently fall back to a default here - the deployment meant
-	// "user_selects" and got "issue_all" would issue credentials the user
-	// never chose, exactly the class of misconfiguration validation exists
-	// to prevent.
-	switch c.Server.EngineIssuanceSelectionPolicy {
-	case "", "issue_all", "user_selects":
-	default:
-		return fmt.Errorf(
-			"server.engine_issuance_selection_policy must be \"issue_all\" or \"user_selects\" (empty = the issue_all default) - got %q",
-			c.Server.EngineIssuanceSelectionPolicy,
-		)
-	}
-
 	if len(c.Server.GetRPOrigins()) == 0 {
 		return fmt.Errorf("rp_origin or rp_origins is required")
 	}
@@ -2906,7 +2686,7 @@ func (c *Config) Validate() error {
 		return err
 	}
 
-	// jwt.secret authenticates OIDC state and OID4VCI resumption (see JWTConfig).
+	// jwt.secret authenticates OIDC state (see JWTConfig).
 	if c.JWT.Secret == "" {
 		return fmt.Errorf("jwt secret is required (it keys the OIDC state-binding cookie)")
 	}
@@ -3101,9 +2881,6 @@ func (c *Config) Validate() error {
 		return fmt.Errorf("http_client.metadata_type: %w", err)
 	}
 
-	if err := c.Presentation.DCQLConsentCheck.validate(); err != nil {
-		return err
-	}
 	if err := c.StatusCheck.validate(); err != nil {
 		return err
 	}
@@ -3130,24 +2907,6 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// A negative TTL is refused rather than quietly rounded up to the
-	// default. Someone who writes -1 here means "off", and silently giving
-	// them an hour of cached trust decisions is the exact failure this
-	// setting exists to cure: an answer that is not what the operator asked
-	// for, with nothing anywhere saying so. trust.cache_disabled is the way
-	// to say off.
-	if c.Trust.CacheTTLSeconds < 0 {
-		return fmt.Errorf("invalid trust.cache_ttl_seconds %d: must not be negative (set trust.cache_disabled to turn the cache off)", c.Trust.CacheTTLSeconds)
-	}
-	// And not so large that it wraps. A value past the int64 nanosecond
-	// range becomes a negative duration, which the cache reads as "off" -
-	// so without this, a number meant to cache for centuries would disable
-	// caching instead, which is the same silent inversion as the negative
-	// case above.
-	if c.Trust.CacheTTLSeconds > MaxTrustCacheTTLSeconds {
-		return fmt.Errorf("invalid trust.cache_ttl_seconds %d: must not exceed %d (a larger value overflows time.Duration and would silently disable the cache)", c.Trust.CacheTTLSeconds, MaxTrustCacheTTLSeconds)
-	}
-
 	return nil
 }
 
@@ -3163,19 +2922,6 @@ func (c *ServerConfig) AdminAddress() string {
 		host = c.Host
 	}
 	return fmt.Sprintf("%s:%d", host, c.AdminPort)
-}
-
-// EngineAddress returns the engine server address
-func (c *ServerConfig) EngineAddress() string {
-	host := c.EngineHost
-	if host == "" {
-		host = c.Host
-	}
-	port := c.EnginePort
-	if port == 0 {
-		port = c.Port // fallback to main port for backward compatibility
-	}
-	return fmt.Sprintf("%s:%d", host, port)
 }
 
 // RegistryAddress returns the registry server address

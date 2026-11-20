@@ -102,7 +102,7 @@ Configuration management:
 ## Roles and the VCTM Registry
 
 The server is one binary (`cmd/server`) whose functionality is selected with
-`--mode` (`backend`, `auth`, `engine`, `registry`, `admin`, `wallet-provider`,
+`--mode` (`backend`, `auth`, `registry`, `admin`, `wallet-provider`,
 or a comma-separated list / `all`). The VCTM registry (`internal/registry`,
 routes under `/registry`) is the `registry` role of that binary; there is no
 separate registry binary. Its previous standalone form (`cmd/registry`, its own
@@ -183,12 +183,6 @@ The application can run multiple instances behind a load balancer:
                           |
                     [MongoDB Cluster]
 ```
-
-### Session Affinity
-
-For WebSocket connections (client keystore):
-- Use load balancer session affinity (sticky sessions)
-- Or implement message broker (Redis Pub/Sub, Kafka)
 
 ### Configuration
 
@@ -387,16 +381,15 @@ Returns 200 OK if:
 
 ## Future Enhancements
 
-1. **WebSocket Support**: Real-time communication for client keystores
-2. **Redis Integration**: Session management, caching
-3. **gRPC API**: High-performance API option
-4. **Event Sourcing**: Audit trail for all operations
-5. **Multi-tenancy**: Support for multiple organizations
-6. **Admin API**: Management and monitoring
-7. **Backup/Restore**: Automated backup solutions
-8. **Rate Limiting**: Per-user and global limits
-9. **OAuth2 Support**: Third-party authentication
-10. **DID Methods**: Support for multiple DID methods
+1. **Redis Integration**: Session management, caching
+2. **gRPC API**: High-performance API option
+3. **Event Sourcing**: Audit trail for all operations
+4. **Multi-tenancy**: Support for multiple organizations
+5. **Admin API**: Management and monitoring
+6. **Backup/Restore**: Automated backup solutions
+7. **Rate Limiting**: Per-user and global limits
+8. **OAuth2 Support**: Third-party authentication
+9. **DID Methods**: Support for multiple DID methods
 
 ## References
 

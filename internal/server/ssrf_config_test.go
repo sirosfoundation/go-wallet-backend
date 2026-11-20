@@ -9,8 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"go.uber.org/zap"
-
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/issuermetadata"
 )
@@ -135,100 +133,5 @@ func TestMetadataResolverConfig_InsecureSkipVerifyImpliesAllowHTTP(t *testing.T)
 	_, err = resolver.Resolve(context.Background(), srv.URL)
 	if err != nil {
 		t.Fatalf("expected success when InsecureSkipVerify=true, got: %v", err)
-	}
-}
-
-// =============================================================================
-// NewEngineProvider wiring tests
-//
-// These verify that NewEngineProvider correctly wires:
-//   AllowHTTP:  cfg.HTTPClient.AllowHTTP || cfg.HTTPClient.InsecureSkipVerify
-//   HTTPClient: cfg.HTTPClient.NewHTTPClient(timeout)
-// =============================================================================
-
-// minimalEngineConfig returns a *config.Config that satisfies NewEngineProvider
-// without triggering network calls or optional subsystems (Redis, etc.).
-func minimalEngineConfig(httpCfg config.HTTPClientConfig) *config.Config {
-	return &config.Config{
-		Server: config.ServerConfig{
-			RPID:     "localhost",
-			RPOrigin: "http://localhost:8080",
-		},
-		JWT: config.JWTConfig{
-			Secret: "test-secret", Issuer: "test",
-		},
-		HTTPClient: httpCfg,
-	}
-}
-
-// TestNewEngineProvider_AllowHTTPWiring verifies that NewEngineProvider wires
-// the plaintext policy to the metadata resolver correctly.
-//
-// It resolves through the provider's own resolver, not a copy built here. An
-// earlier version of this test constructed an equivalent resolver and asserted
-// on that, which made it a test of issuermetadata and AllowsPlaintext rather
-// than of the wiring: it passed while the provider's rule changed underneath
-// it, and it would have gone on passing if providers.go regressed to the old
-// AllowHTTP || InsecureSkipVerify expression, because the copy was calling
-// AllowsPlaintext directly. Reproducing the expression under test is not a
-// check of it.
-func TestNewEngineProvider_AllowHTTPWiring(t *testing.T) {
-	logger := zap.NewNop()
-
-	var srv *httptest.Server
-	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		wellKnownHandler(srv.URL).ServeHTTP(w, r)
-	}))
-	defer srv.Close()
-
-	tests := []struct {
-		name      string
-		httpCfg   config.HTTPClientConfig
-		wantAllow bool // true = expect successful resolution over HTTP+loopback
-	}{
-		{
-			name:      "AllowHTTP=true AllowPrivateIPs=true",
-			httpCfg:   config.HTTPClientConfig{AllowHTTP: true, AllowPrivateIPs: true},
-			wantAllow: true,
-		},
-		{
-			name:      "InsecureSkipVerify=true permits plaintext but not a loopback address",
-			httpCfg:   config.HTTPClientConfig{InsecureSkipVerify: true},
-			wantAllow: false, // loopback blocked because AllowPrivateIPs is not set
-		},
-		{
-			// AllowPrivateIPs is itself a plaintext-permitting setting: such a
-			// deployment reaches its own registry over http://localhost, so
-			// the resolver must accept the scheme the dialer already allows.
-			name:      "AllowPrivateIPs=true permits plaintext on the private network",
-			httpCfg:   config.HTTPClientConfig{AllowPrivateIPs: true},
-			wantAllow: true,
-		},
-		{
-			name:      "nothing set blocks HTTP (default)",
-			httpCfg:   config.HTTPClientConfig{},
-			wantAllow: false,
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			provider, err := NewEngineProvider(minimalEngineConfig(tc.httpCfg), logger, nil, nil, nil)
-			if err != nil {
-				t.Fatalf("NewEngineProvider failed: %v", err)
-			}
-
-			if provider.metadataResolver == nil {
-				t.Fatal("the provider registered its flow handlers without a metadata resolver")
-			}
-
-			_, resolveErr := provider.metadataResolver.Resolve(context.Background(), srv.URL)
-			if tc.wantAllow && resolveErr != nil {
-				t.Errorf("expected successful resolution, got: %v", resolveErr)
-			}
-			if !tc.wantAllow && resolveErr == nil {
-				t.Error("expected resolution to be blocked, but it succeeded")
-			}
-		})
 	}
 }
