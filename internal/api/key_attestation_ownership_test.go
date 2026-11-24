@@ -63,7 +63,7 @@ func TestHandlers_KeyAttestation_ForeignInstanceDoesNotRaiseClaims(t *testing.T)
 	store := memory.NewStore()
 	owner := domain.UserIDFromString("owner")
 	if err := store.WalletInstances().Upsert(context.Background(), &domain.WalletInstance{
-		ID: "inst", TenantID: "tenant-a", UserID: &owner, AttestationSource: "platform_attested", LastAttestedAt: time.Now(),
+		ID: "inst", TenantID: "tenant-a", UserID: &owner, Status: domain.InstanceStatusActive, AttestationSource: "platform_attested", LastAttestedAt: time.Now(),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -80,6 +80,10 @@ func TestHandlers_KeyAttestation_ForeignInstanceDoesNotRaiseClaims(t *testing.T)
 		body := `{"jwks":[{"kty":"EC","crv":"P-256","x":"abc","y":"def"}],"openid4vci":{"nonce":"n"},"wallet_instance_id":"inst","security_properties":{"key_storage":["iso_18045_high"]}}`
 		w := httptest.NewRecorder()
 		router.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/ka", strings.NewReader(body)))
+		if w.Code == http.StatusForbidden {
+			// The lifecycle gate refuses another tenant's instance outright.
+			return "FORBIDDEN"
+		}
 		if w.Code != http.StatusOK {
 			t.Fatalf("status %d: %s", w.Code, w.Body.String())
 		}
@@ -97,8 +101,8 @@ func TestHandlers_KeyAttestation_ForeignInstanceDoesNotRaiseClaims(t *testing.T)
 	if got := call("tenant-a", "owner"); got != "iso_18045_high" {
 		t.Errorf("owner: key_storage = %s, want iso_18045_high", got)
 	}
-	if got := call("tenant-b", "owner"); got != "iso_18045_basic" {
-		t.Errorf("other tenant: key_storage = %s, want iso_18045_basic", got)
+	if got := call("tenant-b", "owner"); got != "FORBIDDEN" {
+		t.Errorf("other tenant: got %s, want the request refused", got)
 	}
 	if got := call("tenant-a", "someone-else"); got != "iso_18045_basic" {
 		t.Errorf("other user: key_storage = %s, want iso_18045_basic", got)

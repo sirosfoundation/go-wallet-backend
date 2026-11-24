@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/go-jose/go-jose/v4/jwt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
 // The policy is a pure function over a Session or a parent token's claims, so
@@ -351,4 +355,97 @@ func TestParentTokenRevoked_NoJTISkipsThatCheckOnly(t *testing.T) {
 	})
 	assert.ErrorIs(t, err, errParentUserGone, "the user check still runs")
 	assert.NotErrorIs(t, err, errStoreDown, "an empty jti must not be looked up")
+}
+
+// fakeCutoffUsers is the tokengate.UserLookup behind the cut-off tests: one
+// cut-off per user id, or an error for every lookup.
+type fakeCutoffUsers struct {
+	cutoffs map[string]time.Time
+	err     error
+}
+
+func (f fakeCutoffUsers) GetAuthCutoff(_ context.Context, id domain.UserID) (time.Time, error) {
+	if f.err != nil {
+		return time.Time{}, f.err
+	}
+	return f.cutoffs[id.String()], nil
+}
+
+func (fakeCutoffUsers) GetDeletionTombstone(context.Context, string) (*domain.DeletionTombstone, error) {
+	return nil, nil
+}
+
+// The SID-AUTH-06 cut-off is a policy rule like the others: it refuses a
+// session or delegating token that predates the user's cut-off, and answers a
+// store that cannot say with a failure (never an allow).
+func TestSessionPredatesCutoff(t *testing.T) {
+	uid := domain.NewUserID().String()
+	cutoff := time.Now().Add(-time.Minute)
+	gate := tokengate.New(fakeCutoffUsers{cutoffs: map[string]time.Time{uid: cutoff}})
+	session := func(at time.Time) *Session { return &Session{UserID: uid, CreatedAt: at} }
+
+	assert.NoError(t, sessionPredatesCutoff(context.Background(), gate, session(time.Now())))
+	assert.ErrorIs(t, sessionPredatesCutoff(context.Background(), gate, session(cutoff.Add(-time.Hour))), errSessionPredatesCutoff)
+
+	// The login's own authentication instant wins over the record's creation
+	// time: a session written after the cut-off by a login that began before
+	// it is still refused.
+	late := &Session{UserID: uid, CreatedAt: time.Now(), AuthenticatedAt: cutoff.Add(-time.Hour)}
+	assert.ErrorIs(t, sessionPredatesCutoff(context.Background(), gate, late), errSessionPredatesCutoff)
+
+	// No gate: no lifecycle gating.
+	assert.NoError(t, sessionPredatesCutoff(context.Background(), nil, session(cutoff.Add(-time.Hour))))
+
+	broken := tokengate.New(fakeCutoffUsers{err: errStoreDown})
+	err := sessionPredatesCutoff(context.Background(), broken, session(time.Now()))
+	var cc *cutoffCheckError
+	require.ErrorAs(t, err, &cc)
+	assert.ErrorIs(t, err, errStoreDown)
+	var te *tokenError
+	assert.False(t, errors.As(err, &te), "a store failure is not a policy refusal")
+}
+
+func TestParentAndIssuePhaseCutoff(t *testing.T) {
+	uid := domain.NewUserID().String()
+	cutoff := time.Now().Add(-time.Minute)
+	gate := tokengate.New(fakeCutoffUsers{cutoffs: map[string]time.Time{uid: cutoff}})
+	old := cutoffSubject{userID: uid, issuedAt: cutoff.Add(-time.Hour)}
+	fresh := cutoffSubject{userID: uid, issuedAt: time.Now()}
+
+	assert.NoError(t, parentPredatesCutoff(context.Background(), gate, fresh))
+	assert.ErrorIs(t, parentPredatesCutoff(context.Background(), gate, old), errParentPredatesCutoff)
+	assert.NoError(t, issuedAfterCutoff(context.Background(), gate, fresh))
+	assert.ErrorIs(t, issuedAfterCutoff(context.Background(), gate, old), errRevokedWhileIssuing)
+}
+
+// A revoked owner's deletion-only exemption (sessionOwnerRevoked) and the
+// lifecycle cut-off are independent: the exemption lifts the first and never
+// the second, in whichever order the endpoint applies them.
+func TestRevokedOwnerExemptionDoesNotLiftCutoff(t *testing.T) {
+	uid := domain.NewUserID().String()
+	cutoff := time.Now().Add(-time.Minute)
+	gate := tokengate.New(fakeCutoffUsers{cutoffs: map[string]time.Time{uid: cutoff}})
+	bl := &fakeBlacklist{revokedUsers: map[string]bool{uid: true}}
+	del := TAC(string(TACDelete))
+
+	for _, tc := range []struct {
+		name       string
+		created    time.Time
+		wantCutoff error
+		wantOwner  error
+	}{
+		{"session after cut-off: the exemption lets the deletion token through", time.Now(), nil, nil},
+		{"session before cut-off: the cut-off still refuses", cutoff.Add(-time.Hour), errSessionPredatesCutoff, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &Session{UserID: uid, CreatedAt: tc.created}
+			assert.ErrorIs(t, sessionPredatesCutoff(context.Background(), gate, s), tc.wantCutoff)
+			// The owner check alone passes in both cases: only the cut-off differs.
+			assert.NoError(t, sessionOwnerRevoked(context.Background(), bl, s, true, del))
+		})
+	}
+	// Without the exemption the owner check refuses regardless of the cut-off.
+	s := &Session{UserID: uid, CreatedAt: time.Now()}
+	assert.NoError(t, sessionPredatesCutoff(context.Background(), gate, s))
+	assert.ErrorIs(t, sessionOwnerRevoked(context.Background(), bl, s, false, ""), errInvalidSession)
 }

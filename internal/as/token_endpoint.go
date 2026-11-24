@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
 // TokenBlacklistChecker is the token blacklist capability this package
@@ -45,6 +48,20 @@ func respondTokenError(c *gin.Context, err error) {
 		te = &tokenError{http.StatusInternalServerError, "server_error", "token issuance failed"}
 	}
 	c.JSON(te.Status, gin.H{"error": te.Message})
+}
+
+// respondCutoff answers a failed lifecycle cut-off check: a refusal is
+// rendered as is, a store failure is logged and answered 500 "internal error".
+func respondCutoff(c *gin.Context, deps *tokenDeps, err error) {
+	var cc *cutoffCheckError
+	if errors.As(err, &cc) {
+		if deps.logger != nil {
+			deps.logger.Error("token cut-off check failed", zap.Error(cc.err))
+		}
+		respondTokenError(c, errCutoffUnavailable)
+		return
+	}
+	respondTokenError(c, err)
 }
 
 // respondRevocation answers a failed revocation check and is the only caller
@@ -98,6 +115,8 @@ type tokenDeps struct {
 	audiences []string
 	blacklist TokenBlacklistChecker
 	logger    *zap.Logger
+	// gate refuses tokens issued before the user's SID-AUTH-06 cut-off (nil: none).
+	gate *tokengate.Gate
 }
 
 // TokenResponse is the response body for POST /auth/token.
@@ -125,7 +144,9 @@ type TokenEndpointConfig struct {
 	Audiences       []string
 	Blacklist       TokenBlacklistChecker
 	InsecureCookies bool
-	Logger          *zap.Logger
+	// Gate refuses tokens issued before the user's SID-AUTH-06 cut-off (nil: none).
+	Gate   *tokengate.Gate
+	Logger *zap.Logger
 }
 
 // TokenEndpointHandler creates the handler for POST /auth/token.
@@ -147,6 +168,7 @@ func TokenEndpointHandler(cfg TokenEndpointConfig) gin.HandlerFunc {
 		audiences: cfg.Audiences,
 		blacklist: blacklistOrNoop(cfg.Blacklist),
 		logger:    cfg.Logger,
+		gate:      cfg.Gate,
 	}
 	return func(c *gin.Context) {
 		var req TokenRequest
@@ -216,6 +238,10 @@ func handleSessionTokenRequest(
 		respondTokenError(c, errInvalidSession)
 		return
 	}
+	if err := sessionPredatesCutoff(c.Request.Context(), deps.gate, session); err != nil {
+		respondCutoff(c, deps, err)
+		return
+	}
 
 	tenantID, tac, err := authorizeSessionToken(session, req)
 	if err != nil {
@@ -224,13 +250,15 @@ func handleSessionTokenRequest(
 	}
 
 	// After the policy, because the deletion-only exemption needs the
-	// resolved TAC.
+	// resolved TAC. Both gates apply: the lifecycle cut-off above and the
+	// shared revocation store here (a revoked owner may still obtain a
+	// deletion-only token, which does not lift the cut-off).
 	if err := sessionOwnerRevoked(c.Request.Context(), deps.blacklist, session, true, tac); err != nil {
 		respondRevocation(c, deps, err)
 		return
 	}
 
-	issueToken(c, deps, session.UserID, session.UserID, req.Audience, tenantID, tac, session.ACR)
+	issueToken(c, deps, sessionSubject(session), session.UserID, session.UserID, req.Audience, tenantID, tac, session.ACR)
 }
 
 // handleIdentityKindToken is the shared shape of the session-backed
@@ -247,8 +275,8 @@ func handleSessionTokenRequest(
 // is "may this authenticated user mint an engine token", which the pseudonym
 // would not carry) and the subject the MINT carries.
 //
-// The revocation check runs before the policy, with the deletion-only
-// exemption off and no TAC: a revoked owner gets no identity-kind token at
+// The lifecycle cut-off (SID-AUTH-06) and the revocation check run before
+// the policy, the latter with the deletion-only exemption off and no TAC: a revoked owner gets no identity-kind token at
 // all - the anonymous kind's missing "sub" would bypass the user revocation,
 // and the pseudonymous kind's fresh sub would name nobody the revocation
 // lists.
@@ -266,6 +294,10 @@ func handleIdentityKindToken(
 		respondTokenError(c, errInvalidSession)
 		return
 	}
+	if err := sessionPredatesCutoff(c.Request.Context(), deps.gate, session); err != nil {
+		respondCutoff(c, deps, err)
+		return
+	}
 	if err := sessionOwnerRevoked(c.Request.Context(), deps.blacklist, session, false, ""); err != nil {
 		respondRevocation(c, deps, err)
 		return
@@ -278,7 +310,7 @@ func handleIdentityKindToken(
 	}
 
 	policySub, mintedSub := subs(session)
-	issueToken(c, deps, policySub, mintedSub, req.Audience, tenantID, tac, session.ACR)
+	issueToken(c, deps, sessionSubject(session), policySub, mintedSub, req.Audience, tenantID, tac, session.ACR)
 }
 
 // handleAnonymousTokenRequest issues a token that omits the caller's
@@ -326,7 +358,7 @@ func handlePseudonymousTokenRequest(
 		// The policy sees the session's REAL subject; the mint carries a
 		// fresh pseudonym - NOT the user id.
 		func(session *Session) (string, string) {
-			return session.UserID, "p-" + uuid.New().String()
+			return session.UserID, tokengate.PseudonymPrefix + uuid.New().String()
 		},
 	)
 }
@@ -363,13 +395,21 @@ func handleDelegationTokenRequest(
 		return
 	}
 
+	// SID-AUTH-06: a delegating token issued before the revocation must not
+	// mint a fresh one; the parent is judged, as a child would carry a fresh iat.
+	parent := parentSubject(parentClaims, bearerToken)
+	if err := parentPredatesCutoff(c.Request.Context(), deps.gate, parent); err != nil {
+		respondCutoff(c, deps, err)
+		return
+	}
+
 	tenantID, tac, err := authorizeDelegationToken(parentClaims, req)
 	if err != nil {
 		respondTokenError(c, err)
 		return
 	}
 
-	issueToken(c, deps, parentClaims.Subject, parentClaims.Subject, req.Audience, tenantID, tac, parentClaims.ACR)
+	issueToken(c, deps, parent, parentClaims.Subject, parentClaims.Subject, req.Audience, tenantID, tac, parentClaims.ACR)
 }
 
 // parentTokenRevoked returns the refusal when the delegating token may no
@@ -421,14 +461,24 @@ func parentUserRevoked(ctx context.Context, bl TokenBlacklistChecker, subject st
 	return nil
 }
 
-// issueToken is the common path for both session and delegation flows.
+// issueToken is the common path for the session, anonymous and delegation flows.
+// subject is the credential behind the request, re-checked against the cut-off.
 func issueToken(
 	c *gin.Context,
 	deps *tokenDeps,
+	subject cutoffSubject,
 	policySub, mintSub, audience, tenantID string,
 	tac TAC,
 	acr string,
 ) {
+	// policySub is the real subject for every kind (the pseudonymous kind mints a
+	// different one), so a real subject in the pseudonym form is refused for all.
+	if strings.HasPrefix(policySub, tokengate.PseudonymPrefix) {
+		deps.logger.Warn("token request refused: subject uses the pseudonym prefix", zap.String("user_id", policySub))
+		respondTokenError(c, errReservedSubject)
+		return
+	}
+
 	// Validate TAC characters.
 	if err := tac.Validate(); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -464,6 +514,13 @@ func issueToken(
 	if err != nil {
 		deps.logger.Error("token issuance failed", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "token issuance failed"})
+		return
+	}
+
+	// SID-AUTH-06: a revocation landing since the check above must not be
+	// handed a token with a fresh iat.
+	if err := issuedAfterCutoff(c.Request.Context(), deps.gate, subject); err != nil {
+		respondCutoff(c, deps, err)
 		return
 	}
 

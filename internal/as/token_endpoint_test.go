@@ -21,6 +21,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
 func setupTokenEndpoint(t *testing.T) (*gin.Engine, *MemorySessionStore, *TokenIssuer) {
@@ -1423,5 +1425,43 @@ func TestTokenEndpoint_Pseudonymous_RevokedOwnerDenied(t *testing.T) {
 
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 for a revoked owner, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// A session whose subject looks like a pseudonym is refused every kind of
+// token: the engine and the middleware treat the pseudonym prefix as "names no
+// user" and skip the per-user checks, so a real subject must never carry it.
+func TestTokenEndpoint_SubjectInPseudonymFormIsRefused(t *testing.T) {
+	router, store, _ := setupTokenEndpoint(t)
+	sess := &Session{
+		JTI:       "sess-p-prefixed",
+		UserID:    tokengate.PseudonymPrefix + "external-idp-sub",
+		TenantID:  "tenant-1",
+		MaxTAC:    TAC("rwil"),
+		ACR:       "urn:siros:acr:passkey",
+		CreatedAt: time.Now(),
+		ExpiresAt: time.Now().Add(time.Hour),
+	}
+	if err := store.Create(context.Background(), sess); err != nil {
+		t.Fatal(err)
+	}
+
+	for name, req := range map[string]TokenRequest{
+		"session":       {Audience: "wallet-engine", TAC: "r"},
+		"pseudonymous":  {Audience: "wallet-engine", Pseudonymous: true},
+		"session write": {Audience: "wallet-engine", TAC: "rw"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := serveTokenRequest(t, router, "sess-p-prefixed", req)
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("expected 403, got %d: %s", w.Code, w.Body.String())
+			}
+		})
+	}
+
+	// The same request for an ordinary subject still works.
+	pseudonymousTestSession(t, store, "sess-ordinary", TAC("rwil"))
+	if w := serveTokenRequest(t, router, "sess-ordinary", TokenRequest{Audience: "wallet-engine", Pseudonymous: true}); w.Code != http.StatusOK {
+		t.Fatalf("ordinary subject: expected 200, got %d: %s", w.Code, w.Body.String())
 	}
 }

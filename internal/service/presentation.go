@@ -9,6 +9,7 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/storage"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
 // PresentationService handles presentation operations
@@ -35,6 +36,10 @@ func (s *PresentationService) Store(ctx context.Context, tenantID domain.TenantI
 		return fmt.Errorf("presentation identifier is required")
 	}
 
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return err
+	}
+
 	// Set tenant ID
 	presentation.TenantID = tenantID
 
@@ -49,6 +54,19 @@ func (s *PresentationService) Store(ctx context.Context, tenantID domain.TenantI
 
 	if err := s.store.Presentations().Create(ctx, presentation); err != nil {
 		return fmt.Errorf("failed to create presentation: %w", err)
+	}
+
+	// Storage-level fence: an erasure can run between admission and Create, so
+	// re-read the cut-off after persisting and delete the record if refused
+	// (tokengate.ConfirmWrite). The rollback is by store-assigned id, so a
+	// replacement under the same identifier is never touched.
+	createdID := presentation.ID
+	if err := tokengate.ConfirmWrite(ctx, s.store.Users(), func(rctx context.Context) error {
+		return s.store.Presentations().DeleteByID(rctx, tenantID, createdID)
+	}); err != nil {
+		s.logger.Error("Presentation write fenced out by a concurrent revocation", zap.Error(err),
+			zap.String("tenant_id", string(tenantID)), zap.Bool("left_behind", errors.Is(err, tokengate.ErrWriteNotRolledBack)))
+		return err
 	}
 
 	s.logger.Info("Presentation stored",
@@ -81,6 +99,10 @@ func (s *PresentationService) GetAll(ctx context.Context, tenantID domain.Tenant
 
 // Delete removes a presentation
 func (s *PresentationService) Delete(ctx context.Context, tenantID domain.TenantID, holderDID, presentationIdentifier string) error {
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return err
+	}
+
 	if err := s.store.Presentations().Delete(ctx, tenantID, holderDID, presentationIdentifier); err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
 			return storage.ErrNotFound
@@ -98,6 +120,10 @@ func (s *PresentationService) Delete(ctx context.Context, tenantID domain.Tenant
 
 // DeleteByCredentialID removes all presentations containing a specific credential
 func (s *PresentationService) DeleteByCredentialID(ctx context.Context, tenantID domain.TenantID, holderDID, credentialID string) error {
+	if err := tokengate.RefuseNow(ctx, s.store.Users()); err != nil {
+		return err
+	}
+
 	if err := s.store.Presentations().DeleteByCredentialID(ctx, tenantID, holderDID, credentialID); err != nil {
 		return fmt.Errorf("failed to delete presentations by credential: %w", err)
 	}

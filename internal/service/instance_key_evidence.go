@@ -24,6 +24,7 @@ import (
 //
 //	android_key            {type, x5c:[base64 DER, leaf first]}   (android_key_attestation.go)
 //	app_attest_assertion   {type, key_id, assertion}              (registered by its own stage)
+//	fido2                  {type, attestation_object, client_data_hash}   (fido2_instance_key.go)
 //
 // Rules of the envelope:
 //   - the field absent: no instance-key evidence, the home stays unknown;
@@ -149,6 +150,7 @@ type KeyAttestationType string
 const (
 	KeyAttestationAndroidKey         KeyAttestationType = "android_key"
 	KeyAttestationAppAttestAssertion KeyAttestationType = "app_attest_assertion"
+	KeyAttestationFIDO2              KeyAttestationType = "fido2"
 )
 
 // KeyAttestation is the `key_attestation` request object. Only Type is read

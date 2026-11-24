@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,8 @@ import (
 
 	"github.com/sirosfoundation/go-wallet-backend/internal/domain"
 	"github.com/sirosfoundation/go-wallet-backend/internal/service"
+	"github.com/sirosfoundation/go-wallet-backend/internal/storage/memory"
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/config"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/middleware"
 	"github.com/sirosfoundation/go-wallet-backend/pkg/oidc"
@@ -27,15 +30,19 @@ type capturingWebAuthn struct {
 	mockWebAuthn
 	lastFinishRegReq   *service.FinishRegistrationRequest
 	lastFinishLoginReq *service.FinishLoginRequest
+	// finishedAt is when FinishRegistration/FinishLogin was entered.
+	finishedAt time.Time
 }
 
 func (m *capturingWebAuthn) FinishRegistration(ctx context.Context, req *service.FinishRegistrationRequest) (*service.FinishRegistrationResponse, error) {
 	m.lastFinishRegReq = req
+	m.finishedAt = time.Now()
 	return m.mockWebAuthn.FinishRegistration(ctx, req)
 }
 
 func (m *capturingWebAuthn) FinishLogin(ctx context.Context, req *service.FinishLoginRequest) (*service.FinishLoginResponse, error) {
 	m.lastFinishLoginReq = req
+	m.finishedAt = time.Now()
 	return m.mockWebAuthn.FinishLogin(ctx, req)
 }
 
@@ -405,5 +412,51 @@ func TestPasskeyRegisterBegin_ErrorMapping(t *testing.T) {
 				t.Errorf("expected %d, got %d: %s", tc.wantStatus, w.Code, w.Body.String())
 			}
 		})
+	}
+}
+
+// SID-AUTH-06: the registration auto-login session is stamped with the instant
+// before the registration was finished, so a cut-off landing during it refuses
+// the session instead of being outrun by a fresh timestamp.
+func TestPasskeyRegisterFinish_SessionIsStampedBeforeTheRegistrationFinishes(t *testing.T) {
+	mock := &capturingWebAuthn{mockWebAuthn: mockWebAuthn{
+		finishRegResp: &service.FinishRegistrationResponse{UUID: "user-1", TenantID: "t"},
+	}}
+	h, store := newTestPasskeyHandlers(mock)
+	router := gin.New()
+	router.POST("/finish", h.RegisterFinish)
+	body, _ := json.Marshal(service.FinishRegistrationRequest{ChallengeID: "c1"})
+	req := httptest.NewRequest(http.MethodPost, "/finish", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var jti string
+	for _, ck := range w.Result().Cookies() {
+		if ck.Name == sessionCookieInsecure {
+			jti = ck.Value
+		}
+	}
+	sess, err := store.Get(context.Background(), jti)
+	if err != nil {
+		t.Fatalf("session not stored: %v", err)
+	}
+	if sess.AuthenticatedAt.IsZero() || sess.AuthenticatedAt.After(mock.finishedAt) {
+		t.Fatalf("AuthenticatedAt = %v, want a time at or before the registration was finished (%v)", sess.AuthenticatedAt, mock.finishedAt)
+	}
+
+	// A cut-off landing while the registration was being finished refuses the session.
+	users := memory.NewStore().Users()
+	uid := domain.NewUserID()
+	if err := users.Create(context.Background(), &domain.User{UUID: uid}); err != nil {
+		t.Fatal(err)
+	}
+	if err := users.InvalidateAuthBefore(context.Background(), uid, mock.finishedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := tokengate.New(users).Check(context.Background(), uid.String(), sess.authInstant()); !errors.Is(err, tokengate.ErrRevoked) {
+		t.Fatalf("session must be refused after a cut-off during the registration, got %v", err)
 	}
 }

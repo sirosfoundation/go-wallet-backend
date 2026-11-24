@@ -2610,3 +2610,193 @@ func TestUserStore_Modify_IsAtomic(t *testing.T) {
 		t.Errorf("version = %d, want %d", got.Version, workers)
 	}
 }
+
+// The lifecycle writes advance Version like Modify does, so a Modify (or any
+// optimistic writer) that read the record before them is never taken as current.
+func TestUserStore_LifecycleWritesAdvanceVersion(t *testing.T) {
+	store := NewStore()
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid, PrivateData: []byte("v"), Keys: []byte("k")}); err != nil {
+		t.Fatal(err)
+	}
+	version := func() int64 {
+		u, err := store.Users().GetByID(ctx, uid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return u.Version
+	}
+
+	v0 := version()
+	if err := store.Users().InvalidateAuthBefore(ctx, uid, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	v1 := version()
+	if v1 <= v0 {
+		t.Fatalf("InvalidateAuthBefore: version %d -> %d, must advance", v0, v1)
+	}
+	if err := store.Users().InvalidateAuthBeforeForToken(ctx, uid, time.Now().Add(time.Second), time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+	v2 := version()
+	if v2 <= v1 {
+		t.Fatalf("InvalidateAuthBeforeForToken: version %d -> %d, must advance", v1, v2)
+	}
+	if err := store.Users().EraseWalletData(ctx, uid, time.Now().Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if v3 := version(); v3 <= v2 {
+		t.Fatalf("EraseWalletData: version %d -> %d, must advance", v2, v3)
+	}
+}
+
+// Modify reads the record under the lock, so it sees a cut-off and an erasure
+// that landed before it: nothing can write them back.
+func TestUserStore_ModifySeesLifecycleWrites(t *testing.T) {
+	store := NewStore()
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid, PrivateData: []byte("vault"), Keys: []byte("k")}); err != nil {
+		t.Fatal(err)
+	}
+	ts := time.Now()
+	if err := store.Users().InvalidateAuthBefore(ctx, uid, ts); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Users().EraseWalletData(ctx, uid, ts); err != nil {
+		t.Fatal(err)
+	}
+
+	var seenCutoff time.Time
+	var seenData []byte
+	if _, err := store.Users().Modify(ctx, uid, func(u *domain.User) error {
+		seenCutoff, seenData = u.AuthInvalidBefore, u.PrivateData
+		u.DID = "did:new"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !seenCutoff.Equal(ts) || seenData != nil {
+		t.Fatalf("Modify must read the post-lifecycle record: cut-off %v data %q", seenCutoff, seenData)
+	}
+	u, _ := store.Users().GetByID(ctx, uid)
+	if u.PrivateData != nil || u.Keys != nil || !u.AuthInvalidBefore.Equal(ts) || u.DID != "did:new" {
+		t.Fatalf("the erasure and cut-off must stand: %+v", u)
+	}
+}
+
+func TestUserStore_InvalidateAuthBeforeAndClearWalletData(t *testing.T) {
+	store := NewStore()
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid, PrivateData: []byte("v"), PrivateDataETag: "e", Keys: []byte("k"), DID: "did:x"}); err != nil {
+		t.Fatal(err)
+	}
+	t1 := time.Now().Add(-time.Hour)
+	t2 := time.Now()
+	if err := store.Users().InvalidateAuthBefore(ctx, uid, t2); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Users().InvalidateAuthBefore(ctx, uid, t1); err != nil {
+		t.Fatal(err)
+	}
+	u, _ := store.Users().GetByID(ctx, uid)
+	if !u.AuthInvalidBefore.Equal(t2) {
+		t.Fatalf("cut-off only moves forward: got %v want %v", u.AuthInvalidBefore, t2)
+	}
+	if err := store.Users().EraseWalletData(ctx, uid, t2); err != nil {
+		t.Fatal(err)
+	}
+	u, _ = store.Users().GetByID(ctx, uid)
+	if u.PrivateData != nil || u.PrivateDataETag != "" || u.Keys != nil {
+		t.Fatalf("wallet data not cleared: %+v", u)
+	}
+	if u.DID != "did:x" || !u.AuthInvalidBefore.Equal(t2) {
+		t.Fatalf("other fields must be untouched: %+v", u)
+	}
+	if err := store.Users().EraseWalletData(ctx, domain.NewUserID(), time.Now()); err != storage.ErrNotFound {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+	if err := store.Users().InvalidateAuthBefore(ctx, domain.NewUserID(), t2); err != storage.ErrNotFound {
+		t.Fatalf("expected ErrNotFound, got %v", err)
+	}
+}
+
+func TestUserStore_InvalidateAuthBeforeForToken(t *testing.T) {
+	store := NewStore()
+	ctx := context.Background()
+	uid := domain.NewUserID()
+	if err := store.Users().Create(ctx, &domain.User{UUID: uid, DID: "did:x"}); err != nil {
+		t.Fatal(err)
+	}
+	base := time.Now().Truncate(time.Second)
+	tokenIat := base.Add(-time.Minute)
+
+	// No cut-off yet: the token is not refused, so the advance happens.
+	if err := store.Users().InvalidateAuthBeforeForToken(ctx, uid, base, tokenIat); err != nil {
+		t.Fatalf("first advance: %v", err)
+	}
+	u, _ := store.Users().GetByID(ctx, uid)
+	if !u.AuthInvalidBefore.Equal(base) || u.AuthFence != 1 {
+		t.Fatalf("cut-off %v fence %d", u.AuthInvalidBefore, u.AuthFence)
+	}
+
+	// The cut-off now refuses the same token (an independent revocation landed
+	// since it was admitted): nothing is written.
+	later := base.Add(time.Hour)
+	if err := store.Users().InvalidateAuthBeforeForToken(ctx, uid, later, tokenIat); !errors.Is(err, storage.ErrStaleWrite) {
+		t.Fatalf("want ErrStaleWrite, got %v", err)
+	}
+	u, _ = store.Users().GetByID(ctx, uid)
+	if !u.AuthInvalidBefore.Equal(base) || u.AuthFence != 1 {
+		t.Fatalf("refused call must not write: %v fence %d", u.AuthInvalidBefore, u.AuthFence)
+	}
+
+	// Same second as the cut-off is refused too (whole-second comparison).
+	if err := store.Users().InvalidateAuthBeforeForToken(ctx, uid, later, base.Add(300*time.Millisecond)); !errors.Is(err, storage.ErrStaleWrite) {
+		t.Fatalf("same-second token: want ErrStaleWrite, got %v", err)
+	}
+
+	// A fresh token (next second) passes, as after a retry of a deletion.
+	if err := store.Users().InvalidateAuthBeforeForToken(ctx, uid, later, base.Add(time.Second)); err != nil {
+		t.Fatalf("fresh token: %v", err)
+	}
+
+	// No token to judge: unconditional.
+	if err := store.Users().InvalidateAuthBeforeForToken(ctx, uid, later.Add(time.Hour), time.Time{}); err != nil {
+		t.Fatalf("zero iat: %v", err)
+	}
+
+	if err := store.Users().InvalidateAuthBeforeForToken(ctx, domain.NewUserID(), later, tokenIat); !errors.Is(err, storage.ErrNotFound) {
+		t.Fatalf("unknown user: want ErrNotFound, got %v", err)
+	}
+}
+
+func TestUserStore_TombstoneHolderDIDKeptUntilCleared(t *testing.T) {
+	ctx := context.Background()
+	users := NewStore().Users()
+	now := time.Now().UTC()
+	put := func(did string) {
+		t.Helper()
+		if err := users.PutDeletionTombstone(ctx, &domain.DeletionTombstone{UserID: "u1", HolderDID: did, DeletedAt: now, ExpiresAt: now.Add(time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	put("did:example:a")
+	put("") // a retry without a DID must not erase the stored one
+	got, _ := users.GetDeletionTombstone(ctx, "u1")
+	if got.HolderDID != "did:example:a" {
+		t.Fatalf("holder did = %q, want kept", got.HolderDID)
+	}
+	if err := users.ClearDeletionTombstoneHolderDID(ctx, "u1"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := users.GetDeletionTombstone(ctx, "u1")
+	if err != nil || got.HolderDID != "" {
+		t.Fatalf("after clear: %v, %q", err, got.HolderDID)
+	}
+	if err := users.ClearDeletionTombstoneHolderDID(ctx, "missing"); err != nil {
+		t.Fatalf("clearing a missing tombstone must not fail: %v", err)
+	}
+}

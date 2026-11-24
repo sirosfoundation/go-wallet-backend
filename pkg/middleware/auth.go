@@ -5,11 +5,15 @@ import (
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
+
+	"github.com/sirosfoundation/go-wallet-backend/internal/tokengate"
 )
 
 // TokenBlacklistChecker is an interface for checking if a token is
@@ -165,4 +169,22 @@ func Logger(logger *zap.Logger, skipPaths ...string) gin.HandlerFunc {
 			zap.Int("status", c.Writer.Status()),
 		)
 	}
+}
+
+// checkTokenGate applies the SID-AUTH-06 token cut-off and writes the
+// response on refusal. It returns false when the request was aborted.
+func checkTokenGate(c *gin.Context, gate *tokengate.Gate, userID string, issuedAt time.Time, logger *zap.Logger) bool {
+	err := gate.Check(c.Request.Context(), userID, issuedAt)
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, tokengate.ErrRevoked):
+		logger.Warn("Token issued before authorization cut-off", zap.String("user_id", userID))
+		c.JSON(401, gin.H{"error": "Token has been revoked"})
+	default:
+		logger.Error("Failed to check token authorization cut-off", zap.String("user_id", userID), zap.Error(err))
+		c.JSON(500, gin.H{"error": "Internal server error"})
+	}
+	c.Abort()
+	return false
 }
